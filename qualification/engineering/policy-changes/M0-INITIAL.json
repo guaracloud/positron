@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "M0-INITIAL",
+  "status": "initial-baseline",
+  "authority": [
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/application-design.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Establish the first enforceable engineering gate registry before product behavior.",
+  "detection_gained": [
+    "exact invariant-to-gate coverage",
+    "scaffold-only application scopes",
+    "acyclic allowed crate edges",
+    "pinned Rust and detector tool identities",
+    "locked formatting, compiler, lint, documentation, test, dependency, secret, and evidence checks",
+    "explicit non-waivable and temporary exception classes"
+  ],
+  "detection_lost": [],
+  "dual_run": "not-applicable-no-predecessor",
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering",
+    "Rust and Toolchain"
+  ],
+  "immutable_after_acceptance": true
+}

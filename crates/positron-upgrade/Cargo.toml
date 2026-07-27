@@ -1,0 +1,14 @@
+[package]
+name = "positron-upgrade"
+description = "Positron upgrade and persistent-format migration scaffold"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/guaracloud/positron/qualification/engineering/evidence.schema.json",
+  "title": "Positron engineering gate evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "profile",
+    "result",
+    "merge_eligible",
+    "source",
+    "started_unix_ms",
+    "ended_unix_ms",
+    "registry_digest",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "attempt_id": { "type": "string", "minLength": 1 },
+    "profile": { "enum": ["pre-commit", "pr", "ext", "qual"] },
+    "result": { "enum": ["passed", "failed"] },
+    "merge_eligible": { "type": "boolean" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "dirty", "trusted_ci"],
+      "properties": {
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+        "dirty": { "type": "boolean" },
+        "trusted_ci": { "type": "boolean" }
+      }
+    },
+    "started_unix_ms": { "type": "integer", "minimum": 0 },
+    "ended_unix_ms": { "type": "integer", "minimum": 0 },
+    "registry_digest": {
+      "type": "string",
+      "pattern": "^(git-object:[0-9a-f]{40,64}|invalid-registry|unavailable-registry-digest)$"
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "gate_id",
+          "result",
+          "duration_ms",
+          "budget_seconds",
+          "command",
+          "detail"
+        ],
+        "properties": {
+          "gate_id": { "pattern": "^EG-(00|[A-Z]+)$" },
+          "result": { "enum": ["passed", "failed", "not-selected"] },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "budget_seconds": { "type": "integer", "minimum": 1 },
+          "command": { "type": "string", "minLength": 1 },
+          "detail": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

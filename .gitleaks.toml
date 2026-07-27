@@ -1,0 +1,4 @@
+title = "Positron secret scanning policy"
+
+[extend]
+useDefault = true

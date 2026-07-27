@@ -1,0 +1,8 @@
+threshold_id	state	value	unit	scope	rationale
+coverage-line	pending-measured-baseline	-	percent	active-application-code	Must be frozen from the first measured M0 harness before application activation
+coverage-region	pending-measured-baseline	-	percent	active-application-code	Must be frozen from the first measured M0 harness before application activation
+coverage-branch	pending-measured-baseline	-	percent	active-application-code	Must be frozen from the first measured M0 harness before application activation
+coverage-changed-code	pending-measured-baseline	-	percent	active-application-code	Must be frozen from the first measured M0 harness before application activation
+mutation-score	pending-measured-baseline	-	percent	active-application-code	Must be frozen from the first measured M0 harness before application activation
+performance-objectives	pending-preregistration	-	digest	release-candidate	Requires the accepted reference hardware and workload preregistration
+soak-duration	pending-preregistration	-	seconds	release-candidate	Requires the accepted reference profiles and fault schedule

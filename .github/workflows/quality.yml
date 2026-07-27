@@ -1,0 +1,66 @@
+name: Engineering quality
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: PR gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      TZ: UTC
+
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,llvm-tools-preview,rust-src,rustfmt --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-apple-darwin,x86_64-unknown-linux-gnu
+
+      - name: Install cargo-nextest
+        run: cargo install --locked --version 0.9.138 cargo-nextest
+
+      - name: Install cargo-deny
+        run: cargo install --locked --version 0.19.9 cargo-deny
+
+      - name: Install cargo-audit
+        run: cargo install --locked --version 0.22.2 cargo-audit
+
+      - name: Install cargo-machete
+        run: cargo install --locked --version 0.9.2 cargo-machete
+
+      - name: Install cargo-vet
+        run: cargo install --locked --version 0.10.2 cargo-vet
+
+      - name: Install Gitleaks
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          go install github.com/gitleaks/gitleaks/v8@v8.30.1
+
+      - name: Run the authoritative PR gate runner
+        run: cargo xtask quality --profile pr
+
+      - name: Retain the exact gate attempt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engineering-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: target/quality/evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 90

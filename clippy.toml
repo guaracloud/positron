@@ -1,0 +1,7 @@
+avoid-breaking-exported-api = false
+cognitive-complexity-threshold = 20
+max-fn-params-bools = 1
+max-struct-bools = 2
+too-many-arguments-threshold = 6
+too-many-lines-threshold = 100
+type-complexity-threshold = 200

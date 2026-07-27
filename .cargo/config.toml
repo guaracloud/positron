@@ -1,0 +1,19 @@
+[alias]
+xtask = "run --locked --package xtask --"
+
+[build]
+incremental = false
+
+[future-incompat-report]
+frequency = "always"
+
+[net]
+git-fetch-with-cli = false
+retry = 2
+
+[registries.crates-io]
+protocol = "sparse"
+
+[term]
+color = "auto"
+hyperlinks = true

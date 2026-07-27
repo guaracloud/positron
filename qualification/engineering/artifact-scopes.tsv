@@ -1,0 +1,7 @@
+scope	path	semantic_owner	state	allowed_scaffold_files	risk_gates
+canonical-api	api/positron/v1	Public API and SDK	scaffold	README.md	EG-DOCS|EG-ERROR|EG-MATRIX|EG-POLICY|EG-TEST
+grafana-integration	integrations/grafana	Query and Integrations	scaffold	README.md	EG-DOCS|EG-MATRIX|EG-SECURITY|EG-TEST
+generated-sdks	sdk	Public API and SDK	scaffold	README.md	EG-DOCS|EG-MATRIX|EG-POLICY|EG-SUPPLY|EG-TEST
+distribution-surfaces	deploy	Release Engineering	scaffold	README.md	EG-BUILD|EG-DOCS|EG-MATRIX|EG-SECURITY|EG-SUPPLY|EG-TEST
+fuzz-targets	fuzz	Quality Engineering	scaffold	README.md	EG-DYNAMIC|EG-SAFETY|EG-SECURITY
+model-tests	models	Quality Engineering	scaffold	README.md	EG-CONCURRENCY|EG-CORRECT|EG-DYNAMIC|EG-TEST

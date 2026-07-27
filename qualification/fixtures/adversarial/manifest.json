@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "synthetic_only": true,
+  "production_secrets_or_telemetry_forbidden": true,
+  "suites": [
+    {
+      "id": "protocol-boundaries",
+      "owner": "Ingest Interoperability",
+      "state": "scaffold",
+      "corpus_path": "protocol/",
+      "activation_requires": [
+        "canonical API Definition",
+        "bounded native decoder",
+        "positive boundary negative and adversarial oracles"
+      ]
+    },
+    {
+      "id": "persistence-boundaries",
+      "owner": "Storage Kernel",
+      "state": "scaffold",
+      "corpus_path": "persistence/",
+      "activation_requires": [
+        "versioned format specification",
+        "publication-point registry",
+        "predecessor-or-successor oracle"
+      ]
+    },
+    {
+      "id": "cryptography-boundaries",
+      "owner": "Security and Key Management",
+      "state": "scaffold",
+      "corpus_path": "cryptography/",
+      "activation_requires": [
+        "approved Crypto Backend dependencies",
+        "known-answer vectors",
+        "wrong-key context substitution and corruption oracles"
+      ]
+    },
+    {
+      "id": "resource-boundaries",
+      "owner": "Storage Kernel",
+      "state": "scaffold",
+      "corpus_path": "resource/",
+      "activation_requires": [
+        "Resource Governor interface",
+        "finite capacity registry",
+        "stable overload outcomes"
+      ]
+    }
+  ]
+}
