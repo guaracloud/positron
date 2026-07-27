@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Positron — the observability database for native logs and traces</title>
+  <meta name="description" content="Positron is an open source observability database by Guara Cloud. One shared storage kernel, signal-native log and trace stores, physical tenant isolation, and mandatory encryption at rest — in a single Rust binary.">
+
+  <link rel="icon" type="image/png" sizes="32x32" href="./logos/favicon-branded-32.png">
+  <link rel="icon" type="image/png" sizes="96x96" href="./logos/favicon-branded-96.png">
+  <link rel="apple-touch-icon" href="./logos/favicon-branded-180.png">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Positron — the observability database for native logs and traces">
+  <meta property="og:description" content="One shared storage kernel. Signal-native log and trace stores. Physical tenant isolation and mandatory encryption at rest, in a single Rust binary. Open source by Guara Cloud.">
+  <meta property="og:image" content="https://guaracloud.github.io/positron/logos/og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Afacad+Flux:wght@500;600;700&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Recursive+Mono:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./assets/site.css">
+  <script>document.documentElement.classList.add('js')</script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header" data-header>
+    <div class="site-header__inner">
+      <a class="brand" href="./">
+        <img src="./logos/icon-transparent.png" alt="" width="30" height="30" style="height:30px;width:auto">
+        <span class="brand__stack">
+          <span class="brand__org">Guara Cloud</span>
+          Positron
+        </span>
+      </a>
+      <nav class="site-nav" aria-label="Site">
+        <a href="./architecture.html">Architecture</a>
+        <a href="https://github.com/guaracloud/positron/tree/main/docs/adr">ADRs</a>
+        <a href="https://github.com/guaracloud/positron">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- ============ Hero: the cloud chamber ============ -->
+    <section class="hero on-deep">
+      <canvas class="hero__chamber" data-chamber aria-hidden="true"></canvas>
+      <div class="hero__content">
+        <h1>The observability database for native logs and traces.</h1>
+        <p class="hero__lede">
+          Positron stores and queries telemetry through <strong>one shared storage
+          kernel</strong> while each signal keeps the physical design that suits it.
+          A single Rust binary that treats <strong>tenancy as a physical
+          boundary</strong> and <strong>refuses to run unencrypted</strong>.
+        </p>
+        <div class="hero__actions">
+          <a class="btn btn--primary" href="./architecture.html">Explore the architecture</a>
+          <a class="btn btn--ghost" href="https://github.com/guaracloud/positron">View on GitHub</a>
+        </div>
+        <p class="hero__meta">
+          <span>open source · MIT</span>
+          <span>100% Rust</span>
+          <span>OTLP + Loki ingest</span>
+          <span>Grafana data source</span>
+          <span>Kubernetes operator</span>
+        </p>
+      </div>
+    </section>
+
+    <!-- ============ One kernel, signal-native stores ============ -->
+    <section class="section">
+      <div class="container split">
+        <div class="split__copy" data-reveal>
+          <h2>One kernel. Signal&#8209;native stores.</h2>
+          <p class="lede">
+            The Storage Kernel owns what every signal needs exactly once:
+            durability, catalog transactions, encryption, resource governance,
+            and lifecycle.
+          </p>
+          <p>
+            Above it, each Signal Store owns what makes its signal fast. The
+            <span class="signal signal--logs">Log Store</span> keeps full-text
+            and typed attribute indexes with workload-driven attribute
+            promotion. The <span class="signal signal--traces">Trace Store</span>
+            consolidates span observations into logical spans, preserves
+            conflicts instead of overwriting them, and maintains incremental
+            trace summaries.
+          </p>
+          <p>
+            Release&nbsp;1 ships logs and traces. Metrics and profiles are
+            deliberate deferrals — the Signal Store seam is built for them, and
+            nothing pretends otherwise.
+          </p>
+        </div>
+        <div class="panel" data-reveal style="--reveal-delay: 120ms">
+          <svg viewBox="0 0 560 380" role="img" aria-label="Diagram: OTLP and Loki producers feed the log and trace stores, which sit on one shared storage kernel above a single data volume.">
+            <defs>
+              <marker id="mk-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0 0 L8 4 L0 8 z" fill="oklch(76% 0.028 262)"/>
+              </marker>
+            </defs>
+            <style>
+              .d-label { font: 500 14px "Recursive Mono", monospace; fill: oklch(94% 0.012 262); }
+              .d-sub { font: 500 11.5px "Recursive Mono", monospace; fill: oklch(76% 0.028 262); }
+              .d-box { fill: oklch(21% 0.038 268); stroke: oklch(36% 0.05 268); rx: 10; }
+              .d-edge { stroke: oklch(48% 0.05 268); stroke-width: 1.6; fill: none; }
+            </style>
+            <!-- producers -->
+            <text class="d-sub" x="60" y="30">otlp/grpc</text>
+            <text class="d-sub" x="245" y="30">otlp/http</text>
+            <text class="d-sub" x="435" y="30">loki/push</text>
+            <path class="d-edge flow-edge" d="M85 40 L 150 86" marker-end="url(#mk-arrow)"/>
+            <path class="d-edge flow-edge" d="M280 40 L 280 86" marker-end="url(#mk-arrow)"/>
+            <path class="d-edge flow-edge" d="M462 40 L 405 86" marker-end="url(#mk-arrow)"/>
+            <!-- signal stores -->
+            <rect class="d-box" x="60" y="92" width="210" height="74" rx="10"/>
+            <circle cx="84" cy="122" r="5" fill="oklch(72% 0.14 262)" class="pulse-node"/>
+            <text class="d-label" x="100" y="127">Log Store</text>
+            <text class="d-sub" x="84" y="150">text + attribute indexes</text>
+            <rect class="d-box" x="290" y="92" width="210" height="74" rx="10"/>
+            <circle cx="314" cy="122" r="5" fill="oklch(74% 0.13 342)" class="pulse-node"/>
+            <text class="d-label" x="330" y="127">Trace Store</text>
+            <text class="d-sub" x="314" y="150">span consolidation</text>
+            <!-- kernel -->
+            <path class="d-edge flow-edge" d="M165 166 L 165 208" marker-end="url(#mk-arrow)"/>
+            <path class="d-edge flow-edge" d="M395 166 L 395 208" marker-end="url(#mk-arrow)"/>
+            <rect class="d-box" x="60" y="214" width="440" height="92" rx="10"/>
+            <text class="d-label" x="84" y="245">Storage Kernel</text>
+            <text class="d-sub" x="84" y="270">segments · catalog · resource governor · encryption</text>
+            <text class="d-sub" x="84" y="288">maintenance · integrity · lifecycle clock</text>
+            <!-- volume -->
+            <path class="d-edge flow-edge" d="M280 306 L 280 336" marker-end="url(#mk-arrow)"/>
+            <text class="d-sub" x="200" y="362">primary data volume</text>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Pillars ============ -->
+    <section class="section section--tight" aria-labelledby="pillars-title">
+      <div class="container">
+        <div class="section-head" data-reveal>
+          <h2 id="pillars-title">Designed like a database,<br>not a pipeline.</h2>
+          <p class="lede">
+            Five decisions define Positron. Each is frozen in an accepted
+            architecture decision record before a line of product code.
+          </p>
+        </div>
+        <div class="pillars">
+          <article class="pillar" data-reveal>
+            <div>
+              <h3>Tenancy is a physical boundary</h3>
+              <span class="pillar__kicker">isolation</span>
+            </div>
+            <div class="pillar__body">
+              <p>
+                Every segment belongs to exactly one tenant. Tenant data is
+                encrypted under tenant-scoped keys, quotas are enforced per
+                tenant, and requests bind to exactly one tenant before any
+                payload is decoded. Tenant Purge is cryptographically complete:
+                it eliminates every reachable key envelope from the instance
+                and from every registered backup repository.
+              </p>
+              <span class="fact">ADR-0006 · ADR-0039 · ADR-0061</span>
+            </div>
+          </article>
+          <article class="pillar" data-reveal>
+            <div>
+              <h3>Encryption is the default state</h3>
+              <span class="pillar__kicker">protection</span>
+            </div>
+            <div class="pillar__body">
+              <p>
+                A Positron instance initializes encrypted or not at all.
+                Independently authenticated AES-256-GCM frames, envelope keys
+                wrapped by your provider — AWS KMS, Google Cloud KMS, Azure Key
+                Vault and Managed HSM, Vault Transit, OpenBao, KMIP — or a
+                hardened local root key with a verified recovery bundle.
+              </p>
+              <span class="fact">ADR-0031 · ADR-0034 · ADR-0035 · ADR-0043</span>
+            </div>
+          </article>
+          <article class="pillar" data-reveal>
+            <div>
+              <h3>Acknowledgment means durability</h3>
+              <span class="pillar__kicker">correctness</span>
+            </div>
+            <div class="pillar__body">
+              <p>
+                An ingest acknowledgment is issued only after the durable
+                commit its deployment mode guarantees — never from queue
+                acceptance. Crash recovery exposes a complete predecessor or a
+                complete successor, never a mixture. Partial results stay
+                explicit: committed, retryable, and rejected records are
+                reported separately.
+              </p>
+              <span class="fact">ADR-0004 · ADR-0013</span>
+            </div>
+          </article>
+          <article class="pillar" data-reveal>
+            <div>
+              <h3>Everything is bounded</h3>
+              <span class="pillar__kicker">governance</span>
+            </div>
+            <div class="pillar__body">
+              <p>
+                Work acquires an explicit reservation from the Resource
+                Governor before it consumes memory, queue slots, or disk.
+                Queries run under budgets with a truthful terminal status.
+                Connection admission is bounded before authentication, and all
+                background work flows through one maintenance scheduler.
+              </p>
+              <span class="fact">ADR-0070 · ADR-0071</span>
+            </div>
+          </article>
+          <article class="pillar" data-reveal>
+            <div>
+              <h3>Releases ship with evidence</h3>
+              <span class="pillar__kicker">trust</span>
+            </div>
+            <div class="pillar__body">
+              <p>
+                Every artifact binds to a signed release manifest with SBOMs,
+                reproducible payloads, and provenance. Every supported target
+                is a qualification cell with retained, immutable evidence — a
+                capability is not claimed until its cell is qualified.
+              </p>
+              <span class="fact">ADR-0073 · ADR-0074</span>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Protocols ============ -->
+    <section class="section on-deep" aria-labelledby="io-title">
+      <div class="container">
+        <div class="section-head" data-reveal>
+          <h2 id="io-title">Speaks the protocols you already run.</h2>
+          <p class="lede">
+            Native stores behind versioned receiver adapters — compatibility is
+            conformance-tested against pinned producers, not resemblance.
+          </p>
+        </div>
+        <div class="io">
+          <div class="io__col" data-reveal>
+            <h3>Wire in <span class="signal signal--logs">ingest</span></h3>
+            <ul class="io__list">
+              <li><span class="mono">otlp/grpc</span><span>logs and traces</span></li>
+              <li><span class="mono">otlp/http</span><span>protobuf and JSON</span></li>
+              <li><span class="mono">loki/push</span><span>with validated <code>X-Scope-OrgID</code> aliases</span></li>
+              <li><span class="mono">ingest policy</span><span>declarative accept, reject, or transform — before persistence, with provenance</span></li>
+            </ul>
+          </div>
+          <div class="io__col" data-reveal style="--reveal-delay: 120ms">
+            <h3>Read out <span class="signal signal--traces">query</span></h3>
+            <ul class="io__list io__list--out">
+              <li><span class="mono">pipelines</span><span>typed operators over logs, spans, and traces</span></li>
+              <li><span class="mono">sql</span><span>a bounded, read-only subset</span></li>
+              <li><span class="mono">tail</span><span>live, resumable, explicitly at-least-once</span></li>
+              <li><span class="mono">grafana</span><span>first-party data source plugin</span></li>
+              <li><span class="mono">sdks</span><span>Rust, TypeScript, Python, Go, Java, .NET — generated from one Protobuf definition</span></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Operations ============ -->
+    <section class="section" aria-labelledby="ops-title">
+      <div class="container split split--flip">
+        <div class="cli" data-reveal style="--reveal-delay: 120ms">
+          <div class="cli__bar">positron — one executable</div>
+          <pre><code><span class="c"># run the database</span>
+<span class="p">$</span> positron serve
+
+<span class="c"># run the Kubernetes reconciler</span>
+<span class="p">$</span> positron operator
+
+<span class="c"># bounded read-only diagnosis</span>
+<span class="p">$</span> positron doctor
+
+<span class="c"># authenticate release artifacts offline</span>
+<span class="p">$</span> positron release verify</code></pre>
+        </div>
+        <div class="split__copy" data-reveal>
+          <h2 id="ops-title">One binary, every role.</h2>
+          <p class="lede">
+            The database, the Kubernetes operator, and the offline tooling are
+            modes of the same signed executable.
+          </p>
+          <ul class="ops">
+            <li>
+              <b>Container contract</b>
+              <span>One multi-architecture OCI image behaves identically under
+              Docker, Compose, and Kubernetes — with explicit persistence,
+              health, and shutdown semantics.</span>
+            </li>
+            <li>
+              <b>Operator, not a dependency</b>
+              <span><code>PositronCluster</code>, <code>PositronBackup</code>, and
+              <code>PositronScheduledBackup</code> reconcile through the public
+              API. The operator never opens the data volume.</span>
+            </li>
+            <li>
+              <b>Verified backups</b>
+              <span>Incremental, application-verified snapshots to filesystem,
+              S3, S3-compatible, GCS, or Azure Blob — restore-only into fresh
+              storage, proven recoverable before a backup counts.</span>
+            </li>
+            <li>
+              <b>Declarative upgrades</b>
+              <span>Fenced, recoverable, and preceded by a verified quiescent
+              snapshot before any persistent format changes.</span>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer on-deep">
+    <div class="site-footer__inner">
+      <div>
+        <a class="brand" href="./">
+          <img src="./logos/icon-transparent.png" alt="" width="28" height="28" style="height:28px;width:auto">
+          <span class="brand__stack">
+            <span class="brand__org">Guara Cloud</span>
+            Positron
+          </span>
+        </a>
+        <p class="site-footer__tag">
+          An open source observability database for native logs and traces.
+        </p>
+      </div>
+      <div>
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/guaracloud/positron">GitHub</a></li>
+          <li><a href="./architecture.html">Architecture</a></li>
+          <li><a href="https://github.com/guaracloud/positron/tree/main/docs/adr">Decision records</a></li>
+          <li><a href="https://github.com/guaracloud/positron/blob/main/LICENSE">MIT license</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Guara Cloud</h4>
+        <ul>
+          <li><a href="https://github.com/guaracloud">github.com/guaracloud</a></li>
+          <li><a href="https://guaracloud.github.io/purple-wolf/">Purple Wolf</a></li>
+          <li><a href="https://guaracloud.github.io/e-navigator/">E-Navigator</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="site-footer__legal">
+      <span>© 2026 Guara Cloud. MIT licensed.</span>
+      <span>Built in the open — every design decision is a public record.</span>
+    </div>
+  </footer>
+
+  <script src="./assets/main.js" defer></script>
+  <script src="./assets/chamber.js" defer></script>
+</body>
+</html>

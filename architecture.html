@@ -1,0 +1,1190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Positron architecture — one kernel, signal-native stores</title>
+  <meta name="description" content="The complete Release 1 architecture of Positron: the whole-system shape, module map, storage kernel internals, encryption hierarchy, canonical flows, lifecycle state machines, crate graph, seams, and engineering discipline.">
+
+  <link rel="icon" type="image/png" sizes="32x32" href="./logos/favicon-branded-32.png">
+  <link rel="icon" type="image/png" sizes="96x96" href="./logos/favicon-branded-96.png">
+  <link rel="apple-touch-icon" href="./logos/favicon-branded-180.png">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Positron architecture">
+  <meta property="og:description" content="The complete Release 1 architecture of Positron: modules, kernel internals, encryption hierarchy, canonical flows, state machines, and the crate graph.">
+  <meta property="og:image" content="https://guaracloud.github.io/positron/logos/og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Afacad+Flux:wght@500;600;700&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Recursive+Mono:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./assets/site.css">
+  <link rel="stylesheet" href="./assets/arch.css">
+  <script>document.documentElement.classList.add('js')</script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header" data-header>
+    <div class="site-header__inner">
+      <a class="brand" href="./">
+        <img src="./logos/icon-transparent.png" alt="" width="30" height="30" style="height:30px;width:auto">
+        <span class="brand__stack">
+          <span class="brand__org">Guara Cloud</span>
+          Positron
+        </span>
+      </a>
+      <nav class="site-nav" aria-label="Site">
+        <a href="./architecture.html" aria-current="page">Architecture</a>
+        <a href="https://github.com/guaracloud/positron/tree/main/docs/adr">ADRs</a>
+        <a href="https://github.com/guaracloud/positron">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <section class="hero arch-hero on-deep">
+    <canvas class="hero__chamber" data-chamber aria-hidden="true"></canvas>
+    <div class="hero__content">
+      <h1>The whole-application architecture.</h1>
+      <p class="hero__lede">
+        Positron's Release&nbsp;1 shape is decided before its code: <strong>74
+        accepted decision records</strong>, one binding language, and a frozen
+        whole-application design. This page is that design — modules, seams,
+        flows, and the invariants that hold them together.
+      </p>
+      <p class="hero__meta">
+        <span>source: <a href="https://github.com/guaracloud/positron/blob/main/docs/application-design.md">application-design.md</a></span>
+        <span><a href="https://github.com/guaracloud/positron/tree/main/docs/adr">docs/adr — 74 records</a></span>
+      </p>
+    </div>
+  </section>
+
+  <div class="arch-layout" id="main">
+    <nav class="rail" aria-label="Sections" data-rail>
+      <ol>
+        <li><a href="#overview">System overview</a></li>
+        <li><a href="#modes">Process modes</a></li>
+        <li><a href="#modules">Module map</a></li>
+        <li><a href="#kernel">Storage kernel</a></li>
+        <li><a href="#protection">Data protection</a></li>
+        <li><a href="#flows">Canonical flows</a></li>
+        <li><a href="#lifecycle">State machines</a></li>
+        <li><a href="#workspace">Crate graph</a></li>
+        <li><a href="#seams">Seams &amp; adapters</a></li>
+        <li><a href="#discipline">Engineering discipline</a></li>
+        <li><a href="#milestones">Road to Release 1</a></li>
+      </ol>
+    </nav>
+
+    <main class="arch-main">
+
+      <!-- ================= 1. System overview ================= -->
+      <section class="arch-section" id="overview">
+        <h2>One process, inward-pointing dependencies.</h2>
+        <p class="lede">
+          Every arrow is an allowed caller-to-dependency direction. Adapters sit
+          at the rim; behavior owners sit inside; the Storage Kernel is the
+          deepest module and knows nothing about protocols, query syntax, or
+          providers. Cycles are a design failure.
+        </p>
+        <figure class="diagram-wrap" data-reveal>
+          <div class="diagram">
+            <svg viewBox="0 0 960 900" role="img" aria-label="System diagram: producers and clients enter through the listener set and identity, then receiver adapters feed ingest and the public interface feeds query and administration. Signal stores and all control-plane modules sit on the storage kernel, which owns the primary data volume. Key providers and backup repositories are external. Kubernetes drives a separate operator process that calls the public interface.">
+              <defs>
+                <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+                  <path d="M0 0 L8 4 L0 8 z" fill="oklch(60% 0.045 268)"/>
+                </marker>
+              </defs>
+
+              <!-- external top -->
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="24" y="16" width="250" height="46" rx="9"/>
+                <text class="dg-label" x="44" y="44">OTLP · Loki producers</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="298" y="16" width="250" height="46" rx="9"/>
+                <text class="dg-label" x="318" y="44">CLI · SDKs · Grafana</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="660" y="16" width="276" height="46" rx="9"/>
+                <text class="dg-label" x="680" y="44">Kubernetes</text>
+              </g>
+
+              <!-- serve container -->
+              <rect class="dg-box dg-box--ext" x="24" y="96" width="560" height="700" rx="14"/>
+              <text class="dg-sub" x="44" y="118">positron serve</text>
+
+              <!-- operator -->
+              <g data-mod>
+                <rect class="dg-box" x="660" y="210" width="276" height="64" rx="10"/>
+                <text class="dg-label" x="680" y="238">positron operator</text>
+                <text class="dg-sub" x="680" y="258">watches · leases · server-side apply</text>
+              </g>
+
+              <!-- listener set -->
+              <g data-mod>
+                <rect class="dg-box" x="48" y="132" width="512" height="50" rx="10"/>
+                <text class="dg-label" x="68" y="153">Listener Set</text>
+                <text class="dg-sub" x="68" y="171">control · operations · api · otlp · loki-push — bounded before auth</text>
+              </g>
+
+              <!-- identity -->
+              <g data-mod>
+                <rect class="dg-box" x="48" y="210" width="512" height="50" rx="10"/>
+                <text class="dg-label" x="68" y="231">Identity &amp; Attribution</text>
+                <text class="dg-sub" x="68" y="249">one principal · one scope · exactly one tenant — before decoding</text>
+              </g>
+
+              <!-- receivers / public -->
+              <g data-mod>
+                <rect class="dg-box" x="48" y="288" width="244" height="54" rx="10"/>
+                <text class="dg-label" x="68" y="310">Receiver Adapters</text>
+                <text class="dg-sub" x="68" y="329">OTLP grpc/http · Loki push</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="316" y="288" width="244" height="54" rx="10"/>
+                <text class="dg-label" x="336" y="310">Public Interface</text>
+                <text class="dg-sub" x="336" y="329">generated from one protobuf</text>
+              </g>
+
+              <!-- ingest / query / admin -->
+              <g data-mod>
+                <rect class="dg-box" x="48" y="370" width="156" height="50" rx="10"/>
+                <text class="dg-label" x="68" y="401">Ingest</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="228" y="370" width="156" height="50" rx="10"/>
+                <text class="dg-label" x="248" y="401">Query</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="408" y="370" width="152" height="50" rx="10"/>
+                <text class="dg-label" x="424" y="391">Administration</text>
+                <text class="dg-sub" x="424" y="409">&amp; governance</text>
+              </g>
+
+              <!-- signal stores -->
+              <g data-mod>
+                <rect class="dg-box" x="48" y="448" width="336" height="78" rx="10"/>
+                <text class="dg-label" x="68" y="472">Signal Stores</text>
+                <rect class="dg-chip" x="68" y="482" width="140" height="32" rx="7"/>
+                <circle class="dg-accent-logs" cx="86" cy="498" r="4"/>
+                <text class="dg-sub" x="96" y="502">Log Store</text>
+                <rect class="dg-chip" x="224" y="482" width="144" height="32" rx="7"/>
+                <circle class="dg-accent-traces" cx="242" cy="498" r="4"/>
+                <text class="dg-sub" x="252" y="502">Trace Store</text>
+              </g>
+
+              <!-- right control column -->
+              <g data-mod>
+                <rect class="dg-box" x="408" y="448" width="152" height="50" rx="10"/>
+                <text class="dg-label" x="424" y="469">Backup &amp;</text>
+                <text class="dg-label" x="424" y="487">Restore</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="408" y="524" width="152" height="50" rx="10"/>
+                <text class="dg-label" x="424" y="545">Upgrade &amp;</text>
+                <text class="dg-label" x="424" y="563">Migration</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="408" y="600" width="152" height="50" rx="10"/>
+                <text class="dg-label" x="424" y="621">Operational</text>
+                <text class="dg-label" x="424" y="639">State</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="408" y="676" width="152" height="50" rx="10"/>
+                <text class="dg-label" x="424" y="706">Diagnostics</text>
+              </g>
+
+              <!-- storage kernel -->
+              <g data-mod>
+                <rect class="dg-box dg-box--kernel" x="48" y="556" width="336" height="170" rx="12"/>
+                <text class="dg-label--lg" x="68" y="582">Storage Kernel</text>
+                <rect class="dg-chip" x="68" y="594" width="146" height="26" rx="6"/>
+                <text class="dg-sub" x="78" y="611">Resource Governor</text>
+                <rect class="dg-chip" x="226" y="594" width="142" height="26" rx="6"/>
+                <text class="dg-sub" x="236" y="611">Catalog Writer</text>
+                <rect class="dg-chip" x="68" y="628" width="146" height="26" rx="6"/>
+                <text class="dg-sub" x="78" y="645">Segment Ledger</text>
+                <rect class="dg-chip" x="226" y="628" width="142" height="26" rx="6"/>
+                <text class="dg-sub" x="236" y="645">Maintenance</text>
+                <rect class="dg-chip" x="68" y="662" width="146" height="26" rx="6"/>
+                <text class="dg-sub" x="78" y="679">Data Protection</text>
+                <rect class="dg-chip" x="226" y="662" width="142" height="26" rx="6"/>
+                <text class="dg-sub" x="236" y="679">Integrity</text>
+                <rect class="dg-chip" x="68" y="696" width="146" height="26" rx="6"/>
+                <text class="dg-sub" x="78" y="713">Lifecycle Clock</text>
+              </g>
+
+              <!-- external bottom -->
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="110" y="830" width="210" height="46" rx="9"/>
+                <text class="dg-label" x="130" y="850">Primary Data Volume</text>
+                <text class="dg-sub" x="130" y="866">one qualified filesystem</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="380" y="830" width="200" height="46" rx="9"/>
+                <text class="dg-label" x="400" y="850">Key Providers</text>
+                <text class="dg-sub" x="400" y="866">KMS · Vault · KMIP</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="640" y="830" width="230" height="46" rx="9"/>
+                <text class="dg-label" x="660" y="850">Backup Repositories</text>
+                <text class="dg-sub" x="660" y="866">FS · S3 · GCS · Azure Blob</text>
+              </g>
+
+              <!-- edges: ingest path (blue, flowing) -->
+              <path class="dg-edge dg-edge--logs flow-edge" d="M149 62 L 170 130" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--logs flow-edge" d="M170 182 L 170 208" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--logs flow-edge" d="M170 260 L 170 286" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--logs flow-edge" d="M126 342 L 126 368" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--logs flow-edge" d="M126 420 L 126 446" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--logs flow-edge" d="M150 526 L 150 554" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--logs flow-edge" d="M215 726 L 215 828" marker-end="url(#ar)"/>
+
+              <!-- edges: query path (rose, flowing) -->
+              <path class="dg-edge dg-edge--traces flow-edge" d="M423 62 L 400 130" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--traces flow-edge" d="M438 260 L 438 286" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--traces flow-edge" d="M388 342 L 320 368" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--traces flow-edge" d="M306 420 L 306 446" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--traces flow-edge" d="M316 526 L 316 554" marker-end="url(#ar)"/>
+
+              <!-- edges: control (neutral) -->
+              <path class="dg-edge" d="M798 62 L 798 208" marker-end="url(#ar)"/>
+              <path class="dg-edge" d="M660 242 C 610 242 590 290 564 310" marker-end="url(#ar)"/>
+              <path class="dg-edge" d="M470 342 L 486 368" marker-end="url(#ar)"/>
+              <path class="dg-edge" d="M484 420 L 484 446" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--soft" d="M420 420 C 398 436 392 460 392 500 L 392 620 L 386 620" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--soft" d="M408 480 L 400 480 L 400 648 L 386 648" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--soft" d="M484 524 L 484 500" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--soft" d="M300 726 C 330 790 420 806 470 828" marker-end="url(#ar)"/>
+              <path class="dg-edge dg-edge--soft" d="M560 473 C 700 500 748 690 752 828" marker-end="url(#ar)"/>
+            </svg>
+          </div>
+          <figcaption>
+            The Release&nbsp;1 whole-system shape, simplified from
+            <span class="mono">application-design.md&nbsp;§3</span>. The operator is a
+            separate process from the same artifact: it calls the public
+            interface and never links storage.
+            <span class="signal signal--logs">ingest path</span>&nbsp;
+            <span class="signal signal--traces">query path</span>
+          </figcaption>
+        </figure>
+      </section>
+
+      <!-- ================= 2. Process modes ================= -->
+      <section class="arch-section" id="modes">
+        <h2>Five ways to run one executable.</h2>
+        <p class="lede">
+          Modes are mutually exclusive. They are never hidden inside one
+          process and never required to coexist.
+        </p>
+        <ul class="ops" data-reveal>
+          <li><b><code>positron serve</code></b><span>composes and runs the database.</span></li>
+          <li><b><code>positron operator</code></b><span>composes and runs the Kubernetes reconciler.</span></li>
+          <li><b>Online CLI</b><span>calls the public or Control Listener interfaces.</span></li>
+          <li><b>Offline CLI</b><span>acquires exclusive storage ownership and composes only the read-only or explicitly mutating workflow it requires.</span></li>
+          <li><b><code>positron release verify</code></b><span>composes offline release-trust verification and does not open database state.</span></li>
+        </ul>
+      </section>
+
+      <!-- ================= 3. Module map ================= -->
+      <section class="arch-section" id="modules">
+        <h2>Twenty deep modules. One owner each.</h2>
+        <p class="lede">
+          Every module states the interface callers learn and the complexity
+          its implementation hides. Deleting any deep module would smear its
+          rules across every caller — that is the depth test each one passes.
+        </p>
+
+        <div class="modmap">
+          <div class="modmap__group" data-reveal>
+            <h3>Foundation <span class="modmap__count">2 modules</span></h3>
+            <details class="mod">
+              <summary><b>Domain Types</b><span class="mod__learn">validated shared identities and value types</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>Tenant ID, principal, scope, signal kind, shard, commit position, typed telemetry values, and time with provenance — constructible only in valid states.</p></div>
+                <div><h4>Implementation hides</h4><p>Construction checks, type preservation, namespace separation, and impossible states. No I/O, no wire decoding, no utility collection.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Configuration</b><span class="mod__learn">resolve, validate, plan, publish one Effective Configuration</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>Resolve sources into a redacted typed candidate; diff it into a typed application plan; publish per declared mutability. Callers receive only their own typed section.</p></div>
+                <div><h4>Implementation hides</h4><p>Source precedence, schema generation, secrecy, live-reload vs drain vs restart classification, and semantic diff. No other module reads env vars or TOML.</p></div>
+              </div>
+            </details>
+          </div>
+
+          <div class="modmap__group" data-reveal>
+            <h3>Runtime <span class="modmap__count">4 modules</span></h3>
+            <details class="mod">
+              <summary><b>Application Runtime</b><span class="mod__learn">run the database, return one truthful exit outcome</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>serve(modules, host) → ExitOutcome</code>. The composition root assembles modules once; nothing fetches dependencies from ambient state.</p></div>
+                <div><h4>Implementation hides</h4><p>Process phases, recovery ordering, listener activation, drain, and dependency retry. Readiness is a derived fact, not a flag.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Instance Bootstrap</b><span class="mod__learn">initialize, resume, or claim one provably classified instance</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>classify</code>, <code>initialize</code> (provably empty roots only), and one-time <code>claim</code> of the initial system-administrator credential.</p></div>
+                <div><h4>Implementation hides</h4><p>Empty-root proof, transactional initialization, instance and key identity, the default tenant, and atomic destruction of claim material. Ambiguous roots never initialize.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Listener Set</b><span class="mod__learn">activate, replace, and drain complete listener generations</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>A generation carries complete per-listener profiles for control, operations, api, otlp-grpc, otlp-http, and loki-push. Partial mutation is impossible.</p></div>
+                <div><h4>Implementation hides</h4><p>TLS, mTLS, proxy trust, and pre-authentication Connection Admission: sockets, handshakes, headers, bodies, decompression, streams, and descriptors — all bounded before identity exists.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Operational State</b><span class="mod__learn">typed facts in, bounded health and telemetry out</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>Closed event and status types. Owning modules never construct metric labels or free-form diagnostics.</p></div>
+                <div><h4>Implementation hides</h4><p>Redaction, stable names, bounded cardinality, liveness and readiness derivation, and the self-export guard.</p></div>
+              </div>
+            </details>
+          </div>
+
+          <div class="modmap__group" data-reveal>
+            <h3>Edge <span class="modmap__count">3 modules</span></h3>
+            <details class="mod">
+              <summary><b>Identity &amp; Attribution</b><span class="mod__learn">credential + intent → one authorized context</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>attribute(credential, intent, hints)</code> binds exactly one principal, one scope and — for data-plane work — exactly one tenant. The result is an unforgeable typed input.</p></div>
+                <div><h4>Implementation hides</h4><p>Salted-hash verification, revocation, immutable identity snapshots, lifecycle checks, alias validation, trusted proxies, and constant-shape failures. Admin contexts cannot become tenant data contexts.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Public Interface</b><span class="mod__learn">generated native request and result semantics</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>Generated servers and clients from <code>api/positron/v1</code>, plus authorization, idempotency, budget, completion, and retry semantics. Wire types stop at this seam.</p></div>
+                <div><h4>Implementation hides</h4><p>gRPC and HTTP/JSON mapping, OpenAPI generation, stable error mapping, capability negotiation, and schema-digest embedding. SDKs in six languages share this one definition.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Receiver Adapters</b><span class="mod__learn">decode one bounded, attributed protocol request</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>decode(AttributedBoundedPayload) → NativeBatch</code> and <code>render(IngestOutcome)</code>. The input type proves admission and attribution already happened.</p></div>
+                <div><h4>Implementation hides</h4><p>OTLP and Loki protocol mapping and partial-result rules. Vendor fields can become native values or validated hints — never tenant selection.</p></div>
+              </div>
+            </details>
+          </div>
+
+          <div class="modmap__group" data-reveal>
+            <h3>Data plane <span class="modmap__count">4 modules</span></h3>
+            <details class="mod">
+              <summary><b>Ingest</b><span class="mod__learn">accept one attributed native batch → one typed outcome</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>accept(batch) → IngestOutcome</code>: committed, retryable, and permanently rejected records reported separately. No claim of atomicity or exactly-once.</p></div>
+                <div><h4>Implementation hides</h4><p>The exact pipeline: policy snapshot, validation, admission grouping by tenant + store + shard, reservations, block preparation, durable commit, acknowledgment.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Signal Stores</b><span class="mod__learn">prepare, scan, and optimize one signal's data</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>The <code>SignalStore</code> seam: <code>prepare</code> canonical store blocks, <code>scan</code> typed plan fragments, <code>plan_maintenance</code>. Two real adapters: Log Store and Trace Store.</p></div>
+                <div><h4>Implementation hides</h4><p>Log: full-text and attribute indexes, typed overflow, attribute promotion. Trace: span observations, consolidation, conflicts, summaries, quiescence. No Release&nbsp;1 metric or profile store exists.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Query</b><span class="mod__learn">start, resume, tail, or export one authorized query</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>Four operations with different completion contracts. Streams emit deterministic result batches and exactly one terminal status. <em>Complete</em> is a fact, never an inferred absence of error.</p></div>
+                <div><h4>Implementation hides</h4><p>Pipeline and SQL parsing into one typed logical plan, costing, budgets, snapshots, leases, cross-signal correlation, cursors, and result digests.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Storage Kernel</b><span class="mod__learn">commit, pin, publish, schedule, inspect — through narrow handles</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>Four capability handles: <code>KernelIngest</code>, <code>KernelQuery</code>, <code>KernelControl</code>, <code>KernelInspect</code>. No caller receives raw volume, key, or catalog-marker access.</p></div>
+                <div><h4>Implementation hides</h4><p>Eight internal modules — detailed in the next section.</p></div>
+              </div>
+            </details>
+          </div>
+
+          <div class="modmap__group" data-reveal>
+            <h3>Control plane <span class="modmap__count">4 modules</span></h3>
+            <details class="mod">
+              <summary><b>Administration &amp; Governance</b><span class="mod__learn">execute or inspect one authorized administrative intent</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>execute(context, command)</code> and <code>inspect</code> — with idempotency keys, expected generations, and durable operation IDs for long work.</p></div>
+                <div><h4>Implementation hides</h4><p>Canonical digests, tenant and principal state machines, audit intent, and the durable-operation handler seam: backup, restore, purge, key work, verification, migration, upgrade.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Backup &amp; Restore</b><span class="mod__learn">start or inspect backup, restore, and repository workflows</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>Workflow creation and inspection only; nobody invokes provider methods directly. A backup succeeds only after complete verification and independent key-recovery readiness.</p></div>
+                <div><h4>Implementation hides</h4><p>The <code>Repository</code> port — identify, ranged reads, put-if-absent, resumable upload, compare-and-swap head, observable delete. Listing is deliberately absent as a correctness primitive.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Upgrade &amp; Migration</b><span class="mod__learn">plan, run, or inspect one supported version transition</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>An authorized target release yields a preflight plan or a stable operation ID.</p></div>
+                <div><h4>Implementation hides</h4><p>Artifact verification, compatibility and migration-graph checks, drain, the quiescent upgrade snapshot, copy-on-write transformation, and atomic format-epoch publication. Failure before publication leaves the previous version current.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Diagnostics</b><span class="mod__learn">produce one Doctor Report or Support Bundle</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>doctor</code> never mutates; offline doctor takes exclusive read-only ownership; bundles use a typed closed allowlist.</p></div>
+                <div><h4>Implementation hides</h4><p>Pseudonymization, declared truncation, encryption, signing — and a redaction report that lists every omission. Unknown fields are excluded, not heuristically scrubbed.</p></div>
+              </div>
+            </details>
+          </div>
+
+          <div class="modmap__group" data-reveal>
+            <h3>Ecosystem &amp; trust <span class="modmap__count">3 modules</span></h3>
+            <details class="mod">
+              <summary><b>Positron Operator</b><span class="mod__learn">reconcile Kubernetes desired state through public calls</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>run</code> for a configured scope. Reconciliation separates observation, pure plan construction, and effect application, so plans are testable without a cluster.</p></div>
+                <div><h4>Implementation hides</h4><p>Watches, lease leadership, apply ownership, finalizers, status. It never opens a data volume, never mounts a live PVC elsewhere, and never infers database completion from Kubernetes objects.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Release Trust</b><span class="mod__learn">verify one artifact set against an installed trust root</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p><code>verify_release(artifacts, trust) → report</code> — fully offline.</p></div>
+                <div><h4>Implementation hides</h4><p>Manifest authentication, revocation, checksums, schema digests, compatibility identity, and reproducible-payload comparison.</p></div>
+              </div>
+            </details>
+            <details class="mod">
+              <summary><b>Qualification Harness</b><span class="mod__learn">execute one qualification cell, retain its evidence</span></summary>
+              <div class="mod__body">
+                <div><h4>Callers learn</h4><p>The exact built artifact and its public interfaces are the test subject; targets are expanded before execution.</p></div>
+                <div><h4>Implementation hides</h4><p>Environment capture and immutable pass-and-fail evidence. A private function call cannot qualify an external protocol, provider, or recovery claim.</p></div>
+              </div>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 4. Storage kernel ================= -->
+      <section class="arch-section" id="kernel">
+        <h2>The kernel: one implementation, narrow handles.</h2>
+        <p class="lede">
+          Callers get capabilities, not access. The four handles are created
+          together and handed out narrowly; the eight internal modules below
+          them are private.
+        </p>
+        <figure class="diagram-wrap" data-reveal>
+          <div class="diagram">
+            <svg viewBox="0 0 960 440" role="img" aria-label="Kernel diagram: four capability handles — KernelIngest, KernelQuery, KernelControl, KernelInspect — sit above the storage kernel, which contains eight internal modules and owns the qualified filesystem volume below it.">
+              <g data-mod>
+                <rect class="dg-chip" x="60" y="24" width="190" height="44" rx="9"/>
+                <circle class="dg-accent-logs" cx="84" cy="46" r="4.5"/>
+                <text class="dg-label" x="96" y="51">KernelIngest</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="270" y="24" width="190" height="44" rx="9"/>
+                <circle class="dg-accent-traces" cx="294" cy="46" r="4.5"/>
+                <text class="dg-label" x="306" y="51">KernelQuery</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="480" y="24" width="190" height="44" rx="9"/>
+                <circle class="dg-accent-verify" cx="504" cy="46" r="4.5"/>
+                <text class="dg-label" x="516" y="51">KernelControl</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="690" y="24" width="190" height="44" rx="9"/>
+                <circle class="dg-accent-warn" cx="714" cy="46" r="4.5"/>
+                <text class="dg-label" x="726" y="51">KernelInspect</text>
+              </g>
+
+              <path class="dg-edge dg-edge--logs flow-edge" d="M155 68 L 155 106" marker-end="url(#ar2)"/>
+              <path class="dg-edge dg-edge--traces flow-edge" d="M365 68 L 365 106" marker-end="url(#ar2)"/>
+              <path class="dg-edge" d="M575 68 L 575 106" marker-end="url(#ar2)"/>
+              <path class="dg-edge" d="M785 68 L 785 106" marker-end="url(#ar2)"/>
+              <defs>
+                <marker id="ar2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+                  <path d="M0 0 L8 4 L0 8 z" fill="oklch(60% 0.045 268)"/>
+                </marker>
+              </defs>
+
+              <rect class="dg-box dg-box--kernel" x="40" y="110" width="880" height="216" rx="12"/>
+              <text class="dg-label--lg" x="64" y="140">Storage Kernel</text>
+
+              <g data-mod>
+                <rect class="dg-chip" x="64" y="158" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="80" y="182">Primary Data Volume</text>
+                <text class="dg-sub" x="80" y="202">probe · lock · publish</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="282" y="158" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="298" y="182">Segment Ledger</text>
+                <text class="dg-sub" x="298" y="202">frontiers · commit positions</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="500" y="158" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="516" y="182">Catalog</text>
+                <text class="dg-sub" x="516" y="202">pin · commit · one writer</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="718" y="158" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="734" y="182">Resource Governor</text>
+                <text class="dg-sub" x="734" y="202">reserve before work</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="64" y="242" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="80" y="266">Maintenance</text>
+                <text class="dg-sub" x="80" y="286">typed tasks · conflict graph</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="282" y="242" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="298" y="266">Lifecycle Clock</text>
+                <text class="dg-sub" x="298" y="286">persisted · non-decreasing</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="500" y="242" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="516" y="266">Data Protection</text>
+                <text class="dg-sub" x="516" y="286">KEKs · DEKs · envelopes</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-chip" x="718" y="242" width="200" height="64" rx="8"/>
+                <text class="dg-label" x="734" y="266">Integrity</text>
+                <text class="dg-sub" x="734" y="286">scrub · quarantine</text>
+              </g>
+
+              <path class="dg-edge dg-edge--logs flow-edge" d="M480 326 L 480 366" marker-end="url(#ar2)"/>
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="330" y="370" width="300" height="46" rx="9"/>
+                <text class="dg-label" x="350" y="390">qualified filesystem volume</text>
+                <text class="dg-sub" x="350" y="406">database-safe persistence semantics</text>
+              </g>
+            </svg>
+          </div>
+          <figcaption>
+            Acknowledgment follows the owning durable commit; telemetry append
+            never runs a catalog transaction, and catalog publication is one
+            atomic authenticated marker.
+          </figcaption>
+        </figure>
+        <div class="flow-panel flow-panel--single" data-reveal>
+          <p class="guarantee">
+            <b>Not ports on purpose:</b> the Primary Data Volume, Ingest, Query,
+            the Catalog Writer, the Resource Governor, and the Maintenance
+            Coordinator are concrete. A <code>StorageBackend</code> trait would
+            falsely imply object-store or multi-writer equivalence; a private
+            limiter or scheduler would fork the source of truth.
+          </p>
+        </div>
+      </section>
+
+      <!-- ================= 5. Data protection ================= -->
+      <section class="arch-section" id="protection">
+        <h2>Encryption with a chain of custody.</h2>
+        <p class="lede">
+          Every persistent byte lives in an independently authenticated
+          AES-256-GCM frame. Keys form a wrap-only hierarchy: no caller ever
+          receives a root or tenant key, and every envelope is bound to its
+          context by digest.
+        </p>
+        <figure class="diagram-wrap" data-reveal>
+          <div class="diagram">
+            <svg viewBox="0 0 960 520" role="img" aria-label="Key hierarchy: a key provider wraps the root KEK, which wraps tenant and system KEKs, which wrap per-segment DEKs, which encrypt frames. Key envelopes carry provider identity, wrapped bytes, and a context digest; recovery bundles and purge tombstones sit alongside.">
+              <defs>
+                <marker id="ar3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+                  <path d="M0 0 L8 4 L0 8 z" fill="oklch(60% 0.045 268)"/>
+                </marker>
+              </defs>
+              <g data-mod>
+                <rect class="dg-box dg-box--ext" x="40" y="24" width="520" height="60" rx="10"/>
+                <text class="dg-label" x="60" y="49">Key Provider</text>
+                <text class="dg-sub" x="60" y="69">AWS KMS · GCP KMS · Azure KV/HSM · Vault · OpenBao · KMIP 2.1 · local file</text>
+              </g>
+              <path class="dg-edge flow-edge" d="M160 84 L 160 116" marker-end="url(#ar3)"/>
+              <text class="dg-sub" x="172" y="106">wraps</text>
+
+              <g data-mod>
+                <rect class="dg-box" x="40" y="120" width="240" height="56" rx="10"/>
+                <text class="dg-label" x="60" y="144">Root KEK</text>
+                <text class="dg-sub" x="60" y="164">provider-owned · never persisted here</text>
+              </g>
+              <path class="dg-edge flow-edge" d="M160 176 L 160 208" marker-end="url(#ar3)"/>
+              <path class="dg-edge flow-edge" d="M280 148 C 380 148 420 180 430 206" marker-end="url(#ar3)"/>
+
+              <g data-mod>
+                <rect class="dg-box" x="40" y="212" width="240" height="56" rx="10"/>
+                <text class="dg-label" x="60" y="236">Tenant KEK</text>
+                <text class="dg-sub" x="60" y="256">stored wrapped only</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="320" y="212" width="240" height="56" rx="10"/>
+                <text class="dg-label" x="340" y="236">System KEK</text>
+                <text class="dg-sub" x="340" y="256">catalog and control state</text>
+              </g>
+              <path class="dg-edge flow-edge" d="M160 268 L 160 300" marker-end="url(#ar3)"/>
+
+              <g data-mod>
+                <rect class="dg-box" x="40" y="304" width="240" height="56" rx="10"/>
+                <text class="dg-label" x="60" y="328">Segment DEK</text>
+                <text class="dg-sub" x="60" y="348">random · one per segment</text>
+              </g>
+              <path class="dg-edge flow-edge" d="M160 360 L 160 392" marker-end="url(#ar3)"/>
+              <text class="dg-sub" x="172" y="382">encrypts</text>
+
+              <g data-mod>
+                <rect class="dg-box" x="40" y="396" width="520" height="60" rx="10"/>
+                <text class="dg-label" x="60" y="421">Encrypted Frames — AES-256-GCM</text>
+                <text class="dg-sub" x="60" y="441">independently checksummed and authenticated extents</text>
+              </g>
+
+              <g data-mod>
+                <rect class="dg-box" x="620" y="120" width="300" height="104" rx="10"/>
+                <text class="dg-label" x="640" y="146">Key Envelope</text>
+                <text class="dg-sub" x="640" y="168">provider identity + opaque reference</text>
+                <text class="dg-sub" x="640" y="186">wrapped key material + versions</text>
+                <text class="dg-sub" x="640" y="204">context digest (SHA-256)</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="620" y="256" width="300" height="88" rx="10"/>
+                <text class="dg-label" x="640" y="282">Envelope Context</text>
+                <text class="dg-sub" x="640" y="304">instance · key · scope · purpose —</text>
+                <text class="dg-sub" x="640" y="322">must match envelope and payload</text>
+              </g>
+              <g data-mod>
+                <rect class="dg-box" x="620" y="376" width="300" height="104" rx="10"/>
+                <text class="dg-label" x="640" y="402">Recovery &amp; Purge</text>
+                <text class="dg-sub" x="640" y="424">Recovery Bundle: age v1 · X25519</text>
+                <text class="dg-sub" x="640" y="442">Purge Tombstone: signed, repository-</text>
+                <text class="dg-sub" x="640" y="460">level unrestorability</text>
+              </g>
+              <path class="dg-edge dg-edge--soft" d="M280 240 C 420 240 500 180 616 172" stroke-dasharray="4 5"/>
+              <path class="dg-edge dg-edge--soft" d="M620 300 C 500 300 400 300 284 300" stroke-dasharray="4 5"/>
+            </svg>
+          </div>
+          <figcaption>
+            The provider port has no create, disable, delete, or retarget
+            operation — rotation and migration are Positron workflows over
+            immutable key epochs and multiple envelopes. Tenant purge removes
+            every reachable tenant envelope from the instance and all
+            registered repositories, then destroys the remaining material.
+          </figcaption>
+        </figure>
+      </section>
+
+      <!-- ================= 6. Canonical flows ================= -->
+      <section class="arch-section" id="flows">
+        <h2>Canonical flows.</h2>
+        <p class="lede">
+          Six sequences define how work moves through the system. Each ends in
+          a guarantee, not a hope.
+        </p>
+
+        <div class="flows" data-flows>
+          <div class="flows__tabs" role="tablist" aria-label="Canonical flows">
+            <button role="tab" id="tab-ingest" aria-selected="true" aria-controls="panel-ingest">Ingestion</button>
+            <button role="tab" id="tab-query" aria-selected="false" aria-controls="panel-query">Query &amp; tail</button>
+            <button role="tab" id="tab-governance" aria-selected="false" aria-controls="panel-governance">Governance</button>
+            <button role="tab" id="tab-backup" aria-selected="false" aria-controls="panel-backup">Backup &amp; restore</button>
+            <button role="tab" id="tab-purge" aria-selected="false" aria-controls="panel-purge">Tenant purge</button>
+            <button role="tab" id="tab-drain" aria-selected="false" aria-controls="panel-drain">Drain &amp; shutdown</button>
+          </div>
+
+          <div class="flow-panel" id="panel-ingest" role="tabpanel" aria-labelledby="tab-ingest">
+            <div>
+              <ol class="steps">
+                <li>The Listener Set admits a bounded protocol request.</li>
+                <li>Identity binds credential and intent to one tenant context.</li>
+                <li>The Receiver Adapter decodes an attributed, bounded payload into a native batch.</li>
+                <li>Ingest snapshots one policy generation, validates, and splits records into admission groups by tenant, store, and shard.</li>
+                <li>The Resource Governor reserves memory, queue slots, and disk headroom per group.</li>
+                <li>The owning Signal Store prepares canonical store blocks.</li>
+                <li>The Storage Kernel commits each group durably and returns an authenticated receipt.</li>
+                <li>The adapter renders committed, retryable, and rejected outcomes in protocol terms.</li>
+              </ol>
+              <p class="guarantee"><b>The commit receipt is the only acknowledgment truth.</b> Queue acceptance, encoding, unsynchronized writes, and sealing prove nothing.</p>
+            </div>
+            <div class="diagram diagram--fit">
+              <svg viewBox="0 0 620 510" role="img" aria-label="Sequence diagram of the ingestion flow across producer, listener, identity, receiver, ingest, signal store, and kernel.">
+                <defs>
+                  <marker id="ar4" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 z" fill="oklch(72% 0.14 262)"/>
+                  </marker>
+                  <marker id="ar5" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 z" fill="oklch(74% 0.13 342)"/>
+                  </marker>
+                </defs>
+                <style>
+                  .sq-life { stroke: oklch(36% 0.05 268); stroke-width: 1; }
+                  .sq-head { font: 500 11.5px "Recursive Mono", monospace; fill: oklch(94% 0.012 262); text-anchor: middle; }
+                  .sq-msg { font: 500 10.5px "Recursive Mono", monospace; fill: oklch(76% 0.028 262); }
+                  .sq-f { stroke: oklch(60% 0.13 262); stroke-width: 1.5; }
+                  .sq-r { stroke: oklch(62% 0.13 342); stroke-width: 1.5; stroke-dasharray: 4 4; }
+                </style>
+                <!-- lifelines -->
+                <g>
+                  <text class="sq-head" x="45" y="30">prod</text><line class="sq-life" x1="45" y1="42" x2="45" y2="490"/>
+                  <text class="sq-head" x="135" y="30">listen</text><line class="sq-life" x1="135" y1="42" x2="135" y2="490"/>
+                  <text class="sq-head" x="225" y="30">ident</text><line class="sq-life" x1="225" y1="42" x2="225" y2="490"/>
+                  <text class="sq-head" x="315" y="30">recv</text><line class="sq-life" x1="315" y1="42" x2="315" y2="490"/>
+                  <text class="sq-head" x="405" y="30">ingest</text><line class="sq-life" x1="405" y1="42" x2="405" y2="490"/>
+                  <text class="sq-head" x="495" y="30">store</text><line class="sq-life" x1="495" y1="42" x2="495" y2="490"/>
+                  <text class="sq-head" x="585" y="30">kernel</text><line class="sq-life" x1="585" y1="42" x2="585" y2="490"/>
+                </g>
+                <g>
+                  <text class="sq-msg" x="52" y="64">bounded request</text>
+                  <line class="sq-f flow-edge" x1="45" y1="70" x2="132" y2="70" marker-end="url(#ar4)"/>
+                  <text class="sq-msg" x="142" y="102">credential + intent</text>
+                  <line class="sq-f flow-edge" x1="135" y1="108" x2="222" y2="108" marker-end="url(#ar4)"/>
+                  <text class="sq-msg" x="142" y="136">authorized context</text>
+                  <line class="sq-r" x1="222" y1="142" x2="138" y2="142" marker-end="url(#ar5)"/>
+                  <text class="sq-msg" x="142" y="172">attributed payload</text>
+                  <line class="sq-f flow-edge" x1="135" y1="178" x2="312" y2="178" marker-end="url(#ar4)"/>
+                  <text class="sq-msg" x="322" y="208">native batch</text>
+                  <line class="sq-f flow-edge" x1="315" y1="214" x2="402" y2="214" marker-end="url(#ar4)"/>
+
+                  <rect x="352" y="238" width="196" height="26" rx="6" fill="oklch(27% 0.045 268)" stroke="oklch(40% 0.05 268)"/>
+                  <text class="sq-msg" x="364" y="255">policy · validate · group</text>
+
+                  <text class="sq-msg" x="412" y="290">reserve groups</text>
+                  <line class="sq-f flow-edge" x1="405" y1="296" x2="582" y2="296" marker-end="url(#ar4)"/>
+                  <text class="sq-msg" x="412" y="324">prepare blocks</text>
+                  <line class="sq-f flow-edge" x1="405" y1="330" x2="492" y2="330" marker-end="url(#ar4)"/>
+                  <text class="sq-msg" x="412" y="358">canonical store blocks</text>
+                  <line class="sq-r" x1="492" y1="364" x2="408" y2="364" marker-end="url(#ar5)"/>
+                  <text class="sq-msg" x="412" y="392">durable commit</text>
+                  <line class="sq-f flow-edge" x1="405" y1="398" x2="582" y2="398" marker-end="url(#ar4)"/>
+                  <text class="sq-msg" x="412" y="426">commit receipt</text>
+                  <line class="sq-r" x1="582" y1="432" x2="408" y2="432" marker-end="url(#ar5)"/>
+                  <text class="sq-msg" x="52" y="458">ingest outcome → protocol reply</text>
+                  <line class="sq-r" x1="402" y1="464" x2="48" y2="464" marker-end="url(#ar5)"/>
+                </g>
+              </svg>
+            </div>
+          </div>
+
+          <div class="flow-panel" id="panel-query" role="tabpanel" aria-labelledby="tab-query" hidden>
+            <div>
+              <ol class="steps">
+                <li>Identity returns a tenant query context.</li>
+                <li>The public adapter converts wire input into one native request.</li>
+                <li>Pipeline or SQL parses into the same typed logical plan.</li>
+                <li>Planning applies mandatory time bounds, estimates cost, and obtains a query-budget reservation.</li>
+                <li>The kernel pins the catalog generation and each store's committed position — the query snapshot.</li>
+                <li>Signal stores build physical scans over verified snapshot readers.</li>
+                <li>Execution streams a typed header, deterministic result batches, and exactly one terminal status.</li>
+                <li>Resume reauthenticates and continues the same snapshot and cumulative budget; tail bridges to per-shard committed positions.</li>
+              </ol>
+            </div>
+            <p class="guarantee"><b>No query path sees unverified plaintext, crosses tenants, changes snapshots on resume, or reports a truncated result as complete.</b> Lagging tail consumers are disconnected explicitly, never silently.</p>
+          </div>
+
+          <div class="flow-panel" id="panel-governance" role="tabpanel" aria-labelledby="tab-governance" hidden>
+            <div>
+              <ol class="steps">
+                <li>A caller submits a command with an idempotency key and expected generation.</li>
+                <li>Administration canonicalizes, authorizes, and validates the transition.</li>
+                <li>It hands the Catalog Writer a proposal plus audit intent.</li>
+                <li>The writer persists immutable objects, then reserves a position and writes a prepared audit entry.</li>
+                <li>It writes and synchronizes the catalog commit record.</li>
+                <li>One atomic authenticated marker publishes the new generation and the audit entry together.</li>
+              </ol>
+            </div>
+            <p class="guarantee"><b>Governance state and its audit evidence publish jointly or not at all.</b> If audit preparation is unavailable, the mutation does not publish. A prepared entry is never visible alone.</p>
+          </div>
+
+          <div class="flow-panel" id="panel-backup" role="tabpanel" aria-labelledby="tab-backup" hidden>
+            <div>
+              <ol class="steps">
+                <li>Administration durably creates the operation; the coordinator reserves work and rolls active segments.</li>
+                <li>Backup pins one complete catalog generation.</li>
+                <li>The repository adapter transfers immutable, checksum-addressed encrypted objects, resuming interrupted uploads.</li>
+                <li>The signed snapshot manifest and registry generation publish through compare-and-swap.</li>
+                <li>Verification proves objects, catalog, signatures, registry head, key provider, and independent recovery readiness — only then <em>Succeeded</em>.</li>
+                <li>Restore opens only an empty target, verifies the chain, applies purge tombstones before any tenant is visible, and publishes atomically.</li>
+              </ol>
+            </div>
+            <p class="guarantee"><b>A backup that cannot prove independent key recovery is not a backup.</b> Restore has no merge and no in-place overwrite path.</p>
+          </div>
+
+          <div class="flow-panel" id="panel-purge" role="tabpanel" aria-labelledby="tab-purge" hidden>
+            <div>
+              <ol class="steps">
+                <li>Administration binds explicit tenant ID, confirmation, generation, and idempotency.</li>
+                <li>The tenant enters <em>Purging</em>; admission stops and existing work drains or terminates.</li>
+                <li>Active segments roll; live manifests become unreachable.</li>
+                <li>Data Protection evicts cached keys and removes live tenant-KEK envelopes.</li>
+                <li>Every registered repository receives a signed purge tombstone and a new registry head with no reachable tenant envelope.</li>
+                <li>All managed recovery paths are verified; remaining key material is destroyed; the tenant becomes <em>Purged</em>.</li>
+              </ol>
+            </div>
+            <p class="guarantee"><b>Purge is cryptographic, not cosmetic.</b> An unavailable or immutability-locked repository leaves the operation pending rather than pretending completion. Tenant ID and slug are never reused.</p>
+          </div>
+
+          <div class="flow-panel" id="panel-drain" role="tabpanel" aria-labelledby="tab-drain" hidden>
+            <div>
+              <ol class="steps">
+                <li>The first termination signal enters <em>Draining</em> and fails readiness.</li>
+                <li>New data and mutation admission closes.</li>
+                <li>Admitted durability work completes using retained reservations.</li>
+                <li>Bounded reads drain; tails end with safe cursors; resumable operations checkpoint.</li>
+                <li>Active segments seal; final frontiers and catalog state publish.</li>
+                <li>Governance checkpoints and the graceful shutdown record is written.</li>
+                <li>Cached keys zeroize, ownership releases, and the process exits successfully.</li>
+              </ol>
+            </div>
+            <p class="guarantee"><b>A second signal or an expired orchestrator deadline exits crash-safe and nonzero — it never fabricates graceful completion.</b></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 7. State machines ================= -->
+      <section class="arch-section" id="lifecycle">
+        <h2>Lifecycle is a state machine, twice.</h2>
+        <p class="lede">
+          The process and each tenant move through explicit durable states.
+          Ambiguity fences; nothing limps.
+        </p>
+        <div class="machines">
+          <figure class="diagram-wrap" data-reveal>
+            <div class="diagram">
+              <svg viewBox="0 0 960 300" role="img" aria-label="Process phase state machine: Starting to Recovering to Serving to Draining to Stopping, with Fenced reachable from Recovering and Serving, and Fenced to Stopping on explicit stop.">
+                <defs>
+                  <marker id="ar6" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 z" fill="oklch(60% 0.045 268)"/>
+                  </marker>
+                </defs>
+                <g data-mod><rect class="dg-box" x="30" y="60" width="140" height="46" rx="23"/><text class="dg-label" x="62" y="88">Starting</text></g>
+                <g data-mod><rect class="dg-box" x="220" y="60" width="150" height="46" rx="23"/><text class="dg-label" x="248" y="88">Recovering</text></g>
+                <g data-mod><rect class="dg-box" x="420" y="60" width="140" height="46" rx="23"/><text class="dg-label" x="456" y="88">Serving</text></g>
+                <g data-mod><rect class="dg-box" x="610" y="60" width="140" height="46" rx="23"/><text class="dg-label" x="642" y="88">Draining</text></g>
+                <g data-mod><rect class="dg-box" x="800" y="60" width="140" height="46" rx="23"/><text class="dg-label" x="832" y="88">Stopping</text></g>
+                <g data-mod>
+                  <rect x="420" y="210" width="140" height="46" rx="23" fill="oklch(27% 0.05 76)" stroke="oklch(55% 0.1 76)"/>
+                  <text class="dg-label" x="460" y="238">Fenced</text>
+                </g>
+                <path class="dg-edge flow-edge" d="M170 83 L 216 83" marker-end="url(#ar6)"/><text class="dg-sub" x="168" y="52">config valid</text>
+                <path class="dg-edge flow-edge" d="M370 83 L 416 83" marker-end="url(#ar6)"/><text class="dg-sub" x="368" y="52">ready</text>
+                <path class="dg-edge flow-edge" d="M560 83 L 606 83" marker-end="url(#ar6)"/><text class="dg-sub" x="556" y="52">SIGTERM</text>
+                <path class="dg-edge flow-edge" d="M750 83 L 796 83" marker-end="url(#ar6)"/><text class="dg-sub" x="726" y="52">graceful record</text>
+                <path class="dg-edge dg-edge--soft" d="M310 106 C 340 170 390 210 416 226" marker-end="url(#ar6)"/><text class="dg-sub" x="290" y="176">ambiguity</text>
+                <path class="dg-edge dg-edge--soft" d="M490 106 L 490 206" marker-end="url(#ar6)"/><text class="dg-sub" x="500" y="160">safety</text>
+                <path class="dg-edge dg-edge--soft" d="M560 233 C 700 233 830 180 866 110" marker-end="url(#ar6)"/><text class="dg-sub" x="660" y="256">explicit stop</text>
+              </svg>
+            </div>
+            <figcaption>
+              Data listeners exist only in <em>Serving</em> and <em>Draining</em>. Identity,
+              ownership, key, catalog, or acknowledged-integrity ambiguity fences the
+              instance; local inspection stays available.
+            </figcaption>
+          </figure>
+
+          <figure class="diagram-wrap" data-reveal>
+            <div class="diagram">
+              <svg viewBox="0 0 960 240" role="img" aria-label="Tenant lifecycle state machine: Active is reversible with ReadOnly and Suspended; Active proceeds through Purging to the terminal Purged state.">
+                <defs>
+                  <marker id="ar7" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 z" fill="oklch(60% 0.045 268)"/>
+                  </marker>
+                </defs>
+                <g data-mod><rect class="dg-box" x="50" y="96" width="130" height="46" rx="23"/><text class="dg-label" x="86" y="124">Active</text></g>
+                <g data-mod><rect class="dg-box" x="290" y="26" width="140" height="46" rx="23"/><text class="dg-label" x="318" y="54">ReadOnly</text></g>
+                <g data-mod><rect class="dg-box" x="290" y="166" width="140" height="46" rx="23"/><text class="dg-label" x="314" y="194">Suspended</text></g>
+                <g data-mod>
+                  <rect x="550" y="96" width="140" height="46" rx="23" fill="oklch(27% 0.05 76)" stroke="oklch(55% 0.1 76)"/>
+                  <text class="dg-label" x="584" y="124">Purging</text>
+                </g>
+                <g data-mod>
+                  <rect x="790" y="96" width="130" height="46" rx="23" fill="oklch(24% 0.04 268)" stroke="oklch(50% 0.06 268)"/>
+                  <rect x="796" y="102" width="118" height="34" rx="17" fill="none" stroke="oklch(50% 0.06 268)"/>
+                  <text class="dg-label" x="822" y="124">Purged</text>
+                </g>
+                <path class="dg-edge" d="M180 106 C 230 84 250 68 286 56" marker-end="url(#ar7)"/>
+                <path class="dg-edge dg-edge--soft" d="M290 68 C 250 84 230 96 184 110" marker-end="url(#ar7)"/>
+                <path class="dg-edge" d="M180 132 C 230 154 250 170 286 182" marker-end="url(#ar7)"/>
+                <path class="dg-edge dg-edge--soft" d="M290 178 C 250 166 230 150 184 128" marker-end="url(#ar7)"/>
+                <path class="dg-edge flow-edge" d="M180 119 L 546 119" marker-end="url(#ar7)"/>
+                <text class="dg-sub" x="300" y="110">purge — confirmed · idempotent</text>
+                <path class="dg-edge flow-edge" d="M690 119 L 786 119" marker-end="url(#ar7)"/>
+                <text class="dg-sub" x="700" y="110">irreversible</text>
+              </svg>
+            </div>
+            <figcaption>
+              ReadOnly and Suspended are reversible. Purged is terminal: only a
+              non-reusable tenant ID and slug, signed tombstones, and governance
+              evidence remain.
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- ================= 8. Crate graph ================= -->
+      <section class="arch-section" id="workspace">
+        <h2>An acyclic workspace, enforced.</h2>
+        <p class="lede">
+          Fifteen crates, dependencies pointing strictly inward. The graph
+          below is machine-checked on every pull request against a committed
+          edge allowlist — a forbidden edge fails the build.
+        </p>
+        <figure class="diagram-wrap" data-reveal>
+          <div class="diagram">
+            <svg viewBox="0 0 960 560" role="img" aria-label="Crate dependency graph: the positron binary depends on the runtime, data-plane, and control-plane crates; those depend on signals, governance, api, and config; everything storage-related depends on the kernel, and everything depends on domain." data-crate-graph>
+              <defs>
+                <marker id="ar8" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+                  <path d="M0 0 L8 4 L0 8 z" fill="oklch(50% 0.045 268)"/>
+                </marker>
+              </defs>
+              <style>
+                .cg-edge { stroke: oklch(40% 0.05 268); stroke-width: 1.2; fill: none; opacity: 0.55; }
+                .cg-name { font: 500 13px "Recursive Mono", monospace; fill: oklch(94% 0.012 262); text-anchor: middle; }
+                .cg-tier { font: 500 11px "Recursive Mono", monospace; fill: oklch(60% 0.03 262); }
+              </style>
+
+              <!-- edges (drawn first) -->
+              <path data-dep="positron:runtime" class="cg-edge" d="M420 70 C 220 90 130 110 92 126"/>
+              <path data-dep="positron:ingest" class="cg-edge" d="M450 70 C 320 92 250 110 212 126"/>
+              <path data-dep="positron:query" class="cg-edge" d="M470 70 C 400 92 350 110 330 126"/>
+              <path data-dep="positron:backup" class="cg-edge" d="M490 70 L 448 126"/>
+              <path data-dep="positron:upgrade" class="cg-edge" d="M510 70 L 564 126"/>
+              <path data-dep="positron:diagnostics" class="cg-edge" d="M530 70 C 620 92 660 110 680 126"/>
+              <path data-dep="positron:operator" class="cg-edge" d="M550 70 C 700 92 760 110 796 126"/>
+              <path data-dep="positron:release" class="cg-edge" d="M560 70 C 780 90 870 110 908 126"/>
+              <path data-dep="positron:governance" class="cg-edge" d="M480 70 C 480 140 420 210 388 246"/>
+
+              <path data-dep="runtime:api" class="cg-edge" d="M80 166 C 200 220 420 246 506 258"/>
+              <path data-dep="runtime:config" class="cg-edge" d="M80 166 C 240 230 540 256 646 264"/>
+              <path data-dep="runtime:governance" class="cg-edge" d="M92 166 C 160 220 260 250 316 262"/>
+              <path data-dep="runtime:kernel" class="cg-edge" d="M68 166 C 80 280 240 350 326 372"/>
+              <path data-dep="runtime:domain" class="cg-edge" d="M60 166 C 60 340 240 450 330 476"/>
+
+              <path data-dep="ingest:signals" class="cg-edge" d="M204 166 L 196 246"/>
+              <path data-dep="ingest:kernel" class="cg-edge" d="M212 166 C 240 270 300 340 344 366"/>
+              <path data-dep="ingest:domain" class="cg-edge" d="M196 166 C 150 320 280 440 330 468"/>
+              <path data-dep="query:signals" class="cg-edge" d="M322 166 C 280 200 230 226 210 244"/>
+              <path data-dep="query:kernel" class="cg-edge" d="M330 166 C 350 250 370 320 380 366"/>
+              <path data-dep="query:domain" class="cg-edge" d="M338 166 C 380 300 400 420 404 456"/>
+              <path data-dep="backup:governance" class="cg-edge" d="M440 166 L 390 246"/>
+              <path data-dep="backup:kernel" class="cg-edge" d="M448 166 C 440 250 410 330 392 366"/>
+              <path data-dep="backup:domain" class="cg-edge" d="M456 166 C 480 300 440 420 416 456"/>
+              <path data-dep="upgrade:governance" class="cg-edge" d="M556 166 C 500 210 430 240 400 252"/>
+              <path data-dep="upgrade:backup" class="cg-edge" d="M568 166 C 560 166 480 152 462 148"/>
+              <path data-dep="upgrade:kernel" class="cg-edge" d="M568 166 C 520 260 430 340 398 368"/>
+              <path data-dep="upgrade:release" class="cg-edge" d="M604 128 C 680 92 786 92 852 106"/>
+              <path data-dep="diagnostics:runtime" class="cg-edge" d="M660 128 C 480 86 280 86 122 126"/>
+              <path data-dep="diagnostics:governance" class="cg-edge" d="M672 166 C 560 220 460 250 402 260"/>
+              <path data-dep="diagnostics:kernel" class="cg-edge" d="M688 166 C 600 280 460 350 400 372"/>
+              <path data-dep="operator:api" class="cg-edge" d="M792 166 C 700 220 600 248 552 258"/>
+              <path data-dep="signals:kernel" class="cg-edge" d="M200 286 C 240 330 310 356 344 368"/>
+              <path data-dep="signals:domain" class="cg-edge" d="M192 286 C 220 380 320 440 344 460"/>
+              <path data-dep="governance:kernel" class="cg-edge" d="M376 286 L 380 366"/>
+              <path data-dep="governance:domain" class="cg-edge" d="M384 286 C 420 360 416 420 410 456"/>
+              <path data-dep="kernel:domain" class="cg-edge" d="M380 410 L 396 456"/>
+
+              <!-- nodes -->
+              <text class="cg-tier" x="24" y="52">binary</text>
+              <g data-crate="positron"><rect class="dg-box" x="420" y="30" width="150" height="40" rx="9"/><text class="cg-name" x="495" y="55">positron</text></g>
+
+              <text class="cg-tier" x="24" y="112">composition &amp; workflows</text>
+              <g data-crate="runtime"><rect class="dg-box" x="24" y="128" width="104" height="38" rx="8"/><text class="cg-name" x="76" y="152">runtime</text></g>
+              <g data-crate="ingest"><rect class="dg-box" x="146" y="128" width="104" height="38" rx="8"/><text class="cg-name" x="198" y="152">ingest</text></g>
+              <g data-crate="query"><rect class="dg-box" x="268" y="128" width="104" height="38" rx="8"/><text class="cg-name" x="320" y="152">query</text></g>
+              <g data-crate="backup"><rect class="dg-box" x="390" y="128" width="104" height="38" rx="8"/><text class="cg-name" x="442" y="152">backup</text></g>
+              <g data-crate="upgrade"><rect class="dg-box" x="512" y="128" width="104" height="38" rx="8"/><text class="cg-name" x="564" y="152">upgrade</text></g>
+              <g data-crate="diagnostics"><rect class="dg-box" x="634" y="128" width="118" height="38" rx="8"/><text class="cg-name" x="693" y="152">diagnostics</text></g>
+              <g data-crate="operator"><rect class="dg-box" x="770" y="128" width="104" height="38" rx="8"/><text class="cg-name" x="822" y="152">operator</text></g>
+              <g data-crate="release"><rect class="dg-box" x="856" y="88" width="90" height="34" rx="8"/><text class="cg-name" x="901" y="110">release</text></g>
+
+              <text class="cg-tier" x="24" y="232">shared behavior owners</text>
+              <g data-crate="signals"><rect class="dg-box" x="140" y="248" width="112" height="38" rx="8"/><text class="cg-name" x="196" y="272">signals</text></g>
+              <g data-crate="governance"><rect class="dg-box" x="316" y="248" width="128" height="38" rx="8"/><text class="cg-name" x="380" y="272">governance</text></g>
+              <g data-crate="api"><rect class="dg-box" x="500" y="248" width="96" height="38" rx="8"/><text class="cg-name" x="548" y="272">api</text></g>
+              <g data-crate="config"><rect class="dg-box" x="640" y="248" width="104" height="38" rx="8"/><text class="cg-name" x="692" y="272">config</text></g>
+
+              <text class="cg-tier" x="24" y="352">the deep foundation</text>
+              <g data-crate="kernel"><rect class="dg-box dg-box--kernel" x="316" y="368" width="128" height="42" rx="9"/><text class="cg-name" x="380" y="394">kernel</text></g>
+
+              <text class="cg-tier" x="24" y="442">shared value types</text>
+              <g data-crate="domain"><rect class="dg-box" x="330" y="458" width="150" height="40" rx="9"/><text class="cg-name" x="405" y="483">domain</text></g>
+            </svg>
+          </div>
+          <figcaption>
+            Crate names shown without their <span class="mono">positron-</span> prefix.
+            Hover or tap a crate to highlight its allowed dependencies. Registered
+            handlers invert calls at runtime — governance does not depend on backup,
+            and the kernel never depends on a signal store implementation.
+          </figcaption>
+        </figure>
+        <p class="crate-note">
+          Layout rules with teeth: no <code>common</code> or <code>utils</code> crate, no
+          forwarding crates, no wire types in <code>domain</code>, no provider SDK outside
+          its adapter-owning module, no storage path outside <code>kernel</code> — and no
+          Release&nbsp;1 crate or feature flag for deferred signals or clustering.
+        </p>
+      </section>
+
+      <!-- ================= 9. Seams ================= -->
+      <section class="arch-section" id="seams">
+        <h2>Traits only where variation is real.</h2>
+        <p class="lede">
+          A trait is permitted only at a justified varying seam with at least
+          two real adapters. These are the Release&nbsp;1 seams — everything else
+          is deliberately concrete.
+        </p>
+        <div class="table-wrap" data-reveal>
+          <table class="seams">
+            <thead>
+              <tr><th scope="col">Seam</th><th scope="col">Adapters</th><th scope="col">Why it is real</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Public transport</td><td><span class="mono">gRPC · HTTP/JSON · conformance client</span></td><td>Multiple transports exercise one native interface</td></tr>
+              <tr><td>Receiver Adapter</td><td><span class="mono">OTLP grpc · OTLP http (pb/json) · Loki push · Loki OTLP</span></td><td>Protocol semantics genuinely vary</td></tr>
+              <tr><td>Signal Store</td><td><span class="mono">Log Store · Trace Store</span></td><td>Physical encoding and query behavior vary by signal</td></tr>
+              <tr><td>Key Provider</td><td><span class="mono">local · AWS · GCP · Azure · Vault · OpenBao · KMIP</span></td><td>Identity, credentials, outages, and wrapping vary</td></tr>
+              <tr><td>Repository</td><td><span class="mono">local · S3 · S3-compatible · GCS · Azure Blob</span></td><td>Conditional publication, uploads, deletion vary</td></tr>
+              <tr><td>Durable Operation</td><td><span class="mono">backup · restore · purge · key · verify · migrate · upgrade</span></td><td>Phases and irreversible boundaries vary</td></tr>
+              <tr><td>Maintenance Task</td><td><span class="mono">segment · compaction · retention · scrub · schema · key · …</span></td><td>Task phases vary; admission stays centralized</td></tr>
+              <tr><td>Catalog publication</td><td><span class="mono">filesystem · test-only fault adapter</span></td><td>Crash points must be deterministic; consensus reuses the seam</td></tr>
+              <tr><td>Crypto Backend</td><td><span class="mono">Rust backend · known-answer/fault adapter</span></td><td>One replaceable cryptographic seam with cross-platform proof</td></tr>
+              <tr><td>Clock &amp; entropy</td><td><span class="mono">host · deterministic test adapters</span></td><td>Safety logic needs reproducible time and nonce tests</td></tr>
+              <tr><td>Kubernetes effects</td><td><span class="mono">client · deterministic fake · live conformance cluster</span></td><td>Reconciliation plans must survive outages and retries</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ================= 10. Discipline ================= -->
+      <section class="arch-section" id="discipline">
+        <h2>Invariants with enforcement, not intentions.</h2>
+        <p class="lede">
+          Forty-two mandatory invariants across nine families, each mapped
+          one-to-one to an automated quality gate. A green gate is evidence for
+          the exact revision; review never substitutes for a missing gate.
+        </p>
+        <div class="invariants" data-reveal>
+          <dl>
+            <div class="inv"><dt>ARC ×5</dt><dd>contracts, single ownership, deep modules, boundary types, commit-then-publish</dd></div>
+            <div class="inv"><dt>RUST ×4</dt><dd>Rust 2024, pinned toolchain, locked builds, clean lints, owned dependencies</dd></div>
+            <div class="inv"><dt>SAFE ×4</dt><dd>unsafe forbidden by default, hard limits before use, verify before decode</dd></div>
+            <div class="inv"><dt>CON ×5</dt><dd>owned tasks, bounded queues, explicit deadlines, no blocking on async workers</dd></div>
+            <div class="inv"><dt>ERR ×4</dt><dd>closed typed outcomes, no panics in production paths, fail closed</dd></div>
+          </dl>
+          <dl>
+            <div class="inv"><dt>SEC ×5</dt><dd>threat models first, attribution before decoding, no ambient authority, SBOM + provenance</dd></div>
+            <div class="inv"><dt>DOC ×4</dt><dd>documented invariants, one canonical source, ADR before contract change</dd></div>
+            <div class="inv"><dt>TEST ×7</dt><dd>adversarial tests at the lowest interface, fault injection at every publication point, frozen coverage and mutation baselines</dd></div>
+            <div class="inv"><dt>PERF ×4</dt><dd>declared budgets, preregistered benchmarks, soak proof on the release artifact</dd></div>
+          </dl>
+        </div>
+        <div class="flow-panel flow-panel--single" data-reveal>
+          <p class="guarantee">
+            <b>Evidence-gated development:</b> one Rust gate runner
+            (<code>cargo xtask quality</code>) drives every check from committed
+            registries. A retry is a new attempt and cannot erase the first
+            result; a timeout is a failure, not a skip; local evidence is
+            deliberately ineligible for merge.
+          </p>
+        </div>
+      </section>
+
+      <!-- ================= 11. Milestones ================= -->
+      <section class="arch-section" id="milestones">
+        <h2>The road to Release 1.</h2>
+        <p class="lede">
+          Vertical slices, in order. Each milestone must work end to end before
+          the surface broadens, and later work may not bypass an earlier
+          interface to look faster.
+        </p>
+        <ol class="ladder" data-reveal>
+          <li data-now>
+            <span class="m">M0</span>
+            <div>
+              <h3>Foundation <span class="now-tag">in progress</span></h3>
+              <p>Workspace, domain types, configuration skeleton, canonical public interface, stable errors, target registry, fault harness — and the quality-gate machinery that everything else must pass.</p>
+            </div>
+          </li>
+          <li>
+            <span class="m">M1</span>
+            <div>
+              <h3>First durable vertical</h3>
+              <p>Runtime startup, instance bootstrap, local data protection, the primary data volume, catalog, resource governor, segment ledger, a minimal OTLP log receiver, ingest, minimal log store and query. M1 must prove acknowledged-data preservation before anything broadens.</p>
+            </div>
+          </li>
+          <li>
+            <span class="m">M2</span>
+            <div>
+              <h3>Complete log store</h3>
+              <p>Full OTLP and Loki adapters, ingest policy, schema bounds, search, live tail, retention, and compaction.</p>
+            </div>
+          </li>
+          <li>
+            <span class="m">M3</span>
+            <div>
+              <h3>Complete trace store</h3>
+              <p>Span observation consolidation, summaries, quiescence, structural query, and log–trace correlation.</p>
+            </div>
+          </li>
+          <li>
+            <span class="m">M4</span>
+            <div>
+              <h3>Full control plane</h3>
+              <p>Identity, administration, tenant lifecycle, audit, durable operations, time safety, maintenance, integrity, process lifecycle, operational state, and diagnostics.</p>
+            </div>
+          </li>
+          <li>
+            <span class="m">M5</span>
+            <div>
+              <h3>Providers and platforms</h3>
+              <p>External key providers, repository adapters, backup, restore, purge, upgrade, all distributions, the operator, Kubernetes, Grafana, and the SDK release set.</p>
+            </div>
+          </li>
+          <li>
+            <span class="m">M6</span>
+            <div>
+              <h3>Qualification and release</h3>
+              <p>The complete qualification matrix, performance and soak evidence, reproducibility, publication, and independent verification.</p>
+            </div>
+          </li>
+        </ol>
+      </section>
+    </main>
+  </div>
+
+  <footer class="site-footer on-deep">
+    <div class="site-footer__inner">
+      <div>
+        <a class="brand" href="./">
+          <img src="./logos/icon-transparent.png" alt="" width="28" height="28" style="height:28px;width:auto">
+          <span class="brand__stack">
+            <span class="brand__org">Guara Cloud</span>
+            Positron
+          </span>
+        </a>
+        <p class="site-footer__tag">
+          An open source observability database for native logs and traces.
+        </p>
+      </div>
+      <div>
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/guaracloud/positron">GitHub</a></li>
+          <li><a href="./architecture.html">Architecture</a></li>
+          <li><a href="https://github.com/guaracloud/positron/tree/main/docs/adr">Decision records</a></li>
+          <li><a href="https://github.com/guaracloud/positron/blob/main/LICENSE">MIT license</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Guara Cloud</h4>
+        <ul>
+          <li><a href="https://github.com/guaracloud">github.com/guaracloud</a></li>
+          <li><a href="https://guaracloud.github.io/purple-wolf/">Purple Wolf</a></li>
+          <li><a href="https://guaracloud.github.io/e-navigator/">E-Navigator</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="site-footer__legal">
+      <span>© 2026 Guara Cloud. MIT licensed.</span>
+      <span>Built in the open — every design decision is a public record.</span>
+    </div>
+  </footer>
+
+  <script src="./assets/main.js" defer></script>
+  <script src="./assets/chamber.js" defer></script>
+  <script src="./assets/arch.js" defer></script>
+</body>
+</html>

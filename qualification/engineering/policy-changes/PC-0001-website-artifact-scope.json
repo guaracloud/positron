@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "id": "PC-0001-website-artifact-scope",
+  "status": "accepted",
+  "authority": [
+    "docs/engineering/quality-gates.md",
+    "qualification/engineering/artifact-scopes.tsv"
+  ],
+  "purpose": "Register the project website's executable source root (assets/) as an active artifact scope so the GitHub Pages site can live on main without weakening the unregistered-code rejection.",
+  "change": {
+    "registry": "artifact-scopes.tsv",
+    "added_row": "website\tassets\tRelease Engineering\tactive\t-\tEG-DOCS|EG-SECRETS",
+    "notes": [
+      "The website is a static, build-free marketing and architecture surface (index.html, architecture.html, assets/, logos/).",
+      "Only assets/ contains code-extension files (browser JavaScript); HTML, CSS, and image artifacts are not code-scanned.",
+      "The scope is active because the site ships real content rather than a scaffold README.",
+      "Selected risk gates EG-DOCS and EG-SECRETS both have implemented harnesses and always-on activation, so gate selection is unchanged.",
+      "The website is presentation-only: it contains no product behavior, no API surface, and no generated SDK content, so crate scopes and other artifact scopes are unaffected."
+    ]
+  },
+  "detection_gained": [
+    "website JavaScript is inside a registered, owned scope instead of being unrepresentable on main",
+    "website sources are covered by the always-on secret and documentation gates"
+  ],
+  "detection_lost": [],
+  "dual_run": "not-applicable-additive-scope-registration",
+  "approvals_required": [
+    "Architecture",
+    "Release Engineering",
+    "Quality Engineering"
+  ],
+  "approved_by": "@vicotrbb (repository owner, all roles) — requested and authorized in-session",
+  "immutable_after_acceptance": true
+}
