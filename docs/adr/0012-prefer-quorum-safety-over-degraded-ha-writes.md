@@ -1,0 +1,3 @@
+# Prefer quorum safety over degraded HA writes
+
+An HA virtual shard requires two of three replicas to elect a leader and acknowledge writes, and only the majority side of a partition may serve traffic. Positron never silently degrades to leader-only durability or follower stale reads; quorum loss makes the shard unavailable, while unacknowledged active-segment tails may be truncated during recovery. Acknowledged data survives any single-node failure, and any forced single-replica disaster recovery is an explicit offline operator action with a data-loss warning rather than an automatic availability path.

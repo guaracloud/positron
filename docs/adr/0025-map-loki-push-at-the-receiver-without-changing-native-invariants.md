@@ -1,0 +1,3 @@
+# Map Loki Push at the receiver without changing native invariants
+
+The Loki Push adapter maps timestamps to event time, lines to native log bodies, stream labels to string stream attributes, structured metadata to record attributes, and valid trace or span identifiers to intrinsic correlation fields while preserving source values. API-key tenancy remains authoritative and a conflicting `X-Scope-OrgID` is rejected. Success requires every record to commit; because Loki Push cannot express partial success, a partially committed request returns an error and retry may duplicate already committed records, preserving Positron's at-least-once and no-rollback contracts rather than inventing vendor-specific transaction semantics.

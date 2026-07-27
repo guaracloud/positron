@@ -1,0 +1,3 @@
+# Model traces as incremental and quiescent, never complete
+
+A trace is the tenant-scoped collection of committed spans sharing a trace ID, and each span becomes queryable without waiting for a root, parent, or completion timeout. Committed append-only deltas maintain trace summaries, compaction materializes them, and an ingest-time quiet period marks a trace quiescent rather than complete; late spans reopen it. Trace results expose missing parents, time bounds, span count, quiescence, and retention or budget truncation, while structural analyses mark themselves incomplete whenever required spans are absent.

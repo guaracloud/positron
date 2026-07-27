@@ -1,0 +1,3 @@
+# Default to TLS with an explicit plaintext opt-out
+
+Release 1 implements TLS natively in Rust for every listener, defaults plaintext listeners to loopback or Unix sockets, verifies certificates in SDKs, redacts transport secrets, and reloads certificates atomically. Operators may explicitly enable non-loopback plaintext per listener; the service remains operationally ready but emits a governance audit record, persistent health warning, and configuration warning rather than treating plaintext as an accidental fallback. Optional mTLS validates transport peers while API keys remain the Release 1 authorization identity.

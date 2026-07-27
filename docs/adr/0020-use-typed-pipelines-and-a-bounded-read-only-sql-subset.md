@@ -1,0 +1,3 @@
+# Use typed pipelines and a bounded read-only SQL subset
+
+Release 1 uses a typed native pipeline language over explicit Logs, Spans, or Traces sources, with bounded ranges over an explicit temporal axis—defaulting to Query Time under ADR-0059—and operators for structured and full-text filtering, projection, parsing, aggregation, trace structure, and explicit cross-signal correlation. A documented read-only SQL subset provides select, filtering, grouping, ordering, aggregates, and limits, but no DDL, DML, transactions, arbitrary joins, stored procedures, or PostgreSQL compatibility. Both frontends compile to the same typed logical plan, and resource admission rejects unbounded or excessively expensive plans before execution.

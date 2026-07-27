@@ -1,0 +1,3 @@
+# Enforce tenant query budgets below ingest priority
+
+Every tenant executes under query budgets bounded by system ceilings for lookback, scanned and decoded data, output, memory, CPU and wall time, concurrency, and trace traversal. Planning estimates cost and reserves concurrency and memory before admission, runtime counters enforce limits when estimates are wrong, weighted-fair scheduling prevents tenant monopolization, and query work runs below ingestion and durability priorities. Cancellation propagates promptly, streamed results end as explicitly complete or incomplete, and responses report execution and rejection statistics rather than disguising truncation as success.

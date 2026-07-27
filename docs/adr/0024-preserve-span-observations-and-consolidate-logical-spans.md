@@ -1,0 +1,3 @@
+# Preserve span observations and consolidate logical spans
+
+Every accepted OTLP span is stored as an immutable span observation, while normal trace results consolidate observations by tenant, trace ID, and span ID. Semantically identical retries appear once with an observation count; disagreeing observations remain queryable as variants and mark the logical span conflicted rather than overwriting evidence. Structural operations deterministically use the earliest committed observation but expose the conflict and mark analysis incomplete, while admission, storage, and quota accounting still count every received observation.

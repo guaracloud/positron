@@ -1,0 +1,3 @@
+# Require native encryption at rest in Release 1
+
+Release 1 always uses authenticated encryption at rest for every class of Positron-managed persistent data, including segment payloads and indexes, catalogs and manifests, governance audit history, and backup snapshots. There is no plaintext-at-rest mode. The Storage Kernel owns the encryption envelope so Signal Stores keep native layouts and remain independent of key providers. A release is not acceptable without encryption, restore, corruption-detection, and lost-or-wrong-key failure tests; subordinate decisions define the key hierarchy, root-key custody, provider set, rotation, and recovery semantics.

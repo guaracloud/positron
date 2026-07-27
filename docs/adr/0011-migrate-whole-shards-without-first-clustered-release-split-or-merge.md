@@ -1,0 +1,3 @@
+# Migrate whole shards without splitting or merging in the first clustered release
+
+A tenant's first-clustered-release virtual shard IDs and routing keyspaces are fixed at tenant creation, with more shards provisioned than nodes so scale-out can rebalance whole shards. Migration adds destinations as learners, copies verified sealed segments, catches up committed active-segment blocks, changes replica membership through consensus, and only then reclaims source data; assignment epochs fence stale leaders and routes throughout. Live shard split and merge are excluded from that release, leaving a genuinely hot individual shard as an explicit limitation.

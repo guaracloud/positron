@@ -1,0 +1,3 @@
+# Use ingest time for retention and preserve producer time for queries
+
+Positron preserves telemetry's original Event Time, assigns Ingest Time when the Storage Kernel accepts data, and uses Ingest Time for retention and physical lifecycle. Segment envelopes retain ranges required by supported temporal axes, and Signal Stores isolate extreme producer values through bounded outlier structures. ADR-0059 later refines the query default into provenance-bearing Query Time—valid source time, signal-defined observed time, then Ingest Time—while retaining explicit Event Time and Ingest Time queries. This gives accepted data deterministic lifecycle behavior and prevents bad source clocks from immediately expiring or indefinitely pinning telemetry.

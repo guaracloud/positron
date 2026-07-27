@@ -1,0 +1,3 @@
+# Ship standalone first with cluster-compatible boundaries
+
+Release 1 ships as a standalone, single-node database for logs and traces; replication, metadata consensus, failover, and shard migration follow later. Release 1 still uses tenant-owned virtual shard identities, canonical checksummed store blocks, explicit commit positions, assignment-ready segment envelopes, and manifest-based state transitions so signal stores and on-disk formats do not assume permanently local ownership. This preserves the agreed HA path without shipping speculative distributed machinery before it can be tested as a complete system.

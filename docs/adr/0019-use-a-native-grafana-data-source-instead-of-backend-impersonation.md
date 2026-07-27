@@ -1,0 +1,3 @@
+# Use a native Grafana data source instead of backend impersonation
+
+Release 1 exposes one authoritative native HTTP and streaming Query API used by both the CLI and a first-party Grafana data-source plugin for log search, live tailing, trace search, trace-by-ID, service relationships, and log-to-trace navigation. Positron does not implement Loki or Tempo query, administration, ruler, deletion, storage, or internal APIs merely to reuse their Grafana data sources. LogQL and TraceQL may later become independently conformance-tested parser frontends over the logical plan, while Positron remains fully usable without Grafana.

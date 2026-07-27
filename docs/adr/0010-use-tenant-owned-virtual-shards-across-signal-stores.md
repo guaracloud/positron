@@ -1,0 +1,3 @@
+# Use tenant-owned virtual shards across signal stores
+
+A virtual shard is the smallest unit of placement, leadership, quorum replication, failover, and migration. It belongs to one tenant but may contain separate single-signal segments from any of that tenant's signal stores; stores share the tenant's shard map and derive stable routing keys, preferring common correlation identities such as trace ID when available. Standalone maps every shard locally, HA gives each shard one leader and two followers, and metadata consensus owns only membership, shard assignments, and epochs rather than telemetry flow.

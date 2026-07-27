@@ -1,0 +1,3 @@
+# Publish six generated SDKs as one release set
+
+Release 1 generates and publishes Rust, TypeScript, Python, Go, Java/JVM, and .NET SDKs from the canonical API definition to their standard registries. The server and every required SDK share one release version, API version, and schema digest; generation is pinned, generated wire code is never hand-edited, and each package must compile and pass the same live conformance suite. A signed release-set manifest records artifacts, checksums, generator versions, and publication state, and a release is not announced complete until failed registry publications resume successfully at the same version.

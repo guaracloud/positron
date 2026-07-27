@@ -1,0 +1,3 @@
+# Keep attribute promotion physical and type-preserving
+
+Intrinsic fields have stable signal-defined names and types, while dynamic attributes preserve their original OTLP types and remain distinct across resource, instrumentation-scope, and record namespaces. Promotion may add or remove physical columns, dictionaries, bitmaps, or indexes but cannot alter logical typing, missing-value semantics, or query results; unpromoted segments remain queryable through their generic representation. Version 1 fully predicates and indexes scalar attributes, preserves complex arrays and maps, and performs no implicit cross-type coercion.

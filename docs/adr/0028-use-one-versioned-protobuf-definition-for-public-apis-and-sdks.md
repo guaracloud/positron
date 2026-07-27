@@ -1,0 +1,3 @@
+# Use one versioned Protobuf definition for public APIs and SDKs
+
+The sole hand-edited public contract lives under a versioned `api/positron/v1` Protobuf package and defines query, streaming, governance, tenant administration, health, and backup control. Rust server and CLI interfaces, gRPC clients, HTTP and JSON routes, OpenAPI documentation, and publishable SDK wire clients are generated from that definition with pinned tooling and an embedded schema digest. Version 1 accepts additive compatible changes only, breaking changes require a new API package, upstream OTLP remains separately pinned, and public API messages are never reused as Store Block formats.

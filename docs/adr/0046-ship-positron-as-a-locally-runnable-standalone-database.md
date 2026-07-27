@@ -1,0 +1,3 @@
+# Ship Positron as a locally runnable standalone database
+
+Release 1 is an installable standalone database that runs directly from the native `positron` executable, its primary portable OCI image, or a supported Nix package. Docker, Kubernetes, Nix, Alloy, Grafana, and external collectors remain Distribution Surfaces or integrations rather than runtime dependencies. One Rust binary provides the server and administrative CLI for initialization, foreground serving, status, verification, backup, restore, key management, and tenant lifecycle. Every distribution uses the same configuration model, public APIs, storage format, security defaults, and lifecycle semantics and passes the same acceptance suite.

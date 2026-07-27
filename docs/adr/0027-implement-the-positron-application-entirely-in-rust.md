@@ -1,0 +1,3 @@
+# Implement the Positron application entirely in Rust
+
+The Positron server, storage kernel, signal stores, receiver adapters, query engine, governance and lifecycle subsystems, and CLI are implemented in Rust and ship without a Go, Java, Node.js, or other language runtime. Other languages are allowed only for external integration artifacts whose host platform requires them, including minimal Grafana frontend code and SDKs generated from the canonical public API definition. No storage, query-planning, policy, or durability logic may leave the Rust application boundary, and any reusable component that can reasonably be implemented in Rust remains Rust.
