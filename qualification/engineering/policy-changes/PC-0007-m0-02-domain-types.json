@@ -64,6 +64,14 @@
       "sha256": "ebf7c59842519f5a91b1ab6880a6ba330790d9f2a1f989a2a5e8139f5050f747"
     }
   },
+  "exact_candidate_evidence_contract": {
+    "baseline_provenance": "The baseline reports and mutation disposition above retain the original dirty-tree activation measurements. They are historical ratchet provenance, not exact-head or merge-eligible evidence.",
+    "self_reference_boundary": "This committed policy record cannot embed its own source revision or a future workflow run identity without changing that revision. Exact candidate attempts are therefore retained outside the source tree and bound by the runner-recorded full revision.",
+    "authoritative_pr": "The protected pull-request workflow uploads target/quality as engineering-evidence-<run>-<attempt>-<github.sha> after cargo xtask quality --profile pr.",
+    "coverage": "The manually dispatched extended workflow uploads target/quality as extended-evidence-<run>-<attempt>-<github.sha> after cargo xtask quality --profile ext, including the M0-02 report and frozen-baseline verdict.",
+    "mutation": "The focused command recorded in change.mutation_command runs once on the clean committed candidate. Its raw outcomes and digests remain local diagnostic evidence because mutation is not a routine authoritative profile under PC-0003.",
+    "claims": "Exact-head evidence does not establish Qualified status. Local mutation evidence does not establish merge eligibility, and workflow evidence remains subject to independent review."
+  },
   "attempts": [
     {
       "id": "red-preimplementation-public-seam",

@@ -394,6 +394,21 @@ fn zero_source_time_quality_requires_the_exact_zero_instant() {
 }
 
 #[test]
+fn zero_source_time_accepts_only_the_non_usable_zero_annotation() {
+    for result in [
+        EventTime::received(UnixNanoseconds::new(0), SourceTimeQuality::Usable).map(|_| ()),
+        ObservedTime::received(UnixNanoseconds::new(0), SourceTimeQuality::Usable).map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(failure)
+                if failure.code() == DomainFailureCode::InvalidTimeAnnotation
+                    && failure.source() == FailureSource::SourceTime
+        ));
+    }
+}
+
+#[test]
 fn missing_event_time_has_no_fabricated_instant() {
     let missing = EventTime::missing();
 

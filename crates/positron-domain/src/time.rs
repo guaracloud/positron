@@ -250,9 +250,9 @@ fn validate_present_source_time(
     instant: UnixNanoseconds,
     quality: SourceTimeQuality,
 ) -> Result<(), DomainFailure> {
-    if matches!(quality, SourceTimeQuality::Missing)
-        || (matches!(quality, SourceTimeQuality::Zero) && instant.value() != 0)
-    {
+    let is_zero = instant.value() == 0;
+    let has_zero_annotation = matches!(quality, SourceTimeQuality::Zero);
+    if matches!(quality, SourceTimeQuality::Missing) || is_zero != has_zero_annotation {
         return Err(DomainFailure::invalid_time_annotation());
     }
     Ok(())
