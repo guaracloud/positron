@@ -48,6 +48,15 @@ const MAXIMUM_PATH_BYTES: usize = 16_384;
 const MAXIMUM_PATH_ENTRIES: usize = 128;
 const MAXIMUM_SNAPSHOT_DIGEST_INPUT_BYTES: usize = 65_536;
 const SNAPSHOT_DIGEST_TIMEOUT: Duration = Duration::from_secs(10);
+const M0_01B_COVERAGE_POLICY: &str =
+    "qualification/engineering/policy-changes/PC-0006-m0-01b-coverage-target-completeness.json";
+const M0_01B_OWNER_TARGET: &str = "\"--test\",\n            \"foundational_scope_activation\",\n            \"--bin\",\n            \"xtask\",";
+const FROZEN_M0_01_COVERAGE_BASELINES: [(&str, f64); 4] = [
+    ("coverage-line", 70.52266534555362),
+    ("coverage-region", 69.9540018399264),
+    ("coverage-branch", 57.622739018087856),
+    ("coverage-changed-code", 65.97888675623801),
+];
 #[derive(Debug)]
 struct EnvironmentSnapshot {
     values: Vec<(OsString, OsString)>,
@@ -514,6 +523,8 @@ fn run_coverage_gate(
             "xtask",
             "--test",
             "foundational_scope_activation",
+            "--bin",
+            "xtask",
             "--branch",
             "--json",
             "--summary-only",
@@ -535,6 +546,8 @@ fn run_coverage_gate(
             "xtask",
             "--test",
             "foundational_scope_activation",
+            "--bin",
+            "xtask",
             "--branch",
             "--json",
             "--summary-only",
@@ -1133,8 +1146,50 @@ fn run_policy_gate(root: &Path, registry: &Registry) -> Result<String, XtaskErro
     hooks::validate_repository_hooks(root)?;
     if registry.activated_risk_gates().contains("EG-COVERAGE") {
         validate_coverage_workflow_provisioning(root)?;
+        validate_m0_01b_coverage_target_completeness(root, registry)?;
     }
     Ok("internal:workflow-action-pin-branch-policy-and-required-file validation".to_owned())
+}
+
+fn validate_m0_01b_coverage_target_completeness(
+    root: &Path,
+    registry: &Registry,
+) -> Result<(), XtaskError> {
+    let policy = root.join(M0_01B_COVERAGE_POLICY);
+    let policy_content = fs::read_to_string(&policy)
+        .map_err(|source| XtaskError::io(format!("read {}", policy.display()), source))?;
+    for required in [
+        "\"id\": \"PC-0006-m0-01b-coverage-target-completeness\"",
+        "\"semantic_owner\": \"Quality Engineering\"",
+        "\"approval_status\": \"pending independent review; no approval is claimed by this local evidence\"",
+    ] {
+        if !policy_content.contains(required) {
+            return Err(XtaskError::invalid_path(
+                &policy,
+                format!("M0-01B coverage policy record is missing `{required}`"),
+            ));
+        }
+    }
+
+    let runner = root.join("tools/xtask/src/quality.rs");
+    let runner_content = fs::read_to_string(&runner)
+        .map_err(|source| XtaskError::io(format!("read {}", runner.display()), source))?;
+    if runner_content.matches(M0_01B_OWNER_TARGET).count() != 2 {
+        return Err(XtaskError::invalid_path(
+            &runner,
+            "M0-01B coverage target selection must run the controlled owner verdict suite in both total and changed-code campaigns",
+        ));
+    }
+    for (identity, expected) in FROZEN_M0_01_COVERAGE_BASELINES {
+        let actual = registry.measured_baseline(identity)?;
+        if actual.to_bits() != expected.to_bits() {
+            return Err(XtaskError::invalid(
+                "M0-01 coverage baseline",
+                format!("frozen baseline `{identity}` drifted from its retained M0-01 value"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_coverage_workflow_provisioning(root: &Path) -> Result<(), XtaskError> {

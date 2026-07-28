@@ -18,6 +18,10 @@ const ACTIVATION_ID: &str = "M0-01";
 const ACTIVATION_SET: &str = "positron-api|positron-config|positron-domain";
 const POLICY_CHANGE: &str =
     "qualification/engineering/policy-changes/PC-0002-m0-01-foundational-scope-activation.json";
+const FROZEN_COVERAGE_LINE: &str = "70.52266534555362";
+const FROZEN_COVERAGE_REGION: &str = "69.9540018399264";
+const FROZEN_COVERAGE_BRANCH: &str = "57.622739018087856";
+const FROZEN_COVERAGE_CHANGED_CODE: &str = "65.97888675623801";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -240,6 +244,117 @@ fn quality_returns_a_closed_failure_when_a_controlled_descendant_holds_capture_o
 }
 
 #[test]
+fn quality_rejects_a_snapshot_digest_that_exceeds_its_captured_output_bound() -> TestResult {
+    assert_fixture_rejected(
+        make_snapshot_digest_exceed_its_capture_bound,
+        "controlled harness execution failed during capture",
+    )
+}
+
+#[test]
+fn quality_rejects_a_nonzero_snapshot_digest_with_its_closed_exit_verdict() -> TestResult {
+    assert_fixture_rejected(
+        make_snapshot_digest_exit_nonzero,
+        "command `git hash-object --stdin` failed: exit status exit status: 79",
+    )
+}
+
+#[test]
+fn quality_records_explicit_not_selected_scheduled_gates_for_the_pr_profile() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality_profile("pr")?;
+        let evidence = fixture.latest_evidence()?;
+        for expected in [
+            "\"profile\": \"pr\"",
+            "\"gate_id\": \"EG-COVERAGE\"",
+            "\"result\": \"not-selected\"",
+            "Gate does not apply to the `pr` execution profile.",
+        ] {
+            if !evidence.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "PR evidence omitted the scheduled-gate verdict `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_records_dirty_local_success_as_non_merge_eligible_evidence() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        make_fixture_git_report_dirty(&fixture.root)?;
+        fixture.quality()?;
+        let evidence = fixture.latest_evidence()?;
+        for expected in [
+            "\"result\": \"passed\"",
+            "\"merge_eligible\": false",
+            "\"dirty\": true",
+        ] {
+            if !evidence.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "local quality evidence omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_qual_profile_rejects_the_scaffold_before_claiming_qualification() -> TestResult {
+    assert_fixture_rejected_profile(
+        "qual",
+        |_| Ok(()),
+        "the scaffold has no candidate artifact and the target registry forbids qualification claims",
+    )
+}
+
+#[test]
+fn quality_rejects_a_snapshot_digest_that_is_not_an_object_identity() -> TestResult {
+    assert_fixture_rejected(
+        make_snapshot_digest_invalid,
+        "snapshot digest tool returned an invalid object identity",
+    )
+}
+
+#[test]
+fn quality_pre_commit_evidence_keeps_every_deferred_gate_explicit() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence = fixture.latest_evidence()?;
+        for expected in [
+            "\"profile\": \"pre-commit\"",
+            "\"gate_id\": \"EG-COVERAGE\"",
+            "\"result\": \"not-selected\"",
+            "Not in the bounded local-feedback profile; the complete PR profile in trusted CI remains authoritative.",
+        ] {
+            if !evidence.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "pre-commit evidence omitted its deferred-gate verdict `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_accepts_a_scaffold_only_workspace_with_pending_thresholds() -> TestResult {
     assert_fixture_accepted(configure_scaffold_only_policy)
 }
@@ -293,11 +408,42 @@ fn quality_ext_executes_the_foundational_coverage_harness() -> TestResult {
 }
 
 #[test]
+fn quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suite() -> TestResult {
+    let fixture = Fixture::create()?;
+    fs::write(
+        fixture
+            .root
+            .join("target/quality-tools/require-owner-verdict-coverage"),
+        "",
+    )?;
+    let result = fixture.quality_profile("ext");
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_coverage_campaign_without_both_owner_verdict_targets() -> TestResult {
+    assert_fixture_rejected(
+        remove_one_m0_01b_owner_coverage_target,
+        "M0-01B coverage target selection must run the controlled owner verdict suite in both total and changed-code campaigns",
+    )
+}
+
+#[test]
+fn quality_rejects_a_frozen_m0_01_coverage_baseline_change() -> TestResult {
+    assert_fixture_rejected(
+        lower_the_frozen_m0_01_line_baseline,
+        "frozen baseline `coverage-line` drifted from its retained M0-01 value",
+    )
+}
+
+#[test]
 fn quality_ext_rejects_coverage_below_the_frozen_baseline() -> TestResult {
     assert_fixture_rejected_profile(
         "ext",
         reduce_line_coverage_measurement,
-        "coverage line 99.00 is below frozen M0 baseline 100.00",
+        "coverage line 70.00 is below frozen M0 baseline 70.52",
     )
 }
 
@@ -446,7 +592,13 @@ fn quality_rejects_invalid_measured_baseline_values() -> TestResult {
 
 #[test]
 fn quality_accepts_zero_as_a_valid_measured_baseline() -> TestResult {
-    assert_fixture_accepted(|root| set_threshold_field(root, "coverage-line", "value", "0"))
+    assert_fixture_accepted(|root| {
+        configure_scaffold_only_policy(root)?;
+        set_threshold_field(root, "coverage-line", "state", "measured-baseline")?;
+        set_threshold_field(root, "coverage-line", "value", "0")?;
+        set_threshold_field(root, "coverage-line", "scope", "m0-01-foundational-policy")?;
+        set_threshold_field(root, "coverage-line", "evidence", POLICY_CHANGE)
+    })
 }
 
 #[test]
@@ -705,15 +857,7 @@ impl Fixture {
     }
 
     fn latest_environment_digest(&self) -> TestResult<String> {
-        let evidence_directory = self.root.join("target/quality/evidence");
-        let mut evidence = fs::read_dir(&evidence_directory)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?;
-        evidence.sort();
-        let path = evidence.last().ok_or_else(|| {
-            std::io::Error::other("quality did not retain an engineering evidence artifact")
-        })?;
-        let content = fs::read_to_string(path)?;
+        let content = self.latest_evidence()?;
         let marker = "\"environment_digest\": \"";
         let (_, value) = content.split_once(marker).ok_or_else(|| {
             std::io::Error::other("engineering evidence omitted environment_digest")
@@ -722,6 +866,18 @@ impl Fixture {
             std::io::Error::other("engineering evidence has a malformed environment_digest")
         })?;
         Ok(digest.to_owned())
+    }
+
+    fn latest_evidence(&self) -> TestResult<String> {
+        let evidence_directory = self.root.join("target/quality/evidence");
+        let mut evidence = fs::read_dir(&evidence_directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        evidence.sort();
+        let path = evidence.last().ok_or_else(|| {
+            std::io::Error::other("quality did not retain an engineering evidence artifact")
+        })?;
+        Ok(fs::read_to_string(path)?)
     }
 
     #[cfg(unix)]
@@ -1160,7 +1316,7 @@ fn configure_scaffold_only_policy(root: &Path) -> TestResult {
 fn remove_coverage_baseline(root: &Path) -> TestResult {
     replace_once(
         &root.join("qualification/engineering/thresholds.tsv"),
-        "coverage-line\tmeasured-baseline\t100.00",
+        &format!("coverage-line\tmeasured-baseline\t{FROZEN_COVERAGE_LINE}"),
         "coverage-line\tpending-measured-baseline\t-",
     )
 }
@@ -1168,7 +1324,7 @@ fn remove_coverage_baseline(root: &Path) -> TestResult {
 fn make_coverage_baseline_nonfinite(root: &Path) -> TestResult {
     replace_once(
         &root.join("qualification/engineering/thresholds.tsv"),
-        "coverage-line\tmeasured-baseline\t100.00",
+        &format!("coverage-line\tmeasured-baseline\t{FROZEN_COVERAGE_LINE}"),
         "coverage-line\tmeasured-baseline\tNaN",
     )
 }
@@ -1335,7 +1491,7 @@ fn reduce_line_coverage_measurement(root: &Path) -> TestResult {
     replace_once(
         &root.join("target/quality-tools/bin/cargo"),
         "\"lines\":{\"percent\":100.0}",
-        "\"lines\":{\"percent\":99.0}",
+        "\"lines\":{\"percent\":70.0}",
     )
 }
 
@@ -1344,6 +1500,54 @@ fn make_coverage_detector_report_a_different_version(root: &Path) -> TestResult 
         &root.join("target/quality-tools/bin/cargo"),
         "cargo-llvm-cov 0.8.7",
         "cargo-llvm-cov 0.8.6",
+    )
+}
+
+fn make_snapshot_digest_exceed_its_capture_bound(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("target/quality-tools/bin/git"),
+        "cat >/dev/null\n    printf '%s\\n' '1111111111111111111111111111111111111111'",
+        "cat >/dev/null\n    /usr/bin/head -c 1025 /dev/zero | /usr/bin/tr '\\0' x",
+    )
+}
+
+fn make_snapshot_digest_exit_nonzero(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("target/quality-tools/bin/git"),
+        "cat >/dev/null\n    printf '%s\\n' '1111111111111111111111111111111111111111'",
+        "cat >/dev/null\n    printf '%s\\n' 'fixture digest failure' >&2\n    exit 79",
+    )
+}
+
+fn make_snapshot_digest_invalid(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("target/quality-tools/bin/git"),
+        "cat >/dev/null\n    printf '%s\\n' '1111111111111111111111111111111111111111'",
+        "cat >/dev/null\n    printf '%s\\n' 'not-an-object-identity'",
+    )
+}
+
+fn make_fixture_git_report_dirty(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("target/quality-tools/bin/git"),
+        "  status)\n    ;;",
+        "  status)\n    printf '%s\\n' ' M fixture-policy.tsv'\n    ;;",
+    )
+}
+
+fn remove_one_m0_01b_owner_coverage_target(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "            \"--bin\",\n            \"xtask\",\n",
+        "",
+    )
+}
+
+fn lower_the_frozen_m0_01_line_baseline(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("qualification/engineering/thresholds.tsv"),
+        &format!("coverage-line\tmeasured-baseline\t{FROZEN_COVERAGE_LINE}"),
+        "coverage-line\tmeasured-baseline\t70.00",
     )
 }
 
@@ -1665,9 +1869,30 @@ fn rewrite_thresholds(root: &Path) -> TestResult {
             },
         };
         let (state, value, scope, rationale, evidence) = match threshold_id {
-            "coverage-line" | "coverage-region" | "coverage-branch" | "coverage-changed-code" => (
+            "coverage-line" => (
                 "measured-baseline",
-                "100.00",
+                FROZEN_COVERAGE_LINE,
+                "m0-01-foundational-policy",
+                "Fixture measurement for the public activation-policy seam",
+                POLICY_CHANGE,
+            ),
+            "coverage-region" => (
+                "measured-baseline",
+                FROZEN_COVERAGE_REGION,
+                "m0-01-foundational-policy",
+                "Fixture measurement for the public activation-policy seam",
+                POLICY_CHANGE,
+            ),
+            "coverage-branch" => (
+                "measured-baseline",
+                FROZEN_COVERAGE_BRANCH,
+                "m0-01-foundational-policy",
+                "Fixture measurement for the public activation-policy seam",
+                POLICY_CHANGE,
+            ),
+            "coverage-changed-code" => (
+                "measured-baseline",
+                FROZEN_COVERAGE_CHANGED_CODE,
                 "m0-01-foundational-policy",
                 "Fixture measurement for the public activation-policy seam",
                 POLICY_CHANGE,
@@ -1791,6 +2016,21 @@ case "$command" in
     if [ "${2:-}" = "--version" ]; then
       printf 'cargo-llvm-cov 0.8.7\n'
       exit 0
+    fi
+    if [ -f target/quality-tools/require-owner-verdict-coverage ]; then
+      owner_verdict_suite=false
+      previous=
+      for argument in "$@"; do
+        if [ "$previous" = "--bin" ] && [ "$argument" = "xtask" ]; then
+          owner_verdict_suite=true
+          break
+        fi
+        previous="$argument"
+      done
+      if [ "$owner_verdict_suite" != true ]; then
+        printf '%s\n' 'fixture requires controlled owner verdict coverage' >&2
+        exit 76
+      fi
     fi
     if [ -f target/quality-tools/reject-coverage-execution ]; then
       printf '%s\n' 'fixture rejects routine coverage execution' >&2

@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "id": "PC-0006-m0-01b-coverage-target-completeness",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "qualification/engineering/gates.tsv",
+    "qualification/engineering/thresholds.tsv"
+  ],
+  "purpose": "Restore the frozen M0-01 coverage contract by making the scheduled coverage campaign execute both registered xtask public-fixture verdicts and the owned controlled-execution verdict suite.",
+  "scope": {
+    "semantic_owner": "Quality Engineering",
+    "registered_surface": "tools/xtask scheduled EG-COVERAGE target selection and its public foundational policy fixtures",
+    "product_runtime_change": false,
+    "gate_selection_change": true
+  },
+  "change": {
+    "coverage_target_selection": {
+      "before": "cargo llvm-cov selected only --test foundational_scope_activation for total and changed-code reports",
+      "after": "cargo llvm-cov selects --test foundational_scope_activation and --bin xtask for both total and changed-code reports",
+      "owner_scope_rationale": "The registered xtask tooling scope owns controlled child process-group, descriptor, bounded wait, termination, reap, capture, and typed verdict behavior. Its existing owner tests prove those public outcomes; the fixture suite proves quality workflow invocation, gate selection, evidence, and policy outcomes. Both are required to measure the registered scope rather than only its outer workflow fixture."
+    },
+    "unchanged": [
+      "coverage-line threshold 70.52266534555362 percent",
+      "coverage-region threshold 69.9540018399264 percent",
+      "coverage-branch threshold 57.622739018087856 percent",
+      "coverage-changed-code threshold 65.97888675623801 percent",
+      "EXT-only placement of EG-COVERAGE, PR and pre-commit gate selection, registered timeouts, detector version, retries, result semantics, evidence schema, and immutable attempt retention",
+      "application scope, dependencies, unsafe-code policy, and Release 1 qualification status"
+    ]
+  },
+  "detection_gained": [
+    "scheduled coverage now measures the controlled-execution owner verdicts for exact stdout and stderr capture, launch and nonzero outcomes, deadline and cancellation cleanup, descriptor closure, descendant reconciliation, process-group reaping, and bounded capture failures",
+    "black-box policy fixtures reject removal of either owner-test target and reject drift of every frozen M0-01 coverage threshold",
+    "the same coverage campaign retains workflow-level fast, PR, EXT, not-selected, missing-tool, and immutable-evidence verdict coverage"
+  ],
+  "detection_lost": [
+    "none; the prior fixture target remains selected and every frozen threshold, stage, timeout, detector, and result rule is retained"
+  ],
+  "migration": {
+    "from": "coverage reports counted 3,813 covered lines out of 5,578 on clean current main because they omitted the registered owner verdict suite",
+    "to": "coverage reports run the fixture and owner targets together under the same pinned cargo-llvm-cov invocation and preserve separate total and changed-code reports",
+    "policy_guard": "the policy gate requires the owner target in both coverage invocations and exact retained threshold values"
+  },
+  "evidence": {
+    "retained_red_clean_main": {
+      "revision": "00646282ea64f8eea50c324772222f531339bc65",
+      "command": "cargo xtask quality --profile ext",
+      "attempt": "target/quality/evidence/1785258336324-00646282ea64-82691.json",
+      "result": "failed-local-diagnostic",
+      "total": {
+        "lines": "3813/5578 = 68.35783434922912 percent",
+        "regions": "5107/7406 = 68.95760194436943 percent",
+        "branches": "538/934 = 57.601713062098504 percent"
+      },
+      "failure": "EG-COVERAGE fell below the frozen line and branch baselines; this failure remains retained."
+    },
+    "pre_record_green_committed_sha": {
+      "revision": "718d87e59d6c2daeb32731d86834efea5ba810d6",
+      "command": "cargo xtask quality --profile ext",
+      "attempt": "target/quality/evidence/1785258961270-718d87e59d6c-36242.json",
+      "result": "passed-local-diagnostic",
+      "merge_eligible": false,
+      "total": {
+        "lines": "4608/6498 = 70.91412742382272 percent",
+        "regions": "6243/8590 = 72.67753201396974 percent",
+        "branches": "621/1006 = 61.7296222664016 percent"
+      },
+      "changed_code": "2667/3990 = 66.84210526315789 percent",
+      "reason": "clean local source identity is diagnostic only; trusted CI and independent review remain required."
+    },
+    "dual_run": "The retained clean-main red run used the former fixture-only target. The retained committed-SHA green run used the fixture plus owner target under the same EXT profile, pinned detector, and thresholds. A final exact-SHA EXT run is required after this record and policy guard are committed."
+  },
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering",
+    "Rust and Toolchain"
+  ],
+  "approval_status": "pending independent review; no approval is claimed by this local evidence",
+  "qualification_status": "Implemented candidate only; no Release 1 target is Qualified by this change."
+}
