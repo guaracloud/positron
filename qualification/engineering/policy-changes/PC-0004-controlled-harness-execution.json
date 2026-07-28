@@ -20,6 +20,7 @@
     "contract": [
       "callers provide a complete command, working directory, explicit environment, input, output, cancellation signal, and deadline",
       "the owner creates one Unix process group, reconciles that group, owns input and capture workers, and returns a closed typed outcome",
+      "the owner reaps an exited direct child while probing group termination so Linux cannot misclassify the direct child's zombie as an unreconciled live process group",
       "the owner clears ambient child environment and quality supplies an explicit bounded PATH, toolchain-path, locale, timezone, temporary-directory, and certificate-path snapshot",
       "fixture control paths are embedded in the synthetic git program instead of inherited through the outer xtask environment",
       "quality documentation builds use a unique temporary target, and EG-DOCS scans the full generated rustdoc root without secret-scan exclusions"
@@ -106,6 +107,15 @@
         "evidence": "target/quality/evidence/1785251688897-e4e833cd6b5d-30585.json",
         "merge_eligible": false,
         "reason": "the source tree was dirty and the run was not trusted CI; all selected PR gates passed and generated rustdoc was scanned without exclusions"
+      },
+      {
+        "command": "cargo xtask quality --profile pr",
+        "result": "failed-trusted-ci",
+        "evidence": "target/quality/evidence/1785252367989-64ddd53df359-21128.json",
+        "workflow_run": "30372568758",
+        "failures": [
+          "EG-TEST exposed Linux zombie handling in the deadline and cancellation direct-child tests: the group probe remained positive until the direct child was reaped"
+        ]
       }
     ],
     "mutation": "not run in this change: PC-0003 assigns mutation and coverage to scheduled extended evidence, and this record makes no mutation claim"

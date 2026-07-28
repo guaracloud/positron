@@ -440,13 +440,40 @@ fn terminate_and_reap(
 ) -> Result<(), ExecutionFailure> {
     group.signal(Signal::Terminate, command)?;
     let grace_deadline = Instant::now() + TERMINATION_GRACE;
-    if !group.wait_until_empty_before(command, grace_deadline)? {
+    if !wait_for_group_while_reaping_direct(child, group, command, grace_deadline)? {
         group.signal(Signal::Kill, command)?;
         let kill_deadline = Instant::now() + TERMINATION_GRACE;
-        group.require_empty(command, kill_deadline)?;
+        if !wait_for_group_while_reaping_direct(child, group, command, kill_deadline)? {
+            return Err(group.not_empty_failure(command));
+        }
     }
     let reap_deadline = Instant::now() + TERMINATION_GRACE;
     wait_for_direct_child(child, command, reap_deadline, None).map(|_| ())
+}
+
+#[cfg(unix)]
+fn wait_for_group_while_reaping_direct(
+    child: &mut Child,
+    group: &ProcessGroup,
+    command: &str,
+    deadline: Instant,
+) -> Result<bool, ExecutionFailure> {
+    loop {
+        child.try_wait().map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::DirectProcess,
+                source.to_string(),
+            )
+        })?;
+        if !group.exists(command)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        wait_for_progress(deadline);
+    }
 }
 
 #[cfg(unix)]
@@ -512,34 +539,15 @@ impl ProcessGroup {
         ))
     }
 
-    fn wait_until_empty_before(
-        &self,
-        command: &str,
-        deadline: Instant,
-    ) -> Result<bool, ExecutionFailure> {
-        loop {
-            if !self.exists(command)? {
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            wait_for_progress(deadline);
-        }
-    }
-
-    fn require_empty(&self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
-        if self.wait_until_empty_before(command, deadline)? {
-            return Ok(());
-        }
-        Err(ExecutionFailure::new(
+    fn not_empty_failure(&self, command: &str) -> ExecutionFailure {
+        ExecutionFailure::new(
             command.to_owned(),
             FailurePhase::Cleanup,
             format!(
                 "controlled process group {} remained alive after forced termination",
                 self.identifier
             ),
-        ))
+        )
     }
 }
 
