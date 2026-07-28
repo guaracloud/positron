@@ -213,6 +213,12 @@ fn tenant_slug_has_one_bounded_canonical_form() -> Result<(), DomainFailure> {
 #[test]
 fn tenant_slug_requires_between_one_and_sixty_three_ascii_bytes() -> Result<(), DomainFailure> {
     assert_eq!(TenantSlug::parse_canonical("a")?.as_str(), "a");
+    let maximum = "a".repeat(63);
+    assert_eq!(
+        TenantSlug::parse_canonical(&maximum)?.as_str(),
+        maximum,
+        "the configured maximum is inclusive"
+    );
     assert!(matches!(
         TenantSlug::parse_canonical(""),
         Err(failure)
@@ -565,7 +571,8 @@ fn typed_value_limits_reject_the_zero_sentinel() {
 }
 
 #[test]
-fn value_limit_profile_validation_only_allows_tenant_lowering() -> Result<(), DomainFailure> {
+fn value_limit_profile_validation_allows_equality_and_tenant_lowering() -> Result<(), DomainFailure>
+{
     let system = ValueLimitSet::new(
         ByteLimit::new(32)?,
         ByteLimit::new(64)?,
@@ -582,6 +589,34 @@ fn value_limit_profile_validation_only_allows_tenant_lowering() -> Result<(), Do
     let profile = ValueLimitProfileCandidate::new(system, Some(lowered_tenant)).validate()?;
     assert_eq!(profile.system_limits(), system);
     assert_eq!(profile.tenant_limits(), Some(lowered_tenant));
+
+    let equal_profile = ValueLimitProfileCandidate::new(system, Some(system)).validate()?;
+    assert_eq!(
+        equal_profile.tenant_limits().map(ValueLimitSet::key_bytes),
+        Some(system.key_bytes()),
+        "tenant key bytes may equal the configured system maximum"
+    );
+    assert_eq!(
+        equal_profile
+            .tenant_limits()
+            .map(ValueLimitSet::value_bytes),
+        Some(system.value_bytes()),
+        "tenant value bytes may equal the configured system maximum"
+    );
+    assert_eq!(
+        equal_profile
+            .tenant_limits()
+            .map(ValueLimitSet::collection_entries),
+        Some(system.collection_entries()),
+        "tenant collection entries may equal the configured system maximum"
+    );
+    assert_eq!(
+        equal_profile
+            .tenant_limits()
+            .map(ValueLimitSet::nesting_depth),
+        Some(system.nesting_depth()),
+        "tenant nesting depth may equal the configured system maximum"
+    );
 
     let raised_tenant = ValueLimitSet::new(
         ByteLimit::new(33)?,
