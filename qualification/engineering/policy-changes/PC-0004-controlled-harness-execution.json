@@ -116,6 +116,15 @@
         "failures": [
           "EG-TEST exposed Linux zombie handling in the deadline and cancellation direct-child tests: the group probe remained positive until the direct child was reaped"
         ]
+      },
+      {
+        "command": "cargo xtask quality --profile pr",
+        "result": "failed-trusted-ci",
+        "evidence": "target/quality/evidence/1785253085195-5e2b6af16b64-21131.json",
+        "workflow_run": "30373525268",
+        "failures": [
+          "EG-TEST exposed a non-idempotent escaped-descriptor fixture release on Linux after the descriptor-holding descendant had exited"
+        ]
       }
     ],
     "mutation": "not run in this change: PC-0003 assigns mutation and coverage to scheduled extended evidence, and this record makes no mutation claim"
