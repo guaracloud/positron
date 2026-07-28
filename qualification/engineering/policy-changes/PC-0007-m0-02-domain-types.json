@@ -20,6 +20,9 @@
       "qualification/engineering/architecture-edges.tsv",
       "qualification/engineering/thresholds.tsv"
     ],
+    "workflows": [
+      ".github/workflows/extended.yml"
+    ],
     "source_inventory": [
       "crates/positron-domain/src/lib.rs",
       "crates/positron-domain/src/identity.rs",
@@ -69,8 +72,8 @@
     "self_reference_boundary": "This committed policy record cannot embed its own source revision or a future workflow run identity without changing that revision. Exact candidate attempts are therefore retained outside the source tree and bound by the runner-recorded full revision.",
     "authoritative_pr": "The protected pull-request workflow uploads target/quality as engineering-evidence-<run>-<attempt>-<github.sha> after cargo xtask quality --profile pr.",
     "coverage": "The manually dispatched extended workflow uploads target/quality as extended-evidence-<run>-<attempt>-<github.sha> after cargo xtask quality --profile ext, including the M0-02 report and frozen-baseline verdict.",
-    "mutation": "The focused command recorded in change.mutation_command runs once on the clean committed candidate. Its raw outcomes and digests remain local diagnostic evidence because mutation is not a routine authoritative profile under PC-0003.",
-    "claims": "Exact-head evidence does not establish Qualified status. Local mutation evidence does not establish merge eligibility, and workflow evidence remains subject to independent review."
+    "mutation": "Mutation remains excluded from routine and scheduled automation by PC-0003. A manual workflow_dispatch may explicitly select the M0-02-only retention step, which runs the exact focused command recorded in change.mutation_command and uploads its raw outcomes inside the existing exact-SHA extended-evidence artifact without making mutation a recurring or merge-required gate.",
+    "claims": "Exact-head evidence does not establish Qualified status. The opt-in retained mutation evidence does not establish merge eligibility, and workflow evidence remains subject to independent review."
   },
   "attempts": [
     {
@@ -365,10 +368,11 @@
     "All callers of positron-domain retain the existing acyclic dependency graph but must carry the M0-02 edge label.",
     "EG-COVERAGE measures and ratchets all handwritten Domain Types source with branch, line, and region baselines.",
     "EG-DYNAMIC executes the retained-seed public contract suite and compile-fail crate boundary test for this narrow scope.",
-    "The registry rejects unregistered Domain Types Rust source, incomplete M0-02 ledger data, forbidden gate selection, and stale or untraceable baselines."
+    "The registry rejects unregistered Domain Types Rust source, incomplete M0-02 ledger data, forbidden gate selection, and stale or untraceable baselines.",
+    "An explicit manual selection can retain the exact M0-02 focused mutation outcomes in the existing revision-bound extended evidence artifact without changing scheduled or routine gate selection."
   ],
   "detection_lost": [],
-  "migration": "No wire protocol, persistence format, runtime, provider, deferred signal store, clustering behavior, generated surface, artifact scope, or public serialization is introduced. positron-api and positron-config remain active under their original M0-01 evidence. Within this first native Domain Types activation, QueryTimeProvenance uses the closed labels Event, Observed, and Ingest for the accepted source meanings. The M0-02 source cleanup removes redundant internal impossible branches before ratcheting coverage. The final report is local dirty-tree diagnostic evidence only and does not establish Qualified or merge-eligible status.",
+  "migration": "No wire protocol, persistence format, runtime, provider, deferred signal store, clustering behavior, generated surface, artifact scope, public serialization, scheduled gate, routine gate, threshold, or merge requirement is introduced. positron-api and positron-config remain active under their original M0-01 evidence. Within this first native Domain Types activation, QueryTimeProvenance uses the closed labels Event, Observed, and Ingest for the accepted source meanings. The M0-02 source cleanup removes redundant internal impossible branches before ratcheting coverage. The original baseline report remains local dirty-tree diagnostic evidence; an explicitly selected exact-head mutation campaign is retained externally in the existing revision-bound extended workflow artifact and does not establish Qualified or merge-eligible status.",
   "old_result": {
     "activation_id": "M0-01",
     "scope_set": [

@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
+    inputs:
+      retain_m0_02_mutation:
+        description: Retain the issue #3 focused mutation campaign
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -58,6 +64,25 @@ jobs:
 
       - name: Run the authoritative extended gate runner
         run: cargo xtask quality --profile ext
+
+      - name: Install the pinned M0-02 mutation detector
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
+        run: cargo install --locked --version 27.1.0 cargo-mutants
+
+      - name: Retain the exact M0-02 focused mutation campaign
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
+        run: >
+          cargo mutants --no-config --package positron-domain
+          --re
+          'TenantId::from_bytes|TenantId::parse_canonical|TenantAttribution::new|parse_identifier|EventTime::received|ObservedTime::received|QueryTime::for_log|QueryTime::for_span|validate_present_source_time|ValueLimitProfileCandidate::validate|AttributeOccurrenceSetCandidate::validate|validate_attribute_value|validate_attribute_array|validate_key_value_list'
+          --test-tool cargo
+          --output target/quality/mutation/m0-02-domain-final-post-lint
+          --timeout 30
+          --jobs 1
+          --no-times
+          --
+          --locked
+          --test foundational_domain_types
 
       - name: Retain the exact gate attempt
         if: always()
