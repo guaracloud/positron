@@ -32,17 +32,46 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
 
+      - name: Restore pinned PR tools
+        id: pr-tools-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.positron-pr-tools
+          key: positron-pr-tools-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-nextest-0.9.138-deny-0.19.9-audit-0.22.2-machete-0.9.2
+
+      - name: Select pinned PR tool root
+        run: echo "$HOME/.positron-pr-tools/bin" >> "$GITHUB_PATH"
+
       - name: Install cargo-nextest
-        run: cargo install --locked --version 0.9.138 cargo-nextest
+        if: steps.pr-tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --root "$HOME/.positron-pr-tools" --version 0.9.138 cargo-nextest
 
       - name: Install cargo-deny
-        run: cargo install --locked --version 0.19.9 cargo-deny
+        if: steps.pr-tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --root "$HOME/.positron-pr-tools" --version 0.19.9 cargo-deny
 
       - name: Install cargo-audit
-        run: cargo install --locked --version 0.22.2 cargo-audit
+        if: steps.pr-tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --root "$HOME/.positron-pr-tools" --version 0.22.2 cargo-audit
 
       - name: Install cargo-machete
-        run: cargo install --locked --version 0.9.2 cargo-machete
+        if: steps.pr-tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --root "$HOME/.positron-pr-tools" --version 0.9.2 cargo-machete
+
+      - name: Verify pinned PR tools
+        run: |
+          tool_root="$HOME/.positron-pr-tools/bin"
+          "$tool_root/cargo-nextest" --version | sed -n 1p | grep --fixed-strings "cargo-nextest 0.9.138"
+          "$tool_root/cargo-deny" --version | grep --fixed-strings --line-regexp "cargo-deny 0.19.9"
+          "$tool_root/cargo-audit" --version | grep --fixed-strings --line-regexp "cargo-audit 0.22.2"
+          "$tool_root/cargo-machete" --version | grep --fixed-strings --line-regexp "0.9.2"
+
+      - name: Save verified PR tools from trusted main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.pr-tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.positron-pr-tools
+          key: positron-pr-tools-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-nextest-0.9.138-deny-0.19.9-audit-0.22.2-machete-0.9.2
 
       - name: Install Gitleaks
         env:

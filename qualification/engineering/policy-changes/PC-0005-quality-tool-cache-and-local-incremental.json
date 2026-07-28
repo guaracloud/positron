@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "id": "PC-0005-quality-tool-cache-and-local-incremental",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "qualification/engineering/toolchains.tsv"
+  ],
+  "purpose": "Remove repeated PR tool compilation and restore local incremental compilation without changing gate selection, detector versions, or authoritative runner semantics.",
+  "scope": {
+    "semantic_owner": "Quality Engineering",
+    "registered_surface": ".github/workflows/quality.yml, .cargo/config.toml, tools/xtask policy validation, and developer workflow documentation",
+    "product_runtime_change": false,
+    "gate_selection_change": false
+  },
+  "change": {
+    "ci_tool_provisioning": [
+      "restore cargo-nextest 0.9.138, cargo-deny 0.19.9, cargo-audit 0.22.2, and cargo-machete 0.9.2 from an operating-system, architecture, Rust-version, and exact-tool-version key",
+      "compile the same locked tool versions only on an exact cache miss",
+      "verify every restored or freshly compiled tool reports its pinned version before the authoritative PR runner executes",
+      "publish a verified cold cache only from a trusted push to the protected main branch; pull-request workflows cannot persist executable tool caches",
+      "cache no repository target directory or gate evidence"
+    ],
+    "local_development": [
+      "remove the repository-wide Cargo configuration override that disabled incremental compilation",
+      "retain the explicit incremental development and test profiles",
+      "retain CARGO_INCREMENTAL=0 in trusted CI for reproducible evidence",
+      "document one focused-test, pre-commit, pre-push, and protected-CI validation ladder without duplicate adjacent PR-profile runs"
+    ],
+    "unchanged": [
+      "cargo xtask quality remains the authoritative quality interface",
+      "all 13 routine PR gates, their tools, versions, timeouts, retries, and evidence semantics",
+      "pre-commit and pre-push hook profiles",
+      "scheduled extended and release qualification gate selection",
+      "application scope, dependencies, unsafe-code policy, and Release 1 qualification status"
+    ]
+  },
+  "detection_gained": [
+    "the policy gate rejects removal or revision drift of the pinned actions/cache restore and trusted-main save actions, exact cache key, cache-miss install condition, custom tool root, or restored-tool verification",
+    "the policy gate rejects a repository-wide local incremental-compilation disable",
+    "black-box fixtures prove both workflow safeguards and the local compilation contract fail closed"
+  ],
+  "detection_lost": [
+    "none; the same locked detectors execute through the same authoritative runner and cached binaries must report every exact registered version"
+  ],
+  "migration": {
+    "ci": "A cache miss compiles the four pinned tools. Only a trusted protected-main push may store the verified result. Later pull requests may restore that default-branch cache and fail closed if any required binary or expected version is absent.",
+    "local": "Existing development and test profile settings take effect after the global override is removed. No command or hook changes are required.",
+    "invalidation": "Any runner operating system, architecture, Rust version, or pinned tool version change creates a distinct cache key and cold installation. The first pull request using a new key remains cold; the protected-main run after merge establishes the trusted cache."
+  },
+  "evidence": {
+    "source_identity": {
+      "base_revision": "afe2120b717b44c4e27e1e43e059fcd2c9d08afe",
+      "working_tree": "local dirty implementation evidence only",
+      "platform": "Darwin arm64"
+    },
+    "before": {
+      "trusted_ci": {
+        "workflow_run": "30374744209",
+        "tool_install_seconds": 574,
+        "authoritative_pr_runner_seconds": 19,
+        "tests": "63 of 63 passed",
+        "interpretation": "source compilation of the four pinned Cargo tools dominated the successful PR run"
+      },
+      "local": [
+        {
+          "command": "cargo xtask quality --profile pre-commit",
+          "result": "passed-local-diagnostic in 1.83 seconds",
+          "evidence": "target/quality/evidence/1785254563911-afe2120b717b-22009.json"
+        },
+        {
+          "command": "cargo xtask quality --profile pr",
+          "result": "passed-local-diagnostic in 17.82 seconds; 63 of 63 tests passed",
+          "evidence": "target/quality/evidence/1785254568085-afe2120b717b-22317.json",
+          "retained_negative_observation": "nextest emitted one existing LEAK marker for quality_evidence_uses_a_stable_redacted_environment_digest even though the canonical runner returned passed; this change does not hide, erase, or claim to resolve it"
+        }
+      ]
+    },
+    "after": {
+      "focused_contracts": "20 xtask unit tests and 46 black-box policy fixtures passed",
+      "canonical_pre_commit": {
+        "result": "passed-local-diagnostic in 1.82 seconds",
+        "evidence": "target/quality/evidence/1785254801839-afe2120b717b-36943.json"
+      },
+      "canonical_pr_profile": {
+        "result": "passed-local-diagnostic in 24.53 seconds; 66 of 66 tests passed",
+        "evidence": "target/quality/evidence/1785254811374-afe2120b717b-37354.json",
+        "merge_eligible": false,
+        "reason": "the source tree was dirty and the run was not trusted CI"
+      },
+      "warm_ci": "pending trusted cold and warm CI runs; this local change makes no unmeasured CI duration claim"
+    },
+    "mutation": "not run in this change: PC-0003 assigns mutation and coverage to scheduled extended evidence, and this policy-only change makes no mutation claim"
+  },
+  "dual_run": "The unchanged local PR profile is measured before and after the provisioning/configuration change. Trusted CI must retain the cold cache-miss attempt and a later warm cache-hit attempt before the workflow optimization is considered operationally verified.",
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering",
+    "Rust and Toolchain",
+    "Security",
+    "Release Engineering"
+  ],
+  "approval_status": "pending independent review; no approval is claimed by this local evidence",
+  "qualification_status": "Implemented candidate only; no Release 1 target is Qualified by this change."
+}

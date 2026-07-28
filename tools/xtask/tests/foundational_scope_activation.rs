@@ -260,6 +260,30 @@ fn quality_pr_skips_the_scheduled_coverage_campaign() -> TestResult {
 }
 
 #[test]
+fn quality_rejects_a_global_local_incremental_disable() -> TestResult {
+    assert_fixture_rejected(
+        disable_incremental_compilation_globally,
+        "local development configuration must not globally disable incremental compilation",
+    )
+}
+
+#[test]
+fn quality_rejects_a_pr_workflow_without_the_pinned_tool_cache() -> TestResult {
+    assert_fixture_rejected(
+        remove_pr_tool_cache,
+        "required workflow safeguard `actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9` is missing",
+    )
+}
+
+#[test]
+fn quality_rejects_a_pr_workflow_without_cached_tool_verification() -> TestResult {
+    assert_fixture_rejected(
+        remove_cached_pr_tool_verification,
+        "required workflow safeguard `\"$tool_root/cargo-audit\" --version` is missing",
+    )
+}
+
+#[test]
 fn quality_ext_executes_the_foundational_coverage_harness() -> TestResult {
     let fixture = Fixture::create()?;
     let result = fixture.quality_profile("ext");
@@ -1256,6 +1280,30 @@ fn add_non_deferred_symbol_with_a_deferred_prefix(root: &Path) -> TestResult {
     content.push_str("\npub struct MetricsStorehouse;\n");
     fs::write(path, content)?;
     Ok(())
+}
+
+fn disable_incremental_compilation_globally(root: &Path) -> TestResult {
+    let path = root.join(".cargo/config.toml");
+    let mut content = fs::read_to_string(&path)?;
+    content.push_str("\n[build]\nincremental = false\n");
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn remove_pr_tool_cache(root: &Path) -> TestResult {
+    replace_once(
+        &root.join(".github/workflows/quality.yml"),
+        "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        "actions/cache/restore@0000000000000000000000000000000000000000",
+    )
+}
+
+fn remove_cached_pr_tool_verification(root: &Path) -> TestResult {
+    replace_once(
+        &root.join(".github/workflows/quality.yml"),
+        "          \"$tool_root/cargo-audit\" --version | grep --fixed-strings --line-regexp \"cargo-audit 0.22.2\"\n",
+        "",
+    )
 }
 
 fn remove_coverage_tool_provisioning(root: &Path) -> TestResult {
