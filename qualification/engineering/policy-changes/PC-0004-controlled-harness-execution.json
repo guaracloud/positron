@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "id": "PC-0004-controlled-harness-execution",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "qualification/engineering/gates.tsv"
+  ],
+  "purpose": "Make the xtask controlled harness deterministic when a fixture child leaves a controlled descendant or inherited capture descriptor behind.",
+  "scope": {
+    "semantic_owner": "Quality Engineering",
+    "registered_surface": "tools/xtask and its foundational test fixture only",
+    "product_runtime_change": false,
+    "gate_selection_change": false
+  },
+  "change": {
+    "owner": "tools/xtask/src/controlled_execution.rs",
+    "contract": [
+      "callers provide a complete command, working directory, explicit environment, input, output, cancellation signal, and deadline",
+      "the owner creates one Unix process group, reconciles that group, owns input and capture workers, and returns a closed typed outcome",
+      "the owner clears ambient child environment and quality supplies an explicit bounded PATH, toolchain-path, locale, timezone, temporary-directory, and certificate-path snapshot",
+      "fixture control paths are embedded in the synthetic git program instead of inherited through the outer xtask environment",
+      "quality documentation builds use a unique temporary target outside the worktree so EG-SECRETS scans source and retained evidence rather than rustdoc-generated compressed search indexes"
+    ],
+    "ownership_boundary": "The owner reconciles only its direct child and the process group it created. It does not claim control over a hostile descendant that intentionally escapes that group.",
+    "unchanged": [
+      "all registered gate identities, profiles, timeout values, retries, nextest grouping, result semantics, and retained M0-02 LEAK evidence",
+      "application scope state, dependencies, unsafe-code policy, and Release 1 qualification status"
+    ]
+  },
+  "detection_gained": [
+    "a deterministic public FIFO regression fails closed when a controlled descendant retains stdout or stderr after its direct parent exits",
+    "typed launch, non-zero, deadline, cancellation, capture-limit, descendant, and cleanup-path outcomes are exercised through the controlled owner",
+    "parallel reordered invocations retain separate descriptors and explicit environments",
+    "an empty-specification child cannot inherit the test runner environment"
+  ],
+  "detection_lost": [
+    "none; existing gates and the retained negative M0-02 LEAK evidence remain intact"
+  ],
+  "migration": {
+    "from": "quality.rs spawned and waited on direct children while capture readers could remain blocked on inherited descriptors",
+    "to": "quality.rs delegates all affected fixture commands to the controlled owner and receives only reconciled verdicts or typed failures",
+    "fixture_protocol": "The retained synthetic git fixture embeds quoted FIFO and pid paths; it uses an explicit readiness file and release FIFO rather than timing or inherited test-control variables."
+  },
+  "evidence": {
+    "source_identity": {
+      "base_revision": "cd51df1e2bbdbca8eaa8116c1bdc9bdb88c14d8e",
+      "working_tree": "local dirty implementation evidence only",
+      "toolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "platform": "Darwin 25.5.0 arm64"
+    },
+    "retained_red": [
+      {
+        "command": "cargo test --locked --package xtask --test foundational_scope_activation quality_returns_a_closed_failure_when_a_controlled_descendant_holds_capture_open -- --exact",
+        "result": "failed after 2.62 seconds because the public quality runner did not return a closed controlled-harness verdict before its deadline"
+      },
+      {
+        "command": "cargo test --locked --package xtask --bin xtask controlled_execution::tests::exposes_only_the_invocation_environment_to_the_controlled_child -- --exact",
+        "result": "failed because inherited parent environment exceeded the 1024-byte controlled capture limit"
+      }
+    ],
+    "green": {
+      "command": "cargo test --locked --package xtask",
+      "result": "14 owner/unit tests and 37 public foundational fixture tests passed after the explicit environment and process-group migration",
+      "canonical_pr_profile": "passed-local-diagnostic: target/quality/evidence/1785246020047-cd51df1e2bbd-82574.json"
+    },
+    "canonical_attempts": [
+      {
+        "command": "cargo xtask quality --profile pr",
+        "result": "failed-local-diagnostic",
+        "evidence": "target/quality/evidence/1785245723672-cd51df1e2bbd-71311.json",
+        "failures": [
+          "EG-RUST rejected a collapsible cancellation conditional and unchecked output-buffer slicing",
+          "EG-SECRETS detected a Square-token false positive in the generated rustdoc search index under target/doc"
+        ]
+      },
+      {
+        "command": "cargo xtask quality --profile pr",
+        "result": "passed-local-diagnostic",
+        "evidence": "target/quality/evidence/1785246020047-cd51df1e2bbd-82574.json",
+        "merge_eligible": false,
+        "reason": "the source tree was dirty and the run was not trusted CI"
+      }
+    ],
+    "mutation": "not run in this change: PC-0003 assigns mutation and coverage to scheduled extended evidence, and this record makes no mutation claim"
+  },
+  "dual_run": "The same retained FIFO protocol produced the pre-owner public failure and the post-owner closed typed descendant failure. The full focused xtask suite passed after the explicit environment migration.",
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering",
+    "Rust and Toolchain"
+  ],
+  "approval_status": "pending independent review; no approval is claimed by this local evidence",
+  "qualification_status": "Implemented candidate only; no Release 1 target is Qualified by this change."
+}

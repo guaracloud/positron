@@ -2,12 +2,11 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::controlled_execution::{self, InvocationInput, InvocationSpec, OutputMode};
 use crate::error::XtaskError;
 use crate::hooks;
 use crate::registry::{self, Gate, Registry};
@@ -38,6 +37,15 @@ const CANONICAL_GATE_IDS: [&str; 25] = [
     "EG-SOAK",
     "EG-SUPPLY",
     "EG-TEST",
+];
+
+const QUALITY_ENVIRONMENT_SNAPSHOT: [&str; 6] = [
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -904,6 +912,12 @@ fn run_dependency_gate(
 
 fn run_documentation_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
     validate_local_markdown_links(root)?;
+    let target = documentation_target_directory()?;
+    fs::create_dir(&target)
+        .map_err(|source| XtaskError::io(format!("create {}", target.display()), source))?;
+    let target_value = target.as_os_str().to_str().ok_or_else(|| {
+        XtaskError::invalid_path(&target, "temporary documentation target is not valid UTF-8")
+    })?;
     let outcome = run_status(
         root,
         "cargo",
@@ -916,9 +930,30 @@ fn run_documentation_gate(root: &Path, budget: Duration) -> Result<String, Xtask
             "--document-private-items",
         ],
         budget,
-        &[("RUSTDOCFLAGS", "-D warnings")],
-    )?;
-    Ok(format!("internal:local-link-check | {}", outcome.display))
+        &[
+            ("RUSTDOCFLAGS", "-D warnings"),
+            ("CARGO_TARGET_DIR", target_value),
+        ],
+    );
+    let cleanup = fs::remove_dir_all(&target)
+        .map_err(|source| XtaskError::io(format!("remove {}", target.display()), source));
+    match (outcome, cleanup) {
+        (Ok(outcome), Ok(())) => Ok(format!("internal:local-link-check | {}", outcome.display)),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(XtaskError::invalid(
+            "documentation gate",
+            format!("{error}; cleanup also failed: {cleanup}"),
+        )),
+    }
+}
+
+fn documentation_target_directory() -> Result<PathBuf, XtaskError> {
+    let nonce = unix_time_ms()?;
+    Ok(env::temp_dir().join(format!(
+        "positron-quality-doc-{}-{nonce}",
+        std::process::id()
+    )))
 }
 
 fn run_error_policy_gate(root: &Path, registry: &Registry) -> Result<String, XtaskError> {
@@ -1483,50 +1518,28 @@ fn run_status<'argument>(
         .collect::<Vec<_>>();
     let display = command_display(program, &arguments);
     println!("  $ {display}");
-    let mut command = Command::new(program);
-    command
-        .current_dir(root)
-        .args(&arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    configure_child_path(&mut command, root)?;
-    for (name, value) in environment {
-        command.env(name, value);
+    let verdict = controlled_execution::execute(InvocationSpec {
+        program: OsString::from(program),
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: controlled_environment(root, environment)?,
+        input: InvocationInput::Null,
+        output: OutputMode::Inherit,
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(timeout)?,
+    })
+    .into_result()
+    .map_err(XtaskError::controlled_harness)?;
+    if verdict.status.success() {
+        return Ok(CommandOutcome {
+            display,
+            stdout: verdict.output.stdout,
+        });
     }
-    let mut child = command
-        .spawn()
-        .map_err(|source| XtaskError::io(format!("spawn `{display}`"), source))?;
-    let started = Instant::now();
-    loop {
-        match child
-            .try_wait()
-            .map_err(|source| XtaskError::io(format!("wait for `{display}`"), source))?
-        {
-            Some(status) if status.success() => {
-                return Ok(CommandOutcome {
-                    display,
-                    stdout: String::new(),
-                });
-            },
-            Some(status) => {
-                return Err(XtaskError::command(
-                    display,
-                    format!("exit status {status}"),
-                ));
-            },
-            None if started.elapsed() >= timeout => {
-                child
-                    .kill()
-                    .map_err(|source| XtaskError::io(format!("terminate `{display}`"), source))?;
-                let _status = child
-                    .wait()
-                    .map_err(|source| XtaskError::io(format!("reap `{display}`"), source))?;
-                return Err(XtaskError::timeout(display, timeout.as_secs()));
-            },
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    }
+    Err(XtaskError::command(
+        display,
+        format!("exit status {}", verdict.status),
+    ))
 }
 
 fn run_capture<'argument>(
@@ -1536,95 +1549,58 @@ fn run_capture<'argument>(
     timeout: Duration,
     environment: &[(&str, &str)],
 ) -> Result<CommandOutcome, XtaskError> {
+    run_capture_with_input(
+        root,
+        program,
+        arguments,
+        timeout,
+        environment,
+        InvocationInput::Null,
+    )
+}
+
+fn run_capture_with_input<'argument>(
+    root: &Path,
+    program: &str,
+    arguments: impl IntoIterator<Item = &'argument str>,
+    timeout: Duration,
+    environment: &[(&str, &str)],
+    input: InvocationInput,
+) -> Result<CommandOutcome, XtaskError> {
     let arguments = arguments
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
     let display = command_display(program, &arguments);
-    let mut command = Command::new(program);
-    command
-        .current_dir(root)
-        .args(&arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_child_path(&mut command, root)?;
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|source| XtaskError::io(format!("spawn `{display}`"), source))?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        XtaskError::invalid(format!("command `{display}`"), "stdout pipe is unavailable")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        XtaskError::invalid(format!("command `{display}`"), "stderr pipe is unavailable")
-    })?;
-    let stdout_reader = spawn_output_reader(stdout);
-    let stderr_reader = spawn_output_reader(stderr);
-    let started = Instant::now();
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|source| XtaskError::io(format!("wait for `{display}`"), source))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                child
-                    .kill()
-                    .map_err(|source| XtaskError::io(format!("terminate `{display}`"), source))?;
-                let _status = child
-                    .wait()
-                    .map_err(|source| XtaskError::io(format!("reap `{display}`"), source))?;
-                let _stdout = join_output_reader(stdout_reader, &display, "stdout")?;
-                let _stderr = join_output_reader(stderr_reader, &display, "stderr")?;
-                return Err(XtaskError::timeout(display, timeout.as_secs()));
-            },
-            None => thread::sleep(Duration::from_millis(25)),
-        }
-    };
-    let mut stdout = join_output_reader(stdout_reader, &display, "stdout")?;
-    let stderr = join_output_reader(stderr_reader, &display, "stderr")?;
-    stdout.push_str(&stderr);
-    if !status.success() {
+    let verdict = controlled_execution::execute(InvocationSpec {
+        program: OsString::from(program),
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: controlled_environment(root, environment)?,
+        input,
+        output: OutputMode::Capture {
+            maximum_bytes_per_stream: 1_048_576,
+        },
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(timeout)?,
+    })
+    .into_result()
+    .map_err(XtaskError::controlled_harness)?;
+    if !verdict.status.success() {
         return Err(XtaskError::command(
             display,
-            format!("exit status {status}: {}", one_line(&stdout)),
+            format!(
+                "exit status {}: stdout={}; stderr={}",
+                verdict.status,
+                one_line(&verdict.output.stdout),
+                one_line(&verdict.output.stderr)
+            ),
         ));
     }
-    Ok(CommandOutcome { display, stdout })
-}
-
-fn spawn_output_reader(
-    mut output: impl Read + Send + 'static,
-) -> thread::JoinHandle<std::io::Result<String>> {
-    thread::spawn(move || {
-        let mut content = String::new();
-        output.read_to_string(&mut content)?;
-        Ok(content)
+    Ok(CommandOutcome {
+        display,
+        stdout: verdict.output.stdout,
     })
-}
-
-fn join_output_reader(
-    reader: thread::JoinHandle<std::io::Result<String>>,
-    command: &str,
-    stream: &str,
-) -> Result<String, XtaskError> {
-    let output = reader.join().map_err(|panic_payload| {
-        let detail = if let Some(message) = panic_payload.downcast_ref::<&str>() {
-            (*message).to_owned()
-        } else if let Some(message) = panic_payload.downcast_ref::<String>() {
-            message.clone()
-        } else {
-            "reader thread panicked without a string payload".to_owned()
-        };
-        XtaskError::invalid(
-            format!("{stream} reader for `{command}`"),
-            format!("reader thread failed: {detail}"),
-        )
-    })?;
-    output.map_err(|source| XtaskError::io(format!("read {stream} from `{command}`"), source))
 }
 
 fn command_display(program: &str, arguments: &[OsString]) -> String {
@@ -1638,19 +1614,63 @@ fn command_display(program: &str, arguments: &[OsString]) -> String {
     parts.join(" ")
 }
 
-fn configure_child_path(command: &mut Command, root: &Path) -> Result<(), XtaskError> {
+fn controlled_environment(
+    root: &Path,
+    environment: &[(&str, &str)],
+) -> Result<Vec<(OsString, OsString)>, XtaskError> {
+    let parent_path = env::var_os("PATH").ok_or_else(|| {
+        XtaskError::invalid(
+            "controlled harness environment",
+            "PATH is required to resolve registered quality tools",
+        )
+    })?;
+    let mut configured =
+        Vec::with_capacity(environment.len() + QUALITY_ENVIRONMENT_SNAPSHOT.len() + 4);
     let local_tools = root.join("target/quality-tools/bin");
-    if !local_tools.is_dir() {
-        return Ok(());
+    let mut paths = Vec::new();
+    if local_tools.is_dir() {
+        paths.push(local_tools);
     }
-    let mut paths = vec![local_tools];
-    if let Some(current) = env::var_os("PATH") {
-        paths.extend(env::split_paths(&current));
-    }
+    paths.extend(env::split_paths(&parent_path));
     let joined = env::join_paths(paths)
         .map_err(|source| XtaskError::invalid("child process PATH", source.to_string()))?;
-    command.env("PATH", joined);
-    Ok(())
+    configured.push((OsString::from("PATH"), joined));
+    for name in QUALITY_ENVIRONMENT_SNAPSHOT {
+        if let Some(value) = env::var_os(name) {
+            configured.push((OsString::from(name), value));
+        }
+    }
+    configured.push((OsString::from("LC_ALL"), OsString::from("C")));
+    configured.push((OsString::from("LANG"), OsString::from("C")));
+    configured.push((OsString::from("TZ"), OsString::from("UTC")));
+    for (name, value) in environment {
+        set_controlled_environment_value(&mut configured, name, OsString::from(value));
+    }
+    Ok(configured)
+}
+
+fn set_controlled_environment_value(
+    environment: &mut Vec<(OsString, OsString)>,
+    name: &str,
+    value: OsString,
+) {
+    if let Some((_, configured)) = environment
+        .iter_mut()
+        .find(|(configured_name, _)| configured_name.as_os_str() == OsStr::new(name))
+    {
+        *configured = value;
+        return;
+    }
+    environment.push((OsString::from(name), value));
+}
+
+fn deadline_after(timeout: Duration) -> Result<Instant, XtaskError> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        XtaskError::invalid(
+            "controlled harness execution",
+            "the declared timeout cannot be represented by the monotonic clock",
+        )
+    })
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, XtaskError> {
@@ -1710,37 +1730,21 @@ fn digest_files(root: &Path, files: &[PathBuf]) -> Result<String, XtaskError> {
         payload.push(0);
     }
 
-    let mut child = Command::new("git")
-        .current_dir(root)
-        .args(["hash-object", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| XtaskError::io("spawn `git hash-object --stdin`", source))?;
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err(XtaskError::invalid(
-            "registry digest",
-            "git hash-object stdin was unavailable",
-        ));
-    };
-    stdin
-        .write_all(&payload)
-        .map_err(|source| XtaskError::io("write registry digest input", source))?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .map_err(|source| XtaskError::io("wait for registry digest", source))?;
-    if !output.status.success() {
+    let output = run_capture_with_input(
+        root,
+        "git",
+        ["hash-object", "--stdin"],
+        Duration::from_secs(10),
+        &[],
+        InvocationInput::Bytes(payload),
+    )?;
+    if output.stdout.is_empty() {
         return Err(XtaskError::command(
             "git hash-object --stdin",
-            format!("exit status {}", output.status),
+            "the controlled invocation returned no standard output",
         ));
     }
-    let digest = String::from_utf8(output.stdout)
-        .map_err(|source| XtaskError::invalid("registry digest encoding", source.to_string()))?
-        .trim()
-        .to_owned();
+    let digest = output.stdout.trim().to_owned();
     if digest.is_empty() {
         return Err(XtaskError::invalid(
             "registry digest",

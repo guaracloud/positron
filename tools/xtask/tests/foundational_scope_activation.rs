@@ -5,10 +5,12 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -24,6 +26,48 @@ fn quality_accepts_the_complete_atomic_foundational_activation_ledger() -> TestR
     let result = fixture.quality();
     let cleanup = fixture.remove();
     cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_returns_a_closed_failure_when_a_controlled_descendant_holds_capture_open() -> TestResult
+{
+    let fixture = Fixture::create()?;
+    let protocol = ControlledDescriptorProtocol::create(&fixture.root)?;
+    install_open_descriptor_git_fixture(&fixture.root, &protocol)?;
+    let mut quality = fixture.quality_child()?;
+
+    let result = (|| {
+        protocol.wait_until_ready(Duration::from_secs(10))?;
+        let status = wait_for_child_exit(&mut quality, Duration::from_secs(2))?;
+        let (stdout, stderr) = read_child_output(&mut quality)?;
+
+        if status.success() {
+            return Err(std::io::Error::other(format!(
+                "the public quality runner accepted an unreconciled controlled descendant: {stdout}\n{stderr}"
+            ))
+            .into());
+        }
+        if !stderr.contains("controlled harness execution failed during descendant") {
+            return Err(std::io::Error::other(format!(
+                "the public quality runner did not expose a controlled-harness failure: {stdout}\n{stderr}"
+            ))
+            .into());
+        }
+        if protocol.descendant_is_running()? {
+            return Err(std::io::Error::other(
+                "the public quality runner returned before reconciling its controlled descendant",
+            )
+            .into());
+        }
+
+        Ok(())
+    })();
+    let cleanup = protocol.cleanup(&mut quality);
+    let remove = fixture.remove();
+    cleanup?;
+    remove?;
     result
 }
 
@@ -437,10 +481,225 @@ impl Fixture {
         Ok(output)
     }
 
+    #[cfg(unix)]
+    fn quality_child(&self) -> TestResult<Child> {
+        Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .current_dir(&self.root)
+            .args(["quality", "--profile", "pre-commit"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(Into::into)
+    }
+
     fn remove(self) -> TestResult {
         fs::remove_dir_all(&self.root)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+struct ControlledDescriptorProtocol {
+    ready: PathBuf,
+    release: PathBuf,
+    pid: PathBuf,
+}
+
+#[cfg(unix)]
+impl ControlledDescriptorProtocol {
+    fn create(root: &Path) -> TestResult<Self> {
+        let directory = root.join("target/controlled-descriptor-protocol");
+        fs::create_dir_all(&directory)?;
+        let release = directory.join("release");
+        let status = Command::new("mkfifo").arg(&release).status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "create controlled descriptor release FIFO failed with {status}"
+            ))
+            .into());
+        }
+        Ok(Self {
+            ready: directory.join("ready"),
+            release,
+            pid: directory.join("descendant.pid"),
+        })
+    }
+
+    fn wait_until_ready(&self, timeout: Duration) -> TestResult {
+        let deadline = Instant::now() + timeout;
+        while !self.ready.is_file() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other(
+                    "controlled descendant did not complete its readiness handshake",
+                )
+                .into());
+            }
+            thread::yield_now();
+        }
+        Ok(())
+    }
+
+    fn descendant_is_running(&self) -> TestResult<bool> {
+        let pid = fs::read_to_string(&self.pid)?.trim().to_owned();
+        if pid.is_empty() {
+            return Err(std::io::Error::other(
+                "controlled descendant did not publish a process identity",
+            )
+            .into());
+        }
+        let status = Command::new("kill")
+            .args(["-0", &pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        Ok(status.success())
+    }
+
+    fn cleanup(&self, quality: &mut Child) -> TestResult {
+        if quality.try_wait()?.is_none() {
+            quality.kill()?;
+            let status = quality.wait()?;
+            if status.success() {
+                return Err(std::io::Error::other(
+                    "controlled quality runner exited successfully after forced termination",
+                )
+                .into());
+            }
+        }
+        self.terminate_descendant()
+    }
+
+    fn terminate_descendant(&self) -> TestResult {
+        if !self.pid.is_file() || !self.descendant_is_running()? {
+            return Ok(());
+        }
+        self.signal_descendant("-TERM")?;
+        if self.wait_until_descendant_stops(Duration::from_secs(2))? {
+            return Ok(());
+        }
+        self.signal_descendant("-KILL")?;
+        if self.wait_until_descendant_stops(Duration::from_secs(2))? {
+            return Ok(());
+        }
+        Err(std::io::Error::other(
+            "controlled descendant remained alive after deterministic cleanup",
+        )
+        .into())
+    }
+
+    fn signal_descendant(&self, signal: &str) -> TestResult {
+        let pid = fs::read_to_string(&self.pid)?.trim().to_owned();
+        let status = Command::new("kill").args([signal, &pid]).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "signal {signal} to controlled descendant failed with {status}"
+        ))
+        .into())
+    }
+
+    fn wait_until_descendant_stops(&self, timeout: Duration) -> TestResult<bool> {
+        let deadline = Instant::now() + timeout;
+        while self.descendant_is_running()? {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::yield_now();
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(unix)]
+fn install_open_descriptor_git_fixture(
+    root: &Path,
+    protocol: &ControlledDescriptorProtocol,
+) -> TestResult {
+    let path = root.join("target/quality-tools/bin/git");
+    let ready = shell_quote(&protocol.ready)?;
+    let release = shell_quote(&protocol.release)?;
+    let pid = shell_quote(&protocol.pid)?;
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+case "${{1:-}}" in
+  rev-parse)
+    (
+      : > {ready}
+      read -r _ < {release}
+    ) &
+    descendant="$!"
+    printf '%s\n' "$descendant" > {pid}
+    while [ ! -f {ready} ]; do
+      :
+    done
+    printf '%s\n' '0000000000000000000000000000000000000000'
+    ;;
+  status)
+    ;;
+  hash-object)
+    cat >/dev/null
+    printf '%s\n' '1111111111111111111111111111111111111111'
+    ;;
+  *)
+    printf 'unsupported fixture git command: %s\n' "${{1:-}}" >&2
+    exit 2
+    ;;
+esac
+"#,
+    );
+    write_tool(&path, &script)
+}
+
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> TestResult<String> {
+    let value = path
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("fixture path is not valid UTF-8"))?;
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> TestResult<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(
+                "public quality runner did not return a closed controlled-harness verdict before its deadline",
+            )
+            .into());
+        }
+        thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn read_child_output(child: &mut Child) -> TestResult<(String, String)> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("public quality runner stdout was unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("public quality runner stderr was unavailable"))?;
+    let mut captured_stdout = String::new();
+    let mut captured_stderr = String::new();
+    let mut stdout = stdout;
+    let mut stderr = stderr;
+    stdout.read_to_string(&mut captured_stdout)?;
+    stderr.read_to_string(&mut captured_stderr)?;
+    Ok((captured_stdout, captured_stderr))
 }
 
 fn assert_fixture_rejected(
