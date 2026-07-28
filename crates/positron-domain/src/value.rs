@@ -99,53 +99,174 @@ impl NestingLimit {
     }
 }
 
-/// One coherent set of typed dynamic-value limits.
+/// Checked request-level bounds in one Value Limit Profile.
 ///
-/// A set contains the byte, collection, and nesting bounds needed by the
-/// current M0 native dynamic-value constructors. The configuration owner later
-/// supplies complete system ceilings and may add further limits without using
-/// wire or provider types in this module.
+/// These limits are native domain values, not wire or durable serialization
+/// formats. Receiver adapters apply compressed and decompressed byte bounds
+/// before structural decode; record and aggregate-attribute bounds are
+/// semantic limits applied after Ingest Policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ValueLimitSet {
-    key_bytes: ByteLimit,
-    value_bytes: ByteLimit,
-    collection_entries: CollectionLimit,
-    nesting_depth: NestingLimit,
+pub struct RequestLimits {
+    request_compressed_bytes: ByteLimit,
+    request_decompressed_bytes: ByteLimit,
+    request_records: CollectionLimit,
+    request_attributes: CollectionLimit,
 }
 
-impl ValueLimitSet {
-    /// Groups already-valid typed limits into one candidate limit set.
+impl RequestLimits {
+    /// Groups all transport and aggregate request bounds.
     #[must_use]
     pub const fn new(
-        key_bytes: ByteLimit,
-        value_bytes: ByteLimit,
-        collection_entries: CollectionLimit,
-        nesting_depth: NestingLimit,
+        request_compressed_bytes: ByteLimit,
+        request_decompressed_bytes: ByteLimit,
+        request_records: CollectionLimit,
+        request_attributes: CollectionLimit,
     ) -> Self {
         Self {
-            key_bytes,
-            value_bytes,
-            collection_entries,
-            nesting_depth,
+            request_compressed_bytes,
+            request_decompressed_bytes,
+            request_records,
+            request_attributes,
         }
     }
 
-    /// Returns the maximum bytes in one dynamic attribute key.
+    /// Returns the maximum compressed bytes in one request.
     #[must_use]
-    pub const fn key_bytes(self) -> ByteLimit {
-        self.key_bytes
+    pub const fn compressed_bytes(self) -> ByteLimit {
+        self.request_compressed_bytes
     }
 
-    /// Returns the maximum bytes in one dynamic value payload.
+    /// Returns the maximum decompressed bytes in one request.
     #[must_use]
-    pub const fn value_bytes(self) -> ByteLimit {
-        self.value_bytes
+    pub const fn decompressed_bytes(self) -> ByteLimit {
+        self.request_decompressed_bytes
     }
 
-    /// Returns the maximum entries in one bounded dynamic collection.
+    /// Returns the maximum records admitted in one request.
     #[must_use]
-    pub const fn collection_entries(self) -> CollectionLimit {
-        self.collection_entries
+    pub const fn records(self) -> CollectionLimit {
+        self.request_records
+    }
+
+    /// Returns the maximum aggregate attributes admitted in one request.
+    #[must_use]
+    pub const fn aggregate_attributes(self) -> CollectionLimit {
+        self.request_attributes
+    }
+
+    const fn exceeds(self, system: Self) -> bool {
+        self.request_compressed_bytes.value() > system.request_compressed_bytes.value()
+            || self.request_decompressed_bytes.value() > system.request_decompressed_bytes.value()
+            || self.request_records.value() > system.request_records.value()
+            || self.request_attributes.value() > system.request_attributes.value()
+    }
+}
+
+/// Checked encoded, decoded, and log-body record bounds in one profile.
+///
+/// These limits are native domain values, not wire or durable serialization
+/// formats. Record owners bound encoded input during safe structural decode;
+/// decoded-record and log-body bounds are semantic limits applied after Ingest
+/// Policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordLimits {
+    encoded_record_bytes: ByteLimit,
+    decoded_record_bytes: ByteLimit,
+    log_body_bytes: ByteLimit,
+}
+
+impl RecordLimits {
+    /// Groups the distinct encoded, decoded, and log-body record bounds.
+    #[must_use]
+    pub const fn new(
+        encoded_record_bytes: ByteLimit,
+        decoded_record_bytes: ByteLimit,
+        log_body_bytes: ByteLimit,
+    ) -> Self {
+        Self {
+            encoded_record_bytes,
+            decoded_record_bytes,
+            log_body_bytes,
+        }
+    }
+
+    /// Returns the maximum encoded bytes in one record.
+    #[must_use]
+    pub const fn encoded_bytes(self) -> ByteLimit {
+        self.encoded_record_bytes
+    }
+
+    /// Returns the maximum decoded bytes in one record.
+    #[must_use]
+    pub const fn decoded_bytes(self) -> ByteLimit {
+        self.decoded_record_bytes
+    }
+
+    /// Returns the maximum bytes in one log body.
+    #[must_use]
+    pub const fn log_body_bytes(self) -> ByteLimit {
+        self.log_body_bytes
+    }
+
+    const fn exceeds(self, system: Self) -> bool {
+        self.encoded_record_bytes.value() > system.encoded_record_bytes.value()
+            || self.decoded_record_bytes.value() > system.decoded_record_bytes.value()
+            || self.log_body_bytes.value() > system.log_body_bytes.value()
+    }
+}
+
+/// Checked native dynamic-value bounds in one Value Limit Profile.
+///
+/// This type has no wire or durable serialization promise. It is applied by
+/// bounded native-value construction; path and key share the one contractually
+/// singular ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DynamicValueLimits {
+    individual_value_bytes: ByteLimit,
+    attributes_per_namespace: CollectionLimit,
+    key_path_bytes: ByteLimit,
+    nesting_depth: NestingLimit,
+    array_entries: CollectionLimit,
+    key_value_list_entries: CollectionLimit,
+}
+
+impl DynamicValueLimits {
+    /// Groups all individual-value, namespace, key/path, and collection bounds.
+    #[must_use]
+    pub const fn new(
+        individual_value_bytes: ByteLimit,
+        attributes_per_namespace: CollectionLimit,
+        key_path_bytes: ByteLimit,
+        nesting_depth: NestingLimit,
+        array_entries: CollectionLimit,
+        key_value_list_entries: CollectionLimit,
+    ) -> Self {
+        Self {
+            individual_value_bytes,
+            attributes_per_namespace,
+            key_path_bytes,
+            nesting_depth,
+            array_entries,
+            key_value_list_entries,
+        }
+    }
+
+    /// Returns the maximum bytes in one individual dynamic value.
+    #[must_use]
+    pub const fn individual_value_bytes(self) -> ByteLimit {
+        self.individual_value_bytes
+    }
+
+    /// Returns the maximum attributes in one native namespace.
+    #[must_use]
+    pub const fn attributes_per_namespace(self) -> CollectionLimit {
+        self.attributes_per_namespace
+    }
+
+    /// Returns the shared maximum bytes in one attribute key or path.
+    #[must_use]
+    pub const fn key_path_bytes(self) -> ByteLimit {
+        self.key_path_bytes
     }
 
     /// Returns the maximum permitted nested collection depth.
@@ -154,11 +275,77 @@ impl ValueLimitSet {
         self.nesting_depth
     }
 
+    /// Returns the maximum entries in one dynamic array.
+    #[must_use]
+    pub const fn array_entries(self) -> CollectionLimit {
+        self.array_entries
+    }
+
+    /// Returns the maximum entries in one ordered dynamic key/value list.
+    #[must_use]
+    pub const fn key_value_list_entries(self) -> CollectionLimit {
+        self.key_value_list_entries
+    }
+
     const fn exceeds(self, system: Self) -> bool {
-        self.key_bytes.value() > system.key_bytes.value()
-            || self.value_bytes.value() > system.value_bytes.value()
-            || self.collection_entries.value() > system.collection_entries.value()
+        self.individual_value_bytes.value() > system.individual_value_bytes.value()
+            || self.attributes_per_namespace.value() > system.attributes_per_namespace.value()
+            || self.key_path_bytes.value() > system.key_path_bytes.value()
             || self.nesting_depth.value() > system.nesting_depth.value()
+            || self.array_entries.value() > system.array_entries.value()
+            || self.key_value_list_entries.value() > system.key_value_list_entries.value()
+    }
+}
+
+/// One complete set of typed Value Limit Profile dimensions.
+///
+/// It combines explicit request, record, and dynamic-value groups. No omitted
+/// dimension receives an implicit or future default, and it makes no wire or
+/// durable serialization promise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValueLimitSet {
+    request: RequestLimits,
+    record: RecordLimits,
+    dynamic_value: DynamicValueLimits,
+}
+
+impl ValueLimitSet {
+    /// Combines the checked request, record, and dynamic-value limit groups.
+    #[must_use]
+    pub const fn new(
+        request: RequestLimits,
+        record: RecordLimits,
+        dynamic_value: DynamicValueLimits,
+    ) -> Self {
+        Self {
+            request,
+            record,
+            dynamic_value,
+        }
+    }
+
+    /// Returns all transport and aggregate request bounds.
+    #[must_use]
+    pub const fn request(self) -> RequestLimits {
+        self.request
+    }
+
+    /// Returns all encoded, decoded, and log-body record bounds.
+    #[must_use]
+    pub const fn record(self) -> RecordLimits {
+        self.record
+    }
+
+    /// Returns all native dynamic-value bounds.
+    #[must_use]
+    pub const fn dynamic_value(self) -> DynamicValueLimits {
+        self.dynamic_value
+    }
+
+    const fn exceeds(self, system: Self) -> bool {
+        self.request.exceeds(system.request)
+            || self.record.exceeds(system.record)
+            || self.dynamic_value.exceeds(system.dynamic_value)
     }
 }
 
@@ -569,9 +756,12 @@ impl AttributeOccurrenceSetCandidate {
         profile: ValueLimitProfile,
     ) -> Result<AttributeOccurrenceSet, DomainFailure> {
         let limits = profile.effective_limits();
-        if exceeds_byte_limit(self.key.len(), limits.key_bytes())
+        if exceeds_byte_limit(self.key.len(), limits.dynamic_value().key_path_bytes())
             || self.occurrences.is_empty()
-            || exceeds_collection_limit(self.occurrences.len(), limits.collection_entries())
+            || exceeds_collection_limit(
+                self.occurrences.len(),
+                limits.dynamic_value().attributes_per_namespace(),
+            )
         {
             return Err(DomainFailure::value_limit_exceeded());
         }
@@ -583,7 +773,7 @@ impl AttributeOccurrenceSetCandidate {
             validated.push(validate_attribute_value(
                 candidate,
                 limits,
-                limits.nesting_depth().value(),
+                limits.dynamic_value().nesting_depth().value(),
             )?);
         }
         Ok(AttributeOccurrenceSet {
@@ -653,13 +843,13 @@ fn validate_attribute_value(
             ValidatedAttributeValueInner::FloatingPointBits(value)
         },
         CandidateAttributeValue::String(value) => {
-            if exceeds_byte_limit(value.len(), limits.value_bytes()) {
+            if exceeds_byte_limit(value.len(), limits.dynamic_value().individual_value_bytes()) {
                 return Err(DomainFailure::value_limit_exceeded());
             }
             ValidatedAttributeValueInner::String(value)
         },
         CandidateAttributeValue::Bytes(value) => {
-            if exceeds_byte_limit(value.len(), limits.value_bytes()) {
+            if exceeds_byte_limit(value.len(), limits.dynamic_value().individual_value_bytes()) {
                 return Err(DomainFailure::value_limit_exceeded());
             }
             ValidatedAttributeValueInner::Bytes(value)
@@ -686,7 +876,7 @@ fn validate_attribute_array(
     let Some(child_depth) = remaining_depth.checked_sub(1) else {
         return Err(DomainFailure::value_limit_exceeded());
     };
-    if exceeds_collection_limit(values.len(), limits.collection_entries()) {
+    if exceeds_collection_limit(values.len(), limits.dynamic_value().array_entries()) {
         return Err(DomainFailure::value_limit_exceeded());
     }
     let mut validated = Vec::new();
@@ -707,7 +897,10 @@ fn validate_key_value_list(
     let Some(child_depth) = remaining_depth.checked_sub(1) else {
         return Err(DomainFailure::value_limit_exceeded());
     };
-    if exceeds_collection_limit(values.len(), limits.collection_entries()) {
+    if exceeds_collection_limit(
+        values.len(),
+        limits.dynamic_value().key_value_list_entries(),
+    ) {
         return Err(DomainFailure::value_limit_exceeded());
     }
     let mut validated = Vec::new();
@@ -715,7 +908,8 @@ fn validate_key_value_list(
         .try_reserve_exact(values.len())
         .map_err(|_| DomainFailure::allocation_unavailable())?;
     for CandidateKeyValue { key, value } in values {
-        if key.is_empty() || exceeds_byte_limit(key.len(), limits.key_bytes()) {
+        if key.is_empty() || exceeds_byte_limit(key.len(), limits.dynamic_value().key_path_bytes())
+        {
             return Err(DomainFailure::value_limit_exceeded());
         }
         validated.push(ValidatedKeyValue {

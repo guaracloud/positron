@@ -70,6 +70,8 @@ const M0_02_MUTATION_SELECTOR: &str = concat!(
     "EventTime::received|ObservedTime::received|",
     "QueryTime::for_log|QueryTime::for_span|validate_present_source_time|",
     "ByteLimit::new|CollectionLimit::new|NestingLimit::new|",
+    "RequestLimits::new|RequestLimits::exceeds|RecordLimits::new|RecordLimits::exceeds|",
+    "DynamicValueLimits::new|DynamicValueLimits::exceeds|ValueLimitSet::new|",
     "ValueLimitSet::exceeds|ValueLimitProfileCandidate::validate|",
     "AttributeOccurrenceSetCandidate::validate|validate_attribute_value|",
     "validate_attribute_array|validate_key_value_list|",
@@ -3078,6 +3080,10 @@ mod tests {
             "ByteLimit::new",
             "CollectionLimit::new",
             "NestingLimit::new",
+            "RequestLimits::new",
+            "RecordLimits::new",
+            "DynamicValueLimits::new",
+            "ValueLimitSet::new",
         ] {
             assert!(
                 M0_02_MUTATION_SELECTOR.contains(owner),

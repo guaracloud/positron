@@ -14,6 +14,34 @@
 //! ```
 //!
 //! ```compile_fail
+//! use positron_domain::value::ValueLimitSet;
+//!
+//! // A complete limit set is assembled only from all three checked groups.
+//! ValueLimitSet {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::RequestLimits;
+//!
+//! // Request limits cannot omit a transport or aggregate request dimension.
+//! RequestLimits {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::RecordLimits;
+//!
+//! // Record limits cannot omit encoded, decoded, or log-body dimensions.
+//! RecordLimits {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::DynamicValueLimits;
+//!
+//! // Dynamic-value limits cannot bypass their complete checked constructor.
+//! DynamicValueLimits {};
+//! ```
+//!
+//! ```compile_fail
 //! use positron_domain::value::ValidatedAttributeValue;
 //!
 //! // A validated value is produced only by bounded validation.

@@ -14,10 +14,39 @@ use positron_domain::{
     },
     value::{
         AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind, ByteLimit,
-        CandidateAttributeValue, CandidateKeyValue, CollectionLimit, NestingLimit,
-        ValueLimitProfileCandidate, ValueLimitSet,
+        CandidateAttributeValue, CandidateKeyValue, CollectionLimit, DynamicValueLimits,
+        NestingLimit, RecordLimits, RequestLimits, ValueLimitProfileCandidate, ValueLimitSet,
     },
 };
+
+fn dynamic_value_limits(
+    key_path_bytes: u32,
+    individual_value_bytes: u32,
+    collection_entries: u32,
+    nesting_depth: u16,
+) -> Result<ValueLimitSet, DomainFailure> {
+    Ok(ValueLimitSet::new(
+        RequestLimits::new(
+            ByteLimit::new(4_096)?,
+            ByteLimit::new(16_384)?,
+            CollectionLimit::new(128)?,
+            CollectionLimit::new(1_024)?,
+        ),
+        RecordLimits::new(
+            ByteLimit::new(16_384)?,
+            ByteLimit::new(65_536)?,
+            ByteLimit::new(65_536)?,
+        ),
+        DynamicValueLimits::new(
+            ByteLimit::new(individual_value_bytes)?,
+            CollectionLimit::new(collection_entries)?,
+            ByteLimit::new(key_path_bytes)?,
+            NestingLimit::new(nesting_depth)?,
+            CollectionLimit::new(collection_entries)?,
+            CollectionLimit::new(collection_entries)?,
+        ),
+    ))
+}
 
 #[test]
 fn tenant_identity_uses_canonical_text_and_rejects_a_sentinel() -> Result<(), DomainFailure> {
@@ -134,18 +163,8 @@ fn reachable_domain_failures_render_as_bounded_safe_diagnostics() -> Result<(), 
 
     let tenant = TenantId::from_bytes([1; 16])?;
     let principal = PrincipalId::from_bytes([2; 16])?;
-    let system_limits = ValueLimitSet::new(
-        ByteLimit::new(16)?,
-        ByteLimit::new(16)?,
-        CollectionLimit::new(1)?,
-        NestingLimit::new(1)?,
-    );
-    let raised_tenant_limits = ValueLimitSet::new(
-        ByteLimit::new(17)?,
-        ByteLimit::new(16)?,
-        CollectionLimit::new(1)?,
-        NestingLimit::new(1)?,
-    );
+    let system_limits = dynamic_value_limits(16, 16, 1, 1)?;
+    let raised_tenant_limits = dynamic_value_limits(17, 16, 1, 1)?;
     let valid_profile = ValueLimitProfileCandidate::new(system_limits, None).validate()?;
 
     assert!(TenantId::from_bytes([0; 16]).is_err_and(is_bounded_diagnostic));
@@ -571,19 +590,92 @@ fn typed_value_limits_reject_the_zero_sentinel() {
 }
 
 #[test]
+fn value_limit_set_exposes_every_contract_dimension() -> Result<(), DomainFailure> {
+    let limits = ValueLimitSet::new(
+        RequestLimits::new(
+            ByteLimit::new(10)?,
+            ByteLimit::new(20)?,
+            CollectionLimit::new(30)?,
+            CollectionLimit::new(40)?,
+        ),
+        RecordLimits::new(
+            ByteLimit::new(50)?,
+            ByteLimit::new(60)?,
+            ByteLimit::new(70)?,
+        ),
+        DynamicValueLimits::new(
+            ByteLimit::new(80)?,
+            CollectionLimit::new(90)?,
+            ByteLimit::new(100)?,
+            NestingLimit::new(110)?,
+            CollectionLimit::new(120)?,
+            CollectionLimit::new(130)?,
+        ),
+    );
+
+    assert_eq!(limits.request().compressed_bytes().value(), 10);
+    assert_eq!(limits.request().decompressed_bytes().value(), 20);
+    assert_eq!(limits.request().records().value(), 30);
+    assert_eq!(limits.request().aggregate_attributes().value(), 40);
+    assert_eq!(limits.record().encoded_bytes().value(), 50);
+    assert_eq!(limits.record().decoded_bytes().value(), 60);
+    assert_eq!(limits.record().log_body_bytes().value(), 70);
+    assert_eq!(limits.dynamic_value().individual_value_bytes().value(), 80);
+    assert_eq!(
+        limits.dynamic_value().attributes_per_namespace().value(),
+        90
+    );
+    assert_eq!(limits.dynamic_value().key_path_bytes().value(), 100);
+    assert_eq!(limits.dynamic_value().nesting_depth().value(), 110);
+    assert_eq!(limits.dynamic_value().array_entries().value(), 120);
+    assert_eq!(limits.dynamic_value().key_value_list_entries().value(), 130);
+
+    Ok(())
+}
+
+#[test]
 fn value_limit_profile_validation_allows_equality_and_tenant_lowering() -> Result<(), DomainFailure>
 {
-    let system = ValueLimitSet::new(
-        ByteLimit::new(32)?,
-        ByteLimit::new(64)?,
-        CollectionLimit::new(4)?,
-        NestingLimit::new(2)?,
+    let request = RequestLimits::new(
+        ByteLimit::new(10)?,
+        ByteLimit::new(20)?,
+        CollectionLimit::new(30)?,
+        CollectionLimit::new(40)?,
     );
+    let record = RecordLimits::new(
+        ByteLimit::new(50)?,
+        ByteLimit::new(60)?,
+        ByteLimit::new(70)?,
+    );
+    let dynamic_value = DynamicValueLimits::new(
+        ByteLimit::new(80)?,
+        CollectionLimit::new(90)?,
+        ByteLimit::new(100)?,
+        NestingLimit::new(110)?,
+        CollectionLimit::new(120)?,
+        CollectionLimit::new(130)?,
+    );
+    let system = ValueLimitSet::new(request, record, dynamic_value);
     let lowered_tenant = ValueLimitSet::new(
-        ByteLimit::new(16)?,
-        ByteLimit::new(32)?,
-        CollectionLimit::new(2)?,
-        NestingLimit::new(1)?,
+        RequestLimits::new(
+            ByteLimit::new(9)?,
+            ByteLimit::new(19)?,
+            CollectionLimit::new(29)?,
+            CollectionLimit::new(39)?,
+        ),
+        RecordLimits::new(
+            ByteLimit::new(49)?,
+            ByteLimit::new(59)?,
+            ByteLimit::new(69)?,
+        ),
+        DynamicValueLimits::new(
+            ByteLimit::new(79)?,
+            CollectionLimit::new(89)?,
+            ByteLimit::new(99)?,
+            NestingLimit::new(109)?,
+            CollectionLimit::new(119)?,
+            CollectionLimit::new(129)?,
+        ),
     );
 
     let profile = ValueLimitProfileCandidate::new(system, Some(lowered_tenant)).validate()?;
@@ -592,37 +684,20 @@ fn value_limit_profile_validation_allows_equality_and_tenant_lowering() -> Resul
 
     let equal_profile = ValueLimitProfileCandidate::new(system, Some(system)).validate()?;
     assert_eq!(
-        equal_profile.tenant_limits().map(ValueLimitSet::key_bytes),
-        Some(system.key_bytes()),
-        "tenant key bytes may equal the configured system maximum"
-    );
-    assert_eq!(
-        equal_profile
-            .tenant_limits()
-            .map(ValueLimitSet::value_bytes),
-        Some(system.value_bytes()),
-        "tenant value bytes may equal the configured system maximum"
-    );
-    assert_eq!(
-        equal_profile
-            .tenant_limits()
-            .map(ValueLimitSet::collection_entries),
-        Some(system.collection_entries()),
-        "tenant collection entries may equal the configured system maximum"
-    );
-    assert_eq!(
-        equal_profile
-            .tenant_limits()
-            .map(ValueLimitSet::nesting_depth),
-        Some(system.nesting_depth()),
-        "tenant nesting depth may equal the configured system maximum"
+        equal_profile.effective_limits(),
+        system,
+        "each tenant dimension may equal its configured system maximum"
     );
 
     let raised_tenant = ValueLimitSet::new(
-        ByteLimit::new(33)?,
-        ByteLimit::new(32)?,
-        CollectionLimit::new(2)?,
-        NestingLimit::new(1)?,
+        RequestLimits::new(
+            ByteLimit::new(11)?,
+            ByteLimit::new(20)?,
+            CollectionLimit::new(30)?,
+            CollectionLimit::new(40)?,
+        ),
+        record,
+        dynamic_value,
     );
     assert!(matches!(
         ValueLimitProfileCandidate::new(system, Some(raised_tenant)).validate(),
@@ -637,35 +712,167 @@ fn value_limit_profile_validation_allows_equality_and_tenant_lowering() -> Resul
 #[test]
 fn tenant_limit_profile_rejects_an_increase_in_each_independent_dimension()
 -> Result<(), DomainFailure> {
-    let system = ValueLimitSet::new(
-        ByteLimit::new(16)?,
-        ByteLimit::new(32)?,
-        CollectionLimit::new(4)?,
-        NestingLimit::new(2)?,
+    let request = RequestLimits::new(
+        ByteLimit::new(10)?,
+        ByteLimit::new(20)?,
+        CollectionLimit::new(30)?,
+        CollectionLimit::new(40)?,
     );
-    let raised_value_bytes = ValueLimitSet::new(
-        ByteLimit::new(16)?,
-        ByteLimit::new(33)?,
-        CollectionLimit::new(4)?,
-        NestingLimit::new(2)?,
+    let record = RecordLimits::new(
+        ByteLimit::new(50)?,
+        ByteLimit::new(60)?,
+        ByteLimit::new(70)?,
     );
-    let raised_collection_entries = ValueLimitSet::new(
-        ByteLimit::new(16)?,
-        ByteLimit::new(32)?,
-        CollectionLimit::new(5)?,
-        NestingLimit::new(2)?,
+    let dynamic_value = DynamicValueLimits::new(
+        ByteLimit::new(80)?,
+        CollectionLimit::new(90)?,
+        ByteLimit::new(100)?,
+        NestingLimit::new(110)?,
+        CollectionLimit::new(120)?,
+        CollectionLimit::new(130)?,
     );
-    let raised_nesting_depth = ValueLimitSet::new(
-        ByteLimit::new(16)?,
-        ByteLimit::new(32)?,
-        CollectionLimit::new(4)?,
-        NestingLimit::new(3)?,
-    );
+    let system = ValueLimitSet::new(request, record, dynamic_value);
 
     for tenant in [
-        raised_value_bytes,
-        raised_collection_entries,
-        raised_nesting_depth,
+        ValueLimitSet::new(
+            RequestLimits::new(
+                ByteLimit::new(11)?,
+                ByteLimit::new(20)?,
+                CollectionLimit::new(30)?,
+                CollectionLimit::new(40)?,
+            ),
+            record,
+            dynamic_value,
+        ),
+        ValueLimitSet::new(
+            RequestLimits::new(
+                ByteLimit::new(10)?,
+                ByteLimit::new(21)?,
+                CollectionLimit::new(30)?,
+                CollectionLimit::new(40)?,
+            ),
+            record,
+            dynamic_value,
+        ),
+        ValueLimitSet::new(
+            RequestLimits::new(
+                ByteLimit::new(10)?,
+                ByteLimit::new(20)?,
+                CollectionLimit::new(31)?,
+                CollectionLimit::new(40)?,
+            ),
+            record,
+            dynamic_value,
+        ),
+        ValueLimitSet::new(
+            RequestLimits::new(
+                ByteLimit::new(10)?,
+                ByteLimit::new(20)?,
+                CollectionLimit::new(30)?,
+                CollectionLimit::new(41)?,
+            ),
+            record,
+            dynamic_value,
+        ),
+        ValueLimitSet::new(
+            request,
+            RecordLimits::new(
+                ByteLimit::new(51)?,
+                ByteLimit::new(60)?,
+                ByteLimit::new(70)?,
+            ),
+            dynamic_value,
+        ),
+        ValueLimitSet::new(
+            request,
+            RecordLimits::new(
+                ByteLimit::new(50)?,
+                ByteLimit::new(61)?,
+                ByteLimit::new(70)?,
+            ),
+            dynamic_value,
+        ),
+        ValueLimitSet::new(
+            request,
+            RecordLimits::new(
+                ByteLimit::new(50)?,
+                ByteLimit::new(60)?,
+                ByteLimit::new(71)?,
+            ),
+            dynamic_value,
+        ),
+        ValueLimitSet::new(
+            request,
+            record,
+            DynamicValueLimits::new(
+                ByteLimit::new(81)?,
+                CollectionLimit::new(90)?,
+                ByteLimit::new(100)?,
+                NestingLimit::new(110)?,
+                CollectionLimit::new(120)?,
+                CollectionLimit::new(130)?,
+            ),
+        ),
+        ValueLimitSet::new(
+            request,
+            record,
+            DynamicValueLimits::new(
+                ByteLimit::new(80)?,
+                CollectionLimit::new(91)?,
+                ByteLimit::new(100)?,
+                NestingLimit::new(110)?,
+                CollectionLimit::new(120)?,
+                CollectionLimit::new(130)?,
+            ),
+        ),
+        ValueLimitSet::new(
+            request,
+            record,
+            DynamicValueLimits::new(
+                ByteLimit::new(80)?,
+                CollectionLimit::new(90)?,
+                ByteLimit::new(101)?,
+                NestingLimit::new(110)?,
+                CollectionLimit::new(120)?,
+                CollectionLimit::new(130)?,
+            ),
+        ),
+        ValueLimitSet::new(
+            request,
+            record,
+            DynamicValueLimits::new(
+                ByteLimit::new(80)?,
+                CollectionLimit::new(90)?,
+                ByteLimit::new(100)?,
+                NestingLimit::new(111)?,
+                CollectionLimit::new(120)?,
+                CollectionLimit::new(130)?,
+            ),
+        ),
+        ValueLimitSet::new(
+            request,
+            record,
+            DynamicValueLimits::new(
+                ByteLimit::new(80)?,
+                CollectionLimit::new(90)?,
+                ByteLimit::new(100)?,
+                NestingLimit::new(110)?,
+                CollectionLimit::new(121)?,
+                CollectionLimit::new(130)?,
+            ),
+        ),
+        ValueLimitSet::new(
+            request,
+            record,
+            DynamicValueLimits::new(
+                ByteLimit::new(80)?,
+                CollectionLimit::new(90)?,
+                ByteLimit::new(100)?,
+                NestingLimit::new(110)?,
+                CollectionLimit::new(120)?,
+                CollectionLimit::new(131)?,
+            ),
+        ),
     ] {
         assert!(matches!(
             ValueLimitProfileCandidate::new(system, Some(tenant)).validate(),
@@ -681,18 +888,8 @@ fn tenant_limit_profile_rejects_an_increase_in_each_independent_dimension()
 #[test]
 fn validated_profile_applies_tenant_lowered_limits_as_effective_limits() -> Result<(), DomainFailure>
 {
-    let system = ValueLimitSet::new(
-        ByteLimit::new(32)?,
-        ByteLimit::new(64)?,
-        CollectionLimit::new(4)?,
-        NestingLimit::new(2)?,
-    );
-    let tenant = ValueLimitSet::new(
-        ByteLimit::new(16)?,
-        ByteLimit::new(32)?,
-        CollectionLimit::new(2)?,
-        NestingLimit::new(1)?,
-    );
+    let system = dynamic_value_limits(32, 64, 4, 2)?;
+    let tenant = dynamic_value_limits(16, 32, 2, 1)?;
     let effective = ValueLimitProfileCandidate::new(system, Some(tenant))
         .validate()?
         .effective_limits();
@@ -705,16 +902,8 @@ fn validated_profile_applies_tenant_lowered_limits_as_effective_limits() -> Resu
 #[test]
 fn validated_attribute_occurrences_preserve_order_and_typed_variants() -> Result<(), DomainFailure>
 {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(2)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 2, 1)?, None).validate()?;
     let occurrences = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "status".to_owned(),
@@ -752,16 +941,8 @@ fn validated_attribute_occurrences_preserve_order_and_typed_variants() -> Result
 
 #[test]
 fn validated_attribute_occurrence_sets_are_never_empty() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
     let occurrences = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "status".to_owned(),
@@ -777,16 +958,8 @@ fn validated_attribute_occurrence_sets_are_never_empty() -> Result<(), DomainFai
 
 #[test]
 fn empty_attribute_occurrence_sets_are_rejected() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(AttributeNamespace::Record, "status".to_owned(), vec![])
@@ -801,16 +974,8 @@ fn empty_attribute_occurrence_sets_are_rejected() -> Result<(), DomainFailure> {
 
 #[test]
 fn attribute_occurrence_keys_cannot_exceed_the_profile_byte_limit() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(4)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(4, 16, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(
@@ -829,16 +994,8 @@ fn attribute_occurrence_keys_cannot_exceed_the_profile_byte_limit() -> Result<()
 
 #[test]
 fn attribute_occurrence_count_cannot_exceed_the_profile_limit() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(
@@ -857,16 +1014,8 @@ fn attribute_occurrence_count_cannot_exceed_the_profile_limit() -> Result<(), Do
 
 #[test]
 fn validated_attribute_values_preserve_non_string_scalar_kinds() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(3)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 3, 1)?, None).validate()?;
     let occurrences = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "kind".to_owned(),
@@ -905,16 +1054,8 @@ fn validated_attribute_values_preserve_non_string_scalar_kinds() -> Result<(), D
 
 #[test]
 fn validated_attribute_values_preserve_every_declared_kind() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(8)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 8, 1)?, None).validate()?;
     let occurrences = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "kind".to_owned(),
@@ -972,16 +1113,8 @@ fn validated_attribute_values_preserve_every_declared_kind() -> Result<(), Domai
 
 #[test]
 fn typed_value_accessors_never_coerce_across_dynamic_value_kinds() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(7)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 7, 1)?, None).validate()?;
     let occurrences = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "kind".to_owned(),
@@ -1050,16 +1183,8 @@ fn typed_value_accessors_never_coerce_across_dynamic_value_kinds() -> Result<(),
 
 #[test]
 fn bytes_attribute_value_is_bounded_without_silent_truncation() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(2)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 2, 1, 1)?, None).validate()?;
 
     let accepted = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
@@ -1089,16 +1214,8 @@ fn bytes_attribute_value_is_bounded_without_silent_truncation() -> Result<(), Do
 
 #[test]
 fn string_attribute_value_is_bounded_without_silent_truncation() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(2)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 2, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(
@@ -1117,16 +1234,8 @@ fn string_attribute_value_is_bounded_without_silent_truncation() -> Result<(), D
 
 #[test]
 fn nested_attribute_arrays_stop_at_the_profile_depth() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
     let accepted = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "nested".to_owned(),
@@ -1160,16 +1269,8 @@ fn nested_attribute_arrays_stop_at_the_profile_depth() -> Result<(), DomainFailu
 
 #[test]
 fn attribute_arrays_reject_more_entries_than_the_profile_allows() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(
@@ -1191,16 +1292,8 @@ fn attribute_arrays_reject_more_entries_than_the_profile_allows() -> Result<(), 
 
 #[test]
 fn key_value_list_preserves_ordered_typed_entries() -> Result<(), Box<dyn std::error::Error>> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(2)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 2, 1)?, None).validate()?;
     let list = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "metadata".to_owned(),
@@ -1235,16 +1328,8 @@ fn key_value_list_preserves_ordered_typed_entries() -> Result<(), Box<dyn std::e
 
 #[test]
 fn key_value_lists_reject_more_entries_than_the_profile_allows() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(
@@ -1266,16 +1351,8 @@ fn key_value_lists_reject_more_entries_than_the_profile_allows() -> Result<(), D
 
 #[test]
 fn key_value_lists_reject_empty_entry_keys() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(
@@ -1297,16 +1374,8 @@ fn key_value_lists_reject_empty_entry_keys() -> Result<(), DomainFailure> {
 
 #[test]
 fn nested_key_value_lists_stop_at_the_profile_depth() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(16)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(16, 16, 1, 1)?, None).validate()?;
     let nested = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
         "outer".to_owned(),
         CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
@@ -1332,16 +1401,8 @@ fn nested_key_value_lists_stop_at_the_profile_depth() -> Result<(), DomainFailur
 
 #[test]
 fn key_value_entry_keys_cannot_exceed_the_profile_byte_limit() -> Result<(), DomainFailure> {
-    let profile = ValueLimitProfileCandidate::new(
-        ValueLimitSet::new(
-            ByteLimit::new(4)?,
-            ByteLimit::new(16)?,
-            CollectionLimit::new(1)?,
-            NestingLimit::new(1)?,
-        ),
-        None,
-    )
-    .validate()?;
+    let profile =
+        ValueLimitProfileCandidate::new(dynamic_value_limits(4, 16, 1, 1)?, None).validate()?;
 
     assert!(matches!(
         AttributeOccurrenceSetCandidate::new(
