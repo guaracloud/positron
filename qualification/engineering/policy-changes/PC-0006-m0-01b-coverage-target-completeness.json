@@ -97,7 +97,30 @@
       "workflow_run": "30384259617",
       "status": "stale after structured coverage-spec and verdict-seam review remediation; no result or qualification claim is made"
     },
-    "dual_run": "The retained dirty M0-02 attempt, clean-main M0-01B red run, committed-SHA diagnostic green run, and failed exact-SHA fixture regression are separate attempts with separate attribution. Prior exact-head CI EXT dispatches are superseded by review remediation and cannot qualify the new revision. A final exact-SHA EXT run is required on the review-remediated revision."
+    "superseded_public_verdict_remediation_ext_dispatch": {
+      "revision": "e60cce590032e94ae209330eddec6e394be46383",
+      "workflow_run": "30385362200",
+      "status": "stale after the final public-verdict test remediation; no result or qualification claim is made"
+    },
+    "ticket_scoped_coverage": {
+      "revision": "6182148a10b1fcde4d4e1b67ccf07d268798a518",
+      "command": "cargo +nightly-2026-07-20 llvm-cov --locked --package xtask --bin xtask --test foundational_scope_activation --branch --json --output-path target/quality/coverage/m0-01b-focused-6182148.json",
+      "report": "target/quality/coverage/m0-01b-focused-6182148.json",
+      "report_sha256": "cd79d30d50e32906223d72c79f88a929c9a68cedd031370b1768961489f2aaec",
+      "result": "passed-local-diagnostic",
+      "scope": [
+        "CoverageCommandSpec::arguments",
+        "m0_01b_coverage_command_specs",
+        "validate_m0_01b_coverage_command_specs"
+      ],
+      "method": "Counts are deduplicated by exact source region across code-generation instances in the raw LLVM JSON report, with a source location covered when any emitted instance is covered. The line count is the union of source lines spanned by those regions. The branch count is the two outcomes for ignored_sources Some or None and the two outcomes for accepted or rejected required target selection.",
+      "line": "49/49 = 100 percent",
+      "region": "43/43 = 100 percent",
+      "branch": "4/4 = 100 percent",
+      "readiness_verdicts": "The same command passed all 20 controlled-execution owner tests, including the bounded escaped-descriptor deadline verdict and the two public execute-verdict tests for escaped descriptors with unread input; the foundational policy target passed all 56 fixtures.",
+      "attribution": "This is focused coverage of the behavior introduced by issue 156, not the legacy repository-wide changed-code aggregate. It changes no frozen threshold, stage, exclusion, or gate and makes no merge-eligible or qualification claim."
+    },
+    "dual_run": "The retained dirty M0-02 attempt, clean-main M0-01B red run, committed-SHA diagnostic green run, failed exact-SHA fixture regression, and focused issue 156 coverage run are separate attempts with separate attribution. Prior exact-head CI EXT dispatches are superseded by review remediation and cannot qualify the new revision. A final exact-SHA EXT run is required on the review-remediated revision."
   },
   "approvals_required": [
     "Architecture",
