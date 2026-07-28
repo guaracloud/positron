@@ -13,7 +13,7 @@ must satisfy [the standards](docs/engineering/standards.md) through
 
 ## Start here
 
-1. Install the exact tool versions listed in
+1. Install the exact `pr` profile tools listed in
    `qualification/engineering/toolchains.tsv`.
 2. Run `cargo xtask setup` once to install the repository-managed Git hooks.
 3. Run `cargo xtask quality` before requesting review.
@@ -22,15 +22,22 @@ The quality runner produces local evidence under `target/quality/evidence/`.
 Local evidence is deliberately marked ineligible for merge; trusted CI evidence
 is bound to the pull-request or merge-group revision.
 
+The normal development path is intentionally lightweight: pre-commit runs
+fast structural checks, while pre-push and pull-request CI run the host build,
+formatting, lints, tests, docs, current-tree secret scan, dependency policy,
+and advisory scan. Cross-target builds, coverage, full-history secret scans,
+and Cargo Vet run in the scheduled extended profile rather than on every push.
+
 ## Scaffold boundary
 
-Every application crate is registered as `scaffold` in
-`qualification/engineering/scopes.tsv`. The architecture gate permits only
-crate documentation, inherited policy, and the empty composition-root entry
-point while that state remains active. Before product behavior is added, the
-owning change must activate the exact module scope, freeze its measured
-thresholds, register its risks and test entry points, and satisfy the mapped
-gates. Editing a marker cannot silently bypass that transition.
+The foundational domain, API, and configuration boundaries are active but
+still contain no product behavior. Every other application crate remains
+registered as `scaffold` in `qualification/engineering/scopes.tsv`. The
+architecture gate permits only crate documentation, inherited policy, and the
+empty composition-root entry point for a scaffold scope. Before product
+behavior is added, the owning change must activate the exact module scope,
+register its risks and test entry points, and satisfy the mapped gates. Editing
+a marker cannot silently bypass that transition.
 
 The API, Grafana integration, SDK, deployment, fuzz, and model roots are
 likewise locked by `qualification/engineering/artifact-scopes.tsv`; code placed

@@ -18,9 +18,11 @@ cargo xtask quality
 ```
 
 `setup` configures this checkout to use `.githooks/`. It does not change global
-Git configuration. The pre-commit hook runs the bounded fast profile; the
-pre-push hook runs the complete PR profile. Hooks are convenience feedback.
-Protected-branch CI is authoritative.
+Git configuration. The pre-commit hook runs the bounded fast profile and the
+pre-push hook runs the complete lightweight PR profile. Expensive cross-target,
+coverage, full-history, and deep supply-chain campaigns run in the scheduled
+extended profile. Hooks are convenience feedback; protected-branch CI is
+authoritative.
 
 ## Change discipline
 
@@ -37,7 +39,7 @@ Before editing code:
 
 Application crates begin in a machine-enforced scaffold-only state. Activating
 one requires an owner, explicit allowed dependency edges, risk gates, test
-entry points, measured coverage and mutation baselines, and any required threat
+entry points, applicable measured coverage baselines, and any required threat
 model or format/API decision. The gate runner rejects application behavior in
 an unactivated crate.
 

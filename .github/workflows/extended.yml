@@ -44,7 +44,6 @@ jobs:
           cargo install --locked --version 0.9.2 cargo-machete
           cargo install --locked --version 0.10.2 cargo-vet
           cargo install --locked --version 0.8.7 cargo-llvm-cov
-          cargo install --locked --version 27.1.0 cargo-mutants
           archive="$RUNNER_TEMP/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           install_dir="$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}"
           curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \

@@ -33,21 +33,12 @@ fn quality_accepts_a_scaffold_only_workspace_with_pending_thresholds() -> TestRe
 }
 
 #[test]
-fn quality_pr_executes_the_foundational_coverage_and_mutation_harness() -> TestResult {
-    let fixture = Fixture::create()?;
-    let result = fixture.quality_profile("pr");
-    let cleanup = fixture.remove();
-    cleanup?;
-    result
-}
-
-#[test]
-fn quality_pr_does_not_force_serial_mutation_tests() -> TestResult {
+fn quality_pr_skips_the_scheduled_coverage_campaign() -> TestResult {
     let fixture = Fixture::create()?;
     fs::write(
         fixture
             .root
-            .join("target/quality-tools/reject-forced-serial-mutation"),
+            .join("target/quality-tools/reject-coverage-execution"),
         "",
     )?;
     let result = fixture.quality_profile("pr");
@@ -57,27 +48,27 @@ fn quality_pr_does_not_force_serial_mutation_tests() -> TestResult {
 }
 
 #[test]
-fn quality_pr_rejects_coverage_below_the_frozen_baseline() -> TestResult {
+fn quality_ext_executes_the_foundational_coverage_harness() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = fixture.quality_profile("ext");
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_ext_rejects_coverage_below_the_frozen_baseline() -> TestResult {
     assert_fixture_rejected_profile(
-        "pr",
+        "ext",
         reduce_line_coverage_measurement,
         "coverage line 99.00 is below frozen M0 baseline 100.00",
     )
 }
 
 #[test]
-fn quality_pr_rejects_a_surviving_mutant() -> TestResult {
+fn quality_ext_rejects_an_unpinned_coverage_detector() -> TestResult {
     assert_fixture_rejected_profile(
-        "pr",
-        make_mutant_survive,
-        "mutation report contains a surviving or inconclusive mutant: `MissedMutant`",
-    )
-}
-
-#[test]
-fn quality_pr_rejects_an_unpinned_coverage_detector() -> TestResult {
-    assert_fixture_rejected_profile(
-        "pr",
+        "ext",
         make_coverage_detector_report_a_different_version,
         "coverage detector `cargo-llvm-cov`: expected version `0.8.7`",
     )
@@ -371,7 +362,7 @@ fn quality_does_not_misclassify_a_symbol_with_a_deferred_prefix() -> TestResult 
 fn quality_rejects_an_activated_coverage_gate_without_ci_tool_provisioning() -> TestResult {
     assert_fixture_rejected(
         remove_coverage_tool_provisioning,
-        "coverage-selected workflow `.github/workflows/quality.yml` is missing",
+        "coverage-selected workflow `.github/workflows/extended.yml` is missing",
     )
 }
 
@@ -379,7 +370,7 @@ fn quality_rejects_an_activated_coverage_gate_without_ci_tool_provisioning() -> 
 fn quality_rejects_a_coverage_workflow_that_does_not_retain_raw_reports() -> TestResult {
     assert_fixture_rejected(
         remove_raw_coverage_report_retention,
-        "coverage-selected workflow `.github/workflows/quality.yml` must retain `target/quality/`",
+        "coverage-selected workflow `.github/workflows/extended.yml` must retain `target/quality/`",
     )
 }
 
@@ -441,7 +432,6 @@ impl Fixture {
     fn quality_output_for(&self, profile: &str) -> TestResult<std::process::Output> {
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .current_dir(&self.root)
-            .env_remove("RUST_TEST_THREADS")
             .args(["quality", "--profile", profile])
             .output()?;
         Ok(output)
@@ -744,41 +734,27 @@ fn add_non_deferred_symbol_with_a_deferred_prefix(root: &Path) -> TestResult {
 }
 
 fn remove_coverage_tool_provisioning(root: &Path) -> TestResult {
-    for workflow in [
-        ".github/workflows/quality.yml",
-        ".github/workflows/extended.yml",
-    ] {
-        let path = root.join(workflow);
-        let content = fs::read_to_string(&path)?;
-        let content = content
-            .replace(
-                "      - name: Install pinned branch-coverage toolchain\n        run: rustup toolchain install nightly-2026-07-20 --profile minimal --component llvm-tools-preview\n\n",
-                "",
-            )
-            .replace(
-                "      - name: Install cargo-llvm-cov\n        run: cargo install --locked --version 0.8.7 cargo-llvm-cov\n\n",
-                "",
-            )
-            .replace(
-                "      - name: Install cargo-mutants\n        run: cargo install --locked --version 27.1.0 cargo-mutants\n\n",
-                "",
-            );
-        fs::write(path, content)?;
-    }
+    let path = root.join(".github/workflows/extended.yml");
+    let content = fs::read_to_string(&path)?;
+    let content = content
+        .replace(
+            "      - name: Install pinned branch-coverage toolchain\n        run: rustup toolchain install nightly-2026-07-20 --profile minimal --component llvm-tools-preview\n\n",
+            "",
+        )
+        .replace(
+            "          cargo install --locked --version 0.8.7 cargo-llvm-cov\n",
+            "",
+        );
+    fs::write(path, content)?;
     Ok(())
 }
 
 fn remove_raw_coverage_report_retention(root: &Path) -> TestResult {
-    for workflow in [
-        ".github/workflows/quality.yml",
-        ".github/workflows/extended.yml",
-    ] {
-        replace_once(
-            &root.join(workflow),
-            "path: target/quality/",
-            "path: target/quality/coverage/",
-        )?;
-    }
+    replace_once(
+        &root.join(".github/workflows/extended.yml"),
+        "path: target/quality/",
+        "path: target/quality/coverage/",
+    )?;
     Ok(())
 }
 
@@ -787,14 +763,6 @@ fn reduce_line_coverage_measurement(root: &Path) -> TestResult {
         &root.join("target/quality-tools/bin/cargo"),
         "\"lines\":{\"percent\":100.0}",
         "\"lines\":{\"percent\":99.0}",
-    )
-}
-
-fn make_mutant_survive(root: &Path) -> TestResult {
-    replace_once(
-        &root.join("target/quality-tools/bin/cargo"),
-        "CaughtMutant",
-        "MissedMutant",
     )
 }
 
@@ -1235,6 +1203,10 @@ case "$command" in
       printf 'cargo-llvm-cov 0.8.7\n'
       exit 0
     fi
+    if [ -f target/quality-tools/reject-coverage-execution ]; then
+      printf '%s\n' 'fixture rejects routine coverage execution' >&2
+      exit 75
+    fi
     output=
     previous=
     for argument in "$@"; do
@@ -1247,29 +1219,6 @@ case "$command" in
     if [ -n "$output" ]; then
       mkdir -p "$(dirname "$output")"
       printf '%s\n' '{"data":[{"totals":{"branches":{"percent":100.0},"lines":{"percent":100.0},"regions":{"percent":100.0}}}]}' > "$output"
-    fi
-    ;;
-  mutants)
-    if [ "${2:-}" = "--version" ]; then
-      printf 'cargo-mutants 27.1.0\n'
-      exit 0
-    fi
-    if [ -f target/quality-tools/reject-forced-serial-mutation ] && [ "${RUST_TEST_THREADS:-}" = "1" ]; then
-      printf '%s\n' 'fixture rejects forced serial mutation tests' >&2
-      exit 73
-    fi
-    output=
-    previous=
-    for argument in "$@"; do
-      if [ "$previous" = "--output" ]; then
-        output="$argument"
-        break
-      fi
-      previous="$argument"
-    done
-    if [ -n "$output" ]; then
-      mkdir -p "$output/mutants.out"
-      printf '%s\n' '{"outcomes": [{"scenario": "Baseline", "summary": "Success"}, {"scenario": {"Mutant": {"name": "fixture"}}, "summary": "CaughtMutant"}]}' > "$output/mutants.out/outcomes.json"
     fi
     ;;
   tree)

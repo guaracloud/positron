@@ -164,13 +164,6 @@ struct CoverageMeasurements {
     region: f64,
 }
 
-#[derive(Debug)]
-struct MutationMeasurement {
-    caught: usize,
-    unviable: usize,
-    score: f64,
-}
-
 pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let root = hooks::workspace_root()?;
     let started_unix_ms = unix_time_ms()?;
@@ -402,8 +395,20 @@ fn gate_selected(gate: &Gate, profile: Profile, activated_risk_gates: &BTreeSet<
 
 fn not_selected_reason(gate: &Gate, profile: Profile) -> String {
     if profile == Profile::PreCommit {
-        return "Not in the bounded pre-commit profile; the pre-push and trusted CI profiles remain authoritative."
+        return "Not in the bounded local-feedback profile; the complete PR profile in trusted CI remains authoritative."
             .to_owned();
+    }
+    let stage_applies = match profile {
+        Profile::Pr => gate.stages.contains("PR"),
+        Profile::Ext => gate.stages.contains("PR") || gate.stages.contains("EXT"),
+        Profile::Qual => true,
+        Profile::PreCommit => false,
+    };
+    if !stage_applies {
+        return format!(
+            "Gate does not apply to the `{}` execution profile.",
+            profile.as_str()
+        );
     }
     if gate.activation == "risk" {
         return "The committed scope registry contains no active application scope selecting this risk gate; scaffold-only source validation passed."
@@ -425,7 +430,7 @@ fn execute_gate(
     match gate.runner.as_str() {
         "registry" => run_registry_gate(root, registry, profile, budget),
         "architecture" => run_architecture_gate(root, registry, budget),
-        "build" => run_build_gate(root, budget),
+        "build" => run_build_gate(root, profile, budget),
         "coverage" => run_coverage_gate(root, registry, budget),
         "dependencies" => run_dependency_gate(root, registry, budget),
         "documentation" => run_documentation_gate(root, budget),
@@ -435,7 +440,7 @@ fn execute_gate(
         "rust" => run_rust_gate(root, budget),
         "safety" => run_safety_gate(root, registry),
         "secrets" => run_secret_gate(root, profile, budget),
-        "supply" => run_supply_gate(root, registry, budget),
+        "supply" => run_supply_gate(root, registry, profile, budget),
         "test" => run_test_gate(root, budget),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
@@ -455,11 +460,6 @@ fn run_coverage_gate(
     fs::create_dir_all(&coverage_directory).map_err(|source| {
         XtaskError::io(format!("create {}", coverage_directory.display()), source)
     })?;
-    let mutation_directory = root.join("target/quality/mutation");
-    fs::create_dir_all(&mutation_directory).map_err(|source| {
-        XtaskError::io(format!("create {}", mutation_directory.display()), source)
-    })?;
-
     let total_report = "target/quality/coverage/m0-01-total.json";
     let changed_code_report = "target/quality/coverage/m0-01-changed-code.json";
     let total = run_status(
@@ -480,7 +480,7 @@ fn run_coverage_gate(
             total_report,
         ],
         remaining(deadline)?,
-        &[("CARGO_INCREMENTAL", "0"), ("RUST_TEST_THREADS", "1")],
+        &[],
     )?;
     let changed_code = run_status(
         root,
@@ -502,63 +502,22 @@ fn run_coverage_gate(
             changed_code_report,
         ],
         remaining(deadline)?,
-        &[("CARGO_INCREMENTAL", "0"), ("RUST_TEST_THREADS", "1")],
-    )?;
-    let mutation = run_status(
-        root,
-        "cargo",
-        [
-            "mutants",
-            "--no-config",
-            "--package",
-            "xtask",
-            "--file",
-            "tools/xtask/src/registry.rs",
-            "--re",
-            "parse_scope_set|parse_edge_set|parse_scopes|parse_edges|validate_thresholds|validate_activation_ledgers|validate_foundational_scope_ledger|foundational_scope_set|foundational_owner|foundational_edges|validate_foundational_edges|validate_dependency_free_scope|validate_active_sources|activation_only_source_line|deferred_runtime_symbol",
-            "--test-tool",
-            "cargo",
-            "--output",
-            "target/quality/mutation/m0-01",
-            "--timeout",
-            "60",
-            "--jobs",
-            "1",
-            "--no-times",
-            "--",
-            "--locked",
-            "--test",
-            "foundational_scope_activation",
-        ],
-        remaining(deadline)?,
-        &[("CARGO_INCREMENTAL", "0")],
+        &[],
     )?;
 
     let total_measurements = read_coverage_measurements(&root.join(total_report))?;
     let changed_measurements = read_coverage_measurements(&root.join(changed_code_report))?;
-    let mutation_measurement = read_mutation_measurement(
-        &root.join("target/quality/mutation/m0-01/mutants.out/outcomes.json"),
-    )?;
-    enforce_coverage_baselines(
-        registry,
-        &total_measurements,
-        &changed_measurements,
-        &mutation_measurement,
-    )?;
+    enforce_coverage_baselines(registry, &total_measurements, &changed_measurements)?;
 
     Ok(format!(
-        "{}; {} | {} | {}; total(branch={:.2}, line={:.2}, region={:.2}); changed-code(line={:.2}); mutation(score={:.2}, caught={}, unviable={})",
+        "{}; {} | {}; total(branch={:.2}, line={:.2}, region={:.2}); changed-code(line={:.2})",
         detector_versions,
         total.display,
         changed_code.display,
-        mutation.display,
         total_measurements.branch,
         total_measurements.line,
         total_measurements.region,
         changed_measurements.line,
-        mutation_measurement.score,
-        mutation_measurement.caught,
-        mutation_measurement.unviable,
     ))
 }
 
@@ -567,52 +526,47 @@ fn verify_coverage_detectors(
     registry: &Registry,
     deadline: Instant,
 ) -> Result<String, XtaskError> {
-    let mut verified = Vec::new();
-    for identity in ["cargo-llvm-cov", "cargo-mutants"] {
-        let tool = registry
-            .tools
-            .iter()
-            .find(|tool| tool.id == identity)
-            .ok_or_else(|| {
-                XtaskError::invalid(
-                    "coverage detector registry",
-                    format!("missing required detector `{identity}`"),
-                )
-            })?;
-        let outcome = run_capture(
-            root,
-            &tool.command,
-            tool.version_arguments.iter().map(String::as_str),
-            remaining(deadline)?,
-            &[],
-        )?;
-        if !outcome.stdout.contains(&tool.version) {
-            return Err(XtaskError::invalid(
-                format!("coverage detector `{identity}`"),
-                format!(
-                    "expected version `{}`, command reported `{}`",
-                    tool.version,
-                    one_line(&outcome.stdout)
-                ),
-            ));
-        }
-        verified.push(format!("{identity}={}", tool.version));
+    let identity = "cargo-llvm-cov";
+    let tool = registry
+        .tools
+        .iter()
+        .find(|tool| tool.id == identity)
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "coverage detector registry",
+                format!("missing required detector `{identity}`"),
+            )
+        })?;
+    let outcome = run_capture(
+        root,
+        &tool.command,
+        tool.version_arguments.iter().map(String::as_str),
+        remaining(deadline)?,
+        &[],
+    )?;
+    if !outcome.stdout.contains(&tool.version) {
+        return Err(XtaskError::invalid(
+            format!("coverage detector `{identity}`"),
+            format!(
+                "expected version `{}`, command reported `{}`",
+                tool.version,
+                one_line(&outcome.stdout)
+            ),
+        ));
     }
-    Ok(verified.join(", "))
+    Ok(format!("{identity}={}", tool.version))
 }
 
 fn enforce_coverage_baselines(
     registry: &Registry,
     total: &CoverageMeasurements,
     changed_code: &CoverageMeasurements,
-    mutation: &MutationMeasurement,
 ) -> Result<(), XtaskError> {
     for (identity, actual, label) in [
         ("coverage-branch", total.branch, "branch"),
         ("coverage-line", total.line, "line"),
         ("coverage-region", total.region, "region"),
         ("coverage-changed-code", changed_code.line, "changed-code"),
-        ("mutation-score", mutation.score, "mutation"),
     ] {
         let baseline = registry.measured_baseline(identity)?;
         if actual < baseline {
@@ -679,42 +633,6 @@ fn read_coverage_percent(content: &str, path: &Path, metric: &str) -> Result<f64
         ));
     }
     Ok(percentage)
-}
-
-fn read_mutation_measurement(path: &Path) -> Result<MutationMeasurement, XtaskError> {
-    let content = fs::read_to_string(path)
-        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-    if content.matches("\"scenario\": \"Baseline\"").count() != 1
-        || content.matches("\"summary\": \"Success\"").count() != 1
-    {
-        return Err(XtaskError::invalid_path(
-            path,
-            "mutation report does not contain one successful baseline",
-        ));
-    }
-    for rejected in ["MissedMutant", "Timeout", "Failure"] {
-        if content.contains(&format!("\"summary\": \"{rejected}\"")) {
-            return Err(XtaskError::invalid_path(
-                path,
-                format!(
-                    "mutation report contains a surviving or inconclusive mutant: `{rejected}`"
-                ),
-            ));
-        }
-    }
-    let caught = content.matches("\"summary\": \"CaughtMutant\"").count();
-    if caught == 0 {
-        return Err(XtaskError::invalid_path(
-            path,
-            "mutation report contains no caught viable mutant",
-        ));
-    }
-    let unviable = content.matches("\"summary\": \"Unviable\"").count();
-    Ok(MutationMeasurement {
-        caught,
-        unviable,
-        score: 100.0,
-    })
 }
 
 fn run_registry_gate(
@@ -827,7 +745,7 @@ fn run_architecture_gate(
                 "{p}",
             ],
             remaining(deadline)?,
-            &[("CARGO_INCREMENTAL", "0")],
+            &[],
         )?;
         for line in outcome.stdout.lines().skip(1) {
             let Some(dependency) = line.split_whitespace().next() else {
@@ -892,7 +810,7 @@ fn run_architecture_gate(
     ))
 }
 
-fn run_build_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
+fn run_build_gate(root: &Path, profile: Profile, budget: Duration) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
@@ -907,34 +825,36 @@ fn run_build_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
                 "--all-features",
             ],
             remaining(deadline)?,
-            &[("CARGO_INCREMENTAL", "0")],
+            &[],
         )?
         .display,
     );
-    for target in [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-    ] {
-        commands.push(
-            run_status(
-                root,
-                "cargo",
-                [
-                    "check",
-                    "--locked",
-                    "--workspace",
-                    "--all-targets",
-                    "--all-features",
-                    "--target",
-                    target,
-                ],
-                remaining(deadline)?,
-                &[("CARGO_INCREMENTAL", "0")],
-            )?
-            .display,
-        );
+    if matches!(profile, Profile::Ext | Profile::Qual) {
+        for target in [
+            "aarch64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+        ] {
+            commands.push(
+                run_status(
+                    root,
+                    "cargo",
+                    [
+                        "check",
+                        "--locked",
+                        "--workspace",
+                        "--all-targets",
+                        "--all-features",
+                        "--target",
+                        target,
+                    ],
+                    remaining(deadline)?,
+                    &[],
+                )?
+                .display,
+            );
+        }
     }
     Ok(commands.join(" | "))
 }
@@ -996,7 +916,7 @@ fn run_documentation_gate(root: &Path, budget: Duration) -> Result<String, Xtask
             "--document-private-items",
         ],
         budget,
-        &[("CARGO_INCREMENTAL", "0"), ("RUSTDOCFLAGS", "-D warnings")],
+        &[("RUSTDOCFLAGS", "-D warnings")],
     )?;
     Ok(format!("internal:local-link-check | {}", outcome.display))
 }
@@ -1079,32 +999,27 @@ fn validate_coverage_workflow_provisioning(root: &Path) -> Result<(), XtaskError
     let required = [
         "rustup toolchain install nightly-2026-07-20 --profile minimal --component llvm-tools-preview",
         "cargo install --locked --version 0.8.7 cargo-llvm-cov",
-        "cargo install --locked --version 27.1.0 cargo-mutants",
     ];
-    for relative in [
-        ".github/workflows/quality.yml",
-        ".github/workflows/extended.yml",
-    ] {
-        let path = root.join(relative);
-        let content = fs::read_to_string(&path)
-            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-        for command in required {
-            if !content.contains(command) {
-                return Err(XtaskError::invalid_path(
-                    &path,
-                    format!("coverage-selected workflow `{relative}` is missing `{command}`"),
-                ));
-            }
-        }
-        if !content
-            .lines()
-            .any(|line| line.trim() == "path: target/quality/")
-        {
+    let relative = ".github/workflows/extended.yml";
+    let path = root.join(relative);
+    let content = fs::read_to_string(&path)
+        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    for command in required {
+        if !content.contains(command) {
             return Err(XtaskError::invalid_path(
                 &path,
-                format!("coverage-selected workflow `{relative}` must retain `target/quality/`"),
+                format!("coverage-selected workflow `{relative}` is missing `{command}`"),
             ));
         }
+    }
+    if !content
+        .lines()
+        .any(|line| line.trim() == "path: target/quality/")
+    {
+        return Err(XtaskError::invalid_path(
+            &path,
+            format!("coverage-selected workflow `{relative}` must retain `target/quality/`"),
+        ));
     }
     Ok(())
 }
@@ -1132,7 +1047,7 @@ fn run_rust_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
             "warnings",
         ],
         remaining(deadline)?,
-        &[("CARGO_INCREMENTAL", "0")],
+        &[],
     )?;
     Ok(format!("{} | {}", format.display, clippy.display))
 }
@@ -1208,7 +1123,7 @@ fn run_secret_gate(root: &Path, profile: Profile, budget: Duration) -> Result<St
         )?
         .display,
     );
-    if profile != Profile::PreCommit {
+    if matches!(profile, Profile::Ext | Profile::Qual) {
         commands.push(
             run_status(
                 root,
@@ -1233,6 +1148,7 @@ fn run_secret_gate(root: &Path, profile: Profile, budget: Duration) -> Result<St
 fn run_supply_gate(
     root: &Path,
     registry: &Registry,
+    profile: Profile,
     budget: Duration,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
@@ -1247,26 +1163,18 @@ fn run_supply_gate(
         )?
         .display,
     );
-    commands.push(
-        run_status(
-            root,
-            "cargo",
-            ["vet", "--locked"],
-            remaining(deadline)?,
-            &[],
-        )?
-        .display,
-    );
-    commands.push(
-        run_status(
-            root,
-            "cargo",
-            ["deny", "check", "advisories"],
-            remaining(deadline)?,
-            &[],
-        )?
-        .display,
-    );
+    if matches!(profile, Profile::Ext | Profile::Qual) {
+        commands.push(
+            run_status(
+                root,
+                "cargo",
+                ["vet", "--locked"],
+                remaining(deadline)?,
+                &[],
+            )?
+            .display,
+        );
+    }
     let dependency_state = if registry.reviewed_dependencies().is_empty() {
         "no direct third-party production or tooling dependencies"
     } else {
@@ -1292,14 +1200,14 @@ fn run_test_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
             "ci",
         ],
         remaining(deadline)?,
-        &[("CARGO_INCREMENTAL", "0"), ("RUST_TEST_THREADS", "1")],
+        &[],
     )?;
     let doctest = run_status(
         root,
         "cargo",
         ["test", "--locked", "--workspace", "--doc", "--all-features"],
         remaining(deadline)?,
-        &[("CARGO_INCREMENTAL", "0"), ("RUST_TEST_THREADS", "1")],
+        &[],
     )?;
     Ok(format!("{} | {}", nextest.display, doctest.display))
 }

@@ -80,13 +80,13 @@ wildcard_dependencies = "deny"
 
 [profile.dev]
 debug = 2
-incremental = false
+incremental = true
 overflow-checks = true
 panic = "unwind"
 
 [profile.test]
 debug = 2
-incremental = false
+incremental = true
 overflow-checks = true
 
 [profile.release]

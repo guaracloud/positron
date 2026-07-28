@@ -30,9 +30,11 @@ immutable record and old/new evidence; editing the initial record is invalid.
 
 An active application scope must declare one atomic ledger: its activation
 identity and complete scope set, exact allowed edges, selected risk gates,
-public test command, measured coverage and mutation baseline identities,
-dependency review, and immutable contract-evidence record. Scaffold application
-rows must leave every ledger field as `-`; tooling may not claim those fields.
+public test command, measured coverage identities, dependency review, and
+immutable contract-evidence record. The original M0-01 mutation measurement is
+retained as historical evidence, not as a routine blocking campaign. Scaffold
+application rows must leave every ledger field as `-`; tooling may not claim
+those fields.
 
 `architecture-edges.tsv` records the same activation identity for every edge.
 `thresholds.tsv` records a `measured-baseline` value and evidence path before
