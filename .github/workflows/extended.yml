@@ -69,6 +69,10 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
         run: cargo install --locked --version 27.1.0 cargo-mutants
 
+      - name: Prepare M0-02 mutation evidence retention
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
+        run: mkdir -p target/quality/mutation
+
       - name: Retain the exact M0-02 focused mutation campaign
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
         run: >
