@@ -92,7 +92,12 @@
       "workflow_run": "30383501649",
       "status": "in progress before review remediation and stale after the remediation commit; no result or qualification claim is made"
     },
-    "dual_run": "The retained dirty M0-02 attempt, clean-main M0-01B red run, committed-SHA diagnostic green run, and failed exact-SHA fixture regression are separate attempts with separate attribution. The prior exact-head CI EXT dispatch is superseded by review remediation and cannot qualify the new revision. A final exact-SHA EXT run is required on the review-remediated revision."
+    "superseded_review_remediation_ext_dispatch": {
+      "revision": "34e2c8f2bc4e43173ab5340524f38f4effd0d3e3",
+      "workflow_run": "30384259617",
+      "status": "stale after structured coverage-spec and verdict-seam review remediation; no result or qualification claim is made"
+    },
+    "dual_run": "The retained dirty M0-02 attempt, clean-main M0-01B red run, committed-SHA diagnostic green run, and failed exact-SHA fixture regression are separate attempts with separate attribution. Prior exact-head CI EXT dispatches are superseded by review remediation and cannot qualify the new revision. A final exact-SHA EXT run is required on the review-remediated revision."
   },
   "approvals_required": [
     "Architecture",

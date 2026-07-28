@@ -424,10 +424,18 @@ fn quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suit
 
 #[test]
 fn quality_rejects_a_coverage_campaign_without_both_owner_verdict_targets() -> TestResult {
-    assert_fixture_rejected(
-        remove_one_m0_01b_owner_coverage_target,
-        "M0-01B coverage target selection must run the controlled owner verdict suite in both total and changed-code campaigns",
-    )
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        remove_one_m0_01b_owner_coverage_target(&fixture.root)?;
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(
+            &output,
+            "M0-01B coverage target selection must run the controlled owner verdict suite in both total and changed-code campaigns",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
 }
 
 #[test]
@@ -843,6 +851,27 @@ impl Fixture {
         Ok(output)
     }
 
+    fn quality_output_from_fixture_source(
+        &self,
+        profile: &str,
+    ) -> TestResult<std::process::Output> {
+        let output = Command::new(env!("CARGO"))
+            .current_dir(&self.root)
+            .args([
+                "run",
+                "--locked",
+                "--quiet",
+                "--package",
+                "xtask",
+                "--",
+                "quality",
+                "--profile",
+                profile,
+            ])
+            .output()?;
+        Ok(output)
+    }
+
     fn quality_output_for_with_environment<const N: usize>(
         &self,
         profile: &str,
@@ -1176,6 +1205,10 @@ fn assert_existing_fixture_rejected(
     expected_failure: &str,
 ) -> TestResult {
     let output = fixture.quality_output_for(profile)?;
+    assert_rejected_output(&output, expected_failure)
+}
+
+fn assert_rejected_output(output: &std::process::Output, expected_failure: &str) -> TestResult {
     if output.status.success() {
         return Err(std::io::Error::other(
             "the public quality runner accepted an invalid activation fixture",
@@ -1536,11 +1569,23 @@ fn make_fixture_git_report_dirty(root: &Path) -> TestResult {
 }
 
 fn remove_one_m0_01b_owner_coverage_target(root: &Path) -> TestResult {
+    let path = root.join("tools/xtask/src/quality.rs");
     replace_once(
-        &root.join("tools/xtask/src/quality.rs"),
-        "            \"--bin\",\n            \"xtask\",\n",
+        &path,
+        "                CoverageTarget::Binary(\"xtask\"),\n",
         "",
-    )
+    )?;
+    let mut content = fs::read_to_string(&path)?;
+    content.push_str(
+        r#"
+/*
+                CoverageTarget::Test("foundational_scope_activation"),
+                CoverageTarget::Binary("xtask"),
+*/
+"#,
+    );
+    fs::write(path, content)?;
+    Ok(())
 }
 
 fn lower_the_frozen_m0_01_line_baseline(root: &Path) -> TestResult {

@@ -1764,79 +1764,21 @@ done
     #[test]
     fn returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_capture_descriptors()
     -> TestResult {
-        let protocol = EscapedDescriptorProtocol::create()?;
-        let specification = escaped_descriptor_spec(
-            &protocol,
-            Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(100),
-        )?;
-        let (sender, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || sender.send(execute(specification)));
-
-        let result = (|| {
-            protocol.wait_until_ready(Duration::from_secs(1))?;
-            let outcome = match receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok(outcome) => outcome,
-                Err(RecvTimeoutError::Timeout) => {
-                    protocol.release()?;
-                    let released = receiver.recv_timeout(Duration::from_secs(2)).map_err(
-                        |source| {
-                            io::Error::other(format!(
-                                "controlled owner remained blocked after test descriptor release: {source}"
-                            ))
-                        },
-                    )?;
-                    let send = worker.join().map_err(|_| {
-                        io::Error::other("escaped-descriptor execution worker panicked")
-                    })?;
-                    send.map_err(|_| {
-                        io::Error::other(
-                            "escaped-descriptor execution worker could not publish its outcome",
-                        )
-                    })?;
-                    let _released_outcome = released;
-                    return Err(io::Error::other(
-                        "controlled owner did not reconcile escaped capture descriptors before its deadline",
-                    )
-                    .into());
-                },
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::other(
-                        "escaped-descriptor execution worker disconnected without an outcome",
-                    )
-                    .into());
-                },
-            };
-            protocol.release()?;
-            let send = worker
-                .join()
-                .map_err(|_| io::Error::other("escaped-descriptor execution worker panicked"))?;
-            send.map_err(|_| {
-                io::Error::other(
-                    "escaped-descriptor execution worker could not publish its outcome",
-                )
-            })?;
-
-            match outcome {
-                ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => {
-                    Ok(())
-                },
-                ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
-                    "escaped capture descriptors returned {} instead of deadline: {}",
-                    failure.phase.as_str(),
-                    failure.detail
-                ))
-                .into()),
-                ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
-                    "escaped capture descriptors reconciled with {}",
-                    verdict.status
-                ))
-                .into()),
-            }
-        })();
-        let cleanup = protocol.remove();
-        cleanup?;
-        result
+        let outcome = execute_escaped_descriptor_fixture_with_deadline(Duration::from_millis(100))?;
+        match outcome {
+            ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => Ok(()),
+            ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                "escaped capture descriptors returned {} instead of deadline: {}",
+                failure.phase.as_str(),
+                failure.detail
+            ))
+            .into()),
+            ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                "escaped capture descriptors reconciled with {}",
+                verdict.status
+            ))
+            .into()),
+        }
     }
 
     #[test]
@@ -2151,6 +2093,18 @@ os._exit(0)
             cancellation,
             deadline,
         })
+    }
+
+    fn execute_escaped_descriptor_fixture_with_deadline(
+        timeout: Duration,
+    ) -> TestResult<ExecutionOutcome> {
+        let protocol = EscapedDescriptorProtocol::create()?;
+        let specification =
+            escaped_descriptor_spec(&protocol, Arc::new(AtomicBool::new(false)), timeout)?;
+        let outcome = execute(specification);
+        let cleanup = protocol.remove();
+        cleanup?;
+        Ok(outcome)
     }
 
     fn captured_shell_with_limit(
