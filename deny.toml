@@ -26,7 +26,10 @@ exceptions = []
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
-deny = []
+deny = [
+  { name = "sha2", version = "<0.10.9" },
+  { name = "sha2", version = ">0.10.9" },
+]
 skip = []
 skip-tree = []
 

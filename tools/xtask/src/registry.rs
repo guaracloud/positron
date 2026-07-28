@@ -265,6 +265,15 @@ impl Registry {
         })
     }
 
+    pub(crate) fn has_m0_03_canonical_api_scope(&self) -> bool {
+        self.scopes.iter().any(|scope| {
+            scope.package == "positron-api"
+                && scope.kind == "application"
+                && scope.state == "active"
+                && scope.activation_id == "M0-03"
+        })
+    }
+
     pub(crate) fn activated_risk_gates(&self) -> BTreeSet<String> {
         let mut activated = self
             .scopes

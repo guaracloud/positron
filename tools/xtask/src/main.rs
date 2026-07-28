@@ -75,7 +75,7 @@ fn ensure_no_more_arguments(mut arguments: impl Iterator<Item = String>) -> Resu
 
 fn usage() -> String {
     format!(
-        "Usage:\n  cargo xtask generate-api\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation]\n  cargo xtask setup\n  cargo xtask help",
+        "Usage:\n  cargo xtask generate-api\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation|--retain-m0-03-mutation]\n  cargo xtask setup\n  cargo xtask help",
         Profile::accepted_values()
     )
 }

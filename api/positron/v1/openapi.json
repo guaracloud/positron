@@ -1,5 +1,8 @@
 {
   "openapi": "3.1.0",
-  "info": {"title": "Positron API", "version": "v1", "x-positron-schema-digest": "65bbd45e3342bbd8b7da71e478be76f1f3057dbaabce6aa31cae76c47d5cba11"},
-  "paths": {"/v1/capabilities:negotiate": {"post": {"operationId": "NegotiateCapabilities"}}}
+  "info": {"title": "Positron API", "version": "v1", "x-positron-schema-digest": "dec4904c90127c22273f6f60287f054c3b6266731971d3418148517956d1e2f7"},
+  "paths": {"/v1/capabilities:negotiate": {"post": {"operationId": "NegotiateCapabilityResponse", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CapabilityRequest"}}}}, "responses": {"200": {"description": "Closed capability statement", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CapabilityResponse"}}}}}}}},
+  "components": {"schemas": {"CapabilityRequest": {"type": "object", "additionalProperties": false, "required": ["api_major"], "properties": {"api_major": {"type": "integer", "minimum": 0, "maximum": 4294967295}, "capability": {"type": "integer", "enum": [0, 1, 2, 3]}}}, "CapabilityResponse": {"type": "object", "properties": {"availability": {"enum": ["IMPLEMENTED", "UNAVAILABLE", "UNSUPPORTED", "VERSION_INCOMPATIBLE"]}, "error_code": {"enum": ["UNSUPPORTED_API_VERSION", "CAPABILITY_UNAVAILABLE", "CAPABILITY_UNSUPPORTED", "MALFORMED_REQUEST", "REQUEST_TOO_LARGE", "UNKNOWN_FIELD"]}, "safe_detail": {"enum": ["API_MAJOR_UNSUPPORTED", "CAPABILITY_NOT_AVAILABLE", "CAPABILITY_NOT_SUPPORTED", "REQUEST_MALFORMED", "REQUEST_LIMIT_EXCEEDED", "FIELD_NOT_RECOGNIZED"]}}}}},
+  "x-positron-capability-statement": {"canonical_public_interface": "IMPLEMENTED", "release_one_query": "UNAVAILABLE", "metrics": "UNSUPPORTED", "other_api_major": "VERSION_INCOMPATIBLE"},
+  "x-positron-max-request-bytes": 64
 }

@@ -12,6 +12,7 @@ service CapabilityService {
 
 message CapabilityRequest {
   uint32 api_major = 1;
+  Capability capability = 2;
 }
 
 message CapabilityResponse {
@@ -19,6 +20,17 @@ message CapabilityResponse {
   string schema_digest = 2;
   CapabilityAvailability availability = 3;
   PublicError refusal = 4;
+  DeprecationState deprecation = 5;
+  Capability capability = 6;
+}
+
+// Unspecified preserves additive compatibility with older v1 clients, whose
+// negotiation request means the canonical public interface itself.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_CANONICAL_PUBLIC_INTERFACE = 1;
+  CAPABILITY_RELEASE_ONE_QUERY = 2;
+  CAPABILITY_METRICS = 3;
 }
 
 enum CapabilityAvailability {
@@ -41,14 +53,43 @@ enum CompletionState {
   COMPLETION_STATE_REJECTED = 1;
 }
 
+enum DeprecationState {
+  DEPRECATION_STATE_UNSPECIFIED = 0;
+  DEPRECATION_STATE_CURRENT = 1;
+  DEPRECATION_STATE_DEPRECATED = 2;
+}
+
 message PublicError {
   PublicErrorCode code = 1;
   RetryClass retry_class = 2;
   CompletionState completion_state = 3;
-  string safe_source = 4;
+  FailureSource source = 4;
+  SafeDetail safe_detail = 5;
 }
 
 enum PublicErrorCode {
   PUBLIC_ERROR_CODE_UNSPECIFIED = 0;
   PUBLIC_ERROR_CODE_UNSUPPORTED_API_VERSION = 1;
+  PUBLIC_ERROR_CODE_CAPABILITY_UNAVAILABLE = 2;
+  PUBLIC_ERROR_CODE_CAPABILITY_UNSUPPORTED = 3;
+  PUBLIC_ERROR_CODE_MALFORMED_REQUEST = 4;
+  PUBLIC_ERROR_CODE_REQUEST_TOO_LARGE = 5;
+  PUBLIC_ERROR_CODE_UNKNOWN_FIELD = 6;
+}
+
+enum FailureSource {
+  FAILURE_SOURCE_UNSPECIFIED = 0;
+  FAILURE_SOURCE_CAPABILITY_NEGOTIATION = 1;
+  FAILURE_SOURCE_GRPC_DECODE = 2;
+  FAILURE_SOURCE_HTTP_DECODE = 3;
+}
+
+enum SafeDetail {
+  SAFE_DETAIL_UNSPECIFIED = 0;
+  SAFE_DETAIL_API_MAJOR_UNSUPPORTED = 1;
+  SAFE_DETAIL_CAPABILITY_NOT_AVAILABLE = 2;
+  SAFE_DETAIL_CAPABILITY_NOT_SUPPORTED = 3;
+  SAFE_DETAIL_REQUEST_MALFORMED = 4;
+  SAFE_DETAIL_REQUEST_LIMIT_EXCEEDED = 5;
+  SAFE_DETAIL_FIELD_NOT_RECOGNIZED = 6;
 }

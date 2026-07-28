@@ -10,5 +10,8 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[dependencies]
+sha2 = { version = "=0.10.9", default-features = false }
+
 [lints]
 workspace = true

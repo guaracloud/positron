@@ -17,7 +17,8 @@
     "test_command": "cargo test --locked --package positron-api --test canonical_public_interface",
     "generation_command": "cargo xtask generate-api",
     "coverage_command": "cargo +nightly-2026-07-20 llvm-cov --locked --package positron-api --test canonical_public_interface --branch --json --summary-only --output-path target/quality/coverage/m0-03-api.json",
-    "mutation_command": "cargo mutants --no-config --package positron-api --file crates/positron-api/src/generated.rs --test-tool cargo --output target/quality/mutation/m0-03-api --timeout 30 --jobs 1 --no-times -- --locked --test canonical_public_interface"
+    "mutation_command": "cargo xtask quality --profile ext --retain-m0-03-mutation",
+    "mutation_selector_owner": "tools/xtask/src/quality.rs::M0_03_MUTATION_SELECTOR"
   },
   "baselines": {
     "coverage_line": 100,
@@ -38,12 +39,49 @@
       "status": "failed-local-diagnostic",
       "source_dirty": true,
       "result": "19 mutants: 4 caught, 2 missed, and 13 tool-unviable. One missed mutant exposed the missing explicit v1-major assertion; the second was a semantic-equivalent replacement of the literal return. The assertion was added and the equivalent match target was removed. This failed attempt remains retained; mutation must run once in trusted CI on the final exact commit."
+    },
+    {
+      "id": "dependency-vet-before-peer-audits",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "result": "cargo vet check rejected the first sha2 0.11.0 candidate and its nine unvetted dependencies. The failed attempt was retained; the dependency was narrowed to imported-audit-covered sha2 0.10.9 with exact transitive exemptions."
+    },
+    {
+      "id": "public-contract-red-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "result": "The expanded public contract test failed to compile with 24 missing capability, transport, safe-detail, bounded decode, and client contract items against the pre-remediation generated surface."
+    },
+    {
+      "id": "public-contract-green-remediation",
+      "status": "passed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p positron-api --test canonical_public_interface",
+      "result": "Nine deterministic public tests passed. Representative old-client and current-client gRPC and HTTP requests produced byte-stable equal typed outcomes; version, unavailable, unsupported, malformed, oversized, duplicate, unknown-field, and redaction cases returned their closed outcomes."
+    },
+    {
+      "id": "semantic-source-mutation-green",
+      "status": "passed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p xtask --test api_generation",
+      "result": "Five bounded generator tests passed. RPC, request field name, and request field number mutations propagated to generated Rust, HTTP, and OpenAPI; ambiguous declarations, duplicate field numbers, and oversized sources failed closed; repeated generation was byte-identical."
+    },
+    {
+      "id": "dependency-vet-and-deny-green",
+      "status": "passed-local-diagnostic",
+      "source_dirty": true,
+      "commands": [
+        "cargo vet check",
+        "cargo deny check"
+      ],
+      "result": "Cargo Vet accepted three fully audited and seven exact-version-exempted crates; Cargo Deny accepted advisories, exact-version bans, licenses, and sources."
     }
   ],
   "detection_gained": [
-    "one hand-edited versioned Protobuf source generates the Rust, HTTP/JSON, OpenAPI, and Schema Digest foundations",
-    "the public in-memory contract proves typed implementation and explicit version refusal without wire or domain leakage",
-    "the canonical artifact scope cannot return to scaffold while generated files drift"
+    "one bounded parsed versioned Protobuf source generates the Rust, gRPC and HTTP decode mapping, client contract, OpenAPI, and Schema Digest foundations",
+    "the public contract proves implemented, unavailable, unsupported, and version-incompatible capability outcomes with safe typed errors and no wire or domain leakage",
+    "the canonical artifact scope cannot return to scaffold, accept unknown fields, exceed its 64-byte request bound, or drift from deterministic generation",
+    "the authoritative EXT runner owns M0-03 coverage and the explicit exact-selector mutation campaign without changing routine PR selection"
   ],
   "detection_lost": [],
   "migration": "No durable format, SDK publication, listener, provider, query, signal-store, clustering, or Release 1 qualification claim is introduced. The implemented candidate remains unqualified until exact-artifact M6 evidence.",
