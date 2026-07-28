@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::controlled_execution::{
+    self, ExecutionTools, InvocationInput, InvocationSpec, OutputMode,
+};
 use crate::error::XtaskError;
 use crate::hooks;
 use crate::registry::{self, Gate, Registry};
@@ -39,6 +40,22 @@ const CANONICAL_GATE_IDS: [&str; 25] = [
     "EG-SUPPLY",
     "EG-TEST",
 ];
+
+const ENVIRONMENT_SNAPSHOT_VERSION: &str = "positron-quality-environment-v1";
+const MAXIMUM_ENVIRONMENT_ENTRIES: usize = 10;
+const MAXIMUM_ENVIRONMENT_VALUE_BYTES: usize = 4_096;
+const MAXIMUM_PATH_BYTES: usize = 16_384;
+const MAXIMUM_PATH_ENTRIES: usize = 128;
+const MAXIMUM_SNAPSHOT_DIGEST_INPUT_BYTES: usize = 65_536;
+const SNAPSHOT_DIGEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[derive(Debug)]
+struct EnvironmentSnapshot {
+    values: Vec<(OsString, OsString)>,
+    tools: BTreeMap<String, PathBuf>,
+    execution_tools: ExecutionTools,
+    temporary_root: PathBuf,
+    digest: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Profile {
@@ -148,6 +165,7 @@ struct Evidence {
     started_unix_ms: u128,
     ended_unix_ms: u128,
     registry_digest: String,
+    environment_digest: String,
     gates: Vec<GateAttempt>,
 }
 
@@ -164,10 +182,20 @@ struct CoverageMeasurements {
     region: f64,
 }
 
+struct AggregatorFailure<'failure> {
+    source: SourceIdentity,
+    started_unix_ms: u128,
+    attempt_id: String,
+    environment_digest: &'failure str,
+    registry_digest: &'failure str,
+    error: &'failure XtaskError,
+}
+
 pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let root = hooks::workspace_root()?;
     let started_unix_ms = unix_time_ms()?;
-    let source = source_identity(&root)?;
+    let environment = EnvironmentSnapshot::capture(&root, options.profile)?;
+    let source = source_identity(&root, &environment)?;
     let attempt_id = attempt_identity(&source.revision, started_unix_ms);
     let registry = match Registry::load(&root) {
         Ok(registry) => registry,
@@ -175,10 +203,14 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             return retain_aggregator_failure(
                 &root,
                 options.profile,
-                source,
-                started_unix_ms,
-                attempt_id,
-                ("invalid-registry", &error),
+                AggregatorFailure {
+                    source,
+                    started_unix_ms,
+                    attempt_id,
+                    environment_digest: environment.digest(),
+                    registry_digest: "invalid-registry",
+                    error: &error,
+                },
             );
         },
     };
@@ -196,22 +228,30 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         return retain_aggregator_failure(
             &root,
             options.profile,
-            source,
-            started_unix_ms,
-            attempt_id,
-            ("invalid-registry", &error),
+            AggregatorFailure {
+                source,
+                started_unix_ms,
+                attempt_id,
+                environment_digest: environment.digest(),
+                registry_digest: "invalid-registry",
+                error: &error,
+            },
         );
     }
-    let registry_digest = match digest_files(&root, registry.registry_files()) {
+    let registry_digest = match digest_files(&root, registry.registry_files(), &environment) {
         Ok(digest) => digest,
         Err(error) => {
             return retain_aggregator_failure(
                 &root,
                 options.profile,
-                source,
-                started_unix_ms,
-                attempt_id,
-                ("unavailable-registry-digest", &error),
+                AggregatorFailure {
+                    source,
+                    started_unix_ms,
+                    attempt_id,
+                    environment_digest: environment.digest(),
+                    registry_digest: "unavailable-registry-digest",
+                    error: &error,
+                },
             );
         },
     };
@@ -243,7 +283,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             gate.id, gate.runner, gate.timeout_seconds, gate.memory_mib
         );
         let started = Instant::now();
-        let execution = execute_gate(&root, &registry, gate, options.profile);
+        let execution = execute_gate(&root, &registry, gate, options.profile, &environment);
         let duration_ms = started.elapsed().as_millis();
         match execution {
             Ok(command) => {
@@ -300,6 +340,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         started_unix_ms,
         ended_unix_ms,
         registry_digest,
+        environment_digest: environment.digest().to_owned(),
         gates: attempts,
     };
     let evidence_path = write_evidence(&root, &evidence)?;
@@ -321,12 +362,8 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
 fn retain_aggregator_failure(
     root: &Path,
     profile: Profile,
-    source: SourceIdentity,
-    started_unix_ms: u128,
-    attempt_id: String,
-    failure_context: (&str, &XtaskError),
+    failure: AggregatorFailure<'_>,
 ) -> Result<(), XtaskError> {
-    let (registry_digest, failure) = failure_context;
     let mut gates = Vec::with_capacity(CANONICAL_GATE_IDS.len());
     for gate_id in CANONICAL_GATE_IDS {
         let is_aggregator = gate_id == "EG-00";
@@ -345,7 +382,7 @@ fn retain_aggregator_failure(
                 "blocked-by:EG-00".to_owned()
             },
             detail: if is_aggregator {
-                failure.to_string()
+                failure.error.to_string()
             } else {
                 "EG-00 failed closed before gate selection; this omission is retained and cannot be interpreted as a pass."
                     .to_owned()
@@ -353,21 +390,22 @@ fn retain_aggregator_failure(
         });
     }
     let evidence = Evidence {
-        attempt_id,
+        attempt_id: failure.attempt_id,
         profile,
         result: GateStatus::Failed,
         merge_eligible: false,
-        source,
-        started_unix_ms,
+        source: failure.source,
+        started_unix_ms: failure.started_unix_ms,
         ended_unix_ms: unix_time_ms()?,
-        registry_digest: registry_digest.to_owned(),
+        registry_digest: failure.registry_digest.to_owned(),
+        environment_digest: failure.environment_digest.to_owned(),
         gates,
     };
     let path = write_evidence(root, &evidence)?;
     eprintln!("Retained failed aggregator evidence: {}", path.display());
     Err(XtaskError::invalid(
         "engineering quality aggregator",
-        failure.to_string(),
+        failure.error.to_string(),
     ))
 }
 
@@ -425,23 +463,24 @@ fn execute_gate(
     registry: &Registry,
     gate: &Gate,
     profile: Profile,
+    environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
-        "registry" => run_registry_gate(root, registry, profile, budget),
-        "architecture" => run_architecture_gate(root, registry, budget),
-        "build" => run_build_gate(root, profile, budget),
-        "coverage" => run_coverage_gate(root, registry, budget),
-        "dependencies" => run_dependency_gate(root, registry, budget),
-        "documentation" => run_documentation_gate(root, budget),
+        "registry" => run_registry_gate(root, registry, profile, budget, environment),
+        "architecture" => run_architecture_gate(root, registry, budget, environment),
+        "build" => run_build_gate(root, profile, budget, environment),
+        "coverage" => run_coverage_gate(root, registry, budget, environment),
+        "dependencies" => run_dependency_gate(root, registry, budget, environment),
+        "documentation" => run_documentation_gate(root, budget, environment),
         "error-policy" => run_error_policy_gate(root, registry),
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
-        "rust" => run_rust_gate(root, budget),
+        "rust" => run_rust_gate(root, budget, environment),
         "safety" => run_safety_gate(root, registry),
-        "secrets" => run_secret_gate(root, profile, budget),
-        "supply" => run_supply_gate(root, registry, profile, budget),
-        "test" => run_test_gate(root, budget),
+        "secrets" => run_secret_gate(root, profile, budget, environment),
+        "supply" => run_supply_gate(root, registry, profile, budget, environment),
+        "test" => run_test_gate(root, budget, environment),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
             "an active risk scope selected a gate whose executable harness has not been implemented",
@@ -453,9 +492,10 @@ fn run_coverage_gate(
     root: &Path,
     registry: &Registry,
     budget: Duration,
+    environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
-    let detector_versions = verify_coverage_detectors(root, registry, deadline)?;
+    let detector_versions = verify_coverage_detectors(root, registry, deadline, environment)?;
     let coverage_directory = root.join("target/quality/coverage");
     fs::create_dir_all(&coverage_directory).map_err(|source| {
         XtaskError::io(format!("create {}", coverage_directory.display()), source)
@@ -464,6 +504,7 @@ fn run_coverage_gate(
     let changed_code_report = "target/quality/coverage/m0-01-changed-code.json";
     let total = run_status(
         root,
+        environment,
         "cargo",
         [
             "+nightly-2026-07-20",
@@ -484,6 +525,7 @@ fn run_coverage_gate(
     )?;
     let changed_code = run_status(
         root,
+        environment,
         "cargo",
         [
             "+nightly-2026-07-20",
@@ -525,6 +567,7 @@ fn verify_coverage_detectors(
     root: &Path,
     registry: &Registry,
     deadline: Instant,
+    environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let identity = "cargo-llvm-cov";
     let tool = registry
@@ -539,6 +582,7 @@ fn verify_coverage_detectors(
         })?;
     let outcome = run_capture(
         root,
+        environment,
         &tool.command,
         tool.version_arguments.iter().map(String::as_str),
         remaining(deadline)?,
@@ -640,6 +684,7 @@ fn run_registry_gate(
     registry: &Registry,
     profile: Profile,
     budget: Duration,
+    environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     if profile == Profile::Qual {
         let targets = root.join("qualification/targets/registry.json");
@@ -662,6 +707,7 @@ fn run_registry_gate(
         }
         let outcome = run_capture(
             root,
+            environment,
             &tool.command,
             tool.version_arguments.iter().map(String::as_str),
             remaining(deadline)?,
@@ -700,6 +746,7 @@ fn run_architecture_gate(
     root: &Path,
     registry: &Registry,
     budget: Duration,
+    environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let workspace_packages = registry
@@ -729,6 +776,7 @@ fn run_architecture_gate(
     for scope in &registry.scopes {
         let outcome = run_capture(
             root,
+            environment,
             "cargo",
             [
                 "tree",
@@ -810,12 +858,18 @@ fn run_architecture_gate(
     ))
 }
 
-fn run_build_gate(root: &Path, profile: Profile, budget: Duration) -> Result<String, XtaskError> {
+fn run_build_gate(
+    root: &Path,
+    profile: Profile,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
         run_status(
             root,
+            environment,
             "cargo",
             [
                 "check",
@@ -839,6 +893,7 @@ fn run_build_gate(root: &Path, profile: Profile, budget: Duration) -> Result<Str
             commands.push(
                 run_status(
                     root,
+                    environment,
                     "cargo",
                     [
                         "check",
@@ -863,12 +918,14 @@ fn run_dependency_gate(
     root: &Path,
     registry: &Registry,
     budget: Duration,
+    environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
         run_capture(
             root,
+            environment,
             "cargo",
             ["metadata", "--locked", "--format-version", "1"],
             remaining(deadline)?,
@@ -879,6 +936,7 @@ fn run_dependency_gate(
     commands.push(
         run_status(
             root,
+            environment,
             "cargo-machete",
             ["--with-metadata", "--skip-target-dir", "."],
             remaining(deadline)?,
@@ -889,6 +947,7 @@ fn run_dependency_gate(
     commands.push(
         run_status(
             root,
+            environment,
             "cargo",
             ["deny", "check", "bans", "licenses", "sources"],
             remaining(deadline)?,
@@ -902,10 +961,22 @@ fn run_dependency_gate(
     Ok(commands.join(" | "))
 }
 
-fn run_documentation_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
+fn run_documentation_gate(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     validate_local_markdown_links(root)?;
+    let target = documentation_target_directory(environment)?;
+    fs::create_dir(&target)
+        .map_err(|source| XtaskError::io(format!("create {}", target.display()), source))?;
+    let target_value = target.as_os_str().to_str().ok_or_else(|| {
+        XtaskError::invalid_path(&target, "temporary documentation target is not valid UTF-8")
+    })?;
+    let deadline = Instant::now() + budget;
     let outcome = run_status(
         root,
+        environment,
         "cargo",
         [
             "doc",
@@ -915,10 +986,80 @@ fn run_documentation_gate(root: &Path, budget: Duration) -> Result<String, Xtask
             "--no-deps",
             "--document-private-items",
         ],
+        remaining(deadline)?,
+        &[
+            ("RUSTDOCFLAGS", "-D warnings"),
+            ("CARGO_TARGET_DIR", target_value),
+        ],
+    )
+    .and_then(|outcome| {
+        scan_generated_rustdoc_secrets(root, environment, &target, remaining(deadline)?)
+            .map(|scan| (outcome, scan))
+    });
+    let cleanup = fs::remove_dir_all(&target)
+        .map_err(|source| XtaskError::io(format!("remove {}", target.display()), source));
+    match (outcome, cleanup) {
+        (Ok((outcome, scan)), Ok(())) => Ok(format!(
+            "internal:local-link-check | {} | {scan}",
+            outcome.display
+        )),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(XtaskError::invalid(
+            "documentation gate",
+            format!("{error}; cleanup also failed: {cleanup}"),
+        )),
+    }
+}
+
+fn documentation_target_directory(
+    environment: &EnvironmentSnapshot,
+) -> Result<PathBuf, XtaskError> {
+    let nonce = unix_time_ms()?;
+    Ok(environment.temporary_root().join(format!(
+        "positron-quality-doc-{}-{nonce}",
+        std::process::id()
+    )))
+}
+
+fn scan_generated_rustdoc_secrets(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    target: &Path,
+    budget: Duration,
+) -> Result<String, XtaskError> {
+    let documentation_root = target.join("doc");
+    if !documentation_root.is_dir() {
+        return Err(XtaskError::invalid_path(
+            &documentation_root,
+            "rustdoc did not produce a generated documentation directory",
+        ));
+    }
+    let documentation_value = documentation_root.as_os_str().to_str().ok_or_else(|| {
+        XtaskError::invalid_path(
+            &documentation_root,
+            "generated documentation directory is not valid UTF-8",
+        )
+    })?;
+    let outcome = run_status(
+        root,
+        environment,
+        "gitleaks",
+        [
+            "dir",
+            "--no-banner",
+            "--no-color",
+            "--redact=100",
+            "--max-target-megabytes=20",
+            documentation_value,
+        ],
         budget,
-        &[("RUSTDOCFLAGS", "-D warnings")],
+        &[],
     )?;
-    Ok(format!("internal:local-link-check | {}", outcome.display))
+    Ok(format!(
+        "{}; full generated rustdoc root scanned without exclusions",
+        outcome.display
+    ))
 }
 
 fn run_error_policy_gate(root: &Path, registry: &Registry) -> Result<String, XtaskError> {
@@ -1024,10 +1165,15 @@ fn validate_coverage_workflow_provisioning(root: &Path) -> Result<(), XtaskError
     Ok(())
 }
 
-fn run_rust_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
+fn run_rust_gate(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let format = run_status(
         root,
+        environment,
         "cargo",
         ["fmt", "--all", "--", "--check"],
         remaining(deadline)?,
@@ -1035,6 +1181,7 @@ fn run_rust_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
     )?;
     let clippy = run_status(
         root,
+        environment,
         "cargo",
         [
             "clippy",
@@ -1103,12 +1250,18 @@ fn run_safety_gate(root: &Path, registry: &Registry) -> Result<String, XtaskErro
     Ok("internal:forbid-unsafe-and-unbounded-source-policy scan".to_owned())
 }
 
-fn run_secret_gate(root: &Path, profile: Profile, budget: Duration) -> Result<String, XtaskError> {
+fn run_secret_gate(
+    root: &Path,
+    profile: Profile,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
         run_status(
             root,
+            environment,
             "gitleaks",
             [
                 "dir",
@@ -1127,6 +1280,7 @@ fn run_secret_gate(root: &Path, profile: Profile, budget: Duration) -> Result<St
         commands.push(
             run_status(
                 root,
+                environment,
                 "gitleaks",
                 [
                     "git",
@@ -1150,12 +1304,14 @@ fn run_supply_gate(
     registry: &Registry,
     profile: Profile,
     budget: Duration,
+    environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
         run_status(
             root,
+            environment,
             "cargo",
             ["audit", "--deny", "warnings"],
             remaining(deadline)?,
@@ -1167,6 +1323,7 @@ fn run_supply_gate(
         commands.push(
             run_status(
                 root,
+                environment,
                 "cargo",
                 ["vet", "--locked"],
                 remaining(deadline)?,
@@ -1184,10 +1341,15 @@ fn run_supply_gate(
     Ok(commands.join(" | "))
 }
 
-fn run_test_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
+fn run_test_gate(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let nextest = run_status(
         root,
+        environment,
         "cargo",
         [
             "nextest",
@@ -1204,6 +1366,7 @@ fn run_test_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {
     )?;
     let doctest = run_status(
         root,
+        environment,
         "cargo",
         ["test", "--locked", "--workspace", "--doc", "--all-features"],
         remaining(deadline)?,
@@ -1472,6 +1635,7 @@ fn validate_required_policy_files(root: &Path) -> Result<(), XtaskError> {
 
 fn run_status<'argument>(
     root: &Path,
+    snapshot: &EnvironmentSnapshot,
     program: &str,
     arguments: impl IntoIterator<Item = &'argument str>,
     timeout: Duration,
@@ -1481,150 +1645,104 @@ fn run_status<'argument>(
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
-    let display = command_display(program, &arguments);
+    let resolved_program = snapshot.tool_path(program)?;
+    let display = command_display(&resolved_program.to_string_lossy(), &arguments);
     println!("  $ {display}");
-    let mut command = Command::new(program);
-    command
-        .current_dir(root)
-        .args(&arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    configure_child_path(&mut command, root)?;
-    for (name, value) in environment {
-        command.env(name, value);
+    let verdict = controlled_execution::execute(InvocationSpec {
+        program: resolved_program,
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: snapshot.invocation_environment(environment)?,
+        tools: snapshot.execution_tools(),
+        input: InvocationInput::Null,
+        output: OutputMode::Inherit,
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(timeout)?,
+    })
+    .into_result()
+    .map_err(XtaskError::controlled_harness)?;
+    if verdict.status.success() {
+        return Ok(CommandOutcome {
+            display,
+            stdout: verdict.output.stdout,
+        });
     }
-    let mut child = command
-        .spawn()
-        .map_err(|source| XtaskError::io(format!("spawn `{display}`"), source))?;
-    let started = Instant::now();
-    loop {
-        match child
-            .try_wait()
-            .map_err(|source| XtaskError::io(format!("wait for `{display}`"), source))?
-        {
-            Some(status) if status.success() => {
-                return Ok(CommandOutcome {
-                    display,
-                    stdout: String::new(),
-                });
-            },
-            Some(status) => {
-                return Err(XtaskError::command(
-                    display,
-                    format!("exit status {status}"),
-                ));
-            },
-            None if started.elapsed() >= timeout => {
-                child
-                    .kill()
-                    .map_err(|source| XtaskError::io(format!("terminate `{display}`"), source))?;
-                let _status = child
-                    .wait()
-                    .map_err(|source| XtaskError::io(format!("reap `{display}`"), source))?;
-                return Err(XtaskError::timeout(display, timeout.as_secs()));
-            },
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    }
+    Err(XtaskError::command(
+        display,
+        format!("exit status {}", verdict.status),
+    ))
 }
 
 fn run_capture<'argument>(
     root: &Path,
+    snapshot: &EnvironmentSnapshot,
     program: &str,
     arguments: impl IntoIterator<Item = &'argument str>,
     timeout: Duration,
     environment: &[(&str, &str)],
 ) -> Result<CommandOutcome, XtaskError> {
+    run_capture_with_input(
+        root,
+        snapshot,
+        program,
+        arguments,
+        CaptureOptions {
+            timeout,
+            environment,
+            input: InvocationInput::Null,
+        },
+    )
+}
+
+struct CaptureOptions<'environment> {
+    timeout: Duration,
+    environment: &'environment [(&'environment str, &'environment str)],
+    input: InvocationInput,
+}
+
+fn run_capture_with_input<'argument>(
+    root: &Path,
+    snapshot: &EnvironmentSnapshot,
+    program: &str,
+    arguments: impl IntoIterator<Item = &'argument str>,
+    options: CaptureOptions<'_>,
+) -> Result<CommandOutcome, XtaskError> {
     let arguments = arguments
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
-    let display = command_display(program, &arguments);
-    let mut command = Command::new(program);
-    command
-        .current_dir(root)
-        .args(&arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_child_path(&mut command, root)?;
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|source| XtaskError::io(format!("spawn `{display}`"), source))?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        XtaskError::invalid(format!("command `{display}`"), "stdout pipe is unavailable")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        XtaskError::invalid(format!("command `{display}`"), "stderr pipe is unavailable")
-    })?;
-    let stdout_reader = spawn_output_reader(stdout);
-    let stderr_reader = spawn_output_reader(stderr);
-    let started = Instant::now();
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|source| XtaskError::io(format!("wait for `{display}`"), source))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                child
-                    .kill()
-                    .map_err(|source| XtaskError::io(format!("terminate `{display}`"), source))?;
-                let _status = child
-                    .wait()
-                    .map_err(|source| XtaskError::io(format!("reap `{display}`"), source))?;
-                let _stdout = join_output_reader(stdout_reader, &display, "stdout")?;
-                let _stderr = join_output_reader(stderr_reader, &display, "stderr")?;
-                return Err(XtaskError::timeout(display, timeout.as_secs()));
-            },
-            None => thread::sleep(Duration::from_millis(25)),
-        }
-    };
-    let mut stdout = join_output_reader(stdout_reader, &display, "stdout")?;
-    let stderr = join_output_reader(stderr_reader, &display, "stderr")?;
-    stdout.push_str(&stderr);
-    if !status.success() {
+    let resolved_program = snapshot.tool_path(program)?;
+    let display = command_display(&resolved_program.to_string_lossy(), &arguments);
+    let verdict = controlled_execution::execute(InvocationSpec {
+        program: resolved_program,
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: snapshot.invocation_environment(options.environment)?,
+        tools: snapshot.execution_tools(),
+        input: options.input,
+        output: OutputMode::Capture {
+            maximum_bytes_per_stream: 1_048_576,
+        },
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(options.timeout)?,
+    })
+    .into_result()
+    .map_err(XtaskError::controlled_harness)?;
+    if !verdict.status.success() {
         return Err(XtaskError::command(
             display,
-            format!("exit status {status}: {}", one_line(&stdout)),
+            format!(
+                "exit status {}: stdout={}; stderr={}",
+                verdict.status,
+                one_line(&verdict.output.stdout),
+                one_line(&verdict.output.stderr)
+            ),
         ));
     }
-    Ok(CommandOutcome { display, stdout })
-}
-
-fn spawn_output_reader(
-    mut output: impl Read + Send + 'static,
-) -> thread::JoinHandle<std::io::Result<String>> {
-    thread::spawn(move || {
-        let mut content = String::new();
-        output.read_to_string(&mut content)?;
-        Ok(content)
+    Ok(CommandOutcome {
+        display,
+        stdout: verdict.output.stdout,
     })
-}
-
-fn join_output_reader(
-    reader: thread::JoinHandle<std::io::Result<String>>,
-    command: &str,
-    stream: &str,
-) -> Result<String, XtaskError> {
-    let output = reader.join().map_err(|panic_payload| {
-        let detail = if let Some(message) = panic_payload.downcast_ref::<&str>() {
-            (*message).to_owned()
-        } else if let Some(message) = panic_payload.downcast_ref::<String>() {
-            message.clone()
-        } else {
-            "reader thread panicked without a string payload".to_owned()
-        };
-        XtaskError::invalid(
-            format!("{stream} reader for `{command}`"),
-            format!("reader thread failed: {detail}"),
-        )
-    })?;
-    output.map_err(|source| XtaskError::io(format!("read {stream} from `{command}`"), source))
 }
 
 fn command_display(program: &str, arguments: &[OsString]) -> String {
@@ -1638,19 +1756,557 @@ fn command_display(program: &str, arguments: &[OsString]) -> String {
     parts.join(" ")
 }
 
-fn configure_child_path(command: &mut Command, root: &Path) -> Result<(), XtaskError> {
+impl EnvironmentSnapshot {
+    fn capture(root: &Path, profile: Profile) -> Result<Self, XtaskError> {
+        let root = canonical_directory(root, "workspace root")?;
+        let parent_path = env::var_os("PATH").ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                "PATH is required to resolve registered quality tools",
+            )
+        })?;
+        let parent_paths = validated_parent_paths(&parent_path)?;
+        let search_paths = snapshot_search_paths(&root, parent_paths)?;
+        let mut tools = BTreeMap::new();
+        for name in required_snapshot_tools(profile) {
+            let resolved = resolve_snapshot_tool(name, &search_paths)?;
+            if tools.insert(name.to_owned(), resolved).is_some() {
+                return Err(XtaskError::invalid(
+                    "controlled harness environment",
+                    format!("duplicate required tool identity `{name}`"),
+                ));
+            }
+        }
+
+        let execution_tools = ExecutionTools {
+            process_control: required_tool_path(&tools, "kill")?,
+            capture_broker: required_tool_path(&tools, "head")?,
+        };
+        let temporary_root = owned_temporary_root(&root)?;
+        let home = validated_home_directory("HOME", None)?;
+        let cargo_home = validated_home_directory("CARGO_HOME", Some(home.join(".cargo")))?;
+        let rustup_home = validated_home_directory("RUSTUP_HOME", Some(home.join(".rustup")))?;
+
+        let path_directories = snapshot_path_directories(&tools)?;
+        let path = env::join_paths(path_directories)
+            .map_err(|source| XtaskError::invalid("controlled harness PATH", source.to_string()))?;
+        validate_environment_value("PATH", &path, MAXIMUM_PATH_BYTES)?;
+
+        let mut configured = BTreeMap::new();
+        insert_environment_value(&mut configured, "PATH", path)?;
+        insert_environment_path(&mut configured, "HOME", &home)?;
+        insert_environment_path(&mut configured, "CARGO_HOME", &cargo_home)?;
+        insert_environment_path(&mut configured, "RUSTUP_HOME", &rustup_home)?;
+        insert_environment_path(&mut configured, "TMPDIR", &temporary_root)?;
+        if let Some(path) = validated_optional_certificate_file("SSL_CERT_FILE")? {
+            insert_environment_path(&mut configured, "SSL_CERT_FILE", &path)?;
+        }
+        if let Some(path) = validated_optional_certificate_directory("SSL_CERT_DIR")? {
+            insert_environment_path(&mut configured, "SSL_CERT_DIR", &path)?;
+        }
+        insert_environment_value(&mut configured, "LC_ALL", OsString::from("C"))?;
+        insert_environment_value(&mut configured, "LANG", OsString::from("C"))?;
+        insert_environment_value(&mut configured, "TZ", OsString::from("UTC"))?;
+        if configured.len() > MAXIMUM_ENVIRONMENT_ENTRIES {
+            return Err(XtaskError::invalid(
+                "controlled harness environment",
+                format!(
+                    "snapshot contains {} entries, above the bounded maximum {MAXIMUM_ENVIRONMENT_ENTRIES}",
+                    configured.len()
+                ),
+            ));
+        }
+        let values = configured
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), value))
+            .collect::<Vec<_>>();
+        let digest = snapshot_digest(&root, &tools, &execution_tools, &values)?;
+        Ok(Self {
+            values,
+            tools,
+            execution_tools,
+            temporary_root,
+            digest,
+        })
+    }
+
+    fn invocation_environment(
+        &self,
+        overrides: &[(&str, &str)],
+    ) -> Result<Vec<(OsString, OsString)>, XtaskError> {
+        let mut configured = self
+            .values
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let mut override_names = BTreeSet::new();
+        for (name, value) in overrides {
+            if !override_names.insert(*name) {
+                return Err(XtaskError::invalid(
+                    "controlled harness environment",
+                    format!("duplicate invocation override `{name}`"),
+                ));
+            }
+            if !matches!(*name, "CARGO_TARGET_DIR" | "RUSTDOCFLAGS") {
+                return Err(XtaskError::invalid(
+                    "controlled harness environment",
+                    format!("unapproved invocation override `{name}`"),
+                ));
+            }
+            let value = OsString::from(*value);
+            validate_environment_value(name, &value, MAXIMUM_ENVIRONMENT_VALUE_BYTES)?;
+            if *name == "CARGO_TARGET_DIR" {
+                let target = canonical_directory(Path::new(value.as_os_str()), "CARGO_TARGET_DIR")?;
+                if !target.starts_with(&self.temporary_root) {
+                    return Err(XtaskError::invalid(
+                        "controlled harness environment",
+                        "CARGO_TARGET_DIR must remain inside the owned TMPDIR",
+                    ));
+                }
+            }
+            if configured
+                .iter()
+                .any(|(configured_name, _)| configured_name.as_os_str() == OsStr::new(name))
+            {
+                return Err(XtaskError::invalid(
+                    "controlled harness environment",
+                    format!("invocation override `{name}` collides with the fixed snapshot"),
+                ));
+            }
+            configured.push((OsString::from(*name), value));
+        }
+        if configured.len() > MAXIMUM_ENVIRONMENT_ENTRIES + 2 {
+            return Err(XtaskError::invalid(
+                "controlled harness environment",
+                "invocation environment exceeds its bounded entry count",
+            ));
+        }
+        Ok(configured)
+    }
+
+    fn tool_path(&self, name: &str) -> Result<OsString, XtaskError> {
+        self.tools
+            .get(name)
+            .map(|path| path.as_os_str().to_owned())
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "controlled harness environment",
+                    format!("program `{name}` is not in the explicit snapshot"),
+                )
+            })
+    }
+
+    fn execution_tools(&self) -> ExecutionTools {
+        self.execution_tools.clone()
+    }
+
+    fn temporary_root(&self) -> &Path {
+        &self.temporary_root
+    }
+
+    fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+fn required_snapshot_tools(profile: Profile) -> BTreeSet<&'static str> {
+    let mut names = BTreeSet::from(["cargo", "git", "gitleaks", "head", "kill", "rustfmt"]);
+    if matches!(profile, Profile::Pr | Profile::Ext | Profile::Qual) {
+        names.insert("rustc");
+    }
+    if matches!(profile, Profile::Pr | Profile::Ext) {
+        names.insert("cargo-machete");
+    }
+    names
+}
+
+fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, XtaskError> {
+    if !path.is_absolute() {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("{label} must be an absolute directory"),
+        ));
+    }
+    let resolved = fs::canonicalize(path)
+        .map_err(|source| XtaskError::io(format!("canonicalize {label}"), source))?;
+    if !resolved.is_dir() {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("{label} is not a directory"),
+        ));
+    }
+    Ok(resolved)
+}
+
+fn validated_parent_paths(parent_path: &OsStr) -> Result<Vec<PathBuf>, XtaskError> {
+    validate_environment_value("PATH", parent_path, MAXIMUM_PATH_BYTES)?;
+    let paths = env::split_paths(parent_path).collect::<Vec<_>>();
+    if paths.is_empty() || paths.len() > MAXIMUM_PATH_ENTRIES {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("PATH must contain between one and {MAXIMUM_PATH_ENTRIES} entries"),
+        ));
+    }
+
+    let mut canonical = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(XtaskError::invalid(
+                "controlled harness environment",
+                "PATH contains a non-absolute entry",
+            ));
+        }
+        if !path.exists() {
+            continue;
+        }
+        let resolved = canonical_directory(&path, "PATH entry")?;
+        if !canonical
+            .iter()
+            .any(|existing: &PathBuf| existing == &resolved)
+        {
+            canonical.push(resolved);
+        }
+    }
+    if canonical.is_empty() {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            "PATH has no existing absolute directory entries",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn snapshot_search_paths(
+    root: &Path,
+    parent_paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, XtaskError> {
     let local_tools = root.join("target/quality-tools/bin");
-    if !local_tools.is_dir() {
-        return Ok(());
+    let mut paths = Vec::with_capacity(parent_paths.len() + 1);
+    if local_tools.exists() {
+        paths.push(canonical_directory(
+            &local_tools,
+            "local quality-tool directory",
+        )?);
     }
-    let mut paths = vec![local_tools];
-    if let Some(current) = env::var_os("PATH") {
-        paths.extend(env::split_paths(&current));
+    paths.extend(parent_paths);
+    Ok(paths)
+}
+
+fn resolve_snapshot_tool(name: &str, search_paths: &[PathBuf]) -> Result<PathBuf, XtaskError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("required tool name `{name}` is invalid"),
+        ));
     }
-    let joined = env::join_paths(paths)
-        .map_err(|source| XtaskError::invalid("child process PATH", source.to_string()))?;
-    command.env("PATH", joined);
+    for directory in search_paths {
+        let candidate = directory.join(name);
+        if !candidate.exists() {
+            continue;
+        }
+        let resolved = fs::canonicalize(&candidate)
+            .map_err(|source| XtaskError::io(format!("canonicalize tool `{name}`"), source))?;
+        if !resolved.is_absolute() || !resolved.is_file() {
+            return Err(XtaskError::invalid(
+                "controlled harness environment",
+                format!("required tool `{name}` is not an absolute regular file"),
+            ));
+        }
+        // Preserve the registered executable name for multi-call launchers
+        // such as `cargo -> rustup`; canonicalization is only a validation
+        // step, because using its target as argv[0] changes the command.
+        return Ok(candidate);
+    }
+    Err(XtaskError::invalid(
+        "controlled harness environment",
+        format!("required tool `{name}` could not be resolved from the bounded PATH"),
+    ))
+}
+
+fn required_tool_path(
+    tools: &BTreeMap<String, PathBuf>,
+    name: &str,
+) -> Result<PathBuf, XtaskError> {
+    tools.get(name).cloned().ok_or_else(|| {
+        XtaskError::invalid(
+            "controlled harness environment",
+            format!("required controlled-execution tool `{name}` is missing"),
+        )
+    })
+}
+
+fn snapshot_path_directories(
+    tools: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<PathBuf>, XtaskError> {
+    let mut directories = BTreeSet::new();
+    for path in tools.values() {
+        let parent = path.parent().ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                format!("resolved tool {} has no parent directory", path.display()),
+            )
+        })?;
+        directories.insert(parent.to_path_buf());
+    }
+    for path in [Path::new("/bin"), Path::new("/usr/bin")] {
+        if path.exists() {
+            directories.insert(canonical_directory(path, "system command directory")?);
+        }
+    }
+    if directories.is_empty() || directories.len() > MAXIMUM_PATH_ENTRIES {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            "resolved controlled PATH violates its directory bound",
+        ));
+    }
+    Ok(directories.into_iter().collect())
+}
+
+fn validated_home_directory(name: &str, fallback: Option<PathBuf>) -> Result<PathBuf, XtaskError> {
+    let path = match env::var_os(name) {
+        Some(value) => {
+            validate_environment_value(name, &value, MAXIMUM_ENVIRONMENT_VALUE_BYTES)?;
+            PathBuf::from(value)
+        },
+        None => fallback.ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                format!("required home directory `{name}` is absent"),
+            )
+        })?,
+    };
+    canonical_directory(&path, name)
+}
+
+fn validated_optional_certificate_file(name: &str) -> Result<Option<PathBuf>, XtaskError> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(None);
+    };
+    validate_environment_value(name, &value, MAXIMUM_ENVIRONMENT_VALUE_BYTES)?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("{name} must be an absolute file path"),
+        ));
+    }
+    let resolved = fs::canonicalize(&path)
+        .map_err(|source| XtaskError::io(format!("canonicalize {name}"), source))?;
+    if !resolved.is_file() {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("{name} is not a regular file"),
+        ));
+    }
+    Ok(Some(resolved))
+}
+
+fn validated_optional_certificate_directory(name: &str) -> Result<Option<PathBuf>, XtaskError> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(None);
+    };
+    validate_environment_value(name, &value, MAXIMUM_ENVIRONMENT_VALUE_BYTES)?;
+    Ok(Some(canonical_directory(&PathBuf::from(value), name)?))
+}
+
+fn owned_temporary_root(root: &Path) -> Result<PathBuf, XtaskError> {
+    let base = root.join("target/quality/tmp");
+    fs::create_dir_all(&base)
+        .map_err(|source| XtaskError::io(format!("create {}", base.display()), source))?;
+    let base = canonical_directory(&base, "owned quality TMPDIR root")?;
+    if !base.starts_with(root) {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            "owned quality TMPDIR root escaped the workspace",
+        ));
+    }
+    let nonce = unix_time_ms()?;
+    let directory = base.join(format!("run-{}-{nonce}", std::process::id()));
+    fs::create_dir(&directory)
+        .map_err(|source| XtaskError::io(format!("create {}", directory.display()), source))?;
+    canonical_directory(&directory, "owned quality TMPDIR")
+}
+
+fn insert_environment_path(
+    configured: &mut BTreeMap<String, OsString>,
+    name: &str,
+    path: &Path,
+) -> Result<(), XtaskError> {
+    insert_environment_value(configured, name, path.as_os_str().to_owned())
+}
+
+fn insert_environment_value(
+    configured: &mut BTreeMap<String, OsString>,
+    name: &str,
+    value: OsString,
+) -> Result<(), XtaskError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("environment name `{name}` is invalid"),
+        ));
+    }
+    validate_environment_value(name, &value, MAXIMUM_ENVIRONMENT_VALUE_BYTES)?;
+    if configured.insert(name.to_owned(), value).is_some() {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("duplicate snapshot environment name `{name}`"),
+        ));
+    }
     Ok(())
+}
+
+fn validate_environment_value(
+    name: &str,
+    value: &OsStr,
+    maximum_bytes: usize,
+) -> Result<(), XtaskError> {
+    if value.is_empty() || value.as_encoded_bytes().len() > maximum_bytes {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("{name} exceeds its bounded value size or is empty"),
+        ));
+    }
+    if value.to_str().is_none() {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            format!("{name} is not valid UTF-8"),
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_digest(
+    root: &Path,
+    tools: &BTreeMap<String, PathBuf>,
+    execution_tools: &ExecutionTools,
+    values: &[(OsString, OsString)],
+) -> Result<String, XtaskError> {
+    let mut payload = Vec::new();
+    append_snapshot_digest_component(&mut payload, ENVIRONMENT_SNAPSHOT_VERSION)?;
+    for (name, value) in values {
+        let name = name.to_str().ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                "snapshot name is not valid UTF-8",
+            )
+        })?;
+        append_snapshot_digest_component(&mut payload, name)?;
+        let value = value.to_str().ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                "snapshot value is not valid UTF-8",
+            )
+        })?;
+        let redacted_value = if name == "TMPDIR" {
+            "owned-tmpdir"
+        } else {
+            value
+        };
+        append_snapshot_digest_component(&mut payload, redacted_value)?;
+    }
+    for (name, path) in tools {
+        append_snapshot_digest_component(&mut payload, name)?;
+        append_snapshot_digest_component(
+            &mut payload,
+            path.to_str().ok_or_else(|| {
+                XtaskError::invalid(
+                    "controlled harness environment",
+                    "resolved tool path is not valid UTF-8",
+                )
+            })?,
+        )?;
+    }
+    append_snapshot_digest_component(&mut payload, "process_control")?;
+    append_snapshot_digest_component(
+        &mut payload,
+        execution_tools.process_control.to_str().ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                "process-control path is not valid UTF-8",
+            )
+        })?,
+    )?;
+    append_snapshot_digest_component(&mut payload, "capture_broker")?;
+    append_snapshot_digest_component(
+        &mut payload,
+        execution_tools.capture_broker.to_str().ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                "capture-broker path is not valid UTF-8",
+            )
+        })?,
+    )?;
+
+    let git = required_tool_path(tools, "git")?;
+    let verdict = controlled_execution::execute(InvocationSpec {
+        program: git.as_os_str().to_owned(),
+        arguments: vec![OsString::from("hash-object"), OsString::from("--stdin")],
+        current_dir: root.to_path_buf(),
+        environment: values.to_vec(),
+        tools: execution_tools.clone(),
+        input: InvocationInput::Bytes(payload),
+        output: OutputMode::Capture {
+            maximum_bytes_per_stream: 1_024,
+        },
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(SNAPSHOT_DIGEST_TIMEOUT)?,
+    })
+    .into_result()
+    .map_err(XtaskError::controlled_harness)?;
+    if !verdict.status.success() {
+        return Err(XtaskError::command(
+            "git hash-object --stdin".to_owned(),
+            format!("exit status {}", verdict.status),
+        ));
+    }
+    let value = verdict.output.stdout.trim();
+    if !valid_hex_identity(value) {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            "snapshot digest tool returned an invalid object identity",
+        ));
+    }
+    Ok(format!("git-object:{value}"))
+}
+
+fn append_snapshot_digest_component(payload: &mut Vec<u8>, value: &str) -> Result<(), XtaskError> {
+    let next_length = payload
+        .len()
+        .checked_add(value.len())
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled harness environment",
+                "snapshot digest input length overflowed",
+            )
+        })?;
+    if next_length > MAXIMUM_SNAPSHOT_DIGEST_INPUT_BYTES {
+        return Err(XtaskError::invalid(
+            "controlled harness environment",
+            "snapshot digest input exceeds its bounded size",
+        ));
+    }
+    payload.extend_from_slice(value.as_bytes());
+    payload.push(0);
+    Ok(())
+}
+
+fn deadline_after(timeout: Duration) -> Result<Instant, XtaskError> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        XtaskError::invalid(
+            "controlled harness execution",
+            "the declared timeout cannot be represented by the monotonic clock",
+        )
+    })
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, XtaskError> {
@@ -1660,9 +2316,13 @@ fn remaining(deadline: Instant) -> Result<Duration, XtaskError> {
         .ok_or_else(|| XtaskError::invalid("gate budget", "no execution time remains"))
 }
 
-fn source_identity(root: &Path) -> Result<SourceIdentity, XtaskError> {
+fn source_identity(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+) -> Result<SourceIdentity, XtaskError> {
     let revision = run_capture(
         root,
+        environment,
         "git",
         ["rev-parse", "HEAD"],
         Duration::from_secs(10),
@@ -1679,6 +2339,7 @@ fn source_identity(root: &Path) -> Result<SourceIdentity, XtaskError> {
     }
     let status = run_capture(
         root,
+        environment,
         "git",
         ["status", "--porcelain=v1", "--untracked-files=all"],
         Duration::from_secs(10),
@@ -1696,7 +2357,11 @@ fn source_identity(root: &Path) -> Result<SourceIdentity, XtaskError> {
     })
 }
 
-fn digest_files(root: &Path, files: &[PathBuf]) -> Result<String, XtaskError> {
+fn digest_files(
+    root: &Path,
+    files: &[PathBuf],
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     let mut payload = Vec::new();
     for path in files {
         let relative = path.strip_prefix(root).map_err(|source| {
@@ -1710,37 +2375,24 @@ fn digest_files(root: &Path, files: &[PathBuf]) -> Result<String, XtaskError> {
         payload.push(0);
     }
 
-    let mut child = Command::new("git")
-        .current_dir(root)
-        .args(["hash-object", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| XtaskError::io("spawn `git hash-object --stdin`", source))?;
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err(XtaskError::invalid(
-            "registry digest",
-            "git hash-object stdin was unavailable",
-        ));
-    };
-    stdin
-        .write_all(&payload)
-        .map_err(|source| XtaskError::io("write registry digest input", source))?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .map_err(|source| XtaskError::io("wait for registry digest", source))?;
-    if !output.status.success() {
+    let output = run_capture_with_input(
+        root,
+        environment,
+        "git",
+        ["hash-object", "--stdin"],
+        CaptureOptions {
+            timeout: Duration::from_secs(10),
+            environment: &[],
+            input: InvocationInput::Bytes(payload),
+        },
+    )?;
+    if output.stdout.is_empty() {
         return Err(XtaskError::command(
             "git hash-object --stdin",
-            format!("exit status {}", output.status),
+            "the controlled invocation returned no standard output",
         ));
     }
-    let digest = String::from_utf8(output.stdout)
-        .map_err(|source| XtaskError::invalid("registry digest encoding", source.to_string()))?
-        .trim()
-        .to_owned();
+    let digest = output.stdout.trim().to_owned();
     if digest.is_empty() {
         return Err(XtaskError::invalid(
             "registry digest",
@@ -1798,6 +2450,7 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
     if evidence.attempt_id.is_empty()
         || !valid_hex_identity(&evidence.source.revision)
         || !valid_registry_digest(&evidence.registry_digest)
+        || !valid_registry_digest(&evidence.environment_digest)
         || evidence.ended_unix_ms < evidence.started_unix_ms
     {
         return Err(XtaskError::invalid(
@@ -1831,6 +2484,7 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
         "\"attempt_id\"",
         "\"merge_eligible\"",
         "\"registry_digest\"",
+        "\"environment_digest\"",
         "\"gates\"",
     ] {
         if !serialized.contains(required) {
@@ -1896,6 +2550,10 @@ fn evidence_json(evidence: &Evidence) -> String {
     output.push_str(&format!(
         "  \"registry_digest\": {},\n",
         json_string(&evidence.registry_digest)
+    ));
+    output.push_str(&format!(
+        "  \"environment_digest\": {},\n",
+        json_string(&evidence.environment_digest)
     ));
     output.push_str("  \"gates\": [\n");
     let mut first = true;
@@ -1963,7 +2621,11 @@ fn one_line(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, Profile, json_string};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{EnvironmentSnapshot, ExecutionTools, Options, Profile, json_string};
 
     #[test]
     fn defaults_to_the_complete_pull_request_profile() {
@@ -1985,6 +2647,34 @@ mod tests {
             json_string("line\n\"secret-like\"\\path"),
             "\"line\\n\\\"secret-like\\\"\\\\path\"",
             "evidence JSON must escape control and delimiter characters"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_invocation_environment_overrides() {
+        let snapshot = EnvironmentSnapshot {
+            values: vec![
+                (OsString::from("PATH"), OsString::from("/usr/bin")),
+                (OsString::from("TMPDIR"), OsString::from("/tmp/owned")),
+            ],
+            tools: BTreeMap::new(),
+            execution_tools: ExecutionTools {
+                process_control: PathBuf::from("/bin/kill"),
+                capture_broker: PathBuf::from("/usr/bin/head"),
+            },
+            temporary_root: PathBuf::from("/tmp/owned"),
+            digest: "git-object:0000000000000000000000000000000000000000".to_owned(),
+        };
+        let result = snapshot.invocation_environment(&[
+            ("RUSTDOCFLAGS", "-D warnings"),
+            ("RUSTDOCFLAGS", "-D warnings"),
+        ]);
+        let error = result.err().map(|error| error.to_string());
+        assert!(
+            error.as_deref().is_some_and(
+                |detail| detail.contains("duplicate invocation override `RUSTDOCFLAGS`")
+            ),
+            "duplicate override rejection must expose the stable environment boundary"
         );
     }
 }

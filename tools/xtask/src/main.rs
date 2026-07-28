@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod controlled_execution;
 mod error;
 mod hooks;
 mod quality;

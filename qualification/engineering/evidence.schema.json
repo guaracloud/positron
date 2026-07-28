@@ -14,6 +14,7 @@
     "started_unix_ms",
     "ended_unix_ms",
     "registry_digest",
+    "environment_digest",
     "gates"
   ],
   "properties": {
@@ -37,6 +38,10 @@
     "registry_digest": {
       "type": "string",
       "pattern": "^(git-object:[0-9a-f]{40,64}|invalid-registry|unavailable-registry-digest)$"
+    },
+    "environment_digest": {
+      "type": "string",
+      "pattern": "^git-object:[0-9a-f]{40,64}$"
     },
     "gates": {
       "type": "array",
