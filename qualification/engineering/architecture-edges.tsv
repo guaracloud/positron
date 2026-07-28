@@ -1,37 +1,37 @@
-caller	dependency
-positron	positron-runtime
-positron	positron-governance
-positron	positron-ingest
-positron	positron-query
-positron	positron-backup
-positron	positron-upgrade
-positron	positron-diagnostics
-positron	positron-operator
-positron	positron-release
-positron-runtime	positron-api
-positron-runtime	positron-config
-positron-runtime	positron-domain
-positron-runtime	positron-governance
-positron-runtime	positron-kernel
-positron-kernel	positron-domain
-positron-signals	positron-kernel
-positron-signals	positron-domain
-positron-governance	positron-kernel
-positron-governance	positron-domain
-positron-ingest	positron-signals
-positron-ingest	positron-kernel
-positron-ingest	positron-domain
-positron-query	positron-signals
-positron-query	positron-kernel
-positron-query	positron-domain
-positron-backup	positron-governance
-positron-backup	positron-kernel
-positron-backup	positron-domain
-positron-upgrade	positron-governance
-positron-upgrade	positron-kernel
-positron-upgrade	positron-backup
-positron-upgrade	positron-release
-positron-diagnostics	positron-runtime
-positron-diagnostics	positron-governance
-positron-diagnostics	positron-kernel
-positron-operator	positron-api
+caller	dependency	activation_id
+positron	positron-runtime	-
+positron	positron-governance	-
+positron	positron-ingest	-
+positron	positron-query	-
+positron	positron-backup	-
+positron	positron-upgrade	-
+positron	positron-diagnostics	-
+positron	positron-operator	-
+positron	positron-release	-
+positron-runtime	positron-api	M0-01
+positron-runtime	positron-config	M0-01
+positron-runtime	positron-domain	M0-01
+positron-runtime	positron-governance	-
+positron-runtime	positron-kernel	-
+positron-kernel	positron-domain	M0-01
+positron-signals	positron-kernel	-
+positron-signals	positron-domain	M0-01
+positron-governance	positron-kernel	-
+positron-governance	positron-domain	M0-01
+positron-ingest	positron-signals	-
+positron-ingest	positron-kernel	-
+positron-ingest	positron-domain	M0-01
+positron-query	positron-signals	-
+positron-query	positron-kernel	-
+positron-query	positron-domain	M0-01
+positron-backup	positron-governance	-
+positron-backup	positron-kernel	-
+positron-backup	positron-domain	M0-01
+positron-upgrade	positron-governance	-
+positron-upgrade	positron-kernel	-
+positron-upgrade	positron-backup	-
+positron-upgrade	positron-release	-
+positron-diagnostics	positron-runtime	-
+positron-diagnostics	positron-governance	-
+positron-diagnostics	positron-kernel	-
+positron-operator	positron-api	M0-01

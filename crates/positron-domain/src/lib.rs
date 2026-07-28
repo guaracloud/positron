@@ -1,7 +1,6 @@
-//! @positron-scaffold-only
-//! Shared invariant-bearing domain-type scaffold.
+//! Shared invariant-bearing domain boundary.
 //!
-//! This crate contains no wire types, persistence types, unchecked
-//! constructors, or application behavior.
+//! M0-01 activates this owned boundary only. Wire types, persistence types,
+//! unchecked constructors, and application behavior remain absent.
 
 #![forbid(unsafe_code)]

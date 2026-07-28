@@ -32,8 +32,14 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,llvm-tools-preview,rust-src,rustfmt --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-apple-darwin,x86_64-unknown-linux-gnu
 
+      - name: Install pinned branch-coverage toolchain
+        run: rustup toolchain install nightly-2026-07-20 --profile minimal --component llvm-tools-preview
+
       - name: Install cargo-nextest
         run: cargo install --locked --version 0.9.138 cargo-nextest
+
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked --version 0.8.7 cargo-llvm-cov
 
       - name: Install cargo-deny
         run: cargo install --locked --version 0.19.9 cargo-deny
@@ -46,6 +52,9 @@ jobs:
 
       - name: Install cargo-vet
         run: cargo install --locked --version 0.10.2 cargo-vet
+
+      - name: Install cargo-mutants
+        run: cargo install --locked --version 27.1.0 cargo-mutants
 
       - name: Install Gitleaks
         env:
@@ -72,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: engineering-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
-          path: target/quality/evidence/
+          path: target/quality/
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 90
