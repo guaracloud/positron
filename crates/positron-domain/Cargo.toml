@@ -1,6 +1,6 @@
 [package]
 name = "positron-domain"
-description = "Positron shared invariant-bearing domain-type scaffold"
+description = "Positron shared invariant-bearing domain boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

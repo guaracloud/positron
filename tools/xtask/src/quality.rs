@@ -157,6 +157,20 @@ struct CommandOutcome {
     stdout: String,
 }
 
+#[derive(Debug)]
+struct CoverageMeasurements {
+    branch: f64,
+    line: f64,
+    region: f64,
+}
+
+#[derive(Debug)]
+struct MutationMeasurement {
+    caught: usize,
+    unviable: usize,
+    score: f64,
+}
+
 pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let root = hooks::workspace_root()?;
     let started_unix_ms = unix_time_ms()?;
@@ -412,11 +426,12 @@ fn execute_gate(
         "registry" => run_registry_gate(root, registry, profile, budget),
         "architecture" => run_architecture_gate(root, registry, budget),
         "build" => run_build_gate(root, budget),
+        "coverage" => run_coverage_gate(root, registry, budget),
         "dependencies" => run_dependency_gate(root, registry, budget),
         "documentation" => run_documentation_gate(root, budget),
         "error-policy" => run_error_policy_gate(root, registry),
         "evidence" => run_evidence_gate(root, registry),
-        "policy" => run_policy_gate(root),
+        "policy" => run_policy_gate(root, registry),
         "rust" => run_rust_gate(root, budget),
         "safety" => run_safety_gate(root, registry),
         "secrets" => run_secret_gate(root, profile, budget),
@@ -427,6 +442,279 @@ fn execute_gate(
             "an active risk scope selected a gate whose executable harness has not been implemented",
         )),
     }
+}
+
+fn run_coverage_gate(
+    root: &Path,
+    registry: &Registry,
+    budget: Duration,
+) -> Result<String, XtaskError> {
+    let deadline = Instant::now() + budget;
+    let detector_versions = verify_coverage_detectors(root, registry, deadline)?;
+    let coverage_directory = root.join("target/quality/coverage");
+    fs::create_dir_all(&coverage_directory).map_err(|source| {
+        XtaskError::io(format!("create {}", coverage_directory.display()), source)
+    })?;
+    let mutation_directory = root.join("target/quality/mutation");
+    fs::create_dir_all(&mutation_directory).map_err(|source| {
+        XtaskError::io(format!("create {}", mutation_directory.display()), source)
+    })?;
+
+    let total_report = "target/quality/coverage/m0-01-total.json";
+    let changed_code_report = "target/quality/coverage/m0-01-changed-code.json";
+    let total = run_status(
+        root,
+        "cargo",
+        [
+            "+nightly-2026-07-20",
+            "llvm-cov",
+            "--locked",
+            "--package",
+            "xtask",
+            "--test",
+            "foundational_scope_activation",
+            "--branch",
+            "--json",
+            "--summary-only",
+            "--output-path",
+            total_report,
+        ],
+        remaining(deadline)?,
+        &[("CARGO_INCREMENTAL", "0"), ("RUST_TEST_THREADS", "1")],
+    )?;
+    let changed_code = run_status(
+        root,
+        "cargo",
+        [
+            "+nightly-2026-07-20",
+            "llvm-cov",
+            "--locked",
+            "--package",
+            "xtask",
+            "--test",
+            "foundational_scope_activation",
+            "--branch",
+            "--json",
+            "--summary-only",
+            "--ignore-filename-regex",
+            "tools/xtask/src/(error|hooks|main|quality)\\.rs",
+            "--output-path",
+            changed_code_report,
+        ],
+        remaining(deadline)?,
+        &[("CARGO_INCREMENTAL", "0"), ("RUST_TEST_THREADS", "1")],
+    )?;
+    let mutation = run_status(
+        root,
+        "cargo",
+        [
+            "mutants",
+            "--no-config",
+            "--package",
+            "xtask",
+            "--file",
+            "tools/xtask/src/registry.rs",
+            "--re",
+            "parse_scope_set|parse_edge_set|parse_scopes|parse_edges|validate_thresholds|validate_activation_ledgers|validate_foundational_scope_ledger|foundational_scope_set|foundational_owner|foundational_edges|validate_foundational_edges|validate_dependency_free_scope|validate_active_sources|activation_only_source_line|deferred_runtime_symbol",
+            "--test-tool",
+            "cargo",
+            "--output",
+            "target/quality/mutation/m0-01",
+            "--timeout",
+            "60",
+            "--jobs",
+            "1",
+            "--no-times",
+            "--",
+            "--locked",
+            "--test",
+            "foundational_scope_activation",
+        ],
+        remaining(deadline)?,
+        &[("CARGO_INCREMENTAL", "0")],
+    )?;
+
+    let total_measurements = read_coverage_measurements(&root.join(total_report))?;
+    let changed_measurements = read_coverage_measurements(&root.join(changed_code_report))?;
+    let mutation_measurement = read_mutation_measurement(
+        &root.join("target/quality/mutation/m0-01/mutants.out/outcomes.json"),
+    )?;
+    enforce_coverage_baselines(
+        registry,
+        &total_measurements,
+        &changed_measurements,
+        &mutation_measurement,
+    )?;
+
+    Ok(format!(
+        "{}; {} | {} | {}; total(branch={:.2}, line={:.2}, region={:.2}); changed-code(line={:.2}); mutation(score={:.2}, caught={}, unviable={})",
+        detector_versions,
+        total.display,
+        changed_code.display,
+        mutation.display,
+        total_measurements.branch,
+        total_measurements.line,
+        total_measurements.region,
+        changed_measurements.line,
+        mutation_measurement.score,
+        mutation_measurement.caught,
+        mutation_measurement.unviable,
+    ))
+}
+
+fn verify_coverage_detectors(
+    root: &Path,
+    registry: &Registry,
+    deadline: Instant,
+) -> Result<String, XtaskError> {
+    let mut verified = Vec::new();
+    for identity in ["cargo-llvm-cov", "cargo-mutants"] {
+        let tool = registry
+            .tools
+            .iter()
+            .find(|tool| tool.id == identity)
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "coverage detector registry",
+                    format!("missing required detector `{identity}`"),
+                )
+            })?;
+        let outcome = run_capture(
+            root,
+            &tool.command,
+            tool.version_arguments.iter().map(String::as_str),
+            remaining(deadline)?,
+            &[],
+        )?;
+        if !outcome.stdout.contains(&tool.version) {
+            return Err(XtaskError::invalid(
+                format!("coverage detector `{identity}`"),
+                format!(
+                    "expected version `{}`, command reported `{}`",
+                    tool.version,
+                    one_line(&outcome.stdout)
+                ),
+            ));
+        }
+        verified.push(format!("{identity}={}", tool.version));
+    }
+    Ok(verified.join(", "))
+}
+
+fn enforce_coverage_baselines(
+    registry: &Registry,
+    total: &CoverageMeasurements,
+    changed_code: &CoverageMeasurements,
+    mutation: &MutationMeasurement,
+) -> Result<(), XtaskError> {
+    for (identity, actual, label) in [
+        ("coverage-branch", total.branch, "branch"),
+        ("coverage-line", total.line, "line"),
+        ("coverage-region", total.region, "region"),
+        ("coverage-changed-code", changed_code.line, "changed-code"),
+        ("mutation-score", mutation.score, "mutation"),
+    ] {
+        let baseline = registry.measured_baseline(identity)?;
+        if actual < baseline {
+            return Err(XtaskError::invalid(
+                "M0 coverage baseline",
+                format!("coverage {label} {actual:.2} is below frozen M0 baseline {baseline:.2}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_coverage_measurements(path: &Path) -> Result<CoverageMeasurements, XtaskError> {
+    let content = fs::read_to_string(path)
+        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    Ok(CoverageMeasurements {
+        branch: read_coverage_percent(&content, path, "branches")?,
+        line: read_coverage_percent(&content, path, "lines")?,
+        region: read_coverage_percent(&content, path, "regions")?,
+    })
+}
+
+fn read_coverage_percent(content: &str, path: &Path, metric: &str) -> Result<f64, XtaskError> {
+    let Some((_, totals)) = content.rsplit_once("\"totals\"") else {
+        return Err(XtaskError::invalid_path(
+            path,
+            "coverage report is missing its totals object",
+        ));
+    };
+    let metric_marker = format!("\"{metric}\"");
+    let Some((_, metric_data)) = totals.split_once(&metric_marker) else {
+        return Err(XtaskError::invalid_path(
+            path,
+            format!("coverage report is missing `{metric}` totals"),
+        ));
+    };
+    let Some((_, percent_data)) = metric_data.split_once("\"percent\"") else {
+        return Err(XtaskError::invalid_path(
+            path,
+            format!("coverage report is missing `{metric}` percent"),
+        ));
+    };
+    let Some((_, numeric)) = percent_data.split_once(':') else {
+        return Err(XtaskError::invalid_path(
+            path,
+            format!("coverage report has malformed `{metric}` percent"),
+        ));
+    };
+    let numeric = numeric.trim_start();
+    let value = numeric
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect::<String>();
+    let percentage = value.parse::<f64>().map_err(|source| {
+        XtaskError::invalid_path(
+            path,
+            format!("coverage report has non-numeric `{metric}` percent: {source}"),
+        )
+    })?;
+    if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
+        return Err(XtaskError::invalid_path(
+            path,
+            format!("coverage report has invalid `{metric}` percent `{percentage}`"),
+        ));
+    }
+    Ok(percentage)
+}
+
+fn read_mutation_measurement(path: &Path) -> Result<MutationMeasurement, XtaskError> {
+    let content = fs::read_to_string(path)
+        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    if content.matches("\"scenario\": \"Baseline\"").count() != 1
+        || content.matches("\"summary\": \"Success\"").count() != 1
+    {
+        return Err(XtaskError::invalid_path(
+            path,
+            "mutation report does not contain one successful baseline",
+        ));
+    }
+    for rejected in ["MissedMutant", "Timeout", "Failure"] {
+        if content.contains(&format!("\"summary\": \"{rejected}\"")) {
+            return Err(XtaskError::invalid_path(
+                path,
+                format!(
+                    "mutation report contains a surviving or inconclusive mutant: `{rejected}`"
+                ),
+            ));
+        }
+    }
+    let caught = content.matches("\"summary\": \"CaughtMutant\"").count();
+    if caught == 0 {
+        return Err(XtaskError::invalid_path(
+            path,
+            "mutation report contains no caught viable mutant",
+        ));
+    }
+    let unviable = content.matches("\"summary\": \"Unviable\"").count();
+    Ok(MutationMeasurement {
+        caught,
+        unviable,
+        score: 100.0,
+    })
 }
 
 fn run_registry_gate(
@@ -777,11 +1065,48 @@ fn run_evidence_gate(root: &Path, registry: &Registry) -> Result<String, XtaskEr
     Ok("internal:evidence-schema-and-complete-gate-set validation".to_owned())
 }
 
-fn run_policy_gate(root: &Path) -> Result<String, XtaskError> {
+fn run_policy_gate(root: &Path, registry: &Registry) -> Result<String, XtaskError> {
     validate_workflows(root)?;
     validate_required_policy_files(root)?;
     hooks::validate_repository_hooks(root)?;
+    if registry.activated_risk_gates().contains("EG-COVERAGE") {
+        validate_coverage_workflow_provisioning(root)?;
+    }
     Ok("internal:workflow-action-pin-branch-policy-and-required-file validation".to_owned())
+}
+
+fn validate_coverage_workflow_provisioning(root: &Path) -> Result<(), XtaskError> {
+    let required = [
+        "rustup toolchain install nightly-2026-07-20 --profile minimal --component llvm-tools-preview",
+        "cargo install --locked --version 0.8.7 cargo-llvm-cov",
+        "cargo install --locked --version 27.1.0 cargo-mutants",
+    ];
+    for relative in [
+        ".github/workflows/quality.yml",
+        ".github/workflows/extended.yml",
+    ] {
+        let path = root.join(relative);
+        let content = fs::read_to_string(&path)
+            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+        for command in required {
+            if !content.contains(command) {
+                return Err(XtaskError::invalid_path(
+                    &path,
+                    format!("coverage-selected workflow `{relative}` is missing `{command}`"),
+                ));
+            }
+        }
+        if !content
+            .lines()
+            .any(|line| line.trim() == "path: target/quality/")
+        {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("coverage-selected workflow `{relative}` must retain `target/quality/`"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run_rust_gate(root: &Path, budget: Duration) -> Result<String, XtaskError> {

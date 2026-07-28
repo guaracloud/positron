@@ -27,8 +27,29 @@ pub(crate) struct Scope {
     pub(crate) semantic_owner: String,
     pub(crate) kind: String,
     pub(crate) state: String,
+    activation_id: String,
+    activation_scope_set: BTreeSet<String>,
+    allowed_edges: BTreeSet<(String, String)>,
     pub(crate) risk_gates: BTreeSet<String>,
     pub(crate) test_commands: String,
+    coverage_baseline: BTreeSet<String>,
+    mutation_baseline: String,
+    dependency_review: String,
+    contract_evidence: String,
+}
+
+#[derive(Clone, Debug)]
+struct ArchitectureEdge {
+    caller: String,
+    dependency: String,
+    activation_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct Threshold {
+    state: String,
+    value: String,
+    evidence: String,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +76,7 @@ pub(crate) struct Registry {
     pub(crate) tools: Vec<Tool>,
     artifact_scopes: Vec<ArtifactScope>,
     allowed_edges: BTreeSet<(String, String)>,
+    thresholds: BTreeMap<String, Threshold>,
     reviewed_dependencies: BTreeSet<String>,
     registry_files: Vec<PathBuf>,
 }
@@ -122,15 +144,30 @@ impl Registry {
                 "semantic_owner",
                 "kind",
                 "state",
+                "activation_id",
+                "activation_scope_set",
+                "allowed_edges",
                 "risk_gates",
                 "test_commands",
+                "coverage_baseline",
+                "mutation_baseline",
+                "dependency_review",
+                "contract_evidence",
             ],
         )?;
         let scopes = parse_scopes(root, &scopes_table, &owners, &gate_ids)?;
         let artifact_scopes = parse_artifact_scopes(root, &owners, &gate_ids)?;
 
-        let edges_table = read_table(root, "architecture-edges.tsv", &["caller", "dependency"])?;
-        let allowed_edges = parse_edges(&edges_table, &scopes)?;
+        let edges_table = read_table(
+            root,
+            "architecture-edges.tsv",
+            &["caller", "dependency", "activation_id"],
+        )?;
+        let edges = parse_edges(&edges_table, &scopes)?;
+        let allowed_edges = edges
+            .iter()
+            .map(|edge| (edge.caller.clone(), edge.dependency.clone()))
+            .collect::<BTreeSet<_>>();
 
         let tools_table = read_table(
             root,
@@ -145,8 +182,9 @@ impl Registry {
         )?;
         let tools = parse_tools(&tools_table)?;
 
-        validate_thresholds(root, &scopes)?;
+        let thresholds = validate_thresholds(root, &scopes)?;
         let reviewed_dependencies = validate_dependencies(root)?;
+        validate_activation_ledgers(root, &scopes, &edges, &thresholds, &reviewed_dependencies)?;
         validate_empty_or_owned_registries(root, &owners)?;
         validate_exceptions(root, &owners, &gates, &invariant_gates)?;
         validate_policy_seed(root)?;
@@ -154,6 +192,7 @@ impl Registry {
         validate_documented_gate_set(root, &gate_ids)?;
         validate_workspace_members(root, &scopes)?;
         validate_scaffold_sources(root, &scopes)?;
+        validate_active_sources(root, &scopes)?;
         validate_artifact_scaffolds(root, &artifact_scopes)?;
         validate_no_unregistered_code(root, &scopes, &artifact_scopes)?;
         validate_acyclic_edges(&allowed_edges)?;
@@ -166,6 +205,7 @@ impl Registry {
             tools,
             artifact_scopes,
             allowed_edges,
+            thresholds,
             reviewed_dependencies,
             registry_files,
         })
@@ -177,6 +217,27 @@ impl Registry {
 
     pub(crate) fn reviewed_dependencies(&self) -> &BTreeSet<String> {
         &self.reviewed_dependencies
+    }
+
+    pub(crate) fn measured_baseline(&self, identity: &str) -> Result<f64, XtaskError> {
+        let Some(threshold) = self.thresholds.get(identity) else {
+            return Err(XtaskError::invalid(
+                "threshold registry",
+                format!("coverage runner references unknown baseline `{identity}`"),
+            ));
+        };
+        if threshold.state != "measured-baseline" {
+            return Err(XtaskError::invalid(
+                "threshold registry",
+                format!("coverage runner baseline `{identity}` is not measured"),
+            ));
+        }
+        threshold.value.parse::<f64>().map_err(|source| {
+            XtaskError::invalid(
+                "threshold registry",
+                format!("coverage runner baseline `{identity}` is not numeric: {source}"),
+            )
+        })
     }
 
     pub(crate) fn registry_files(&self) -> &[PathBuf] {
@@ -457,6 +518,10 @@ fn parse_scopes(
             return Err(row_error(row, "tooling scopes must be active"));
         }
 
+        let activation_id = nonempty(row, "activation_id")?.to_owned();
+        let activation_scope_set = parse_scope_set(row, "activation_scope_set")?;
+        let allowed_edges = parse_edge_set(row, "allowed_edges")?;
+
         let risk_value = nonempty(row, "risk_gates")?;
         let risk_gates = if risk_value == "-" {
             BTreeSet::new()
@@ -469,23 +534,57 @@ fn parse_scopes(
             }
         }
         let test_commands = nonempty(row, "test_commands")?.to_owned();
+        let coverage_baseline = parse_scope_set(row, "coverage_baseline")?;
+        let mutation_baseline = nonempty(row, "mutation_baseline")?.to_owned();
+        let dependency_review = nonempty(row, "dependency_review")?.to_owned();
+        let contract_evidence = nonempty(row, "contract_evidence")?.to_owned();
 
         if kind == "application"
             && state == "scaffold"
-            && (!risk_gates.is_empty() || test_commands != "-")
+            && (activation_id != "-"
+                || !activation_scope_set.is_empty()
+                || !allowed_edges.is_empty()
+                || !risk_gates.is_empty()
+                || test_commands != "-"
+                || !coverage_baseline.is_empty()
+                || mutation_baseline != "-"
+                || dependency_review != "-"
+                || contract_evidence != "-")
         {
             return Err(row_error(
                 row,
-                "scaffold application scopes cannot advertise active gates or tests",
+                "scaffold application scopes cannot advertise activation, edges, gates, tests, baselines, reviews, or evidence",
             ));
         }
         if kind == "application"
             && state == "active"
-            && (risk_gates.is_empty() || test_commands == "-")
+            && (activation_id == "-"
+                || activation_scope_set.is_empty()
+                || allowed_edges.is_empty()
+                || risk_gates.is_empty()
+                || test_commands == "-"
+                || coverage_baseline.is_empty()
+                || mutation_baseline == "-"
+                || dependency_review == "-"
+                || contract_evidence == "-")
         {
             return Err(row_error(
                 row,
-                "active application scopes require risk gates and test commands",
+                "active application scopes require an atomic activation ledger",
+            ));
+        }
+        if kind == "tooling"
+            && (activation_id != "-"
+                || !activation_scope_set.is_empty()
+                || !allowed_edges.is_empty()
+                || !coverage_baseline.is_empty()
+                || mutation_baseline != "-"
+                || dependency_review != "-"
+                || contract_evidence != "-")
+        {
+            return Err(row_error(
+                row,
+                "tooling scopes cannot claim application activation ledger fields",
             ));
         }
 
@@ -504,11 +603,68 @@ fn parse_scopes(
             semantic_owner: owner,
             kind,
             state,
+            activation_id,
+            activation_scope_set,
+            allowed_edges,
             risk_gates,
             test_commands,
+            coverage_baseline,
+            mutation_baseline,
+            dependency_review,
+            contract_evidence,
         });
     }
     Ok(scopes)
+}
+
+fn parse_scope_set(row: &Row, field: &str) -> Result<BTreeSet<String>, XtaskError> {
+    let value = nonempty(row, field)?;
+    if value == "-" {
+        return Ok(BTreeSet::new());
+    }
+    let values = split_set(value);
+    if values.contains("-") || values.is_empty() {
+        return Err(row_error(
+            row,
+            format!("field `{field}` must be `-` or a non-empty pipe-delimited set"),
+        ));
+    }
+    Ok(values)
+}
+
+fn parse_edge_set(row: &Row, field: &str) -> Result<BTreeSet<(String, String)>, XtaskError> {
+    let value = nonempty(row, field)?;
+    if value == "-" {
+        return Ok(BTreeSet::new());
+    }
+    let mut edges = BTreeSet::new();
+    for edge in split_list(value) {
+        let Some((caller, dependency)) = edge.split_once("->") else {
+            return Err(row_error(
+                row,
+                format!("field `{field}` edge `{edge}` must use `caller->dependency`"),
+            ));
+        };
+        if caller.is_empty() || dependency.is_empty() || caller == dependency {
+            return Err(row_error(
+                row,
+                format!("field `{field}` has an invalid edge `{edge}`"),
+            ));
+        }
+        if !edges.insert((caller.to_owned(), dependency.to_owned())) {
+            return Err(row_error(
+                row,
+                format!("field `{field}` repeats edge `{edge}`"),
+            ));
+        }
+    }
+    if edges.is_empty() {
+        return Err(row_error(
+            row,
+            format!("field `{field}` must be `-` or a non-empty edge set"),
+        ));
+    }
+    Ok(edges)
 }
 
 fn parse_artifact_scopes(
@@ -604,16 +760,18 @@ fn parse_artifact_scopes(
     Ok(scopes)
 }
 
-fn parse_edges(table: &Table, scopes: &[Scope]) -> Result<BTreeSet<(String, String)>, XtaskError> {
+fn parse_edges(table: &Table, scopes: &[Scope]) -> Result<Vec<ArchitectureEdge>, XtaskError> {
     let application_packages = scopes
         .iter()
         .filter(|scope| scope.kind == "application")
         .map(|scope| scope.package.clone())
         .collect::<BTreeSet<_>>();
-    let mut edges = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    let mut edges = Vec::new();
     for row in &table.rows {
         let caller = nonempty(row, "caller")?.to_owned();
         let dependency = nonempty(row, "dependency")?.to_owned();
+        let activation_id = nonempty(row, "activation_id")?.to_owned();
         if !application_packages.contains(&caller) {
             return Err(row_error(row, format!("unknown caller `{caller}`")));
         }
@@ -623,12 +781,20 @@ fn parse_edges(table: &Table, scopes: &[Scope]) -> Result<BTreeSet<(String, Stri
         if caller == dependency {
             return Err(row_error(row, "self-dependencies are forbidden"));
         }
-        if !edges.insert((caller.clone(), dependency.clone())) {
+        if !identities.insert((caller.clone(), dependency.clone())) {
             return Err(row_error(
                 row,
                 format!("duplicate allowed edge `{caller}` -> `{dependency}`"),
             ));
         }
+        if activation_id.is_empty() {
+            return Err(row_error(row, "edge activation identity is empty"));
+        }
+        edges.push(ArchitectureEdge {
+            caller,
+            dependency,
+            activation_id,
+        });
     }
     Ok(edges)
 }
@@ -662,7 +828,10 @@ fn parse_tools(table: &Table) -> Result<Vec<Tool>, XtaskError> {
     Ok(tools)
 }
 
-fn validate_thresholds(root: &Path, scopes: &[Scope]) -> Result<(), XtaskError> {
+fn validate_thresholds(
+    root: &Path,
+    scopes: &[Scope],
+) -> Result<BTreeMap<String, Threshold>, XtaskError> {
     let table = read_table(
         root,
         "thresholds.tsv",
@@ -673,9 +842,11 @@ fn validate_thresholds(root: &Path, scopes: &[Scope]) -> Result<(), XtaskError> 
             "unit",
             "scope",
             "rationale",
+            "evidence",
         ],
     )?;
     let mut identities = BTreeSet::new();
+    let mut thresholds = BTreeMap::new();
     let mut has_pending_application_threshold = false;
     for row in &table.rows {
         let identity = nonempty(row, "threshold_id")?;
@@ -687,6 +858,7 @@ fn validate_thresholds(root: &Path, scopes: &[Scope]) -> Result<(), XtaskError> 
         let _unit = nonempty(row, "unit")?;
         let scope = nonempty(row, "scope")?;
         let _rationale = nonempty(row, "rationale")?;
+        let evidence = nonempty(row, "evidence")?.to_owned();
         if state.starts_with("pending-") && value != "-" {
             return Err(row_error(
                 row,
@@ -696,6 +868,28 @@ fn validate_thresholds(root: &Path, scopes: &[Scope]) -> Result<(), XtaskError> 
         if state.starts_with("pending-") && scope == "active-application-code" {
             has_pending_application_threshold = true;
         }
+        if state == "measured-baseline" {
+            let measured = value.parse::<f64>().map_err(|source| {
+                row_error(
+                    row,
+                    format!("measured baselines must use a non-negative numeric value: {source}"),
+                )
+            })?;
+            if !measured.is_finite() || measured < 0.0 {
+                return Err(row_error(
+                    row,
+                    "measured baselines must use a non-negative numeric value",
+                ));
+            }
+        }
+        thresholds.insert(
+            identity.to_owned(),
+            Threshold {
+                state: state.to_owned(),
+                value: value.to_owned(),
+                evidence,
+            },
+        );
     }
 
     let active_application = scopes
@@ -706,6 +900,313 @@ fn validate_thresholds(root: &Path, scopes: &[Scope]) -> Result<(), XtaskError> 
             "threshold registry",
             "application code cannot activate before measured M0 thresholds are frozen",
         ));
+    }
+    Ok(thresholds)
+}
+
+fn validate_activation_ledgers(
+    root: &Path,
+    scopes: &[Scope],
+    edges: &[ArchitectureEdge],
+    thresholds: &BTreeMap<String, Threshold>,
+    reviewed_dependencies: &BTreeSet<String>,
+) -> Result<(), XtaskError> {
+    let active = scopes
+        .iter()
+        .filter(|scope| scope.kind == "application" && scope.state == "active")
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Ok(());
+    }
+
+    let groups = active.iter().fold(
+        BTreeMap::<String, BTreeSet<String>>::new(),
+        |mut groups, scope| {
+            groups
+                .entry(scope.activation_id.clone())
+                .or_default()
+                .insert(scope.package.clone());
+            groups
+        },
+    );
+    if groups.len() != 1 || !groups.contains_key("M0-01") {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "this M0 policy may activate only the exact M0-01 foundational scope group",
+        ));
+    }
+
+    let expected_scopes = foundational_scope_set();
+    if groups.get("M0-01") != Some(&expected_scopes) {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!(
+                "M0-01 must activate exactly [{}]",
+                expected_scopes.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+
+    for scope in active {
+        validate_foundational_scope_ledger(root, scope, thresholds, reviewed_dependencies)?;
+    }
+    validate_foundational_edges(edges)?;
+    Ok(())
+}
+
+fn foundational_scope_set() -> BTreeSet<String> {
+    ["positron-api", "positron-config", "positron-domain"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn validate_foundational_scope_ledger(
+    root: &Path,
+    scope: &Scope,
+    thresholds: &BTreeMap<String, Threshold>,
+    reviewed_dependencies: &BTreeSet<String>,
+) -> Result<(), XtaskError> {
+    let Some(expected_owner) = foundational_owner(&scope.package) else {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!("M0-01 cannot activate unknown scope `{}`", scope.package),
+        ));
+    };
+    if scope.semantic_owner != expected_owner {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!(
+                "scope `{}` owner `{}` does not match the M0-01 owner `{expected_owner}`",
+                scope.package, scope.semantic_owner
+            ),
+        ));
+    }
+    if scope.activation_id != "M0-01" || scope.activation_scope_set != foundational_scope_set() {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!(
+                "scope `{}` does not declare the complete M0-01 set",
+                scope.package
+            ),
+        ));
+    }
+    let expected_edges = foundational_edges(&scope.package);
+    if scope.allowed_edges != expected_edges {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!(
+                "scope `{}` has an incomplete or forbidden edge set",
+                scope.package
+            ),
+        ));
+    }
+    if scope.risk_gates != BTreeSet::from(["EG-COVERAGE".to_owned()]) {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!("scope `{}` must select exactly EG-COVERAGE", scope.package),
+        ));
+    }
+    if scope.test_commands
+        != "cargo test --locked --package xtask --test foundational_scope_activation"
+    {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!(
+                "scope `{}` has an unexpected public policy test command",
+                scope.package
+            ),
+        ));
+    }
+    if scope.coverage_baseline
+        != BTreeSet::from([
+            "coverage-branch".to_owned(),
+            "coverage-changed-code".to_owned(),
+            "coverage-line".to_owned(),
+            "coverage-region".to_owned(),
+        ])
+        || scope.mutation_baseline != "mutation-score"
+    {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            format!(
+                "scope `{}` is missing the complete M0 baseline set",
+                scope.package
+            ),
+        ));
+    }
+    for baseline in scope
+        .coverage_baseline
+        .iter()
+        .chain(std::iter::once(&scope.mutation_baseline))
+    {
+        let Some(threshold) = thresholds.get(baseline) else {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!(
+                    "scope `{}` references unknown baseline `{baseline}`",
+                    scope.package
+                ),
+            ));
+        };
+        if threshold.state != "measured-baseline" || threshold.value == "-" {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!(
+                    "scope `{}` baseline `{baseline}` is not measured",
+                    scope.package
+                ),
+            ));
+        }
+        if threshold.evidence != scope.contract_evidence {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!(
+                    "scope `{}` baseline `{baseline}` is not traceable to its contract evidence",
+                    scope.package
+                ),
+            ));
+        }
+    }
+    if scope.dependency_review == "none" {
+        validate_dependency_free_scope(root, scope)?;
+    } else {
+        for dependency in split_set(&scope.dependency_review) {
+            if !reviewed_dependencies.contains(&dependency) {
+                return Err(XtaskError::invalid(
+                    "application activation ledger",
+                    format!(
+                        "scope `{}` names unreviewed dependency `{dependency}`",
+                        scope.package
+                    ),
+                ));
+            }
+        }
+    }
+    let evidence = root.join(&scope.contract_evidence);
+    if !evidence.is_file() {
+        return Err(XtaskError::invalid_path(
+            &evidence,
+            format!("scope `{}` contract evidence is missing", scope.package),
+        ));
+    }
+    Ok(())
+}
+
+fn foundational_owner(package: &str) -> Option<&'static str> {
+    match package {
+        "positron-domain" => Some("Architecture"),
+        "positron-api" => Some("Public API and SDK"),
+        "positron-config" => Some("Recovery and Lifecycle"),
+        _ => None,
+    }
+}
+
+fn foundational_edges(package: &str) -> BTreeSet<(String, String)> {
+    let edges = match package {
+        "positron-domain" => vec![
+            "positron-backup->positron-domain",
+            "positron-governance->positron-domain",
+            "positron-ingest->positron-domain",
+            "positron-kernel->positron-domain",
+            "positron-query->positron-domain",
+            "positron-runtime->positron-domain",
+            "positron-signals->positron-domain",
+        ],
+        "positron-api" => vec![
+            "positron-operator->positron-api",
+            "positron-runtime->positron-api",
+        ],
+        "positron-config" => vec!["positron-runtime->positron-config"],
+        _ => Vec::new(),
+    };
+    edges
+        .into_iter()
+        .filter_map(|edge| {
+            edge.split_once("->")
+                .map(|(caller, dependency)| (caller.to_owned(), dependency.to_owned()))
+        })
+        .collect()
+}
+
+fn validate_foundational_edges(edges: &[ArchitectureEdge]) -> Result<(), XtaskError> {
+    let foundational = foundational_scope_set();
+    let mut actual = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+    for edge in edges {
+        let touches_foundation =
+            foundational.contains(&edge.caller) || foundational.contains(&edge.dependency);
+        if touches_foundation && edge.activation_id != "M0-01" {
+            return Err(XtaskError::invalid(
+                "architecture edge activation ledger",
+                format!(
+                    "foundation edge `{}->{}` must be activated by M0-01",
+                    edge.caller, edge.dependency
+                ),
+            ));
+        }
+        if !touches_foundation && edge.activation_id != "-" {
+            return Err(XtaskError::invalid(
+                "architecture edge activation ledger",
+                format!(
+                    "non-foundational edge `{}->{}` cannot receive M0-01 activation",
+                    edge.caller, edge.dependency
+                ),
+            ));
+        }
+        if touches_foundation {
+            let package = if foundational.contains(&edge.caller) {
+                &edge.caller
+            } else {
+                &edge.dependency
+            };
+            let expected = foundational_edges(package);
+            if !expected.contains(&(edge.caller.clone(), edge.dependency.clone())) {
+                return Err(XtaskError::invalid(
+                    "architecture edge activation ledger",
+                    format!(
+                        "foundation edge `{}->{}` is forbidden",
+                        edge.caller, edge.dependency
+                    ),
+                ));
+            }
+            actual
+                .entry(package.clone())
+                .or_default()
+                .insert((edge.caller.clone(), edge.dependency.clone()));
+        }
+    }
+    for package in foundational {
+        let expected = foundational_edges(&package);
+        if actual.get(&package) != Some(&expected) {
+            return Err(XtaskError::invalid(
+                "architecture edge activation ledger",
+                format!("foundation edges for `{package}` do not match its activation ledger"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dependency_free_scope(root: &Path, scope: &Scope) -> Result<(), XtaskError> {
+    let manifest = root.join(&scope.path).join("Cargo.toml");
+    let content = fs::read_to_string(&manifest)
+        .map_err(|source| XtaskError::io(format!("read {}", manifest.display()), source))?;
+    for section in [
+        "[dependencies]",
+        "[dev-dependencies]",
+        "[build-dependencies]",
+        "[target.",
+        "[features]",
+    ] {
+        if content.contains(section) {
+            return Err(XtaskError::invalid_path(
+                &manifest,
+                format!(
+                    "scope `{}` declares `{section}` despite its `none` dependency review",
+                    scope.package
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1174,6 +1675,113 @@ fn validate_scaffold_sources(root: &Path, scopes: &[Scope]) -> Result<(), XtaskE
         }
     }
     Ok(())
+}
+
+fn validate_active_sources(root: &Path, scopes: &[Scope]) -> Result<(), XtaskError> {
+    for scope in scopes
+        .iter()
+        .filter(|scope| scope.kind == "application" && scope.state == "active")
+    {
+        let source_root = root.join(&scope.path).join("src");
+        let mut files = Vec::new();
+        collect_files_with_extension(&source_root, "rs", 0, &mut files)?;
+        if files.is_empty() {
+            return Err(XtaskError::invalid_path(
+                &source_root,
+                format!("active scope `{}` has no Rust source", scope.package),
+            ));
+        }
+        if scope.activation_id == "M0-01"
+            && (files.len() != 1 || files.first() != Some(&source_root.join("lib.rs")))
+        {
+            return Err(XtaskError::invalid_path(
+                &source_root,
+                format!(
+                    "activation-only scope `{}` must retain exactly its crate root source",
+                    scope.package
+                ),
+            ));
+        }
+        for path in files {
+            let content = fs::read_to_string(&path)
+                .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+            if content.lines().any(|line| line.trim() == SCAFFOLD_MARKER) {
+                return Err(XtaskError::invalid_path(
+                    &path,
+                    format!(
+                        "active scope `{}` retains the scaffold marker instead of an activation ledger",
+                        scope.package
+                    ),
+                ));
+            }
+            for (line_index, line) in content.lines().enumerate() {
+                if let Some(symbol) = deferred_runtime_symbol(line) {
+                    return Err(XtaskError::invalid_path(
+                        &path,
+                        format!(
+                            "line {} deferred runtime symbol `{symbol}` is forbidden",
+                            line_index + 1
+                        ),
+                    ));
+                }
+                if line.trim_start().starts_with("pub use ") {
+                    return Err(XtaskError::invalid_path(
+                        &path,
+                        format!(
+                            "line {} pass-through module surface is forbidden",
+                            line_index + 1
+                        ),
+                    ));
+                }
+                if scope.activation_id == "M0-01" && !activation_only_source_line(line) {
+                    return Err(XtaskError::invalid_path(
+                        &path,
+                        format!(
+                            "line {} activation-only scope `{}` contains behavior or a placeholder API",
+                            line_index + 1,
+                            scope.package
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn activation_only_source_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with("//!") || trimmed == "#![forbid(unsafe_code)]"
+}
+
+fn deferred_runtime_symbol(line: &str) -> Option<&'static str> {
+    const SYMBOLS: [&str; 8] = [
+        "MetricsStore",
+        "ProfileStore",
+        "Replication",
+        "Cluster",
+        "Consensus",
+        "Failover",
+        "FollowerRead",
+        "ShardMigration",
+    ];
+    let declaration = line.trim_start();
+    for prefix in ["pub struct ", "pub enum ", "pub mod ", "pub type ", "mod "] {
+        let Some(remainder) = declaration.strip_prefix(prefix) else {
+            continue;
+        };
+        for symbol in SYMBOLS {
+            if let Some(suffix) = remainder.strip_prefix(symbol)
+                && suffix
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+            {
+                return Some(symbol);
+            }
+        }
+    }
+    None
 }
 
 fn validate_artifact_scaffolds(root: &Path, scopes: &[ArtifactScope]) -> Result<(), XtaskError> {

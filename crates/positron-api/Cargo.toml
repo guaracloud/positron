@@ -1,6 +1,6 @@
 [package]
 name = "positron-api"
-description = "Positron generated public-interface and transport scaffold"
+description = "Positron public-interface and transport boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

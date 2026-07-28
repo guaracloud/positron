@@ -1,17 +1,17 @@
-package	path	semantic_owner	kind	state	risk_gates	test_commands
-positron	crates/positron	Application Runtime	application	scaffold	-	-
-positron-api	crates/positron-api	Public API and SDK	application	scaffold	-	-
-positron-backup	crates/positron-backup	Recovery and Lifecycle	application	scaffold	-	-
-positron-config	crates/positron-config	Recovery and Lifecycle	application	scaffold	-	-
-positron-diagnostics	crates/positron-diagnostics	Diagnostics and Operations	application	scaffold	-	-
-positron-domain	crates/positron-domain	Architecture	application	scaffold	-	-
-positron-governance	crates/positron-governance	Identity and Governance	application	scaffold	-	-
-positron-ingest	crates/positron-ingest	Ingest Interoperability	application	scaffold	-	-
-positron-kernel	crates/positron-kernel	Storage Kernel	application	scaffold	-	-
-positron-operator	crates/positron-operator	Kubernetes Platform	application	scaffold	-	-
-positron-query	crates/positron-query	Query and Integrations	application	scaffold	-	-
-positron-release	crates/positron-release	Release Engineering	application	scaffold	-	-
-positron-runtime	crates/positron-runtime	Application Runtime	application	scaffold	-	-
-positron-signals	crates/positron-signals	Log Store and Trace Store	application	scaffold	-	-
-positron-upgrade	crates/positron-upgrade	Recovery and Lifecycle	application	scaffold	-	-
-xtask	tools/xtask	Rust and Toolchain	tooling	active	EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST	cargo test --locked --package xtask
+package	path	semantic_owner	kind	state	activation_id	activation_scope_set	allowed_edges	risk_gates	test_commands	coverage_baseline	mutation_baseline	dependency_review	contract_evidence
+positron	crates/positron	Application Runtime	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-api	crates/positron-api	Public API and SDK	application	active	M0-01	positron-api|positron-config|positron-domain	positron-operator->positron-api|positron-runtime->positron-api	EG-COVERAGE	cargo test --locked --package xtask --test foundational_scope_activation	coverage-branch|coverage-changed-code|coverage-line|coverage-region	mutation-score	none	qualification/engineering/policy-changes/PC-0002-m0-01-foundational-scope-activation.json
+positron-backup	crates/positron-backup	Recovery and Lifecycle	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-config	crates/positron-config	Recovery and Lifecycle	application	active	M0-01	positron-api|positron-config|positron-domain	positron-runtime->positron-config	EG-COVERAGE	cargo test --locked --package xtask --test foundational_scope_activation	coverage-branch|coverage-changed-code|coverage-line|coverage-region	mutation-score	none	qualification/engineering/policy-changes/PC-0002-m0-01-foundational-scope-activation.json
+positron-diagnostics	crates/positron-diagnostics	Diagnostics and Operations	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-domain	crates/positron-domain	Architecture	application	active	M0-01	positron-api|positron-config|positron-domain	positron-backup->positron-domain|positron-governance->positron-domain|positron-ingest->positron-domain|positron-kernel->positron-domain|positron-query->positron-domain|positron-runtime->positron-domain|positron-signals->positron-domain	EG-COVERAGE	cargo test --locked --package xtask --test foundational_scope_activation	coverage-branch|coverage-changed-code|coverage-line|coverage-region	mutation-score	none	qualification/engineering/policy-changes/PC-0002-m0-01-foundational-scope-activation.json
+positron-governance	crates/positron-governance	Identity and Governance	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-ingest	crates/positron-ingest	Ingest Interoperability	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-kernel	crates/positron-kernel	Storage Kernel	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-operator	crates/positron-operator	Kubernetes Platform	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-query	crates/positron-query	Query and Integrations	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-release	crates/positron-release	Release Engineering	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-runtime	crates/positron-runtime	Application Runtime	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-signals	crates/positron-signals	Log Store and Trace Store	application	scaffold	-	-	-	-	-	-	-	-	-
+positron-upgrade	crates/positron-upgrade	Recovery and Lifecycle	application	scaffold	-	-	-	-	-	-	-	-	-
+xtask	tools/xtask	Rust and Toolchain	tooling	active	-	-	-	EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST	cargo test --locked --package xtask	-	-	-	-

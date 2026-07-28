@@ -1,6 +1,6 @@
 [package]
 name = "positron-config"
-description = "Positron transactional configuration module scaffold"
+description = "Positron transactional configuration boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
