@@ -27,6 +27,11 @@ fast structural checks, while pre-push and pull-request CI run the host build,
 formatting, lints, tests, docs, current-tree secret scan, dependency policy,
 and advisory scan. Cross-target builds, coverage, full-history secret scans,
 and Cargo Vet run in the scheduled extended profile rather than on every push.
+During implementation, run focused owner-crate tests and let the installed
+hooks advance through the pre-commit and PR profiles. Local dev/test builds
+reuse incremental artifacts; trusted CI disables incremental compilation and
+caches only the exact pinned PR tools, which it version-checks before running
+the unchanged authoritative profile.
 
 ## Scaffold boundary
 

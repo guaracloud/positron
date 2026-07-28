@@ -24,6 +24,31 @@ coverage, full-history, and deep supply-chain campaigns run in the scheduled
 extended profile. Hooks are convenience feedback; protected-branch CI is
 authoritative.
 
+## Fast feedback loop
+
+Use the smallest check that can disprove the change while editing:
+
+```console
+cargo test --locked --package <owner-crate> <test-filter>
+cargo clippy --locked --package <owner-crate> --all-targets --all-features
+```
+
+Local development and test profiles use incremental compilation. Trusted CI
+still sets `CARGO_INCREMENTAL=0` so retained evidence is built reproducibly.
+
+The normal validation ladder is:
+
+1. run focused owner-crate tests while editing;
+2. let pre-commit run the bounded structural profile;
+3. let pre-push run the complete local PR profile once; and
+4. rely on protected-branch CI for authoritative evidence.
+
+When repository hooks are installed, do not manually run
+`cargo xtask quality --profile pr` immediately before `git push`: the pre-push
+hook runs that same profile. Run it manually only when a final check is needed
+without pushing. Scheduled extended and release qualification profiles remain
+separate and are selected only for their registered risks and lifecycle stage.
+
 ## Change discipline
 
 Before editing code:

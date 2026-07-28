@@ -1128,6 +1128,7 @@ fn run_evidence_gate(root: &Path, registry: &Registry) -> Result<String, XtaskEr
 
 fn run_policy_gate(root: &Path, registry: &Registry) -> Result<String, XtaskError> {
     validate_workflows(root)?;
+    validate_local_development_configuration(root)?;
     validate_required_policy_files(root)?;
     hooks::validate_repository_hooks(root)?;
     if registry.activated_risk_gates().contains("EG-COVERAGE") {
@@ -1551,6 +1552,20 @@ fn validate_workflows(root: &Path) -> Result<(), XtaskError> {
         "merge_group:",
         "permissions:",
         "contents: read",
+        "CARGO_INCREMENTAL: \"0\"",
+        "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        "id: pr-tools-cache",
+        "path: ~/.positron-pr-tools",
+        "key: positron-pr-tools-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-nextest-0.9.138-deny-0.19.9-audit-0.22.2-machete-0.9.2",
+        "if: steps.pr-tools-cache.outputs.cache-hit != 'true'",
+        "if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.pr-tools-cache.outputs.cache-hit != 'true'",
+        "--root \"$HOME/.positron-pr-tools\"",
+        "Verify pinned PR tools",
+        "\"$tool_root/cargo-nextest\" --version",
+        "\"$tool_root/cargo-deny\" --version",
+        "\"$tool_root/cargo-audit\" --version",
+        "\"$tool_root/cargo-machete\" --version",
         "cargo xtask quality --profile pr",
         "persist-credentials: false",
         "if: always()",
@@ -1561,6 +1576,22 @@ fn validate_workflows(root: &Path) -> Result<(), XtaskError> {
                 format!("required workflow safeguard `{safeguard}` is missing"),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_local_development_configuration(root: &Path) -> Result<(), XtaskError> {
+    let path = root.join(".cargo/config.toml");
+    let content = fs::read_to_string(&path)
+        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    if content
+        .lines()
+        .any(|line| line.trim() == "incremental = false")
+    {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "local development configuration must not globally disable incremental compilation",
+        ));
     }
     Ok(())
 }

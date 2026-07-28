@@ -1,9 +1,6 @@
 [alias]
 xtask = "run --locked --package xtask --"
 
-[build]
-incremental = false
-
 [future-incompat-report]
 frequency = "always"
 
