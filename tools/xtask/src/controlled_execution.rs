@@ -1934,23 +1934,19 @@ done
                 OsString::from(
                     r#"
 import os
-import socket
 import sys
 import time
 
 synchronization_read, synchronization_write = os.pipe()
-with open(sys.argv[4], "w", encoding="utf-8") as direct_identity:
+with open(sys.argv[3], "w", encoding="utf-8") as direct_identity:
     direct_identity.write(str(os.getpid()))
 child = os.fork()
 if child == 0:
     os.close(synchronization_read)
     os.setsid()
-    release = os.open(sys.argv[3], os.O_RDONLY | os.O_NONBLOCK)
-    with open(sys.argv[2], "w", encoding="utf-8") as identity:
+    release = os.open(sys.argv[2], os.O_RDONLY | os.O_NONBLOCK)
+    with open(sys.argv[1], "w", encoding="utf-8") as identity:
         identity.write(str(os.getpid()))
-    readiness = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    readiness.sendto(b"ready", sys.argv[1])
-    readiness.close()
     os.write(synchronization_write, b"1")
     os.close(synchronization_write)
     while True:
@@ -1969,7 +1965,6 @@ os.close(synchronization_read)
 os._exit(0)
 "#,
                 ),
-                protocol.readiness_socket_path().as_os_str().to_owned(),
                 protocol.pid.as_os_str().to_owned(),
                 protocol.release.as_os_str().to_owned(),
                 protocol.direct_pid.as_os_str().to_owned(),
@@ -2009,7 +2004,6 @@ os._exit(0)
         let worker = thread::spawn(move || sender.send(execute(specification)));
 
         let result = (|| {
-            protocol.wait_until_ready(Duration::from_secs(1))?;
             protocol.wait_until_direct_child_stops(Duration::from_secs(1))?;
             cancellation.store(true, Ordering::Release);
             let outcome = match receiver.recv_timeout(Duration::from_secs(1)) {
@@ -2268,8 +2262,6 @@ os._exit(0)
 
     struct EscapedDescriptorProtocol {
         directory: PathBuf,
-        readiness_socket: std::os::unix::net::UnixDatagram,
-        readiness_socket_path: PathBuf,
         release: PathBuf,
         pid: PathBuf,
         direct_pid: PathBuf,
@@ -2283,8 +2275,6 @@ os._exit(0)
             let directory = PathBuf::from("/tmp")
                 .join(format!("pce-{}-{timestamp}-{sequence}", std::process::id()));
             fs::create_dir_all(&directory)?;
-            let readiness_socket_path = directory.join("ready.sock");
-            let readiness_socket = std::os::unix::net::UnixDatagram::bind(&readiness_socket_path)?;
             let release = directory.join("release");
             let status = Command::new("/usr/bin/mkfifo").arg(&release).status()?;
             if !status.success() {
@@ -2294,45 +2284,12 @@ os._exit(0)
                 .into());
             }
             Ok(Self {
-                readiness_socket,
-                readiness_socket_path,
                 pid: directory.join("descendant.pid"),
                 direct_pid: directory.join("direct.pid"),
                 directory,
                 release,
                 released: AtomicBool::new(false),
             })
-        }
-
-        fn readiness_socket_path(&self) -> &std::path::Path {
-            &self.readiness_socket_path
-        }
-
-        fn wait_until_ready(&self, timeout: Duration) -> TestResult {
-            self.readiness_socket.set_read_timeout(Some(timeout))?;
-            let mut signal = [0_u8; b"ready".len()];
-            let received = match self.readiness_socket.recv(&mut signal) {
-                Ok(received) => received,
-                Err(source)
-                    if matches!(
-                        source.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    return Err(io::Error::other(
-                        "escaped descendant did not complete its readiness handshake",
-                    )
-                    .into());
-                },
-                Err(source) => return Err(source.into()),
-            };
-            if received != signal.len() || signal != *b"ready" {
-                return Err(io::Error::other(
-                    "escaped descendant published an invalid readiness handshake",
-                )
-                .into());
-            }
-            Ok(())
         }
 
         fn wait_until_direct_child_stops(&self, timeout: Duration) -> TestResult {
