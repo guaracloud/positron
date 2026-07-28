@@ -29,6 +29,174 @@ fn quality_accepts_the_complete_atomic_foundational_activation_ledger() -> TestR
     result
 }
 
+#[test]
+fn quality_rejects_a_relative_ambient_path_before_running_a_gate() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let output = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [("PATH", "relative-tool-directory")],
+        )?;
+        if output.status.success() {
+            return Err(std::io::Error::other(
+                "the public quality runner accepted a relative ambient PATH",
+            )
+            .into());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        if !combined.contains("controlled harness environment: PATH contains a non-absolute entry")
+        {
+            return Err(std::io::Error::other(format!(
+                "quality rejected an invalid ambient PATH for the wrong reason: {combined}"
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_oversized_ambient_path_before_running_a_gate() -> TestResult {
+    let fixture = Fixture::create()?;
+    let oversized_path = "/usr/bin:".repeat(2_049);
+    let result = (|| {
+        let output = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [("PATH", oversized_path.as_str())],
+        )?;
+        if output.status.success() {
+            return Err(std::io::Error::other(
+                "the public quality runner accepted an oversized ambient PATH",
+            )
+            .into());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        if !combined.contains("controlled harness environment: PATH exceeds its bounded value size")
+        {
+            return Err(std::io::Error::other(format!(
+                "quality rejected an oversized PATH for the wrong reason: {combined}"
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_evidence_uses_a_stable_redacted_environment_digest() -> TestResult {
+    let fixture = Fixture::create()?;
+    let first_certificate = fixture.root.join("target/fixture-certificate-one.pem");
+    let second_certificate = fixture.root.join("target/fixture-certificate-two.pem");
+    let canary = fixture.root.join("target/ambient-path-canary");
+    let result = (|| {
+        fs::create_dir_all(&canary)?;
+        install_ambient_path_canary_git_fixture(&fixture.root, &canary)?;
+        fs::write(&first_certificate, "synthetic certificate fixture one\n")?;
+        fs::write(&second_certificate, "synthetic certificate fixture two\n")?;
+        let first_certificate_value = first_certificate.to_str().ok_or_else(|| {
+            std::io::Error::other("first fixture certificate path is not valid UTF-8")
+        })?;
+        let first = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [("SSL_CERT_FILE", first_certificate_value)],
+        )?;
+        if !first.status.success() {
+            return Err(std::io::Error::other(format!(
+                "quality rejected the first valid certificate snapshot: {}\n{}",
+                String::from_utf8_lossy(&first.stdout),
+                String::from_utf8_lossy(&first.stderr)
+            ))
+            .into());
+        }
+        let baseline = fixture.latest_environment_digest()?;
+        let repeated_output = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [("SSL_CERT_FILE", first_certificate_value)],
+        )?;
+        if !repeated_output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "quality rejected a repeated valid certificate snapshot: {}\n{}",
+                String::from_utf8_lossy(&repeated_output.stdout),
+                String::from_utf8_lossy(&repeated_output.stderr)
+            ))
+            .into());
+        }
+        let repeated = fixture.latest_environment_digest()?;
+        if baseline != repeated {
+            return Err(std::io::Error::other(format!(
+                "the same explicit quality environment produced unstable digests: {baseline} then {repeated}"
+            ))
+            .into());
+        }
+        let second_certificate_value = second_certificate.to_str().ok_or_else(|| {
+            std::io::Error::other("second fixture certificate path is not valid UTF-8")
+        })?;
+        let output = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [("SSL_CERT_FILE", second_certificate_value)],
+        )?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "quality rejected the valid certificate snapshot: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        let changed = fixture.latest_environment_digest()?;
+        if changed == baseline {
+            return Err(std::io::Error::other(
+                "the certificate-bearing snapshot did not change its environment digest",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_does_not_reinject_an_unresolved_ambient_path_canary() -> TestResult {
+    let fixture = Fixture::create()?;
+    let canary = fixture.root.join("target/ambient-path-canary");
+    fs::create_dir_all(&canary)?;
+    let result = (|| {
+        install_ambient_path_canary_git_fixture(&fixture.root, &canary)?;
+        let inherited_path = env::var("PATH")?;
+        let path = format!("{}:{inherited_path}", canary.display());
+        fixture
+            .quality_output_for_with_environment("pre-commit", [("PATH", path.as_str())])
+            .and_then(|output| {
+                if output.status.success() {
+                    return Ok(());
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(std::io::Error::other(format!(
+                    "the public quality runner leaked the ambient PATH canary: {stdout}\n{stderr}"
+                ))
+                .into())
+            })
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 #[cfg(unix)]
 #[test]
 fn quality_returns_a_closed_failure_when_a_controlled_descendant_holds_capture_open() -> TestResult
@@ -115,6 +283,24 @@ fn quality_ext_rejects_an_unpinned_coverage_detector() -> TestResult {
         "ext",
         make_coverage_detector_report_a_different_version,
         "coverage detector `cargo-llvm-cov`: expected version `0.8.7`",
+    )
+}
+
+#[test]
+fn quality_rejects_a_different_square_canary_in_generated_search_index() -> TestResult {
+    assert_fixture_rejected_profile(
+        "pr",
+        add_square_shaped_search_index_canary,
+        "fixture detected Square-shaped secret canary",
+    )
+}
+
+#[test]
+fn quality_rejects_a_non_square_generated_search_index_canary() -> TestResult {
+    assert_fixture_rejected_profile(
+        "pr",
+        add_non_square_search_index_canary,
+        "fixture detected generated search-index non-Square secret canary",
     )
 }
 
@@ -481,6 +667,39 @@ impl Fixture {
         Ok(output)
     }
 
+    fn quality_output_for_with_environment<const N: usize>(
+        &self,
+        profile: &str,
+        environment: [(&str, &str); N],
+    ) -> TestResult<std::process::Output> {
+        let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .current_dir(&self.root)
+            .args(["quality", "--profile", profile])
+            .envs(environment)
+            .output()?;
+        Ok(output)
+    }
+
+    fn latest_environment_digest(&self) -> TestResult<String> {
+        let evidence_directory = self.root.join("target/quality/evidence");
+        let mut evidence = fs::read_dir(&evidence_directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        evidence.sort();
+        let path = evidence.last().ok_or_else(|| {
+            std::io::Error::other("quality did not retain an engineering evidence artifact")
+        })?;
+        let content = fs::read_to_string(path)?;
+        let marker = "\"environment_digest\": \"";
+        let (_, value) = content.split_once(marker).ok_or_else(|| {
+            std::io::Error::other("engineering evidence omitted environment_digest")
+        })?;
+        let (digest, _) = value.split_once('"').ok_or_else(|| {
+            std::io::Error::other("engineering evidence has a malformed environment_digest")
+        })?;
+        Ok(digest.to_owned())
+    }
+
     #[cfg(unix)]
     fn quality_child(&self) -> TestResult<Child> {
         Command::new(env!("CARGO_BIN_EXE_xtask"))
@@ -651,6 +870,53 @@ case "${{1:-}}" in
 esac
 "#,
     );
+    write_tool(&path, &script)
+}
+
+#[cfg(unix)]
+fn install_ambient_path_canary_git_fixture(root: &Path, canary: &Path) -> TestResult {
+    let path = root.join("target/quality-tools/bin/git");
+    if !canary.ends_with("ambient-path-canary") {
+        return Err(std::io::Error::other(
+            "ambient PATH fixture canary must retain its stable path marker",
+        )
+        .into());
+    }
+    let script = r#"#!/bin/sh
+set -eu
+case ":$PATH:" in
+  *ambient-path-canary*)
+    printf '%s\n' 'ambient PATH canary reached a controlled child' >&2
+    exit 70
+    ;;
+esac
+case "${1:-}" in
+  rev-parse)
+    printf '%s\n' '0000000000000000000000000000000000000000'
+    ;;
+  status)
+    ;;
+  hash-object)
+    cat >/dev/null
+    case "${SSL_CERT_FILE:-}" in
+      *fixture-certificate-one.pem)
+        printf '%s\n' '1111111111111111111111111111111111111111'
+        ;;
+      *fixture-certificate-two.pem)
+        printf '%s\n' '2222222222222222222222222222222222222222'
+        ;;
+      *)
+        printf '%s\n' '3333333333333333333333333333333333333333'
+        ;;
+    esac
+    ;;
+  *)
+    printf 'unsupported fixture git command: %s\n' "${1:-}" >&2
+    exit 2
+    ;;
+esac
+"#
+    .to_owned();
     write_tool(&path, &script)
 }
 
@@ -1031,6 +1297,22 @@ fn make_coverage_detector_report_a_different_version(root: &Path) -> TestResult 
         "cargo-llvm-cov 0.8.7",
         "cargo-llvm-cov 0.8.6",
     )
+}
+
+fn add_square_shaped_search_index_canary(root: &Path) -> TestResult {
+    fs::write(
+        root.join("target/quality-tools/emit-search-index-square-canary"),
+        "",
+    )?;
+    Ok(())
+}
+
+fn add_non_square_search_index_canary(root: &Path) -> TestResult {
+    fs::write(
+        root.join("target/quality-tools/emit-search-index-projection-canary"),
+        "",
+    )?;
+    Ok(())
 }
 
 fn replace_once(path: &Path, before: &str, after: &str) -> TestResult {
@@ -1480,6 +1762,20 @@ case "$command" in
       printf '%s\n' '{"data":[{"totals":{"branches":{"percent":100.0},"lines":{"percent":100.0},"regions":{"percent":100.0}}}]}' > "$output"
     fi
     ;;
+  doc)
+    target="${CARGO_TARGET_DIR:?CARGO_TARGET_DIR is required}"
+    document_root="$target/doc"
+    search_index="$document_root/search.index/7ee4fc406f.js"
+    mkdir -p "$(dirname "$search_index")"
+    token_prefix='sq0atp-'
+    : > "$search_index"
+    if [ -f target/quality-tools/emit-search-index-square-canary ]; then
+      printf '%s%s\n' "$token_prefix" '1111111111111111111111' > "$search_index"
+    fi
+    if [ -f target/quality-tools/emit-search-index-projection-canary ]; then
+      printf '%s\n' 'GENERATED_DOC_NON_SQUARE_SECRET_CANARY' >> "$search_index"
+    fi
+    ;;
   tree)
     package=unknown
     previous=
@@ -1497,7 +1793,43 @@ esac
     )?;
     write_tool(
         &directory.join("gitleaks"),
-        "#!/bin/sh\nif [ \"${1:-}\" = \"version\" ]; then\n  printf '8.30.1\\n'\nfi\n",
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "version" ]; then
+  printf '8.30.1\n'
+  exit 0
+fi
+if [ "${1:-}" != "dir" ]; then
+  exit 0
+fi
+target=
+for argument in "$@"; do
+  case "$argument" in
+    --*)
+      ;;
+    dir)
+      ;;
+    *)
+      target=$argument
+      ;;
+  esac
+done
+if [ -z "$target" ]; then
+  target=.
+fi
+search_index="$target/search.index/7ee4fc406f.js"
+if [ -f "$search_index" ]; then
+  if grep -E 'sq0atp-[0-9]{22}' "$search_index" >/dev/null; then
+    printf '%s\n' 'fixture detected Square-shaped secret canary' >&2
+    exit 78
+  fi
+  if grep -F 'GENERATED_DOC_NON_SQUARE_SECRET_CANARY' "$search_index" >/dev/null; then
+    printf '%s\n' 'fixture detected generated search-index non-Square secret canary' >&2
+    exit 79
+  fi
+fi
+exit 0
+"#,
     )?;
     if !real_git {
         write_tool(

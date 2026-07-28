@@ -4,9 +4,11 @@
 //! ownership, descriptor capture, bounded waiting, termination, reaping, and
 //! final execution verdicts used by `xtask` tooling. A reconciled verdict
 //! proves that the direct child has exited, its process group has no remaining
-//! members, and every owned capture or input worker has joined.
+//! members, and every owned capture or input broker has been reaped.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
@@ -32,6 +34,8 @@ pub(crate) struct InvocationSpec {
     pub(crate) current_dir: PathBuf,
     /// The complete explicit environment visible to the child.
     pub(crate) environment: Vec<(OsString, OsString)>,
+    /// The absolute, caller-resolved tools used by the lifecycle owner itself.
+    pub(crate) tools: ExecutionTools,
     /// The owned standard input contract.
     pub(crate) input: InvocationInput,
     /// The owned output-descriptor contract.
@@ -40,6 +44,37 @@ pub(crate) struct InvocationSpec {
     pub(crate) cancellation: Arc<AtomicBool>,
     /// The complete deadline for direct execution and reconciliation.
     pub(crate) deadline: Instant,
+}
+
+/// Resolved helper executables that are outside the target child's environment.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionTools {
+    /// The absolute process-group probe and signal executable.
+    pub(crate) process_control: PathBuf,
+    /// The absolute bounded stream-capture executable.
+    pub(crate) capture_broker: PathBuf,
+}
+
+#[cfg(unix)]
+impl ExecutionTools {
+    fn validate(&self, command: &str) -> Result<(), ExecutionFailure> {
+        for (purpose, path) in [
+            ("process control", &self.process_control),
+            ("capture broker", &self.capture_broker),
+        ] {
+            if !path.is_absolute() || !path.is_file() {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    format!(
+                        "resolved {purpose} tool is not an absolute file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The bounded standard-input forms supported by the controlled owner.
@@ -207,6 +242,9 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
             "the invocation deadline had already elapsed before launch",
         ));
     }
+    if let Err(failure) = specification.tools.validate(&command_display) {
+        return ExecutionOutcome::Failed(failure);
+    }
 
     let mut command = std::process::Command::new(&specification.program);
     command
@@ -232,12 +270,14 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
             ));
         },
     };
-    let group = ProcessGroup::new(child.id());
+    let group = ProcessGroup::new(child.id(), specification.tools.process_control.clone());
     let mut workers = match OwnedWorkers::start(
         &mut child,
         &command_display,
         specification.output,
         specification.input,
+        &specification.current_dir,
+        &specification.tools,
     ) {
         Ok(workers) => workers,
         Err(failure) => {
@@ -284,7 +324,11 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                     cancellation_failure(&command_display),
                 );
             }
-            match workers.join(&command_display) {
+            match workers.join_until(
+                &command_display,
+                specification.deadline,
+                specification.cancellation.as_ref(),
+            ) {
                 Ok(output) => ExecutionOutcome::Reconciled(ExecutionVerdict { status, output }),
                 Err(failure) => ExecutionOutcome::Failed(failure),
             }
@@ -344,9 +388,9 @@ fn finish_after_execution_failure(
     failure: ExecutionFailure,
 ) -> ExecutionOutcome {
     let cleanup = terminate_and_reap(child, group, &failure.command);
-    let workers_result = workers.join(&failure.command);
+    let workers_result = workers.abort(&failure.command);
     match (cleanup, workers_result) {
-        (Ok(()), Ok(_)) => ExecutionOutcome::Failed(failure),
+        (Ok(()), Ok(())) => ExecutionOutcome::Failed(failure),
         (Err(cleanup), _) => ExecutionOutcome::Failed(cleanup),
         (Ok(()), Err(worker)) => ExecutionOutcome::Failed(worker),
     }
@@ -396,17 +440,13 @@ fn terminate_and_reap(
 ) -> Result<(), ExecutionFailure> {
     group.signal(Signal::Terminate, command)?;
     let grace_deadline = Instant::now() + TERMINATION_GRACE;
-    match wait_for_direct_child(child, command, grace_deadline, None) {
-        Ok(_) => {},
-        Err(failure) if failure.phase == FailurePhase::Deadline => {
-            group.signal(Signal::Kill, command)?;
-            let kill_deadline = Instant::now() + TERMINATION_GRACE;
-            wait_for_direct_child(child, command, kill_deadline, None).map(|_| ())?;
-        },
-        Err(failure) => return Err(failure),
+    if !group.wait_until_empty_before(command, grace_deadline)? {
+        group.signal(Signal::Kill, command)?;
+        let kill_deadline = Instant::now() + TERMINATION_GRACE;
+        group.require_empty(command, kill_deadline)?;
     }
-    let group_deadline = Instant::now() + TERMINATION_GRACE;
-    group.wait_until_empty(command, group_deadline)
+    let reap_deadline = Instant::now() + TERMINATION_GRACE;
+    wait_for_direct_child(child, command, reap_deadline, None).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -418,17 +458,29 @@ fn wait_for_progress(deadline: Instant) {
 #[cfg(unix)]
 struct ProcessGroup {
     identifier: u32,
+    process_control: PathBuf,
 }
 
 #[cfg(unix)]
 impl ProcessGroup {
-    fn new(identifier: u32) -> Self {
-        Self { identifier }
+    fn new(identifier: u32, process_control: PathBuf) -> Self {
+        Self {
+            identifier,
+            process_control,
+        }
     }
 
     fn exists(&self, command: &str) -> Result<bool, ExecutionFailure> {
         let target = format!("-{}", self.identifier);
-        let status = run_platform_kill(&[OsString::from("-0"), OsString::from(target)], command)?;
+        let status = run_platform_kill(
+            &[
+                OsString::from("-0"),
+                OsString::from("--"),
+                OsString::from(target),
+            ],
+            command,
+            &self.process_control,
+        )?;
         Ok(status.success())
     }
 
@@ -438,8 +490,13 @@ impl ProcessGroup {
         }
         let target = format!("-{}", self.identifier);
         let status = run_platform_kill(
-            &[OsString::from(signal.flag()), OsString::from(target)],
+            &[
+                OsString::from(signal.flag()),
+                OsString::from("--"),
+                OsString::from(target),
+            ],
             command,
+            &self.process_control,
         )?;
         if status.success() || !self.exists(command)? {
             return Ok(());
@@ -455,23 +512,34 @@ impl ProcessGroup {
         ))
     }
 
-    fn wait_until_empty(&self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
+    fn wait_until_empty_before(
+        &self,
+        command: &str,
+        deadline: Instant,
+    ) -> Result<bool, ExecutionFailure> {
         loop {
             if !self.exists(command)? {
-                return Ok(());
+                return Ok(true);
             }
             if Instant::now() >= deadline {
-                return Err(ExecutionFailure::new(
-                    command.to_owned(),
-                    FailurePhase::Cleanup,
-                    format!(
-                        "controlled process group {} remained alive after bounded termination",
-                        self.identifier
-                    ),
-                ));
+                return Ok(false);
             }
             wait_for_progress(deadline);
         }
+    }
+
+    fn require_empty(&self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
+        if self.wait_until_empty_before(command, deadline)? {
+            return Ok(());
+        }
+        Err(ExecutionFailure::new(
+            command.to_owned(),
+            FailurePhase::Cleanup,
+            format!(
+                "controlled process group {} remained alive after forced termination",
+                self.identifier
+            ),
+        ))
     }
 }
 
@@ -503,8 +571,10 @@ impl Signal {
 fn run_platform_kill(
     arguments: &[OsString],
     command: &str,
+    process_control: &std::path::Path,
 ) -> Result<ExitStatus, ExecutionFailure> {
-    let mut child = std::process::Command::new("/bin/kill")
+    let mut child = std::process::Command::new(process_control)
+        .env_clear()
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -542,9 +612,8 @@ fn run_platform_kill(
 
 #[cfg(unix)]
 struct OwnedWorkers {
-    stdout: Option<OutputReader>,
-    stderr: Option<OutputReader>,
-    stdin: Option<InputWriter>,
+    capture: Option<CaptureBroker>,
+    input: Option<InputBroker>,
 }
 
 #[cfg(unix)]
@@ -554,6 +623,8 @@ impl OwnedWorkers {
         command: &str,
         output: OutputMode,
         input: InvocationInput,
+        current_dir: &std::path::Path,
+        tools: &ExecutionTools,
     ) -> Result<Self, ExecutionFailure> {
         let input_pipe = match input {
             InvocationInput::Null => None,
@@ -590,96 +661,740 @@ impl OwnedWorkers {
                 Some((stdout, stderr, maximum_bytes_per_stream))
             },
         };
-        let stdin = input_pipe.map(|(stdin, bytes)| InputWriter::spawn(stdin, bytes));
-        let (stdout, stderr) = match capture_pipes {
-            Some((stdout, stderr, maximum_bytes_per_stream)) => (
-                Some(OutputReader::spawn(stdout, maximum_bytes_per_stream)),
-                Some(OutputReader::spawn(stderr, maximum_bytes_per_stream)),
-            ),
-            None => (None, None),
+        let mut capture = match capture_pipes {
+            Some((stdout, stderr, maximum_bytes_per_stream)) => Some(CaptureBroker::start(
+                stdout,
+                stderr,
+                CaptureBrokerRequest {
+                    maximum_bytes: maximum_bytes_per_stream,
+                    current_dir,
+                    invocation_id: child.id(),
+                    command,
+                    capture_broker: &tools.capture_broker,
+                },
+            )?),
+            None => None,
+        };
+        let input = match input_pipe {
+            Some((stdin, bytes)) => match InputBroker::start(
+                stdin,
+                bytes,
+                current_dir,
+                child.id(),
+                command,
+                &tools.capture_broker,
+            ) {
+                Ok(input) => Some(input),
+                Err(failure) => {
+                    let cleanup = match capture.take() {
+                        Some(capture) => capture.abort(command),
+                        None => Ok(()),
+                    };
+                    return match cleanup {
+                        Ok(()) => Err(failure),
+                        Err(cleanup) => Err(cleanup),
+                    };
+                },
+            },
+            None => None,
+        };
+        Ok(Self { capture, input })
+    }
+
+    fn join_until(
+        &mut self,
+        command: &str,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> Result<CapturedOutput, ExecutionFailure> {
+        if let Some(input) = self.input.take()
+            && let Err(failure) = input.join_until(command, deadline, cancellation)
+        {
+            let cleanup = match self.capture.take() {
+                Some(capture) => capture.abort(command),
+                None => Ok(()),
+            };
+            return match cleanup {
+                Ok(()) => Err(failure),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+        match self.capture.take() {
+            Some(capture) => capture.join_until(command, deadline, cancellation),
+            None => Ok(CapturedOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        }
+    }
+
+    fn abort(&mut self, command: &str) -> Result<(), ExecutionFailure> {
+        let capture = match self.capture.take() {
+            Some(capture) => capture.abort(command),
+            None => Ok(()),
+        };
+        let input = match self.input.take() {
+            Some(input) => input.abort(command),
+            None => Ok(()),
+        };
+        match (capture, input) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(failure), _) | (Ok(()), Err(failure)) => Err(failure),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct InputBroker {
+    child: Option<Child>,
+    status: Option<ExitStatus>,
+    directory: PathBuf,
+    payload: PathBuf,
+}
+
+#[cfg(unix)]
+impl InputBroker {
+    fn start(
+        input: std::process::ChildStdin,
+        bytes: Vec<u8>,
+        current_dir: &std::path::Path,
+        invocation_id: u32,
+        command: &str,
+        broker: &std::path::Path,
+    ) -> Result<Self, ExecutionFailure> {
+        let base = current_dir.join("target/quality/input");
+        fs::create_dir_all(&base).map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Input,
+                format!("create input broker directory: {source}"),
+            )
+        })?;
+        let directory = base.join(format!("invocation-{invocation_id}"));
+        fs::create_dir(&directory).map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Input,
+                format!("create invocation input directory: {source}"),
+            )
+        })?;
+        let payload = directory.join("payload");
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&payload)
+        {
+            Ok(file) => file,
+            Err(source) => {
+                return match fs::remove_dir(&directory) {
+                    Ok(()) => Err(ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::Input,
+                        format!("create input broker payload: {source}"),
+                    )),
+                    Err(cleanup) => Err(ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::Cleanup,
+                        format!("remove incomplete input directory: {cleanup}"),
+                    )),
+                };
+            },
+        };
+        if let Err(source) = file.write_all(&bytes) {
+            drop(file);
+            return match remove_input_paths(&directory, &payload) {
+                Ok(()) => Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Input,
+                    format!("write input broker payload: {source}"),
+                )),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+        drop(file);
+        let source = match File::open(&payload) {
+            Ok(source) => source,
+            Err(error) => {
+                return match remove_input_paths(&directory, &payload) {
+                    Ok(()) => Err(ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::Input,
+                        format!("open input broker payload: {error}"),
+                    )),
+                    Err(cleanup) => Err(cleanup),
+                };
+            },
+        };
+        let child = match std::process::Command::new(broker)
+            .env_clear()
+            .args(["-c", &bytes.len().to_string()])
+            .stdin(Stdio::from(source))
+            .stdout(Stdio::from(input))
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(source) => {
+                return match remove_input_paths(&directory, &payload) {
+                    Ok(()) => Err(ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::Input,
+                        format!("start input broker: {source}"),
+                    )),
+                    Err(cleanup) => Err(cleanup),
+                };
+            },
+        };
+        Ok(Self {
+            child: Some(child),
+            status: None,
+            directory,
+            payload,
+        })
+    }
+
+    fn join_until(
+        mut self,
+        command: &str,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> Result<(), ExecutionFailure> {
+        loop {
+            if cancellation_requested(cancellation) {
+                let failure = cancellation_failure(command);
+                return match self.abort(command) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+            match self.poll(command) {
+                Ok(Some(status)) => return self.finish(command, status),
+                Ok(None) => {},
+                Err(failure) => {
+                    return match self.abort(command) {
+                        Ok(()) => Err(failure),
+                        Err(cleanup) => Err(cleanup),
+                    };
+                },
+            }
+            if Instant::now() >= deadline {
+                let failure = ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Deadline,
+                    "input broker remained blocked after the invocation deadline",
+                );
+                return match self.abort(command) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+            wait_for_progress(deadline);
+        }
+    }
+
+    fn poll(&mut self, command: &str) -> Result<Option<ExitStatus>, ExecutionFailure> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let child = self.child.as_mut().ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Input,
+                "input broker lost its process handle",
+            )
+        })?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.status = Some(status);
+                Ok(Some(status))
+            },
+            Ok(None) => Ok(None),
+            Err(source) => Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Input,
+                format!("observe input broker: {source}"),
+            )),
+        }
+    }
+
+    fn finish(self, command: &str, status: ExitStatus) -> Result<(), ExecutionFailure> {
+        let cleanup = remove_input_paths(&self.directory, &self.payload);
+        if !status.success() {
+            return match cleanup {
+                Ok(()) => Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Input,
+                    format!("input broker exited with {status}"),
+                )),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+        cleanup
+    }
+
+    fn abort(mut self, command: &str) -> Result<(), ExecutionFailure> {
+        let process = match self.child.take() {
+            Some(mut child) => match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.status = Some(status);
+                    Ok(())
+                },
+                Ok(None) => {
+                    if let Err(source) = child.kill() {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                self.status = Some(status);
+                                Ok(())
+                            },
+                            Ok(None) | Err(_) => Err(ExecutionFailure::new(
+                                command.to_owned(),
+                                FailurePhase::Cleanup,
+                                format!("kill input broker: {source}"),
+                            )),
+                        }
+                    } else {
+                        let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
+                        wait_for_direct_child(&mut child, command, deadline, None).map(|status| {
+                            self.status = Some(status);
+                        })
+                    }
+                },
+                Err(source) => Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Cleanup,
+                    format!("observe input broker during cleanup: {source}"),
+                )),
+            },
+            None => Ok(()),
+        };
+        let cleanup = remove_input_paths(&self.directory, &self.payload);
+        match (process, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(failure), _) | (Ok(()), Err(failure)) => Err(failure),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn remove_input_paths(
+    directory: &std::path::Path,
+    payload: &std::path::Path,
+) -> Result<(), ExecutionFailure> {
+    let mut failures = Vec::new();
+    if let Err(source) = fs::remove_file(payload) {
+        failures.push(format!(
+            "remove input broker payload {}: {source}",
+            payload.display()
+        ));
+    }
+    if let Err(source) = fs::remove_dir(directory) {
+        failures.push(format!("remove input broker directory: {source}"));
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(ExecutionFailure::new(
+        directory.display().to_string(),
+        FailurePhase::Cleanup,
+        failures.join("; "),
+    ))
+}
+
+#[cfg(unix)]
+struct CaptureBroker {
+    stdout: CaptureReader,
+    stderr: CaptureReader,
+    directory: PathBuf,
+}
+
+#[cfg(unix)]
+struct CaptureBrokerRequest<'a> {
+    maximum_bytes: usize,
+    current_dir: &'a std::path::Path,
+    invocation_id: u32,
+    command: &'a str,
+    capture_broker: &'a std::path::Path,
+}
+
+#[cfg(unix)]
+impl CaptureBroker {
+    fn start(
+        stdout: std::process::ChildStdout,
+        stderr: std::process::ChildStderr,
+        request: CaptureBrokerRequest<'_>,
+    ) -> Result<Self, ExecutionFailure> {
+        let CaptureBrokerRequest {
+            maximum_bytes,
+            current_dir,
+            invocation_id,
+            command,
+            capture_broker,
+        } = request;
+        let broker_limit = maximum_bytes.checked_add(1).ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                "captured output limit cannot reserve an overflow-detection byte",
+            )
+        })?;
+        let base = current_dir.join("target/quality/capture");
+        fs::create_dir_all(&base).map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                format!("create capture broker directory: {source}"),
+            )
+        })?;
+        let directory = base.join(format!("invocation-{invocation_id}"));
+        fs::create_dir(&directory).map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                format!("create invocation capture directory: {source}"),
+            )
+        })?;
+        let stdout_path = directory.join("stdout");
+        let stderr_path = directory.join("stderr");
+        let stdout_file = match create_capture_file(&stdout_path, command) {
+            Ok(file) => file,
+            Err(failure) => {
+                return match fs::remove_dir(&directory) {
+                    Ok(()) => Err(failure),
+                    Err(source) => Err(ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::Cleanup,
+                        format!("remove incomplete capture directory: {source}"),
+                    )),
+                };
+            },
+        };
+        let stderr_file = match create_capture_file(&stderr_path, command) {
+            Ok(file) => file,
+            Err(failure) => {
+                return match remove_capture_paths(&directory, &[&stdout_path]) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(cleanup),
+                };
+            },
+        };
+        let stdout = match CaptureReader::start(
+            stdout,
+            stdout_file,
+            CaptureReaderRequest {
+                path: stdout_path.clone(),
+                stream: "stdout",
+                maximum_bytes,
+                broker_limit,
+                command,
+                capture_broker,
+            },
+        ) {
+            Ok(reader) => reader,
+            Err(failure) => {
+                return match remove_capture_paths(&directory, &[&stdout_path, &stderr_path]) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(cleanup),
+                };
+            },
+        };
+        let stderr = match CaptureReader::start(
+            stderr,
+            stderr_file,
+            CaptureReaderRequest {
+                path: stderr_path.clone(),
+                stream: "stderr",
+                maximum_bytes,
+                broker_limit,
+                command,
+                capture_broker,
+            },
+        ) {
+            Ok(reader) => reader,
+            Err(failure) => {
+                let broker_cleanup = stdout.abort(command);
+                let file_cleanup = remove_capture_paths(&directory, &[&stdout_path, &stderr_path]);
+                return match (broker_cleanup, file_cleanup) {
+                    (Ok(()), Ok(())) => Err(failure),
+                    (Err(cleanup), _) | (Ok(()), Err(cleanup)) => Err(cleanup),
+                };
+            },
         };
         Ok(Self {
             stdout,
             stderr,
-            stdin,
+            directory,
         })
     }
 
-    fn join(&mut self, command: &str) -> Result<CapturedOutput, ExecutionFailure> {
-        if let Some(writer) = self.stdin.take() {
-            writer.join(command)?;
+    fn join_until(
+        mut self,
+        command: &str,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> Result<CapturedOutput, ExecutionFailure> {
+        loop {
+            if cancellation_requested(cancellation) {
+                let failure = cancellation_failure(command);
+                return match self.abort(command) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+            let stdout_complete = match self.stdout.poll(command) {
+                Ok(complete) => complete,
+                Err(failure) => {
+                    return match self.abort(command) {
+                        Ok(()) => Err(failure),
+                        Err(cleanup) => Err(cleanup),
+                    };
+                },
+            };
+            let stderr_complete = match self.stderr.poll(command) {
+                Ok(complete) => complete,
+                Err(failure) => {
+                    return match self.abort(command) {
+                        Ok(()) => Err(failure),
+                        Err(cleanup) => Err(cleanup),
+                    };
+                },
+            };
+            if stdout_complete && stderr_complete {
+                return self.finish(command);
+            }
+            if Instant::now() >= deadline {
+                let failure = ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Deadline,
+                    "capture descriptors remained open after the invocation deadline",
+                );
+                return match self.abort(command) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+            wait_for_progress(deadline);
         }
-        let stdout = match self.stdout.take() {
-            Some(reader) => reader.join(command, "stdout")?,
-            None => String::new(),
-        };
-        let stderr = match self.stderr.take() {
-            Some(reader) => reader.join(command, "stderr")?,
-            None => String::new(),
-        };
-        Ok(CapturedOutput { stdout, stderr })
-    }
-}
-
-#[cfg(unix)]
-struct InputWriter {
-    worker: thread::JoinHandle<std::io::Result<()>>,
-}
-
-#[cfg(unix)]
-impl InputWriter {
-    fn spawn(mut input: std::process::ChildStdin, bytes: Vec<u8>) -> Self {
-        let worker = thread::spawn(move || {
-            input.write_all(&bytes)?;
-            Ok(())
-        });
-        Self { worker }
     }
 
-    fn join(self, command: &str) -> Result<(), ExecutionFailure> {
-        match self.worker.join() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(source)) => Err(ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Input,
-                source.to_string(),
-            )),
-            Err(_) => Err(ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Input,
-                "owned input worker terminated unexpectedly",
-            )),
+    fn finish(mut self, command: &str) -> Result<CapturedOutput, ExecutionFailure> {
+        let stdout = self.stdout.finish(command);
+        let stderr = self.stderr.finish(command);
+        let cleanup =
+            remove_capture_paths(&self.directory, &[&self.stdout.path, &self.stderr.path]);
+        match (stdout, stderr, cleanup) {
+            (Ok(stdout), Ok(stderr), Ok(())) => Ok(CapturedOutput { stdout, stderr }),
+            (Err(failure), _, _) | (Ok(_), Err(failure), _) => Err(failure),
+            (Ok(_), Ok(_), Err(cleanup)) => Err(cleanup),
+        }
+    }
+
+    fn abort(self, command: &str) -> Result<(), ExecutionFailure> {
+        let stdout_path = self.stdout.path.clone();
+        let stderr_path = self.stderr.path.clone();
+        let stdout = self.stdout.abort(command);
+        let stderr = self.stderr.abort(command);
+        let cleanup = remove_capture_paths(&self.directory, &[&stdout_path, &stderr_path]);
+        match (stdout, stderr, cleanup) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(failure), _, _) | (Ok(()), Err(failure), _) => Err(failure),
+            (Ok(()), Ok(()), Err(cleanup)) => Err(cleanup),
         }
     }
 }
 
 #[cfg(unix)]
-struct OutputReader {
-    worker: thread::JoinHandle<Result<String, OutputReadFailure>>,
+struct CaptureReader {
+    child: Option<Child>,
+    status: Option<ExitStatus>,
+    path: PathBuf,
+    stream: &'static str,
+    maximum_bytes: usize,
 }
 
 #[cfg(unix)]
-impl OutputReader {
-    fn spawn(output: impl Read + Send + 'static, maximum_bytes: usize) -> Self {
-        let worker = thread::spawn(move || read_limited_output(output, maximum_bytes));
-        Self { worker }
+struct CaptureReaderRequest<'a> {
+    path: PathBuf,
+    stream: &'static str,
+    maximum_bytes: usize,
+    broker_limit: usize,
+    command: &'a str,
+    capture_broker: &'a std::path::Path,
+}
+
+#[cfg(unix)]
+impl CaptureReader {
+    fn start(
+        input: impl Into<Stdio>,
+        output: File,
+        request: CaptureReaderRequest<'_>,
+    ) -> Result<Self, ExecutionFailure> {
+        let CaptureReaderRequest {
+            path,
+            stream,
+            maximum_bytes,
+            broker_limit,
+            command,
+            capture_broker,
+        } = request;
+        let child = std::process::Command::new(capture_broker)
+            .env_clear()
+            .args(["-c", &broker_limit.to_string()])
+            .stdin(input)
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|source| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    format!("start {stream} capture broker: {source}"),
+                )
+            })?;
+        Ok(Self {
+            child: Some(child),
+            status: None,
+            path,
+            stream,
+            maximum_bytes,
+        })
     }
 
-    fn join(self, command: &str, stream: &str) -> Result<String, ExecutionFailure> {
-        match self.worker.join() {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(failure)) => Err(ExecutionFailure::new(
+    fn poll(&mut self, command: &str) -> Result<bool, ExecutionFailure> {
+        if self.status.is_some() {
+            return Ok(true);
+        }
+        let child = self.child.as_mut().ok_or_else(|| {
+            ExecutionFailure::new(
                 command.to_owned(),
                 FailurePhase::Capture,
-                format!("{stream} capture failed: {}", failure.detail),
-            )),
-            Err(_) => Err(ExecutionFailure::new(
+                format!("{} capture broker lost its process handle", self.stream),
+            )
+        })?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.status = Some(status);
+                Ok(true)
+            },
+            Ok(None) => Ok(false),
+            Err(source) => Err(ExecutionFailure::new(
                 command.to_owned(),
                 FailurePhase::Capture,
-                format!("owned {stream} capture worker terminated unexpectedly"),
+                format!("observe {} capture broker: {source}", self.stream),
             )),
         }
     }
+
+    fn finish(&mut self, command: &str) -> Result<String, ExecutionFailure> {
+        let status = self.status.ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("{} capture broker has no terminal status", self.stream),
+            )
+        })?;
+        if !status.success() {
+            return Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("{} capture broker exited with {status}", self.stream),
+            ));
+        }
+        let output = File::open(&self.path).map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("open {} capture: {source}", self.stream),
+            )
+        })?;
+        read_limited_output(output, self.maximum_bytes).map_err(|failure| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("{} capture failed: {}", self.stream, failure.detail),
+            )
+        })
+    }
+
+    fn abort(mut self, command: &str) -> Result<(), ExecutionFailure> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.status = Some(status);
+                Ok(())
+            },
+            Ok(None) => {
+                if let Err(source) = child.kill() {
+                    return match child.try_wait() {
+                        Ok(Some(status)) => {
+                            self.status = Some(status);
+                            Ok(())
+                        },
+                        Ok(None) | Err(_) => Err(ExecutionFailure::new(
+                            command.to_owned(),
+                            FailurePhase::Cleanup,
+                            format!("kill {} capture broker: {source}", self.stream),
+                        )),
+                    };
+                }
+                let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
+                wait_for_direct_child(&mut child, command, deadline, None).map(|status| {
+                    self.status = Some(status);
+                })
+            },
+            Err(source) => Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                format!(
+                    "observe {} capture broker during cleanup: {source}",
+                    self.stream
+                ),
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn create_capture_file(path: &std::path::Path, command: &str) -> Result<File, ExecutionFailure> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                format!("create capture broker file {}: {source}", path.display()),
+            )
+        })
+}
+
+#[cfg(unix)]
+fn remove_capture_paths(
+    directory: &std::path::Path,
+    paths: &[&std::path::Path],
+) -> Result<(), ExecutionFailure> {
+    let mut failures = Vec::new();
+    for path in paths {
+        if let Err(source) = fs::remove_file(path) {
+            failures.push(format!(
+                "remove capture broker file {}: {source}",
+                path.display()
+            ));
+        }
+    }
+    if let Err(source) = fs::remove_dir(directory) {
+        failures.push(format!("remove capture broker directory: {source}"));
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(ExecutionFailure::new(
+        directory.display().to_string(),
+        FailurePhase::Cleanup,
+        failures.join("; "),
+    ))
 }
 
 #[cfg(unix)]
@@ -697,9 +1412,8 @@ fn read_limited_output(
     let mut buffer = [0_u8; 8_192];
     let mut exceeded = false;
 
-    // Keep draining after the retained limit so an owned child cannot block on
-    // a full descriptor pipe. Storage remains capped; the invocation deadline
-    // bounds a child that writes forever.
+    // The broker caps its regular output file at one byte past the retained
+    // limit. Reading that file is non-blocking with respect to escaped writers.
     loop {
         let read = output
             .read(&mut buffer)
@@ -743,16 +1457,18 @@ fn command_display(program: &OsStr, arguments: &[OsString]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        CapturedOutput, ExecutionFailure, ExecutionOutcome, ExecutionVerdict, FailurePhase,
-        InvocationInput, InvocationSpec, OutputMode, execute,
+        CapturedOutput, ExecutionFailure, ExecutionOutcome, ExecutionTools, ExecutionVerdict,
+        FailurePhase, InvocationInput, InvocationSpec, OutputMode, execute,
     };
     use std::error::Error;
     use std::ffi::OsString;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io;
+    use std::io::Write as _;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -779,6 +1495,40 @@ mod tests {
             "normal-stdout",
             "normal-stderr",
             "successful controlled child",
+        )
+    }
+
+    #[test]
+    fn reconciles_an_immediate_child_after_its_process_group_disappears() -> TestResult {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or_else(|| io::Error::other("test group deadline cannot be represented"))?;
+        let verdict = reconciled(execute(InvocationSpec {
+            program: OsString::from("/usr/bin/true"),
+            arguments: Vec::new(),
+            current_dir: std::env::current_dir()?,
+            environment: Vec::new(),
+            tools: test_execution_tools()?,
+            input: InvocationInput::Null,
+            output: OutputMode::Capture {
+                maximum_bytes_per_stream: 1_024,
+            },
+            cancellation: Arc::new(AtomicBool::new(false)),
+            deadline,
+        }))?;
+
+        if !verdict.status.success() {
+            return Err(io::Error::other(format!(
+                "immediate controlled child returned {}",
+                verdict.status
+            ))
+            .into());
+        }
+        assert_output(
+            verdict.output,
+            "",
+            "",
+            "immediate controlled child with an empty process group",
         )
     }
 
@@ -817,6 +1567,7 @@ mod tests {
                 OsString::from("POSITRON_CONTROLLED_MARKER"),
                 OsString::from("isolated"),
             )],
+            tools: test_execution_tools()?,
             input: InvocationInput::Null,
             output: OutputMode::Capture {
                 maximum_bytes_per_stream: 1_024,
@@ -850,6 +1601,7 @@ mod tests {
             arguments: Vec::new(),
             current_dir: std::env::current_dir()?,
             environment: Vec::new(),
+            tools: test_execution_tools()?,
             input: InvocationInput::Null,
             output: OutputMode::Capture {
                 maximum_bytes_per_stream: 1_024,
@@ -915,6 +1667,7 @@ mod tests {
             ],
             current_dir: std::env::current_dir()?,
             environment: protocol.environment(),
+            tools: test_execution_tools()?,
             input: InvocationInput::Null,
             output: OutputMode::Capture {
                 maximum_bytes_per_stream: 1_024,
@@ -948,6 +1701,287 @@ mod tests {
             ))
             .into()),
         }
+    }
+
+    #[test]
+    fn returns_a_closed_descendant_failure_after_killing_a_term_ignoring_group() -> TestResult {
+        let protocol = TermIgnoringProtocol::create()?;
+        let mut specification = captured_shell(
+            r#"
+(
+  trap '' TERM
+  : > "$POSITRON_CONTROLLED_READY"
+  while :; do
+    /bin/sleep 60
+  done
+) &
+printf '%s\n' "$!" > "$POSITRON_CONTROLLED_PID"
+while [ ! -f "$POSITRON_CONTROLLED_READY" ]; do
+  :
+done
+"#,
+            Duration::from_secs(3),
+        )?;
+        specification.environment = protocol.environment();
+
+        let outcome = execute(specification);
+        let descendant_running = protocol.descendant_is_running();
+        let cleanup = protocol.remove();
+        cleanup?;
+        if descendant_running? {
+            return Err(io::Error::other(
+                "controlled owner returned before killing the TERM-ignoring process group",
+            )
+            .into());
+        }
+
+        match outcome {
+            ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Descendant => {
+                Ok(())
+            },
+            ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                "TERM-ignoring controlled group returned {} instead of descendant: {}",
+                failure.phase.as_str(),
+                failure.detail
+            ))
+            .into()),
+            ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                "TERM-ignoring controlled group reconciled with {}",
+                verdict.status
+            ))
+            .into()),
+        }
+    }
+
+    #[test]
+    fn returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_capture_descriptors()
+    -> TestResult {
+        let protocol = EscapedDescriptorProtocol::create()?;
+        let specification = escaped_descriptor_spec(
+            &protocol,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(100),
+        )?;
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || sender.send(execute(specification)));
+
+        let result = (|| {
+            protocol.wait_until_ready(Duration::from_secs(1))?;
+            let outcome = match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(outcome) => outcome,
+                Err(RecvTimeoutError::Timeout) => {
+                    protocol.release()?;
+                    let released = receiver.recv_timeout(Duration::from_secs(2)).map_err(
+                        |source| {
+                            io::Error::other(format!(
+                                "controlled owner remained blocked after test descriptor release: {source}"
+                            ))
+                        },
+                    )?;
+                    let send = worker.join().map_err(|_| {
+                        io::Error::other("escaped-descriptor execution worker panicked")
+                    })?;
+                    send.map_err(|_| {
+                        io::Error::other(
+                            "escaped-descriptor execution worker could not publish its outcome",
+                        )
+                    })?;
+                    let _released_outcome = released;
+                    return Err(io::Error::other(
+                        "controlled owner did not reconcile escaped capture descriptors before its deadline",
+                    )
+                    .into());
+                },
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other(
+                        "escaped-descriptor execution worker disconnected without an outcome",
+                    )
+                    .into());
+                },
+            };
+            protocol.release()?;
+            let send = worker
+                .join()
+                .map_err(|_| io::Error::other("escaped-descriptor execution worker panicked"))?;
+            send.map_err(|_| {
+                io::Error::other(
+                    "escaped-descriptor execution worker could not publish its outcome",
+                )
+            })?;
+
+            match outcome {
+                ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => {
+                    Ok(())
+                },
+                ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                    "escaped capture descriptors returned {} instead of deadline: {}",
+                    failure.phase.as_str(),
+                    failure.detail
+                ))
+                .into()),
+                ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                    "escaped capture descriptors reconciled with {}",
+                    verdict.status
+                ))
+                .into()),
+            }
+        })();
+        let cleanup = protocol.remove();
+        cleanup?;
+        result
+    }
+
+    #[test]
+    fn returns_a_bounded_cancellation_failure_when_an_escaped_descendant_retains_descriptors_and_unread_input()
+    -> TestResult {
+        let protocol = EscapedDescriptorProtocol::create()?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut specification =
+            escaped_descriptor_spec(&protocol, Arc::clone(&cancellation), Duration::from_secs(2))?;
+        specification.input = InvocationInput::Bytes(vec![b'x'; 2_097_152]);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || sender.send(execute(specification)));
+
+        let result = (|| {
+            protocol.wait_until_ready(Duration::from_secs(1))?;
+            protocol.wait_until_direct_child_stops(Duration::from_secs(1))?;
+            cancellation.store(true, Ordering::Release);
+            let outcome = match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(outcome) => outcome,
+                Err(source) => {
+                    protocol.release()?;
+                    let published = receiver.recv_timeout(Duration::from_secs(2)).map_err(
+                        |release_source| {
+                            io::Error::other(format!(
+                                "controlled owner remained blocked after cancellation test release: {release_source}"
+                            ))
+                        },
+                    )?;
+                    let send = worker.join().map_err(|_| {
+                        io::Error::other("escaped-descriptor execution worker panicked")
+                    })?;
+                    send.map_err(|_| {
+                        io::Error::other(
+                            "escaped-descriptor execution worker could not publish its outcome",
+                        )
+                    })?;
+                    let _published_after_release = published;
+                    return Err(io::Error::other(format!(
+                        "controlled owner did not reconcile escaped capture descriptors after cancellation: {source}"
+                    ))
+                    .into());
+                },
+            };
+            protocol.release()?;
+            let send = worker
+                .join()
+                .map_err(|_| io::Error::other("escaped-descriptor execution worker panicked"))?;
+            send.map_err(|_| {
+                io::Error::other(
+                    "escaped-descriptor execution worker could not publish its outcome",
+                )
+            })?;
+
+            match outcome {
+                ExecutionOutcome::Failed(failure)
+                    if failure.phase == FailurePhase::Cancellation =>
+                {
+                    Ok(())
+                },
+                ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                    "cancelled escaped capture descriptors returned {} instead of cancellation: {}",
+                    failure.phase.as_str(),
+                    failure.detail
+                ))
+                .into()),
+                ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                    "cancelled escaped capture descriptors reconciled with {}",
+                    verdict.status
+                ))
+                .into()),
+            }
+        })();
+        let cleanup = protocol.remove();
+        cleanup?;
+        result
+    }
+
+    #[test]
+    fn returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_unread_input()
+    -> TestResult {
+        let protocol = EscapedDescriptorProtocol::create()?;
+        let mut specification = escaped_descriptor_spec(
+            &protocol,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(1),
+        )?;
+        specification.input = InvocationInput::Bytes(vec![b'x'; 2_097_152]);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || sender.send(execute(specification)));
+
+        let result = (|| {
+            protocol.wait_until_ready(Duration::from_secs(1))?;
+            let outcome = match receiver.recv_timeout(Duration::from_secs(2)) {
+                Ok(outcome) => outcome,
+                Err(RecvTimeoutError::Timeout) => {
+                    protocol.release()?;
+                    let released =
+                        receiver
+                            .recv_timeout(Duration::from_secs(2))
+                            .map_err(|source| {
+                                io::Error::other(format!(
+                                    "controlled owner remained blocked after test input release: {source}"
+                                ))
+                            })?;
+                    let send = worker
+                        .join()
+                        .map_err(|_| io::Error::other("escaped-input execution worker panicked"))?;
+                    send.map_err(|_| {
+                        io::Error::other(
+                            "escaped-input execution worker could not publish its outcome",
+                        )
+                    })?;
+                    let _released_outcome = released;
+                    return Err(io::Error::other(
+                        "controlled owner did not reconcile escaped unread input before its deadline",
+                    )
+                    .into());
+                },
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other(
+                        "escaped-input execution worker disconnected without an outcome",
+                    )
+                    .into());
+                },
+            };
+            protocol.release()?;
+            let send = worker
+                .join()
+                .map_err(|_| io::Error::other("escaped-input execution worker panicked"))?;
+            send.map_err(|_| {
+                io::Error::other("escaped-input execution worker could not publish its outcome")
+            })?;
+
+            match outcome {
+                ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => {
+                    Ok(())
+                },
+                ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                    "escaped unread input returned {} instead of deadline: {}",
+                    failure.phase.as_str(),
+                    failure.detail
+                ))
+                .into()),
+                ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                    "escaped unread input reconciled with {}",
+                    verdict.status
+                ))
+                .into()),
+            }
+        })();
+        let cleanup = protocol.remove();
+        cleanup?;
+        result
     }
 
     #[test]
@@ -1043,6 +2077,65 @@ mod tests {
         captured_shell_with_limit(script, timeout, 1_024)
     }
 
+    fn escaped_descriptor_spec(
+        protocol: &EscapedDescriptorProtocol,
+        cancellation: Arc<AtomicBool>,
+        timeout: Duration,
+    ) -> TestResult<InvocationSpec> {
+        let python = python3_path()?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::other("test escape deadline cannot be represented"))?;
+        Ok(InvocationSpec {
+            program: python.into_os_string(),
+            arguments: vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"
+import os
+import sys
+import time
+
+with open(sys.argv[4], "w", encoding="utf-8") as direct_identity:
+    direct_identity.write(str(os.getpid()))
+child = os.fork()
+if child == 0:
+    os.setsid()
+    release = os.open(sys.argv[3], os.O_RDONLY | os.O_NONBLOCK)
+    with open(sys.argv[2], "w", encoding="utf-8") as identity:
+        identity.write(str(os.getpid()))
+    open(sys.argv[1], "wb").close()
+    while True:
+        try:
+            if os.read(release, 1):
+                break
+        except BlockingIOError:
+            time.sleep(0.005)
+    os.close(release)
+    os._exit(0)
+
+while not os.path.isfile(sys.argv[1]):
+    time.sleep(0.005)
+os._exit(0)
+"#,
+                ),
+                protocol.ready.as_os_str().to_owned(),
+                protocol.pid.as_os_str().to_owned(),
+                protocol.release.as_os_str().to_owned(),
+                protocol.direct_pid.as_os_str().to_owned(),
+            ],
+            current_dir: std::env::current_dir()?,
+            environment: Vec::new(),
+            tools: test_execution_tools()?,
+            input: InvocationInput::Null,
+            output: OutputMode::Capture {
+                maximum_bytes_per_stream: 1_024,
+            },
+            cancellation,
+            deadline,
+        })
+    }
+
     fn captured_shell_with_limit(
         script: &str,
         timeout: Duration,
@@ -1056,6 +2149,7 @@ mod tests {
             arguments: vec![OsString::from("-c"), OsString::from(script)],
             current_dir: std::env::current_dir()?,
             environment: Vec::new(),
+            tools: test_execution_tools()?,
             input: InvocationInput::Null,
             output: OutputMode::Capture {
                 maximum_bytes_per_stream,
@@ -1172,5 +2266,209 @@ mod tests {
             fs::remove_dir_all(self.directory)?;
             Ok(())
         }
+    }
+
+    struct TermIgnoringProtocol {
+        directory: PathBuf,
+        ready: PathBuf,
+        pid: PathBuf,
+    }
+
+    impl TermIgnoringProtocol {
+        fn create() -> TestResult<Self> {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let sequence = CANCELLATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "positron-controlled-term-ignore-{}-{timestamp}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory)?;
+            Ok(Self {
+                ready: directory.join("ready"),
+                pid: directory.join("descendant.pid"),
+                directory,
+            })
+        }
+
+        fn environment(&self) -> Vec<(OsString, OsString)> {
+            vec![
+                (
+                    OsString::from("POSITRON_CONTROLLED_READY"),
+                    self.ready.as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("POSITRON_CONTROLLED_PID"),
+                    self.pid.as_os_str().to_owned(),
+                ),
+            ]
+        }
+
+        fn descendant_is_running(&self) -> TestResult<bool> {
+            let pid = fs::read_to_string(&self.pid)?.trim().to_owned();
+            let status = Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            Ok(status.success())
+        }
+
+        fn remove(self) -> TestResult {
+            if self.pid.is_file() && self.descendant_is_running()? {
+                let pid = fs::read_to_string(&self.pid)?.trim().to_owned();
+                let status = Command::new("/bin/kill")
+                    .args(["-KILL", &pid])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?;
+                if !status.success() {
+                    return Err(io::Error::other(format!(
+                        "test cleanup could not kill TERM-ignoring descendant: {status}"
+                    ))
+                    .into());
+                }
+            }
+            fs::remove_dir_all(self.directory)?;
+            Ok(())
+        }
+    }
+
+    struct EscapedDescriptorProtocol {
+        directory: PathBuf,
+        ready: PathBuf,
+        release: PathBuf,
+        pid: PathBuf,
+        direct_pid: PathBuf,
+    }
+
+    impl EscapedDescriptorProtocol {
+        fn create() -> TestResult<Self> {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let sequence = CANCELLATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "positron-controlled-escaped-descriptor-{}-{timestamp}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory)?;
+            let release = directory.join("release");
+            let status = Command::new("/usr/bin/mkfifo").arg(&release).status()?;
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "create escaped-descriptor release FIFO failed with {status}"
+                ))
+                .into());
+            }
+            Ok(Self {
+                ready: directory.join("ready"),
+                pid: directory.join("descendant.pid"),
+                direct_pid: directory.join("direct.pid"),
+                directory,
+                release,
+            })
+        }
+
+        fn wait_until_ready(&self, timeout: Duration) -> TestResult {
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| io::Error::other("test readiness deadline cannot be represented"))?;
+            while !self.ready.is_file() {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(
+                        "escaped descendant did not complete its readiness handshake",
+                    )
+                    .into());
+                }
+                thread::yield_now();
+            }
+            Ok(())
+        }
+
+        fn wait_until_direct_child_stops(&self, timeout: Duration) -> TestResult {
+            let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+                io::Error::other("test direct-child deadline cannot be represented")
+            })?;
+            while process_identity_is_running(&self.direct_pid)? {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(
+                        "escaped-descriptor direct child remained alive before cancellation",
+                    )
+                    .into());
+                }
+                thread::yield_now();
+            }
+            Ok(())
+        }
+
+        fn descendant_is_running(&self) -> TestResult<bool> {
+            process_identity_is_running(&self.pid)
+        }
+
+        fn release(&self) -> TestResult {
+            if !self.descendant_is_running()? {
+                return Ok(());
+            }
+            let mut release = OpenOptions::new().write(true).open(&self.release)?;
+            release.write_all(b"1")?;
+            Ok(())
+        }
+
+        fn remove(self) -> TestResult {
+            self.release()?;
+            let deadline = Instant::now()
+                .checked_add(Duration::from_secs(2))
+                .ok_or_else(|| io::Error::other("test cleanup deadline cannot be represented"))?;
+            while self.descendant_is_running()? {
+                if Instant::now() >= deadline {
+                    let pid = fs::read_to_string(&self.pid)?.trim().to_owned();
+                    let status = Command::new("/bin/kill").args(["-KILL", &pid]).status()?;
+                    if !status.success() {
+                        return Err(io::Error::other(format!(
+                            "test cleanup could not kill escaped descendant: {status}"
+                        ))
+                        .into());
+                    }
+                    break;
+                }
+                thread::yield_now();
+            }
+            fs::remove_dir_all(self.directory)?;
+            Ok(())
+        }
+    }
+
+    fn process_identity_is_running(identity: &std::path::Path) -> TestResult<bool> {
+        if !identity.is_file() {
+            return Ok(false);
+        }
+        let pid = fs::read_to_string(identity)?.trim().to_owned();
+        let status = Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        Ok(status.success())
+    }
+
+    fn test_execution_tools() -> TestResult<ExecutionTools> {
+        Ok(ExecutionTools {
+            process_control: fs::canonicalize("/bin/kill")?,
+            capture_broker: fs::canonicalize("/usr/bin/head")?,
+        })
+    }
+
+    fn python3_path() -> TestResult<PathBuf> {
+        for candidate in ["/usr/bin/python3", "/opt/homebrew/bin/python3"] {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+        Err(io::Error::other(
+            "escaped-descriptor regression requires an absolute Python 3 interpreter",
+        )
+        .into())
     }
 }

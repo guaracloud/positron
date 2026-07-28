@@ -22,7 +22,7 @@
       "the owner creates one Unix process group, reconciles that group, owns input and capture workers, and returns a closed typed outcome",
       "the owner clears ambient child environment and quality supplies an explicit bounded PATH, toolchain-path, locale, timezone, temporary-directory, and certificate-path snapshot",
       "fixture control paths are embedded in the synthetic git program instead of inherited through the outer xtask environment",
-      "quality documentation builds use a unique temporary target outside the worktree so EG-SECRETS scans source and retained evidence rather than rustdoc-generated compressed search indexes"
+      "quality documentation builds use a unique temporary target, and EG-DOCS scans the full generated rustdoc root without secret-scan exclusions"
     ],
     "ownership_boundary": "The owner reconciles only its direct child and the process group it created. It does not claim control over a hostile descendant that intentionally escapes that group.",
     "unchanged": [
@@ -31,10 +31,11 @@
     ]
   },
   "detection_gained": [
-    "a deterministic public FIFO regression fails closed when a controlled descendant retains stdout or stderr after its direct parent exits",
-    "typed launch, non-zero, deadline, cancellation, capture-limit, descendant, and cleanup-path outcomes are exercised through the controlled owner",
-    "parallel reordered invocations retain separate descriptors and explicit environments",
-    "an empty-specification child cannot inherit the test runner environment"
+      "a deterministic public FIFO regression fails closed when a controlled descendant retains stdout or stderr after its direct parent exits",
+      "typed launch, non-zero, deadline, cancellation, capture-limit, descendant, and cleanup-path outcomes are exercised through the controlled owner",
+      "parallel reordered invocations retain separate descriptors and explicit environments",
+      "an empty-specification child cannot inherit the test runner environment",
+      "generated rustdoc secret canaries are rejected without permitting an artifact or detector fingerprint"
   ],
   "detection_lost": [
     "none; existing gates and the retained negative M0-02 LEAK evidence remain intact"
@@ -63,8 +64,8 @@
     ],
     "green": {
       "command": "cargo test --locked --package xtask",
-      "result": "14 owner/unit tests and 37 public foundational fixture tests passed after the explicit environment and process-group migration",
-      "canonical_pr_profile": "passed-local-diagnostic: target/quality/evidence/1785246020047-cd51df1e2bbd-82574.json"
+      "result": "20 owner/unit tests and 43 public foundational fixture tests passed after the explicit environment and process-group migration",
+      "canonical_pr_profile": "passed-local-diagnostic: target/quality/evidence/1785251688897-e4e833cd6b5d-30585.json"
     },
     "canonical_attempts": [
       {
@@ -82,6 +83,29 @@
         "evidence": "target/quality/evidence/1785246020047-cd51df1e2bbd-82574.json",
         "merge_eligible": false,
         "reason": "the source tree was dirty and the run was not trusted CI"
+      },
+      {
+        "command": "cargo xtask quality --profile pr",
+        "result": "failed-local-diagnostic",
+        "evidence": "target/quality/evidence/1785251425895-e4e833cd6b5d-14742.json",
+        "failures": [
+          "EG-DOCS rejected a stale hard-coded rustdoc search-index artifact identity"
+        ]
+      },
+      {
+        "command": "cargo xtask quality --profile pr",
+        "result": "failed-local-diagnostic",
+        "evidence": "target/quality/evidence/1785251501464-e4e833cd6b5d-21010.json",
+        "failures": [
+          "EG-DOCS rejected the assumption that rustdoc emits exactly one search-index JavaScript artifact"
+        ]
+      },
+      {
+        "command": "cargo xtask quality --profile pr",
+        "result": "passed-local-diagnostic",
+        "evidence": "target/quality/evidence/1785251688897-e4e833cd6b5d-30585.json",
+        "merge_eligible": false,
+        "reason": "the source tree was dirty and the run was not trusted CI; all selected PR gates passed and generated rustdoc was scanned without exclusions"
       }
     ],
     "mutation": "not run in this change: PC-0003 assigns mutation and coverage to scheduled extended evidence, and this record makes no mutation claim"
