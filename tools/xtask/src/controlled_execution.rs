@@ -2349,6 +2349,7 @@ os._exit(0)
         release: PathBuf,
         pid: PathBuf,
         direct_pid: PathBuf,
+        released: AtomicBool,
     }
 
     impl EscapedDescriptorProtocol {
@@ -2374,6 +2375,7 @@ os._exit(0)
                 direct_pid: directory.join("direct.pid"),
                 directory,
                 release,
+                released: AtomicBool::new(false),
             })
         }
 
@@ -2414,11 +2416,15 @@ os._exit(0)
         }
 
         fn release(&self) -> TestResult {
+            if self.released.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if !self.descendant_is_running()? {
                 return Ok(());
             }
             let mut release = OpenOptions::new().write(true).open(&self.release)?;
             release.write_all(b"1")?;
+            self.released.store(true, Ordering::Release);
             Ok(())
         }
 
