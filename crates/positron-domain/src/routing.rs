@@ -1,5 +1,7 @@
 //! Cluster-compatible shard and committed-position values.
 
+use std::num::NonZeroU64;
+
 use crate::outcome::{DomainFailure, FailureSource};
 
 /// The tenant-owned identity of one virtual shard.
@@ -37,20 +39,25 @@ impl VirtualShardId {
 pub struct AssignmentEpoch(u64);
 
 impl AssignmentEpoch {
-    /// Preserves one exact assignment epoch value.
+    /// Creates the distinguished epoch before the first reassignment.
     #[must_use]
-    pub const fn from_value(value: u64) -> Self {
-        Self(value)
+    pub const fn initial() -> Self {
+        Self(0)
     }
 
-    /// Advances to the next epoch without integer wraparound.
-    pub fn next(self) -> Result<Self, DomainFailure> {
-        let Some(value) = self.0.checked_add(1) else {
+    /// Applies an owner-selected non-zero epoch advance without wrapping.
+    pub fn advance_by(self, increment: NonZeroU64) -> Result<Self, DomainFailure> {
+        let Some(value) = self.0.checked_add(increment.get()) else {
             return Err(DomainFailure::arithmetic_overflow(
                 FailureSource::AssignmentEpoch,
             ));
         };
         Ok(Self(value))
+    }
+
+    /// Advances to the next epoch without integer wraparound.
+    pub fn next(self) -> Result<Self, DomainFailure> {
+        self.advance_by(NonZeroU64::MIN)
     }
 
     /// Returns the exact monotonically ordered epoch.
@@ -75,20 +82,19 @@ impl CommitPosition {
         Self(0)
     }
 
-    /// Preserves an exact logical position from its Storage Kernel owner.
-    #[must_use]
-    pub const fn from_value(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Advances one position without integer wraparound.
-    pub fn next(self) -> Result<Self, DomainFailure> {
-        let Some(value) = self.0.checked_add(1) else {
+    /// Applies a Storage Kernel-selected non-zero committed-block advance.
+    pub fn advance_by(self, increment: NonZeroU64) -> Result<Self, DomainFailure> {
+        let Some(value) = self.0.checked_add(increment.get()) else {
             return Err(DomainFailure::arithmetic_overflow(
                 FailureSource::CommitPosition,
             ));
         };
         Ok(Self(value))
+    }
+
+    /// Advances one position without integer wraparound.
+    pub fn next(self) -> Result<Self, DomainFailure> {
+        self.advance_by(NonZeroU64::MIN)
     }
 
     /// Returns the exact opaque logical position.

@@ -56,6 +56,26 @@ const FROZEN_M0_01_COVERAGE_BASELINES: [(&str, f64); 4] = [
     ("coverage-branch", 57.622739018087856),
     ("coverage-changed-code", 65.97888675623801),
 ];
+const M0_02_MUTATION_SELECTOR: &str = concat!(
+    "TenantId::from_bytes|TenantId::parse_canonical|",
+    "PrincipalId::from_bytes|PrincipalId::parse_canonical|",
+    "TenantSlug::parse_canonical|TenantAttribution::new|parse_identifier|",
+    "TenantLifecycle::active|TenantLifecycle::to_read_only|",
+    "TenantLifecycle::to_suspended|TenantLifecycle::to_active|",
+    "TenantLifecycle::begin_purge|TenantLifecycle::complete_purge|",
+    "TenantLifecycle::transition|lifecycle_transition_is_valid|",
+    "VirtualShardId::new|AssignmentEpoch::initial|AssignmentEpoch::advance_by|",
+    "AssignmentEpoch::next|CommitPosition::origin|CommitPosition::advance_by|",
+    "CommitPosition::next|IngestTime::from_candidate|IngestTimeCandidate::new|",
+    "EventTime::received|ObservedTime::received|",
+    "QueryTime::for_log|QueryTime::for_span|validate_present_source_time|",
+    "ByteLimit::new|CollectionLimit::new|NestingLimit::new|",
+    "ValueLimitSet::exceeds|ValueLimitProfileCandidate::validate|",
+    "AttributeOccurrenceSetCandidate::validate|validate_attribute_value|",
+    "validate_attribute_array|validate_key_value_list|",
+    "exceeds_byte_limit|exceeds_collection_limit",
+);
+const M0_02_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-02-domain-final-post-lint";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoverageTarget {
@@ -168,11 +188,13 @@ impl Profile {
 #[derive(Debug)]
 pub(crate) struct Options {
     profile: Profile,
+    retain_m0_02_mutation: bool,
 }
 
 impl Options {
     pub(crate) fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, XtaskError> {
         let mut profile = Profile::Pr;
+        let mut retain_m0_02_mutation = false;
         let mut arguments = arguments.peekable();
         while let Some(argument) = arguments.next() {
             if argument == "--profile" {
@@ -182,13 +204,23 @@ impl Options {
                 profile = Profile::parse(&value)?;
             } else if let Some(value) = argument.strip_prefix("--profile=") {
                 profile = Profile::parse(value)?;
+            } else if argument == "--retain-m0-02-mutation" {
+                retain_m0_02_mutation = true;
             } else {
                 return Err(XtaskError::usage(format!(
                     "unexpected quality argument `{argument}`"
                 )));
             }
         }
-        Ok(Self { profile })
+        if retain_m0_02_mutation && profile != Profile::Ext {
+            return Err(XtaskError::usage(
+                "`--retain-m0-02-mutation` requires `--profile ext`".to_owned(),
+            ));
+        }
+        Ok(Self {
+            profile,
+            retain_m0_02_mutation,
+        })
     }
 }
 
@@ -355,7 +387,14 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             gate.id, gate.runner, gate.timeout_seconds, gate.memory_mib
         );
         let started = Instant::now();
-        let execution = execute_gate(&root, &registry, gate, options.profile, &environment);
+        let execution = execute_gate(
+            &root,
+            &registry,
+            gate,
+            options.profile,
+            options.retain_m0_02_mutation,
+            &environment,
+        );
         let duration_ms = started.elapsed().as_millis();
         match execution {
             Ok(command) => {
@@ -535,6 +574,7 @@ fn execute_gate(
     registry: &Registry,
     gate: &Gate,
     profile: Profile,
+    retain_m0_02_mutation: bool,
     environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let budget = Duration::from_secs(gate.timeout_seconds);
@@ -542,7 +582,7 @@ fn execute_gate(
         "registry" => run_registry_gate(root, registry, profile, budget, environment),
         "architecture" => run_architecture_gate(root, registry, budget, environment),
         "build" => run_build_gate(root, profile, budget, environment),
-        "coverage" => run_coverage_gate(root, registry, budget, environment),
+        "coverage" => run_coverage_gate(root, registry, budget, retain_m0_02_mutation, environment),
         "dynamic-analysis" => run_dynamic_analysis_gate(root, registry, budget, environment),
         "dependencies" => run_dependency_gate(root, registry, budget, environment),
         "documentation" => run_documentation_gate(root, budget, environment),
@@ -607,6 +647,7 @@ fn run_coverage_gate(
     root: &Path,
     registry: &Registry,
     budget: Duration,
+    retain_m0_02_mutation: bool,
     environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
@@ -627,6 +668,9 @@ fn run_coverage_gate(
     if registry.has_m0_01_foundational_scope() {
         results.push(run_m0_01_coverage(root, registry, deadline, environment)?);
     }
+    if retain_m0_02_mutation {
+        results.push(run_m0_02_mutation(root, registry, deadline, environment)?);
+    }
     if results.is_empty() {
         return Err(XtaskError::invalid(
             "coverage runner",
@@ -634,6 +678,83 @@ fn run_coverage_gate(
         ));
     }
     Ok(format!("{detector_versions}; {}", results.join(" | ")))
+}
+
+fn run_m0_02_mutation(
+    root: &Path,
+    registry: &Registry,
+    deadline: Instant,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    if !registry.has_m0_02_domain_types_scope() {
+        return Err(XtaskError::invalid(
+            "M0-02 mutation runner",
+            "the retained M0-02 mutation campaign requires the active Domain Types scope",
+        ));
+    }
+    let tool = registry
+        .tools
+        .iter()
+        .find(|tool| tool.id == "cargo-mutants")
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "M0-02 mutation detector registry",
+                "missing required detector `cargo-mutants`",
+            )
+        })?;
+    let version = run_capture(
+        root,
+        environment,
+        &tool.command,
+        tool.version_arguments.iter().map(String::as_str),
+        remaining(deadline)?,
+        &[],
+    )?;
+    if !version.stdout.contains(&tool.version) {
+        return Err(XtaskError::invalid(
+            "M0-02 mutation detector `cargo-mutants`",
+            format!(
+                "expected version `{}`, command reported `{}`",
+                tool.version,
+                one_line(&version.stdout)
+            ),
+        ));
+    }
+    let output = root.join(M0_02_MUTATION_OUTPUT);
+    fs::create_dir_all(&output)
+        .map_err(|source| XtaskError::io(format!("create {}", output.display()), source))?;
+    let outcome = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "mutants",
+            "--no-config",
+            "--package",
+            "positron-domain",
+            "--re",
+            M0_02_MUTATION_SELECTOR,
+            "--test-tool",
+            "cargo",
+            "--output",
+            M0_02_MUTATION_OUTPUT,
+            "--timeout",
+            "30",
+            "--jobs",
+            "1",
+            "--no-times",
+            "--",
+            "--locked",
+            "--test",
+            "foundational_domain_types",
+        ],
+        remaining(deadline)?,
+        &[],
+    )?;
+    Ok(format!(
+        "cargo-mutants={}; {}",
+        tool.version, outcome.display
+    ))
 }
 
 fn run_m0_01_coverage(
@@ -1376,6 +1497,25 @@ fn validate_coverage_workflow_provisioning(root: &Path) -> Result<(), XtaskError
                 format!("coverage-selected workflow `{relative}` is missing `{command}`"),
             ));
         }
+    }
+    if content
+        .lines()
+        .any(|line| line.trim_start().starts_with("cargo mutants"))
+    {
+        return Err(XtaskError::invalid_path(
+            &path,
+            format!(
+                "coverage-selected workflow `{relative}` must invoke detectors only through `cargo xtask quality`"
+            ),
+        ));
+    }
+    if !content.contains("cargo xtask quality --profile ext --retain-m0-02-mutation") {
+        return Err(XtaskError::invalid_path(
+            &path,
+            format!(
+                "coverage-selected workflow `{relative}` is missing the authoritative retained M0-02 mutation selection"
+            ),
+        ));
     }
     if !content
         .lines()
@@ -2879,7 +3019,9 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{EnvironmentSnapshot, ExecutionTools, Options, Profile, json_string};
+    use super::{
+        EnvironmentSnapshot, ExecutionTools, M0_02_MUTATION_SELECTOR, Options, Profile, json_string,
+    };
 
     #[test]
     fn defaults_to_the_complete_pull_request_profile() {
@@ -2888,11 +3030,60 @@ mod tests {
             matches!(
                 options,
                 Ok(Options {
-                    profile: Profile::Pr
+                    profile: Profile::Pr,
+                    retain_m0_02_mutation: false,
                 })
             ),
             "quality must default to the authoritative PR profile"
         );
+    }
+
+    #[test]
+    fn retained_m0_02_mutation_requires_the_extended_profile() {
+        let options = Options::parse(
+            ["--profile", "ext", "--retain-m0-02-mutation"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(
+            matches!(
+                options,
+                Ok(Options {
+                    profile: Profile::Ext,
+                    retain_m0_02_mutation: true,
+                })
+            ),
+            "the explicit retained mutation campaign must be accepted only as an EXT option"
+        );
+
+        let rejected = Options::parse(
+            ["--profile", "pr", "--retain-m0-02-mutation"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(
+            rejected.is_err(),
+            "routine PR quality must not select the focused mutation campaign"
+        );
+    }
+
+    #[test]
+    fn focused_m0_02_mutation_selection_covers_every_invariant_owner() {
+        for owner in [
+            "TenantLifecycle::transition",
+            "VirtualShardId::new",
+            "AssignmentEpoch::advance_by",
+            "CommitPosition::advance_by",
+            "IngestTime::from_candidate",
+            "ByteLimit::new",
+            "CollectionLimit::new",
+            "NestingLimit::new",
+        ] {
+            assert!(
+                M0_02_MUTATION_SELECTOR.contains(owner),
+                "focused mutation selection omitted invariant owner `{owner}`"
+            );
+        }
     }
 
     #[test]

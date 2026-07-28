@@ -475,6 +475,55 @@ fn quality_ext_executes_the_foundational_coverage_harness() -> TestResult {
 }
 
 #[test]
+fn extended_workflow_routes_opt_in_mutation_through_the_authoritative_runner() -> TestResult {
+    let workflow = fs::read_to_string(repository_root()?.join(".github/workflows/extended.yml"))?;
+
+    assert!(
+        !workflow
+            .lines()
+            .any(|line| line.trim_start().starts_with("cargo mutants")),
+        "CI must not invoke the mutation detector outside cargo xtask quality"
+    );
+    assert!(
+        workflow.contains("cargo xtask quality --profile ext --retain-m0-02-mutation"),
+        "the explicit mutation selection must enter through the authoritative runner"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn quality_ext_runs_the_focused_mutation_campaign_only_when_explicitly_selected() -> TestResult {
+    let fixture = Fixture::create_m0_02_domain_types()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/require-m0-02-mutation"),
+            "",
+        )?;
+        let output = fixture.quality_output_for_arguments([
+            "quality",
+            "--profile",
+            "ext",
+            "--retain-m0-02-mutation",
+        ])?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "the explicit retained mutation campaign failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suite() -> TestResult {
     let fixture = Fixture::create()?;
     fs::write(
@@ -919,11 +968,17 @@ impl Fixture {
     }
 
     fn quality_output_for(&self, profile: &str) -> TestResult<std::process::Output> {
-        let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        self.quality_output_for_arguments(["quality", "--profile", profile])
+    }
+
+    fn quality_output_for_arguments<const N: usize>(
+        &self,
+        arguments: [&str; N],
+    ) -> TestResult<std::process::Output> {
+        Ok(Command::new(env!("CARGO_BIN_EXE_xtask"))
             .current_dir(&self.root)
-            .args(["quality", "--profile", profile])
-            .output()?;
-        Ok(output)
+            .args(arguments)
+            .output()?)
     }
 
     fn quality_output_from_fixture_source(
@@ -2292,6 +2347,31 @@ case "$command" in
       mkdir -p "$(dirname "$output")"
       printf '%s\n' '{"data":[{"totals":{"branches":{"percent":100.0},"lines":{"percent":100.0},"regions":{"percent":100.0}}}]}' > "$output"
     fi
+    ;;
+  mutants)
+    if [ "${2:-}" = "--version" ]; then
+      printf 'cargo-mutants 27.1.0\n'
+      exit 0
+    fi
+    if [ ! -f target/quality-tools/require-m0-02-mutation ]; then
+      printf '%s\n' 'fixture rejects unselected M0-02 mutation execution' >&2
+      exit 80
+    fi
+    output=
+    previous=
+    for argument in "$@"; do
+      if [ "$previous" = "--output" ]; then
+        output="$argument"
+        break
+      fi
+      previous="$argument"
+    done
+    if [ -z "$output" ]; then
+      printf '%s\n' 'fixture requires a retained mutation output path' >&2
+      exit 81
+    fi
+    mkdir -p "$output/mutants.out"
+    printf '%s\n' '{"outcomes":[]}' > "$output/mutants.out/outcomes.json"
     ;;
   doc)
     target="${CARGO_TARGET_DIR:?CARGO_TARGET_DIR is required}"

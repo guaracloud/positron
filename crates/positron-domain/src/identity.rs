@@ -107,12 +107,14 @@ pub struct TenantSlug(String);
 impl TenantSlug {
     /// Parses a checked, canonical tenant locator.
     pub fn parse_canonical(source: &str) -> Result<Self, DomainFailure> {
-        let valid_length = !source.is_empty() && source.len() <= MAX_TENANT_SLUG_BYTES;
+        if source.is_empty() || source.len() > MAX_TENANT_SLUG_BYTES {
+            return Err(DomainFailure::invalid_identifier(FailureSource::TenantSlug));
+        }
         let valid_boundaries = !source.starts_with('-') && !source.ends_with('-');
         let valid_characters = source.chars().all(|character| {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
         });
-        if !valid_length || !valid_boundaries || !valid_characters {
+        if !valid_boundaries || !valid_characters {
             return Err(DomainFailure::invalid_identifier(FailureSource::TenantSlug));
         }
         Ok(Self(source.to_owned()))

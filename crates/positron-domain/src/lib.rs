@@ -68,6 +68,29 @@
 //! // Query Time is selected only through a signal-specific transition.
 //! QueryTime {};
 //! ```
+//!
+//! ```compile_fail
+//! use positron_domain::time::{IngestTime, UnixNanoseconds};
+//!
+//! // Kernel-assigned time is a later state with no public raw constructor.
+//! IngestTime::new(UnixNanoseconds::new(1));
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::routing::AssignmentEpoch;
+//!
+//! // Assignment epochs begin at the distinguished initial state and advance
+//! // only through their checked transition.
+//! AssignmentEpoch::from_value(41);
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::routing::CommitPosition;
+//!
+//! // Commit positions begin at origin and advance only through their checked
+//! // transition.
+//! CommitPosition::from_value(41);
+//! ```
 
 #![forbid(unsafe_code)]
 

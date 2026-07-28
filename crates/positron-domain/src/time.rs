@@ -152,16 +152,31 @@ impl ObservedTime {
 pub struct IngestTime(UnixNanoseconds);
 
 impl IngestTime {
-    /// Wraps the exact timestamp assigned by the Storage Kernel.
-    #[must_use]
-    pub const fn new(instant: UnixNanoseconds) -> Self {
-        Self(instant)
+    const fn from_candidate(candidate: IngestTimeCandidate) -> Self {
+        Self(candidate.instant)
     }
 
     /// Returns the exact kernel-assigned timestamp.
     #[must_use]
     pub const fn instant(self) -> UnixNanoseconds {
         self.0
+    }
+}
+
+/// A representable timestamp proposed for Storage Kernel assignment.
+///
+/// This is an earlier state, not an assigned `IngestTime`. Domain-owned
+/// selection consumes it before the later state can participate in Query Time.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IngestTimeCandidate {
+    instant: UnixNanoseconds,
+}
+
+impl IngestTimeCandidate {
+    /// Preserves the exact timestamp proposed by the Storage Kernel owner.
+    #[must_use]
+    pub const fn new(instant: UnixNanoseconds) -> Self {
+        Self { instant }
     }
 }
 
@@ -196,8 +211,9 @@ impl QueryTime {
     pub fn for_log(
         event_time: &EventTime,
         observed_time: Option<&ObservedTime>,
-        ingest_time: IngestTime,
+        ingest_time: IngestTimeCandidate,
     ) -> Self {
+        let ingest_time = IngestTime::from_candidate(ingest_time);
         if let Some(instant) = event_time.usable_instant() {
             return Self {
                 instant,
@@ -220,7 +236,8 @@ impl QueryTime {
 
     /// Selects Query Time for a span from usable start time or Ingest Time.
     #[must_use]
-    pub fn for_span(start_time: &EventTime, ingest_time: IngestTime) -> Self {
+    pub fn for_span(start_time: &EventTime, ingest_time: IngestTimeCandidate) -> Self {
+        let ingest_time = IngestTime::from_candidate(ingest_time);
         if let Some(instant) = start_time.usable_instant() {
             return Self {
                 instant,

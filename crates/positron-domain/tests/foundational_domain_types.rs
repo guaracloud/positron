@@ -1,13 +1,16 @@
 //! Public contract tests for the foundational Domain Types seam.
 
+use std::num::NonZeroU64;
+use std::time::{Duration, Instant};
+
 use positron_domain::{
     identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug},
     lifecycle::{TenantLifecycle, TenantLifecycleState},
     outcome::{CompletionState, DomainFailure, DomainFailureCode, FailureSource, RetryClass},
     routing::{AssignmentEpoch, CommitPosition, SignalKind, VirtualShardId},
     time::{
-        EventTime, IngestTime, ObservedTime, QueryTime, QueryTimeProvenance, SourceTimeQuality,
-        UnixNanoseconds,
+        EventTime, IngestTimeCandidate, ObservedTime, QueryTime, QueryTimeProvenance,
+        SourceTimeQuality, UnixNanoseconds,
     },
     value::{
         AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind, ByteLimit,
@@ -160,7 +163,8 @@ fn reachable_domain_failures_render_as_bounded_safe_diagnostics() -> Result<(), 
             .is_err_and(is_bounded_diagnostic)
     );
     assert!(
-        AssignmentEpoch::from_value(u64::MAX)
+        AssignmentEpoch::initial()
+            .advance_by(NonZeroU64::MAX)?
             .next()
             .is_err_and(is_bounded_diagnostic)
     );
@@ -223,6 +227,25 @@ fn tenant_slug_requires_between_one_and_sixty_three_ascii_bytes() -> Result<(), 
     ));
 
     Ok(())
+}
+
+#[test]
+fn tenant_slug_rejects_an_oversized_input_before_scanning_its_characters() {
+    let oversized = "a".repeat(16 * 1_024 * 1_024);
+    let started = Instant::now();
+
+    let result = TenantSlug::parse_canonical(&oversized);
+
+    assert!(matches!(
+        result,
+        Err(failure)
+            if failure.code() == DomainFailureCode::InvalidIdentifier
+                && failure.source() == FailureSource::TenantSlug
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(1),
+        "an input above the byte limit must be rejected before character scanning"
+    );
 }
 
 #[test]
@@ -316,7 +339,7 @@ fn log_query_time_preserves_source_values_and_exposes_fallback_provenance()
 -> Result<(), DomainFailure> {
     let event = EventTime::received(UnixNanoseconds::new(100), SourceTimeQuality::Usable)?;
     let observed = ObservedTime::received(UnixNanoseconds::new(200), SourceTimeQuality::Usable)?;
-    let ingest = IngestTime::new(UnixNanoseconds::new(300));
+    let ingest = IngestTimeCandidate::new(UnixNanoseconds::new(300));
 
     let direct = QueryTime::for_log(&event, Some(&observed), ingest);
     assert_eq!(direct.instant(), UnixNanoseconds::new(100));
@@ -345,7 +368,7 @@ fn observed_time_retains_its_exact_value_when_log_selection_uses_it() -> Result<
     let selected = QueryTime::for_log(
         &EventTime::missing(),
         Some(&observed),
-        IngestTime::new(UnixNanoseconds::new(300)),
+        IngestTimeCandidate::new(UnixNanoseconds::new(300)),
     );
 
     assert_eq!(observed.instant(), Some(UnixNanoseconds::new(200)));
@@ -362,7 +385,7 @@ fn unusable_observed_time_cannot_replace_log_ingest_time() -> Result<(), DomainF
     let selected = QueryTime::for_log(
         &EventTime::missing(),
         Some(&observed),
-        IngestTime::new(UnixNanoseconds::new(300)),
+        IngestTimeCandidate::new(UnixNanoseconds::new(300)),
     );
 
     assert_eq!(observed.instant(), Some(UnixNanoseconds::new(0)));
@@ -419,7 +442,7 @@ fn missing_event_time_has_no_fabricated_instant() {
 #[test]
 fn span_query_time_uses_start_time_or_ingest_time_only() -> Result<(), DomainFailure> {
     let start = EventTime::received(UnixNanoseconds::new(10), SourceTimeQuality::Usable)?;
-    let ingest = IngestTime::new(UnixNanoseconds::new(20));
+    let ingest = IngestTimeCandidate::new(UnixNanoseconds::new(20));
 
     let direct = QueryTime::for_span(&start, ingest);
     assert_eq!(direct.instant(), UnixNanoseconds::new(10));
@@ -435,7 +458,7 @@ fn span_query_time_uses_start_time_or_ingest_time_only() -> Result<(), DomainFai
 #[test]
 fn source_time_quality_keeps_outliers_queryable_without_using_contradictions()
 -> Result<(), DomainFailure> {
-    let ingest = IngestTime::new(UnixNanoseconds::new(20));
+    let ingest = IngestTimeCandidate::new(UnixNanoseconds::new(20));
     let outlier = EventTime::received(UnixNanoseconds::new(i64::MAX), SourceTimeQuality::Outlier)?;
     let contradictory =
         EventTime::received(UnixNanoseconds::new(10), SourceTimeQuality::Contradictory)?;
@@ -468,7 +491,7 @@ fn virtual_shard_identity_rejects_the_zero_sentinel() -> Result<(), DomainFailur
 
 #[test]
 fn assignment_epoch_progression_is_checked_without_wraparound() -> Result<(), DomainFailure> {
-    let epoch = AssignmentEpoch::from_value(u64::MAX);
+    let epoch = AssignmentEpoch::initial().advance_by(NonZeroU64::MAX)?;
 
     assert!(matches!(
         epoch.next(),
@@ -483,26 +506,30 @@ fn assignment_epoch_progression_is_checked_without_wraparound() -> Result<(), Do
 
 #[test]
 fn assignment_epoch_preserves_successful_monotonic_progression() -> Result<(), DomainFailure> {
-    let first = AssignmentEpoch::from_value(41);
+    let first = AssignmentEpoch::initial();
     let second = first.next()?;
 
-    assert_eq!(second.value(), 42);
+    assert_eq!(second.value(), 1);
 
     Ok(())
 }
 
 #[test]
-fn commit_position_advances_without_wrapping_into_timestamp_like_order() {
+fn commit_position_advances_without_wrapping_into_timestamp_like_order() -> Result<(), DomainFailure>
+{
     let origin = CommitPosition::origin();
+    let maximum = origin.advance_by(NonZeroU64::MAX)?;
 
     assert_eq!(origin.value(), 0);
-    assert_eq!(origin.next(), Ok(CommitPosition::from_value(1)));
+    assert!(matches!(origin.next(), Ok(position) if position.value() == 1));
     assert!(matches!(
-        CommitPosition::from_value(u64::MAX).next(),
+        maximum.next(),
         Err(failure)
             if failure.code() == DomainFailureCode::ArithmeticOverflow
                 && failure.source() == FailureSource::CommitPosition
     ));
+
+    Ok(())
 }
 
 #[test]
@@ -1128,7 +1155,7 @@ fn attribute_arrays_reject_more_entries_than_the_profile_allows() -> Result<(), 
 }
 
 #[test]
-fn key_value_list_preserves_ordered_typed_entries() -> Result<(), DomainFailure> {
+fn key_value_list_preserves_ordered_typed_entries() -> Result<(), Box<dyn std::error::Error>> {
     let profile = ValueLimitProfileCandidate::new(
         ValueLimitSet::new(
             ByteLimit::new(16)?,
@@ -1155,9 +1182,9 @@ fn key_value_list_preserves_ordered_typed_entries() -> Result<(), DomainFailure>
     )
     .validate(profile)?;
 
-    let Some(value) = list.occurrence(0) else {
-        return Ok(());
-    };
+    let value = list.occurrence(0).ok_or_else(|| {
+        std::io::Error::other("a validated non-empty candidate did not retain its first occurrence")
+    })?;
     assert_eq!(value.key_value_list_len(), Some(2));
     assert_eq!(
         value.key_value_entry(0).map(|entry| entry.key()),

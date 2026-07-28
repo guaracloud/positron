@@ -62,31 +62,17 @@ jobs:
           echo "$install_dir" >> "$GITHUB_PATH"
           "$install_dir/gitleaks" version | grep --fixed-strings --line-regexp "$GITLEAKS_VERSION"
 
-      - name: Run the authoritative extended gate runner
-        run: cargo xtask quality --profile ext
-
       - name: Install the pinned M0-02 mutation detector
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
         run: cargo install --locked --version 27.1.0 cargo-mutants
 
-      - name: Prepare M0-02 mutation evidence retention
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
-        run: mkdir -p target/quality/mutation
+      - name: Run the authoritative extended gate runner
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.retain_m0_02_mutation }}
+        run: cargo xtask quality --profile ext
 
-      - name: Retain the exact M0-02 focused mutation campaign
+      - name: Run the authoritative extended gate runner with retained M0-02 mutation
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
-        run: >
-          cargo mutants --no-config --package positron-domain
-          --re
-          'TenantId::from_bytes|TenantId::parse_canonical|TenantAttribution::new|parse_identifier|EventTime::received|ObservedTime::received|QueryTime::for_log|QueryTime::for_span|validate_present_source_time|ValueLimitProfileCandidate::validate|AttributeOccurrenceSetCandidate::validate|validate_attribute_value|validate_attribute_array|validate_key_value_list'
-          --test-tool cargo
-          --output target/quality/mutation/m0-02-domain-final-post-lint
-          --timeout 30
-          --jobs 1
-          --no-times
-          --
-          --locked
-          --test foundational_domain_types
+        run: cargo xtask quality --profile ext --retain-m0-02-mutation
 
       - name: Retain the exact gate attempt
         if: always()
