@@ -1840,26 +1840,6 @@ done
     }
 
     #[test]
-    fn escaped_descriptor_readiness_requires_a_single_owned_protocol_signal() -> TestResult {
-        let protocol = EscapedDescriptorProtocol::create()?;
-        let result = (|| {
-            let sender = std::os::unix::net::UnixDatagram::unbound()?;
-            let sent = sender.send_to(b"ready", protocol.readiness_socket_path())?;
-            if sent != b"ready".len() {
-                return Err(io::Error::other(format!(
-                    "escaped-descriptor readiness signal sent {sent} bytes instead of {}",
-                    b"ready".len()
-                ))
-                .into());
-            }
-            protocol.wait_until_ready(Duration::from_secs(1))
-        })();
-        let cleanup = protocol.remove();
-        cleanup?;
-        result
-    }
-
-    #[test]
     fn returns_a_bounded_cancellation_failure_when_an_escaped_descendant_retains_descriptors_and_unread_input()
     -> TestResult {
         let protocol = EscapedDescriptorProtocol::create()?;

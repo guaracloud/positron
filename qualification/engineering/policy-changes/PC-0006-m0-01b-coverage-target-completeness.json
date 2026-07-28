@@ -46,6 +46,14 @@
     "policy_guard": "the policy gate requires the owner target in both coverage invocations and exact retained threshold values"
   },
   "evidence": {
+    "retained_m0_02_failed_ext": {
+      "revision": "00646282ea64f8eea50c324772222f531339bc65",
+      "dirty": true,
+      "command": "cargo xtask quality --profile ext",
+      "attempt": "target/quality/evidence/1785257456575-00646282ea64-25342.json",
+      "result": "failed-local-diagnostic",
+      "attribution": "This dirty-tree attempt contained the M0-02 Domain Types activation and remains distinct from the later clean-main M0-01B red baseline. EG-00 failed because cargo-vet was unavailable; EG-COVERAGE independently reported 68.81 percent line coverage below the frozen 70.52 percent baseline; the M0-02 dynamic gate passed. No qualification claim is made."
+    },
     "retained_red_clean_main": {
       "revision": "00646282ea64f8eea50c324772222f531339bc65",
       "command": "cargo xtask quality --profile ext",
@@ -79,7 +87,12 @@
       "result": "failed-local-diagnostic",
       "failure": "The changed-code coverage campaign failed while `returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_capture_descriptors` reported that its escaped descendant did not complete the file-polling readiness handshake. This attempt remains retained as the regression reproducer; it was not retried on the same revision."
     },
-    "dual_run": "The retained clean-main red run used the former fixture-only target. The retained committed-SHA green run used the fixture plus owner target under the same EXT profile, pinned detector, and thresholds. The retained failed exact-SHA run exposed a file-polling fixture race under changed-code instrumentation. A final exact-SHA EXT run is required after the bounded readiness-protocol revision is committed."
+    "superseded_exact_head_ext_dispatch": {
+      "revision": "29212b1d001bbe688e84ed490d42a5ced2c40061",
+      "workflow_run": "30383501649",
+      "status": "in progress before review remediation and stale after the remediation commit; no result or qualification claim is made"
+    },
+    "dual_run": "The retained dirty M0-02 attempt, clean-main M0-01B red run, committed-SHA diagnostic green run, and failed exact-SHA fixture regression are separate attempts with separate attribution. The prior exact-head CI EXT dispatch is superseded by review remediation and cannot qualify the new revision. A final exact-SHA EXT run is required on the review-remediated revision."
   },
   "approvals_required": [
     "Architecture",
