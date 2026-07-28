@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
+    inputs:
+      retain_m0_02_mutation:
+        description: Retain the issue #3 focused mutation campaign
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -56,8 +62,17 @@ jobs:
           echo "$install_dir" >> "$GITHUB_PATH"
           "$install_dir/gitleaks" version | grep --fixed-strings --line-regexp "$GITLEAKS_VERSION"
 
+      - name: Install the pinned M0-02 mutation detector
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
+        run: cargo install --locked --version 27.1.0 cargo-mutants
+
       - name: Run the authoritative extended gate runner
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.retain_m0_02_mutation }}
         run: cargo xtask quality --profile ext
+
+      - name: Run the authoritative extended gate runner with retained M0-02 mutation
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.retain_m0_02_mutation }}
+        run: cargo xtask quality --profile ext --retain-m0-02-mutation
 
       - name: Retain the exact gate attempt
         if: always()

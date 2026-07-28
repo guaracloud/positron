@@ -1,6 +1,136 @@
 //! Shared invariant-bearing domain boundary.
 //!
-//! M0-01 activates this owned boundary only. Wire types, persistence types,
-//! unchecked constructors, and application behavior remain absent.
+//! This crate owns checked values shared by more than one Positron deep module.
+//! It contains no I/O, wire decoding, persistence encoding, configuration
+//! loading, provider client, or runtime behavior. Canonical text is a native
+//! domain representation only; wire and durable serialization stay with their
+//! owning adapters.
+//!
+//! ```compile_fail
+//! use positron_domain::value::ValueLimitProfile;
+//!
+//! // A validated limit profile has no public unchecked constructor.
+//! ValueLimitProfile {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::ValueLimitSet;
+//!
+//! // A complete limit set is assembled only from all three checked groups.
+//! ValueLimitSet {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::RequestLimits;
+//!
+//! // Request limits cannot omit a transport or aggregate request dimension.
+//! RequestLimits {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::RecordLimits;
+//!
+//! // Record limits cannot omit encoded, decoded, or log-body dimensions.
+//! RecordLimits {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::DynamicValueLimits;
+//!
+//! // Dynamic-value limits cannot bypass their complete checked constructor.
+//! DynamicValueLimits {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::ValidatedAttributeValue;
+//!
+//! // A validated value is produced only by bounded validation.
+//! ValidatedAttributeValue {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::ValidatedKeyValue;
+//!
+//! // A validated entry is produced only while validating its owning list.
+//! ValidatedKeyValue {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::value::AttributeOccurrenceSet;
+//!
+//! // A validated occurrence set cannot bypass its candidate transition.
+//! AttributeOccurrenceSet {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::identity::TenantAttribution;
+//!
+//! // Attribution must pass its tenant-scope check.
+//! TenantAttribution {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::lifecycle::TenantLifecycle;
+//!
+//! // Lifecycle state can advance only through checked transitions.
+//! TenantLifecycle {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::time::EventTime;
+//!
+//! // Event Time must retain a validated source-time annotation.
+//! EventTime {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::time::ObservedTime;
+//!
+//! // Observed Time must retain a validated source-time annotation.
+//! ObservedTime {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::time::QueryTime;
+//!
+//! // Query Time is selected only through a signal-specific transition.
+//! QueryTime {};
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::time::{IngestTime, UnixNanoseconds};
+//!
+//! // Kernel-assigned time is a later state with no public raw constructor.
+//! IngestTime::new(UnixNanoseconds::new(1));
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::routing::AssignmentEpoch;
+//!
+//! // Assignment epochs begin at the distinguished initial state and advance
+//! // only through their checked transition.
+//! AssignmentEpoch::from_value(41);
+//! ```
+//!
+//! ```compile_fail
+//! use positron_domain::routing::CommitPosition;
+//!
+//! // Commit positions begin at origin and advance only through their checked
+//! // transition.
+//! CommitPosition::from_value(41);
+//! ```
 
 #![forbid(unsafe_code)]
+
+/// Tenant, principal, scope, and attribution values.
+pub mod identity;
+/// Checked tenant lifecycle transitions.
+pub mod lifecycle;
+/// Closed typed failures returned by Domain Types.
+pub mod outcome;
+/// Cluster-compatible shard and committed-position values.
+pub mod routing;
+/// Exact source, observed, ingest, and selected query times.
+pub mod time;
+/// Bounded native dynamic attribute values.
+pub mod value;

@@ -1,0 +1,427 @@
+{
+  "schema_version": 1,
+  "id": "PC-0007-m0-02-domain-types",
+  "status": "accepted",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/application-design.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Activate only the Architecture-owned M0-02 Domain Types boundary with its exact source inventory, public contract suite, compile-fail contract, dynamic harness, and measured handwritten-domain coverage baselines.",
+  "change": {
+    "activation_id": "M0-02",
+    "scope_set": [
+      "positron-domain"
+    ],
+    "registries": [
+      "qualification/engineering/scopes.tsv",
+      "qualification/engineering/architecture-edges.tsv",
+      "qualification/engineering/thresholds.tsv"
+    ],
+    "workflows": [
+      ".github/workflows/extended.yml"
+    ],
+    "source_inventory": [
+      "crates/positron-domain/src/lib.rs",
+      "crates/positron-domain/src/identity.rs",
+      "crates/positron-domain/src/lifecycle.rs",
+      "crates/positron-domain/src/outcome.rs",
+      "crates/positron-domain/src/routing.rs",
+      "crates/positron-domain/src/time.rs",
+      "crates/positron-domain/src/value.rs",
+      "crates/positron-domain/tests/foundational_domain_types.rs"
+    ],
+    "public_contract_command": "cargo test --locked --package positron-domain --test foundational_domain_types",
+    "compile_fail_command": "cargo test --locked --package positron-domain --doc",
+    "coverage_command": "cargo +nightly-2026-07-20 llvm-cov --locked --package positron-domain --test foundational_domain_types --branch --json --summary-only --ignore-filename-regex crates/positron-domain/tests/.* --output-path target/quality/coverage/m0-02-domain-final.json",
+    "coverage_denominator": "All handwritten Rust source under crates/positron-domain/src. The integration-test source is excluded only from the measured implementation denominator; no source module, branch, line, coverage attribute, or implementation path is excluded.",
+    "mutation_command": "cargo mutants --no-config --package positron-domain --re TenantId::from_bytes|TenantId::parse_canonical|PrincipalId::from_bytes|PrincipalId::parse_canonical|TenantSlug::parse_canonical|TenantAttribution::new|parse_identifier|TenantLifecycle::active|TenantLifecycle::to_read_only|TenantLifecycle::to_suspended|TenantLifecycle::to_active|TenantLifecycle::begin_purge|TenantLifecycle::complete_purge|TenantLifecycle::transition|lifecycle_transition_is_valid|VirtualShardId::new|AssignmentEpoch::initial|AssignmentEpoch::advance_by|AssignmentEpoch::next|CommitPosition::origin|CommitPosition::advance_by|CommitPosition::next|IngestTime::from_candidate|IngestTimeCandidate::new|EventTime::received|ObservedTime::received|QueryTime::for_log|QueryTime::for_span|validate_present_source_time|ByteLimit::new|CollectionLimit::new|NestingLimit::new|RequestLimits::new|RequestLimits::exceeds|RecordLimits::new|RecordLimits::exceeds|DynamicValueLimits::new|DynamicValueLimits::exceeds|ValueLimitSet::new|ValueLimitSet::exceeds|ValueLimitProfileCandidate::validate|AttributeOccurrenceSetCandidate::validate|validate_attribute_value|validate_attribute_array|validate_key_value_list|exceeds_byte_limit|exceeds_collection_limit --test-tool cargo --output target/quality/mutation/m0-02-domain-final-post-lint --timeout 30 --jobs 1 --no-times -- --locked --test foundational_domain_types",
+    "mutation_tool": "cargo-mutants 27.1.0",
+    "coverage_tool": "cargo-llvm-cov 0.8.7",
+    "pinned_rust_toolchain": "1.96.0",
+    "dependencies": "none"
+  },
+  "baselines": {
+    "coverage_branch": {
+      "value": 100,
+      "report": "target/quality/coverage/m0-02-domain-final.json",
+      "sha256": "d8b1d0d66123449452c54e3912d9b000e078ba59bb46e3e54ed378bb5ff17a29"
+    },
+    "coverage_line": {
+      "value": 98.21882951653944,
+      "report": "target/quality/coverage/m0-02-domain-final.json",
+      "sha256": "d8b1d0d66123449452c54e3912d9b000e078ba59bb46e3e54ed378bb5ff17a29"
+    },
+    "coverage_region": {
+      "value": 98.24561403508771,
+      "report": "target/quality/coverage/m0-02-domain-final.json",
+      "sha256": "d8b1d0d66123449452c54e3912d9b000e078ba59bb46e3e54ed378bb5ff17a29"
+    },
+    "mutation_invariant_disposition": {
+      "value": 100,
+      "unit": "percent",
+      "meaning": "No viable invariant-breaking mutant survived the exact-source focused campaign. This is focused diagnostic evidence, not a routine merge mutation gate.",
+      "report": "target/quality/mutation/m0-02-domain-final-post-lint/mutants.out/outcomes.json",
+      "sha256": "ebf7c59842519f5a91b1ab6880a6ba330790d9f2a1f989a2a5e8139f5050f747"
+    }
+  },
+  "exact_candidate_evidence_contract": {
+    "baseline_provenance": "The baseline reports and mutation disposition above retain the original dirty-tree activation measurements. They are historical ratchet provenance, not exact-head or merge-eligible evidence.",
+    "self_reference_boundary": "This committed policy record cannot embed its own source revision or a future workflow run identity without changing that revision. Exact candidate attempts are therefore retained outside the source tree and bound by the runner-recorded full revision.",
+    "authoritative_pr": "The protected pull-request workflow uploads target/quality as engineering-evidence-<run>-<attempt>-<github.sha> after cargo xtask quality --profile pr.",
+    "coverage": "The manually dispatched extended workflow uploads target/quality as extended-evidence-<run>-<attempt>-<github.sha> after cargo xtask quality --profile ext, including the M0-02 report and frozen-baseline verdict.",
+    "mutation": "Mutation remains excluded from routine and scheduled automation by PC-0003. A manual workflow_dispatch may explicitly select cargo xtask quality --profile ext --retain-m0-02-mutation. The authoritative runner then executes the exact focused detector command recorded in change.mutation_command and uploads its raw outcomes inside the existing exact-SHA extended-evidence artifact without making mutation a recurring or merge-required gate.",
+    "claims": "Exact-head evidence does not establish Qualified status. The opt-in retained mutation evidence does not establish merge eligibility, and workflow evidence remains subject to independent review."
+  },
+  "attempts": [
+    {
+      "id": "red-preimplementation-public-seam",
+      "status": "failed-retained-disposable-worktree",
+      "command": "cargo test --locked --package positron-domain --test m0_02_red_public_seam",
+      "source_revision": "00646282ea64f8eea50c324772222f531339bc65",
+      "source_dirty": false,
+      "reproducer": "use positron_domain::identity::TenantId; assert!(TenantId::from_bytes([0; 16]).is_err());",
+      "result": "error[E0432]: unresolved import `positron_domain::identity`; the rebased preimplementation public seam did not exist.",
+      "retention": "The disposable worktree and its tests-only red reproducer remain at /tmp/positron-m0-02-red.ib2k1v for this implementation handoff."
+    },
+    {
+      "id": "quality-pr-rebased-precommit",
+      "status": "passed-local-diagnostic",
+      "command": "cargo xtask quality",
+      "source_revision": "00646282ea64f8eea50c324772222f531339bc65",
+      "source_dirty": true,
+      "result": "The rebased M0-02 candidate passed all selected PR gates while retaining M0-01A controlled-environment and controlled-descendant semantics. This local dirty-tree attempt is diagnostic only.",
+      "evidence": "target/quality/evidence/1785257367644-00646282ea64-14758.json"
+    },
+    {
+      "id": "quality-ext-rebased-precommit",
+      "status": "failed-local-diagnostic",
+      "command": "cargo xtask quality --profile ext",
+      "source_revision": "00646282ea64f8eea50c324772222f531339bc65",
+      "source_dirty": true,
+      "result": "EG-00 failed because the exact pinned cargo-vet 0.10.2 was absent. EG-COVERAGE also failed because M0-01 line coverage was 68.81 percent below the frozen 70.52 percent baseline. A clean origin/main worktree independently measured 68.38 percent, proving the baseline breach predates M0-02. No threshold or gate was weakened.",
+      "evidence": "target/quality/evidence/1785257456575-00646282ea64-25342.json"
+    },
+    {
+      "id": "coverage-prebaseline-remediation-series",
+      "status": "retained-prebaseline-diagnostics",
+      "result": "The reports were retained while public-seam tests and source-level impossible-state removal raised the handwritten Domain Types measurement. None was frozen as a baseline.",
+      "reports": [
+        {
+          "report": "target/quality/coverage/m0-02-domain-total.json",
+          "branch": 70.1923076923077,
+          "line": 88.62433862433863,
+          "region": 88.68832731648617,
+          "sha256": "778bc73d9c321a6abd7bf3f38fda57e66ec5df9b4e1f389f126c2b44f1fa5259"
+        },
+        {
+          "report": "target/quality/coverage/m0-02-domain-progress-01.json",
+          "branch": 74.03846153846155,
+          "line": 90.3566710700132,
+          "region": 90.49338146811073,
+          "sha256": "3b140c4a09725078f39ba59139d0f35f00ac63cc3fe8989a0f6459c68e890c4b"
+        },
+        {
+          "report": "target/quality/coverage/m0-02-domain-progress-02.json",
+          "branch": 90.38461538461539,
+          "line": 93.39498018494056,
+          "region": 93.14079422382672,
+          "sha256": "26da0c19964968f38be9b4eaa37b8a203cd6e2bd42abdf9f0465150d97410c09"
+        },
+        {
+          "report": "target/quality/coverage/m0-02-domain-progress-03.json",
+          "branch": 90.38461538461539,
+          "line": 97.09379128137384,
+          "region": 96.9915764139591,
+          "sha256": "b2d8759a39e31031dba6603533f3a4df258f414015903edb9ce419fcc5b3c3d2"
+        },
+        {
+          "report": "target/quality/coverage/m0-02-domain-refactored.json",
+          "branch": 98.86363636363636,
+          "line": 98.09160305343512,
+          "region": 98.02631578947368,
+          "sha256": "fdf3cdd1bad32926125e4849259dcec8b7fc6bfee20fddddbd4c1075580dd6ec",
+          "note": "Superseded 46-test diagnostic. A meaningful public observed-time fallback case was added before the final measurement."
+        }
+      ]
+    },
+    {
+      "id": "mutation-pre-refactor-remediation",
+      "status": "retained-superseded-diagnostic",
+      "result": "All raw outcomes remain retained. The source was subsequently simplified only to remove redundant impossible states, then mutation was rerun for the final source.",
+      "campaigns": [
+        {
+          "report": "target/quality/mutation/m0-02-domain-identity/mutants.out/outcomes.json",
+          "counts": {
+            "total": 15,
+            "caught": 9,
+            "missed": 2,
+            "unviable": 4,
+            "timeout": 0
+          },
+          "sha256": "ba4c071a9591ada3f21fb1b3d576676cc365c8eb648e18b03368b771aefbc9ce"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-time/mutants.out/outcomes.json",
+          "counts": {
+            "total": 11,
+            "caught": 3,
+            "missed": 0,
+            "unviable": 8,
+            "timeout": 0
+          },
+          "sha256": "766f89c4f4e4ef8dadb7d551d071ecf75cc3c70bc4230f6c7ff4315117853c24"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-lifecycle/mutants.out/outcomes.json",
+          "counts": {
+            "total": 10,
+            "caught": 0,
+            "missed": 0,
+            "unviable": 10,
+            "timeout": 0
+          },
+          "sha256": "4e7b460e4190453b1e4f0af1572e2e6b76007884f6817a2455027a8176c31fd3"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-value/mutants.out/outcomes.json",
+          "counts": {
+            "total": 15,
+            "caught": 2,
+            "missed": 5,
+            "unviable": 8,
+            "timeout": 0
+          },
+          "sha256": "14de486b6fadaa3ae08219efb1634d4897143eb060d129dd004d1ba96df4a295"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-value-rerun-1/mutants.out/outcomes.json",
+          "counts": {
+            "total": 15,
+            "caught": 4,
+            "missed": 3,
+            "unviable": 8,
+            "timeout": 0
+          },
+          "sha256": "a2e15dc2c02e17cfc2efd7d4c0a97f22d348d69978f7b68ef21e6c5e71d82c8c"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-value-rerun-2/mutants.out/outcomes.json",
+          "counts": {
+            "total": 15,
+            "caught": 5,
+            "missed": 2,
+            "unviable": 8,
+            "timeout": 0
+          },
+          "sha256": "d7e3a5d4aab6fed9f8b4bb51db549010746fe9681b06639652163ce038913548"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-value-rerun-3/mutants.out/outcomes.json",
+          "counts": {
+            "total": 15,
+            "caught": 6,
+            "missed": 1,
+            "unviable": 8,
+            "timeout": 0
+          },
+          "sha256": "621dd203efefb170df6c8f0a719e411d6430749891904138db7a98c13ebb5f89"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-value-rerun-4/mutants.out/outcomes.json",
+          "counts": {
+            "total": 15,
+            "caught": 7,
+            "missed": 0,
+            "unviable": 8,
+            "timeout": 0
+          },
+          "sha256": "a597bdf10b8be75f8fa4b47f373e5fa6e67e5f216fecb9ca9a2d1afffbd73f46"
+        },
+        {
+          "report": "target/quality/mutation/m0-02-domain-final/mutants.out/outcomes.json",
+          "counts": {
+            "total": 41,
+            "caught": 19,
+            "missed": 2,
+            "unviable": 20,
+            "timeout": 0
+          },
+          "sha256": "1e7511bf415ee34871132aedd531e7925524d2124eec216692169ea9cf9637a5",
+          "missed_mutant_disposition": [
+            "Changing the old parser shape rejection from logical OR to logical AND was semantically equivalent after its mutually exclusive predicates.",
+            "Changing the old disjoint nibble combination from bitwise OR to XOR was semantically equivalent."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mutation-pre-lint-exact-source",
+      "status": "retained-superseded-diagnostic",
+      "source_revision": "cd51df1e2bbdbca8eaa8116c1bdc9bdb88c14d8e",
+      "source_dirty": true,
+      "counts": {
+        "total": 27,
+        "caught": 10,
+        "missed": 0,
+        "unviable": 17,
+        "timeout": 0
+      },
+      "outcomes": "target/quality/mutation/m0-02-domain-final-rerun/mutants.out/outcomes.json",
+      "outcomes_sha256": "70d3b1298d2f793e34a31447a82c711e93231756bc8f05773c72e5bdbb17fe36",
+      "mutants": "target/quality/mutation/m0-02-domain-final-rerun/mutants.out/mutants.json",
+      "mutants_sha256": "e293e095fc5c387f97a6af07c5c0f0f3afe4c8c2db9bb85355ba8bbff278715c",
+      "note": "Superseded after the clippy-required provenance variant rename; no behavioral invariant changed."
+    },
+    {
+      "id": "quality-pr-pre-lint",
+      "status": "failed-local-diagnostic",
+      "command": "cargo xtask quality --profile pr",
+      "source_revision": "cd51df1e2bbdbca8eaa8116c1bdc9bdb88c14d8e",
+      "source_dirty": true,
+      "result": "EG-RUST rejected the shared Time suffix in QueryTimeProvenance variants through clippy::enum_variant_names. No lint allow or policy weakening was applied; the closed variants were renamed to Event, Observed, and Ingest, then the exact-source evidence was regenerated.",
+      "evidence": "target/quality/evidence/1785220481889-cd51df1e2bbd-94353.json",
+      "evidence_sha256": "04cee0cc4d17e3426875ab5051d208b806ee44cad93238a6d1be917c89ff3c5d"
+    },
+    {
+      "id": "mutation-final-post-lint-exact-source",
+      "status": "passed-local-diagnostic",
+      "source_revision": "cd51df1e2bbdbca8eaa8116c1bdc9bdb88c14d8e",
+      "source_dirty": true,
+      "counts": {
+        "total": 27,
+        "caught": 10,
+        "missed": 0,
+        "unviable": 17,
+        "timeout": 0
+      },
+      "outcomes": "target/quality/mutation/m0-02-domain-final-post-lint/mutants.out/outcomes.json",
+      "outcomes_sha256": "ebf7c59842519f5a91b1ab6880a6ba330790d9f2a1f989a2a5e8139f5050f747",
+      "mutants": "target/quality/mutation/m0-02-domain-final-post-lint/mutants.out/mutants.json",
+      "mutants_sha256": "1c89ef78952dfe1eea3c71995aec5471db997d88f63b6541eb2f8f8d40fc89a2"
+    },
+    {
+      "id": "quality-pr-canonical",
+      "status": "passed-local-diagnostic",
+      "command": "cargo xtask quality --profile pr",
+      "source_revision": "cd51df1e2bbdbca8eaa8116c1bdc9bdb88c14d8e",
+      "source_dirty": true,
+      "result": "All selected PR gates passed after the provenance variant rename and exact-source mutation rerun. This remains local dirty-tree diagnostic evidence only.",
+      "evidence": "target/quality/evidence/1785220698806-cd51df1e2bbd-6368.json",
+      "evidence_sha256": "4c7d72cf180736a0d0340ea7cdd78ed7ab82f2b24e9907932b79ae982359298d"
+    },
+    {
+      "id": "quality-ext-canonical",
+      "status": "passed-local-diagnostic",
+      "command": "cargo xtask quality --profile ext",
+      "source_revision": "cd51df1e2bbdbca8eaa8116c1bdc9bdb88c14d8e",
+      "source_dirty": true,
+      "result": "All selected extended gates passed, including the M0-02 Domain Types coverage and dynamic checks. This remains local dirty-tree diagnostic evidence only.",
+      "evidence": "target/quality/evidence/1785220733271-cd51df1e2bbd-10073.json",
+      "evidence_sha256": "3639292de587b385dd27f18c03ad7af5a625e833ea4feaa5d660f49ca8f4387d"
+    }
+  ],
+  "residual_uncovered_paths": [
+    {
+      "source": "crates/positron-domain/src/outcome.rs:196-203,217",
+      "classification": "non-public allocator-fault path",
+      "reason": "Domain Types maps Vec::try_reserve_exact allocation failure to a typed bounded failure, but no safe deterministic public input can force the process allocator to fail without trying to exhaust host memory. There is intentionally no hidden allocator seam or fault injector in this narrow M0-02 scope. The error constructor and Display arm remain in the denominator and are not marked covered."
+    },
+    {
+      "source": "crates/positron-domain/src/value.rs:732,739",
+      "classification": "pinned-target-impossible conversion error",
+      "reason": "Each pinned M0 target is aarch64 or x86_64, so every u32 value fits usize. The explicit TryFrom error arms remain as future-target defensive behavior; they cannot be reached on the declared target set. They remain in the denominator and are not marked covered."
+    }
+  ],
+  "mutation_unviable_classification": {
+    "status": "tool-classified-unviable",
+    "count": 17,
+    "rule": "No viable mutant is exempted. The exact tool classifications and mutant identities remain in the final raw outcomes report."
+  },
+  "affected_invariants": [
+    "ARC-01",
+    "ARC-02",
+    "ARC-03",
+    "RUST-01",
+    "RUST-02",
+    "RUST-03",
+    "RUST-04",
+    "ERR-01",
+    "ERR-02",
+    "TEST-01",
+    "TEST-02",
+    "TEST-06"
+  ],
+  "affected_gates": [
+    "EG-ARCH",
+    "EG-COVERAGE",
+    "EG-DYNAMIC",
+    "EG-EVIDENCE",
+    "EG-POLICY",
+    "EG-RUST",
+    "EG-TEST"
+  ],
+  "detection_gained": [
+    "Only the exact Architecture-owned Domain Types source inventory can activate under M0-02.",
+    "All callers of positron-domain retain the existing acyclic dependency graph but must carry the M0-02 edge label.",
+    "EG-COVERAGE measures and ratchets all handwritten Domain Types source with branch, line, and region baselines.",
+    "EG-DYNAMIC executes the retained-seed public contract suite and compile-fail crate boundary test for this narrow scope.",
+    "The registry rejects unregistered Domain Types Rust source, incomplete M0-02 ledger data, forbidden gate selection, and stale or untraceable baselines.",
+    "An explicit manual selection can retain the exact M0-02 focused mutation outcomes in the existing revision-bound extended evidence artifact without changing scheduled or routine gate selection."
+  ],
+  "detection_lost": [],
+  "migration": "No wire protocol, persistence format, runtime, provider, deferred signal store, clustering behavior, generated surface, artifact scope, public serialization, scheduled gate, routine gate, threshold, or merge requirement is introduced. positron-api and positron-config remain active under their original M0-01 evidence. Within this first native Domain Types activation, QueryTimeProvenance uses the closed labels Event, Observed, and Ingest for the accepted source meanings. The M0-02 source cleanup removes redundant internal impossible branches before ratcheting coverage. The original baseline report remains local dirty-tree diagnostic evidence; an explicitly selected exact-head mutation campaign is retained externally in the existing revision-bound extended workflow artifact and does not establish Qualified or merge-eligible status.",
+  "old_result": {
+    "activation_id": "M0-01",
+    "scope_set": [
+      "positron-api",
+      "positron-config",
+      "positron-domain"
+    ],
+    "status": "passed-local-diagnostic",
+    "command": "cargo test --locked --package xtask --test foundational_scope_activation",
+    "trusted_ci": false,
+    "merge_eligible": false
+  },
+  "new_result": {
+    "activation_id": "M0-02",
+    "scope_set": [
+      "positron-domain"
+    ],
+    "status": "passed-local-diagnostic",
+    "source_revision": "cd51df1e2bbdbca8eaa8116c1bdc9bdb88c14d8e",
+    "source_dirty": true,
+    "trusted_ci": false,
+    "merge_eligible": false,
+    "coverage_report": "target/quality/coverage/m0-02-domain-final.json",
+    "coverage_report_sha256": "d8b1d0d66123449452c54e3912d9b000e078ba59bb46e3e54ed378bb5ff17a29",
+    "quality_evidence": [
+      {
+        "profile": "pr",
+        "result": "passed",
+        "evidence": "target/quality/evidence/1785220698806-cd51df1e2bbd-6368.json",
+        "sha256": "4c7d72cf180736a0d0340ea7cdd78ed7ab82f2b24e9907932b79ae982359298d"
+      },
+      {
+        "profile": "ext",
+        "result": "passed",
+        "evidence": "target/quality/evidence/1785220733271-cd51df1e2bbd-10073.json",
+        "sha256": "3639292de587b385dd27f18c03ad7af5a625e833ea4feaa5d660f49ca8f4387d"
+      }
+    ]
+  },
+  "dual_run": {
+    "status": "completed-local-diagnostic",
+    "reason": "The foundational-scope activation suite retains both the M0-01 historical fixture path and the narrow M0-02 Domain Types transition fixture. The exact-source Domain Types public, compile-fail, coverage, and focused mutation commands were rerun after the M0-02 source refactor. Independent review and trusted CI remain required."
+  },
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering",
+    "Rust and Toolchain"
+  ],
+  "approval_status": "approved-after-completed-independent-terra-high-code-review",
+  "approved_by": "@vicotrbb (repository owner; Architecture, Quality Engineering, and Rust and Toolchain) - explicitly stated in-session `I approve PC-0007 for Architecture, Quality Engineering, and Rust/Toolchain.`; recorded 2026-07-28T19:53:28-03:00",
+  "immutable_after_acceptance": true
+}
