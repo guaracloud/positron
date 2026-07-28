@@ -22,6 +22,10 @@ const FROZEN_COVERAGE_LINE: &str = "70.52266534555362";
 const FROZEN_COVERAGE_REGION: &str = "69.9540018399264";
 const FROZEN_COVERAGE_BRANCH: &str = "57.622739018087856";
 const FROZEN_COVERAGE_CHANGED_CODE: &str = "65.97888675623801";
+const M0_02_ACTIVATION_ID: &str = "M0-02";
+const M0_02_ACTIVATION_SET: &str = "positron-domain";
+const M0_02_POLICY_CHANGE: &str =
+    "qualification/engineering/policy-changes/PC-0007-m0-02-domain-types.json";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -240,6 +244,69 @@ fn quality_returns_a_closed_failure_when_a_controlled_descendant_holds_capture_o
     let remove = fixture.remove();
     cleanup?;
     remove?;
+    result
+}
+
+#[test]
+fn quality_accepts_the_narrow_m0_02_domain_types_transition() -> TestResult {
+    let fixture = Fixture::create_m0_02_domain_types()?;
+    let result = fixture.quality();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_unregistered_m0_02_domain_source_file() -> TestResult {
+    let fixture = Fixture::create_m0_02_domain_types()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("crates/positron-domain/src/unregistered.rs"),
+            "//! Unregistered M0-02 source.\n",
+        )?;
+        assert_existing_fixture_rejected(
+            &fixture,
+            "pre-commit",
+            "M0-02 Domain Types source layout differs from its registered file set",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_ext_rejects_m0_02_domain_coverage_below_its_frozen_baseline() -> TestResult {
+    let fixture = Fixture::create_m0_02_domain_types()?;
+    let result = (|| {
+        reduce_line_coverage_measurement(&fixture.root)?;
+        assert_existing_fixture_rejected(
+            &fixture,
+            "ext",
+            "domain coverage line 70.00 is below frozen M0-02 baseline 100.00",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_pr_executes_the_m0_02_domain_dynamic_harness() -> TestResult {
+    let fixture = Fixture::create_m0_02_domain_types()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/reject-m0-02-dynamic-execution"),
+            "",
+        )?;
+        assert_existing_fixture_rejected(&fixture, "pr", "fixture rejects M0-02 dynamic execution")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
     result
 }
 
@@ -610,11 +677,11 @@ fn quality_accepts_zero_as_a_valid_measured_baseline() -> TestResult {
 }
 
 #[test]
-fn quality_rejects_an_activation_group_other_than_m0_01() -> TestResult {
+fn quality_rejects_an_incomplete_m0_02_domain_types_ledger() -> TestResult {
     assert_scope_fields_rejected(
         "positron-domain",
         &[("activation_id", "M0-02")],
-        "this M0 policy may activate only the exact M0-01 foundational scope group",
+        "M0-02 Domain Types must declare only the exact `positron-domain` scope set",
     )
 }
 
@@ -801,11 +868,19 @@ impl Fixture {
         Self::create_with_identity(true)
     }
 
+    fn create_m0_02_domain_types() -> TestResult<Self> {
+        Self::create_with_policy(false, configure_m0_02_domain_types_ledger)
+    }
+
     fn create_with_identity(real_git: bool) -> TestResult<Self> {
+        Self::create_with_policy(real_git, configure_activation_ledger)
+    }
+
+    fn create_with_policy(real_git: bool, configure: fn(&Path) -> TestResult) -> TestResult<Self> {
         let root = temporary_root()?;
         let source = repository_root()?;
         copy_tree(&source, &root)?;
-        configure_activation_ledger(&root)?;
+        configure(&root)?;
         install_fixture_tools(&root, real_git)?;
         if real_git {
             initialize_git_repository(&root)?;
@@ -1310,7 +1385,114 @@ fn configure_activation_ledger(root: &Path) -> TestResult {
     rewrite_thresholds(root)?;
     write_policy_change(root)?;
     remove_scaffold_markers(root)?;
+    restore_m0_01_domain_source_shape(root)?;
     Ok(())
+}
+
+fn restore_m0_01_domain_source_shape(root: &Path) -> TestResult {
+    let source_root = root.join("crates/positron-domain/src");
+    for name in [
+        "identity.rs",
+        "lifecycle.rs",
+        "outcome.rs",
+        "routing.rs",
+        "time.rs",
+        "value.rs",
+    ] {
+        let path = source_root.join(name);
+        if path.is_file() {
+            fs::remove_file(path)?;
+        }
+    }
+    let contract_test = root.join("crates/positron-domain/tests/foundational_domain_types.rs");
+    if contract_test.is_file() {
+        fs::remove_file(contract_test)?;
+    }
+    fs::write(
+        source_root.join("lib.rs"),
+        "//! Historical M0-01 activation-only fixture.\n#![forbid(unsafe_code)]\n",
+    )?;
+    Ok(())
+}
+
+fn configure_m0_02_domain_types_ledger(root: &Path) -> TestResult {
+    set_scope_field(
+        root,
+        "positron-domain",
+        "risk_gates",
+        "EG-COVERAGE|EG-DYNAMIC",
+    )?;
+    set_scope_field(
+        root,
+        "positron-domain",
+        "activation_id",
+        M0_02_ACTIVATION_ID,
+    )?;
+    set_scope_field(
+        root,
+        "positron-domain",
+        "activation_scope_set",
+        M0_02_ACTIVATION_SET,
+    )?;
+    set_scope_field(
+        root,
+        "positron-domain",
+        "test_commands",
+        "cargo test --locked --package positron-domain",
+    )?;
+    set_scope_field(
+        root,
+        "positron-domain",
+        "coverage_baseline",
+        "domain-coverage-branch|domain-coverage-line|domain-coverage-region",
+    )?;
+    set_scope_field(
+        root,
+        "positron-domain",
+        "mutation_baseline",
+        "domain-mutation-score",
+    )?;
+    set_scope_field(
+        root,
+        "positron-domain",
+        "contract_evidence",
+        M0_02_POLICY_CHANGE,
+    )?;
+
+    let edges_path = root.join("qualification/engineering/architecture-edges.tsv");
+    let edges = fs::read_to_string(&edges_path)?;
+    fs::write(
+        edges_path,
+        edges.replace("\tpositron-domain\tM0-01\n", "\tpositron-domain\tM0-02\n"),
+    )?;
+
+    let thresholds_path = root.join("qualification/engineering/thresholds.tsv");
+    let mut thresholds = fs::read_to_string(&thresholds_path)?;
+    for threshold in [
+        "domain-coverage-branch",
+        "domain-coverage-line",
+        "domain-coverage-region",
+        "domain-mutation-score",
+    ] {
+        let registered = thresholds
+            .lines()
+            .any(|line| line.split('\t').next() == Some(threshold));
+        if !registered {
+            thresholds.push_str(&format!(
+                "{threshold}\tmeasured-baseline\t100.00\tpercent\tm0-02-domain-types\tFixture M0-02 baseline\t{M0_02_POLICY_CHANGE}\n"
+            ));
+        }
+    }
+    fs::write(thresholds_path, thresholds)?;
+    for threshold in [
+        "domain-coverage-branch",
+        "domain-coverage-line",
+        "domain-coverage-region",
+        "domain-mutation-score",
+    ] {
+        set_threshold_field(root, threshold, "value", "100.00")?;
+    }
+    write_m0_02_policy_change(root)
 }
 
 fn configure_scaffold_only_policy(root: &Path) -> TestResult {
@@ -1982,6 +2164,22 @@ fn write_policy_change(root: &Path) -> TestResult {
     Ok(())
 }
 
+fn write_m0_02_policy_change(root: &Path) -> TestResult {
+    let content = r#"{
+  "schema_version": 1,
+  "id": "PC-0007-m0-02-domain-types",
+  "status": "proposed-for-independent-review",
+  "activation_id": "M0-02",
+  "scope_set": ["positron-domain"],
+  "baseline_evidence": "measured",
+  "dependency_review": "none",
+  "approvals_required": ["Architecture", "Quality Engineering"]
+}
+"#;
+    fs::write(root.join(M0_02_POLICY_CHANGE), content)?;
+    Ok(())
+}
+
 fn remove_scaffold_markers(root: &Path) -> TestResult {
     for package in ["positron-domain", "positron-api", "positron-config"] {
         let path = root.join("crates").join(package).join("src/lib.rs");
@@ -2107,6 +2305,21 @@ case "$command" in
     fi
     if [ -f target/quality-tools/emit-search-index-projection-canary ]; then
       printf '%s\n' 'GENERATED_DOC_NON_SQUARE_SECRET_CANARY' >> "$search_index"
+    fi
+    ;;
+  test)
+    package=
+    previous=
+    for argument in "$@"; do
+      if [ "$previous" = "--package" ]; then
+        package="$argument"
+        break
+      fi
+      previous="$argument"
+    done
+    if [ "$package" = "positron-domain" ] && [ -f target/quality-tools/reject-m0-02-dynamic-execution ]; then
+      printf '%s\n' 'fixture rejects M0-02 dynamic execution' >&2
+      exit 75
     fi
     ;;
   tree)

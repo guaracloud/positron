@@ -543,6 +543,7 @@ fn execute_gate(
         "architecture" => run_architecture_gate(root, registry, budget, environment),
         "build" => run_build_gate(root, profile, budget, environment),
         "coverage" => run_coverage_gate(root, registry, budget, environment),
+        "dynamic-analysis" => run_dynamic_analysis_gate(root, registry, budget, environment),
         "dependencies" => run_dependency_gate(root, registry, budget, environment),
         "documentation" => run_documentation_gate(root, budget, environment),
         "error-policy" => run_error_policy_gate(root, registry),
@@ -560,6 +561,48 @@ fn execute_gate(
     }
 }
 
+fn run_dynamic_analysis_gate(
+    root: &Path,
+    registry: &Registry,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    if !registry.has_m0_02_domain_types_scope() {
+        return Err(XtaskError::invalid(
+            "dynamic analysis runner",
+            "EG-DYNAMIC was selected without an applicable registered dynamic target",
+        ));
+    }
+    let deadline = Instant::now() + budget;
+    let contract = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "positron-domain",
+            "--test",
+            "foundational_domain_types",
+        ],
+        remaining(deadline)?,
+        &[],
+    )?;
+    let compile_fail = run_status(
+        root,
+        environment,
+        "cargo",
+        ["test", "--locked", "--package", "positron-domain", "--doc"],
+        remaining(deadline)?,
+        &[],
+    )?;
+    Ok(format!(
+        "M0-02 Domain Types retained-seed contract/property cases: {} | compile-fail: {}",
+        contract.display, compile_fail.display,
+    ))
+}
+
 fn run_coverage_gate(
     root: &Path,
     registry: &Registry,
@@ -572,6 +615,33 @@ fn run_coverage_gate(
     fs::create_dir_all(&coverage_directory).map_err(|source| {
         XtaskError::io(format!("create {}", coverage_directory.display()), source)
     })?;
+    let mut results = Vec::new();
+    if registry.has_m0_02_domain_types_scope() {
+        results.push(run_m0_02_domain_types_coverage(
+            root,
+            registry,
+            deadline,
+            environment,
+        )?);
+    }
+    if registry.has_m0_01_foundational_scope() {
+        results.push(run_m0_01_coverage(root, registry, deadline, environment)?);
+    }
+    if results.is_empty() {
+        return Err(XtaskError::invalid(
+            "coverage runner",
+            "EG-COVERAGE was selected without a registered coverage activation",
+        ));
+    }
+    Ok(format!("{detector_versions}; {}", results.join(" | ")))
+}
+
+fn run_m0_01_coverage(
+    root: &Path,
+    registry: &Registry,
+    deadline: Instant,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     let specifications = m0_01b_coverage_command_specs();
     validate_m0_01b_coverage_command_specs(&specifications)?;
     let [total_specification, changed_code_specification] = specifications;
@@ -595,17 +665,54 @@ fn run_coverage_gate(
     let total_measurements = read_coverage_measurements(&root.join(total_specification.report))?;
     let changed_measurements =
         read_coverage_measurements(&root.join(changed_code_specification.report))?;
-    enforce_coverage_baselines(registry, &total_measurements, &changed_measurements)?;
+    enforce_m0_01_coverage_baselines(registry, &total_measurements, &changed_measurements)?;
 
     Ok(format!(
-        "{}; {} | {}; total(branch={:.2}, line={:.2}, region={:.2}); changed-code(line={:.2})",
-        detector_versions,
+        "M0-01: {} | {}; total(branch={:.2}, line={:.2}, region={:.2}); changed-code(line={:.2})",
         total.display,
         changed_code.display,
         total_measurements.branch,
         total_measurements.line,
         total_measurements.region,
         changed_measurements.line,
+    ))
+}
+
+fn run_m0_02_domain_types_coverage(
+    root: &Path,
+    registry: &Registry,
+    deadline: Instant,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    let report = "target/quality/coverage/m0-02-domain-total.json";
+    let outcome = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "+nightly-2026-07-20",
+            "llvm-cov",
+            "--locked",
+            "--package",
+            "positron-domain",
+            "--test",
+            "foundational_domain_types",
+            "--branch",
+            "--json",
+            "--summary-only",
+            "--ignore-filename-regex",
+            "crates/positron-domain/tests/.*",
+            "--output-path",
+            report,
+        ],
+        remaining(deadline)?,
+        &[],
+    )?;
+    let measurements = read_coverage_measurements(&root.join(report))?;
+    enforce_m0_02_domain_types_coverage_baselines(registry, &measurements)?;
+    Ok(format!(
+        "M0-02 Domain Types: {}; total(branch={:.2}, line={:.2}, region={:.2})",
+        outcome.display, measurements.branch, measurements.line, measurements.region,
     ))
 }
 
@@ -647,7 +754,7 @@ fn verify_coverage_detectors(
     Ok(format!("{identity}={}", tool.version))
 }
 
-fn enforce_coverage_baselines(
+fn enforce_m0_01_coverage_baselines(
     registry: &Registry,
     total: &CoverageMeasurements,
     changed_code: &CoverageMeasurements,
@@ -663,6 +770,28 @@ fn enforce_coverage_baselines(
             return Err(XtaskError::invalid(
                 "M0 coverage baseline",
                 format!("coverage {label} {actual:.2} is below frozen M0 baseline {baseline:.2}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_m0_02_domain_types_coverage_baselines(
+    registry: &Registry,
+    measurements: &CoverageMeasurements,
+) -> Result<(), XtaskError> {
+    for (identity, actual, label) in [
+        ("domain-coverage-branch", measurements.branch, "branch"),
+        ("domain-coverage-line", measurements.line, "line"),
+        ("domain-coverage-region", measurements.region, "region"),
+    ] {
+        let baseline = registry.measured_baseline(identity)?;
+        if actual < baseline {
+            return Err(XtaskError::invalid(
+                "M0-02 coverage baseline",
+                format!(
+                    "domain coverage {label} {actual:.2} is below frozen M0-02 baseline {baseline:.2}"
+                ),
             ));
         }
     }
