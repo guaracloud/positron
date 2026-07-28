@@ -1,0 +1,54 @@
+// Canonical Positron public API definition. Generated artifacts are produced
+// only by `cargo xtask generate-api`.
+syntax = "proto3";
+
+package positron.v1;
+
+// Capability negotiation is the public foundation used before any later
+// versioned service sends a request whose semantics the peer cannot support.
+service CapabilityService {
+  rpc Negotiate(CapabilityRequest) returns (CapabilityResponse);
+}
+
+message CapabilityRequest {
+  uint32 api_major = 1;
+}
+
+message CapabilityResponse {
+  uint32 api_major = 1;
+  string schema_digest = 2;
+  CapabilityAvailability availability = 3;
+  PublicError refusal = 4;
+}
+
+enum CapabilityAvailability {
+  CAPABILITY_AVAILABILITY_UNSPECIFIED = 0;
+  CAPABILITY_AVAILABILITY_IMPLEMENTED = 1;
+  CAPABILITY_AVAILABILITY_UNAVAILABLE = 2;
+  CAPABILITY_AVAILABILITY_UNSUPPORTED = 3;
+  CAPABILITY_AVAILABILITY_VERSION_INCOMPATIBLE = 4;
+}
+
+enum RetryClass {
+  RETRY_CLASS_UNSPECIFIED = 0;
+  RETRY_CLASS_NEVER = 1;
+  RETRY_CLASS_AFTER_BACKOFF = 2;
+  RETRY_CLASS_AFTER_INPUT_CORRECTION = 3;
+}
+
+enum CompletionState {
+  COMPLETION_STATE_UNSPECIFIED = 0;
+  COMPLETION_STATE_REJECTED = 1;
+}
+
+message PublicError {
+  PublicErrorCode code = 1;
+  RetryClass retry_class = 2;
+  CompletionState completion_state = 3;
+  string safe_source = 4;
+}
+
+enum PublicErrorCode {
+  PUBLIC_ERROR_CODE_UNSPECIFIED = 0;
+  PUBLIC_ERROR_CODE_UNSUPPORTED_API_VERSION = 1;
+}

@@ -1,0 +1,5 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Positron API", "version": "v1", "x-positron-schema-digest": "65bbd45e3342bbd8b7da71e478be76f1f3057dbaabce6aa31cae76c47d5cba11"},
+  "paths": {"/v1/capabilities:negotiate": {"post": {"operationId": "NegotiateCapabilities"}}}
+}

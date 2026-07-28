@@ -596,11 +596,47 @@ fn execute_gate(
         "secrets" => run_secret_gate(root, profile, budget, environment),
         "supply" => run_supply_gate(root, registry, profile, budget, environment),
         "test" => run_test_gate(root, budget, environment),
+        "matrix" => run_canonical_api_matrix_gate(root),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
             "an active risk scope selected a gate whose executable harness has not been implemented",
         )),
     }
+}
+
+fn run_canonical_api_matrix_gate(root: &Path) -> Result<String, XtaskError> {
+    const ARTIFACTS: [&str; 4] = [
+        "api/positron/v1/http.json",
+        "api/positron/v1/openapi.json",
+        "api/positron/v1/schema.sha256",
+        "crates/positron-api/src/generated.rs",
+    ];
+    let before = ARTIFACTS
+        .iter()
+        .map(|relative| {
+            let path = root.join(relative);
+            let contents = fs::read(&path).map_err(|source| {
+                XtaskError::io(
+                    format!("read canonical API artifact {}", path.display()),
+                    source,
+                )
+            })?;
+            Ok((path, contents))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::api_generation::generate(root)?;
+    for (path, contents) in before {
+        let regenerated = fs::read(&path).map_err(|source| {
+            XtaskError::io(format!("read regenerated {}", path.display()), source)
+        })?;
+        if regenerated != contents {
+            return Err(XtaskError::invalid_path(
+                &path,
+                "canonical API generation is not clean and deterministic",
+            ));
+        }
+    }
+    Ok("canonical API generation parity is clean across Rust, HTTP/JSON, OpenAPI, and Schema Digest".to_owned())
 }
 
 fn run_dynamic_analysis_gate(

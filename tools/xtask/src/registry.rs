@@ -949,21 +949,42 @@ fn validate_activation_ledgers(
     let m0_02_domain_transition = groups.len() == 2
         && groups.get("M0-01") == Some(&m0_01_remaining_scope_set())
         && groups.get("M0-02") == Some(&m0_02_domain_scope_set());
-    if !m0_01_complete && !m0_02_domain_transition {
+    let m0_03_api_transition = groups.len() == 3
+        && groups.get("M0-01") == Some(&m0_01_config_scope_set())
+        && groups.get("M0-02") == Some(&m0_02_domain_scope_set())
+        && groups.get("M0-03") == Some(&m0_03_api_scope_set());
+    if !m0_01_complete && !m0_02_domain_transition && !m0_03_api_transition {
         return Err(XtaskError::invalid(
             "application activation ledger",
-            "active application scopes must be either the complete M0-01 foundation or the narrow M0-02 Domain Types transition",
+            "active application scopes must be the complete M0-01 foundation, the narrow M0-02 Domain Types transition, or the narrow M0-03 canonical API transition",
         ));
     }
 
     for scope in active {
-        if scope.activation_id == "M0-01" {
-            validate_foundational_scope_ledger(root, scope, thresholds, reviewed_dependencies)?;
-        } else {
-            validate_m0_02_domain_types_ledger(root, scope, thresholds, reviewed_dependencies)?;
+        match scope.activation_id.as_str() {
+            "M0-01" => {
+                validate_foundational_scope_ledger(root, scope, thresholds, reviewed_dependencies)?;
+            },
+            "M0-02" => {
+                validate_m0_02_domain_types_ledger(root, scope, thresholds, reviewed_dependencies)?;
+            },
+            "M0-03" => {
+                validate_m0_03_canonical_api_ledger(
+                    root,
+                    scope,
+                    thresholds,
+                    reviewed_dependencies,
+                )?;
+            },
+            _ => {
+                return Err(XtaskError::invalid(
+                    "application activation ledger",
+                    "active application scope has an unrecognized activation identity",
+                ));
+            },
         }
     }
-    validate_foundational_edges(edges, m0_02_domain_transition)?;
+    validate_foundational_edges(edges, m0_02_domain_transition, m0_03_api_transition)?;
     Ok(())
 }
 
@@ -981,8 +1002,16 @@ fn m0_01_remaining_scope_set() -> BTreeSet<String> {
         .collect()
 }
 
+fn m0_01_config_scope_set() -> BTreeSet<String> {
+    ["positron-config"].into_iter().map(str::to_owned).collect()
+}
+
 fn m0_02_domain_scope_set() -> BTreeSet<String> {
     ["positron-domain"].into_iter().map(str::to_owned).collect()
+}
+
+fn m0_03_api_scope_set() -> BTreeSet<String> {
+    ["positron-api"].into_iter().map(str::to_owned).collect()
 }
 
 fn validate_foundational_scope_ledger(
@@ -1214,6 +1243,105 @@ fn validate_m0_02_domain_types_ledger(
     Ok(())
 }
 
+fn validate_m0_03_canonical_api_ledger(
+    root: &Path,
+    scope: &Scope,
+    thresholds: &BTreeMap<String, Threshold>,
+    reviewed_dependencies: &BTreeSet<String>,
+) -> Result<(), XtaskError> {
+    if scope.package != "positron-api" || scope.semantic_owner != "Public API and SDK" {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "M0-03 can activate only the Public API and SDK-owned `positron-api` scope",
+        ));
+    }
+    if scope.activation_id != "M0-03" || scope.activation_scope_set != m0_03_api_scope_set() {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "M0-03 canonical API must declare only the exact `positron-api` scope set",
+        ));
+    }
+    if scope.allowed_edges != foundational_edges(&scope.package) {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "M0-03 canonical API has an incomplete or forbidden edge set",
+        ));
+    }
+    if scope.risk_gates != BTreeSet::from(["EG-COVERAGE".to_owned()]) {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "M0-03 canonical API must select exactly EG-COVERAGE",
+        ));
+    }
+    if scope.test_commands
+        != "cargo test --locked --package positron-api --test canonical_public_interface"
+    {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "M0-03 canonical API has an unexpected public contract test command",
+        ));
+    }
+    let expected_coverage = BTreeSet::from([
+        "api-coverage-branch".to_owned(),
+        "api-coverage-line".to_owned(),
+        "api-coverage-region".to_owned(),
+    ]);
+    if scope.coverage_baseline != expected_coverage
+        || scope.mutation_baseline != "api-mutation-score"
+    {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "M0-03 canonical API is missing its exact coverage and focused mutation baselines",
+        ));
+    }
+    for baseline in scope
+        .coverage_baseline
+        .iter()
+        .chain(std::iter::once(&scope.mutation_baseline))
+    {
+        let Some(threshold) = thresholds.get(baseline) else {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!("M0-03 canonical API references unknown baseline `{baseline}`"),
+            ));
+        };
+        if threshold.state != "measured-baseline" || threshold.value == "-" {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!("M0-03 canonical API baseline `{baseline}` is not measured"),
+            ));
+        }
+        if threshold.evidence != scope.contract_evidence {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!(
+                    "M0-03 canonical API baseline `{baseline}` is not traceable to its contract evidence"
+                ),
+            ));
+        }
+    }
+    if scope.dependency_review == "none" {
+        validate_dependency_free_scope(root, scope)?;
+    } else {
+        for dependency in split_set(&scope.dependency_review) {
+            if !reviewed_dependencies.contains(&dependency) {
+                return Err(XtaskError::invalid(
+                    "application activation ledger",
+                    format!("M0-03 canonical API names unreviewed dependency `{dependency}`"),
+                ));
+            }
+        }
+    }
+    let evidence = root.join(&scope.contract_evidence);
+    if !evidence.is_file() {
+        return Err(XtaskError::invalid_path(
+            &evidence,
+            "M0-03 canonical API contract evidence is missing",
+        ));
+    }
+    Ok(())
+}
+
 fn foundational_owner(package: &str) -> Option<&'static str> {
     match package {
         "positron-domain" => Some("Architecture"),
@@ -1253,6 +1381,7 @@ fn foundational_edges(package: &str) -> BTreeSet<(String, String)> {
 fn validate_foundational_edges(
     edges: &[ArchitectureEdge],
     m0_02_domain_transition: bool,
+    m0_03_api_transition: bool,
 ) -> Result<(), XtaskError> {
     let foundational = foundational_scope_set();
     let mut actual = BTreeMap::<String, BTreeSet<(String, String)>>::new();
@@ -1264,11 +1393,14 @@ fn validate_foundational_edges(
         } else {
             &edge.dependency
         };
-        let expected_activation_id = if m0_02_domain_transition && package == "positron-domain" {
-            "M0-02"
-        } else {
-            "M0-01"
-        };
+        let expected_activation_id =
+            if (m0_02_domain_transition || m0_03_api_transition) && package == "positron-domain" {
+                "M0-02"
+            } else if m0_03_api_transition && package == "positron-api" {
+                "M0-03"
+            } else {
+                "M0-01"
+            };
         if touches_foundation && edge.activation_id != expected_activation_id {
             return Err(XtaskError::invalid(
                 "architecture edge activation ledger",
@@ -1823,6 +1955,9 @@ fn validate_active_sources(root: &Path, scopes: &[Scope]) -> Result<(), XtaskErr
         if scope.activation_id == "M0-02" {
             validate_m0_02_domain_source_layout(root, scope)?;
         }
+        if scope.activation_id == "M0-03" {
+            validate_m0_03_api_source_layout(root, scope)?;
+        }
         if scope.activation_id == "M0-01"
             && (files.len() != 1 || files.first() != Some(&source_root.join("lib.rs")))
         {
@@ -1915,6 +2050,40 @@ fn validate_m0_02_domain_source_layout(root: &Path, scope: &Scope) -> Result<(),
         return Err(XtaskError::invalid_path(
             &scope_root,
             "M0-02 Domain Types source layout differs from its registered file set",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_m0_03_api_source_layout(root: &Path, scope: &Scope) -> Result<(), XtaskError> {
+    let scope_root = root.join(&scope.path);
+    let mut files = Vec::new();
+    collect_files_with_extension(&scope_root, "rs", 0, &mut files)?;
+    let actual = files
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&scope_root)
+                .map(|relative| relative.to_path_buf())
+                .map_err(|source| {
+                    XtaskError::invalid_path(
+                        path,
+                        format!("M0-03 canonical API source escaped its scope: {source}"),
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected = [
+        "src/generated.rs",
+        "src/lib.rs",
+        "tests/canonical_public_interface.rs",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(XtaskError::invalid_path(
+            &scope_root,
+            "M0-03 canonical API source layout differs from its registered file set",
         ));
     }
     Ok(())

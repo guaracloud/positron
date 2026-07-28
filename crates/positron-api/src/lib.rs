@@ -1,7 +1,10 @@
-//! Public-interface and transport boundary.
+//! Generated public-interface foundations for the canonical Positron v1 API.
 //!
-//! Product API messages and transport behavior remain absent until the
-//! canonical versioned API Definition and stable error taxonomy are accepted
-//! and their reproducible generation gate is activated.
+//! The public source lives exclusively in `api/positron/v1/positron.proto`.
+//! Run `cargo xtask generate-api` to refresh this module and its HTTP/JSON,
+//! OpenAPI, and Schema Digest artifacts.
 
 #![forbid(unsafe_code)]
+
+/// Deterministically generated v1 wire and in-memory interface types.
+pub mod generated;

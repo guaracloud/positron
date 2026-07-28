@@ -1,0 +1,4 @@
+{
+  "schema_digest": "65bbd45e3342bbd8b7da71e478be76f1f3057dbaabce6aa31cae76c47d5cba11",
+  "mappings": [{"rpc": "positron.v1.CapabilityService/Negotiate", "method": "POST", "path": "/v1/capabilities:negotiate"}]
+}

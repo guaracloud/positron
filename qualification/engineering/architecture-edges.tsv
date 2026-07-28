@@ -8,7 +8,7 @@ positron	positron-upgrade	-
 positron	positron-diagnostics	-
 positron	positron-operator	-
 positron	positron-release	-
-positron-runtime	positron-api	M0-01
+positron-runtime	positron-api	M0-03
 positron-runtime	positron-config	M0-01
 positron-runtime	positron-domain	M0-02
 positron-runtime	positron-governance	-
@@ -34,4 +34,4 @@ positron-upgrade	positron-release	-
 positron-diagnostics	positron-runtime	-
 positron-diagnostics	positron-governance	-
 positron-diagnostics	positron-kernel	-
-positron-operator	positron-api	M0-01
+positron-operator	positron-api	M0-03

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "id": "PC-0008-m0-03-canonical-public-interface",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0028-use-one-versioned-protobuf-definition-for-public-apis-and-sdks.md",
+    "docs/adr/0060-publish-independent-compatibility-claims-in-one-release-manifest.md",
+    "docs/application-design.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Activate only the canonical API artifact and Public API and SDK-owned positron-api behavior required by M0-03.",
+  "change": {
+    "activation_id": "M0-03",
+    "scope_set": ["positron-api"],
+    "artifact_scope": "canonical-api",
+    "test_command": "cargo test --locked --package positron-api --test canonical_public_interface",
+    "generation_command": "cargo xtask generate-api",
+    "coverage_command": "cargo +nightly-2026-07-20 llvm-cov --locked --package positron-api --test canonical_public_interface --branch --json --summary-only --output-path target/quality/coverage/m0-03-api.json",
+    "mutation_command": "cargo mutants --no-config --package positron-api --file crates/positron-api/src/generated.rs --test-tool cargo --output target/quality/mutation/m0-03-api --timeout 30 --jobs 1 --no-times -- --locked --test canonical_public_interface"
+  },
+  "baselines": {
+    "coverage_line": 100,
+    "coverage_region": 100,
+    "coverage_branch": 100,
+    "mutation_score": 100
+  },
+  "attempts": [
+    {
+      "id": "focused-coverage-local-diagnostic",
+      "status": "passed-local-diagnostic",
+      "source_dirty": true,
+      "report": "target/quality/coverage/m0-03-api.json",
+      "result": "100 percent line, region, branch, and function coverage for the canonical generated API owner"
+    },
+    {
+      "id": "focused-mutation-pre-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "result": "19 mutants: 4 caught, 2 missed, and 13 tool-unviable. One missed mutant exposed the missing explicit v1-major assertion; the second was a semantic-equivalent replacement of the literal return. The assertion was added and the equivalent match target was removed. This failed attempt remains retained; mutation must run once in trusted CI on the final exact commit."
+    }
+  ],
+  "detection_gained": [
+    "one hand-edited versioned Protobuf source generates the Rust, HTTP/JSON, OpenAPI, and Schema Digest foundations",
+    "the public in-memory contract proves typed implementation and explicit version refusal without wire or domain leakage",
+    "the canonical artifact scope cannot return to scaffold while generated files drift"
+  ],
+  "detection_lost": [],
+  "migration": "No durable format, SDK publication, listener, provider, query, signal-store, clustering, or Release 1 qualification claim is introduced. The implemented candidate remains unqualified until exact-artifact M6 evidence.",
+  "approvals_required": ["Architecture", "Public API and SDK", "Quality Engineering"],
+  "approval_status": "pending-independent-review",
+  "approved_by": [],
+  "immutable_after_acceptance": true
+}

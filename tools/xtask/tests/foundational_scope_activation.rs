@@ -1441,6 +1441,7 @@ fn configure_activation_ledger(root: &Path) -> TestResult {
     write_policy_change(root)?;
     remove_scaffold_markers(root)?;
     restore_m0_01_domain_source_shape(root)?;
+    restore_m0_01_api_source_shape(root)?;
     Ok(())
 }
 
@@ -1467,6 +1468,38 @@ fn restore_m0_01_domain_source_shape(root: &Path) -> TestResult {
         source_root.join("lib.rs"),
         "//! Historical M0-01 activation-only fixture.\n#![forbid(unsafe_code)]\n",
     )?;
+    Ok(())
+}
+
+fn restore_m0_01_api_source_shape(root: &Path) -> TestResult {
+    for path in [
+        "crates/positron-api/src/generated.rs",
+        "crates/positron-api/tests/canonical_public_interface.rs",
+        "api/positron/v1/http.json",
+        "api/positron/v1/openapi.json",
+        "api/positron/v1/positron.proto",
+        "api/positron/v1/schema.sha256",
+    ] {
+        let path = root.join(path);
+        if path.is_file() {
+            fs::remove_file(path)?;
+        }
+    }
+    fs::write(
+        root.join("crates/positron-api/src/lib.rs"),
+        "//! Historical M0-01 activation-only fixture.\n#![forbid(unsafe_code)]\n",
+    )?;
+    let artifact_scopes = root.join("qualification/engineering/artifact-scopes.tsv");
+    let content = fs::read_to_string(&artifact_scopes)?;
+    if content.contains("canonical-api\tapi/positron/v1\tPublic API and SDK\tactive\t-") {
+        fs::write(
+            artifact_scopes,
+            content.replace(
+                "canonical-api\tapi/positron/v1\tPublic API and SDK\tactive\t-",
+                "canonical-api\tapi/positron/v1\tPublic API and SDK\tscaffold\tREADME.md",
+            ),
+        )?;
+    }
     Ok(())
 }
 
