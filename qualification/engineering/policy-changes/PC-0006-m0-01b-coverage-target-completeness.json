@@ -34,6 +34,7 @@
   "detection_gained": [
     "scheduled coverage now measures the controlled-execution owner verdicts for exact stdout and stderr capture, launch and nonzero outcomes, deadline and cancellation cleanup, descriptor closure, descendant reconciliation, process-group reaping, and bounded capture failures",
     "black-box policy fixtures reject removal of either owner-test target and reject drift of every frozen M0-01 coverage threshold",
+    "the escaped-descriptor deadline verdict fixture uses one bounded owned datagram acknowledgement: the escaped descendant signals only after it owns the retained descriptors, and the direct child exits only after that acknowledgement",
     "the same coverage campaign retains workflow-level fast, PR, EXT, not-selected, missing-tool, and immutable-evidence verdict coverage"
   ],
   "detection_lost": [
@@ -41,7 +42,7 @@
   ],
   "migration": {
     "from": "coverage reports counted 3,813 covered lines out of 5,578 on clean current main because they omitted the registered owner verdict suite",
-    "to": "coverage reports run the fixture and owner targets together under the same pinned cargo-llvm-cov invocation and preserve separate total and changed-code reports",
+    "to": "coverage reports run the fixture and owner targets together under the same pinned cargo-llvm-cov invocation and preserve separate total and changed-code reports; the escaped-descriptor regression fixture uses a bounded Unix-datagram readiness acknowledgement instead of two-sided file polling",
     "policy_guard": "the policy gate requires the owner target in both coverage invocations and exact retained threshold values"
   },
   "evidence": {
@@ -71,7 +72,14 @@
       "changed_code": "2667/3990 = 66.84210526315789 percent",
       "reason": "clean local source identity is diagnostic only; trusted CI and independent review remain required."
     },
-    "dual_run": "The retained clean-main red run used the former fixture-only target. The retained committed-SHA green run used the fixture plus owner target under the same EXT profile, pinned detector, and thresholds. A final exact-SHA EXT run is required after this record and policy guard are committed."
+    "retained_failed_exact_sha": {
+      "revision": "2f589cbf41be71a36b393a93e0cd32c68e191798",
+      "command": "cargo xtask quality --profile ext",
+      "attempt": "target/quality/evidence/1785259425300-2f589cbf41be-71266.json",
+      "result": "failed-local-diagnostic",
+      "failure": "The changed-code coverage campaign failed while `returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_capture_descriptors` reported that its escaped descendant did not complete the file-polling readiness handshake. This attempt remains retained as the regression reproducer; it was not retried on the same revision."
+    },
+    "dual_run": "The retained clean-main red run used the former fixture-only target. The retained committed-SHA green run used the fixture plus owner target under the same EXT profile, pinned detector, and thresholds. The retained failed exact-SHA run exposed a file-polling fixture race under changed-code instrumentation. A final exact-SHA EXT run is required after the bounded readiness-protocol revision is committed."
   },
   "approvals_required": [
     "Architecture",

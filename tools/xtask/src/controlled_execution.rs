@@ -1840,6 +1840,26 @@ done
     }
 
     #[test]
+    fn escaped_descriptor_readiness_requires_a_single_owned_protocol_signal() -> TestResult {
+        let protocol = EscapedDescriptorProtocol::create()?;
+        let result = (|| {
+            let sender = std::os::unix::net::UnixDatagram::unbound()?;
+            let sent = sender.send_to(b"ready", protocol.readiness_socket_path())?;
+            if sent != b"ready".len() {
+                return Err(io::Error::other(format!(
+                    "escaped-descriptor readiness signal sent {sent} bytes instead of {}",
+                    b"ready".len()
+                ))
+                .into());
+            }
+            protocol.wait_until_ready(Duration::from_secs(1))
+        })();
+        let cleanup = protocol.remove();
+        cleanup?;
+        result
+    }
+
+    #[test]
     fn returns_a_bounded_cancellation_failure_when_an_escaped_descendant_retains_descriptors_and_unread_input()
     -> TestResult {
         let protocol = EscapedDescriptorProtocol::create()?;
@@ -2101,18 +2121,25 @@ done
                 OsString::from(
                     r#"
 import os
+import socket
 import sys
 import time
 
+synchronization_read, synchronization_write = os.pipe()
 with open(sys.argv[4], "w", encoding="utf-8") as direct_identity:
     direct_identity.write(str(os.getpid()))
 child = os.fork()
 if child == 0:
+    os.close(synchronization_read)
     os.setsid()
     release = os.open(sys.argv[3], os.O_RDONLY | os.O_NONBLOCK)
     with open(sys.argv[2], "w", encoding="utf-8") as identity:
         identity.write(str(os.getpid()))
-    open(sys.argv[1], "wb").close()
+    readiness = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    readiness.sendto(b"ready", sys.argv[1])
+    readiness.close()
+    os.write(synchronization_write, b"1")
+    os.close(synchronization_write)
     while True:
         try:
             if os.read(release, 1):
@@ -2122,12 +2149,14 @@ if child == 0:
     os.close(release)
     os._exit(0)
 
-while not os.path.isfile(sys.argv[1]):
-    time.sleep(0.005)
+os.close(synchronization_write)
+if os.read(synchronization_read, 1) != b"1":
+    os._exit(1)
+os.close(synchronization_read)
 os._exit(0)
 "#,
                 ),
-                protocol.ready.as_os_str().to_owned(),
+                protocol.readiness_socket_path().as_os_str().to_owned(),
                 protocol.pid.as_os_str().to_owned(),
                 protocol.release.as_os_str().to_owned(),
                 protocol.direct_pid.as_os_str().to_owned(),
@@ -2345,7 +2374,8 @@ os._exit(0)
 
     struct EscapedDescriptorProtocol {
         directory: PathBuf,
-        ready: PathBuf,
+        readiness_socket: std::os::unix::net::UnixDatagram,
+        readiness_socket_path: PathBuf,
         release: PathBuf,
         pid: PathBuf,
         direct_pid: PathBuf,
@@ -2356,11 +2386,11 @@ os._exit(0)
         fn create() -> TestResult<Self> {
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let sequence = CANCELLATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let directory = std::env::temp_dir().join(format!(
-                "positron-controlled-escaped-descriptor-{}-{timestamp}-{sequence}",
-                std::process::id()
-            ));
+            let directory = std::env::temp_dir()
+                .join(format!("pce-{}-{timestamp}-{sequence}", std::process::id()));
             fs::create_dir_all(&directory)?;
+            let readiness_socket_path = directory.join("ready.sock");
+            let readiness_socket = std::os::unix::net::UnixDatagram::bind(&readiness_socket_path)?;
             let release = directory.join("release");
             let status = Command::new("/usr/bin/mkfifo").arg(&release).status()?;
             if !status.success() {
@@ -2370,7 +2400,8 @@ os._exit(0)
                 .into());
             }
             Ok(Self {
-                ready: directory.join("ready"),
+                readiness_socket,
+                readiness_socket_path,
                 pid: directory.join("descendant.pid"),
                 direct_pid: directory.join("direct.pid"),
                 directory,
@@ -2379,18 +2410,33 @@ os._exit(0)
             })
         }
 
+        fn readiness_socket_path(&self) -> &std::path::Path {
+            &self.readiness_socket_path
+        }
+
         fn wait_until_ready(&self, timeout: Duration) -> TestResult {
-            let deadline = Instant::now()
-                .checked_add(timeout)
-                .ok_or_else(|| io::Error::other("test readiness deadline cannot be represented"))?;
-            while !self.ready.is_file() {
-                if Instant::now() >= deadline {
+            self.readiness_socket.set_read_timeout(Some(timeout))?;
+            let mut signal = [0_u8; b"ready".len()];
+            let received = match self.readiness_socket.recv(&mut signal) {
+                Ok(received) => received,
+                Err(source)
+                    if matches!(
+                        source.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
                     return Err(io::Error::other(
                         "escaped descendant did not complete its readiness handshake",
                     )
                     .into());
-                }
-                thread::yield_now();
+                },
+                Err(source) => return Err(source.into()),
+            };
+            if received != signal.len() || signal != *b"ready" {
+                return Err(io::Error::other(
+                    "escaped descendant published an invalid readiness handshake",
+                )
+                .into());
             }
             Ok(())
         }
