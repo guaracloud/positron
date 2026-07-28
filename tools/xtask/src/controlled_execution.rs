@@ -2386,7 +2386,7 @@ os._exit(0)
         fn create() -> TestResult<Self> {
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let sequence = CANCELLATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let directory = std::env::temp_dir()
+            let directory = PathBuf::from("/tmp")
                 .join(format!("pce-{}-{timestamp}-{sequence}", std::process::id()));
             fs::create_dir_all(&directory)?;
             let readiness_socket_path = directory.join("ready.sock");
