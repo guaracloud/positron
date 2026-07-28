@@ -34,7 +34,7 @@
   "detection_gained": [
     "scheduled coverage now measures the controlled-execution owner verdicts for exact stdout and stderr capture, launch and nonzero outcomes, deadline and cancellation cleanup, descriptor closure, descendant reconciliation, process-group reaping, and bounded capture failures",
     "black-box policy fixtures reject removal of either owner-test target and reject drift of every frozen M0-01 coverage threshold",
-    "the escaped-descriptor deadline verdict fixture uses one bounded owned datagram acknowledgement: the escaped descendant signals only after it owns the retained descriptors, and the direct child exits only after that acknowledgement",
+    "the escaped-descriptor fixture uses only an internal inherited-pipe handoff: the escaped descendant opens the retained descriptors before releasing the direct child to exit, while tests establish correctness solely from bounded typed execute outcomes",
     "the same coverage campaign retains workflow-level fast, PR, EXT, not-selected, missing-tool, and immutable-evidence verdict coverage"
   ],
   "detection_lost": [
@@ -42,7 +42,7 @@
   ],
   "migration": {
     "from": "coverage reports counted 3,813 covered lines out of 5,578 on clean current main because they omitted the registered owner verdict suite",
-    "to": "coverage reports run the fixture and owner targets together under the same pinned cargo-llvm-cov invocation and preserve separate total and changed-code reports; the escaped-descriptor regression fixture uses a bounded Unix-datagram readiness acknowledgement instead of two-sided file polling",
+    "to": "coverage reports run the fixture and owner targets together under the same pinned cargo-llvm-cov invocation and preserve separate total and changed-code reports; the escaped-descriptor regression fixture has no test-visible readiness side channel and returns bounded typed execute outcomes while its child processes coordinate descriptor ownership through an internal inherited pipe",
     "policy_guard": "the policy gate requires the owner target in both coverage invocations and exact retained threshold values"
   },
   "evidence": {
@@ -102,6 +102,11 @@
       "workflow_run": "30385362200",
       "status": "stale after the final public-verdict test remediation; no result or qualification claim is made"
     },
+    "superseded_focused_coverage_ext_dispatch": {
+      "revision": "deb4cb42e99b61b27b7fc44a28eb9ad66896a817",
+      "workflow_run": "30386500710",
+      "status": "stale after final merge-review remediation removed the escaped readiness side channel; no result or qualification claim is made"
+    },
     "ticket_scoped_coverage": {
       "revision": "6182148a10b1fcde4d4e1b67ccf07d268798a518",
       "command": "cargo +nightly-2026-07-20 llvm-cov --locked --package xtask --bin xtask --test foundational_scope_activation --branch --json --output-path target/quality/coverage/m0-01b-focused-6182148.json",
@@ -120,7 +125,37 @@
       "readiness_verdicts": "The same command passed all 20 controlled-execution owner tests, including the bounded escaped-descriptor deadline verdict and the two public execute-verdict tests for escaped descriptors with unread input; the foundational policy target passed all 56 fixtures.",
       "attribution": "This is focused coverage of the behavior introduced by issue 156, not the legacy repository-wide changed-code aggregate. It changes no frozen threshold, stage, exclusion, or gate and makes no merge-eligible or qualification claim."
     },
-    "dual_run": "The retained dirty M0-02 attempt, clean-main M0-01B red run, committed-SHA diagnostic green run, failed exact-SHA fixture regression, and focused issue 156 coverage run are separate attempts with separate attribution. Prior exact-head CI EXT dispatches are superseded by review remediation and cannot qualify the new revision. A final exact-SHA EXT run is required on the review-remediated revision."
+    "dual_run": {
+      "revision": "a6a9c4882a93a575a4fe5620d848c3a20f07d32c",
+      "environment": "CARGO_INCREMENTAL=0 LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC",
+      "result": "passed-local-diagnostic",
+      "old_selector": {
+        "command": "env CARGO_INCREMENTAL=0 LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC cargo +nightly-2026-07-20 llvm-cov --locked --package xtask --test foundational_scope_activation --branch --json --summary-only --output-path target/quality/coverage/m0-01b-dual-old-a6a9c48.json",
+        "report": "target/quality/coverage/m0-01b-dual-old-a6a9c48.json",
+        "report_sha256": "ae514835007d9360c4f733b329f3abdefac2b79fe0a81bc9dc17ccc8d40130ea",
+        "tests": "56 foundational policy fixtures passed",
+        "lines": "3898/5632 = 69.21164772727273 percent",
+        "regions": "5209/7476 = 69.67629748528626 percent",
+        "branches": "554/942 = 58.81104033970276 percent",
+        "functions": "258/406 = 63.54679802955665 percent"
+      },
+      "new_selector": {
+        "command": "env CARGO_INCREMENTAL=0 LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC cargo +nightly-2026-07-20 llvm-cov --locked --package xtask --test foundational_scope_activation --bin xtask --branch --json --summary-only --output-path target/quality/coverage/m0-01b-dual-new-a6a9c48.json",
+        "report": "target/quality/coverage/m0-01b-dual-new-a6a9c48.json",
+        "report_sha256": "a9de3cdbcc39092e22ec1c95239170a952ae30d9a3adfb90e90724fc10ae1b4c",
+        "tests": "the same 56 foundational policy fixtures and all 20 controlled-execution owner tests passed",
+        "lines": "4622/6450 = 71.65891472868216 percent",
+        "regions": "6249/8526 = 73.29345531315975 percent",
+        "branches": "627/1010 = 62.07920792079208 percent",
+        "functions": "325/474 = 68.56540084388185 percent"
+      },
+      "detection_gained": [
+        "724 additional covered lines, 1040 additional covered regions, 73 additional covered branch outcomes, and 67 additional covered functions were observed on the same immutable source revision",
+        "the new selector executed the owned controlled-execution verdict suite for capture, launch, nonzero, deadline, cancellation, descriptor closure, descendant reconciliation, process-group reaping, and bounded capture failure behavior"
+      ],
+      "detection_lost": "none; the new selector retained and passed the same foundational policy fixture target and added the owner target",
+      "attribution": "The two raw reports compare only old and new target selection on one committed code SHA with the same pinned toolchain, options, and environment. They are local diagnostic evidence, change no gate, threshold, stage, or exclusion, and make no merge-eligible or qualification claim. Prior attempts remain separately attributed, and a final exact-head CI EXT run is still required."
+    }
   },
   "approvals_required": [
     "Architecture",
