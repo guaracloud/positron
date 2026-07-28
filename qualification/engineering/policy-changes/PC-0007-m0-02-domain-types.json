@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "PC-0007-m0-02-domain-types",
-  "status": "proposed-for-independent-review",
+  "status": "accepted",
   "authority": [
     "CONTRIBUTING.md",
     "docs/engineering/standards.md",
@@ -421,7 +421,7 @@
     "Quality Engineering",
     "Rust and Toolchain"
   ],
-  "approval_status": "pending-independent-review",
-  "approved_by": [],
+  "approval_status": "approved-after-completed-independent-terra-high-code-review",
+  "approved_by": "@vicotrbb (repository owner; Architecture, Quality Engineering, and Rust and Toolchain) - explicitly stated in-session `I approve PC-0007 for Architecture, Quality Engineering, and Rust/Toolchain.`; recorded 2026-07-28T19:53:28-03:00",
   "immutable_after_acceptance": true
 }
