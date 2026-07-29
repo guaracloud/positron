@@ -786,7 +786,9 @@ fn quality_rejects_an_unregistered_spawn_in_a_resource_only_profile_through_the_
             "risk_gates",
             "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
         )?;
-        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let source = fixture
+            .root
+            .join("tools/xtask/src/registered_task_lifecycle.rs");
         let mut content = fs::read_to_string(&source)?;
         content.push_str(
             "\n#[allow(dead_code)]\nfn resource_only_unregistered_spawn_regression() { let _worker = thread::Builder::new().spawn(|| {}); }\n",
