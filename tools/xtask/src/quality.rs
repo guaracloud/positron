@@ -2514,9 +2514,13 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
         }
         let evidence = fs::read_to_string(&path)
             .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-        let mut object = parse_object(&path, &evidence, "retained engineering evidence")?;
-        let schema_version = require_any_integer(&mut object, "schema_version", &path)?;
-        let recorded_attempt = require_string(&mut object, "attempt_id", &path)?;
+        let (schema_version, recorded_attempt) = parse_retained_evidence_header(&path, &evidence)
+            .map_err(|error| {
+            XtaskError::invalid_path(
+                &path,
+                format!("retained engineering evidence is invalid: {error}"),
+            )
+        })?;
         match schema_version {
             1 | 2 => {},
             3 => {
@@ -2560,6 +2564,16 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
         ));
     }
     Ok(())
+}
+
+fn parse_retained_evidence_header(
+    path: &Path,
+    evidence: &str,
+) -> Result<(u128, String), XtaskError> {
+    let mut object = parse_object(path, evidence, "retained engineering evidence")?;
+    let schema_version = require_any_integer(&mut object, "schema_version", path)?;
+    let attempt_id = require_string(&mut object, "attempt_id", path)?;
+    Ok((schema_version, attempt_id))
 }
 
 fn validate_retained_v3_reports(
