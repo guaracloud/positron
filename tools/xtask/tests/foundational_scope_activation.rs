@@ -1527,6 +1527,29 @@ fn quality_preserves_recovery_when_primary_reservation_collides_afterward() -> T
 }
 
 #[test]
+fn quality_does_not_acknowledge_primary_when_evidence_directory_parent_sync_fails() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject_evidence_directory_parent_sync_failure(&fixture.root)?;
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "injected evidence directory durability failure")?;
+
+        let evidence_directory = fixture.root.join("target/quality/evidence");
+        if evidence_directory.exists() {
+            return Err(std::io::Error::other(
+                "evidence parent-sync failure left an acknowledged evidence directory",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_retains_recovery_when_a_staged_report_file_sync_fails() -> TestResult {
     assert_report_durability_failure(inject_staged_report_file_sync_failure)
 }
@@ -1539,6 +1562,16 @@ fn quality_retains_recovery_when_the_staging_directory_sync_fails() -> TestResul
 #[test]
 fn quality_retains_recovery_when_the_final_report_parent_sync_fails() -> TestResult {
     assert_report_durability_failure(inject_final_report_parent_sync_failure)
+}
+
+#[test]
+fn quality_retains_recovery_when_the_report_parent_chain_sync_fails() -> TestResult {
+    assert_report_durability_failure(inject_report_parent_chain_sync_failure)
+}
+
+#[test]
+fn quality_retains_recovery_when_the_staging_child_parent_sync_fails() -> TestResult {
+    assert_report_durability_failure(inject_staging_child_parent_sync_failure)
 }
 
 fn assert_report_durability_failure(inject: impl FnOnce(&Path) -> TestResult) -> TestResult {
@@ -3473,6 +3506,30 @@ fn inject_final_report_parent_sync_failure(root: &Path) -> TestResult {
         &root.join("tools/xtask/src/quality.rs"),
         "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n",
         "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n    if path.file_name().and_then(OsStr::to_str) == Some(\"evidence-reports\") {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"final report parent sync failed\",\n        ));\n    }\n",
+    )
+}
+
+fn inject_evidence_directory_parent_sync_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "    sync_directory(child)?;\n    sync_directory(parent)\n",
+        "    sync_directory(child)?;\n    if child.file_name().and_then(OsStr::to_str) == Some(\"evidence\") {\n        return Err(XtaskError::invalid(\n            \"injected evidence directory durability failure\",\n            \"evidence directory parent sync failed\",\n        ));\n    }\n    sync_directory(parent)\n",
+    )
+}
+
+fn inject_report_parent_chain_sync_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "    sync_directory(child)?;\n    sync_directory(parent)\n",
+        "    sync_directory(child)?;\n    if child.file_name().and_then(OsStr::to_str) == Some(\"evidence-reports\") {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"report parent chain sync failed\",\n        ));\n    }\n    sync_directory(parent)\n",
+    )
+}
+
+fn inject_staging_child_parent_sync_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "    sync_directory(child)?;\n    sync_directory(parent)\n",
+        "    sync_directory(child)?;\n    if parent.file_name().and_then(OsStr::to_str)\n        == Some(\"evidence-report-staging\")\n    {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"staging child parent sync failed\",\n        ));\n    }\n    sync_directory(parent)\n",
     )
 }
 

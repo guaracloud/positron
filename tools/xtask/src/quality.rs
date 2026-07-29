@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -5817,9 +5817,12 @@ fn unix_time_ms() -> Result<u128, XtaskError> {
 
 fn write_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, XtaskError> {
     let directory = root.join("target/quality/evidence");
-    fs::create_dir_all(&directory)
-        .map_err(|source| XtaskError::io(format!("create {}", directory.display()), source))?;
-    let reservation = AttemptReservation::reserve(root, &directory, evidence)?;
+    let owned_directories =
+        OwnedDirectoryChain::create(root, &directory, OwnedLeaf::ExistingAllowed)?;
+    let reservation = match AttemptReservation::reserve(root, &directory, evidence) {
+        Ok(reservation) => reservation,
+        Err(error) => return Err(owned_directories.reconcile_failure(error)),
+    };
     let collided = reservation.collided;
     let retained = reservation.commit(root)?;
     if collided {
@@ -5835,6 +5838,8 @@ struct AttemptReservation {
     recovery_bytes: String,
     report_staging_path: PathBuf,
     report_final_path: PathBuf,
+    report_staging_directories: OwnedDirectoryChain,
+    report_final_directories: OwnedDirectoryChain,
     reports_published: bool,
     evidence: Evidence,
     collided: bool,
@@ -5946,31 +5951,37 @@ impl AttemptReservation {
             report_final_path: root
                 .join("target/quality/evidence-reports")
                 .join(&evidence.attempt_id),
+            report_staging_directories: OwnedDirectoryChain::default(),
+            report_final_directories: OwnedDirectoryChain::default(),
             reports_published: false,
             evidence,
             collided,
         })
     }
 
-    fn commit(mut self, _root: &Path) -> Result<PathBuf, XtaskError> {
+    fn commit(mut self, root: &Path) -> Result<PathBuf, XtaskError> {
         let serialized = evidence_json(&self.evidence);
         validate_serialized_evidence(&self.evidence, &serialized)?;
-        let publication = self.publish_primary(&serialized);
+        let publication = self.publish_primary(root, &serialized);
         if let Err(error) = publication {
             return Err(self.reconcile_failed_publication(error));
         }
         Ok(self.path)
     }
 
-    fn publish_primary(&mut self, serialized: &str) -> Result<(), XtaskError> {
+    fn publish_primary(&mut self, root: &Path, serialized: &str) -> Result<(), XtaskError> {
+        let final_parent = self.report_final_path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&self.report_final_path, "report path has no parent")
+        })?;
+        self.report_final_directories =
+            OwnedDirectoryChain::create(root, final_parent, OwnedLeaf::ExistingAllowed)?;
+        self.report_staging_directories =
+            OwnedDirectoryChain::create(root, &self.report_staging_path, OwnedLeaf::MustCreate)?;
         stage_raw_reports(&self.report_staging_path, &self.evidence)?;
         sync_directory(&self.report_staging_path)?;
         publish_staged_reports(&self.report_staging_path, &self.report_final_path)?;
         self.reports_published = true;
         sync_directory(&self.report_final_path)?;
-        let final_parent = self.report_final_path.parent().ok_or_else(|| {
-            XtaskError::invalid_path(&self.report_final_path, "report path has no parent")
-        })?;
         sync_directory(final_parent)?;
         self.file
             .write_all(serialized.as_bytes())
@@ -6011,6 +6022,8 @@ impl AttemptReservation {
             cleanup_report_staging(&self.report_staging_path),
             final_cleanup,
             cleanup_primary_evidence(&self.path),
+            self.report_staging_directories.cleanup_empty(),
+            self.report_final_directories.cleanup_empty(),
         ] {
             if let Err(cleanup_error) = cleanup {
                 cleanup_errors.push(cleanup_error.to_string());
@@ -6047,6 +6060,118 @@ fn sync_directory(path: &Path) -> Result<(), XtaskError> {
     directory
         .sync_all()
         .map_err(|source| XtaskError::io(format!("sync directory {}", path.display()), source))
+}
+
+#[derive(Default)]
+struct OwnedDirectoryChain {
+    created: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum OwnedLeaf {
+    ExistingAllowed,
+    MustCreate,
+}
+
+impl OwnedDirectoryChain {
+    fn create(root: &Path, target: &Path, leaf: OwnedLeaf) -> Result<Self, XtaskError> {
+        let relative = target.strip_prefix(root).map_err(|source| {
+            XtaskError::invalid_path(
+                target,
+                format!("owned directory target is outside its evidence root: {source}"),
+            )
+        })?;
+        let mut chain = Self::default();
+        let mut current = root.to_path_buf();
+        let component_count = relative.components().count();
+        if component_count == 0 {
+            return Err(XtaskError::invalid_path(
+                target,
+                "owned directory target must be below its evidence root",
+            ));
+        }
+
+        for (index, component) in relative.components().enumerate() {
+            let Component::Normal(name) = component else {
+                return Err(chain.reconcile_failure(XtaskError::invalid_path(
+                    target,
+                    "owned directory target contains a non-normal path component",
+                )));
+            };
+            let parent = current.clone();
+            current.push(name);
+            let is_leaf = index + 1 == component_count;
+            match fs::create_dir(&current) {
+                Ok(()) => {
+                    chain.created.push(current.clone());
+                    if let Err(error) = sync_owned_directory_entry(&parent, &current) {
+                        return Err(chain.reconcile_failure(error));
+                    }
+                },
+                Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+                    if is_leaf && matches!(leaf, OwnedLeaf::MustCreate) {
+                        return Err(chain.reconcile_failure(XtaskError::invalid_path(
+                            &current,
+                            "owned evidence directory is already occupied",
+                        )));
+                    }
+                    if !current.is_dir() {
+                        return Err(chain.reconcile_failure(XtaskError::invalid_path(
+                            &current,
+                            "owned evidence directory component is not a directory",
+                        )));
+                    }
+                },
+                Err(source) => {
+                    return Err(chain.reconcile_failure(XtaskError::io(
+                        format!("create owned evidence directory {}", current.display()),
+                        source,
+                    )));
+                },
+            }
+        }
+        Ok(chain)
+    }
+
+    fn reconcile_failure(self, error: XtaskError) -> XtaskError {
+        match self.cleanup_empty() {
+            Ok(()) => error,
+            Err(cleanup) => XtaskError::invalid(
+                "owned evidence directory reconciliation",
+                format!("{error}; cleanup also failed: {cleanup}"),
+            ),
+        }
+    }
+
+    fn cleanup_empty(&self) -> Result<(), XtaskError> {
+        for directory in self.created.iter().rev() {
+            match fs::remove_dir(directory) {
+                Ok(()) => {
+                    let parent = directory.parent().ok_or_else(|| {
+                        XtaskError::invalid_path(
+                            directory,
+                            "owned evidence directory has no parent",
+                        )
+                    })?;
+                    sync_directory(parent)?;
+                },
+                Err(source) if source.kind() == ErrorKind::NotFound => {},
+                Err(source) if source.kind() == ErrorKind::DirectoryNotEmpty => break,
+                Err(source) => {
+                    return Err(XtaskError::io(
+                        format!("remove owned evidence directory {}", directory.display()),
+                        source,
+                    ));
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sync_owned_directory_entry(parent: &Path, child: &Path) -> Result<(), XtaskError> {
+    sync_directory(child)?;
+    sync_directory(parent)
 }
 
 fn reserve_new_file(path: &Path) -> Result<fs::File, std::io::Error> {
@@ -6120,17 +6245,6 @@ fn collision_error(evidence: &Evidence, retained: &Path) -> XtaskError {
 }
 
 fn stage_raw_reports(staging_path: &Path, evidence: &Evidence) -> Result<(), XtaskError> {
-    let staging_parent = staging_path.parent().ok_or_else(|| {
-        XtaskError::invalid_path(staging_path, "report staging path has no parent")
-    })?;
-    fs::create_dir_all(staging_parent)
-        .map_err(|source| XtaskError::io(format!("create {}", staging_parent.display()), source))?;
-    fs::create_dir(staging_path).map_err(|source| {
-        XtaskError::io(
-            format!("create new report staging {}", staging_path.display()),
-            source,
-        )
-    })?;
     for gate in &evidence.gates {
         let RawReportBinding::Exact { .. } = &gate.raw_report else {
             continue;
@@ -6176,11 +6290,6 @@ fn stage_raw_reports(staging_path: &Path, evidence: &Evidence) -> Result<(), Xta
 }
 
 fn publish_staged_reports(staging_path: &Path, final_path: &Path) -> Result<(), XtaskError> {
-    let final_parent = final_path
-        .parent()
-        .ok_or_else(|| XtaskError::invalid_path(final_path, "report path has no parent"))?;
-    fs::create_dir_all(final_parent)
-        .map_err(|source| XtaskError::io(format!("create {}", final_parent.display()), source))?;
     if final_path.exists() {
         return Err(XtaskError::invalid_path(
             final_path,
