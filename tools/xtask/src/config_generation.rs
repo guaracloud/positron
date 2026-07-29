@@ -7,9 +7,9 @@ use std::path::Path;
 
 use crate::error::XtaskError;
 
-const SOURCE: &str = "crates/positron-config/src/contract.rs";
-const JSON_SCHEMA: &str = "configuration/schema.json";
-const REFERENCE: &str = "configuration/reference.md";
+const SOURCE: &str = crate::generation::CONFIGURATION_INPUT;
+const JSON_SCHEMA: &str = crate::generation::CONFIGURATION_SCHEMA;
+const REFERENCE: &str = crate::generation::CONFIGURATION_REFERENCE;
 const DECLARATION_START: &str =
     "pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 7] = define_settings! {";
 const DECLARATION_END: &str = "};";

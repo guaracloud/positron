@@ -7,11 +7,11 @@ use sha2::{Digest, Sha256};
 
 use crate::error::XtaskError;
 
-const SOURCE: &str = "api/positron/v1/positron.proto";
-const GENERATED_RUST: &str = "crates/positron-api/src/generated.rs";
-const SCHEMA_DIGEST: &str = "api/positron/v1/schema.sha256";
-const OPENAPI: &str = "api/positron/v1/openapi.json";
-const HTTP_MAPPING: &str = "api/positron/v1/http.json";
+const SOURCE: &str = crate::generation::API_INPUT;
+const GENERATED_RUST: &str = crate::generation::API_RUST;
+const SCHEMA_DIGEST: &str = crate::generation::API_SCHEMA_DIGEST;
+const OPENAPI: &str = crate::generation::API_OPENAPI;
+const HTTP_MAPPING: &str = crate::generation::API_HTTP_MAPPING;
 const MAX_SOURCE_BYTES: usize = 65_536;
 const MAX_DECLARATIONS: usize = 128;
 

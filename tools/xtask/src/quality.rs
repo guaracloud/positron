@@ -664,40 +664,7 @@ fn execute_gate(
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
-    const ARTIFACTS: [&str; 6] = [
-        "api/positron/v1/http.json",
-        "api/positron/v1/openapi.json",
-        "api/positron/v1/schema.sha256",
-        "configuration/reference.md",
-        "configuration/schema.json",
-        "crates/positron-api/src/generated.rs",
-    ];
-    let before = ARTIFACTS
-        .iter()
-        .map(|relative| {
-            let path = root.join(relative);
-            let contents = fs::read(&path).map_err(|source| {
-                XtaskError::io(
-                    format!("read canonical API artifact {}", path.display()),
-                    source,
-                )
-            })?;
-            Ok((path, contents))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    crate::api_generation::generate(root)?;
-    crate::config_generation::generate(root)?;
-    for (path, contents) in before {
-        let regenerated = fs::read(&path).map_err(|source| {
-            XtaskError::io(format!("read regenerated {}", path.display()), source)
-        })?;
-        if regenerated != contents {
-            return Err(XtaskError::invalid_path(
-                &path,
-                "canonical generation is not clean and deterministic",
-            ));
-        }
-    }
+    crate::generation::verify(root)?;
     Ok("canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, and Schema Digest".to_owned())
 }
 

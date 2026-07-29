@@ -10,6 +10,7 @@ mod api_generation;
 mod config_generation;
 mod controlled_execution;
 mod error;
+mod generation;
 mod hooks;
 mod quality;
 mod registry;
@@ -37,6 +38,18 @@ fn run() -> Result<(), XtaskError> {
     };
 
     match command.as_str() {
+        "generate" => {
+            ensure_no_more_arguments(arguments)?;
+            let root = env::current_dir()
+                .map_err(|source| XtaskError::io("resolve current directory", source))?;
+            generation::generate(&root)
+        },
+        "verify-generation" => {
+            ensure_no_more_arguments(arguments)?;
+            let root = env::current_dir()
+                .map_err(|source| XtaskError::io("resolve current directory", source))?;
+            generation::verify(&root)
+        },
         "generate-api" => {
             ensure_no_more_arguments(arguments)?;
             let root = env::current_dir()
@@ -82,7 +95,7 @@ fn ensure_no_more_arguments(mut arguments: impl Iterator<Item = String>) -> Resu
 
 fn usage() -> String {
     format!(
-        "Usage:\n  cargo xtask generate-api\n  cargo xtask generate-config\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation|--retain-m0-03-mutation|--retain-m0-04-mutation]\n  cargo xtask setup\n  cargo xtask help",
+        "Usage:\n  cargo xtask generate\n  cargo xtask verify-generation\n  cargo xtask generate-api\n  cargo xtask generate-config\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation|--retain-m0-03-mutation|--retain-m0-04-mutation]\n  cargo xtask setup\n  cargo xtask help",
         Profile::accepted_values()
     )
 }

@@ -14,6 +14,38 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn combined_generation_emits_every_public_api_and_configuration_artifact_twice() -> TestResult {
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    fixture.copy_configuration_source()?;
+    let result = (|| {
+        fixture.assert_combined_success()?;
+        let first = fixture.all_generated_artifacts()?;
+        fixture.assert_combined_success()?;
+        let second = fixture.all_generated_artifacts()?;
+        assert_eq!(first, second);
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn generation_verification_rejects_a_hand_edited_checked_artifact() -> TestResult {
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    fixture.copy_configuration_source()?;
+    let result = (|| {
+        fixture.assert_combined_success()?;
+        fs::write(
+            fixture.root.join("api/positron/v1/openapi.json"),
+            b"hand edit\n",
+        )?;
+        fixture.assert_verification_failure_containing("not clean and deterministic")
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
 fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> TestResult {
     let source = canonical_source()?
         .replace("rpc Negotiate(", "rpc Inspect(")
@@ -244,6 +276,41 @@ impl GeneratorFixture {
         .into())
     }
 
+    fn assert_combined_success(&self) -> TestResult {
+        let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .current_dir(&self.root)
+            .arg("generate")
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "combined generator failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into())
+    }
+
+    fn assert_verification_failure_containing(&self, expected: &str) -> TestResult {
+        let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .current_dir(&self.root)
+            .arg("verify-generation")
+            .output()?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() && combined.contains(expected) {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "generation verification did not fail with `{expected}`: {combined}"
+        ))
+        .into())
+    }
+
     fn assert_failure_containing(&self, expected: &str) -> TestResult {
         let output = self.run()?;
         let combined = format!(
@@ -270,6 +337,33 @@ impl GeneratorFixture {
         .iter()
         .map(|path| Ok(fs::read(self.root.join(path))?))
         .collect()
+    }
+
+    fn all_generated_artifacts(&self) -> TestResult<Vec<Vec<u8>>> {
+        [
+            "crates/positron-api/src/generated.rs",
+            "api/positron/v1/schema.sha256",
+            "api/positron/v1/openapi.json",
+            "api/positron/v1/http.json",
+            "configuration/schema.json",
+            "configuration/reference.md",
+        ]
+        .iter()
+        .map(|path| Ok(fs::read(self.root.join(path))?))
+        .collect()
+    }
+
+    fn copy_configuration_source(&self) -> TestResult {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = manifest.join("../../crates/positron-config/src/contract.rs");
+        let destination = self.root.join("crates/positron-config/src/contract.rs");
+        let parent = destination.parent().ok_or_else(|| {
+            std::io::Error::other("configuration contract destination has no parent")
+        })?;
+        fs::create_dir_all(parent)?;
+        fs::create_dir_all(self.root.join("configuration"))?;
+        fs::copy(source, destination)?;
+        Ok(())
     }
 
     fn read(&self, path: &str) -> TestResult<String> {
