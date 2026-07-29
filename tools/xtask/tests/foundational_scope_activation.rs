@@ -464,6 +464,342 @@ fn quality_runs_correctness_through_the_registered_public_seam() -> TestResult {
     result
 }
 
+#[cfg(unix)]
+#[test]
+fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let quality_registry_path = fixture
+            .root
+            .join("qualification/engineering/quality-fixtures.tsv");
+        let integrity_registry_path = fixture
+            .root
+            .join("qualification/engineering/integrity-fixtures.tsv");
+        let captured_quality_registry = fs::read(&quality_registry_path)?;
+        let captured_integrity_registry = fs::read(&integrity_registry_path)?;
+        let mut seed_hasher = Sha256::new();
+        seed_hasher.update(b"positron-quality-fixture-seeds-v1\0");
+        seed_hasher.update(&captured_quality_registry);
+        seed_hasher.update(b"\0");
+        seed_hasher.update(&captured_integrity_registry);
+        let expected_seed = format!("sha256:{:x}", seed_hasher.finalize());
+
+        inject_fixture_registry_capture_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let ready = fixture
+            .root
+            .join("target/quality-tools/fixture-registry-capture-ready");
+        wait_for_path(&ready, Duration::from_secs(30))?;
+        fs::write(&quality_registry_path, b"mutated-after-capture\n")?;
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/fixture-registry-capture-release"),
+            b"release\n",
+        )?;
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "quality reread fixture registry bytes after capture: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let exact_seed =
+            format!("\"seed\": {{\"applicability\": \"exact\", \"value\": \"{expected_seed}\"");
+        if !evidence.contains(&exact_seed) {
+            return Err(std::io::Error::other(format!(
+                "evidence seed was not derived from the exact frozen registry bytes: expected `{exact_seed}` in {evidence}"
+            ))
+            .into());
+        }
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-CORRECT",
+        )?)?;
+        if !report.contains("correctness-before-publication:crash-after-candidate-sync:state-v1") {
+            return Err(std::io::Error::other(
+                "correctness did not execute the typed case parsed from frozen registry bytes",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_proves_forced_writer_termination_and_fresh_process_recovery() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "registered process recovery runner failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-CORRECT",
+        )?)?;
+        for expected in [
+            "process-interface=qualification/engineering/fixture-harness.tsv",
+            "ack=publication-point-ready-v1",
+            "writer=forcibly-terminated-and-reaped",
+            "recovery=fresh-process",
+            "recovery-digest=sha256:",
+        ] {
+            if !report.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "process recovery report omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+        for outcome in report.split(',') {
+            let Some((_, identities)) = outcome.split_once("writer-pid=") else {
+                continue;
+            };
+            let Some((writer_pid, recovery)) = identities.split_once(":recovery-pid=") else {
+                return Err(
+                    std::io::Error::other("writer identity omitted recovery identity").into(),
+                );
+            };
+            let recovery_pid = recovery
+                .split(':')
+                .next()
+                .ok_or_else(|| std::io::Error::other("recovery identity was empty"))?;
+            if writer_pid == recovery_pid {
+                return Err(std::io::Error::other(
+                    "recovery reused the forcibly terminated writer process",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_fixture_root_symlink_race_without_touching_the_target() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_fixture_root_claim_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let ready = fixture
+            .root
+            .join("target/quality-tools/fixture-root-claim-ready");
+        wait_for_path(&ready, Duration::from_secs(30))?;
+        let temporary_root = PathBuf::from(fs::read_to_string(&ready)?.trim());
+        let external = fixture
+            .root
+            .join("target/quality-tools/fixture-root-external");
+        fs::create_dir(&external)?;
+        let canary = external.join("canary");
+        fs::write(&canary, b"untouched\n")?;
+        std::os::unix::fs::symlink(
+            &external,
+            temporary_root.join("qualification-fixtures-correctness"),
+        )?;
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/fixture-root-claim-release"),
+            b"release\n",
+        )?;
+
+        let output = child.wait_with_output()?;
+        assert_rejected_output(
+            &output,
+            "owned fixture directory component is not a directory",
+        )?;
+        if fs::read(&canary)? != b"untouched\n" {
+            return Err(
+                std::io::Error::other("fixture symlink race changed the external canary").into(),
+            );
+        }
+        let mut external_entries = fs::read_dir(&external)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        external_entries.sort();
+        if external_entries != [std::ffi::OsString::from("canary")] {
+            return Err(std::io::Error::other(
+                "fixture symlink race created content outside the owned root",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_cleans_attempt_owned_fixture_trees_after_repeated_successes() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        for attempt in 1..=2 {
+            let output = fixture.quality_output_for("pr")?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "cleanup repeat attempt {attempt} failed: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ))
+                .into());
+            }
+            assert_no_fixture_trees(&fixture.root)?;
+            let evidence = fixture.latest_evidence()?;
+            let report = fs::read_to_string(exact_raw_report_path(
+                &fixture.root,
+                &evidence,
+                "EG-CORRECT",
+            )?)?;
+            if report.contains("qualification-fixtures-correctness") {
+                return Err(std::io::Error::other(
+                    "immutable evidence retained a mutable fixture-tree path",
+                )
+                .into());
+            }
+            if !report.contains("recovery-digest=sha256:") {
+                return Err(std::io::Error::other(
+                    "immutable evidence omitted the recovered-state digest",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_kills_reaps_and_cleans_a_timed_out_fixture_writer() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("qualification/engineering/fixture-harness.tsv"),
+            "\t5000\tforce-kill-and-reap\t",
+            "\t50\tforce-kill-and-reap\t",
+        )?;
+        inject_fixture_writer_timeout(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture
+            .quality_child_from_built_fixture_for("pr")?
+            .wait_with_output()?;
+        assert_rejected_output(
+            &output,
+            "writer did not acknowledge its publication point before the registered deadline",
+        )?;
+        assert_no_fixture_trees(&fixture.root)?;
+        let pid = fs::read_to_string(
+            fixture
+                .root
+                .join("target/quality-tools/fixture-writer-timeout-pid"),
+        )?;
+        let status = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            return Err(std::io::Error::other(
+                "timed-out fixture writer remained alive after gate reconciliation",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_fails_when_attempt_owned_fixture_cleanup_fails() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_fixture_cleanup_failure(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture
+            .quality_child_from_built_fixture_for("pr")?
+            .wait_with_output()?;
+        assert_rejected_output(&output, "injected qualification fixture cleanup failure")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-CORRECT")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "fixture cleanup failure was not retained as a failed gate",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 #[test]
 fn quality_rejects_a_malformed_correctness_fixture_registry() -> TestResult {
     let fixture = Fixture::create()?;
@@ -527,6 +863,7 @@ fn quality_rejects_a_correctness_fixture_with_a_false_reopen_oracle() -> TestRes
             )
             .into());
         }
+        assert_no_fixture_trees(&fixture.root)?;
         Ok(())
     })();
     let cleanup = fixture.remove();
@@ -599,8 +936,17 @@ fn quality_runs_fault_through_the_registered_public_seam() -> TestResult {
             "\"schema_version\": 1",
             "\"gate_id\": \"EG-FAULT\"",
             "\"verdict\": \"passed\"",
-            "fault-before-publication:crash-after-candidate-sync:state-v1",
-            "fault-after-publication:crash-after-publication-sync:state-v2",
+            "exact-fault-classes=partial-write+crash+restart+corruption+full-disk+clock+cancellation+network+provider",
+            "fault-partial-write:inject-partial-write:state-v1",
+            "fault-crash:inject-crash:state-v1",
+            "fault-restart:inject-restart:state-v2",
+            "fault-corruption:inject-corruption:state-v1",
+            "fault-full-disk:inject-full-disk:state-v1",
+            "fault-clock:inject-clock:state-v1",
+            "fault-cancellation:inject-cancellation:state-v1",
+            "fault-network:inject-network:state-v1",
+            "fault-provider:inject-provider:state-v1",
+            "one-to-one-publication-points=9",
         ] {
             if !report.contains(expected) {
                 return Err(std::io::Error::other(format!(
@@ -630,13 +976,13 @@ fn quality_rejects_a_fault_registry_without_one_schedule_per_publication_point()
             &fixture
                 .root
                 .join("qualification/engineering/quality-fixtures.tsv"),
-            "fault-after-publication\tEG-FAULT\tafter-publication\tcrash-after-publication-sync\tseed-fault-after-v1\tstate-v1\tstate-v2\tstate-v2\n",
+            "fault-provider\tEG-FAULT\tprovider-boundary\tinject-provider\tseed-fault-provider-v1\tstate-v1\tstate-v2\tstate-v1\n",
             "",
         )?;
         let output = fixture.quality_output_for("pr")?;
         assert_rejected_output(
             &output,
-            "invalid EG-FAULT fixture registry: expected exactly 2 publication-point fixtures, found 1",
+            "invalid EG-FAULT fixture registry: expected exactly 9 publication-point fixtures, found 8",
         )?;
         let evidence = fixture.latest_evidence()?;
         let record = gate_record(&evidence, "EG-FAULT")?;
@@ -3241,9 +3587,14 @@ impl Fixture {
 
     #[cfg(unix)]
     fn quality_child_from_built_fixture(&self) -> TestResult<Child> {
+        self.quality_child_from_built_fixture_for("pre-commit")
+    }
+
+    #[cfg(unix)]
+    fn quality_child_from_built_fixture_for(&self, profile: &str) -> TestResult<Child> {
         Command::new(self.root.join("target/debug/xtask"))
             .current_dir(&self.root)
-            .args(["quality", "--profile", "pre-commit"])
+            .args(["quality", "--profile", profile])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3571,6 +3922,34 @@ fn assert_rejected_output(output: &std::process::Output, expected_failure: &str)
             "quality failed for the wrong reason; expected `{expected_failure}`, got `{combined}`"
         ))
         .into());
+    }
+    Ok(())
+}
+
+fn assert_no_fixture_trees(root: &Path) -> TestResult {
+    let temporary_base = root.join("target/quality/tmp");
+    if !temporary_base.try_exists()? {
+        return Ok(());
+    }
+    for attempt in fs::read_dir(&temporary_base)? {
+        let attempt = attempt?;
+        if !attempt.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(attempt.path())? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("qualification-fixtures-")
+            {
+                return Err(std::io::Error::other(format!(
+                    "attempt-owned fixture tree remained at {}",
+                    entry.path().display()
+                ))
+                .into());
+            }
+        }
     }
     Ok(())
 }
@@ -4347,6 +4726,135 @@ fn pin_fixture_attempt_identity(root: &Path) -> TestResult {
         &root.join("tools/xtask/src/quality.rs"),
         "fn attempt_identity(revision: &str, started_unix_ms: u128) -> String {\n    let revision_prefix = revision.chars().take(12).collect::<String>();\n    format!(\"{started_unix_ms}-{revision_prefix}-{}\", std::process::id())\n}",
         "fn attempt_identity(_revision: &str, _started_unix_ms: u128) -> String {\n    \"1700000000000-111111111111-1\".to_owned()\n}",
+    )
+}
+
+#[cfg(unix)]
+fn inject_fixture_registry_capture_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/quality.rs");
+    replace_once(
+        &source,
+        "    println!(\n        \"Positron engineering quality: profile={}, revision={}, dirty={}\",\n",
+        "    fixture_registry_capture_barrier(&root)?;\n    println!(\n        \"Positron engineering quality: profile={}, revision={}, dirty={}\",\n",
+    )?;
+    replace_once(
+        &source,
+        "fn digest_relative_files(\n",
+        r#"fn fixture_registry_capture_barrier(root: &Path) -> Result<(), XtaskError> {
+    let tools = root.join("target/quality-tools");
+    let ready = tools.join("fixture-registry-capture-ready");
+    let release = tools.join("fixture-registry-capture-release");
+    fs::write(&ready, b"ready\n")
+        .map_err(|source| XtaskError::io("publish fixture registry capture barrier", source))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if release
+            .try_exists()
+            .map_err(|source| XtaskError::io("inspect fixture registry capture barrier", source))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(XtaskError::invalid(
+                "fixture registry capture barrier",
+                "registry mutator did not release the barrier",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn digest_relative_files(
+"#,
+    )
+}
+
+#[cfg(unix)]
+fn inject_fixture_root_claim_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    replace_once(
+        &source,
+        "    fn create(temporary_root: &Path, name: &str) -> Result<Self, XtaskError> {\n        validate_owned_directory(temporary_root, temporary_root, \"attempt temporary root\")?;\n",
+        "    fn create(temporary_root: &Path, name: &str) -> Result<Self, XtaskError> {\n        fixture_root_claim_barrier(temporary_root)?;\n        validate_owned_directory(temporary_root, temporary_root, \"attempt temporary root\")?;\n",
+    )?;
+    replace_once(
+        &source,
+        "impl OwnedFixtureRoot {\n",
+        r#"fn fixture_root_claim_barrier(temporary_root: &Path) -> Result<(), XtaskError> {
+    let workspace = temporary_root
+        .ancestors()
+        .nth(4)
+        .ok_or_else(|| XtaskError::invalid_path(temporary_root, "fixture TMPDIR has no workspace ancestor"))?;
+    let tools = workspace.join("target/quality-tools");
+    let ready = tools.join("fixture-root-claim-ready");
+    let release = tools.join("fixture-root-claim-release");
+    fs::write(&ready, temporary_root.as_os_str().as_encoded_bytes())
+        .map_err(|source| XtaskError::io("publish fixture root claim barrier", source))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if release
+            .try_exists()
+            .map_err(|source| XtaskError::io("inspect fixture root claim barrier", source))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(XtaskError::invalid(
+                "fixture root claim barrier",
+                "symlink racer did not release the barrier",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+impl OwnedFixtureRoot {
+"#,
+    )
+}
+
+#[cfg(unix)]
+fn inject_fixture_writer_timeout(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    replace_once(
+        &source,
+        "    validate_process_root(owned_root, case_root)?;\n    validate_field(case_root, 0, \"predecessor\", predecessor)?;\n",
+        "    validate_process_root(owned_root, case_root)?;\n    fixture_writer_timeout(case_root)?;\n    validate_field(case_root, 0, \"predecessor\", predecessor)?;\n",
+    )?;
+    replace_once(
+        &source,
+        "fn run_writer_process(\n",
+        r#"fn fixture_writer_timeout(case_root: &Path) -> Result<(), XtaskError> {
+    let workspace = case_root
+        .ancestors()
+        .nth(6)
+        .ok_or_else(|| XtaskError::invalid_path(case_root, "fixture case has no workspace ancestor"))?;
+    fs::write(
+        workspace.join("target/quality-tools/fixture-writer-timeout-pid"),
+        std::process::id().to_string(),
+    )
+    .map_err(|source| XtaskError::io("publish timed-out fixture writer PID", source))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(XtaskError::invalid(
+        "injected fixture writer timeout",
+        "writer safety deadline elapsed",
+    ))
+}
+
+fn run_writer_process(
+"#,
+    )
+}
+
+#[cfg(unix)]
+fn inject_fixture_cleanup_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/qualification_fixtures.rs"),
+        "    fn cleanup(&mut self) -> Result<(), XtaskError> {\n        if !self.active {\n",
+        "    fn cleanup(&mut self) -> Result<(), XtaskError> {\n        if self.active {\n            return Err(XtaskError::invalid(\n                \"injected qualification fixture cleanup failure\",\n                \"owned tree could not be reconciled\",\n            ));\n        }\n        if !self.active {\n",
     )
 }
 

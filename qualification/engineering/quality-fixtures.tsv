@@ -1,5 +1,12 @@
 fixture_id	gate_id	publication_point	fault_schedule	seed	predecessor	successor	expected_reopen
 correctness-before-publication	EG-CORRECT	before-publication	crash-after-candidate-sync	seed-correctness-before-v1	state-v1	state-v2	state-v1
 correctness-after-publication	EG-CORRECT	after-publication	crash-after-publication-sync	seed-correctness-after-v1	state-v1	state-v2	state-v2
-fault-before-publication	EG-FAULT	before-publication	crash-after-candidate-sync	seed-fault-before-v1	state-v1	state-v2	state-v1
-fault-after-publication	EG-FAULT	after-publication	crash-after-publication-sync	seed-fault-after-v1	state-v1	state-v2	state-v2
+fault-partial-write	EG-FAULT	partial-write-boundary	inject-partial-write	seed-fault-partial-write-v1	state-v1	state-v2	state-v1
+fault-crash	EG-FAULT	crash-boundary	inject-crash	seed-fault-crash-v1	state-v1	state-v2	state-v1
+fault-restart	EG-FAULT	restart-boundary	inject-restart	seed-fault-restart-v1	state-v1	state-v2	state-v2
+fault-corruption	EG-FAULT	corruption-boundary	inject-corruption	seed-fault-corruption-v1	state-v1	state-v2	state-v1
+fault-full-disk	EG-FAULT	full-disk-boundary	inject-full-disk	seed-fault-full-disk-v1	state-v1	state-v2	state-v1
+fault-clock	EG-FAULT	clock-boundary	inject-clock	seed-fault-clock-v1	state-v1	state-v2	state-v1
+fault-cancellation	EG-FAULT	cancellation-boundary	inject-cancellation	seed-fault-cancellation-v1	state-v1	state-v2	state-v1
+fault-network	EG-FAULT	network-boundary	inject-network	seed-fault-network-v1	state-v1	state-v2	state-v1
+fault-provider	EG-FAULT	provider-boundary	inject-provider	seed-fault-provider-v1	state-v1	state-v2	state-v1

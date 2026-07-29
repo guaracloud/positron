@@ -409,6 +409,7 @@ struct GateCapture {
 struct GateExecutionContext<'context> {
     root: &'context Path,
     registry: &'context Registry,
+    qualification_fixtures: &'context crate::qualification_fixtures::FrozenQualificationFixtures,
     options: &'context Options,
     environment: &'context EnvironmentSnapshot,
     source: &'context SourceIdentity,
@@ -681,6 +682,7 @@ fn engineering_evidence_identity(
     root: &Path,
     source: &SourceIdentity,
     environment: &EnvironmentSnapshot,
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
     qualification_fixture_selected: bool,
 ) -> Result<EvidenceIdentity, XtaskError> {
     let target_registry_digest =
@@ -693,17 +695,7 @@ fn engineering_evidence_identity(
             "rust-toolchain.toml",
         ],
     )?;
-    let fixture_registry_digest = digest_relative_files(
-        root,
-        environment,
-        &[
-            "qualification/fixtures/adversarial/manifest.json",
-            "qualification/engineering/quality-fixtures.tsv",
-            "qualification/engineering/integrity-fixtures.tsv",
-        ],
-    )?;
-    let (seed_digest, fault_schedule_digest) =
-        crate::qualification_fixtures::seed_and_schedule_digests(root)?;
+    let fixture_registry_digest = digest_payload(root, environment, fixtures.identity_payload())?;
     let mut identity = EvidenceIdentity {
         target_registry_digest,
         toolchain_digest,
@@ -711,8 +703,8 @@ fn engineering_evidence_identity(
         ..unavailable_evidence_identity(source)
     };
     if qualification_fixture_selected {
-        identity.seed = IdentityBinding::exact(seed_digest);
-        identity.fault_schedule = IdentityBinding::exact(fault_schedule_digest);
+        identity.seed = IdentityBinding::exact(fixtures.seed_digest());
+        identity.fault_schedule = IdentityBinding::exact(fixtures.fault_schedule_digest());
     }
     Ok(identity)
 }
@@ -812,10 +804,29 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         matches!(gate.id.as_str(), "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY")
             && gate_selected(gate, options.profile, &activated_risk_gates)
     });
+    let qualification_fixtures =
+        match crate::qualification_fixtures::FrozenQualificationFixtures::capture(&root) {
+            Ok(fixtures) => fixtures,
+            Err(error) => {
+                return retain_aggregator_failure(
+                    &root,
+                    options.profile,
+                    AggregatorFailure {
+                        source,
+                        started_unix_ms,
+                        attempt_id,
+                        environment_digest: environment.digest(),
+                        registry_digest: &registry_digest,
+                        error: &error,
+                    },
+                );
+            },
+        };
     let identity = match engineering_evidence_identity(
         &root,
         &source,
         &environment,
+        &qualification_fixtures,
         qualification_fixture_selected,
     ) {
         Ok(identity) => identity,
@@ -869,6 +880,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             GateExecutionContext {
                 root: &root,
                 registry: &registry,
+                qualification_fixtures: &qualification_fixtures,
                 options,
                 environment: &environment,
                 source: &source,
@@ -1311,6 +1323,7 @@ fn execute_gate(
     let GateExecutionContext {
         root,
         registry,
+        qualification_fixtures,
         options,
         environment,
         source,
@@ -1334,9 +1347,16 @@ fn execute_gate(
         },
         "dependencies" => run_dependency_gate(root, registry, budget, environment, capture),
         "documentation" => run_documentation_gate(root, budget, environment, capture),
-        "correctness" => run_correctness_gate(root, environment),
-        "fault" => run_fault_gate(root, environment),
-        "integrity" => run_integrity_gate(root, gate, options, environment, source, identity),
+        "correctness" => run_correctness_gate(qualification_fixtures, environment),
+        "fault" => run_fault_gate(qualification_fixtures, environment),
+        "integrity" => run_integrity_gate(
+            qualification_fixtures,
+            gate,
+            options,
+            environment,
+            source,
+            identity,
+        ),
         "error-policy" => run_error_policy_gate(root, registry),
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
@@ -1362,18 +1382,21 @@ fn execute_gate(
 }
 
 fn run_correctness_gate(
-    root: &Path,
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
     environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
-    crate::qualification_fixtures::run_correctness(root, &environment.temporary_root)
+    crate::qualification_fixtures::run_correctness(fixtures, &environment.temporary_root)
 }
 
-fn run_fault_gate(root: &Path, environment: &EnvironmentSnapshot) -> Result<String, XtaskError> {
-    crate::qualification_fixtures::run_fault(root, &environment.temporary_root)
+fn run_fault_gate(
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    crate::qualification_fixtures::run_fault(fixtures, &environment.temporary_root)
 }
 
 fn run_integrity_gate(
-    root: &Path,
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
     gate: &Gate,
     options: &Options,
     environment: &EnvironmentSnapshot,
@@ -1391,7 +1414,7 @@ fn run_integrity_gate(
         result: GateStatus::Passed.as_str().to_owned(),
     };
     crate::qualification_fixtures::run_integrity(
-        root,
+        fixtures,
         &environment.temporary_root,
         &integrity_identity,
     )
@@ -5889,6 +5912,14 @@ fn digest_files(
         payload.push(0);
     }
 
+    digest_payload(root, environment, payload)
+}
+
+fn digest_payload(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    payload: Vec<u8>,
+) -> Result<String, XtaskError> {
     let output = run_capture_with_input(
         root,
         environment,

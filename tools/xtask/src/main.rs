@@ -71,6 +71,7 @@ fn run() -> Result<(), XtaskError> {
             let options = quality::Options::parse(arguments)?;
             quality::run(&options)
         },
+        "quality-fixture" => qualification_fixtures::run_process(arguments),
         "setup" => {
             ensure_no_more_arguments(arguments)?;
             hooks::install()
