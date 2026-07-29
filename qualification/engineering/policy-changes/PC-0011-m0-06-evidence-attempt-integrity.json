@@ -84,11 +84,11 @@
       "result": "The public runner now preserves arbitrary canonical and slot bytes, retains schema-v3 collision or reserved exhaustion failures, publishes exact selected-gate report and structured-invocation bindings, independently rejects missing report directories and orphan report paths, preserves bounded legacy inputs, bounds exact encoded JSON bytes before copying, rejects missing, tampered, oversized, and command-mismatched reports, rejects incomplete schema, and retains schema-valid failed verdicts for encoding limits and stale, retried, or missing trusted-CI identities. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "d3a8804f24b7a162c972e8b0098958ec7f0ade2f",
-      "source_tree": "bde584fc0c73e3e15fa7fee0c74cc06dcfd99faa",
+      "source_revision": "7b9b42b108e80125698045d0a1fdc858c5edc7bf",
+      "source_tree": "3595318d531c1f4a358615c91918410dadd34c2d",
       "fixture_sha256": "7c0cf63189e50acfaa1f972481c19bcfeac02c5024f091a10faa2d4b92e67857",
       "schema_sha256": "f75900ffcd94a33b23d68bd4cd974f8994670b5593d060a18084f192ac2a69b1",
-      "runner_sha256": "d88ae87a39fbf3e087bea31aa0fb0b9ff27e48ce9c79444d6e16e1538ac76640",
+      "runner_sha256": "2b205639eaecfd0401f570a47023f8e135775b6c1b8428d108221dcf8ff74d5a",
       "parser_sha256": "84f149f0478df4e7f13f99d674fa367c23196721bcdcade583a899fcbfa7032b",
       "exact_fixture_results": [
         "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
