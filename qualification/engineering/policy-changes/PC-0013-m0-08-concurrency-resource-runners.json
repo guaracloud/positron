@@ -83,6 +83,14 @@
         "command": "git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
         "observed_state": "The detached worktree started at the exact clean revision and the pre-push PR profile progressed through EG-CONCURRENCY, EG-RESOURCE, and subsequent gates, but the invocation ended without a final success result, no isolated target/quality/evidence record was retained, and origin remained at 62a61bd32369aa320ac012a57a52b2be93489afa.",
         "recovery": "Preserve this worktree as diagnostic material. Run one fresh isolated exact-head publication attempt with a separate external target directory, retain its final result, and do not infer a passed quality verdict or a successful push from partial hook output."
+      },
+      {
+        "revision": "c4819b43edaee2512f9b39098bcfa6ee4c158761",
+        "worktree": "/private/tmp/positron-m0-08-publish-final-c4819b4",
+        "cargo_target_dir": "/private/tmp/positron-m0-08-push-target.2Hbbfg",
+        "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-push-target.2Hbbfg git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
+        "observed_state": "The clean exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-publish-final-c4819b4/target/quality/evidence/1785353054135-c4819b43edae-97659.json. EG-TEST failed when source-run mutation fixtures recursively executed the full PR profile, and origin remained at 62a61bd32369aa320ac012a57a52b2be93489afa.",
+        "recovery": "Preserve the worktree, external target directory, log, and exact failed evidence. Correct only the copied-source mutation test orchestration, then run one fresh isolated exact-head publication attempt without inferring a passed quality verdict or a successful push from partial output."
       }
     ]
   },

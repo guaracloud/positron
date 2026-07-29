@@ -933,7 +933,10 @@ fn quality_rejects_an_omitted_serialized_worker_measurement_through_the_public_s
             "    let record = record.replacen(\"workers=\", \"workers=;omitted-\", 1);\n    verify_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(&output, "worker measurement is malformed")
+        assert_rejected_output(
+            &output,
+            "measurement record contains a duplicate or empty field",
+        )
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -956,10 +959,7 @@ fn quality_rejects_a_tampered_serialized_resource_schedule_through_the_public_se
             "    let record = record.replacen(\"workers=\", \"workers=2:0:executed,1:1:executed,0:2:executed;tampered-\", 1);\n    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(
-            &output,
-            "retained schedule and measurements do not prove fair bounded leak-free recovery",
-        )
+        assert_rejected_output(&output, "measurement record contains a malformed field")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -4898,19 +4898,10 @@ impl Fixture {
         &self,
         profile: &str,
     ) -> TestResult<std::process::Output> {
-        let output = Command::new(env!("CARGO"))
+        self.build_fixture_xtask()?;
+        let output = Command::new(self.root.join("target/debug/xtask"))
             .current_dir(&self.root)
-            .args([
-                "run",
-                "--locked",
-                "--quiet",
-                "--package",
-                "xtask",
-                "--",
-                "quality",
-                "--profile",
-                profile,
-            ])
+            .args(["quality", "--profile", profile])
             .output()?;
         Ok(output)
     }
@@ -4968,7 +4959,6 @@ impl Fixture {
             .map_err(Into::into)
     }
 
-    #[cfg(unix)]
     fn build_fixture_xtask(&self) -> TestResult {
         let output = Command::new(env!("CARGO"))
             .current_dir(&self.root)
