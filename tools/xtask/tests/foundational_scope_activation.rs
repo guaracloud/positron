@@ -1012,10 +1012,15 @@ fn quality_fails_with_bounded_evidence_when_writer_reap_observation_stalls() -> 
         )?;
         inject_stalled_writer_reap_observation(&fixture.root)?;
         fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        wait_for_path(
+            &fixture
+                .root
+                .join("target/quality-tools/fixture-writer-reap-observer-entered"),
+            Duration::from_secs(30),
+        )?;
         let started = Instant::now();
-        let output = fixture
-            .quality_child_from_built_fixture_for("pr")?
-            .wait_with_output()?;
+        let output = child.wait_with_output()?;
         if started.elapsed() >= Duration::from_secs(5) {
             return Err(std::io::Error::other(
                 "stalled writer reap exceeded its bounded public failure deadline",
@@ -5677,7 +5682,7 @@ fn inject_stalled_writer_reap_observation(root: &Path) -> TestResult {
     replace_once(
         &root.join("tools/xtask/src/qualification_fixtures.rs"),
         "    child\n        .try_wait()\n        .map_err(|source| XtaskError::io(format!(\"observe {label} reap\"), source))\n",
-        "    fs::write(\n        \"target/quality-tools/fixture-writer-reap-stall-pid\",\n        child.id().to_string(),\n    )\n    .map_err(|source| XtaskError::io(\"publish stalled writer PID\", source))?;\n    let _label = label;\n    Ok(None)\n",
+        "    fs::write(\n        \"target/quality-tools/fixture-writer-reap-stall-pid\",\n        child.id().to_string(),\n    )\n    .map_err(|source| XtaskError::io(\"publish stalled writer PID\", source))?;\n    fs::write(\n        \"target/quality-tools/fixture-writer-reap-observer-entered\",\n        b\"entered\\n\",\n    )\n    .map_err(|source| XtaskError::io(\"publish stalled reap observer entry\", source))?;\n    let _label = label;\n    Ok(None)\n",
     )
 }
 
