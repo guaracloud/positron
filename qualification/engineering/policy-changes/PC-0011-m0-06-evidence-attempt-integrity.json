@@ -23,7 +23,10 @@
       "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a missing or retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass.",
       "Engineering evidence schema version 3 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact structured-invocation digests.",
       "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. A bounded typed JSON parser rejects malformed, duplicate, missing, unknown, oversized, or cross-reference-inconsistent evidence and reports. Controlled steps are charged before stream copies, with 128 steps, 131072 bytes per stream, and 8388608 encoded bytes per report; the serializer reserves each exact escaped JSON field before copying and retains a schema-valid failed attempt if encoding reaches the limit.",
-      "Retained evidence files and raw-report directories are enumerated independently under bounded counts. Current schema-v3 evidence requires every exact report even when its report directory is absent, orphan report files and attempt directories fail closed, schema-v3 attempt-owned filenames are constrained, and bounded schema-v1/v2 records remain explicit legacy inputs with their historical filename labels and without schema-v3 report requirements."
+      "Retained evidence files and raw-report directories are enumerated independently under bounded counts. Current schema-v3 evidence requires every exact report even when its report directory is absent, orphan report files and attempt directories fail closed, schema-v3 attempt-owned filenames are constrained, and bounded schema-v1/v2 records remain explicit legacy inputs with their historical filename labels and without schema-v3 report requirements.",
+      "The reserved attempt owns one bounded attempt-derived report staging directory. Every selected report is create-new written and read back there; one same-filesystem directory rename atomically publishes the complete set only after all reports pass, and the reserved evidence record commits afterward. Any first, middle, last, publication, or staging-cleanup failure retains one schema-valid failed attempt without publishing partial final reports.",
+      "EVIDENCE_V3_CONSTRAINTS_V1 is the canonical runtime constraint owner for string, digest, path, count, and size boundaries. The checked schema names this owner and is verified by its exact SHA-256 after structural checks, so enum, pattern, length, range, required-field, or additional-properties drift fails closed. Runtime parsing enforces lowercase 40/64-character source and registry identities, lowercase SHA-256, and every declared maximum.",
+      "Retained structured invocations are parsed into typed ordered fields, including repeated arguments, canonicalized with the writer's positron-quality-command-v2 NUL-domain-separated JSON algorithm, and SHA-256 recomputed independently for both evidence and raw reports before their stored digests are cross-compared."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
@@ -41,7 +44,10 @@
     "Retained evidence with missing, duplicate, or extra canonical gates, aggregate-result overwrite, or schema-version removal fails closed.",
     "A raw-report collision or encoded-size rejection cannot consume the attempt without a schema-valid failed evidence record.",
     "Deleting an entire schema-v3 report directory, adding an orphan report file or attempt directory, or presenting an adversarial retained-evidence filename fails the public validator.",
-    "Bounded legacy schema-v1/v2 evidence is explicitly preserved without being reinterpreted as schema-v3 report evidence."
+    "Bounded legacy schema-v1/v2 evidence is explicitly preserved without being reinterpreted as schema-v3 report evidence.",
+    "A report failure at any position cannot expose a partial final report directory, and a cleanup failure cannot erase the retained failed verdict.",
+    "Uppercase hashes, overlong constrained identities, and any checked-schema constraint drift fail EG-EVIDENCE.",
+    "Coordinated edits to an invocation plus both stored command digests fail canonical digest recomputation while ordered repeated arguments remain lossless."
   ],
   "detection_lost": [],
   "representative_old_new_evidence": {
@@ -53,56 +59,41 @@
     "new": {
       "status": "passed-focused-local-diagnostic",
       "commands": [
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_overwritten_engineering_evidence_attempt -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_collision_exhaustion_without_changing_any_occupied_bytes -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_publishes_the_complete_exact_identity_evidence_contract -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_missing_retained_raw_report_evidence -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_tampered_retained_raw_report_evidence -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_oversized_retained_raw_report_binding -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_raw_report_command_digest_mismatch -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retained_v3_attempt_with_its_report_directory_removed -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_orphan_report_file -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_orphan_report_attempt_directory -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_adversarial_retained_evidence_filename -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_report_serializer_bounds_encoded_bytes_before_copying -- --exact",
-        "cargo test --locked --package xtask --bin xtask quality::tests::raw_report_limit_applies_to_exact_encoded_bytes -- --exact",
-        "cargo test --locked --package xtask --bin xtask quality::tests::report_encoding_failure_is_retained_as_schema_valid_failed_evidence -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_incomplete_evidence_identity_schema -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_first_staged_write_fails -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_middle_staged_write_fails -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_last_staged_write_fails -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_staging_cleanup_fails -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_evidence_schema_constraint_drift -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_schema_v3_uppercase_source_identity -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_schema_v3_overlong_exact_identity_value -- --exact",
+        "cargo test --locked --package xtask --bin xtask quality::tests::evidence_v3_constraint_owner_enforces_every_string_and_digest_boundary -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_coordinated_invocation_and_stored_digest_tampering -- --exact",
+        "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_malformed_retained_engineering_evidence_json -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_duplicate_top_level_retained_engineering_evidence_keys -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_retained_evidence_missing_a_canonical_gate -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_duplicate_canonical_gate_in_retained_evidence -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_extra_gate_in_retained_evidence -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retained_evidence_aggregate_result_overwrite -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_retained_evidence_without_its_schema_version -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_stale_trusted_ci_source_identity -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retried_trusted_ci_attempt -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_trusted_ci_without_a_run_attempt_identity -- --exact"
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_incomplete_evidence_identity_schema -- --exact"
       ],
-      "result": "The public runner now preserves arbitrary canonical and slot bytes, retains schema-v3 collision or reserved exhaustion failures, publishes exact selected-gate report and structured-invocation bindings, independently rejects missing report directories and orphan report paths, preserves bounded legacy inputs, bounds exact encoded JSON bytes before copying, rejects missing, tampered, oversized, and command-mismatched reports, rejects incomplete schema, and retains schema-valid failed verdicts for encoding limits and stale, retried, or missing trusted-CI identities. These local results are diagnostic only."
+      "result": "The focused public runner fixtures prove atomic complete-directory report publication and failed-attempt retention across first, middle, last, and cleanup failures; exact checked-schema drift, uppercase identity, and overlong identity rejection; canonical invocation-digest recomputation under coordinated tampering; and lossless repeated arguments. The pre-existing occupied-report and incomplete-schema guards also pass. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "7b9b42b108e80125698045d0a1fdc858c5edc7bf",
-      "source_tree": "3595318d531c1f4a358615c91918410dadd34c2d",
-      "fixture_sha256": "7c0cf63189e50acfaa1f972481c19bcfeac02c5024f091a10faa2d4b92e67857",
-      "schema_sha256": "f75900ffcd94a33b23d68bd4cd974f8994670b5593d060a18084f192ac2a69b1",
-      "runner_sha256": "2b205639eaecfd0401f570a47023f8e135775b6c1b8428d108221dcf8ff74d5a",
+      "source_revision": "1929347e80d1e46deb22003be222d6949200e9d4",
+      "source_tree": "1bcb7685c2a6e7d00d1f23624910a6fc8ec56c2d",
+      "fixture_sha256": "499e200543bda784709f88e275d52dfe4cd6eedaf886008c997e4f92eeefe633",
+      "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
+      "runner_sha256": "9c63a1d866ead1e595baa3267fa0103f0e3789c93c551cf54ed6c4701744b54b",
       "parser_sha256": "84f149f0478df4e7f13f99d674fa367c23196721bcdcade583a899fcbfa7032b",
       "exact_fixture_results": [
-        "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
+        "quality_retains_failed_attempt_without_final_reports_when_first_staged_write_fails: passed",
+        "quality_retains_failed_attempt_without_final_reports_when_middle_staged_write_fails: passed",
+        "quality_retains_failed_attempt_without_final_reports_when_last_staged_write_fails: passed",
+        "quality_retains_failed_attempt_without_final_reports_when_staging_cleanup_fails: passed",
+        "quality_rejects_evidence_schema_constraint_drift: passed",
+        "quality_rejects_schema_v3_uppercase_source_identity: passed",
+        "quality_rejects_schema_v3_overlong_exact_identity_value: passed",
+        "quality::tests::evidence_v3_constraint_owner_enforces_every_string_and_digest_boundary: passed",
+        "quality_rejects_coordinated_invocation_and_stored_digest_tampering: passed",
+        "quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments: passed",
         "quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied: passed",
-        "quality_rejects_a_retained_v3_attempt_with_its_report_directory_removed: passed",
-        "quality_rejects_an_orphan_report_file: passed",
-        "quality_rejects_an_orphan_report_attempt_directory: passed",
-        "quality_rejects_an_adversarial_retained_evidence_filename: passed",
-        "quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports: passed",
-        "quality_report_serializer_bounds_encoded_bytes_before_copying: passed",
-        "quality::tests::raw_report_limit_applies_to_exact_encoded_bytes: passed",
-        "quality::tests::report_encoding_failure_is_retained_as_schema_valid_failed_evidence: passed",
-        "quality_ext_executes_the_foundational_coverage_harness: passed",
-        "quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suite: passed"
+        "quality_rejects_an_incomplete_evidence_identity_schema: passed"
       ]
     },
     "dual_run_artifacts": {
