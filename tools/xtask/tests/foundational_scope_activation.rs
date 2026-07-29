@@ -767,6 +767,188 @@ fn quality_rejects_a_raw_report_command_digest_mismatch() -> TestResult {
 }
 
 #[test]
+fn quality_rejects_malformed_retained_engineering_evidence_json() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, evidence| {
+            fs::write(
+                evidence_path,
+                format!("{evidence}\ntrailing-malformed-json"),
+            )?;
+            Ok(())
+        },
+        "retained engineering evidence",
+    )
+}
+
+#[test]
+fn quality_capture_is_attempt_owned_and_charges_resources_before_copying() -> TestResult {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = fs::read_to_string(root.join("tools/xtask/src/quality.rs"))?;
+    if source.contains("static ACTIVE_GATE_CAPTURE")
+        || !source.contains("struct GateCapture")
+        || !source.contains("MAXIMUM_CONTROLLED_REPORT_STEPS")
+        || !source.contains("stdout: &str")
+        || !source.contains("stderr: &str")
+    {
+        return Err(std::io::Error::other(
+            "gate capture is not explicitly attempt-owned and borrowed-resource bounded",
+        )
+        .into());
+    }
+    let charge = source
+        .find("if stdout.len()")
+        .ok_or_else(|| std::io::Error::other("gate capture does not charge borrowed streams"))?;
+    let copy = source.find("stdout: stdout.to_owned()").ok_or_else(|| {
+        std::io::Error::other("gate capture does not retain a bounded stream copy")
+    })?;
+    if charge >= copy {
+        return Err(std::io::Error::other(
+            "gate capture copies report streams before enforcing resource bounds",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn quality_rejects_duplicate_top_level_retained_engineering_evidence_keys() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, evidence| {
+            let duplicate = "{\n  \"schema_version\": 3,\n";
+            let Some(suffix) = evidence.strip_prefix("{\n") else {
+                return Err(std::io::Error::other(
+                    "fixture evidence did not begin with a JSON object",
+                )
+                .into());
+            };
+            fs::write(evidence_path, format!("{duplicate}{suffix}"))?;
+            Ok(())
+        },
+        "retained engineering evidence",
+    )
+}
+
+#[test]
+fn quality_rejects_retained_evidence_missing_a_canonical_gate() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, _| {
+            replace_once(
+                evidence_path,
+                "\"gate_id\": \"EG-SUPPLY\"",
+                "\"gate_id\": \"EG-SUPPLX\"",
+            )
+        },
+        "retained engineering evidence",
+    )
+}
+
+#[test]
+fn quality_rejects_a_duplicate_canonical_gate_in_retained_evidence() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, _| {
+            replace_once(
+                evidence_path,
+                "\"gate_id\": \"EG-SUPPLY\"",
+                "\"gate_id\": \"EG-00\"",
+            )
+        },
+        "retained engineering evidence",
+    )
+}
+
+#[test]
+fn quality_rejects_an_extra_gate_in_retained_evidence() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, _| {
+            replace_once(
+                evidence_path,
+                "\"gate_id\": \"EG-SUPPLY\"",
+                "\"gate_id\": \"EG-EXTRA\"",
+            )
+        },
+        "retained engineering evidence",
+    )
+}
+
+#[test]
+fn quality_rejects_a_retained_evidence_aggregate_result_overwrite() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, _| {
+            replace_once(
+                evidence_path,
+                "  \"result\": \"passed\",",
+                "  \"result\": \"failed\",",
+            )
+        },
+        "retained engineering evidence",
+    )
+}
+
+#[test]
+fn quality_rejects_retained_evidence_without_its_schema_version() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, _| {
+            replace_once(
+                evidence_path,
+                "\"schema_version\": 3",
+                "\"removed_schema_version\": 3",
+            )
+        },
+        "retained engineering evidence",
+    )
+}
+
+#[test]
+fn quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied() -> TestResult
+{
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        let report = fixture
+            .root
+            .join("target/quality/evidence-reports/1700000000000-111111111111-1/EG-00.json");
+        let parent = report.parent().ok_or_else(|| {
+            std::io::Error::other("fixture raw report path has no parent directory")
+        })?;
+        fs::create_dir_all(parent)?;
+        let occupied = b"{\"preexisting\":true}\n";
+        fs::write(&report, occupied)?;
+
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "engineering evidence raw report")?;
+        if fs::read(&report)? != occupied {
+            return Err(std::io::Error::other(
+                "raw report reservation changed the pre-existing report bytes",
+            )
+            .into());
+        }
+
+        let evidence = fixture
+            .root
+            .join("target/quality/evidence/1700000000000-111111111111-1.json");
+        let retained = fs::read_to_string(&evidence)?;
+        assert_complete_evidence_contract(&retained)?;
+        for expected in [
+            "\"result\": \"failed\"",
+            "\"merge_eligible\": false",
+            "\"gate_id\": \"EG-00\"",
+            "raw report",
+        ] {
+            if !retained.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "raw-report collision did not retain failed evidence field `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_an_incomplete_evidence_identity_schema() -> TestResult {
     assert_fixture_rejected_profile(
         "pr",
@@ -1776,6 +1958,24 @@ fn assert_invalid_retained_raw_report(
         let evidence_path = fixture.latest_evidence_path()?;
         let evidence = fs::read_to_string(&evidence_path)?;
         mutate(&fixture, &evidence_path, &evidence)?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, expected_failure)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn assert_invalid_retained_engineering_evidence(
+    mutate: impl FnOnce(&Path, &str) -> TestResult,
+    expected_failure: &str,
+) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        let evidence = fs::read_to_string(&evidence_path)?;
+        mutate(&evidence_path, &evidence)?;
         let output = fixture.quality_output_for("pr")?;
         assert_rejected_output(&output, expected_failure)
     })();

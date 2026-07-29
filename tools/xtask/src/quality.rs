@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -13,6 +13,7 @@ use crate::controlled_execution::{
     self, ExecutionTools, InvocationInput, InvocationSpec, OutputMode,
 };
 use crate::error::XtaskError;
+use crate::evidence_json as bounded_json;
 use crate::hooks;
 use crate::registry::{self, Gate, Registry};
 
@@ -54,6 +55,7 @@ const SNAPSHOT_DIGEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAXIMUM_CAPTURED_REPORT_STREAM_BYTES: usize = 131_072;
 const MAXIMUM_RAW_REPORT_BYTES: usize = 8_388_608;
 const MAXIMUM_RETAINED_EVIDENCE_BYTES: usize = 2_097_152;
+const MAXIMUM_CONTROLLED_REPORT_STEPS: usize = 128;
 const RAW_REPORT_CONTENT_TYPE: &str = "application/vnd.positron.quality-gate-report+json;version=1";
 const COLLISION_SLOT_COUNT: usize = 16;
 const COLLISION_OCCUPIED_SET: &str = "collision-00,collision-01,collision-02,collision-03,collision-04,collision-05,collision-06,collision-07,collision-08,collision-09,collision-10,collision-11,collision-12,collision-13,collision-14,collision-15";
@@ -383,7 +385,78 @@ struct ControlledStepReport {
     stderr: String,
 }
 
-static ACTIVE_GATE_CAPTURE: Mutex<Option<Vec<ControlledStepReport>>> = Mutex::new(None);
+struct GateCapture {
+    steps: Vec<ControlledStepReport>,
+    charged_bytes: usize,
+}
+
+impl GateCapture {
+    fn new() -> Self {
+        Self {
+            steps: Vec::new(),
+            charged_bytes: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        invocation: ControlledInvocation,
+        verdict: &str,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<(), XtaskError> {
+        if self.steps.len() >= MAXIMUM_CONTROLLED_REPORT_STEPS {
+            return Err(XtaskError::invalid(
+                "gate report resource limit",
+                format!("controlled step count exceeds {MAXIMUM_CONTROLLED_REPORT_STEPS}"),
+            ));
+        }
+        if stdout.len() > MAXIMUM_CAPTURED_REPORT_STREAM_BYTES
+            || stderr.len() > MAXIMUM_CAPTURED_REPORT_STREAM_BYTES
+        {
+            return Err(XtaskError::invalid(
+                "gate report resource limit",
+                format!("controlled stream exceeds {MAXIMUM_CAPTURED_REPORT_STREAM_BYTES} bytes"),
+            ));
+        }
+        let invocation_bytes = controlled_invocation_json(&invocation).len();
+        let charge = invocation_bytes
+            .checked_add(verdict.len())
+            .and_then(|bytes| bytes.checked_add(stdout.len()))
+            .and_then(|bytes| bytes.checked_add(stderr.len()))
+            .and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "gate report resource limit",
+                    "controlled step byte accounting overflowed",
+                )
+            })?;
+        let charged_bytes = self.charged_bytes.checked_add(charge).ok_or_else(|| {
+            XtaskError::invalid(
+                "gate report resource limit",
+                "controlled report byte accounting overflowed",
+            )
+        })?;
+        if charged_bytes > MAXIMUM_RAW_REPORT_BYTES {
+            return Err(XtaskError::invalid(
+                "gate report resource limit",
+                format!("controlled report exceeds {MAXIMUM_RAW_REPORT_BYTES} bytes"),
+            ));
+        }
+        self.charged_bytes = charged_bytes;
+        self.steps.push(ControlledStepReport {
+            invocation,
+            verdict: verdict.to_owned(),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<ControlledStepReport> {
+        self.steps
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RawReportBinding {
@@ -433,6 +506,7 @@ enum NotApplicableReason {
     NoApprovalClaimed,
     NoExceptionApplied,
     GateNotSelected,
+    ReportRetentionFailed,
     UnavailableBeforeRegistryValidation,
 }
 
@@ -455,6 +529,7 @@ impl NotApplicableReason {
             Self::NoApprovalClaimed => "no-approval-claimed",
             Self::NoExceptionApplied => "no-exception-applied",
             Self::GateNotSelected => "gate-not-selected",
+            Self::ReportRetentionFailed => "report-retention-failed",
             Self::UnavailableBeforeRegistryValidation => "unavailable-before-registry-validation",
         }
     }
@@ -733,9 +808,9 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             gate.id, gate.runner, gate.timeout_seconds, gate.memory_mib
         );
         let started = Instant::now();
-        begin_gate_capture()?;
-        let execution = execute_gate(&root, &registry, gate, options, &environment);
-        let controlled_steps = finish_gate_capture()?;
+        let mut capture = GateCapture::new();
+        let execution = execute_gate(&root, &registry, gate, options, &environment, &mut capture);
+        let controlled_steps = capture.finish();
         let duration_ms = started.elapsed().as_millis();
         match execution {
             Ok(detail) => {
@@ -989,51 +1064,6 @@ fn build_gate_attempt(
     }
 }
 
-fn begin_gate_capture() -> Result<(), XtaskError> {
-    let mut capture = ACTIVE_GATE_CAPTURE.lock().map_err(|_| {
-        XtaskError::invalid(
-            "gate report capture",
-            "the selected-gate capture owner is unavailable",
-        )
-    })?;
-    if capture.is_some() {
-        return Err(XtaskError::invalid(
-            "gate report capture",
-            "a selected-gate capture is already active",
-        ));
-    }
-    *capture = Some(Vec::new());
-    Ok(())
-}
-
-fn finish_gate_capture() -> Result<Vec<ControlledStepReport>, XtaskError> {
-    let mut capture = ACTIVE_GATE_CAPTURE.lock().map_err(|_| {
-        XtaskError::invalid(
-            "gate report capture",
-            "the selected-gate capture owner is unavailable",
-        )
-    })?;
-    capture.take().ok_or_else(|| {
-        XtaskError::invalid(
-            "gate report capture",
-            "the selected-gate capture was not active",
-        )
-    })
-}
-
-fn record_controlled_step(step: ControlledStepReport) -> Result<(), XtaskError> {
-    let mut capture = ACTIVE_GATE_CAPTURE.lock().map_err(|_| {
-        XtaskError::invalid(
-            "gate report capture",
-            "the selected-gate capture owner is unavailable",
-        )
-    })?;
-    if let Some(steps) = capture.as_mut() {
-        steps.push(step);
-    }
-    Ok(())
-}
-
 fn raw_report_relative_path(attempt_id: &str, gate_id: &str) -> String {
     format!("target/quality/evidence-reports/{attempt_id}/{gate_id}.json")
 }
@@ -1170,25 +1200,42 @@ fn execute_gate(
     gate: &Gate,
     options: &Options,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
-        "registry" => run_registry_gate(root, registry, options.profile, budget, environment),
-        "architecture" => run_architecture_gate(root, registry, budget, environment),
-        "build" => run_build_gate(root, options.profile, budget, environment),
-        "coverage" => run_coverage_gate(root, registry, budget, options, environment),
-        "dynamic-analysis" => run_dynamic_analysis_gate(root, registry, budget, environment),
-        "dependencies" => run_dependency_gate(root, registry, budget, environment),
-        "documentation" => run_documentation_gate(root, budget, environment),
+        "registry" => run_registry_gate(
+            root,
+            registry,
+            options.profile,
+            budget,
+            environment,
+            capture,
+        ),
+        "architecture" => run_architecture_gate(root, registry, budget, environment, capture),
+        "build" => run_build_gate(root, options.profile, budget, environment, capture),
+        "coverage" => run_coverage_gate(root, registry, budget, options, environment, capture),
+        "dynamic-analysis" => {
+            run_dynamic_analysis_gate(root, registry, budget, environment, capture)
+        },
+        "dependencies" => run_dependency_gate(root, registry, budget, environment, capture),
+        "documentation" => run_documentation_gate(root, budget, environment, capture),
         "error-policy" => run_error_policy_gate(root, registry),
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
-        "rust" => run_rust_gate(root, budget, environment),
-        "safety" => run_safety_gate(root, registry, budget, environment),
-        "security" => run_security_gate(root, registry, budget, environment),
-        "secrets" => run_secret_gate(root, options.profile, budget, environment),
-        "supply" => run_supply_gate(root, registry, options.profile, budget, environment),
-        "test" => run_test_gate(root, budget, environment),
+        "rust" => run_rust_gate(root, budget, environment, capture),
+        "safety" => run_safety_gate(root, registry, budget, environment, capture),
+        "security" => run_security_gate(root, registry, budget, environment, capture),
+        "secrets" => run_secret_gate(root, options.profile, budget, environment, capture),
+        "supply" => run_supply_gate(
+            root,
+            registry,
+            options.profile,
+            budget,
+            environment,
+            capture,
+        ),
+        "test" => run_test_gate(root, budget, environment, capture),
         "matrix" => run_generation_matrix_gate(root),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
@@ -1211,6 +1258,7 @@ fn run_dynamic_analysis_gate(
     registry: &Registry,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     if !registry.has_m0_02_domain_types_scope() {
         return Err(XtaskError::invalid(
@@ -1232,7 +1280,7 @@ fn run_dynamic_analysis_gate(
             "foundational_domain_types",
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     let compile_fail = run_status(
         root,
@@ -1240,7 +1288,7 @@ fn run_dynamic_analysis_gate(
         "cargo",
         ["test", "--locked", "--package", "positron-domain", "--doc"],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     Ok(format!(
         "M0-02 Domain Types retained-seed contract/property cases: {} | compile-fail: {}",
@@ -1254,9 +1302,11 @@ fn run_coverage_gate(
     budget: Duration,
     options: &Options,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
-    let detector_versions = verify_coverage_detectors(root, registry, deadline, environment)?;
+    let detector_versions =
+        verify_coverage_detectors(root, registry, deadline, environment, capture)?;
     let coverage_directory = root.join("target/quality/coverage");
     fs::create_dir_all(&coverage_directory).map_err(|source| {
         XtaskError::io(format!("create {}", coverage_directory.display()), source)
@@ -1268,10 +1318,17 @@ fn run_coverage_gate(
             registry,
             deadline,
             environment,
+            capture,
         )?);
     }
     if registry.has_m0_01_foundational_scope() {
-        results.push(run_m0_01_coverage(root, registry, deadline, environment)?);
+        results.push(run_m0_01_coverage(
+            root,
+            registry,
+            deadline,
+            environment,
+            capture,
+        )?);
     }
     if registry.has_m0_03_canonical_api_scope() {
         results.push(run_m0_03_canonical_api_coverage(
@@ -1279,6 +1336,7 @@ fn run_coverage_gate(
             registry,
             deadline,
             environment,
+            capture,
         )?);
     }
     if registry.has_m0_04_configuration_scope() {
@@ -1286,16 +1344,35 @@ fn run_coverage_gate(
             root,
             deadline,
             environment,
+            capture,
         )?);
     }
     if options.retain_m0_02_mutation {
-        results.push(run_m0_02_mutation(root, registry, deadline, environment)?);
+        results.push(run_m0_02_mutation(
+            root,
+            registry,
+            deadline,
+            environment,
+            capture,
+        )?);
     }
     if options.retain_m0_03_mutation {
-        results.push(run_m0_03_mutation(root, registry, deadline, environment)?);
+        results.push(run_m0_03_mutation(
+            root,
+            registry,
+            deadline,
+            environment,
+            capture,
+        )?);
     }
     if options.retain_m0_04_mutation {
-        results.push(run_m0_04_mutation(root, registry, deadline, environment)?);
+        results.push(run_m0_04_mutation(
+            root,
+            registry,
+            deadline,
+            environment,
+            capture,
+        )?);
     }
     if results.is_empty() {
         return Err(XtaskError::invalid(
@@ -1311,6 +1388,7 @@ fn run_m0_02_mutation(
     registry: &Registry,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     if !registry.has_m0_02_domain_types_scope() {
         return Err(XtaskError::invalid(
@@ -1334,7 +1412,7 @@ fn run_m0_02_mutation(
         &tool.command,
         tool.version_arguments.iter().map(String::as_str),
         remaining(deadline)?,
-        &[],
+        Some(&mut *capture),
     )?;
     if !version.stdout.contains(&tool.version) {
         return Err(XtaskError::invalid(
@@ -1375,7 +1453,7 @@ fn run_m0_02_mutation(
             "foundational_domain_types",
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     Ok(format!(
         "cargo-mutants={}; {}",
@@ -1388,6 +1466,7 @@ fn run_m0_03_mutation(
     registry: &Registry,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     if !registry.has_m0_03_canonical_api_scope() {
         return Err(XtaskError::invalid(
@@ -1411,7 +1490,7 @@ fn run_m0_03_mutation(
         &tool.command,
         tool.version_arguments.iter().map(String::as_str),
         remaining(deadline)?,
-        &[],
+        Some(&mut *capture),
     )?;
     if !version.stdout.contains(&tool.version) {
         return Err(XtaskError::invalid(
@@ -1452,7 +1531,7 @@ fn run_m0_03_mutation(
             "canonical_public_interface",
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     Ok(format!(
         "cargo-mutants={}; {}",
@@ -1465,6 +1544,7 @@ fn run_m0_04_mutation(
     registry: &Registry,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     if !registry.has_m0_04_configuration_scope() {
         return Err(XtaskError::invalid(
@@ -1488,7 +1568,7 @@ fn run_m0_04_mutation(
         &tool.command,
         tool.version_arguments.iter().map(String::as_str),
         remaining(deadline)?,
-        &[],
+        Some(&mut *capture),
     )?;
     if !version.stdout.contains(&tool.version) {
         return Err(XtaskError::invalid(
@@ -1529,7 +1609,7 @@ fn run_m0_04_mutation(
             "configuration_foundation",
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     Ok(format!(
         "cargo-mutants={}; {}",
@@ -1542,6 +1622,7 @@ fn run_m0_01_coverage(
     registry: &Registry,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let specifications = m0_01b_coverage_command_specs();
     validate_m0_01b_coverage_command_specs(&specifications)?;
@@ -1552,7 +1633,7 @@ fn run_m0_01_coverage(
         "cargo",
         total_specification.arguments(),
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     let changed_code = run_status(
         root,
@@ -1560,7 +1641,7 @@ fn run_m0_01_coverage(
         "cargo",
         changed_code_specification.arguments(),
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
 
     let total_measurements = read_coverage_measurements(&root.join(total_specification.report))?;
@@ -1584,6 +1665,7 @@ fn run_m0_02_domain_types_coverage(
     registry: &Registry,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let report = "target/quality/coverage/m0-02-domain-total.json";
     let outcome = run_status(
@@ -1607,7 +1689,7 @@ fn run_m0_02_domain_types_coverage(
             report,
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     let measurements = read_coverage_measurements(&root.join(report))?;
     enforce_m0_02_domain_types_coverage_baselines(registry, &measurements)?;
@@ -1622,6 +1704,7 @@ fn run_m0_03_canonical_api_coverage(
     registry: &Registry,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let report = "target/quality/coverage/m0-03-api.json";
     let outcome = run_status(
@@ -1645,7 +1728,7 @@ fn run_m0_03_canonical_api_coverage(
             report,
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     let measurements = read_coverage_measurements(&root.join(report))?;
     enforce_m0_03_canonical_api_coverage_baselines(registry, &measurements)?;
@@ -1659,6 +1742,7 @@ fn run_m0_04_configuration_coverage(
     root: &Path,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let report = "target/quality/coverage/m0-04-config.json";
     let outcome = run_status(
@@ -1682,7 +1766,7 @@ fn run_m0_04_configuration_coverage(
             report,
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     let measurements = read_coverage_measurements(&root.join(report))?;
     for (actual, label) in [(measurements.line, "line"), (measurements.region, "region")] {
@@ -1706,6 +1790,7 @@ fn verify_coverage_detectors(
     registry: &Registry,
     deadline: Instant,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let identity = "cargo-llvm-cov";
     let tool = registry
@@ -1724,7 +1809,7 @@ fn verify_coverage_detectors(
         &tool.command,
         tool.version_arguments.iter().map(String::as_str),
         remaining(deadline)?,
-        &[],
+        Some(capture),
     )?;
     if !outcome.stdout.contains(&tool.version) {
         return Err(XtaskError::invalid(
@@ -1867,6 +1952,7 @@ fn run_registry_gate(
     profile: Profile,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     if profile == Profile::Qual {
         let targets = root.join("qualification/targets/registry.json");
@@ -1893,7 +1979,7 @@ fn run_registry_gate(
             &tool.command,
             tool.version_arguments.iter().map(String::as_str),
             remaining(deadline)?,
-            &[],
+            Some(&mut *capture),
         )?;
         if !outcome.stdout.contains(&tool.version) {
             return Err(XtaskError::invalid(
@@ -1929,6 +2015,7 @@ fn run_architecture_gate(
     registry: &Registry,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let workspace_packages = registry
@@ -1975,7 +2062,7 @@ fn run_architecture_gate(
                 "{p}",
             ],
             remaining(deadline)?,
-            &[],
+            Some(&mut *capture),
         )?;
         for line in outcome.stdout.lines().skip(1) {
             let Some(dependency) = line.split_whitespace().next() else {
@@ -2045,6 +2132,7 @@ fn run_build_gate(
     profile: Profile,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
@@ -2061,7 +2149,7 @@ fn run_build_gate(
                 "--all-features",
             ],
             remaining(deadline)?,
-            &[],
+            capture,
         )?
         .display,
     );
@@ -2087,7 +2175,7 @@ fn run_build_gate(
                         target,
                     ],
                     remaining(deadline)?,
-                    &[],
+                    capture,
                 )?
                 .display,
             );
@@ -2101,6 +2189,7 @@ fn run_dependency_gate(
     registry: &Registry,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
@@ -2111,7 +2200,7 @@ fn run_dependency_gate(
             "cargo",
             ["metadata", "--locked", "--format-version", "1"],
             remaining(deadline)?,
-            &[],
+            Some(&mut *capture),
         )?
         .display,
     );
@@ -2122,7 +2211,7 @@ fn run_dependency_gate(
             "cargo-machete",
             ["--with-metadata", "--skip-target-dir", "."],
             remaining(deadline)?,
-            &[],
+            capture,
         )?
         .display,
     );
@@ -2133,7 +2222,7 @@ fn run_dependency_gate(
             "cargo",
             ["deny", "check", "bans", "licenses", "sources"],
             remaining(deadline)?,
-            &[],
+            capture,
         )?
         .display,
     );
@@ -2147,6 +2236,7 @@ fn run_documentation_gate(
     root: &Path,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     validate_local_markdown_links(root)?;
     let target = documentation_target_directory(environment)?;
@@ -2156,7 +2246,7 @@ fn run_documentation_gate(
         XtaskError::invalid_path(&target, "temporary documentation target is not valid UTF-8")
     })?;
     let deadline = Instant::now() + budget;
-    let outcome = run_status(
+    let outcome = run_status_with_options(
         root,
         environment,
         "cargo",
@@ -2168,14 +2258,17 @@ fn run_documentation_gate(
             "--no-deps",
             "--document-private-items",
         ],
-        remaining(deadline)?,
-        &[
-            ("RUSTDOCFLAGS", "-D warnings"),
-            ("CARGO_TARGET_DIR", target_value),
-        ],
+        StatusOptions {
+            timeout: remaining(deadline)?,
+            environment: &[
+                ("RUSTDOCFLAGS", "-D warnings"),
+                ("CARGO_TARGET_DIR", target_value),
+            ],
+            capture,
+        },
     )
     .and_then(|outcome| {
-        scan_generated_rustdoc_secrets(root, environment, &target, remaining(deadline)?)
+        scan_generated_rustdoc_secrets(root, environment, &target, remaining(deadline)?, capture)
             .map(|scan| (outcome, scan))
     });
     let cleanup = fs::remove_dir_all(&target)
@@ -2209,6 +2302,7 @@ fn scan_generated_rustdoc_secrets(
     environment: &EnvironmentSnapshot,
     target: &Path,
     budget: Duration,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let documentation_root = target.join("doc");
     if !documentation_root.is_dir() {
@@ -2236,7 +2330,7 @@ fn scan_generated_rustdoc_secrets(
             documentation_value,
         ],
         budget,
-        &[],
+        capture,
     )?;
     Ok(format!(
         "{}; full generated rustdoc root scanned without exclusions",
@@ -2285,45 +2379,7 @@ fn run_evidence_gate(root: &Path, registry: &Registry) -> Result<String, XtaskEr
     let path = root.join("qualification/engineering/evidence.schema.json");
     let schema = fs::read_to_string(&path)
         .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-    for field in [
-        "\"schema_version\": { \"const\": 3 }",
-        "\"additionalProperties\": false",
-        "\"attempt_id\"",
-        "\"collision_of\"",
-        "\"collision_slots\"",
-        "\"merge_eligible\"",
-        "\"registry_digest\"",
-        "\"release_manifest\"",
-        "\"artifact\"",
-        "\"target\"",
-        "\"target_registry_digest\"",
-        "\"environment_digest\"",
-        "\"toolchain_digest\"",
-        "\"effective_configuration\"",
-        "\"fixture_registry_digest\"",
-        "\"corpus\"",
-        "\"seed\"",
-        "\"fault_schedule\"",
-        "\"verifier\"",
-        "\"approval\"",
-        "\"exception\"",
-        "\"invocation\"",
-        "\"controlled_steps\"",
-        "\"command_digest\"",
-        "\"owner\"",
-        "\"raw_report\"",
-        "\"content_type\"",
-        "\"sha256\"",
-        "\"bytes\"",
-        "\"not-selected\"",
-    ] {
-        if !schema.contains(field) {
-            return Err(XtaskError::invalid_path(
-                &path,
-                format!("evidence schema is missing `{field}`"),
-            ));
-        }
-    }
+    validate_evidence_schema_document(&path, &schema)?;
     validate_retained_engineering_evidence(root)?;
     if registry.gates.len() != 25 {
         return Err(XtaskError::invalid(
@@ -2332,6 +2388,31 @@ fn run_evidence_gate(root: &Path, registry: &Registry) -> Result<String, XtaskEr
         ));
     }
     Ok("internal:evidence-schema-complete-gate-set-and-retained-report validation".to_owned())
+}
+
+#[derive(Debug)]
+struct ParsedRawReportBinding {
+    applicability: String,
+    path: String,
+    digest: String,
+    bytes: usize,
+    reason: String,
+}
+
+#[derive(Debug)]
+struct ParsedGateRecord {
+    gate_id: String,
+    result: String,
+    command_digest: String,
+    invocation: bounded_json::JsonValue,
+    controlled_steps: Vec<bounded_json::JsonValue>,
+    raw_report: ParsedRawReportBinding,
+}
+
+#[derive(Debug)]
+struct ParsedEvidenceRecord {
+    attempt_id: String,
+    gates: Vec<ParsedGateRecord>,
 }
 
 fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError> {
@@ -2348,6 +2429,16 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
         if path.extension().and_then(OsStr::to_str) != Some("json") {
             continue;
         }
+        let Some(attempt_id) = path.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !root
+            .join("target/quality/evidence-reports")
+            .join(attempt_id)
+            .is_dir()
+        {
+            continue;
+        }
         let metadata = fs::metadata(&path)
             .map_err(|source| XtaskError::io(format!("inspect {}", path.display()), source))?;
         if metadata.len() > MAXIMUM_RETAINED_EVIDENCE_BYTES as u64 {
@@ -2360,10 +2451,12 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
         }
         let evidence = fs::read_to_string(&path)
             .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-        if !evidence.contains("\"schema_version\": 3") {
-            continue;
-        }
-        validate_retained_v3_reports(root, &path, &evidence)?;
+        validate_retained_v3_reports(root, &path, &evidence).map_err(|error| {
+            XtaskError::invalid_path(
+                &path,
+                format!("retained engineering evidence is invalid: {error}"),
+            )
+        })?;
     }
     Ok(())
 }
@@ -2373,76 +2466,14 @@ fn validate_retained_v3_reports(
     evidence_path: &Path,
     evidence: &str,
 ) -> Result<(), XtaskError> {
-    let attempt_id = extract_json_string(evidence, "\"attempt_id\": \"").ok_or_else(|| {
-        XtaskError::invalid_path(evidence_path, "retained evidence omitted attempt_id")
-    })?;
-    for record in evidence.split("\"gate_id\": \"").skip(1) {
-        let (gate_id, _) = record.split_once('"').ok_or_else(|| {
-            XtaskError::invalid_path(evidence_path, "retained evidence has malformed gate_id")
-        })?;
-        let command_digest =
-            extract_json_string(record, "\"command_digest\": \"").ok_or_else(|| {
-                XtaskError::invalid_path(
-                    evidence_path,
-                    format!("retained gate `{gate_id}` omitted command_digest"),
-                )
-            })?;
-        let applicability = extract_json_string(record, "\"raw_report\": {\"applicability\": \"")
-            .ok_or_else(|| {
-            XtaskError::invalid_path(
-                evidence_path,
-                format!("retained gate `{gate_id}` omitted raw_report applicability"),
-            )
-        })?;
-        if applicability == "not-applicable" {
+    let parsed = parse_evidence_record(evidence_path, evidence)?;
+    for gate in parsed.gates {
+        if gate.raw_report.applicability == "not-applicable" {
             continue;
         }
-        if applicability != "exact" {
-            return Err(XtaskError::invalid_path(
-                evidence_path,
-                format!("retained gate `{gate_id}` has invalid raw_report applicability"),
-            ));
-        }
-        let report_relative = extract_json_string(record, "\"path\": \"").ok_or_else(|| {
-            XtaskError::invalid_path(
-                evidence_path,
-                format!("retained gate `{gate_id}` omitted raw_report path"),
-            )
-        })?;
-        let digest = extract_json_string(record, "\"sha256\": \"").ok_or_else(|| {
-            XtaskError::invalid_path(
-                evidence_path,
-                format!("retained gate `{gate_id}` omitted raw_report digest"),
-            )
-        })?;
-        let bytes = extract_json_usize(record, "\"bytes\": ").ok_or_else(|| {
-            XtaskError::invalid_path(
-                evidence_path,
-                format!("retained gate `{gate_id}` omitted raw_report byte length"),
-            )
-        })?;
-        let content_type =
-            extract_json_string(record, "\"content_type\": \"").ok_or_else(|| {
-                XtaskError::invalid_path(
-                    evidence_path,
-                    format!("retained gate `{gate_id}` omitted raw_report content type"),
-                )
-            })?;
-        if bytes > MAXIMUM_RAW_REPORT_BYTES {
-            return Err(XtaskError::invalid_path(
-                evidence_path,
-                format!("retained raw report exceeds {MAXIMUM_RAW_REPORT_BYTES} bytes"),
-            ));
-        }
-        if !valid_sha256_digest(digest) || content_type != RAW_REPORT_CONTENT_TYPE {
-            return Err(XtaskError::invalid_path(
-                evidence_path,
-                format!("retained gate `{gate_id}` has an invalid raw_report binding"),
-            ));
-        }
-        let expected_relative = raw_report_relative_path(attempt_id, gate_id);
-        let relative_path = Path::new(report_relative);
-        if report_relative != expected_relative
+        let expected_relative = raw_report_relative_path(&parsed.attempt_id, &gate.gate_id);
+        let relative_path = Path::new(&gate.raw_report.path);
+        if gate.raw_report.path != expected_relative
             || relative_path.is_absolute()
             || !relative_path
                 .components()
@@ -2450,7 +2481,10 @@ fn validate_retained_v3_reports(
         {
             return Err(XtaskError::invalid_path(
                 evidence_path,
-                format!("retained gate `{gate_id}` raw_report path is not attempt-owned"),
+                format!(
+                    "retained gate `{}` raw_report path is not attempt-owned",
+                    gate.gate_id
+                ),
             ));
         }
         let report_path = root.join(relative_path);
@@ -2463,7 +2497,7 @@ fn validate_retained_v3_reports(
         let report_metadata = fs::metadata(&report_path).map_err(|source| {
             XtaskError::io(format!("inspect {}", report_path.display()), source)
         })?;
-        if report_metadata.len() != bytes as u64 {
+        if report_metadata.len() != gate.raw_report.bytes as u64 {
             if report_metadata.len() > MAXIMUM_RAW_REPORT_BYTES as u64 {
                 return Err(XtaskError::invalid_path(
                     &report_path,
@@ -2477,7 +2511,7 @@ fn validate_retained_v3_reports(
         }
         let report = fs::read(&report_path)
             .map_err(|source| XtaskError::io(format!("read {}", report_path.display()), source))?;
-        if sha256_digest(&report) != digest {
+        if sha256_digest(&report) != gate.raw_report.digest {
             return Err(XtaskError::invalid_path(
                 &report_path,
                 "retained raw report digest does not match its evidence binding",
@@ -2486,51 +2520,668 @@ fn validate_retained_v3_reports(
         let report = String::from_utf8(report).map_err(|_| {
             XtaskError::invalid_path(&report_path, "retained raw report is not valid UTF-8 JSON")
         })?;
-        let report_invocation_digest = extract_json_string(&report, "\"invocation_digest\": \"")
-            .ok_or_else(|| {
-                XtaskError::invalid_path(
-                    &report_path,
-                    "retained raw report omitted invocation_digest",
-                )
-            })?;
-        if report_invocation_digest != command_digest {
+        let parsed_report = parse_raw_report_record(&report_path, &report)?;
+        if parsed_report.invocation_digest != gate.command_digest {
             return Err(XtaskError::invalid_path(
                 &report_path,
                 "raw report invocation digest does not match its evidence command digest",
             ));
         }
-        for required in [
-            format!("\"attempt_id\": {}", json_string(attempt_id)),
-            format!("\"gate_id\": {}", json_string(gate_id)),
-            format!("\"content_type\": {}", json_string(RAW_REPORT_CONTENT_TYPE)),
-        ] {
-            if !report.contains(&required) {
-                return Err(XtaskError::invalid_path(
-                    &report_path,
-                    format!("retained raw report omitted exact field `{required}`"),
-                ));
-            }
+        if parsed_report.attempt_id != parsed.attempt_id
+            || parsed_report.gate_id != gate.gate_id
+            || parsed_report.result != gate.result
+            || parsed_report.invocation != gate.invocation
+            || parsed_report.controlled_steps != gate.controlled_steps
+        {
+            return Err(XtaskError::invalid_path(
+                &report_path,
+                "raw report fields do not exactly cross-reference their evidence gate",
+            ));
         }
     }
     Ok(())
 }
 
-fn extract_json_string<'value>(content: &'value str, marker: &str) -> Option<&'value str> {
-    let (_, value) = content.split_once(marker)?;
-    let (value, _) = value.split_once('"')?;
-    Some(value)
+#[derive(Debug)]
+struct ParsedRawReportRecord {
+    attempt_id: String,
+    gate_id: String,
+    result: String,
+    invocation_digest: String,
+    invocation: bounded_json::JsonValue,
+    controlled_steps: Vec<bounded_json::JsonValue>,
 }
 
-fn extract_json_usize(content: &str, marker: &str) -> Option<usize> {
-    let (_, value) = content.split_once(marker)?;
-    let digits = value
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    if digits.is_empty() {
-        return None;
+fn parse_evidence_record(path: &Path, content: &str) -> Result<ParsedEvidenceRecord, XtaskError> {
+    let mut object = parse_object(path, content, "engineering evidence")?;
+    require_integer(&mut object, "schema_version", path, 3)?;
+    let attempt_id = require_string(&mut object, "attempt_id", path)?;
+    validate_identity_binding(take_value(&mut object, "collision_of", path)?, path)?;
+    validate_identity_binding(take_value(&mut object, "collision_slots", path)?, path)?;
+    let profile = require_string(&mut object, "profile", path)?;
+    if !matches!(profile.as_str(), "pre-commit" | "pr" | "ext" | "qual") {
+        return invalid_json(path, "profile has an invalid value");
     }
-    digits.parse().ok()
+    let result = require_string(&mut object, "result", path)?;
+    if !matches!(result.as_str(), "passed" | "failed") {
+        return invalid_json(path, "aggregate result has an invalid value");
+    }
+    let merge_eligible = require_boolean(&mut object, "merge_eligible", path)?;
+    let mut source = require_object(&mut object, "source", path)?;
+    let revision = require_string(&mut source, "revision", path)?;
+    if !valid_hex_identity(&revision) {
+        return invalid_json(
+            path,
+            "source revision is not a complete hexadecimal identity",
+        );
+    }
+    require_boolean(&mut source, "dirty", path)?;
+    require_boolean(&mut source, "trusted_ci", path)?;
+    reject_unknown(source, path, "source")?;
+    let started = require_any_integer(&mut object, "started_unix_ms", path)?;
+    let ended = require_any_integer(&mut object, "ended_unix_ms", path)?;
+    if ended < started {
+        return invalid_json(path, "evidence end time precedes its start time");
+    }
+    for field in ["registry_digest", "environment_digest"] {
+        let digest = require_string(&mut object, field, path)?;
+        if !valid_registry_digest(&digest) {
+            return invalid_json(path, format!("`{field}` is invalid"));
+        }
+    }
+    validate_evidence_identity_object(require_object(&mut object, "identity", path)?, path)?;
+    let gates = require_array(&mut object, "gates", path)?;
+    reject_unknown(object, path, "engineering evidence")?;
+    if gates.len() != CANONICAL_GATE_IDS.len() {
+        return invalid_json(path, "evidence must contain exactly 25 gates");
+    }
+    let mut parsed_gates = Vec::with_capacity(gates.len());
+    let mut gate_ids = BTreeSet::new();
+    for gate in gates {
+        let gate = parse_gate_record(gate, path)?;
+        if !gate_ids.insert(gate.gate_id.clone()) {
+            return invalid_json(path, format!("duplicate gate `{}`", gate.gate_id));
+        }
+        parsed_gates.push(gate);
+    }
+    let canonical = CANONICAL_GATE_IDS.into_iter().map(str::to_owned).collect();
+    if gate_ids != canonical {
+        return invalid_json(path, "gate identities do not match the canonical set");
+    }
+    let any_failed = parsed_gates.iter().any(|gate| gate.result == "failed");
+    if (result == "failed") != any_failed || (merge_eligible && result != "passed") {
+        return invalid_json(
+            path,
+            "aggregate result does not match independent gate verdicts",
+        );
+    }
+    Ok(ParsedEvidenceRecord {
+        attempt_id,
+        gates: parsed_gates,
+    })
+}
+
+fn parse_gate_record(
+    value: bounded_json::JsonValue,
+    path: &Path,
+) -> Result<ParsedGateRecord, XtaskError> {
+    let mut object = value
+        .into_object("gate")
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    let gate_id = require_string(&mut object, "gate_id", path)?;
+    let result = require_string(&mut object, "result", path)?;
+    if !matches!(result.as_str(), "passed" | "failed" | "not-selected") {
+        return invalid_json(path, format!("gate `{gate_id}` has an invalid result"));
+    }
+    let duration = require_any_integer(&mut object, "duration_ms", path)?;
+    if result == "not-selected" && duration != 0 {
+        return invalid_json(
+            path,
+            format!("not-selected gate `{gate_id}` reports execution time"),
+        );
+    }
+    let budget = require_any_integer(&mut object, "budget_seconds", path)?;
+    if budget == 0 {
+        return invalid_json(path, format!("gate `{gate_id}` has a zero budget"));
+    }
+    let invocation = take_value(&mut object, "invocation", path)?;
+    let controlled_steps = validate_gate_invocation_value(invocation.clone(), path)?;
+    let command_digest = require_string(&mut object, "command_digest", path)?;
+    if !valid_sha256_digest(&command_digest) {
+        return invalid_json(
+            path,
+            format!("gate `{gate_id}` has an invalid command digest"),
+        );
+    }
+    validate_identity_binding(take_value(&mut object, "owner", path)?, path)?;
+    let raw_report = parse_raw_report_binding(take_value(&mut object, "raw_report", path)?, path)?;
+    let detail = require_string(&mut object, "detail", path)?;
+    if detail.is_empty() {
+        return invalid_json(path, format!("gate `{gate_id}` has an empty detail"));
+    }
+    reject_unknown(object, path, "gate")?;
+    match (result.as_str(), raw_report.applicability.as_str()) {
+        ("not-selected", "not-applicable") if raw_report.reason == "gate-not-selected" => {},
+        ("passed" | "failed", "exact") => {},
+        ("failed", "not-applicable") if raw_report.reason == "report-retention-failed" => {},
+        _ => {
+            return invalid_json(
+                path,
+                format!("gate `{gate_id}` has inconsistent report applicability"),
+            );
+        },
+    }
+    Ok(ParsedGateRecord {
+        gate_id,
+        result,
+        command_digest,
+        invocation,
+        controlled_steps,
+        raw_report,
+    })
+}
+
+fn validate_gate_invocation_value(
+    value: bounded_json::JsonValue,
+    path: &Path,
+) -> Result<Vec<bounded_json::JsonValue>, XtaskError> {
+    let mut object = value
+        .into_object("gate invocation")
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    if require_string(&mut object, "program", path)? != "cargo-xtask-quality/internal"
+        || require_string(&mut object, "working_directory", path)? != "engineering-workspace"
+    {
+        return invalid_json(path, "gate invocation identity is invalid");
+    }
+    let arguments = require_array(&mut object, "arguments", path)?;
+    if !(3..=16).contains(&arguments.len()) {
+        return invalid_json(path, "gate invocation arguments are out of bounds");
+    }
+    validate_string_values(arguments, path, "gate invocation arguments")?;
+    let environment_digest = require_string(&mut object, "environment_digest", path)?;
+    if !valid_sha256_digest(&environment_digest) {
+        return invalid_json(path, "gate invocation environment digest is invalid");
+    }
+    for field in ["timeout_seconds", "memory_mib"] {
+        if require_any_integer(&mut object, field, path)? == 0 {
+            return invalid_json(path, format!("gate invocation `{field}` must be positive"));
+        }
+    }
+    for field in ["activation", "exception_class"] {
+        if require_string(&mut object, field, path)?.is_empty() {
+            return invalid_json(path, format!("gate invocation `{field}` is empty"));
+        }
+    }
+    let controlled_steps = require_array(&mut object, "controlled_steps", path)?;
+    if controlled_steps.len() > MAXIMUM_CONTROLLED_REPORT_STEPS {
+        return invalid_json(path, "gate invocation contains too many controlled steps");
+    }
+    for step in &controlled_steps {
+        validate_controlled_invocation_value(step.clone(), path)?;
+    }
+    reject_unknown(object, path, "gate invocation")?;
+    Ok(controlled_steps)
+}
+
+fn validate_controlled_invocation_value(
+    value: bounded_json::JsonValue,
+    path: &Path,
+) -> Result<(), XtaskError> {
+    let mut object = value
+        .into_object("controlled invocation")
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    for field in ["program", "resolved_program"] {
+        if require_string(&mut object, field, path)?.is_empty() {
+            return invalid_json(path, format!("controlled invocation `{field}` is empty"));
+        }
+    }
+    let arguments = require_array(&mut object, "arguments", path)?;
+    if arguments.len() > 256 {
+        return invalid_json(path, "controlled invocation contains too many arguments");
+    }
+    validate_string_values(arguments, path, "controlled invocation arguments")?;
+    if require_string(&mut object, "working_directory", path)? != "engineering-workspace" {
+        return invalid_json(path, "controlled invocation working directory is invalid");
+    }
+    let digest = require_string(&mut object, "environment_digest", path)?;
+    if !valid_sha256_digest(&digest) {
+        return invalid_json(path, "controlled invocation environment digest is invalid");
+    }
+    if require_any_integer(&mut object, "timeout_ms", path)? == 0 {
+        return invalid_json(path, "controlled invocation timeout is zero");
+    }
+    let input_kind = require_string(&mut object, "input_kind", path)?;
+    let input_bytes = require_any_integer(&mut object, "input_bytes", path)?;
+    let input_sha256 = require_string(&mut object, "input_sha256", path)?;
+    match input_kind.as_str() {
+        "null" if input_bytes == 0 && input_sha256 == "-" => {},
+        "bytes"
+            if input_bytes <= MAXIMUM_RAW_REPORT_BYTES as u128
+                && valid_sha256_digest(&input_sha256) => {},
+        _ => return invalid_json(path, "controlled invocation input binding is invalid"),
+    }
+    reject_unknown(object, path, "controlled invocation")
+}
+
+fn parse_raw_report_binding(
+    value: bounded_json::JsonValue,
+    path: &Path,
+) -> Result<ParsedRawReportBinding, XtaskError> {
+    let mut object = value
+        .into_object("raw report binding")
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    let applicability = require_string(&mut object, "applicability", path)?;
+    let report_path = require_string(&mut object, "path", path)?;
+    let digest = require_string(&mut object, "sha256", path)?;
+    let bytes = usize::try_from(require_any_integer(&mut object, "bytes", path)?)
+        .map_err(|_| XtaskError::invalid_path(path, "raw report byte length exceeds usize"))?;
+    let content_type = require_string(&mut object, "content_type", path)?;
+    let reason = require_string(&mut object, "reason", path)?;
+    reject_unknown(object, path, "raw report binding")?;
+    if bytes > MAXIMUM_RAW_REPORT_BYTES {
+        return invalid_json(
+            path,
+            format!("retained raw report exceeds {MAXIMUM_RAW_REPORT_BYTES} bytes"),
+        );
+    }
+    match applicability.as_str() {
+        "exact"
+            if !report_path.is_empty()
+                && valid_sha256_digest(&digest)
+                && (1..=MAXIMUM_RAW_REPORT_BYTES).contains(&bytes)
+                && content_type == RAW_REPORT_CONTENT_TYPE
+                && reason == "-" => {},
+        "not-applicable"
+            if report_path == "-"
+                && digest == "-"
+                && bytes == 0
+                && content_type == "-"
+                && matches!(
+                    reason.as_str(),
+                    "gate-not-selected" | "report-retention-failed"
+                ) => {},
+        _ => return invalid_json(path, "raw report binding is invalid"),
+    }
+    Ok(ParsedRawReportBinding {
+        applicability,
+        path: report_path,
+        digest,
+        bytes,
+        reason,
+    })
+}
+
+fn parse_raw_report_record(
+    path: &Path,
+    content: &str,
+) -> Result<ParsedRawReportRecord, XtaskError> {
+    let mut object = parse_object(path, content, "raw report")?;
+    require_integer(&mut object, "schema_version", path, 1)?;
+    if require_string(&mut object, "content_type", path)? != RAW_REPORT_CONTENT_TYPE {
+        return invalid_json(path, "raw report content type is invalid");
+    }
+    let attempt_id = require_string(&mut object, "attempt_id", path)?;
+    let gate_id = require_string(&mut object, "gate_id", path)?;
+    let result = require_string(&mut object, "verdict", path)?;
+    if !matches!(result.as_str(), "passed" | "failed") {
+        return invalid_json(path, "raw report verdict is invalid");
+    }
+    require_any_integer(&mut object, "duration_ms", path)?;
+    let invocation_digest = require_string(&mut object, "invocation_digest", path)?;
+    if !valid_sha256_digest(&invocation_digest) {
+        return invalid_json(path, "raw report invocation digest is invalid");
+    }
+    let invocation = take_value(&mut object, "invocation", path)?;
+    let invocation_steps = validate_gate_invocation_value(invocation.clone(), path)?;
+    if require_string(&mut object, "detail", path)?.is_empty() {
+        return invalid_json(path, "raw report detail is empty");
+    }
+    let controlled_step_values = require_array(&mut object, "controlled_steps", path)?;
+    if controlled_step_values.len() > MAXIMUM_CONTROLLED_REPORT_STEPS {
+        return invalid_json(path, "raw report contains too many controlled steps");
+    }
+    let mut controlled_steps = Vec::with_capacity(controlled_step_values.len());
+    let mut charged_bytes = 0_usize;
+    for value in controlled_step_values {
+        let mut step = value
+            .into_object("controlled step report")
+            .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+        let invocation = take_value(&mut step, "invocation", path)?;
+        validate_controlled_invocation_value(invocation.clone(), path)?;
+        let verdict = require_string(&mut step, "verdict", path)?;
+        let stdout = require_string(&mut step, "stdout", path)?;
+        let stderr = require_string(&mut step, "stderr", path)?;
+        reject_unknown(step, path, "controlled step report")?;
+        if stdout.len() > MAXIMUM_CAPTURED_REPORT_STREAM_BYTES
+            || stderr.len() > MAXIMUM_CAPTURED_REPORT_STREAM_BYTES
+        {
+            return invalid_json(path, "controlled step stream exceeds its resource bound");
+        }
+        let step_bytes = verdict
+            .len()
+            .checked_add(stdout.len())
+            .and_then(|bytes| bytes.checked_add(stderr.len()))
+            .and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| XtaskError::invalid_path(path, "raw report size overflow"))?;
+        charged_bytes = charged_bytes
+            .checked_add(step_bytes)
+            .ok_or_else(|| XtaskError::invalid_path(path, "raw report size overflow"))?;
+        if charged_bytes > MAXIMUM_RAW_REPORT_BYTES {
+            return invalid_json(path, "controlled report exceeds its total resource bound");
+        }
+        controlled_steps.push(invocation);
+    }
+    reject_unknown(object, path, "raw report")?;
+    if controlled_steps != invocation_steps {
+        return invalid_json(
+            path,
+            "raw report controlled steps differ from its invocation binding",
+        );
+    }
+    Ok(ParsedRawReportRecord {
+        attempt_id,
+        gate_id,
+        result,
+        invocation_digest,
+        invocation,
+        controlled_steps,
+    })
+}
+
+fn validate_identity_binding(
+    value: bounded_json::JsonValue,
+    path: &Path,
+) -> Result<(), XtaskError> {
+    let mut object = value
+        .into_object("identity binding")
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    let applicability = require_string(&mut object, "applicability", path)?;
+    let value = require_string(&mut object, "value", path)?;
+    let reason = require_string(&mut object, "reason", path)?;
+    reject_unknown(object, path, "identity binding")?;
+    match applicability.as_str() {
+        "exact" if !value.is_empty() && value != "-" && reason == "-" => Ok(()),
+        "not-applicable"
+            if value == "-"
+                && matches!(
+                    reason.as_str(),
+                    "no-collision"
+                        | "no-release-manifest-for-engineering-attempt"
+                        | "no-candidate-artifact-for-engineering-attempt"
+                        | "no-effective-configuration-for-engineering-attempt"
+                        | "no-corpus-selected"
+                        | "no-seed-selected"
+                        | "no-fault-schedule-selected"
+                        | "no-approval-claimed"
+                        | "no-exception-applied"
+                        | "gate-not-selected"
+                        | "unavailable-before-registry-validation"
+                ) =>
+        {
+            Ok(())
+        },
+        _ => invalid_json(path, "identity binding is invalid"),
+    }
+}
+
+fn validate_evidence_identity_object(
+    mut object: bounded_json::JsonObject,
+    path: &Path,
+) -> Result<(), XtaskError> {
+    for field in [
+        "release_manifest",
+        "artifact",
+        "target",
+        "effective_configuration",
+        "corpus",
+        "seed",
+        "fault_schedule",
+        "verifier",
+        "approval",
+        "exception",
+    ] {
+        validate_identity_binding(take_value(&mut object, field, path)?, path)?;
+    }
+    for field in [
+        "target_registry_digest",
+        "toolchain_digest",
+        "fixture_registry_digest",
+    ] {
+        let digest = require_string(&mut object, field, path)?;
+        if !valid_registry_digest(&digest) {
+            return invalid_json(path, format!("identity `{field}` is invalid"));
+        }
+    }
+    reject_unknown(object, path, "evidence identity")
+}
+
+fn validate_evidence_schema_document(path: &Path, content: &str) -> Result<(), XtaskError> {
+    let parsed = bounded_json::parse(content)
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    for field in [
+        "attempt_id",
+        "collision_of",
+        "collision_slots",
+        "merge_eligible",
+        "registry_digest",
+        "release_manifest",
+        "artifact",
+        "target",
+        "target_registry_digest",
+        "environment_digest",
+        "toolchain_digest",
+        "effective_configuration",
+        "fixture_registry_digest",
+        "corpus",
+        "seed",
+        "fault_schedule",
+        "verifier",
+        "approval",
+        "exception",
+        "invocation",
+        "controlled_steps",
+        "command_digest",
+        "owner",
+        "raw_report",
+        "content_type",
+        "sha256",
+        "bytes",
+        "not-selected",
+    ] {
+        if !json_contains_field_or_string(&parsed, field) {
+            return Err(XtaskError::invalid_path(
+                path,
+                format!("evidence schema is missing `{}`", json_string(field)),
+            ));
+        }
+    }
+    let mut schema = parsed
+        .into_object("evidence schema")
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    if require_string(&mut schema, "type", path)? != "object"
+        || require_boolean(&mut schema, "additionalProperties", path)?
+    {
+        return invalid_json(path, "evidence schema must be a closed object");
+    }
+    let required = require_array(&mut schema, "required", path)?;
+    let required = validate_string_values(required, path, "schema required fields")?;
+    for field in [
+        "schema_version",
+        "attempt_id",
+        "collision_of",
+        "collision_slots",
+        "profile",
+        "result",
+        "merge_eligible",
+        "source",
+        "started_unix_ms",
+        "ended_unix_ms",
+        "registry_digest",
+        "environment_digest",
+        "identity",
+        "gates",
+    ] {
+        if !required.contains(field) {
+            return invalid_json(path, format!("schema omits required field `{field}`"));
+        }
+    }
+    let mut properties = require_object(&mut schema, "properties", path)?;
+    let mut version = take_value(&mut properties, "schema_version", path)?
+        .into_object("schema_version definition")
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))?;
+    require_integer(&mut version, "const", path, 3)?;
+    reject_unknown(version, path, "schema_version definition")?;
+    for field in ["attempt_id", "collision_of", "collision_slots", "gates"] {
+        take_value(&mut properties, field, path)?;
+    }
+    let definitions = require_object(&mut schema, "$defs", path)?;
+    for field in [
+        "registryDigest",
+        "sha256Digest",
+        "gateInvocation",
+        "controlledInvocation",
+        "rawReportBinding",
+        "identityBinding",
+    ] {
+        if !definitions.contains_key(field) {
+            return invalid_json(path, format!("schema omits definition `{field}`"));
+        }
+    }
+    Ok(())
+}
+
+fn json_contains_field_or_string(value: &bounded_json::JsonValue, expected: &str) -> bool {
+    match value {
+        bounded_json::JsonValue::String(value) => value == expected,
+        bounded_json::JsonValue::Array(values) => values
+            .iter()
+            .any(|value| json_contains_field_or_string(value, expected)),
+        bounded_json::JsonValue::Object(fields) => fields.iter().any(|(field, value)| {
+            field == expected || json_contains_field_or_string(value, expected)
+        }),
+        bounded_json::JsonValue::Null
+        | bounded_json::JsonValue::Boolean(_)
+        | bounded_json::JsonValue::Integer(_) => false,
+    }
+}
+
+fn parse_object(
+    path: &Path,
+    content: &str,
+    subject: &str,
+) -> Result<bounded_json::JsonObject, XtaskError> {
+    bounded_json::parse(content)
+        .and_then(|value| value.into_object(subject))
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))
+}
+
+fn take_value(
+    object: &mut bounded_json::JsonObject,
+    field: &str,
+    path: &Path,
+) -> Result<bounded_json::JsonValue, XtaskError> {
+    bounded_json::take_required(object, field)
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))
+}
+
+fn require_string(
+    object: &mut bounded_json::JsonObject,
+    field: &str,
+    path: &Path,
+) -> Result<String, XtaskError> {
+    match take_value(object, field, path)? {
+        bounded_json::JsonValue::String(value) => Ok(value),
+        _ => invalid_json(path, format!("`{field}` must be a string")),
+    }
+}
+
+fn require_boolean(
+    object: &mut bounded_json::JsonObject,
+    field: &str,
+    path: &Path,
+) -> Result<bool, XtaskError> {
+    match take_value(object, field, path)? {
+        bounded_json::JsonValue::Boolean(value) => Ok(value),
+        _ => invalid_json(path, format!("`{field}` must be a boolean")),
+    }
+}
+
+fn require_any_integer(
+    object: &mut bounded_json::JsonObject,
+    field: &str,
+    path: &Path,
+) -> Result<u128, XtaskError> {
+    match take_value(object, field, path)? {
+        bounded_json::JsonValue::Integer(value) => Ok(value),
+        _ => invalid_json(path, format!("`{field}` must be an integer")),
+    }
+}
+
+fn require_integer(
+    object: &mut bounded_json::JsonObject,
+    field: &str,
+    path: &Path,
+    expected: u128,
+) -> Result<(), XtaskError> {
+    if require_any_integer(object, field, path)? == expected {
+        Ok(())
+    } else {
+        invalid_json(path, format!("`{field}` must equal {expected}"))
+    }
+}
+
+fn require_object(
+    object: &mut bounded_json::JsonObject,
+    field: &str,
+    path: &Path,
+) -> Result<bounded_json::JsonObject, XtaskError> {
+    take_value(object, field, path)?
+        .into_object(field)
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))
+}
+
+fn require_array(
+    object: &mut bounded_json::JsonObject,
+    field: &str,
+    path: &Path,
+) -> Result<Vec<bounded_json::JsonValue>, XtaskError> {
+    match take_value(object, field, path)? {
+        bounded_json::JsonValue::Array(value) => Ok(value),
+        _ => invalid_json(path, format!("`{field}` must be an array")),
+    }
+}
+
+fn validate_string_values(
+    values: Vec<bounded_json::JsonValue>,
+    path: &Path,
+    subject: &str,
+) -> Result<BTreeSet<String>, XtaskError> {
+    let mut strings = BTreeSet::new();
+    for value in values {
+        let bounded_json::JsonValue::String(value) = value else {
+            return invalid_json(path, format!("{subject} must contain only strings"));
+        };
+        if value.is_empty() || !strings.insert(value) {
+            return invalid_json(
+                path,
+                format!("{subject} contains an empty or duplicate value"),
+            );
+        }
+    }
+    Ok(strings)
+}
+
+fn reject_unknown(
+    object: bounded_json::JsonObject,
+    path: &Path,
+    subject: &str,
+) -> Result<(), XtaskError> {
+    bounded_json::reject_unknown_fields(object, subject)
+        .map_err(|error| XtaskError::invalid_path(path, error.to_string()))
+}
+
+fn invalid_json<T>(path: &Path, detail: impl Into<String>) -> Result<T, XtaskError> {
+    Err(XtaskError::invalid_path(path, detail.into()))
 }
 
 fn run_policy_gate(root: &Path, registry: &Registry) -> Result<String, XtaskError> {
@@ -2660,6 +3311,7 @@ fn run_rust_gate(
     root: &Path,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let format = run_status(
@@ -2668,7 +3320,7 @@ fn run_rust_gate(
         "cargo",
         ["fmt", "--all", "--", "--check"],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     let clippy = run_status(
         root,
@@ -2685,7 +3337,7 @@ fn run_rust_gate(
             "warnings",
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     Ok(format!("{} | {}", format.display, clippy.display))
 }
@@ -2695,6 +3347,7 @@ fn run_safety_gate(
     registry: &Registry,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     for scope in &registry.scopes {
         let source_root = root.join(&scope.path).join("src");
@@ -2745,8 +3398,9 @@ fn run_safety_gate(
     )?;
     let mut evidence = vec!["internal:forbid-unsafe-and-unbounded-source-policy scan".to_owned()];
     if registry.has_m0_04_configuration_scope() {
-        evidence
-            .push(run_configuration_parser_adversarial_tests(root, budget, environment)?.display);
+        evidence.push(
+            run_configuration_parser_adversarial_tests(root, budget, environment, capture)?.display,
+        );
     }
     Ok(evidence.join(" | "))
 }
@@ -2756,6 +3410,7 @@ fn run_security_gate(
     registry: &Registry,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     if !registry.has_m0_04_configuration_scope() {
         return Err(XtaskError::invalid(
@@ -2767,7 +3422,8 @@ fn run_security_gate(
     let threat_model = fs::read_to_string(&path)
         .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
-    let adversarial = run_configuration_parser_adversarial_tests(root, budget, environment)?;
+    let adversarial =
+        run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
     Ok(format!(
         "internal:versioned-parser-threat-model-and-pending-security-owner-review validation | {}",
         adversarial.display
@@ -2778,6 +3434,7 @@ fn run_configuration_parser_adversarial_tests(
     root: &Path,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<CommandOutcome, XtaskError> {
     run_status(
         root,
@@ -2793,7 +3450,7 @@ fn run_configuration_parser_adversarial_tests(
             "preflight_",
         ],
         budget,
-        &[],
+        capture,
     )
 }
 
@@ -2839,6 +3496,7 @@ fn run_secret_gate(
     profile: Profile,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
@@ -2856,7 +3514,7 @@ fn run_secret_gate(
                 ".",
             ],
             remaining(deadline)?,
-            &[],
+            capture,
         )?
         .display,
     );
@@ -2875,7 +3533,7 @@ fn run_secret_gate(
                     ".",
                 ],
                 remaining(deadline)?,
-                &[],
+                capture,
             )?
             .display,
         );
@@ -2889,6 +3547,7 @@ fn run_supply_gate(
     profile: Profile,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
@@ -2899,7 +3558,7 @@ fn run_supply_gate(
             "cargo",
             ["audit", "--deny", "warnings"],
             remaining(deadline)?,
-            &[],
+            capture,
         )?
         .display,
     );
@@ -2911,7 +3570,7 @@ fn run_supply_gate(
                 "cargo",
                 ["vet", "--locked"],
                 remaining(deadline)?,
-                &[],
+                capture,
             )?
             .display,
         );
@@ -2929,6 +3588,7 @@ fn run_test_gate(
     root: &Path,
     budget: Duration,
     environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
     let nextest = run_status(
@@ -2946,7 +3606,7 @@ fn run_test_gate(
             "ci",
         ],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     let doctest = run_status(
         root,
@@ -2954,7 +3614,7 @@ fn run_test_gate(
         "cargo",
         ["test", "--locked", "--workspace", "--doc", "--all-features"],
         remaining(deadline)?,
-        &[],
+        capture,
     )?;
     Ok(format!("{} | {}", nextest.display, doctest.display))
 }
@@ -3253,7 +3913,33 @@ fn run_status<'argument>(
     program: &str,
     arguments: impl IntoIterator<Item = &'argument str>,
     timeout: Duration,
-    environment: &[(&str, &str)],
+    capture: &mut GateCapture,
+) -> Result<CommandOutcome, XtaskError> {
+    run_status_with_options(
+        root,
+        snapshot,
+        program,
+        arguments,
+        StatusOptions {
+            timeout,
+            environment: &[],
+            capture,
+        },
+    )
+}
+
+struct StatusOptions<'environment, 'capture> {
+    timeout: Duration,
+    environment: &'environment [(&'environment str, &'environment str)],
+    capture: &'capture mut GateCapture,
+}
+
+fn run_status_with_options<'argument>(
+    root: &Path,
+    snapshot: &EnvironmentSnapshot,
+    program: &str,
+    arguments: impl IntoIterator<Item = &'argument str>,
+    options: StatusOptions<'_, '_>,
 ) -> Result<CommandOutcome, XtaskError> {
     let arguments = arguments
         .into_iter()
@@ -3262,14 +3948,14 @@ fn run_status<'argument>(
     let resolved_program = snapshot.tool_path(program)?;
     let display = command_display(&resolved_program.to_string_lossy(), &arguments);
     println!("  $ {display}");
-    let invocation_environment = snapshot.invocation_environment(environment)?;
+    let invocation_environment = snapshot.invocation_environment(options.environment)?;
     let input = InvocationInput::Null;
     let invocation = controlled_invocation(
         program,
         resolved_program.as_os_str(),
         &arguments,
         &invocation_environment,
-        timeout,
+        options.timeout,
         &input,
     );
     let verdict = controlled_execution::execute(InvocationSpec {
@@ -3283,28 +3969,27 @@ fn run_status<'argument>(
             maximum_bytes_per_stream: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
         },
         cancellation: Arc::new(AtomicBool::new(false)),
-        deadline: deadline_after(timeout)?,
+        deadline: deadline_after(options.timeout)?,
     })
     .into_result();
     let verdict = match verdict {
         Ok(verdict) => {
             print!("{}", verdict.output.stdout);
             eprint!("{}", verdict.output.stderr);
-            record_controlled_step(ControlledStepReport {
+            let step_verdict = format!("exit-status:{}", verdict.status);
+            options.capture.record(
                 invocation,
-                verdict: format!("exit-status:{}", verdict.status),
-                stdout: verdict.output.stdout.clone(),
-                stderr: verdict.output.stderr.clone(),
-            })?;
+                &step_verdict,
+                &verdict.output.stdout,
+                &verdict.output.stderr,
+            )?;
             verdict
         },
         Err(error) => {
-            record_controlled_step(ControlledStepReport {
-                invocation,
-                verdict: format!("controlled-failure:{}", error.phase.as_str()),
-                stdout: String::new(),
-                stderr: error.detail.clone(),
-            })?;
+            let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
+            options
+                .capture
+                .record(invocation, &step_verdict, "", &error.detail)?;
             return Err(XtaskError::controlled_harness(error));
         },
     };
@@ -3326,7 +4011,7 @@ fn run_capture<'argument>(
     program: &str,
     arguments: impl IntoIterator<Item = &'argument str>,
     timeout: Duration,
-    environment: &[(&str, &str)],
+    capture: Option<&mut GateCapture>,
 ) -> Result<CommandOutcome, XtaskError> {
     run_capture_with_input(
         root,
@@ -3335,9 +4020,10 @@ fn run_capture<'argument>(
         arguments,
         CaptureOptions {
             timeout,
-            environment,
+            environment: &[],
             input: InvocationInput::Null,
         },
+        capture,
     )
 }
 
@@ -3353,6 +4039,7 @@ fn run_capture_with_input<'argument>(
     program: &str,
     arguments: impl IntoIterator<Item = &'argument str>,
     options: CaptureOptions<'_>,
+    capture: Option<&mut GateCapture>,
 ) -> Result<CommandOutcome, XtaskError> {
     let arguments = arguments
         .into_iter()
@@ -3385,21 +4072,22 @@ fn run_capture_with_input<'argument>(
     .into_result();
     let verdict = match verdict {
         Ok(verdict) => {
-            record_controlled_step(ControlledStepReport {
-                invocation,
-                verdict: format!("exit-status:{}", verdict.status),
-                stdout: verdict.output.stdout.clone(),
-                stderr: verdict.output.stderr.clone(),
-            })?;
+            if let Some(capture) = capture {
+                let step_verdict = format!("exit-status:{}", verdict.status);
+                capture.record(
+                    invocation,
+                    &step_verdict,
+                    &verdict.output.stdout,
+                    &verdict.output.stderr,
+                )?;
+            }
             verdict
         },
         Err(error) => {
-            record_controlled_step(ControlledStepReport {
-                invocation,
-                verdict: format!("controlled-failure:{}", error.phase.as_str()),
-                stdout: String::new(),
-                stderr: error.detail.clone(),
-            })?;
+            if let Some(capture) = capture {
+                let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
+                capture.record(invocation, &step_verdict, "", &error.detail)?;
+            }
             return Err(XtaskError::controlled_harness(error));
         },
     };
@@ -4001,7 +4689,7 @@ fn source_identity(
         "git",
         ["rev-parse", "HEAD"],
         Duration::from_secs(10),
-        &[],
+        None,
     )?
     .stdout
     .trim()
@@ -4018,7 +4706,7 @@ fn source_identity(
         "git",
         ["status", "--porcelain=v1", "--untracked-files=all"],
         Duration::from_secs(10),
-        &[],
+        None,
     )?
     .stdout;
     let dirty = !status.trim().is_empty();
@@ -4083,6 +4771,7 @@ fn digest_files(
             environment: &[],
             input: InvocationInput::Bytes(payload),
         },
+        None,
     )?;
     if output.stdout.is_empty() {
         return Err(XtaskError::command(
@@ -4116,34 +4805,173 @@ fn write_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, XtaskErro
     let directory = root.join("target/quality/evidence");
     fs::create_dir_all(&directory)
         .map_err(|source| XtaskError::io(format!("create {}", directory.display()), source))?;
-    let path = directory.join(format!("{}.json", evidence.attempt_id));
-    if path.exists() {
-        let retained = retain_collision_evidence(root, &directory, evidence)?;
+    let reservation = AttemptReservation::reserve(&directory, evidence)?;
+    let collided = reservation.collided;
+    let retained = reservation.commit(root)?;
+    if collided {
         return Err(collision_error(evidence, &retained));
     }
-    let serialized = evidence_json(evidence);
-    validate_serialized_evidence(evidence, &serialized)?;
-    write_raw_reports(root, evidence)?;
-    let opened = fs::OpenOptions::new()
+    Ok(retained)
+}
+
+struct AttemptReservation {
+    path: PathBuf,
+    file: fs::File,
+    evidence: Evidence,
+    collided: bool,
+}
+
+impl AttemptReservation {
+    fn reserve(directory: &Path, attempted: &Evidence) -> Result<Self, XtaskError> {
+        let canonical = directory.join(format!("{}.json", attempted.attempt_id));
+        match reserve_new_file(&canonical) {
+            Ok(file) => {
+                return Ok(Self {
+                    path: canonical,
+                    file,
+                    evidence: attempted.clone(),
+                    collided: false,
+                });
+            },
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!("reserve engineering evidence {}", canonical.display()),
+                    source,
+                ));
+            },
+        }
+
+        for slot in 0..COLLISION_SLOT_COUNT {
+            let collision_id = format!("{}-collision-{slot:02}", attempted.attempt_id);
+            let path = directory.join(format!("{collision_id}.json"));
+            match reserve_new_file(&path) {
+                Ok(file) => {
+                    let evidence = collision_evidence(
+                        attempted,
+                        collision_id,
+                        format!("collision-{slot:02}"),
+                        "engineering evidence attempt collision; original bytes preserved",
+                    )?;
+                    return Ok(Self {
+                        path,
+                        file,
+                        evidence,
+                        collided: true,
+                    });
+                },
+                Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
+                Err(source) => {
+                    return Err(XtaskError::io(
+                        format!("reserve collision evidence {}", path.display()),
+                        source,
+                    ));
+                },
+            }
+        }
+
+        let exhaustion_id = format!("{}-collision-exhausted", attempted.attempt_id);
+        let path = directory.join(format!("{exhaustion_id}.json"));
+        let file = match reserve_new_file(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+                return Err(collision_error(attempted, &path));
+            },
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!("reserve collision-exhaustion evidence {}", path.display()),
+                    source,
+                ));
+            },
+        };
+        let evidence = collision_evidence(
+            attempted,
+            exhaustion_id,
+            COLLISION_OCCUPIED_SET.to_owned(),
+            "all 16 deterministic collision slots were already occupied; every existing byte was preserved",
+        )?;
+        Ok(Self {
+            path,
+            file,
+            evidence,
+            collided: true,
+        })
+    }
+
+    fn commit(mut self, root: &Path) -> Result<PathBuf, XtaskError> {
+        let serialized = evidence_json(&self.evidence);
+        validate_serialized_evidence(&self.evidence, &serialized)?;
+        if let Err(error) = write_raw_reports(root, &self.evidence) {
+            self.evidence = report_retention_failure_evidence(&self.evidence, &error)?;
+            let failed = evidence_json(&self.evidence);
+            validate_serialized_evidence(&self.evidence, &failed)?;
+            self.file.write_all(failed.as_bytes()).map_err(|source| {
+                XtaskError::io(
+                    format!("write failed reservation {}", self.path.display()),
+                    source,
+                )
+            })?;
+            return Err(error);
+        }
+        self.file
+            .write_all(serialized.as_bytes())
+            .map_err(|source| {
+                XtaskError::io(
+                    format!("write engineering evidence {}", self.path.display()),
+                    source,
+                )
+            })?;
+        Ok(self.path)
+    }
+}
+
+fn reserve_new_file(path: &Path) -> Result<fs::File, std::io::Error> {
+    fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path);
-    let mut file = match opened {
-        Ok(file) => file,
-        Err(source) if source.kind() == ErrorKind::AlreadyExists => {
-            let retained = retain_collision_evidence(root, &directory, evidence)?;
-            return Err(collision_error(evidence, &retained));
-        },
-        Err(source) => {
-            return Err(XtaskError::io(
-                format!("create new engineering evidence {}", path.display()),
-                source,
-            ));
-        },
-    };
-    file.write_all(serialized.as_bytes())
-        .map_err(|source| XtaskError::io(format!("write {}", path.display()), source))?;
-    Ok(path)
+        .open(path)
+}
+
+fn collision_evidence(
+    attempted: &Evidence,
+    attempt_id: String,
+    collision_slots: String,
+    detail: &str,
+) -> Result<Evidence, XtaskError> {
+    let mut collision = attempted.clone();
+    collision.attempt_id = attempt_id;
+    collision.collision_of = IdentityBinding::exact(attempted.attempt_id.clone());
+    collision.collision_slots = IdentityBinding::exact(collision_slots);
+    collision.result = GateStatus::Failed;
+    collision.merge_eligible = false;
+    collision.ended_unix_ms = unix_time_ms()?;
+    collision.gates = collision_gate_attempts(&collision.attempt_id, &attempted.gates, detail);
+    Ok(collision)
+}
+
+fn report_retention_failure_evidence(
+    reserved: &Evidence,
+    error: &XtaskError,
+) -> Result<Evidence, XtaskError> {
+    let mut failed = reserved.clone();
+    failed.result = GateStatus::Failed;
+    failed.merge_eligible = false;
+    failed.ended_unix_ms = unix_time_ms()?;
+    let detail = bounded_detail(&format!("raw report retention failed closed: {error}"));
+    failed.gates = collision_gate_attempts(&failed.attempt_id, &reserved.gates, &detail);
+    for gate in &mut failed.gates {
+        if gate.gate_id == "EG-00" {
+            gate.raw_report =
+                RawReportBinding::NotApplicable(NotApplicableReason::ReportRetentionFailed);
+            gate.raw_report_content = None;
+            gate.detail.clone_from(&detail);
+        }
+    }
+    Ok(failed)
+}
+
+fn bounded_detail(detail: &str) -> String {
+    detail.chars().take(16_384).collect()
 }
 
 fn collision_error(evidence: &Evidence, retained: &Path) -> XtaskError {
@@ -4184,7 +5012,10 @@ fn write_raw_reports(root: &Path, evidence: &Evidence) -> Result<(), XtaskError>
             .open(&report_path)
             .map_err(|source| {
                 XtaskError::io(
-                    format!("create new raw report {}", report_path.display()),
+                    format!(
+                        "engineering evidence raw report: create new {}",
+                        report_path.display()
+                    ),
                     source,
                 )
             })?;
@@ -4200,107 +5031,6 @@ fn write_raw_reports(root: &Path, evidence: &Evidence) -> Result<(), XtaskError>
         }
     }
     Ok(())
-}
-
-fn retain_collision_evidence(
-    root: &Path,
-    directory: &Path,
-    attempted: &Evidence,
-) -> Result<PathBuf, XtaskError> {
-    for slot in 0..COLLISION_SLOT_COUNT {
-        let collision_id = format!("{}-collision-{slot:02}", attempted.attempt_id);
-        let path = directory.join(format!("{collision_id}.json"));
-        if path.exists() {
-            continue;
-        }
-        let mut collision = attempted.clone();
-        collision.attempt_id = collision_id;
-        collision.collision_of = IdentityBinding::exact(attempted.attempt_id.clone());
-        collision.collision_slots = IdentityBinding::exact(format!("collision-{slot:02}"));
-        collision.result = GateStatus::Failed;
-        collision.merge_eligible = false;
-        collision.ended_unix_ms = unix_time_ms()?;
-        collision.gates = collision_gate_attempts(
-            &collision.attempt_id,
-            &attempted.gates,
-            "engineering evidence attempt collision; original bytes preserved",
-        );
-        let serialized = evidence_json(&collision);
-        validate_serialized_evidence(&collision, &serialized)?;
-        write_raw_reports(root, &collision)?;
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(serialized.as_bytes()).map_err(|source| {
-                    XtaskError::io(
-                        format!("write collision evidence {}", path.display()),
-                        source,
-                    )
-                })?;
-                return Ok(path);
-            },
-            Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
-            Err(source) => {
-                return Err(XtaskError::io(
-                    format!("create collision evidence {}", path.display()),
-                    source,
-                ));
-            },
-        }
-    }
-    retain_collision_exhaustion(root, directory, attempted)
-}
-
-fn retain_collision_exhaustion(
-    root: &Path,
-    directory: &Path,
-    attempted: &Evidence,
-) -> Result<PathBuf, XtaskError> {
-    let exhaustion_id = format!("{}-collision-exhausted", attempted.attempt_id);
-    let path = directory.join(format!("{exhaustion_id}.json"));
-    if path.exists() {
-        return Ok(path);
-    }
-    let mut exhausted = attempted.clone();
-    exhausted.attempt_id = exhaustion_id;
-    exhausted.collision_of = IdentityBinding::exact(attempted.attempt_id.clone());
-    exhausted.collision_slots = IdentityBinding::exact(COLLISION_OCCUPIED_SET);
-    exhausted.result = GateStatus::Failed;
-    exhausted.merge_eligible = false;
-    exhausted.ended_unix_ms = unix_time_ms()?;
-    exhausted.gates = collision_gate_attempts(
-        &exhausted.attempt_id,
-        &attempted.gates,
-        "all 16 deterministic collision slots were already occupied; every existing byte was preserved",
-    );
-    let serialized = evidence_json(&exhausted);
-    validate_serialized_evidence(&exhausted, &serialized)?;
-    write_raw_reports(root, &exhausted)?;
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(serialized.as_bytes()).map_err(|source| {
-                XtaskError::io(
-                    format!("write collision-exhaustion evidence {}", path.display()),
-                    source,
-                )
-            })?;
-        },
-        Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
-        Err(source) => {
-            return Err(XtaskError::io(
-                format!("create collision-exhaustion evidence {}", path.display()),
-                source,
-            ));
-        },
-    }
-    Ok(path)
 }
 
 fn collision_gate_attempts(
@@ -4446,6 +5176,11 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
                 None,
                 GateStatus::NotSelected,
             ) => {},
+            (
+                RawReportBinding::NotApplicable(NotApplicableReason::ReportRetentionFailed),
+                None,
+                GateStatus::Failed,
+            ) if gate.gate_id == "EG-00" => {},
             (RawReportBinding::Exact { .. }, Some(_), GateStatus::Passed | GateStatus::Failed) => {
                 validate_raw_report_binding(&evidence.attempt_id, gate)?;
             },
@@ -4460,28 +5195,7 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
             },
         }
     }
-    for required in [
-        "\"schema_version\": 3",
-        "\"attempt_id\"",
-        "\"collision_of\"",
-        "\"collision_slots\"",
-        "\"merge_eligible\"",
-        "\"registry_digest\"",
-        "\"environment_digest\"",
-        "\"identity\"",
-        "\"invocation\"",
-        "\"command_digest\"",
-        "\"owner\"",
-        "\"raw_report\"",
-        "\"gates\"",
-    ] {
-        if !serialized.contains(required) {
-            return Err(XtaskError::invalid(
-                "engineering evidence serialization",
-                format!("required field `{required}` is missing"),
-            ));
-        }
-    }
+    parse_evidence_record(Path::new("in-memory-engineering-evidence.json"), serialized)?;
     Ok(())
 }
 
@@ -4580,25 +5294,42 @@ fn validate_raw_report_binding(attempt_id: &str, gate: &GateAttempt) -> Result<(
             ),
         ));
     }
-    for required in [
-        format!("\"attempt_id\": {}", json_string(attempt_id)),
-        format!("\"gate_id\": {}", json_string(&gate.gate_id)),
-        format!("\"verdict\": {}", json_string(gate.result.as_str())),
-        format!(
-            "\"invocation_digest\": {}",
-            json_string(&gate.command_digest)
-        ),
-        format!("\"content_type\": {}", json_string(RAW_REPORT_CONTENT_TYPE)),
-    ] {
-        if !content.contains(&required) {
-            return Err(XtaskError::invalid(
+    let parsed = parse_raw_report_record(Path::new(path), content)?;
+    let invocation =
+        bounded_json::parse(&gate_invocation_json(&gate.invocation)).map_err(|error| {
+            XtaskError::invalid(
                 "engineering evidence raw report",
-                format!(
-                    "gate `{}` report omitted exact field `{required}`",
-                    gate.gate_id
-                ),
-            ));
-        }
+                format!("gate invocation cannot be parsed: {error}"),
+            )
+        })?;
+    let controlled_steps = gate
+        .invocation
+        .controlled_steps
+        .iter()
+        .map(controlled_invocation_json)
+        .map(|step| {
+            bounded_json::parse(&step).map_err(|error| {
+                XtaskError::invalid(
+                    "engineering evidence raw report",
+                    format!("controlled invocation cannot be parsed: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.attempt_id != attempt_id
+        || parsed.gate_id != gate.gate_id
+        || parsed.result != gate.result.as_str()
+        || parsed.invocation_digest != gate.command_digest
+        || parsed.invocation != invocation
+        || parsed.controlled_steps != controlled_steps
+    {
+        return Err(XtaskError::invalid(
+            "engineering evidence raw report",
+            format!(
+                "gate `{}` report does not exactly cross-reference its evidence",
+                gate.gate_id
+            ),
+        ));
     }
     Ok(())
 }

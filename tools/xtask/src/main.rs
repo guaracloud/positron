@@ -10,6 +10,7 @@ mod api_generation;
 mod config_generation;
 mod controlled_execution;
 mod error;
+mod evidence_json;
 mod generation;
 mod hooks;
 mod quality;
