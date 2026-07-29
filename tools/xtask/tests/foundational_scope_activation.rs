@@ -5482,7 +5482,7 @@ fn inject_dependency_metadata_artifact_barrier(root: &Path) -> TestResult {
     replace_once(
         &source,
         "    let summary = validate_dependency_metadata_artifact(root, &artifact)?;\n",
-        "    dependency_metadata_artifact_barrier(root, &artifact_path)?;\n    let summary = validate_dependency_metadata_artifact(root, &artifact)?;\n",
+        "    dependency_metadata_artifact_barrier(root, artifact.diagnostic_path())?;\n    let summary = validate_dependency_metadata_artifact(root, &artifact)?;\n",
     )?;
     replace_once(
         &source,
