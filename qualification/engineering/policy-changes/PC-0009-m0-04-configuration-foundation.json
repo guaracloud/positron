@@ -125,7 +125,7 @@
     "value_domain_positive_and_exact_boundaries": "accepts_each_closed_value_and_exact_numeric_and_address_boundaries",
     "value_domain_invalid_types_values_and_paths": "rejects_invalid_shapes_and_values_from_each_closed_value_domain",
     "schema_and_root_table_variants": "requires_an_explicit_supported_schema_version_for_file_configuration; rejects_empty_unknown_root_table_before_iterating_children; rejects_nonempty_unknown_root_table; rejects_unknown_or_non_table_root_sections_before_setting_application; accepts_known_empty_root_tables_without_changing_default_values",
-    "preflight_resource_malformed_comment_string_and_escape_paths": "preflight_rejects_adversarial_toml_before_unbounded_parse_allocation; preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape; preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax; preflight_preserves_blank_lines_single_quoted_literals_and_escaped_quotes",
+    "preflight_resource_malformed_comment_string_and_escape_paths": "preflight_rejects_adversarial_toml_before_unbounded_parse_allocation; preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape; preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax; preflight_preserves_blank_lines_single_quoted_literals_and_escaped_quotes; malformed_quote_state_precedes_scalar_resource_classification; quoted_key_separator_scanning_preserves_syntax_and_resource_precedence",
     "redaction_and_opaque_protected_references": "raw_configuration_inputs_and_failures_never_format_secret_canaries; rejects_each_reachable_immutable_change_with_its_semantic_source",
     "mutability_classes_combinations_and_priority": "returns_only_checked_mutability_plans_and_rejects_immutable_changes; plans_no_change_and_mixed_mutability_with_closed_priority; rejects_each_reachable_immutable_change_with_its_semantic_source",
     "generated_metadata_schema_and_reference": "exposes_the_complete_canonical_setting_contract_and_compiled_defaults; generated_schema_and_reference_are_deterministic_and_secret_safe; rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity",
@@ -136,8 +136,8 @@
     "trusted_run_id": 30422346238,
     "trusted_artifact_id": 8712581081,
     "classification_counts": {
-      "real": 18,
-      "semantic_equivalent_or_impossible": 23,
+      "real": 31,
+      "semantic_equivalent_or_impossible": 10,
       "total": 41
     },
     "groups": [
@@ -191,8 +191,8 @@
         "misses": [
           "13: replace terminal quote-or-escape || with && at lib.rs:917:24"
         ],
-        "public_invariant": "The maintained TOML parser remains the final syntax authority and returns the same closed Malformed outcome for unterminated strings.",
-        "remediation": "Removed duplicate terminal quote-syntax validation from comment stripping."
+        "public_invariant": "The escaped state implies an open double quote, so the retained boolean mutation is expression-equivalent; however, terminal quote-state validation is a real public owner because Malformed must precede scalar ResourceLimit when an unterminated string also exceeds 256 bytes.",
+        "remediation": "Replaced the equivalent quote-or-escape disjunction with the structurally sufficient quote.is_some check. malformed_quote_state_precedes_scalar_resource_classification proves under-limit unterminated, over-limit well-formed, and unterminated-plus-over-limit typed outcomes."
       },
       {
         "owner": "preflight_table_header",
@@ -219,7 +219,7 @@
       },
       {
         "owner": "unquoted_equals",
-        "classification": "semantic-equivalent",
+        "classification": "real",
         "misses": [
           "21: replace escaped guard with true at lib.rs:951:26",
           "22: replace escaped guard with false at lib.rs:951:26",
@@ -233,11 +233,19 @@
           "30: replace backslash == with != at lib.rs:952:36",
           "31: replace double-quote == with != at lib.rs:953:36",
           "32: replace single-quote == with != at lib.rs:954:37",
-          "33: replace quote-open || with && at lib.rs:956:38",
+          "33: replace quote-open || with && at lib.rs:956:38"
+        ],
+        "public_invariant": "Separator discovery precedes bare-key rejection and must keep equals signs inside bounded quoted key tokens. A well-formed quoted key of 65 bytes returns ResourceLimit after the complete key is measured, while a quoted key of exactly 64 bytes remains Malformed as unsupported canonical syntax.",
+        "remediation": "Restored the registered bounded quote-aware separator scan. quoted_key_separator_scanning_preserves_syntax_and_resource_precedence exercises valid TOML double, single, and escaped quoted keys containing equals signs and the exact 64/65-byte classification boundary."
+      },
+      {
+        "owner": "unquoted_equals",
+        "classification": "semantic-equivalent",
+        "misses": [
           "34: replace terminal quote-or-escape || with && at lib.rs:961:24"
         ],
-        "public_invariant": "The supported subset permits only bare keys, so the first equals sign is necessarily the key-value separator and quoted scalar equals signs occur only after it.",
-        "remediation": "Retained the registered unquoted_equals owner and reduced it to line.find('='); removed the duplicate quote-state machine without changing its selector."
+        "public_invariant": "The escaped state implies an open double quote, and an unterminated quoted key without an external separator returns Malformed whether terminal detection happens in the owner or its caller.",
+        "remediation": "Removed the equivalent escaped operand while retaining terminal open-quote rejection in the bounded quote-aware owner."
       },
       {
         "owner": "preflight_key",
@@ -596,6 +604,44 @@
         }
       ],
       "result": "All 30 public configuration tests, four generator tests, the exact-owner selector test, the parser threat-model test, and all six preflight security tests passed. Deterministic generation was byte-identical with no artifact drift; formatting and focused Clippy passed. No local coverage, mutation, or extended profile ran, and no trusted mutation outcome is predicted."
+    },
+    {
+      "id": "mutation-remediation-first-independent-review",
+      "status": "failed-independent-review",
+      "source_revision": "21e83090a1c520ca284bcc44a400b986fee26f2a",
+      "review_axes": {
+        "standards": "passed with no hard violations",
+        "spec": "failed with one P1 compound-classification finding"
+      },
+      "result": "The fresh read-only Spec review found that removing terminal quote validation changed an unterminated over-limit scalar from Malformed to ResourceLimit and replacing quote-aware separator discovery with line.find('=') changed a well-formed oversized quoted key containing an embedded equals sign from ResourceLimit to Malformed. The review result is retained; no code was changed during review."
+    },
+    {
+      "id": "compound-classification-test-command-shape-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation malformed_quote_state_precedes_scalar_resource_classification quoted_key_separator_scanning_preserves_syntax_and_resource_precedence",
+      "result": "Cargo rejected the diagnostic command because it accepts only one test-name filter. This command-shape failure is retained and is not a product-test result."
+    },
+    {
+      "id": "compound-classification-public-regressions-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation",
+      "result": "The 32-test public suite established the review finding: 30 tests passed, while malformed_quote_state_precedes_scalar_resource_classification and quoted_key_separator_scanning_preserves_syntax_and_resource_precedence failed against the pushed refactor's changed typed outcomes."
+    },
+    {
+      "id": "compound-classification-format-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo fmt --all -- --check",
+      "result": "Rustfmt reported one test-only array-layout difference. cargo fmt --all applied only that mechanical formatting."
+    },
+    {
+      "id": "compound-classification-focused-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package positron-config --test configuration_foundation",
+        "cargo fmt --all -- --check",
+        "cargo clippy --locked --package positron-config --all-targets --all-features -- -D warnings"
+      ],
+      "result": "All 32 public configuration tests passed after restoring only the bounded terminal quote-state and quote-aware separator owners. Formatting and focused positron-config Clippy passed with warnings denied. No local coverage, mutation, or extended profile ran, and no trusted mutation outcome is predicted."
     }
   ],
   "detection_gained": [

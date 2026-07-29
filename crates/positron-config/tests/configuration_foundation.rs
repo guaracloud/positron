@@ -1392,6 +1392,55 @@ fn comment_markers_inside_supported_string_forms_preserve_the_complete_value()
 }
 
 #[test]
+fn malformed_quote_state_precedes_scalar_resource_classification() {
+    let unterminated_under_limit =
+        inputs(Some("schema_version = \"unterminated\n"), [], []).and_then(resolve);
+    assert_document_rejection(
+        unterminated_under_limit,
+        ConfigurationFailureCode::Malformed,
+    );
+
+    let well_formed_over_limit = format!("schema_version = \"{}\"\n", "1".repeat(257));
+    assert_document_rejection(
+        inputs(Some(&well_formed_over_limit), [], []).and_then(resolve),
+        ConfigurationFailureCode::ResourceLimit,
+    );
+
+    let unterminated_over_limit = format!("schema_version = \"{}\n", "1".repeat(257));
+    assert_document_rejection(
+        inputs(Some(&unterminated_over_limit), [], []).and_then(resolve),
+        ConfigurationFailureCode::Malformed,
+    );
+}
+
+#[test]
+fn quoted_key_separator_scanning_preserves_syntax_and_resource_precedence() {
+    for quoted_key in ["\"unknown=key\"", "'unknown=key'", "\"unknown\\\"=key\""] {
+        let document = format!("schema_version = 1\n{quoted_key} = 1\n");
+        assert_document_rejection(
+            inputs(Some(&document), [], []).and_then(resolve),
+            ConfigurationFailureCode::Malformed,
+        );
+    }
+
+    let exact_key = format!("\"{}=\"", "k".repeat(61));
+    assert_eq!(exact_key.len(), 64);
+    let exact_document = format!("schema_version = 1\n{exact_key} = 1\n");
+    assert_document_rejection(
+        inputs(Some(&exact_document), [], []).and_then(resolve),
+        ConfigurationFailureCode::Malformed,
+    );
+
+    let oversized_key = format!("\"{}=\"", "k".repeat(62));
+    assert_eq!(oversized_key.len(), 65);
+    let oversized_document = format!("schema_version = 1\n{oversized_key} = 1\n");
+    assert_document_rejection(
+        inputs(Some(&oversized_document), [], []).and_then(resolve),
+        ConfigurationFailureCode::ResourceLimit,
+    );
+}
+
+#[test]
 fn preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape() {
     for document in [
         "schema_version 1\n",
@@ -1566,6 +1615,20 @@ fn assert_resource_limit(document: &str) {
         Err(error)
             if error.code() == ConfigurationFailureCode::ResourceLimit
                 && error.source() == positron_config::FailureSource::ConfigurationDocument
+    ));
+}
+
+fn assert_document_rejection<T>(
+    result: Result<T, ConfigurationFailure>,
+    code: ConfigurationFailureCode,
+) {
+    assert!(matches!(
+        result,
+        Err(error)
+            if error.code() == code
+                && error.source() == FailureSource::ConfigurationDocument
+                && error.retry_class() == RetryClass::AfterInputCorrection
+                && error.completion_state() == CompletionState::Rejected
     ));
 }
 

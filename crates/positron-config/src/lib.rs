@@ -872,7 +872,7 @@ fn preflight_toml(file: &str) -> Result<(), ConfigurationFailure> {
             }
             continue;
         }
-        let Some(separator) = unquoted_equals(line) else {
+        let Some(separator) = unquoted_equals(line)? else {
             return Err(document_failure(ConfigurationFailureCode::Malformed));
         };
         let key = line
@@ -914,6 +914,9 @@ fn content_before_comment(line: &str) -> Result<&str, ConfigurationFailure> {
             None => {},
         }
     }
+    if quote.is_some() {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
     Ok(line)
 }
 
@@ -938,8 +941,25 @@ fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
     Ok(())
 }
 
-fn unquoted_equals(line: &str) -> Option<usize> {
-    line.find('=')
+fn unquoted_equals(line: &str) -> Result<Option<usize>, ConfigurationFailure> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some('"') if character == '"' => quote = None,
+            Some('\'') if character == '\'' => quote = None,
+            Some(_) => {},
+            None if character == '"' || character == '\'' => quote = Some(character),
+            None if character == '=' => return Ok(Some(index)),
+            None => {},
+        }
+    }
+    if quote.is_some() {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    Ok(None)
 }
 
 fn preflight_key(key: &str) -> Result<(), ConfigurationFailure> {
