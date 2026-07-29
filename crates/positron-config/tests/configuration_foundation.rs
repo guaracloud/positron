@@ -1,6 +1,6 @@
 //! Public contract tests for the M0 Configuration foundation.
 
-use std::error::Error;
+use std::{error::Error, io};
 
 use positron_config::{
     CommandLineOverrides, CompletionState, ConfigurationFailure, ConfigurationFailureCode,
@@ -9,6 +9,193 @@ use positron_config::{
     SettingSource, ValueDomain, generated_json_schema, generated_reference, resolve,
     setting_definition,
 };
+
+#[derive(Debug)]
+struct GeneratedConfigurationFixture {
+    id: String,
+    class: String,
+    document: String,
+    expected: Option<ConfigurationFailureCode>,
+}
+
+#[test]
+fn generated_validation_fixtures_execute_through_the_public_resolver() -> Result<(), Box<dyn Error>>
+{
+    let fixture_document = include_str!("../../../configuration/validation-fixtures.json");
+    let fixtures = parse_generated_configuration_fixtures(fixture_document)?;
+    assert_eq!(
+        fixtures
+            .iter()
+            .map(|fixture| fixture.class.as_str())
+            .collect::<Vec<_>>(),
+        ["positive", "boundary", "negative", "adversarial"]
+    );
+    assert_eq!(
+        json_unsigned_field(fixture_document, "maximum_document_bytes")?,
+        16_384
+    );
+    assert_eq!(
+        generated_json_schema(),
+        include_str!("../../../configuration/schema.json")
+    );
+    assert_eq!(
+        generated_reference(),
+        include_str!("../../../configuration/reference.md")
+    );
+
+    for fixture in fixtures {
+        let result = inputs(Some(&fixture.document), [], []).and_then(resolve);
+        match fixture.expected {
+            None => {
+                result.map_err(|error| {
+                    io::Error::other(format!(
+                        "generated fixture `{}` was rejected: {error}",
+                        fixture.id
+                    ))
+                })?;
+            },
+            Some(expected) => {
+                let error = result.err().ok_or_else(|| {
+                    io::Error::other(format!(
+                        "generated fixture `{}` was unexpectedly accepted",
+                        fixture.id
+                    ))
+                })?;
+                assert_eq!(error.code(), expected, "{}", fixture.id);
+                assert_eq!(
+                    error.source(),
+                    FailureSource::ConfigurationDocument,
+                    "{}",
+                    fixture.id
+                );
+            },
+        }
+    }
+    Ok(())
+}
+
+fn parse_generated_configuration_fixtures(
+    document: &str,
+) -> Result<Vec<GeneratedConfigurationFixture>, Box<dyn Error>> {
+    let mut fixtures = Vec::new();
+    for line in document.lines().map(str::trim) {
+        if !line.starts_with("{\"id\":") {
+            continue;
+        }
+        let id = config_json_string_field(line, "id")?;
+        let class = config_json_string_field(line, "class")?;
+        let expected_name = config_json_string_field(line, "expected")?;
+        let expected = match expected_name.as_str() {
+            "accepted" => None,
+            "unknown_setting" => Some(ConfigurationFailureCode::UnknownSetting),
+            "resource_limit" => Some(ConfigurationFailureCode::ResourceLimit),
+            _ => {
+                return Err(io::Error::other(format!(
+                    "unknown generated configuration outcome `{expected_name}`"
+                ))
+                .into());
+            },
+        };
+        let document = match optional_config_json_string_field(line, "toml")? {
+            Some(toml) => toml,
+            None => {
+                let repeated = config_json_string_field(line, "repeat")?;
+                let bytes = json_unsigned_field(line, "bytes")?;
+                if repeated.len() != 1 {
+                    return Err(io::Error::other(
+                        "generated repetition recipe must use one ASCII byte",
+                    )
+                    .into());
+                }
+                repeated.repeat(bytes)
+            },
+        };
+        fixtures.push(GeneratedConfigurationFixture {
+            id,
+            class,
+            document,
+            expected,
+        });
+    }
+    if fixtures.len() != 4 {
+        return Err(
+            io::Error::other("expected exactly four generated configuration fixtures").into(),
+        );
+    }
+    Ok(fixtures)
+}
+
+fn optional_config_json_string_field(
+    document: &str,
+    field: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let needle = format!("\"{field}\": \"");
+    if !document.contains(&needle) {
+        return Ok(None);
+    }
+    config_json_string_field(document, field).map(Some)
+}
+
+fn config_json_string_field(document: &str, field: &str) -> Result<String, Box<dyn Error>> {
+    let needle = format!("\"{field}\": \"");
+    let start = document
+        .find(&needle)
+        .map(|offset| offset + needle.len())
+        .ok_or_else(|| io::Error::other(format!("missing generated fixture field `{field}`")))?;
+    let encoded = document
+        .get(start..)
+        .ok_or_else(|| io::Error::other(format!("invalid fixture field offset for `{field}`")))?;
+    let mut decoded = String::new();
+    let mut escaped = false;
+    for character in encoded.chars() {
+        if escaped {
+            decoded.push(match character {
+                '"' => '"',
+                '\\' => '\\',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "unsupported JSON escape in generated fixture field `{field}`"
+                    ))
+                    .into());
+                },
+            });
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Ok(decoded);
+        } else {
+            decoded.push(character);
+        }
+    }
+    Err(io::Error::other(format!("unterminated generated fixture field `{field}`")).into())
+}
+
+fn json_unsigned_field(document: &str, field: &str) -> Result<usize, Box<dyn Error>> {
+    let needle = format!("\"{field}\": ");
+    let start = document
+        .find(&needle)
+        .map(|offset| offset + needle.len())
+        .ok_or_else(|| io::Error::other(format!("missing generated fixture field `{field}`")))?;
+    let encoded = document
+        .get(start..)
+        .ok_or_else(|| io::Error::other(format!("invalid fixture field offset for `{field}`")))?;
+    let digits = encoded
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() {
+        return Err(
+            io::Error::other(format!("generated fixture field `{field}` is not unsigned")).into(),
+        );
+    }
+    digits
+        .parse::<usize>()
+        .map_err(|error| io::Error::other(format!("invalid generated integer: {error}")).into())
+}
 
 #[test]
 fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()

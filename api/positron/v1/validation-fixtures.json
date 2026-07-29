@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "generated_from": "api/positron/v1/positron.proto",
+  "schema_digest": "2807ac4ab5ada79d1dac1e9c64e01b57e9e61c22646296dc59a06652fa122036",
+  "cases": [
+    {"id": "current-client", "class": "positive", "grpc_hex": "08011001", "http_json": "{\"api_major\":1,\"capability\":1}", "expected_availability": "CAPABILITY_AVAILABILITY_IMPLEMENTED", "expected_error": "PUBLIC_ERROR_CODE_UNSPECIFIED"},
+    {"id": "maximum-api-major", "class": "boundary", "grpc_hex": "08ffffffff0f1001", "http_json": "{\"api_major\":4294967295,\"capability\":1}", "expected_availability": "CAPABILITY_AVAILABILITY_VERSION_INCOMPATIBLE", "expected_error": "PUBLIC_ERROR_CODE_UNSUPPORTED_API_VERSION"},
+    {"id": "unknown-field", "class": "negative", "grpc_hex": "080110011801", "http_json": "{\"api_major\":1,\"capability\":1,\"unknown\":1}", "expected_error": "PUBLIC_ERROR_CODE_UNKNOWN_FIELD"},
+    {"id": "truncated-input", "class": "adversarial", "grpc_hex": "08ff", "http_json": "{", "expected_error": "PUBLIC_ERROR_CODE_MALFORMED_REQUEST"}
+  ]
+}

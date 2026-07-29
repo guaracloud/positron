@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "policy_change": "PC-0010-m0-05-reproducible-generation",
+  "enforcement": "new-independent-clean-roots",
+  "representative_revision": "63dc4405138d836a56d799e846fb95eb07a6844f",
+  "representative_inputs": {
+    "api/positron/v1/positron.proto": "sha256:dec4904c90127c22273f6f60287f054c3b6266731971d3418148517956d1e2f7",
+    "crates/positron-config/src/contract.rs": "sha256:5a25d52f8f97a6f4cc8c91d91cf6ea8079a22c570589676fb0e69449d6f6d038"
+  },
+  "fixture": {
+    "description": "The representative 63dc440 checked artifact set plus the same occupied verify-generation-0 staging slot and synthetic preexisting OpenAPI output used by old-single-clean-root.json.",
+    "preexisting_output": "target/quality/tmp/verify-generation-0/api/positron/v1/openapi.json",
+    "preexisting_output_sha256": "afa24d021982ae99c63fcc6263211ac98181c11d9600184b75fc19259145083b",
+    "synthetic_non_production": true
+  },
+  "execution": {
+    "date_utc": "2026-07-29",
+    "toolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "command": "target/debug/xtask verify-generation",
+    "binary_source_revision": "63dc4405138d836a56d799e846fb95eb07a6844f-dirty-two-clean-remediation",
+    "binary_sha256": "90e64aa4de285826da9258a38e1907cf67b27232a1acdda4e5481da2cb6eaa92",
+    "working_directory": "/Users/victorbona/Code/Daedalus/positron",
+    "exit_code": 0,
+    "stdout": "clean generation A sha256:5e3cbc7beeae6717da87237c2f3f553e717e037ee8e9f03bfaa58c9e534cd1eb; clean generation B sha256:5e3cbc7beeae6717da87237c2f3f553e717e037ee8e9f03bfaa58c9e534cd1eb; parity=byte-identical\n",
+    "stderr": ""
+  },
+  "verdict": {
+    "status": "passed-local-diagnostic",
+    "clean_generation_count": 2,
+    "independent_clean_parity_digests": [
+      "sha256:5e3cbc7beeae6717da87237c2f3f553e717e037ee8e9f03bfaa58c9e534cd1eb",
+      "sha256:5e3cbc7beeae6717da87237c2f3f553e717e037ee8e9f03bfaa58c9e534cd1eb"
+    ],
+    "checked_artifacts_mutated": false,
+    "preexisting_output_preserved": true,
+    "conclusion": "Two separately claimed clean staging roots generated the complete eight-artifact set from the same registered inputs. Their domain-separated artifact-set digests are identical, the agreed bytes equal the checked artifacts, and the occupied contaminated slot remained outside invocation ownership."
+  },
+  "attribution": "Local dirty-tree diagnostic policy evidence only. The fixture uses synthetic non-production bytes. This record claims neither trusted CI, merge eligibility, qualification, release readiness, nor approval."
+}

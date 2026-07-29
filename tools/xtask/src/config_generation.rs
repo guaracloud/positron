@@ -7,9 +7,10 @@ use std::path::Path;
 
 use crate::error::XtaskError;
 
-const SOURCE: &str = "crates/positron-config/src/contract.rs";
-const JSON_SCHEMA: &str = "configuration/schema.json";
-const REFERENCE: &str = "configuration/reference.md";
+const SOURCE: &str = crate::generation::CONFIGURATION_INPUT;
+const JSON_SCHEMA: &str = crate::generation::CONFIGURATION_SCHEMA;
+const REFERENCE: &str = crate::generation::CONFIGURATION_REFERENCE;
+const VALIDATION_FIXTURES: &str = crate::generation::CONFIGURATION_VALIDATION_FIXTURES;
 const DECLARATION_START: &str =
     "pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 7] = define_settings! {";
 const DECLARATION_END: &str = "};";
@@ -84,6 +85,11 @@ pub(crate) fn generate(root: &Path) -> Result<(), XtaskError> {
     let specification = parse_source(&source_path, &source)?;
     write_generated(root, JSON_SCHEMA, &json_schema(&specification)?)?;
     write_generated(root, REFERENCE, &reference(&specification)?)?;
+    write_generated(
+        root,
+        VALIDATION_FIXTURES,
+        &validation_fixtures(&specification)?,
+    )?;
     Ok(())
 }
 
@@ -574,6 +580,22 @@ fn reference(specification: &ConfigurationSpec) -> Result<String, XtaskError> {
         output.push_str(" |\n");
     }
     Ok(output)
+}
+
+fn validation_fixtures(specification: &ConfigurationSpec) -> Result<String, XtaskError> {
+    let schema_version = setting(specification, "SchemaVersion")?;
+    let shutdown = setting(specification, "RuntimeShutdownGraceSeconds")?;
+    let Domain::UnsignedIntegerRange(_, maximum_shutdown_seconds) = &shutdown.domain else {
+        return Err(XtaskError::invalid(
+            "canonical configuration model",
+            "shutdown grace must retain its bounded integer domain",
+        ));
+    };
+    let oversized_document_bytes = MAX_SOURCE_BYTES.saturating_add(1);
+    Ok(format!(
+        "{{\n  \"schema_version\": 1,\n  \"generated_from\": \"{SOURCE}\",\n  \"maximum_document_bytes\": {MAX_SOURCE_BYTES},\n  \"cases\": [\n    {{\"id\": \"minimal-valid-document\", \"class\": \"positive\", \"toml\": \"schema_version = {}\\n\", \"expected\": \"accepted\"}},\n    {{\"id\": \"shutdown-upper-bound\", \"class\": \"boundary\", \"toml\": \"schema_version = {}\\n[runtime]\\nshutdown_grace_seconds = {maximum_shutdown_seconds}\\n\", \"expected\": \"accepted\"}},\n    {{\"id\": \"unknown-setting\", \"class\": \"negative\", \"toml\": \"schema_version = {}\\nunknown_setting = true\\n\", \"expected\": \"unknown_setting\"}},\n    {{\"id\": \"oversized-document\", \"class\": \"adversarial\", \"recipe\": {{\"repeat\": \"#\", \"bytes\": {oversized_document_bytes}}}, \"expected\": \"resource_limit\"}}\n  ]\n}}\n",
+        schema_version.default, schema_version.default, schema_version.default,
+    ))
 }
 
 const fn kind_label(kind: SettingKind) -> &'static str {
