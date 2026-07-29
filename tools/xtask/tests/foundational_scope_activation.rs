@@ -32,6 +32,7 @@ const M0_02_POLICY_CHANGE: &str =
     "qualification/engineering/policy-changes/PC-0007-m0-02-domain-types.json";
 const M0_04_POLICY_CHANGE: &str =
     "qualification/engineering/policy-changes/PC-0009-m0-04-configuration-foundation.json";
+const CANONICAL_CONCURRENCY_FIXTURE_REGISTRY: &[u8] = b"scenario_id\tgate_id\tspawn_site\tschedule\tseed\tmax_tasks\tqueue_capacity\treservation_capacity\tretry_limit\tshutdown_ms\texpected\nconcurrency-cancel-join\tEG-CONCURRENCY\tquality-bounded-worker-v1\tcancel-then-join-v1\tseed-concurrency-v1\t3\t1\t1\t1\t100\tcancelled-then-joined-v1\nresource-fair-pressure\tEG-RESOURCE\tquality-bounded-worker-v1\tround-robin-pressure-v1\tseed-resource-v1\t3\t3\t2\t2\t100\tfair-pressure-retry-leak-free-v1\n";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -636,14 +637,34 @@ fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> Test
         let integrity_registry_path = fixture
             .root
             .join("qualification/engineering/integrity-fixtures.tsv");
+        let concurrency_registry_path = fixture
+            .root
+            .join("qualification/engineering/concurrency-fixtures.tsv");
         let captured_quality_registry = fs::read(&quality_registry_path)?;
         let captured_integrity_registry = fs::read(&integrity_registry_path)?;
+        let captured_concurrency_registry = fs::read(&concurrency_registry_path)?;
+        if captured_concurrency_registry != CANONICAL_CONCURRENCY_FIXTURE_REGISTRY {
+            return Err(std::io::Error::other(
+                "the canonical concurrency fixture registry changed without updating its frozen identity assertion",
+            )
+            .into());
+        }
         let mut seed_hasher = Sha256::new();
         seed_hasher.update(b"positron-quality-fixture-seeds-v1\0");
         seed_hasher.update(&captured_quality_registry);
         seed_hasher.update(b"\0");
         seed_hasher.update(&captured_integrity_registry);
+        seed_hasher.update(b"\0");
+        seed_hasher.update(CANONICAL_CONCURRENCY_FIXTURE_REGISTRY);
         let expected_seed = format!("sha256:{:x}", seed_hasher.finalize());
+        let mut schedule_hasher = Sha256::new();
+        schedule_hasher.update(b"positron-quality-fault-schedules-v1\0");
+        schedule_hasher.update(&captured_quality_registry);
+        schedule_hasher.update(b"\0");
+        schedule_hasher.update(&captured_integrity_registry);
+        schedule_hasher.update(b"\0");
+        schedule_hasher.update(CANONICAL_CONCURRENCY_FIXTURE_REGISTRY);
+        let expected_schedule = format!("sha256:{:x}", schedule_hasher.finalize());
 
         inject_fixture_registry_capture_barrier(&fixture.root)?;
         fixture.build_fixture_xtask()?;
@@ -653,6 +674,8 @@ fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> Test
             .join("target/quality-tools/fixture-registry-capture-ready");
         wait_for_path(&ready, Duration::from_secs(30))?;
         fs::write(&quality_registry_path, b"mutated-after-capture\n")?;
+        fs::write(&integrity_registry_path, b"mutated-after-capture\n")?;
+        fs::write(&concurrency_registry_path, b"mutated-after-capture\n")?;
         fs::write(
             fixture
                 .root
@@ -675,6 +698,15 @@ fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> Test
         if !evidence.contains(&exact_seed) {
             return Err(std::io::Error::other(format!(
                 "evidence seed was not derived from the exact frozen registry bytes: expected `{exact_seed}` in {evidence}"
+            ))
+            .into());
+        }
+        let exact_schedule = format!(
+            "\"fault_schedule\": {{\"applicability\": \"exact\", \"value\": \"{expected_schedule}\""
+        );
+        if !evidence.contains(&exact_schedule) {
+            return Err(std::io::Error::other(format!(
+                "evidence schedule was not derived from the exact frozen quality, integrity, and concurrency registry bytes: expected `{exact_schedule}` in {evidence}"
             ))
             .into());
         }
