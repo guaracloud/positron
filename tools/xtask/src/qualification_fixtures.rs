@@ -2086,7 +2086,6 @@ fn write_atomic_process_record(
     let staged = format!("{name}.staged");
     write_process_record(directory, &staged, bytes)?;
     directory.hard_link(&staged, name)?;
-    directory.remove_file(&staged)?;
     directory.sync()
 }
 

@@ -3626,6 +3626,53 @@ fn quality_rejects_an_unreviewed_activation_dependency() -> TestResult {
 }
 
 #[test]
+fn quality_retains_full_dependency_metadata_above_the_stream_capture_ceiling() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/emit-large-dependency-metadata"),
+            b"enabled\n",
+        )?;
+        fixture.quality_profile("pr")?;
+        let evidence = fixture.latest_evidence()?;
+        let report =
+            fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, "EG-DEPS")?)?;
+        for expected in [
+            "metadata-artifact=target/quality/dependency-metadata/",
+            "packages+workspace+resolve=validated",
+            "digest=sha256:",
+        ] {
+            if !report.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "dependency raw report omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+        let metadata_directory = fixture.root.join("target/quality/dependency-metadata");
+        let artifacts = fs::read_dir(&metadata_directory)?.collect::<Result<Vec<_>, _>>()?;
+        let [artifact] = artifacts.as_slice() else {
+            return Err(std::io::Error::other(
+                "dependency metadata did not retain exactly one attempt-owned artifact",
+            )
+            .into());
+        };
+        if fs::metadata(artifact.path())?.len() <= 131_072 {
+            return Err(std::io::Error::other(
+                "dependency metadata regression did not exceed the stream capture ceiling",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_an_activation_without_its_registered_owner() -> TestResult {
     assert_fixture_rejected(missing_domain_owner, "unknown semantic owner `-`")
 }
@@ -6191,6 +6238,23 @@ case "$command" in
   audit)
     if [ "${2:-}" = "--version" ]; then
       printf 'cargo-audit 0.22.2\n'
+    fi
+    ;;
+  metadata)
+    if [ -f target/quality-tools/emit-large-dependency-metadata ]; then
+      printf '%s' '{"packages":['
+      index=0
+      padding='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+      while [ "$index" -lt 440 ]; do
+        if [ "$index" -ne 0 ]; then
+          printf ','
+        fi
+        printf '{"name":"fixture-%s","description":"%s"}' "$index" "$padding"
+        index=$((index + 1))
+      done
+      printf '%s\n' '],"workspace_members":[],"workspace_root":"/fixture","target_directory":"/fixture/target","resolve":{}}'
+    else
+      printf '%s\n' '{"packages":[],"workspace_members":[],"workspace_root":"/fixture","target_directory":"/fixture/target","resolve":{}}'
     fi
     ;;
   vet)

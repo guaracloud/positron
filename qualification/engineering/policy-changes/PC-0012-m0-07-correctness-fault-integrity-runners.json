@@ -100,8 +100,10 @@
       "Each gate claims one must-create no-follow fixture root directly beneath the canonical attempt TMPDIR, then performs every fixture create, read, write, copy, link, rename, removal, and recursive cleanup relative to held directory descriptors. Writer and recovery children verify exact device/inode identity tokens before mutation; occupied, symbolic-link, non-directory, escaped, swapped, and identity-changed paths fail closed.",
       "An RAII owner reconciles the exact attempt-owned gate tree on success, detector failure, forced writer termination, recovery failure, and timeout; it synchronizes the attempt parent after removal, converts cleanup failure into a failed gate, and retains only immutable process observations and recovery digests in raw evidence.",
       "All frozen fixture inputs and process records are opened no-follow through their held parent descriptors, checked against their byte ceiling before allocation, read through a maximum-plus-one stream bound into a pre-reserved buffer, and rejected if their opened identity or metadata drifts during the read.",
+      "Published fixture process records retain their staged hard link until the attempt-owned RAII cleanup runs, so the acknowledgement does not mutate its own inode metadata after publication.",
       "The internal quality-fixture child interface accepts only its exact registered writer or recovery arity, including parent-claimed directory identities, and rejects any trailing argument before dispatch.",
-      "EG-TEST retains its exact locked workspace, all-targets, all-features, no-retry CI selection and the existing 131072-byte per-stream ceiling. Its Nextest invocation overrides only live and final status verbosity to failure level, preserves immediate-final failure output from the registered CI profile, requires exactly one terminal canonical summary, rejects missing or ambiguous counts and any skipped test, and retains the completed-test count in the gate detail."
+      "EG-TEST retains its exact locked workspace, all-targets, all-features, no-retry CI selection and the existing 131072-byte per-stream ceiling. Its Nextest invocation overrides only live and final status verbosity to failure level, preserves immediate-final failure output from the registered CI profile, requires exactly one terminal canonical summary, rejects missing or ambiguous counts and any skipped test, and retains the completed-test count in the gate detail.",
+      "EG-DEPS keeps the 131072-byte controlled stderr ceiling and streams cargo metadata stdout directly into one create-new attempt-owned artifact capped at 8388608 bytes. The runner checks length before allocation, hashes while reading the bounded artifact, validates its required JSON fields, and records only a concise path, byte count, digest, and validation summary in gate capture."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, coordinators, timeouts, memory declarations, exception classes, targets, thresholds, and application activation ledgers.",
@@ -148,9 +150,13 @@
         "cargo test --locked --package xtask --test foundational_scope_activation quality_cleans_attempt_owned_fixture_trees_after_repeated_successes -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_kills_reaps_and_cleans_a_timed_out_fixture_writer -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_fails_when_attempt_owned_fixture_cleanup_fails -- --exact",
-        "cargo test --locked --package xtask --bin xtask quality::tests::test_runner_preserves_full_selection_failure_visibility_and_bounded_summary -- --exact"
+        "cargo test --locked --package xtask --bin xtask quality::tests::test_runner_preserves_full_selection_failure_visibility_and_bounded_summary -- --exact",
+        "cargo test --locked -p xtask controlled_execution::tests::streams_stdout_above_the_capture_ceiling_without_retaining_it_in_memory -- --exact",
+        "cargo test --locked -p xtask controlled_execution::tests::rejects_and_removes_a_streamed_stdout_artifact_above_eight_mibibytes -- --exact",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_retains_full_dependency_metadata_above_the_stream_capture_ceiling -- --exact",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_accepts_a_valid_retained_raw_report_at_its_limit -- --exact"
       ],
-      "result": "The named process-backed state-transition, nine-class one-to-one fault schedule, frozen-input, no-follow ownership, bounded cleanup, identity-bound corruption/deletion, and bounded full-selection EG-TEST command-contract fixtures passed through their registry-selected public seams locally. These local results are diagnostic only."
+      "result": "The named process-backed state-transition, nine-class one-to-one fault schedule, frozen-input, no-follow ownership, bounded cleanup, identity-bound corruption/deletion, bounded full-selection EG-TEST command-contract, streamed dependency-metadata, and stable published-acknowledgement fixtures passed through their registry-selected public seams locally. The first clean push attempt for revision ce340f2247883d34b43492ee09e07197522b0476 was rejected; its immutable diagnostic evidence remains at target/quality/evidence/1785338294119-ce340f224788-32584.json. These later local results are diagnostic only and do not erase or reclassify that failed attempt."
     }
   },
   "compatibility_and_recovery": {

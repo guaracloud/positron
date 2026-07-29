@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -421,6 +421,7 @@ struct GateCapture {
 }
 
 struct GateExecutionContext<'context> {
+    attempt_id: &'context str,
     root: &'context Path,
     registry: &'context Registry,
     qualification_fixtures: &'context crate::qualification_fixtures::FrozenQualificationFixtures,
@@ -893,6 +894,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         let mut capture = GateCapture::new();
         let execution = execute_gate(
             GateExecutionContext {
+                attempt_id: &attempt_id,
                 root: &root,
                 registry: &registry,
                 qualification_fixtures: &qualification_fixtures,
@@ -1336,6 +1338,7 @@ fn execute_gate(
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let GateExecutionContext {
+        attempt_id,
         root,
         registry,
         qualification_fixtures,
@@ -1360,7 +1363,9 @@ fn execute_gate(
         "dynamic-analysis" => {
             run_dynamic_analysis_gate(root, registry, budget, environment, capture)
         },
-        "dependencies" => run_dependency_gate(root, registry, budget, environment, capture),
+        "dependencies" => {
+            run_dependency_gate(attempt_id, root, registry, budget, environment, capture)
+        },
         "documentation" => run_documentation_gate(root, budget, environment, capture),
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
         "fault" => run_fault_gate(qualification_fixtures, environment),
@@ -2376,6 +2381,7 @@ fn run_build_gate(
 }
 
 fn run_dependency_gate(
+    attempt_id: &str,
     root: &Path,
     registry: &Registry,
     budget: Duration,
@@ -2385,13 +2391,12 @@ fn run_dependency_gate(
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
-        run_capture(
+        run_dependency_metadata_capture(
+            attempt_id,
             root,
             environment,
-            "cargo",
-            ["metadata", "--locked", "--format-version", "1"],
             remaining(deadline)?,
-            Some(&mut *capture),
+            capture,
         )?
         .display,
     );
@@ -2421,6 +2426,199 @@ fn run_dependency_gate(
         commands.push("internal:direct-dependency-review parity".to_owned());
     }
     Ok(commands.join(" | "))
+}
+
+fn run_dependency_metadata_capture(
+    attempt_id: &str,
+    root: &Path,
+    snapshot: &EnvironmentSnapshot,
+    timeout: Duration,
+    capture: &mut GateCapture,
+) -> Result<CommandOutcome, XtaskError> {
+    let artifact_path = prepare_dependency_metadata_artifact_path(root, attempt_id)?;
+    let argument_values = ["metadata", "--locked", "--format-version", "1"];
+    let arguments = argument_values.map(OsString::from).to_vec();
+    let resolved_program = snapshot.tool_path("cargo")?;
+    let display = command_display(&resolved_program.to_string_lossy(), &arguments);
+    println!("  $ {display}");
+    let invocation_environment = snapshot.invocation_environment(&[])?;
+    let input = InvocationInput::Null;
+    let invocation = controlled_invocation(
+        "cargo",
+        resolved_program.as_os_str(),
+        &arguments,
+        &invocation_environment,
+        timeout,
+        &input,
+    );
+    let verdict = controlled_execution::execute(InvocationSpec {
+        program: resolved_program,
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: invocation_environment,
+        tools: snapshot.execution_tools(),
+        input,
+        output: OutputMode::CaptureWithStdoutArtifact {
+            artifact_path: artifact_path.clone(),
+            maximum_artifact_bytes: MAXIMUM_RAW_REPORT_BYTES,
+            maximum_stderr_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+        },
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(timeout)?,
+    })
+    .into_result();
+    let verdict = match verdict {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
+            capture.record(invocation, &step_verdict, "", &error.detail)?;
+            return Err(XtaskError::controlled_harness(error));
+        },
+    };
+    if !verdict.status.success() {
+        let step_verdict = format!("exit-status:{}", verdict.status);
+        capture.record(
+            invocation,
+            &step_verdict,
+            "",
+            &bounded_stream_summary(&verdict.output.stderr),
+        )?;
+        return Err(XtaskError::command(
+            display,
+            format!(
+                "exit status {}: stderr={}",
+                verdict.status,
+                one_line(&verdict.output.stderr)
+            ),
+        ));
+    }
+    let summary = validate_dependency_metadata_artifact(root, &artifact_path)?;
+    capture.record(
+        invocation,
+        &format!("exit-status:{}", verdict.status),
+        &summary,
+        &bounded_stream_summary(&verdict.output.stderr),
+    )?;
+    Ok(CommandOutcome {
+        display,
+        stdout: summary,
+        stderr: bounded_stream_summary(&verdict.output.stderr),
+    })
+}
+
+fn bounded_stream_summary(stream: &str) -> String {
+    let one_line = one_line(stream);
+    one_line
+        .chars()
+        .take(MAXIMUM_GATE_DETAIL_CHARACTERS)
+        .collect()
+}
+
+fn prepare_dependency_metadata_artifact_path(
+    root: &Path,
+    attempt_id: &str,
+) -> Result<PathBuf, XtaskError> {
+    let directory = root.join("target/quality/dependency-metadata");
+    fs::create_dir_all(&directory)
+        .map_err(|source| XtaskError::io(format!("create {}", directory.display()), source))?;
+    sync_directory(&directory)?;
+    Ok(directory.join(format!("{attempt_id}.json")))
+}
+
+fn validate_dependency_metadata_artifact(root: &Path, path: &Path) -> Result<String, XtaskError> {
+    let mut file = fs::File::open(path)
+        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| XtaskError::io(format!("inspect {}", path.display()), source))?;
+    let expected_bytes = usize::try_from(metadata.len()).map_err(|_| {
+        XtaskError::invalid(
+            "dependency metadata artifact",
+            "cargo metadata length does not fit the host address space",
+        )
+    })?;
+    if expected_bytes == 0 || expected_bytes > MAXIMUM_RAW_REPORT_BYTES {
+        return Err(XtaskError::invalid(
+            "dependency metadata artifact",
+            format!("cargo metadata output must contain 1..={MAXIMUM_RAW_REPORT_BYTES} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(expected_bytes);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8_192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > MAXIMUM_RAW_REPORT_BYTES {
+            return Err(XtaskError::invalid(
+                "dependency metadata artifact",
+                format!("cargo metadata output exceeds {MAXIMUM_RAW_REPORT_BYTES} bytes"),
+            ));
+        }
+        let chunk = buffer.get(..read).ok_or_else(|| {
+            XtaskError::invalid(
+                "dependency metadata artifact",
+                "cargo metadata read exceeded the fixed buffer",
+            )
+        })?;
+        digest.update(chunk);
+        bytes.extend_from_slice(chunk);
+    }
+    if bytes.len() != expected_bytes {
+        return Err(XtaskError::invalid(
+            "dependency metadata artifact",
+            "cargo metadata length changed while it was being validated",
+        ));
+    }
+    let content = std::str::from_utf8(&bytes).map_err(|_| {
+        XtaskError::invalid(
+            "dependency metadata artifact",
+            "cargo metadata is not UTF-8",
+        )
+    })?;
+    let mut document = bounded_json::parse_with_maximum_bytes(content, MAXIMUM_RAW_REPORT_BYTES)
+        .map_err(|error| XtaskError::invalid("dependency metadata artifact", error.to_string()))?
+        .into_object("cargo metadata")
+        .map_err(|error| XtaskError::invalid("dependency metadata artifact", error.to_string()))?;
+    for (field, expected) in [
+        ("packages", "array"),
+        ("workspace_members", "array"),
+        ("workspace_root", "string"),
+        ("target_directory", "string"),
+        ("resolve", "object"),
+    ] {
+        let value = bounded_json::take_required(&mut document, field).map_err(|error| {
+            XtaskError::invalid("dependency metadata artifact", error.to_string())
+        })?;
+        let valid = matches!(
+            (expected, value),
+            ("array", bounded_json::JsonValue::Array(_))
+                | ("string", bounded_json::JsonValue::String(_))
+                | ("object", bounded_json::JsonValue::Object(_))
+        );
+        if !valid {
+            return Err(XtaskError::invalid(
+                "dependency metadata artifact",
+                format!("cargo metadata field `{field}` is not a {expected}"),
+            ));
+        }
+    }
+    let parent = path.parent().ok_or_else(|| {
+        XtaskError::invalid_path(path, "metadata artifact has no parent directory")
+    })?;
+    sync_directory(parent)?;
+    let digest = format!("sha256:{:x}", digest.finalize());
+    Ok(format!(
+        "metadata-artifact={}; bytes={}; digest={digest}; packages+workspace+resolve=validated",
+        path.strip_prefix(root)
+            .map_err(|_| XtaskError::invalid_path(path, "metadata artifact escaped workspace"))?
+            .display(),
+        expected_bytes,
+    ))
 }
 
 fn run_documentation_gate(
