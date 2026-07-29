@@ -1085,6 +1085,14 @@ struct ArtifactCleanup {
 }
 
 #[cfg(unix)]
+fn normalized_device_identity<T>(device: T) -> Result<u64, T::Error>
+where
+    T: TryInto<u64>,
+{
+    device.try_into()
+}
+
+#[cfg(unix)]
 impl ArtifactCleanup {
     fn remove_if_owned(self, command: &str) -> Result<(), ExecutionFailure> {
         let metadata = rustix::fs::statat(
@@ -1107,7 +1115,7 @@ impl ArtifactCleanup {
                 ));
             },
         };
-        let device = u64::try_from(metadata.st_dev).map_err(|_| {
+        let device = normalized_device_identity(metadata.st_dev).map_err(|_| {
             ExecutionFailure::new(
                 command.to_owned(),
                 FailurePhase::Cleanup,
