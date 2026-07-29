@@ -625,7 +625,14 @@ fn quality_rejects_a_fixture_root_symlink_race_without_touching_the_target() -> 
             .root
             .join("target/quality-tools/fixture-root-claim-ready");
         wait_for_path(&ready, Duration::from_secs(30))?;
-        let temporary_root = PathBuf::from(fs::read_to_string(&ready)?.trim());
+        let temporary_root = PathBuf::from(
+            fs::read_to_string(
+                fixture
+                    .root
+                    .join("target/quality-tools/fixture-root-claim-path"),
+            )?
+            .trim(),
+        );
         let external = fixture
             .root
             .join("target/quality-tools/fixture-root-external");
@@ -4786,10 +4793,13 @@ fn inject_fixture_root_claim_barrier(root: &Path) -> TestResult {
         .nth(4)
         .ok_or_else(|| XtaskError::invalid_path(temporary_root, "fixture TMPDIR has no workspace ancestor"))?;
     let tools = workspace.join("target/quality-tools");
+    let path = tools.join("fixture-root-claim-path");
     let ready = tools.join("fixture-root-claim-ready");
     let release = tools.join("fixture-root-claim-release");
-    fs::write(&ready, temporary_root.as_os_str().as_encoded_bytes())
-        .map_err(|source| XtaskError::io("publish fixture root claim barrier", source))?;
+    fs::write(&path, temporary_root.as_os_str().as_encoded_bytes())
+        .map_err(|source| XtaskError::io("publish fixture root claim path", source))?;
+    fs::write(&ready, b"ready\n")
+        .map_err(|source| XtaskError::io("publish fixture root claim readiness", source))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if release
