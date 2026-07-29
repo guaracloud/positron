@@ -110,12 +110,47 @@
         "cargo deny check"
       ],
       "result": "Cargo Vet accepted three fully audited and seven exact-version-exempted crates; Cargo Deny accepted advisories, exact-version bans, licenses, and sources."
+    },
+    {
+      "id": "u32-varint-overflow-red-final-review-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p positron-api --test canonical_public_interface overflowing_terminal_u32_varints_fail_closed_before_negotiation",
+      "result": "An overflowing fifth u32 varint payload truncated before negotiation, producing a successful response instead of the stable MalformedRequest outcome."
+    },
+    {
+      "id": "canonical-json-u32-red-final-review-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p positron-api --test canonical_public_interface http_u32_values_require_canonical_integer_grammar",
+      "result": "The HTTP decoder accepted noncanonical signed, zero-padded, or whitespace-padded u32 text before negotiation."
+    },
+    {
+      "id": "mutation-selector-owner-red-final-review-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p xtask focused_m0_03_mutation_selection_covers_public_boundary_owners",
+      "result": "The focused selector regression rejected the missing CapabilityResponse::api_major owner and exposed the stale nonexistent CapabilityResponse::api_version selector."
+    },
+    {
+      "id": "parser-and-selector-green-final-review-remediation",
+      "status": "passed-local-diagnostic",
+      "source_dirty": true,
+      "commands": [
+        "cargo test -p xtask --test api_generation",
+        "cargo test -p positron-api --test canonical_public_interface",
+        "cargo test -p xtask --bin xtask focused_m0_03_mutation_selection_covers_public_boundary_owners"
+      ],
+      "result": "Eleven generator tests, twelve public-interface tests, and the exact-owner selector regression passed. Overflowing fifth-byte u32 varints fail closed for version and capability fields; HTTP u32 parsing accepts only canonical decimal forms including exact zero and maximum boundaries; every selected mutation owner exists in generated Rust."
     }
   ],
   "detection_gained": [
     "one bounded parsed versioned Protobuf source generates the Rust, gRPC and HTTP decode mapping, client contract, OpenAPI, and Schema Digest foundations",
     "the bounded canonical model covers required request, response, PublicError, Capability, supporting-enum, field-number, enum-number, and supported deprecation semantics while rejecting ambiguity and unsupported constructs",
     "the HTTP client publishes and tests an exact one-buffer allocation contract with no intermediate heap body and no completed-body copy",
+    "public decoding rejects overflowing terminal u32 varints before shifting or capability negotiation",
+    "HTTP u32 decoding accepts only canonical unsigned decimal grammar and rejects signed, padded, fractional, exponent, and whitespace forms",
+    "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail",
     "the public contract proves implemented, unavailable, unsupported, and version-incompatible capability outcomes with safe typed errors and no wire or domain leakage",
     "the canonical artifact scope cannot return to scaffold, accept unknown fields, exceed its 64-byte request bound, or drift from deterministic generation",
     "the authoritative EXT runner owns M0-03 coverage and the explicit exact-selector mutation campaign without changing routine PR selection"

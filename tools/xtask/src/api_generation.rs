@@ -1391,6 +1391,9 @@ fn decode_varint(
             return Err(ApiError::malformed(source));
         }};
         cursor += 1;
+        if shift == 28 && byte & 0x7f > 0x0f {{
+            return Err(ApiError::malformed(source));
+        }}
         value |= u32::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {{
             return Ok((value, cursor));
@@ -1445,8 +1448,16 @@ fn decode_http(body: &[u8]) -> Result<{request}, ApiError> {{
 }}
 
 fn parse_json_u32(value: &str, source: ApiFailureSource) -> Result<u32, ApiError> {{
+    let bytes = value.as_bytes();
+    let canonical = match bytes {{
+        [b'0'] => true,
+        [first, rest @ ..] => (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit),
+        [] => false,
+    }};
+    if !canonical {{
+        return Err(ApiError::malformed(source));
+    }}
     value
-        .trim()
         .parse::<u32>()
         .map_err(|_| ApiError::malformed(source))
 }}

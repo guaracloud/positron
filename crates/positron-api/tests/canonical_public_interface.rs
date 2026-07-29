@@ -196,6 +196,67 @@ fn maximum_api_major_round_trips_to_an_explicit_version_refusal() -> Result<(), 
 }
 
 #[test]
+fn overflowing_terminal_u32_varints_fail_closed_before_negotiation() -> Result<(), std::io::Error> {
+    let cases = [
+        &[0x08, 0xff, 0xff, 0xff, 0xff, 0x10][..],
+        &[0x08, 0x01, 0x10, 0x80, 0x80, 0x80, 0x80, 0x10][..],
+    ];
+
+    for bytes in cases {
+        let result = CapabilityService::decode_and_negotiate(Transport::GrpcProtobuf, bytes);
+        let error = result.err().ok_or_else(|| {
+            std::io::Error::other("overflowing u32 varint negotiated successfully")
+        })?;
+        assert_eq!(error.code(), ApiErrorCode::MalformedRequest);
+        assert_eq!(error.retry_class(), RetryClass::AfterInputCorrection);
+        assert_eq!(error.completion_state(), CompletionState::Rejected);
+        assert_eq!(error.source(), ApiFailureSource::GrpcDecode);
+        assert_eq!(error.safe_detail(), SafeDetail::RequestMalformed);
+    }
+    Ok(())
+}
+
+#[test]
+fn http_u32_values_require_canonical_integer_grammar() {
+    for bytes in [
+        &br#"{"api_major":+1}"#[..],
+        &br#"{"api_major":01}"#[..],
+        &br#"{"api_major":-1}"#[..],
+        &br#"{"api_major": 1}"#[..],
+        &br#"{"api_major":1 }"#[..],
+        &br#"{"api_major":1e0}"#[..],
+        &br#"{"api_major":1.0}"#[..],
+        &br#"{"api_major":1,"capability":+1}"#[..],
+        &br#"{"api_major":1,"capability":01}"#[..],
+    ] {
+        let result = CapabilityService::decode_and_negotiate(Transport::HttpJson, bytes);
+        assert_eq!(
+            result.map_err(|error| error.code()),
+            Err(ApiErrorCode::MalformedRequest)
+        );
+    }
+
+    for bytes in [
+        &br#"{"api_major":0}"#[..],
+        &br#"{"api_major":4294967295}"#[..],
+    ] {
+        let response = CapabilityService::decode_and_negotiate(Transport::HttpJson, bytes);
+        assert_eq!(
+            response.map(|value| value.availability()),
+            Ok(CapabilityAvailability::VersionIncompatible)
+        );
+    }
+    let zero_capability = CapabilityService::decode_and_negotiate(
+        Transport::HttpJson,
+        br#"{"api_major":1,"capability":0}"#,
+    );
+    assert_eq!(
+        zero_capability.map(|value| value.availability()),
+        Ok(CapabilityAvailability::Implemented)
+    );
+}
+
+#[test]
 fn malformed_oversized_and_unknown_wire_inputs_fail_closed() {
     let oversized = vec![0_u8; MAX_PUBLIC_REQUEST_BYTES + 1];
     let cases = [

@@ -85,7 +85,7 @@ const M0_03_MUTATION_SELECTOR: &str = concat!(
     "ApiError::capability_unsupported|ApiError::malformed|ApiError::too_large|",
     "ApiError::unknown_field|CapabilityRequest::for_version|",
     "CapabilityRequest::for_capability|CapabilityRequest::unknown|",
-    "CapabilityResponse::availability|CapabilityResponse::api_version|",
+    "CapabilityResponse::availability|CapabilityResponse::api_major|",
     "CapabilityResponse::schema_digest|CapabilityResponse::refusal|",
     "CapabilityResponse::deprecation|CapabilityResponse::capability|",
     "Transport::source|EncodedRequest::push|EncodedRequest::extend|",
@@ -3240,7 +3240,7 @@ fn one_line(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -3350,9 +3350,11 @@ mod tests {
 
     #[test]
     fn focused_m0_03_mutation_selection_covers_public_boundary_owners() {
+        let selected = M0_03_MUTATION_SELECTOR.split('|').collect::<BTreeSet<_>>();
         for owner in [
             "Capability::from_wire",
             "ApiError::unsupported_api_version",
+            "CapabilityResponse::api_major",
             "CapabilityService::negotiate",
             "CapabilityService::decode_and_negotiate",
             "encode_grpc",
@@ -3360,10 +3362,64 @@ mod tests {
             "decode_http",
         ] {
             assert!(
-                M0_03_MUTATION_SELECTOR.contains(owner),
+                selected.contains(owner),
                 "focused M0-03 mutation selection omitted public owner `{owner}`"
             );
         }
+        let generated = generated_rust_owner_names(include_str!(
+            "../../../crates/positron-api/src/generated.rs"
+        ));
+        let stale = selected
+            .iter()
+            .filter(|owner| !generated.contains(**owner))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            stale.is_empty(),
+            "focused M0-03 mutation selection contains stale or nonexistent owners: {stale:?}"
+        );
+    }
+
+    fn generated_rust_owner_names(source: &str) -> BTreeSet<String> {
+        let mut owners = BTreeSet::new();
+        let mut implementation = None;
+        let mut implementation_depth = 0_usize;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if implementation.is_none()
+                && let Some(owner) = trimmed
+                    .strip_prefix("impl ")
+                    .and_then(|value| value.strip_suffix(" {"))
+            {
+                implementation = Some(owner);
+                implementation_depth = 1;
+                continue;
+            }
+            if let Some(name) = rust_function_name(trimmed) {
+                if let Some(owner) = implementation {
+                    owners.insert(format!("{owner}::{name}"));
+                } else {
+                    owners.insert(name.to_owned());
+                }
+            }
+            if implementation.is_some() {
+                implementation_depth =
+                    implementation_depth.saturating_add(trimmed.matches('{').count());
+                implementation_depth =
+                    implementation_depth.saturating_sub(trimmed.matches('}').count());
+                if implementation_depth == 0 {
+                    implementation = None;
+                }
+            }
+        }
+        owners
+    }
+
+    fn rust_function_name(line: &str) -> Option<&str> {
+        line.split_once("fn ")
+            .and_then(|(_, suffix)| suffix.split_once('('))
+            .map(|(name, _)| name.trim())
+            .filter(|name| !name.is_empty())
     }
 
     #[test]
