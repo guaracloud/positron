@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "id": "PC-0011-m0-06-evidence-attempt-integrity",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Close the M0-06 engineering-evidence attempt-integrity gaps in the authoritative cargo xtask quality runner without changing product behavior or qualification state.",
+  "change": {
+    "issue": 7,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
+    "runner_changes": [
+      "A target/quality/evidence attempt path is created exclusively and an existing path is a fail-closed error; evidence is never overwritten.",
+      "Trusted CI rejects a GITHUB_SHA that differs from the controlled git revision before gate selection.",
+      "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass."
+    ],
+    "unchanged": [
+      "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
+      "Developer evidence remains diagnostic and non-merge-eligible.",
+      "Release Qualification Cells remain Specified; this engineering runner does not qualify a product artifact."
+    ]
+  },
+  "detection_gained": [
+    "A same-attempt evidence collision cannot replace a retained result.",
+    "A trusted CI result cannot be accepted for a source revision other than the controlled git revision.",
+    "A trusted CI retry cannot turn an earlier failing run into a fresh green attempt."
+  ],
+  "detection_lost": [],
+  "representative_old_new_evidence": {
+    "old": {
+      "status": "failed-focused-public-regression",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_overwritten_engineering_evidence_attempt -- --exact",
+      "result": "Before the change, a pre-created target/quality/evidence attempt path was silently replaced and the public runner returned success."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_overwritten_engineering_evidence_attempt -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_stale_trusted_ci_source_identity -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retried_trusted_ci_attempt -- --exact"
+      ],
+      "result": "The public runner now returns a retained failed verdict for overwrite, stale source, and retry inputs. These local results are diagnostic only."
+    },
+    "dual_run_conclusion": "The failing overwrite reproducer remains represented by the retained regression test. No prior failed attempt is removed, reclassified, or converted into a qualification claim."
+  },
+  "compatibility_and_recovery": {
+    "compatibility": "The cargo xtask quality command and JSON evidence schema remain compatible. A duplicate attempt identity now fails instead of replacing prior evidence.",
+    "recovery": "Create a new run with its own fresh attempt identity after correcting the underlying failure. Do not delete, rename, or overwrite an existing evidence attempt."
+  },
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering"
+  ],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
+    "attribution": "No implementation agent, reviewer, or repository owner is recorded as granting a required approval."
+  },
+  "qualification_claim": "None. This record does not claim a qualified cell, trusted CI pass, merge eligibility, release readiness, or role approval."
+}

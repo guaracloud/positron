@@ -399,6 +399,71 @@ fn quality_records_dirty_local_success_as_non_merge_eligible_evidence() -> TestR
 }
 
 #[test]
+fn quality_rejects_stale_trusted_ci_source_identity() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let output = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [
+                ("GITHUB_ACTIONS", "true"),
+                ("GITHUB_SHA", "2222222222222222222222222222222222222222"),
+                ("GITHUB_RUN_ATTEMPT", "1"),
+            ],
+        )?;
+        assert_rejected_output(
+            &output,
+            "trusted CI revision does not match the executing source",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_retried_trusted_ci_attempt() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let output = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [
+                ("GITHUB_ACTIONS", "true"),
+                ("GITHUB_SHA", "0000000000000000000000000000000000000000"),
+                ("GITHUB_RUN_ATTEMPT", "2"),
+            ],
+        )?;
+        assert_rejected_output(
+            &output,
+            "trusted CI retry attempts are not accepted as fresh evidence",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_overwritten_engineering_evidence_attempt() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        let evidence = fixture
+            .root
+            .join("target/quality/evidence/1700000000000-111111111111-1.json");
+        let parent = evidence.parent().ok_or_else(|| {
+            std::io::Error::other("fixture evidence path has no parent directory")
+        })?;
+        fs::create_dir_all(parent)?;
+        fs::write(&evidence, "{\"tampered\":true}\n")?;
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "create new engineering evidence")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_qual_profile_rejects_the_scaffold_before_claiming_qualification() -> TestResult {
     assert_fixture_rejected_profile(
         "qual",
@@ -1922,6 +1987,14 @@ fn make_fixture_git_report_dirty(root: &Path) -> TestResult {
         &root.join("target/quality-tools/bin/git"),
         "  status)\n    ;;",
         "  status)\n    printf '%s\\n' ' M fixture-policy.tsv'\n    ;;",
+    )
+}
+
+fn pin_fixture_attempt_identity(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "fn attempt_identity(revision: &str, started_unix_ms: u128) -> String {\n    let revision_prefix = revision.chars().take(12).collect::<String>();\n    format!(\"{started_unix_ms}-{revision_prefix}-{}\", std::process::id())\n}",
+        "fn attempt_identity(_revision: &str, _started_unix_ms: u128) -> String {\n    \"1700000000000-111111111111-1\".to_owned()\n}",
     )
 }
 

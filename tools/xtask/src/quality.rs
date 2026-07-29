@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -369,6 +370,20 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let environment = EnvironmentSnapshot::capture(&root, options.profile)?;
     let source = source_identity(&root, &environment)?;
     let attempt_id = attempt_identity(&source.revision, started_unix_ms);
+    if let Err(error) = validate_trusted_ci_attempt(&source) {
+        return retain_aggregator_failure(
+            &root,
+            options.profile,
+            AggregatorFailure {
+                source,
+                started_unix_ms,
+                attempt_id,
+                environment_digest: environment.digest(),
+                registry_digest: "unavailable-registry-digest",
+                error: &error,
+            },
+        );
+    }
     let registry = match Registry::load(&root) {
         Ok(registry) => registry,
         Err(error) => {
@@ -3212,6 +3227,29 @@ fn source_identity(
     })
 }
 
+fn validate_trusted_ci_attempt(source: &SourceIdentity) -> Result<(), XtaskError> {
+    if !source.trusted_ci {
+        return Ok(());
+    }
+    if !source.revision_matches_ci {
+        return Err(XtaskError::invalid(
+            "trusted CI evidence",
+            "trusted CI revision does not match the executing source",
+        ));
+    }
+    match env::var("GITHUB_RUN_ATTEMPT").as_deref() {
+        Ok("1") => Ok(()),
+        Ok(_) => Err(XtaskError::invalid(
+            "trusted CI evidence",
+            "trusted CI retry attempts are not accepted as fresh evidence",
+        )),
+        Err(_) => Err(XtaskError::invalid(
+            "trusted CI evidence",
+            "trusted CI evidence is missing its run-attempt identity",
+        )),
+    }
+}
+
 fn digest_files(
     root: &Path,
     files: &[PathBuf],
@@ -3276,7 +3314,17 @@ fn write_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, XtaskErro
     let path = directory.join(format!("{}.json", evidence.attempt_id));
     let serialized = evidence_json(evidence);
     validate_serialized_evidence(evidence, &serialized)?;
-    fs::write(&path, serialized)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|source| {
+            XtaskError::io(
+                format!("create new engineering evidence {}", path.display()),
+                source,
+            )
+        })?;
+    file.write_all(serialized.as_bytes())
         .map_err(|source| XtaskError::io(format!("write {}", path.display()), source))?;
     Ok(path)
 }
