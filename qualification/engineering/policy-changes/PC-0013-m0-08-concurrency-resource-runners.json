@@ -75,6 +75,14 @@
         "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-target.gdwmGh git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
         "observed_state": "The detached worktree was clean and the hook started with dirty=false, but no target/quality/evidence or evidence-reports file was published and refs/heads/codex/m0-08-concurrency-resource-runners remained absent from origin after the interrupted invocation.",
         "recovery": "Preserve the worktree and external target directory as diagnostic material. Run one fresh isolated exact-head publication attempt; do not infer a passed quality verdict or a successful push."
+      },
+      {
+        "revision": "7595f9a06b652eac83577cfa67148f819e2ed7b1",
+        "worktree": "/private/tmp/positron-m0-08-publish-remediation.7595f9a",
+        "cargo_target_dir": "worktree-local target directory",
+        "command": "git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
+        "observed_state": "The detached worktree started at the exact clean revision and the pre-push PR profile progressed through EG-CONCURRENCY, EG-RESOURCE, and subsequent gates, but the invocation ended without a final success result, no isolated target/quality/evidence record was retained, and origin remained at 62a61bd32369aa320ac012a57a52b2be93489afa.",
+        "recovery": "Preserve this worktree as diagnostic material. Run one fresh isolated exact-head publication attempt with a separate external target directory, retain its final result, and do not infer a passed quality verdict or a successful push from partial hook output."
       }
     ]
   },
