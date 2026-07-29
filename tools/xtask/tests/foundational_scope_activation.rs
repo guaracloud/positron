@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const ACTIVATION_ID: &str = "M0-01";
@@ -849,6 +851,68 @@ fn quality_rejects_a_raw_report_command_digest_mismatch() -> TestResult {
 }
 
 #[test]
+fn quality_rejects_coordinated_invocation_and_stored_digest_tampering() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        let mut evidence = fs::read_to_string(&evidence_path)?;
+        let report_path = exact_raw_report_path(&fixture.root, &evidence, "EG-00")?;
+        let mut report = fs::read_to_string(&report_path)?;
+        let original_gate = gate_record(&evidence, "EG-00")?;
+        let original_report_digest =
+            extract_json_string_after(original_gate, "\"sha256\": \"")?.to_owned();
+        let original_command_digest =
+            extract_json_string_after(original_gate, "\"command_digest\": \"")?.to_owned();
+        let forged_command_digest =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        evidence = replace_once_in_string(
+            evidence,
+            "\"--profile\"",
+            "\"--profIle\"",
+            "evidence invocation argument",
+        )?;
+        evidence = replace_once_in_string(
+            evidence,
+            &format!("\"command_digest\": \"{original_command_digest}\""),
+            &format!("\"command_digest\": \"{forged_command_digest}\""),
+            "evidence command digest",
+        )?;
+        report = replace_once_in_string(
+            report,
+            "\"--profile\"",
+            "\"--profIle\"",
+            "raw report invocation argument",
+        )?;
+        report = replace_once_in_string(
+            report,
+            &format!("\"invocation_digest\": \"{original_command_digest}\""),
+            &format!("\"invocation_digest\": \"{forged_command_digest}\""),
+            "raw report invocation digest",
+        )?;
+        let forged_report_digest = format!("sha256:{:x}", Sha256::digest(report.as_bytes()));
+        evidence = replace_once_in_string(
+            evidence,
+            &format!("\"sha256\": \"{original_report_digest}\""),
+            &format!("\"sha256\": \"{forged_report_digest}\""),
+            "evidence raw report digest",
+        )?;
+        fs::write(&report_path, report)?;
+        fs::write(&evidence_path, evidence)?;
+
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "command digest does not match its canonical structured invocation",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_malformed_retained_engineering_evidence_json() -> TestResult {
     assert_invalid_retained_engineering_evidence(
         |evidence_path, evidence| {
@@ -1051,6 +1115,88 @@ fn quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occup
 }
 
 #[test]
+fn quality_retains_failed_attempt_without_final_reports_when_first_staged_write_fails() -> TestResult
+{
+    assert_staged_report_write_failure("EG-00", false)
+}
+
+#[test]
+fn quality_retains_failed_attempt_without_final_reports_when_middle_staged_write_fails()
+-> TestResult {
+    assert_staged_report_write_failure("EG-POLICY", false)
+}
+
+#[test]
+fn quality_retains_failed_attempt_without_final_reports_when_last_staged_write_fails() -> TestResult
+{
+    assert_staged_report_write_failure("EG-SECRETS", false)
+}
+
+#[test]
+fn quality_retains_failed_attempt_without_final_reports_when_staging_cleanup_fails() -> TestResult {
+    assert_staged_report_write_failure("EG-POLICY", true)
+}
+
+fn assert_staged_report_write_failure(gate_id: &str, inject_cleanup_failure: bool) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject_report_write_failure(&fixture.root, gate_id)?;
+        if inject_cleanup_failure {
+            inject_report_cleanup_failure(&fixture.root)?;
+        }
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "injected report staging failure")?;
+
+        let attempt_id = "1700000000000-111111111111-1";
+        let final_reports = fixture
+            .root
+            .join("target/quality/evidence-reports")
+            .join(attempt_id);
+        if final_reports.exists() {
+            return Err(std::io::Error::other(format!(
+                "failed report staging published final attempt directory {}",
+                final_reports.display()
+            ))
+            .into());
+        }
+        let staged_reports = fixture
+            .root
+            .join("target/quality/evidence-report-staging")
+            .join(attempt_id);
+        if staged_reports.exists() {
+            return Err(std::io::Error::other(format!(
+                "failed report staging left unreconciled directory {}",
+                staged_reports.display()
+            ))
+            .into());
+        }
+        let evidence = fixture
+            .root
+            .join("target/quality/evidence")
+            .join(format!("{attempt_id}.json"));
+        let retained = fs::read_to_string(evidence)?;
+        assert_complete_evidence_contract(&retained)?;
+        for expected in [
+            "\"result\": \"failed\"",
+            "\"merge_eligible\": false",
+            "\"reason\": \"report-retention-failed\"",
+        ] {
+            if !retained.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "staging failure omitted retained evidence field `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_an_incomplete_evidence_identity_schema() -> TestResult {
     assert_fixture_rejected_profile(
         "pr",
@@ -1062,6 +1208,52 @@ fn quality_rejects_an_incomplete_evidence_identity_schema() -> TestResult {
             )
         },
         "evidence schema is missing `\"command_digest\"`",
+    )
+}
+
+#[test]
+fn quality_rejects_evidence_schema_constraint_drift() -> TestResult {
+    assert_fixture_rejected_profile(
+        "pr",
+        |root| {
+            replace_once(
+                &root.join("qualification/engineering/evidence.schema.json"),
+                "\"maxLength\": 4096",
+                "\"maxLength\": 4097",
+            )
+        },
+        "evidence schema differs from the canonical v3 constraint owner",
+    )
+}
+
+#[test]
+fn quality_rejects_schema_v3_uppercase_source_identity() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, _| {
+            replace_once(
+                evidence_path,
+                "\"revision\": \"0000000000000000000000000000000000000000\"",
+                "\"revision\": \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+            )
+        },
+        "source revision is not a complete hexadecimal identity",
+    )
+}
+
+#[test]
+fn quality_rejects_schema_v3_overlong_exact_identity_value() -> TestResult {
+    assert_invalid_retained_engineering_evidence(
+        |evidence_path, _| {
+            replace_once(
+                evidence_path,
+                "\"target\": {\"applicability\": \"exact\", \"value\": \"engineering-workspace\", \"reason\": \"-\"}",
+                &format!(
+                    "\"target\": {{\"applicability\": \"exact\", \"value\": \"{}\", \"reason\": \"-\"}}",
+                    "a".repeat(4_097)
+                ),
+            )
+        },
+        "identity binding is invalid",
     )
 }
 
@@ -2770,6 +2962,24 @@ fn pin_fixture_attempt_identity(root: &Path) -> TestResult {
     )
 }
 
+fn inject_report_write_failure(root: &Path, gate_id: &str) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "        validate_raw_report_binding(&evidence.attempt_id, gate)?;\n",
+        &format!(
+            "        validate_raw_report_binding(&evidence.attempt_id, gate)?;\n        if gate.gate_id == \"{gate_id}\" {{\n            return Err(XtaskError::invalid(\"injected report staging failure\", \"selected report write failed\"));\n        }}\n"
+        ),
+    )
+}
+
+fn inject_report_cleanup_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "fn cleanup_report_staging(path: &Path) -> Result<(), XtaskError> {\n    match fs::remove_dir_all(path) {\n        Ok(()) => Ok(()),",
+        "fn cleanup_report_staging(path: &Path) -> Result<(), XtaskError> {\n    match fs::remove_dir_all(path) {\n        Ok(()) => Err(XtaskError::invalid(\n            \"injected report staging failure\",\n            \"cleanup reported failure after removing staging\",\n        )),",
+    )
+}
+
 fn remove_one_m0_01b_owner_coverage_target(root: &Path) -> TestResult {
     let path = root.join("tools/xtask/src/quality.rs");
     replace_once(
@@ -2825,6 +3035,36 @@ fn replace_once(path: &Path, before: &str, after: &str) -> TestResult {
     };
     fs::write(path, format!("{prefix}{after}{suffix}"))?;
     Ok(())
+}
+
+fn replace_once_in_string(
+    content: String,
+    before: &str,
+    after: &str,
+    subject: &str,
+) -> TestResult<String> {
+    let Some((prefix, suffix)) = content.split_once(before) else {
+        return Err(std::io::Error::other(format!(
+            "{subject} fixture does not contain `{before}`"
+        ))
+        .into());
+    };
+    Ok(format!("{prefix}{after}{suffix}"))
+}
+
+fn extract_json_string_after<'content>(
+    content: &'content str,
+    marker: &str,
+) -> TestResult<&'content str> {
+    let (_, suffix) = content
+        .split_once(marker)
+        .ok_or_else(|| std::io::Error::other(format!("fixture omitted marker `{marker}`")))?;
+    suffix
+        .split_once('"')
+        .map(|(value, _)| value)
+        .ok_or_else(|| {
+            std::io::Error::other(format!("fixture value after `{marker}` is malformed")).into()
+        })
 }
 
 fn replace_all(path: &Path, before: &str, after: &str) -> TestResult {
