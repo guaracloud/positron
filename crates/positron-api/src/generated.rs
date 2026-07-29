@@ -14,6 +14,14 @@ pub enum ApiVersion {
     V1 = 1,
 }
 
+impl ApiVersion {
+    /// Returns the wire major version.
+    #[must_use]
+    pub const fn major(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Generated closed values from `Capability`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -390,7 +398,7 @@ impl CapabilityRequest {
     #[must_use]
     pub const fn for_version(version: ApiVersion) -> Self {
         Self {
-            api_major: version as u32,
+            api_major: version.major(),
             capability: Capability::CanonicalPublicInterface,
         }
     }
@@ -399,7 +407,7 @@ impl CapabilityRequest {
     #[must_use]
     pub const fn for_capability(version: ApiVersion, capability: Capability) -> Self {
         Self {
-            api_major: version as u32,
+            api_major: version.major(),
             capability,
         }
     }
@@ -583,7 +591,7 @@ impl CapabilityService {
     /// Negotiates one bounded, versioned public API request without ambient state.
     #[must_use]
     pub const fn negotiate(request: CapabilityRequest) -> CapabilityResponse {
-        if request.api_major != ApiVersion::V1 as u32 {
+        if request.api_major != ApiVersion::V1.major() {
             return CapabilityResponse {
                 availability: CapabilityAvailability::VersionIncompatible,
                 api_major: ApiVersion::V1,

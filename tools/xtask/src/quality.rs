@@ -3367,9 +3367,13 @@ mod tests {
                 "focused M0-03 mutation selection omitted public owner `{owner}`"
             );
         }
+        // `ApiVersion` is a closed single-variant v1 enum, so replacing
+        // `ApiVersion::major` with the literal `1` is identical for every
+        // possible input. The observable version invariants remain selected
+        // through request construction, response access, and negotiation.
         assert!(
             !selected.contains("ApiVersion::major"),
-            "the closed v1 discriminant must not retain an equivalent accessor mutation target"
+            "the proven-equivalent closed-v1 accessor must not replace observable version owners"
         );
         let generated = generated_rust_owner_names(include_str!(
             "../../../crates/positron-api/src/generated.rs"

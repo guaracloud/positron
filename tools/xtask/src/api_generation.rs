@@ -867,6 +867,14 @@ pub enum ApiVersion {{
     V1 = 1,
 }}
 
+impl ApiVersion {{
+    /// Returns the wire major version.
+    #[must_use]
+    pub const fn major(self) -> u32 {{
+        self as u32
+    }}
+}}
+
 {capability_definition}
 
 /// The stable SHA-256 identity of the canonical API definition.
@@ -1015,7 +1023,7 @@ impl {request} {{
     #[must_use]
     pub const fn for_version(version: ApiVersion) -> Self {{
         Self {{
-            {api_major_name}: version as u32,
+            {api_major_name}: version.major(),
             {capability_name}: Capability::{capability_canonical},
         }}
     }}
@@ -1024,7 +1032,7 @@ impl {request} {{
     #[must_use]
     pub const fn for_capability(version: ApiVersion, capability: Capability) -> Self {{
         Self {{
-            {api_major_name}: version as u32,
+            {api_major_name}: version.major(),
             {request_capability_assignment},
         }}
     }}
@@ -1208,7 +1216,7 @@ impl {service} {{
     /// Negotiates one bounded, versioned public API request without ambient state.
     #[must_use]
     pub const fn negotiate(request: {request}) -> {response} {{
-        if request.{api_major_name} != ApiVersion::V1 as u32 {{
+        if request.{api_major_name} != ApiVersion::V1.major() {{
             return {response} {{
                 {response_availability_name}: CapabilityAvailability::{availability_version},
                 {response_api_major_name}: ApiVersion::V1,

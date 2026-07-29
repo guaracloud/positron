@@ -11,7 +11,7 @@ use std::hint::black_box;
 fn v1_capability_statement_is_typed_and_bound_to_the_canonical_schema() {
     let response = CapabilityService::negotiate(CapabilityRequest::for_version(ApiVersion::V1));
 
-    assert_eq!(ApiVersion::V1 as u32, 1);
+    assert_eq!(ApiVersion::V1.major(), 1);
     assert_eq!(response.availability(), CapabilityAvailability::Implemented);
     assert_eq!(response.api_major(), ApiVersion::V1);
     assert_eq!(response.schema_digest(), SchemaDigest::canonical());

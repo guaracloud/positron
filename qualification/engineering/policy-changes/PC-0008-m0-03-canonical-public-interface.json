@@ -190,7 +190,7 @@
       "evidence_attempt_id": "1785287818503-5d0fe2a6e4e1-29039",
       "coverage_report": "target/quality/coverage/m0-03-api.json",
       "mutation_report": "target/quality/mutation/m0-03-api-final/mutants.out/outcomes.json",
-      "result": "EG-COVERAGE failed after the canonical API reached 100 percent branch, function, line, and region coverage. The retained mutation campaign selected 88 mutants: 50 caught, 34 unviable, 3 missed, and 1 timed out. The missed outcomes were the semantic-equivalent closed-v1 ApiVersion::major return, an algebraically equivalent encode_varint bitwise-OR replacement, and a decode_varint right-shift replacement not distinguished by the public multi-byte cases. Mutating encode_varint termination from equality to inequality timed out. This exact trusted-CI failure remains immutable and is not merge-eligible."
+      "result": "EG-COVERAGE failed after the canonical API reached 100 percent branch, function, line, and region coverage. The retained mutation campaign selected 88 mutants: 50 caught, 34 unviable, 3 missed, and 1 timed out. Replacing ApiVersion::major with 1 is proven semantic-equivalent because the public type is a closed single-variant v1 enum; the additive public accessor remains, while the focused selector excludes only this equivalent target and retains CapabilityRequest::for_version, CapabilityResponse::api_major, and CapabilityService::negotiate as the observable version invariant owners. The other missed outcomes were an algebraically equivalent encode_varint bitwise-OR replacement and a decode_varint right-shift replacement not distinguished by the public multi-byte cases. Mutating encode_varint termination from equality to inequality timed out. This exact trusted-CI failure remains immutable and is not merge-eligible."
     }
   ],
   "detection_gained": [
@@ -199,7 +199,7 @@
     "the HTTP client publishes and tests an exact one-buffer allocation contract with no intermediate heap body and no completed-body copy",
     "public decoding rejects overflowing terminal u32 varints before shifting or capability negotiation",
     "HTTP u32 decoding accepts canonical unsigned decimal grammar with RFC JSON boundary whitespace and rejects signed, zero-padded, fractional, exponent, internal-whitespace, and non-RFC-whitespace forms",
-    "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail",
+    "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail; it retains observable version owners while excluding only the documented semantic-equivalent single-variant ApiVersion::major target",
     "the public contract proves implemented, unavailable, unsupported, and version-incompatible capability outcomes with safe typed errors and no wire or domain leakage",
     "the canonical artifact scope cannot return to scaffold, accept unknown fields, exceed its 64-byte request bound, or drift from deterministic generation",
     "the authoritative EXT runner owns M0-03 coverage and the explicit exact-selector mutation campaign without changing routine PR selection"
