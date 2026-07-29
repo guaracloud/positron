@@ -102,6 +102,21 @@ fn quality_rejects_a_rebound_imported_spawn_alias_through_the_public_seam() -> T
 }
 
 #[test]
+fn quality_rejects_a_typed_rebound_spawn_alias_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::thread::spawn as entry;\n#[allow(dead_code)] fn typed_rebound_spawn_alias() { let invoke: _ = entry; let _worker = invoke(|| {}); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_transitively_typed_rebound_spawn_alias_through_the_public_seam() -> TestResult
+{
+    assert_imported_concurrency_alias_rejected(
+        "use std::thread::spawn as entry;\n#[allow(dead_code)] fn transitively_typed_rebound_spawn_alias() { let first: _ = entry; let invoke: _ = first; let _worker = invoke(|| {}); }\n",
+    )
+}
+
+#[test]
 fn quality_rejects_a_rebound_thread_module_alias_through_the_public_seam() -> TestResult {
     assert_imported_concurrency_alias_rejected(
         "use std::thread as entry;\n#[allow(dead_code)] fn rebound_thread_module_alias() { let invoke = entry::spawn; let _worker = invoke(|| {}); }\n",
@@ -126,6 +141,21 @@ fn quality_rejects_a_braced_channel_alias_through_the_public_seam() -> TestResul
 fn quality_rejects_a_rebound_imported_channel_factory_through_the_public_seam() -> TestResult {
     assert_imported_concurrency_alias_rejected(
         "use std::sync::mpsc::channel as entry;\n#[allow(dead_code)] fn rebound_channel_factory() { let invoke = entry; let (sender, _receiver) = invoke(); let _ = sender.send(()); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_an_explicitly_typed_rebound_channel_factory_through_the_public_seam()
+-> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::sync::mpsc::{channel as entry, Receiver, Sender};\n#[allow(dead_code)] fn typed_rebound_channel_factory() { let invoke: fn() -> (Sender<()>, Receiver<()>) = entry; let (sender, _receiver) = invoke(); let _ = sender.send(()); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_parenthesized_rebound_channel_factory_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::sync::mpsc::channel as entry;\n#[allow(dead_code, unused_parens)] fn parenthesized_rebound_channel_factory() { let invoke = ( ( entry ) ); let (sender, _receiver) = invoke(); let _ = sender.send(()); }\n",
     )
 }
 
@@ -227,6 +257,34 @@ fn quality_accepts_a_rebound_bounded_channel_factory_through_the_public_seam() -
 }
 
 #[test]
+fn quality_accepts_a_parenthesized_rebound_bounded_channel_factory_through_the_public_seam()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "use std::sync::mpsc::sync_channel as entry;\n#[allow(dead_code, unused_parens)] fn parenthesized_rebound_bounded_channel_factory() { let invoke: _ = ((entry)); let (sender, _receiver) = invoke(1); let _ = sender.send(()); }\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "the public quality seam falsely rejected a typed parenthesized bounded channel factory: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_scans_production_after_a_cfg_test_module_through_the_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -277,6 +335,13 @@ fn quality_skips_only_nested_cfg_test_items_through_the_public_seam() -> TestRes
 fn quality_rejects_a_function_pointer_spawn_binding_through_the_public_seam() -> TestResult {
     assert_imported_concurrency_alias_rejected(
         "#[allow(dead_code)] fn function_pointer_spawn() { let launch = std::thread::spawn; let _worker = launch(|| {}); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_parenthesized_direct_spawn_binding_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "#[allow(dead_code, unused_parens)] fn parenthesized_direct_spawn() { let launch = (((std::thread::spawn))); let _worker = launch(|| {}); }\n",
     )
 }
 

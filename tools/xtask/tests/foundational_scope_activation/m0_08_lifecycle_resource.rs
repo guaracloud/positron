@@ -147,7 +147,7 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
             &evidence,
             "EG-CONCURRENCY",
         )?)?;
-        let (_, duration) = report.split_once("shutdown-elapsed-ms=").ok_or_else(|| {
+        let (_, duration) = report.split_once(";shutdown-elapsed-ms=").ok_or_else(|| {
             std::io::Error::other("lifecycle evidence omitted shutdown elapsed time")
         })?;
         let duration = duration
@@ -173,11 +173,9 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture
-                .root
-                .join("tools/xtask/src/registered_task_lifecycle.rs"),
-            "    if id == 0 {\n        readiness.signal()?;\n    }\n    cooperative_pause(&cancel, Duration::ZERO)?;\n",
-            "    if id == 0 {\n        readiness.signal()?;\n        loop { thread::yield_now(); }\n    }\n    cooperative_pause(&cancel, Duration::ZERO)?;\n",
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    let result = (|| {\n        let registry =",
+            "    if gate == CONCURRENCY_GATE {\n        readiness.signal()?;\n        loop { std::thread::park(); }\n    }\n    let result = (|| {\n        let registry =",
         )?;
         fixture.build_fixture_xtask()?;
         let mut quality = fixture.quality_child_from_built_fixture_for("pr")?;
@@ -224,7 +222,7 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
             }
         }
         let (_, elapsed) = report
-            .split_once("shutdown-elapsed-ms=")
+            .split_once(";shutdown-elapsed-ms=")
             .ok_or_else(|| std::io::Error::other("process lifecycle omitted elapsed time"))?;
         let elapsed = elapsed
             .split(|character: char| !character.is_ascii_digit())
@@ -262,7 +260,7 @@ fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence(
             &evidence,
             "EG-CONCURRENCY",
         )?)?;
-        let (_, elapsed) = report.split_once("shutdown-elapsed-ms=").ok_or_else(|| {
+        let (_, elapsed) = report.split_once(";shutdown-elapsed-ms=").ok_or_else(|| {
             std::io::Error::other("lifecycle evidence omitted shutdown elapsed time")
         })?;
         let elapsed = elapsed

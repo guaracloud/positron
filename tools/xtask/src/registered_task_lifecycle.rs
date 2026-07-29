@@ -77,7 +77,7 @@ impl WorkerReadiness {
         Ok(Self { path })
     }
 
-    fn signal(&self) -> Result<(), XtaskError> {
+    pub(crate) fn signal(&self) -> Result<(), XtaskError> {
         let mut marker = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -328,8 +328,12 @@ impl RegisteredTasks {
             cleanup_errors.extend(self.join_finished_tasks());
             if Instant::now() >= shutdown_deadline {
                 deadline_expired = true;
+                break;
             }
             thread::yield_now();
+        }
+        if deadline_expired {
+            cleanup_errors.extend(self.join_structurally_cooperative_tasks());
         }
         drain_measurements(&self.results, &mut reported_ids);
 
@@ -420,6 +424,30 @@ impl RegisteredTasks {
                         )
                         .to_string(),
                     );
+                },
+            }
+        }
+        errors
+    }
+
+    fn join_structurally_cooperative_tasks(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for task in &mut self.tasks {
+            let Some(handle) = task.handle.take() else {
+                continue;
+            };
+            match handle.join() {
+                Ok(Ok(())) => {
+                    self.completed_ids.push(task.id);
+                    self.joined_ids.push(task.id);
+                },
+                Ok(Err(error)) => {
+                    self.completed_ids.push(task.id);
+                    errors.push(format!("worker {} returned {error}", task.id));
+                },
+                Err(_) => {
+                    self.completed_ids.push(task.id);
+                    errors.push(format!("worker {} panicked", task.id));
                 },
             }
         }

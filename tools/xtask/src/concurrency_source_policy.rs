@@ -329,6 +329,8 @@ enum UseToken {
     Semicolon,
     Equals,
     Glob,
+    OpenParenthesis,
+    CloseParenthesis,
 }
 
 fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, XtaskError> {
@@ -371,6 +373,15 @@ fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, X
         .iter()
         .map(|invocation| invocation.split("::").map(str::to_owned).collect())
         .collect::<Vec<Vec<String>>>();
+    paths.extend([
+        vec!["std".to_owned(), "thread".to_owned(), "spawn".to_owned()],
+        vec![
+            "std".to_owned(),
+            "sync".to_owned(),
+            "mpsc".to_owned(),
+            "channel".to_owned(),
+        ],
+    ]);
     loop {
         let mut changed = false;
         let mut cursor = 0;
@@ -387,10 +398,21 @@ fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, X
                 continue;
             };
             cursor += 1;
+            while !matches!(
+                tokens.get(cursor),
+                Some(UseToken::Equals | UseToken::Semicolon) | None
+            ) {
+                cursor += 1;
+            }
             if tokens.get(cursor) != Some(&UseToken::Equals) {
                 continue;
             }
             cursor += 1;
+            let mut parenthesis_depth = 0_usize;
+            while tokens.get(cursor) == Some(&UseToken::OpenParenthesis) {
+                parenthesis_depth += 1;
+                cursor += 1;
+            }
             let Some(first) = identifier_at(&tokens, cursor) else {
                 continue;
             };
@@ -404,7 +426,13 @@ fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, X
                 right_hand_side.push(segment.to_owned());
                 cursor += 1;
             }
-            if tokens.get(cursor) != Some(&UseToken::Semicolon) || !paths.contains(&right_hand_side)
+            while parenthesis_depth > 0 && tokens.get(cursor) == Some(&UseToken::CloseParenthesis) {
+                parenthesis_depth -= 1;
+                cursor += 1;
+            }
+            if tokens.get(cursor) != Some(&UseToken::Semicolon)
+                || !paths.contains(&right_hand_side)
+                || parenthesis_depth != 0
             {
                 continue;
             }
@@ -546,6 +574,8 @@ fn use_tokens(source: &str) -> Vec<UseToken> {
                 ';' => Some(UseToken::Semicolon),
                 '=' => Some(UseToken::Equals),
                 '*' => Some(UseToken::Glob),
+                '(' => Some(UseToken::OpenParenthesis),
+                ')' => Some(UseToken::CloseParenthesis),
                 _ => None,
             };
             if let Some(token) = token {

@@ -1483,7 +1483,7 @@ fn run_bounded_runner_gate(
     remove_optional_bounded_runner_outcome(&cancellation_path)?;
     let completed_lifecycle = |phase: &str| {
         format!(
-            "process-lifecycle-v1;phase={phase};termination-requested=false;process-reaped=true;live=0;shutdown-ms={};shutdown-elapsed-ms=0",
+            "process-lifecycle-v1;phase={phase};termination-requested=false;process-reaped=true;live=0;shutdown-ms={};process-shutdown-elapsed-ms=0;resource-shutdown-elapsed-ms=0;shutdown-elapsed-ms=0",
             shutdown.as_millis(),
         )
     };
@@ -1496,16 +1496,18 @@ fn run_bounded_runner_gate(
         Err(error) => {
             let lifecycle = match error.shutdown {
                 Some(observed) => format!(
-                    "process-lifecycle-v1;phase={};termination-requested={};process-reaped={};live={};shutdown-ms={};shutdown-elapsed-ms={}",
+                    "process-lifecycle-v1;phase={};termination-requested={};process-reaped={};live={};shutdown-ms={};process-shutdown-elapsed-ms={};resource-shutdown-elapsed-ms={};shutdown-elapsed-ms={}",
                     error.phase.as_str(),
                     observed.termination_requested,
                     observed.process_reaped,
                     observed.live,
                     observed.bound.as_millis(),
+                    observed.process_elapsed.as_millis(),
+                    observed.resource_elapsed.as_millis(),
                     observed.elapsed.as_millis(),
                 ),
                 None => format!(
-                    "process-lifecycle-v1;phase={};termination-requested=false;process-reaped=false;live=0;shutdown-ms={};shutdown-elapsed-ms=0",
+                    "process-lifecycle-v1;phase={};termination-requested=false;process-reaped=false;live=0;shutdown-ms={};process-shutdown-elapsed-ms=0;resource-shutdown-elapsed-ms=0;shutdown-elapsed-ms=0",
                     error.phase.as_str(),
                     shutdown.as_millis(),
                 ),
