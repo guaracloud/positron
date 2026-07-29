@@ -20,7 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PLATFORM_CONTROL_BUDGET: Duration = Duration::from_secs(1);
-const TERMINATION_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const TERMINATION_GRACE: Duration = Duration::from_millis(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The explicit inputs for one controlled external invocation.
@@ -42,8 +43,12 @@ pub(crate) struct InvocationSpec {
     pub(crate) output: OutputMode,
     /// The caller-owned cancellation signal for this invocation only.
     pub(crate) cancellation: Arc<AtomicBool>,
-    /// The complete deadline for direct execution and reconciliation.
+    /// The registered deadline for ordinary direct execution.
     pub(crate) deadline: Instant,
+    /// The separately registered bound for termination and process reaping.
+    pub(crate) shutdown_timeout: Duration,
+    /// An optional create-new marker that requests controlled termination.
+    pub(crate) cancellation_marker: Option<PathBuf>,
 }
 
 /// Resolved helper executables that are outside the target child's environment.
@@ -222,6 +227,8 @@ pub(crate) struct ExecutionFailure {
     pub(crate) phase: FailurePhase,
     /// Bounded diagnostic context for the failed phase.
     pub(crate) detail: String,
+    /// Honest reconciliation observations when a launched process was shut down.
+    pub(crate) shutdown: Option<ShutdownEvidence>,
 }
 
 impl ExecutionFailure {
@@ -230,8 +237,19 @@ impl ExecutionFailure {
             command,
             phase,
             detail: detail.into(),
+            shutdown: None,
         }
     }
+}
+
+/// Observed shutdown behavior for a failed controlled invocation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShutdownEvidence {
+    pub(crate) termination_requested: bool,
+    pub(crate) process_reaped: bool,
+    pub(crate) live: usize,
+    pub(crate) bound: Duration,
+    pub(crate) elapsed: Duration,
 }
 
 fn cancellation_requested(cancellation: &AtomicBool) -> bool {
@@ -318,7 +336,12 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
     ) {
         Ok(workers) => workers,
         Err(failure) => {
-            return finish_after_setup_failure(&mut child, &group, failure);
+            return finish_after_setup_failure(
+                &mut child,
+                &group,
+                failure,
+                specification.shutdown_timeout,
+            );
         },
     };
 
@@ -327,10 +350,17 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
         &command_display,
         specification.deadline,
         Some(specification.cancellation.as_ref()),
+        specification.cancellation_marker.as_deref(),
     ) {
         Ok(status) => status,
         Err(failure) => {
-            return finish_after_execution_failure(&mut child, &group, &mut workers, failure);
+            return finish_after_execution_failure(
+                &mut child,
+                &group,
+                &mut workers,
+                failure,
+                specification.shutdown_timeout,
+            );
         },
     };
 
@@ -340,6 +370,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
             &group,
             &mut workers,
             cancellation_failure(&command_display),
+            specification.shutdown_timeout,
         );
     }
 
@@ -350,7 +381,13 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                 FailurePhase::Descendant,
                 "the direct child exited while its controlled process group still owned descendants or inherited descriptors",
             );
-            finish_after_execution_failure(&mut child, &group, &mut workers, failure)
+            finish_after_execution_failure(
+                &mut child,
+                &group,
+                &mut workers,
+                failure,
+                specification.shutdown_timeout,
+            )
         },
         Ok(false) => {
             if cancellation_requested(specification.cancellation.as_ref()) {
@@ -359,6 +396,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                     &group,
                     &mut workers,
                     cancellation_failure(&command_display),
+                    specification.shutdown_timeout,
                 );
             }
             match workers.join_until(
@@ -370,7 +408,13 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                 Err(failure) => ExecutionOutcome::Failed(failure),
             }
         },
-        Err(failure) => finish_after_execution_failure(&mut child, &group, &mut workers, failure),
+        Err(failure) => finish_after_execution_failure(
+            &mut child,
+            &group,
+            &mut workers,
+            failure,
+            specification.shutdown_timeout,
+        ),
     }
 }
 
@@ -409,11 +453,35 @@ fn configure_standard_descriptors(
 fn finish_after_setup_failure(
     child: &mut Child,
     group: &ProcessGroup,
-    failure: ExecutionFailure,
+    mut failure: ExecutionFailure,
+    shutdown_timeout: Duration,
 ) -> ExecutionOutcome {
-    match terminate_and_reap(child, group, &failure.command) {
-        Ok(()) => ExecutionOutcome::Failed(failure),
-        Err(cleanup) => ExecutionOutcome::Failed(cleanup),
+    let shutdown_started = Instant::now();
+    let Some(shutdown_deadline) = shutdown_started.checked_add(shutdown_timeout) else {
+        return ExecutionOutcome::Failed(ExecutionFailure::new(
+            failure.command,
+            FailurePhase::Cleanup,
+            "the setup-failure shutdown deadline cannot be represented",
+        ));
+    };
+    let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
+    let process_reaped = cleanup.is_ok();
+    let evidence = ShutdownEvidence {
+        termination_requested: true,
+        process_reaped,
+        live: usize::from(!process_reaped),
+        bound: shutdown_timeout,
+        elapsed: shutdown_started.elapsed(),
+    };
+    match cleanup {
+        Ok(()) => {
+            failure.shutdown = Some(evidence);
+            ExecutionOutcome::Failed(failure)
+        },
+        Err(mut cleanup) => {
+            cleanup.shutdown = Some(evidence);
+            ExecutionOutcome::Failed(cleanup)
+        },
     }
 }
 
@@ -422,14 +490,43 @@ fn finish_after_execution_failure(
     child: &mut Child,
     group: &ProcessGroup,
     workers: &mut OwnedWorkers,
-    failure: ExecutionFailure,
+    mut failure: ExecutionFailure,
+    shutdown_timeout: Duration,
 ) -> ExecutionOutcome {
-    let cleanup = terminate_and_reap(child, group, &failure.command);
+    let shutdown_started = Instant::now();
+    let shutdown_deadline = match shutdown_started.checked_add(shutdown_timeout) {
+        Some(deadline) => deadline,
+        None => {
+            return ExecutionOutcome::Failed(ExecutionFailure::new(
+                failure.command,
+                FailurePhase::Cleanup,
+                "the registered shutdown deadline cannot be represented",
+            ));
+        },
+    };
+    let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
     let workers_result = workers.abort(&failure.command);
+    let process_reaped = cleanup.is_ok();
+    let evidence = ShutdownEvidence {
+        termination_requested: true,
+        process_reaped,
+        live: usize::from(!process_reaped),
+        bound: shutdown_timeout,
+        elapsed: shutdown_started.elapsed(),
+    };
     match (cleanup, workers_result) {
-        (Ok(()), Ok(())) => ExecutionOutcome::Failed(failure),
-        (Err(cleanup), _) => ExecutionOutcome::Failed(cleanup),
-        (Ok(()), Err(worker)) => ExecutionOutcome::Failed(worker),
+        (Ok(()), Ok(())) => {
+            failure.shutdown = Some(evidence);
+            ExecutionOutcome::Failed(failure)
+        },
+        (Err(mut cleanup), _) => {
+            cleanup.shutdown = Some(evidence);
+            ExecutionOutcome::Failed(cleanup)
+        },
+        (Ok(()), Err(mut worker)) => {
+            worker.shutdown = Some(evidence);
+            ExecutionOutcome::Failed(worker)
+        },
     }
 }
 
@@ -439,12 +536,29 @@ fn wait_for_direct_child(
     command: &str,
     deadline: Instant,
     cancellation: Option<&AtomicBool>,
+    cancellation_marker: Option<&std::path::Path>,
 ) -> Result<ExitStatus, ExecutionFailure> {
     loop {
         if let Some(cancellation) = cancellation
             && cancellation_requested(cancellation)
         {
             return Err(cancellation_failure(command));
+        }
+        if let Some(marker) = cancellation_marker {
+            match marker.try_exists() {
+                Ok(true) => return Err(cancellation_failure(command)),
+                Ok(false) => {},
+                Err(source) => {
+                    return Err(ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::Descriptor,
+                        format!(
+                            "inspect controlled cancellation marker {}: {source}",
+                            marker.display()
+                        ),
+                    ));
+                },
+            }
         }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -474,18 +588,20 @@ fn terminate_and_reap(
     child: &mut Child,
     group: &ProcessGroup,
     command: &str,
+    shutdown_deadline: Instant,
 ) -> Result<(), ExecutionFailure> {
     group.signal(Signal::Terminate, command)?;
-    let grace_deadline = Instant::now() + TERMINATION_GRACE;
+    let grace_deadline = Instant::now()
+        .checked_add(TERMINATION_GRACE)
+        .unwrap_or(shutdown_deadline)
+        .min(shutdown_deadline);
     if !wait_for_group_while_reaping_direct(child, group, command, grace_deadline)? {
         group.signal(Signal::Kill, command)?;
-        let kill_deadline = Instant::now() + TERMINATION_GRACE;
-        if !wait_for_group_while_reaping_direct(child, group, command, kill_deadline)? {
+        if !wait_for_group_while_reaping_direct(child, group, command, shutdown_deadline)? {
             return Err(group.not_empty_failure(command));
         }
     }
-    let reap_deadline = Instant::now() + TERMINATION_GRACE;
-    wait_for_direct_child(child, command, reap_deadline, None).map(|_| ())
+    wait_for_direct_child(child, command, shutdown_deadline, None, None).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -634,7 +750,7 @@ fn run_platform_kill(
             )
         })?;
     let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-    match wait_for_direct_child(&mut child, command, deadline, None) {
+    match wait_for_direct_child(&mut child, command, deadline, None, None) {
         Ok(status) => Ok(status),
         Err(failure) if failure.phase == FailurePhase::Deadline => {
             child.kill().map_err(|source| {
@@ -645,7 +761,7 @@ fn run_platform_kill(
                 )
             })?;
             let reap_deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-            wait_for_direct_child(&mut child, command, reap_deadline, None).map(|_| ())?;
+            wait_for_direct_child(&mut child, command, reap_deadline, None, None).map(|_| ())?;
             Err(ExecutionFailure::new(
                 command.to_owned(),
                 FailurePhase::Cleanup,
@@ -1029,9 +1145,11 @@ impl InputBroker {
                         }
                     } else {
                         let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-                        wait_for_direct_child(&mut child, command, deadline, None).map(|status| {
-                            self.status = Some(status);
-                        })
+                        wait_for_direct_child(&mut child, command, deadline, None, None).map(
+                            |status| {
+                                self.status = Some(status);
+                            },
+                        )
                     }
                 },
                 Err(source) => Err(ExecutionFailure::new(
@@ -1676,7 +1794,7 @@ impl CaptureReader {
                     };
                 }
                 let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-                wait_for_direct_child(&mut child, command, deadline, None).map(|status| {
+                wait_for_direct_child(&mut child, command, deadline, None, None).map(|status| {
                     self.status = Some(status);
                 })
             },
@@ -1794,8 +1912,9 @@ fn command_display(program: &OsStr, arguments: &[OsString]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        ArtifactOutput, CapturedOutput, ExecutionFailure, ExecutionOutcome, ExecutionTools,
-        ExecutionVerdict, FailurePhase, InvocationInput, InvocationSpec, OutputMode, execute,
+        ArtifactOutput, CapturedOutput, DEFAULT_SHUTDOWN_TIMEOUT, ExecutionFailure,
+        ExecutionOutcome, ExecutionTools, ExecutionVerdict, FailurePhase, InvocationInput,
+        InvocationSpec, OutputMode, execute,
     };
     use std::error::Error;
     use std::ffi::{OsStr, OsString};
@@ -1853,6 +1972,8 @@ mod tests {
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         }))?;
 
         if !verdict.status.success() {
@@ -1912,6 +2033,8 @@ mod tests {
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         }))?;
 
         if !verdict.status.success() {
@@ -1946,6 +2069,8 @@ mod tests {
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         });
 
         match outcome {
@@ -2012,6 +2137,8 @@ mod tests {
             },
             cancellation: worker_cancellation,
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         };
         let worker = thread::spawn(move || execute(specification));
 
@@ -2385,6 +2512,8 @@ done
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         })
     }
 
@@ -2448,6 +2577,8 @@ os._exit(0)
             },
             cancellation,
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         })
     }
 
@@ -2551,6 +2682,8 @@ os._exit(0)
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         })
     }
 

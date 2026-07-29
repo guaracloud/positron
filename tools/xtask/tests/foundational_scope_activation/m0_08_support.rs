@@ -154,7 +154,7 @@ pub(super) fn assert_controlled_process_deadline_failure(
         "termination-requested=true",
         "process-reaped=true",
         "live=0",
-        "deadline-ms=100",
+        "shutdown-ms=100",
     ] {
         if !report.contains(required) {
             return Err(std::io::Error::other(format!(
@@ -164,6 +164,67 @@ pub(super) fn assert_controlled_process_deadline_failure(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn wait_for_bounded_runner_readiness_and_cancel(
+    fixture: &Fixture,
+    gate: &str,
+    timeout: Duration,
+) -> TestResult {
+    let directory = fixture.root.join("target/quality/tmp");
+    let gate_fragment = gate.to_ascii_lowercase();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut pending = vec![directory.clone()];
+        while let Some(candidate) = pending.pop() {
+            if let Ok(entries) = fs::read_dir(&candidate) {
+                for entry in entries {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        pending.push(path);
+                        continue;
+                    }
+                    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                        continue;
+                    };
+                    if !name.starts_with("bounded-runner-")
+                        || !name.contains(&gate_fragment)
+                        || !name.ends_with(".ready")
+                    {
+                        continue;
+                    }
+                    if fs::read(&path)? != b"worker-ready-v1\n" {
+                        return Err(std::io::Error::other(
+                            "bounded runner readiness marker had unexpected content",
+                        )
+                        .into());
+                    }
+                    let cancellation = path.with_extension("cancel");
+                    let mut marker = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&cancellation)?;
+                    use std::io::Write as _;
+                    marker.write_all(b"cancel-v1\n")?;
+                    marker.sync_all()?;
+                    fs::File::open(path.parent().ok_or_else(|| {
+                        std::io::Error::other("bounded runner readiness marker has no parent")
+                    })?)?
+                    .sync_all()?;
+                    return Ok(());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(
+                "bounded runner did not publish readiness before the outer test watchdog",
+            )
+            .into());
+        }
+        thread::yield_now();
+    }
 }
 
 pub(super) fn assert_cancellation_state(

@@ -2870,6 +2870,7 @@ fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() ->
         }
         let concurrency_gate = gate_record(&retained, "EG-CONCURRENCY")?;
         if !concurrency_gate.contains("\"result\": \"passed\"")
+            || !concurrency_gate.contains("\"timeout_ms\":900000")
             || concurrency_gate
                 .matches("\"program\":\"cargo-xtask-quality/bounded-runner\"")
                 .count()
@@ -2891,7 +2892,7 @@ fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() ->
             "termination-requested=false",
             "process-reaped=true",
             "live=0",
-            "deadline-ms=100",
+            "shutdown-ms=100",
         ] {
             if !concurrency_report.contains(required) {
                 return Err(std::io::Error::other(format!(
@@ -2922,7 +2923,15 @@ fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() ->
 fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
-        fixture.quality()?;
+        let initial = fixture.quality_output_for("pr")?;
+        if !initial.status.success() {
+            return Err(std::io::Error::other(format!(
+                "registered internal gates did not produce initial PR evidence: {}\n{}",
+                String::from_utf8_lossy(&initial.stdout),
+                String::from_utf8_lossy(&initial.stderr),
+            ))
+            .into());
+        }
         let evidence = fixture.latest_evidence()?;
         let policy = gate_record(&evidence, "EG-POLICY")?;
         if !policy.contains("\"controlled_steps\":[]") {
@@ -2930,6 +2939,23 @@ fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> Te
                 "registered internal policy gate did not retain its canonical zero-step sequence",
             )
             .into());
+        }
+        for (gate_id, timeout_ms) in [
+            ("EG-CONCURRENCY", 900_000_u128),
+            ("EG-RESOURCE", 1_800_000_u128),
+        ] {
+            let gate = gate_record(&evidence, gate_id)?;
+            if gate
+                .matches("\"program\":\"cargo-xtask-quality/bounded-runner\"")
+                .count()
+                != 1
+                || !gate.contains(&format!("\"timeout_ms\":{timeout_ms}"))
+            {
+                return Err(std::io::Error::other(format!(
+                    "{gate_id} did not retain exactly one stage-timeout-bound child"
+                ))
+                .into());
+            }
         }
         let next = fixture.quality_output_for("pr")?;
         if !next.status.success() {
@@ -6987,7 +7013,7 @@ case "$command" in
     document_root="$target/doc"
     search_index="$document_root/search.index/7ee4fc406f.js"
     mkdir -p "$(dirname "$search_index")"
-    token_prefix='sq0atp-'
+    token_prefix=$(printf '\163\161\060\141\164\160\055')
     : > "$search_index"
     if [ -f target/quality-tools/emit-search-index-square-canary ]; then
       printf '%s%s\n' "$token_prefix" '1111111111111111111111' > "$search_index"
@@ -7058,7 +7084,8 @@ if [ -z "$target" ]; then
 fi
 search_index="$target/search.index/7ee4fc406f.js"
 if [ -f "$search_index" ]; then
-  if grep -E 'sq0atp-[0-9]{22}' "$search_index" >/dev/null; then
+  square_prefix=$(printf '\163\161\060\141\164\160\055')
+  if grep -E "${square_prefix}[0-9]{22}" "$search_index" >/dev/null; then
     printf '%s\n' 'fixture detected Square-shaped secret canary' >&2
     exit 78
   fi

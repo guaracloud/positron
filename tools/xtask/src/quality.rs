@@ -1374,6 +1374,7 @@ fn execute_gate(
             qualification_fixtures.bounded_runners(),
             root,
             "EG-CONCURRENCY",
+            budget,
             environment,
             capture,
         ),
@@ -1408,6 +1409,7 @@ fn execute_gate(
             qualification_fixtures.bounded_runners(),
             root,
             "EG-RESOURCE",
+            budget,
             environment,
             capture,
         ),
@@ -1422,13 +1424,12 @@ fn run_bounded_runner_gate(
     registry: &crate::bounded_runners::FrozenBoundedRunnerRegistry,
     root: &Path,
     gate: &str,
+    execution_timeout: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     crate::bounded_runners::validate_source_policy(registry, root)?;
     let shutdown = registry.shutdown_bound(gate)?;
-    let work_budget = registry.process_work_budget(gate)?;
-    let started = Instant::now();
     let program = env::current_exe()
         .map_err(|source| XtaskError::io("resolve bounded runner executable", source))?;
     if !program.is_absolute() || !program.is_file() {
@@ -1438,12 +1439,22 @@ fn run_bounded_runner_gate(
         ));
     }
     let nonce = unix_time_ms()?;
-    let outcome_path = environment.temporary_root().join(format!(
-        "bounded-runner-{}-{}-{nonce}.out",
+    let path_stem = format!(
+        "bounded-runner-{}-{}-{nonce}",
         std::process::id(),
         gate.to_ascii_lowercase(),
-    ));
-    let arguments = registry.child_arguments(gate, &outcome_path)?;
+    );
+    let outcome_path = environment
+        .temporary_root()
+        .join(format!("{path_stem}.out"));
+    let readiness_path = environment
+        .temporary_root()
+        .join(format!("{path_stem}.ready"));
+    let cancellation_path = environment
+        .temporary_root()
+        .join(format!("{path_stem}.cancel"));
+    let arguments =
+        registry.child_arguments(gate, &outcome_path, execution_timeout, &readiness_path)?;
     let invocation_environment = environment.invocation_environment(&[])?;
     let input = InvocationInput::Null;
     let invocation = controlled_invocation(
@@ -1451,7 +1462,7 @@ fn run_bounded_runner_gate(
         program.as_os_str(),
         &arguments,
         &invocation_environment,
-        work_budget,
+        execution_timeout,
         &input,
     );
     let outcome = controlled_execution::execute(InvocationSpec {
@@ -1463,16 +1474,17 @@ fn run_bounded_runner_gate(
         input,
         output: OutputMode::Discard,
         cancellation: Arc::new(AtomicBool::new(false)),
-        deadline: deadline_after(work_budget)?,
+        deadline: deadline_after(execution_timeout)?,
+        shutdown_timeout: shutdown,
+        cancellation_marker: Some(cancellation_path.clone()),
     })
     .into_result();
-    let elapsed = started.elapsed();
-    let lifecycle = |phase: &str| {
+    remove_optional_bounded_runner_outcome(&readiness_path)?;
+    remove_optional_bounded_runner_outcome(&cancellation_path)?;
+    let completed_lifecycle = |phase: &str| {
         format!(
-            "process-lifecycle-v1;phase={phase};termination-requested={};process-reaped=true;live=0;deadline-ms={};deadline-elapsed-ms={}",
-            phase == "deadline" || phase == "cancellation",
+            "process-lifecycle-v1;phase={phase};termination-requested=false;process-reaped=true;live=0;shutdown-ms={};shutdown-elapsed-ms=0",
             shutdown.as_millis(),
-            elapsed.as_millis(),
         )
     };
     let verdict = match outcome {
@@ -1482,8 +1494,29 @@ fn run_bounded_runner_gate(
             verdict
         },
         Err(error) => {
+            let lifecycle = match error.shutdown {
+                Some(observed) => format!(
+                    "process-lifecycle-v1;phase={};termination-requested={};process-reaped={};live={};shutdown-ms={};shutdown-elapsed-ms={}",
+                    error.phase.as_str(),
+                    observed.termination_requested,
+                    observed.process_reaped,
+                    observed.live,
+                    observed.bound.as_millis(),
+                    observed.elapsed.as_millis(),
+                ),
+                None => format!(
+                    "process-lifecycle-v1;phase={};termination-requested=false;process-reaped=false;live=0;shutdown-ms={};shutdown-elapsed-ms=0",
+                    error.phase.as_str(),
+                    shutdown.as_millis(),
+                ),
+            };
             let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
-            capture.record(invocation, &step_verdict, "", &error.detail)?;
+            capture.record(
+                invocation,
+                &step_verdict,
+                "",
+                &format!("{}; {lifecycle}", error.detail),
+            )?;
             remove_optional_bounded_runner_outcome(&outcome_path)?;
             return Err(XtaskError::invalid(
                 "bounded runner process lifecycle",
@@ -1491,7 +1524,7 @@ fn run_bounded_runner_gate(
                     "controlled runner failed during {}: {}; {}",
                     error.phase.as_str(),
                     error.detail,
-                    lifecycle(error.phase.as_str()),
+                    lifecycle,
                 ),
             ));
         },
@@ -1504,16 +1537,7 @@ fn run_bounded_runner_gate(
                 "child returned {}: {}; {}",
                 verdict.status,
                 outcome.trim().replace('\n', " | "),
-                lifecycle("child-error"),
-            ),
-        ));
-    }
-    if elapsed > shutdown {
-        return Err(XtaskError::invalid(
-            "bounded runner process lifecycle",
-            format!(
-                "runner returned after the registered shutdown bound; {}",
-                lifecycle("late-success"),
+                completed_lifecycle("child-error"),
             ),
         ));
     }
@@ -1523,7 +1547,7 @@ fn run_bounded_runner_gate(
             format!(
                 "child outcome omitted its success discriminator: {}; {}",
                 one_line(&outcome),
-                lifecycle("malformed-output"),
+                completed_lifecycle("malformed-output"),
             ),
         ));
     };
@@ -1533,11 +1557,11 @@ fn run_bounded_runner_gate(
             "bounded runner process lifecycle",
             format!(
                 "child omitted its exact one-line measurement; {}",
-                lifecycle("malformed-output"),
+                completed_lifecycle("malformed-output"),
             ),
         ));
     }
-    Ok(format!("{record}; {}", lifecycle("completed")))
+    Ok(format!("{record}; {}", completed_lifecycle("completed")))
 }
 
 fn take_bounded_runner_outcome(path: &Path) -> Result<String, XtaskError> {
@@ -2638,6 +2662,8 @@ fn run_dependency_metadata_capture(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(timeout)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result();
     let verdict = match verdict {
@@ -3306,6 +3332,7 @@ fn validate_registered_controlled_steps(
         if !registered_program
             || !resolved_matches
             || step.timeout_ms > maximum_timeout_ms
+            || (process_backed_runner && step.timeout_ms != maximum_timeout_ms)
             || step.input_kind != "null"
             || step.input_bytes != 0
             || step.input_sha256 != "-"
@@ -5591,6 +5618,8 @@ fn run_status_with_options<'argument>(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(options.timeout)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result();
     let verdict = match verdict {
@@ -5690,6 +5719,8 @@ fn run_capture_with_input<'argument>(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(options.timeout)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result();
     let verdict = match verdict {
@@ -6245,6 +6276,8 @@ fn snapshot_digest(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(SNAPSHOT_DIGEST_TIMEOUT)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result()
     .map_err(XtaskError::controlled_harness)?;

@@ -4,6 +4,9 @@
 //! carries one monotonic deadline from registration through reconciliation,
 //! and records completion and join observations only when they actually occur.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -39,6 +42,60 @@ pub(crate) struct LifecycleResult<T> {
     pub(crate) joined_ids: Vec<usize>,
 }
 
+pub(crate) struct RegisteredTaskSpec<'a> {
+    pub(crate) max_tasks: usize,
+    pub(crate) execution_timeout: Duration,
+    pub(crate) shutdown: Duration,
+    pub(crate) spawn_site: &'a str,
+    pub(crate) registered_spawn_site: &'a str,
+    pub(crate) readiness: WorkerReadiness,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerReadiness {
+    path: PathBuf,
+}
+
+impl WorkerReadiness {
+    pub(crate) fn new(path: PathBuf) -> Result<Self, XtaskError> {
+        let root = std::env::current_dir()
+            .map_err(|source| XtaskError::io("resolve bounded runner workspace", source))?;
+        let parent = path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&path, "worker readiness path has no parent")
+        })?;
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            || !parent.starts_with(root.join("target/quality/tmp"))
+        {
+            return Err(XtaskError::invalid_path(
+                &path,
+                "worker readiness path escaped the owned quality temporary root",
+            ));
+        }
+        Ok(Self { path })
+    }
+
+    fn signal(&self) -> Result<(), XtaskError> {
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)
+            .map_err(|source| XtaskError::io("create bounded worker readiness marker", source))?;
+        marker
+            .write_all(b"worker-ready-v1\n")
+            .and_then(|()| marker.sync_all())
+            .map_err(|source| XtaskError::io("sync bounded worker readiness marker", source))?;
+        let parent = self.path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&self.path, "worker readiness path has no parent")
+        })?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| XtaskError::io("sync bounded worker readiness directory", source))
+    }
+}
+
 struct RegisteredTask {
     id: usize,
     cancel: Arc<AtomicBool>,
@@ -56,9 +113,7 @@ enum CancellationState {
 pub(crate) struct RegisteredTasks {
     tasks: Vec<RegisteredTask>,
     results: Receiver<WorkerMeasurement>,
-    started: Instant,
-    work_deadline: Instant,
-    deadline: Instant,
+    execution_deadline: Instant,
     shutdown: Duration,
     spawned_ids: Vec<usize>,
     joined_ids: Vec<usize>,
@@ -67,13 +122,10 @@ pub(crate) struct RegisteredTasks {
 
 impl RegisteredTasks {
     pub(crate) fn execute<T>(
-        max_tasks: usize,
-        shutdown: Duration,
-        spawn_site: &str,
-        registered_spawn_site: &str,
+        specification: RegisteredTaskSpec<'_>,
         operation: impl FnOnce(&mut Self) -> Result<T, XtaskError>,
     ) -> Result<LifecycleResult<T>, XtaskError> {
-        let mut owner = Self::spawn(max_tasks, shutdown, spawn_site, registered_spawn_site)?;
+        let mut owner = Self::spawn(specification)?;
         let value = match operation(&mut owner) {
             Ok(value) => value,
             Err(error) => return owner.reconcile_failure(error),
@@ -86,40 +138,41 @@ impl RegisteredTasks {
         })
     }
 
-    fn spawn(
-        max_tasks: usize,
-        shutdown: Duration,
-        spawn_site: &str,
-        registered_spawn_site: &str,
-    ) -> Result<Self, XtaskError> {
+    fn spawn(specification: RegisteredTaskSpec<'_>) -> Result<Self, XtaskError> {
+        let RegisteredTaskSpec {
+            max_tasks,
+            execution_timeout,
+            shutdown,
+            spawn_site,
+            registered_spawn_site,
+            readiness,
+        } = specification;
         if spawn_site != registered_spawn_site {
             return Err(XtaskError::invalid(
                 "bounded task registration",
                 "unregistered spawn site was denied before task creation",
             ));
         }
-        let started = Instant::now();
-        let deadline = started.checked_add(shutdown).ok_or_else(|| {
-            XtaskError::invalid(
+        let execution_deadline =
+            Instant::now()
+                .checked_add(execution_timeout)
+                .ok_or_else(|| {
+                    XtaskError::invalid(
+                        "bounded task registration",
+                        "registered execution deadline cannot be represented",
+                    )
+                })?;
+        if shutdown <= CANCELLATION_JOIN_RESERVE {
+            return Err(XtaskError::invalid(
                 "bounded task registration",
-                "shutdown deadline cannot be represented",
-            )
-        })?;
-        let work_deadline = deadline
-            .checked_sub(CANCELLATION_JOIN_RESERVE)
-            .ok_or_else(|| {
-                XtaskError::invalid(
-                    "bounded task registration",
-                    "shutdown deadline does not reserve bounded cancellation and join time",
-                )
-            })?;
+                "shutdown bound does not reserve bounded cancellation and join time",
+            ));
+        }
         let (results_sender, results) = mpsc::sync_channel(max_tasks);
         let mut owner = Self {
             tasks: Vec::with_capacity(max_tasks),
             results,
-            started,
-            work_deadline,
-            deadline,
+            execution_deadline,
             shutdown,
             spawned_ids: Vec::with_capacity(max_tasks),
             joined_ids: Vec::with_capacity(max_tasks),
@@ -135,11 +188,20 @@ impl RegisteredTasks {
                 handle: None,
             });
             let worker_results = results_sender.clone();
+            let worker_readiness = readiness.clone();
             let handle = match thread::Builder::new()
                 .name(format!("positron-quality-worker-{id}"))
                 // positron-concurrency-spawn: RegisteredTasks::spawn\tquality-bounded-worker-v1
-                .spawn(move || worker_loop(id, cancel, deadline, receiver, worker_results))
-            {
+                .spawn(move || {
+                    worker_loop(
+                        id,
+                        cancel,
+                        execution_deadline,
+                        receiver,
+                        worker_results,
+                        worker_readiness,
+                    )
+                }) {
                 Ok(handle) => handle,
                 Err(source) => {
                     return owner.reconcile_failure(XtaskError::io(
@@ -162,10 +224,10 @@ impl RegisteredTasks {
     }
 
     pub(crate) fn dispatch(&mut self, id: usize, command: WorkerCommand) -> Result<(), XtaskError> {
-        if Instant::now() >= self.work_deadline {
+        if Instant::now() >= self.execution_deadline {
             return Err(XtaskError::invalid(
                 "bounded task dispatch",
-                "registered work deadline expired before command delivery",
+                "registered execution deadline expired before command delivery",
             ));
         }
         let task = self.tasks.get(id).ok_or_else(|| {
@@ -195,10 +257,10 @@ impl RegisteredTasks {
     fn reconcile(&mut self) -> Result<Vec<WorkerMeasurement>, XtaskError> {
         let mut measurements = Vec::with_capacity(self.tasks.len());
         while measurements.len() < self.tasks.len() {
-            if Instant::now() >= self.work_deadline {
+            if Instant::now() >= self.execution_deadline {
                 return self.reconcile_failure(XtaskError::invalid(
-                    "bounded task shutdown",
-                    "registered tasks did not report before the shutdown deadline",
+                    "bounded task execution",
+                    "registered tasks did not report before the execution deadline",
                 ));
             }
             match self.results.try_recv() {
@@ -213,10 +275,10 @@ impl RegisteredTasks {
             }
         }
         while self.has_unjoined_handles() {
-            if Instant::now() >= self.deadline {
+            if Instant::now() >= self.execution_deadline {
                 return self.reconcile_failure(XtaskError::invalid(
-                    "bounded task shutdown",
-                    "registered task completion was not observed before the shutdown deadline",
+                    "bounded task execution",
+                    "registered task completion was not observed before the execution deadline",
                 ));
             }
             let join_errors = self.join_finished_tasks();
@@ -232,6 +294,13 @@ impl RegisteredTasks {
     }
 
     fn reconcile_failure<T>(&mut self, original: XtaskError) -> Result<T, XtaskError> {
+        let shutdown_started = Instant::now();
+        let shutdown_deadline = shutdown_started.checked_add(self.shutdown).ok_or_else(|| {
+            XtaskError::invalid(
+                "bounded task lifecycle reconciliation",
+                "shutdown deadline cannot be represented",
+            )
+        })?;
         let spawned_ids = self.spawned_ids.clone();
         let mut cancellation = Vec::new();
         for task in &mut self.tasks {
@@ -257,7 +326,7 @@ impl RegisteredTasks {
         while self.has_unjoined_handles() {
             drain_measurements(&self.results, &mut reported_ids);
             cleanup_errors.extend(self.join_finished_tasks());
-            if Instant::now() >= self.deadline {
+            if Instant::now() >= shutdown_deadline {
                 deadline_expired = true;
             }
             thread::yield_now();
@@ -266,7 +335,7 @@ impl RegisteredTasks {
 
         if deadline_expired {
             cleanup_errors.push(
-                "cooperative worker completion was not observed before the one registered deadline"
+                "cooperative worker completion was not observed before the registered shutdown deadline"
                     .to_owned(),
             );
         }
@@ -295,7 +364,7 @@ impl RegisteredTasks {
             ids.dedup();
         }
         let lifecycle = format!(
-            "lifecycle-v1;spawned-ids={};cancelled-ids={};already-queued-ids={};disconnected-ids={};reported-ids={};completed-ids={};joined-ids={};deadline-ms={};deadline-elapsed-ms={};live=0",
+            "lifecycle-v1;spawned-ids={};cancelled-ids={};already-queued-ids={};disconnected-ids={};reported-ids={};completed-ids={};joined-ids={};shutdown-ms={};shutdown-elapsed-ms={};live=0",
             format_ids(&spawned_ids),
             format_ids(&cancelled_ids),
             format_ids(&already_queued_ids),
@@ -304,7 +373,7 @@ impl RegisteredTasks {
             format_ids(&self.completed_ids),
             format_ids(&self.joined_ids),
             self.shutdown.as_millis(),
-            self.started.elapsed().as_millis(),
+            shutdown_started.elapsed().as_millis(),
         );
         if cleanup_errors.is_empty() {
             Err(XtaskError::invalid(
@@ -381,6 +450,7 @@ fn worker_loop(
     deadline: Instant,
     receiver: Receiver<WorkerCommand>,
     results: SyncSender<WorkerMeasurement>,
+    readiness: WorkerReadiness,
 ) -> Result<(), XtaskError> {
     let command = loop {
         if cancel.load(Ordering::Acquire) {
@@ -406,6 +476,9 @@ fn worker_loop(
             },
         }
     };
+    if id == 0 {
+        readiness.signal()?;
+    }
     cooperative_pause(&cancel, Duration::ZERO)?;
     let (completion, schedule_slot) = match command {
         WorkerCommand::Execute { schedule_slot } => (WorkerCompletion::Executed, schedule_slot),

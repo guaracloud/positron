@@ -18,7 +18,8 @@ use std::time::Duration;
 use crate::concurrency_source_policy::SpawnSiteRegistry;
 use crate::error::XtaskError;
 use crate::registered_task_lifecycle::{
-    LifecycleResult, RegisteredTasks, WorkerCommand, WorkerCompletion, WorkerMeasurement,
+    LifecycleResult, RegisteredTaskSpec, RegisteredTasks, WorkerCommand, WorkerCompletion,
+    WorkerMeasurement, WorkerReadiness,
 };
 
 const REGISTRY_PATH: &str = "qualification/engineering/concurrency-fixtures.tsv";
@@ -31,7 +32,6 @@ const MAXIMUM_FIELD_BYTES: usize = 96;
 const REGISTERED_SPAWN_SITE: &str = "quality-bounded-worker-v1";
 const CONCURRENCY_GATE: &str = "EG-CONCURRENCY";
 const RESOURCE_GATE: &str = "EG-RESOURCE";
-const CHILD_PROCESS_RECONCILIATION_RESERVE: Duration = Duration::from_millis(50);
 const MAXIMUM_CHILD_ARGUMENT_BYTES: usize = 32_768;
 const MAXIMUM_CHILD_OUTCOME_BYTES: usize = 8_192;
 
@@ -252,6 +252,8 @@ impl FrozenBoundedRunnerRegistry {
         &self,
         gate: &str,
         outcome: &Path,
+        execution_timeout: Duration,
+        readiness: &Path,
     ) -> Result<Vec<OsString>, XtaskError> {
         let registry = hex_encode(&self.bytes)?;
         let spawn_sites = hex_encode(&self.spawn_site_bytes)?;
@@ -261,6 +263,8 @@ impl FrozenBoundedRunnerRegistry {
             OsString::from(registry),
             OsString::from(spawn_sites),
             outcome.as_os_str().to_owned(),
+            OsString::from(execution_timeout.as_millis().to_string()),
+            readiness.as_os_str().to_owned(),
         ])
     }
 
@@ -275,11 +279,13 @@ impl FrozenBoundedRunnerRegistry {
             registry,
             spawn_sites,
             outcome,
+            recorded_timeout,
+            readiness,
         ] = arguments
         else {
             return false;
         };
-        if *recorded_gate != gate {
+        if *recorded_gate != gate || recorded_timeout.parse::<u128>().ok() != Some(timeout_ms) {
             return false;
         }
         let outcome = Path::new(outcome);
@@ -287,7 +293,17 @@ impl FrozenBoundedRunnerRegistry {
             .file_name()
             .and_then(OsStr::to_str)
             .is_some_and(|name| name.starts_with("bounded-runner-") && name.ends_with(".out"));
-        if !outcome.is_absolute() || !outcome_name_matches {
+        let readiness = Path::new(readiness);
+        let readiness_name_matches = readiness
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("bounded-runner-") && name.ends_with(".ready"));
+        if !outcome.is_absolute()
+            || !outcome_name_matches
+            || !readiness.is_absolute()
+            || !readiness_name_matches
+            || readiness.parent() != outcome.parent()
+        {
             return false;
         }
         let Ok(registry_bytes) = hex_decode(registry) else {
@@ -300,24 +316,8 @@ impl FrozenBoundedRunnerRegistry {
             return false;
         };
         FrozenBoundedRunnerRegistry::capture(registry_bytes, spawn_site_bytes)
-            .and_then(|frozen| {
-                frozen.scenario(parsed_gate)?;
-                frozen.process_work_budget(gate)
-            })
-            .is_ok_and(|budget| budget.as_millis() == timeout_ms)
-    }
-
-    pub(crate) fn process_work_budget(&self, gate: &str) -> Result<Duration, XtaskError> {
-        let scenario = self.scenario(ScenarioGate::parse(gate)?)?;
-        scenario
-            .shutdown
-            .checked_sub(CHILD_PROCESS_RECONCILIATION_RESERVE)
-            .ok_or_else(|| {
-                XtaskError::invalid(
-                    "bounded runner process lifecycle",
-                    "registered shutdown bound does not reserve process reconciliation time",
-                )
-            })
+            .and_then(|frozen| frozen.scenario(parsed_gate).map(|_| ()))
+            .is_ok()
     }
 
     pub(crate) fn shutdown_bound(&self, gate: &str) -> Result<Duration, XtaskError> {
@@ -357,19 +357,45 @@ fn hex_digit(digits: &[u8; 16], index: u8) -> Result<u8, XtaskError> {
 }
 
 pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(), XtaskError> {
-    let arguments = arguments.take(5).collect::<Vec<_>>();
-    let [gate, registry, spawn_sites, outcome] = arguments.as_slice() else {
+    let arguments = arguments.take(7).collect::<Vec<_>>();
+    let [
+        gate,
+        registry,
+        spawn_sites,
+        outcome,
+        execution_timeout_ms,
+        readiness,
+    ] = arguments.as_slice()
+    else {
         return Err(XtaskError::usage(
-            "quality-bounded-runner requires one gate, two frozen registries, and one outcome path",
+            "quality-bounded-runner requires one gate, two frozen registries, one outcome path, one execution timeout, and one readiness path",
         ));
     };
     let outcome = PathBuf::from(outcome);
+    let readiness = WorkerReadiness::new(PathBuf::from(readiness))?;
+    let execution_timeout_ms = execution_timeout_ms.parse::<u64>().map_err(|_| {
+        XtaskError::invalid(
+            "bounded runner child arguments",
+            "execution timeout is not a canonical unsigned millisecond value",
+        )
+    })?;
+    let execution_timeout = Duration::from_millis(execution_timeout_ms);
+    if execution_timeout.is_zero() {
+        return Err(XtaskError::invalid(
+            "bounded runner child arguments",
+            "execution timeout must be positive",
+        ));
+    }
     let result = (|| {
         let registry =
             FrozenBoundedRunnerRegistry::capture(hex_decode(registry)?, hex_decode(spawn_sites)?)?;
         let record = match ScenarioGate::parse(gate)? {
-            ScenarioGate::Concurrency => run_concurrency_scenario(&registry)?,
-            ScenarioGate::Resource => run_resource_scenario(&registry)?,
+            ScenarioGate::Concurrency => {
+                run_concurrency_scenario(&registry, execution_timeout, readiness)?
+            },
+            ScenarioGate::Resource => {
+                run_resource_scenario(&registry, execution_timeout, readiness)?
+            },
         };
         Ok(record)
     })();
@@ -610,7 +636,11 @@ impl BoundedWorkQueue {
     }
 }
 
-fn run_concurrency_scenario(registry: &FrozenBoundedRunnerRegistry) -> Result<String, XtaskError> {
+fn run_concurrency_scenario(
+    registry: &FrozenBoundedRunnerRegistry,
+    execution_timeout: Duration,
+    readiness: WorkerReadiness,
+) -> Result<String, XtaskError> {
     let scenario = registry.scenario(ScenarioGate::Concurrency)?;
     validate_concurrency_scenario(scenario)?;
     let LifecycleResult {
@@ -618,10 +648,14 @@ fn run_concurrency_scenario(registry: &FrozenBoundedRunnerRegistry) -> Result<St
         measurements,
         joined_ids,
     } = RegisteredTasks::execute(
-        scenario.max_tasks,
-        scenario.shutdown,
-        &scenario.spawn_site,
-        REGISTERED_SPAWN_SITE,
+        RegisteredTaskSpec {
+            max_tasks: scenario.max_tasks,
+            execution_timeout,
+            shutdown: scenario.shutdown,
+            spawn_site: &scenario.spawn_site,
+            registered_spawn_site: REGISTERED_SPAWN_SITE,
+            readiness,
+        },
         |tasks| {
             tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;
             tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;
@@ -634,7 +668,11 @@ fn run_concurrency_scenario(registry: &FrozenBoundedRunnerRegistry) -> Result<St
     Ok(record)
 }
 
-fn run_resource_scenario(registry: &FrozenBoundedRunnerRegistry) -> Result<String, XtaskError> {
+fn run_resource_scenario(
+    registry: &FrozenBoundedRunnerRegistry,
+    execution_timeout: Duration,
+    readiness: WorkerReadiness,
+) -> Result<String, XtaskError> {
     let scenario = registry.scenario(ScenarioGate::Resource)?;
     validate_resource_scenario(scenario)?;
     let LifecycleResult {
@@ -642,10 +680,14 @@ fn run_resource_scenario(registry: &FrozenBoundedRunnerRegistry) -> Result<Strin
         measurements,
         joined_ids,
     } = RegisteredTasks::execute(
-        scenario.max_tasks,
-        scenario.shutdown,
-        &scenario.spawn_site,
-        REGISTERED_SPAWN_SITE,
+        RegisteredTaskSpec {
+            max_tasks: scenario.max_tasks,
+            execution_timeout,
+            shutdown: scenario.shutdown,
+            spawn_site: &scenario.spawn_site,
+            registered_spawn_site: REGISTERED_SPAWN_SITE,
+            readiness,
+        },
         |tasks| {
             let mut queue = BoundedWorkQueue::new(scenario.queue_capacity);
             for task in 0..scenario.max_tasks {
@@ -735,7 +777,7 @@ fn measurement_record(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "measurement-v1;scenario={};schedule={};seed={};registered={};workers={workers};retries={retries};reservations={reservations};queue-empty={queue_empty};joined-ids={joined};deadline-ms={}",
+        "measurement-v1;scenario={};schedule={};seed={};registered={};workers={workers};retries={retries};reservations={reservations};queue-empty={queue_empty};joined-ids={joined};shutdown-ms={}",
         scenario.id,
         scenario.schedule,
         scenario.seed,
@@ -878,7 +920,7 @@ fn verify_measurement_record(
         ));
     }
     if fields
-        .get("deadline-ms")
+        .get("shutdown-ms")
         .and_then(|value| value.parse::<u128>().ok())
         != Some(scenario.shutdown.as_millis())
     {

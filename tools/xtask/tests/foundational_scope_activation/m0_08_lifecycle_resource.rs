@@ -24,11 +24,11 @@ fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() ->
         for (gate, required) in [
             (
                 "EG-CONCURRENCY",
-                "measurement-v1;scenario=concurrency-cancel-join;schedule=cancel-then-join-v1;seed=seed-concurrency-v1;registered=3;workers=0:0:cancelled,1:1:executed,2:2:executed;retries=0;reservations=0;queue-empty=true;joined-ids=0,1,2;deadline-ms=100",
+                "measurement-v1;scenario=concurrency-cancel-join;schedule=cancel-then-join-v1;seed=seed-concurrency-v1;registered=3;workers=0:0:cancelled,1:1:executed,2:2:executed;retries=0;reservations=0;queue-empty=true;joined-ids=0,1,2;shutdown-ms=100",
             ),
             (
                 "EG-RESOURCE",
-                "measurement-v1;scenario=resource-fair-pressure;schedule=round-robin-pressure-v1;seed=seed-resource-v1;registered=3;workers=0:0:executed,1:1:executed,2:2:executed;retries=2;reservations=0;queue-empty=true;joined-ids=0,1,2;deadline-ms=100",
+                "measurement-v1;scenario=resource-fair-pressure;schedule=round-robin-pressure-v1;seed=seed-resource-v1;registered=3;workers=0:0:executed,1:1:executed,2:2:executed;retries=2;reservations=0;queue-empty=true;joined-ids=0,1,2;shutdown-ms=100",
             ),
         ] {
             let record = gate_record(&evidence, gate)?;
@@ -101,11 +101,16 @@ fn quality_reconciles_after_a_result_timeout_through_the_public_seam() -> TestRe
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
+            &fixture.root.join("qualification/engineering/gates.tsv"),
+            "EG-CONCURRENCY\tPR|EXT|QUAL\tApplication Runtime\t900\t4096\tnon-waivable\trisk\tconcurrency",
+            "EG-CONCURRENCY\tPR|EXT|QUAL\tApplication Runtime\t1\t4096\tnon-waivable\trisk\tconcurrency",
+        )?;
+        replace_once(
             &fixture
                 .root
                 .join("tools/xtask/src/registered_task_lifecycle.rs"),
             "    let (completion, schedule_slot) = match command {",
-            "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
+            "    cooperative_pause(&cancel, Duration::from_millis(1250))?;\n    let (completion, schedule_slot) = match command {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_controlled_process_deadline_failure(&fixture, &output)
@@ -128,15 +133,22 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
             "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_controlled_process_deadline_failure(&fixture, &output)?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "ordinary 250ms worker execution was incorrectly charged to the 100ms shutdown clock: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
         let evidence = fixture.latest_evidence()?;
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
             &evidence,
             "EG-CONCURRENCY",
         )?)?;
-        let (_, duration) = report.split_once("deadline-elapsed-ms=").ok_or_else(|| {
-            std::io::Error::other("lifecycle evidence omitted total deadline elapsed time")
+        let (_, duration) = report.split_once("shutdown-elapsed-ms=").ok_or_else(|| {
+            std::io::Error::other("lifecycle evidence omitted shutdown elapsed time")
         })?;
         let duration = duration
             .split(|character: char| !character.is_ascii_digit())
@@ -145,7 +157,7 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
             .parse::<u128>()?;
         if duration > 100 {
             return Err(std::io::Error::other(format!(
-                "worker reconciliation exceeded the registered 100ms shutdown deadline: {duration}ms"
+                "successful worker reconciliation reported an invalid shutdown duration: {duration}ms"
             ))
             .into());
         }
@@ -164,11 +176,16 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
             &fixture
                 .root
                 .join("tools/xtask/src/registered_task_lifecycle.rs"),
-            "    cooperative_pause(&cancel, Duration::ZERO)?;\n",
-            "    if id == 0 { loop { thread::yield_now(); } }\n    cooperative_pause(&cancel, Duration::ZERO)?;\n",
+            "    if id == 0 {\n        readiness.signal()?;\n    }\n    cooperative_pause(&cancel, Duration::ZERO)?;\n",
+            "    if id == 0 {\n        readiness.signal()?;\n        loop { thread::yield_now(); }\n    }\n    cooperative_pause(&cancel, Duration::ZERO)?;\n",
         )?;
         fixture.build_fixture_xtask()?;
         let mut quality = fixture.quality_child_from_built_fixture_for("pr")?;
+        wait_for_bounded_runner_readiness_and_cancel(
+            &fixture,
+            "eg-concurrency",
+            Duration::from_secs(30),
+        )?;
         // This outer test-infrastructure watchdog includes fixture startup and broad
         // nextest contention; the product lifecycle bound asserted below remains 100ms.
         let status = match wait_for_child_exit(&mut quality, Duration::from_secs(30)) {
@@ -180,9 +197,9 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
             },
         };
         let (stdout, stderr) = read_child_output(&mut quality)?;
-        if status.success() || !stderr.contains("controlled runner failed during deadline") {
+        if status.success() || !stderr.contains("controlled runner failed during cancellation") {
             return Err(std::io::Error::other(format!(
-                "the public quality seam did not return a typed noncooperative-worker deadline: {stdout}\n{stderr}"
+                "the public quality seam did not return a typed noncooperative-worker cancellation: {stdout}\n{stderr}"
             ))
             .into());
         }
@@ -193,11 +210,11 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
             "EG-CONCURRENCY",
         )?)?;
         for required in [
-            "process-lifecycle-v1;phase=deadline",
+            "process-lifecycle-v1;phase=cancellation",
             "termination-requested=true",
             "process-reaped=true",
             "live=0",
-            "deadline-ms=100",
+            "shutdown-ms=100",
         ] {
             if !report.contains(required) {
                 return Err(std::io::Error::other(format!(
@@ -207,7 +224,7 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
             }
         }
         let (_, elapsed) = report
-            .split_once("deadline-elapsed-ms=")
+            .split_once("shutdown-elapsed-ms=")
             .ok_or_else(|| std::io::Error::other("process lifecycle omitted elapsed time"))?;
         let elapsed = elapsed
             .split(|character: char| !character.is_ascii_digit())
@@ -238,15 +255,15 @@ fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence(
             "            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            std::thread::sleep(Duration::from_millis(60));\n            Err(XtaskError::invalid(\"test lifecycle deadline\", \"injected single-deadline failure\"))",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_controlled_process_deadline_failure(&fixture, &output)?;
+        assert_rejected_output(&output, "injected single-deadline failure")?;
         let evidence = fixture.latest_evidence()?;
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
             &evidence,
             "EG-CONCURRENCY",
         )?)?;
-        let (_, elapsed) = report.split_once("deadline-elapsed-ms=").ok_or_else(|| {
-            std::io::Error::other("lifecycle evidence omitted total deadline elapsed time")
+        let (_, elapsed) = report.split_once("shutdown-elapsed-ms=").ok_or_else(|| {
+            std::io::Error::other("lifecycle evidence omitted shutdown elapsed time")
         })?;
         let elapsed = elapsed
             .split(|character: char| !character.is_ascii_digit())
@@ -255,7 +272,7 @@ fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence(
             .parse::<u128>()?;
         if elapsed > 100 {
             return Err(std::io::Error::other(format!(
-                "work, cancellation, join, and evidence exceeded one registered 100ms deadline: {elapsed}ms"
+                "cancellation and join exceeded the distinct registered 100ms shutdown deadline: {elapsed}ms"
             ))
             .into());
         }
