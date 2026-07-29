@@ -22,7 +22,8 @@
       "Trusted CI rejects a GITHUB_SHA that differs from the controlled git revision before gate selection.",
       "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a missing or retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass.",
       "Engineering evidence schema version 3 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact structured-invocation digests.",
-      "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. A bounded typed JSON parser rejects malformed, duplicate, missing, unknown, oversized, or cross-reference-inconsistent evidence and reports. Controlled steps are charged before stream copies, with 128 steps, 131072 bytes per stream, and 8388608 bytes per report; not-selected gates remain explicit not-applicable."
+      "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. A bounded typed JSON parser rejects malformed, duplicate, missing, unknown, oversized, or cross-reference-inconsistent evidence and reports. Controlled steps are charged before stream copies, with 128 steps, 131072 bytes per stream, and 8388608 encoded bytes per report; the serializer reserves each exact escaped JSON field before copying and retains a schema-valid failed attempt if encoding reaches the limit.",
+      "Retained evidence files and raw-report directories are enumerated independently under bounded counts. Current schema-v3 evidence requires every exact report even when its report directory is absent, orphan report files and attempt directories fail closed, attempt-owned filenames are constrained, and bounded schema-v1/v2 records remain explicit legacy inputs without schema-v3 report requirements."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
@@ -38,7 +39,9 @@
     "Every current runner attempt exposes exact or explicitly non-applicable evidence identities with validated structured invocation and registry digests.",
     "Missing, tampered, oversized, malformed, duplicate-field, or command-mismatched selected-gate raw reports fail the public EG-EVIDENCE validator.",
     "Retained evidence with missing, duplicate, or extra canonical gates, aggregate-result overwrite, or schema-version removal fails closed.",
-    "A raw-report collision cannot consume the attempt without a schema-valid failed evidence record."
+    "A raw-report collision or encoded-size rejection cannot consume the attempt without a schema-valid failed evidence record.",
+    "Deleting an entire schema-v3 report directory, adding an orphan report file or attempt directory, or presenting an adversarial retained-evidence filename fails the public validator.",
+    "Bounded legacy schema-v1/v2 evidence is explicitly preserved without being reinterpreted as schema-v3 report evidence."
   ],
   "detection_lost": [],
   "representative_old_new_evidence": {
@@ -57,6 +60,14 @@
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_tampered_retained_raw_report_evidence -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_oversized_retained_raw_report_binding -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_raw_report_command_digest_mismatch -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retained_v3_attempt_with_its_report_directory_removed -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_orphan_report_file -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_orphan_report_attempt_directory -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_adversarial_retained_evidence_filename -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_report_serializer_bounds_encoded_bytes_before_copying -- --exact",
+        "cargo test --locked --package xtask --bin xtask quality::tests::raw_report_limit_applies_to_exact_encoded_bytes -- --exact",
+        "cargo test --locked --package xtask --bin xtask quality::tests::report_encoding_failure_is_retained_as_schema_valid_failed_evidence -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_incomplete_evidence_identity_schema -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_malformed_retained_engineering_evidence_json -- --exact",
@@ -70,18 +81,26 @@
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retried_trusted_ci_attempt -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_trusted_ci_without_a_run_attempt_identity -- --exact"
       ],
-      "result": "The public runner now preserves arbitrary canonical and slot bytes, retains schema-v3 collision or reserved exhaustion failures, publishes exact selected-gate report and structured-invocation bindings, rejects missing, tampered, oversized, and command-mismatched reports, rejects incomplete schema, and retains schema-valid failed verdicts for stale, retried, and missing trusted-CI identities. These local results are diagnostic only."
+      "result": "The public runner now preserves arbitrary canonical and slot bytes, retains schema-v3 collision or reserved exhaustion failures, publishes exact selected-gate report and structured-invocation bindings, independently rejects missing report directories and orphan report paths, preserves bounded legacy inputs, bounds exact encoded JSON bytes before copying, rejects missing, tampered, oversized, and command-mismatched reports, rejects incomplete schema, and retains schema-valid failed verdicts for encoding limits and stale, retried, or missing trusted-CI identities. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "97cd11a304a0ffb4228c771b77bfcd62fdd859d9",
-      "source_tree": "f636bb2796c86faa7e9b47e6c0cb279d337d1b9d",
-      "fixture_sha256": "37931f5c70117541ba24ad3a54a153e884a21edcab05a49a761431ea58127e2d",
-      "schema_sha256": "83605fea70fc599a609a3f04bc2ffacb73972facad948363f88c50371d6311f7",
-      "runner_sha256": "29dc954e2097de6e4617f86fd8fe193813b5e8159f3d797f294cb40ba3d00e45",
+      "source_revision": "db9307afd74a655f2ceb26099d91ffbe1b57536b",
+      "source_tree": "7b14645ed0ba659282787371d10b0dc61c1cc237",
+      "fixture_sha256": "b791b2a9159491c438796fac285b952198ac580871e4382dc0cd81d522e7c5d5",
+      "schema_sha256": "f75900ffcd94a33b23d68bd4cd974f8994670b5593d060a18084f192ac2a69b1",
+      "runner_sha256": "75f94981b311e17c9e041c6add75d30896b90ac3ed91f498e8886b30aaf0c9e0",
       "parser_sha256": "84f149f0478df4e7f13f99d674fa367c23196721bcdcade583a899fcbfa7032b",
       "exact_fixture_results": [
         "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
         "quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied: passed",
+        "quality_rejects_a_retained_v3_attempt_with_its_report_directory_removed: passed",
+        "quality_rejects_an_orphan_report_file: passed",
+        "quality_rejects_an_orphan_report_attempt_directory: passed",
+        "quality_rejects_an_adversarial_retained_evidence_filename: passed",
+        "quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports: passed",
+        "quality_report_serializer_bounds_encoded_bytes_before_copying: passed",
+        "quality::tests::raw_report_limit_applies_to_exact_encoded_bytes: passed",
+        "quality::tests::report_encoding_failure_is_retained_as_schema_valid_failed_evidence: passed",
         "quality_ext_executes_the_foundational_coverage_harness: passed",
         "quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suite: passed"
       ]
