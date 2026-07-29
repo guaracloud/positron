@@ -1495,6 +1495,37 @@ bypassed_fault_operation_regression!(
     "ProviderPublication"
 );
 
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_candidate_replacement_after_its_first_bounded_read() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_candidate_replacement_after_first_read(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture
+            .quality_child_from_built_fixture_for("pr")?
+            .wait_with_output()?;
+        assert_rejected_output(&output, "fixture recovery process")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-FAULT")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "candidate replacement did not retain a failed EG-FAULT verdict",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 fn assert_removed_fault_adapter_is_rejected(variant: &str) -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -5584,6 +5615,33 @@ fn bypass_fault_operation(root: &Path, adapter: &str) -> TestResult {
         "            let receipt = if adapter == QualityFixtureAdapter::{adapter} {{\n                FaultOperationReceipt {{\n                    observation: adapter.expected_observation(),\n                    error_identity: \"forged-operation-bypass\".to_owned(),\n                }}\n            }} else {{\n                exercise_deterministic_fault(case_root, adapter, candidate, successor)?\n            }};\n"
     );
     replace_once(&source, original, &replacement)
+}
+
+#[cfg(unix)]
+fn inject_candidate_replacement_after_first_read(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    replace_once(
+        &source,
+        "    if let Err(error) = case_root.require_child_file_identity(\n",
+        "    if let Err(error) = replace_candidate_after_first_read(case_root) {\n        return CandidateStateOutcome::ReadIoSecurityError(error);\n    }\n    if let Err(error) = case_root.require_child_file_identity(\n",
+    )?;
+    replace_once(
+        &source,
+        "fn read_adapter_observation(\n",
+        r#"fn replace_candidate_after_first_read(
+    case_root: &DirectoryCapability,
+) -> Result<(), XtaskError> {
+    case_root.remove_file("candidate.state")?;
+    std::os::unix::fs::symlink(
+        "missing-candidate-target",
+        case_root.diagnostic_path.join("candidate.state"),
+    )
+    .map_err(|source| XtaskError::io("replace candidate after first bounded read", source))
+}
+
+fn read_adapter_observation(
+"#,
+    )
 }
 
 #[cfg(unix)]

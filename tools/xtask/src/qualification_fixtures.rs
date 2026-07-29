@@ -305,6 +305,21 @@ struct FixtureCancellationToken {
     requested: bool,
 }
 
+enum CandidateStateOutcome {
+    Absent,
+    ValidState(String),
+    IntentionallyMalformedState,
+    ReadIoSecurityError(XtaskError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateStateParseError {
+    NotUtf8,
+    WrongFieldCount,
+    RegisteredCorruption,
+    IntegrityMismatch,
+}
+
 impl FixtureCancellationToken {
     fn requested() -> Self {
         Self { requested: true }
@@ -879,6 +894,63 @@ impl DirectoryCapability {
             diagnostic_path,
             identity: FileIdentity::from_metadata(&metadata),
         })
+    }
+
+    fn open_file_capability_optional(
+        &self,
+        name: &str,
+        label: &str,
+    ) -> Result<Option<FileCapability>, XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let diagnostic_path = self.diagnostic_path.join(name);
+        let file = match rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(file) => fs::File::from(file),
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(rustix::io::Errno::LOOP) => {
+                return Err(XtaskError::invalid_path(
+                    &diagnostic_path,
+                    format!("{label} canonical name is a symbolic link"),
+                ));
+            },
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!("open {label} {}", diagnostic_path.display()),
+                    rustix_io(source),
+                ));
+            },
+        };
+        let metadata = file.metadata().map_err(|source| {
+            XtaskError::io(
+                format!("inspect opened {label} {}", diagnostic_path.display()),
+                source,
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(XtaskError::invalid_path(
+                &diagnostic_path,
+                format!("{label} is not a regular file"),
+            ));
+        }
+        Ok(Some(FileCapability {
+            file,
+            parent: self.file.try_clone().map_err(|source| {
+                XtaskError::io(
+                    format!(
+                        "duplicate parent capability for {label} {}",
+                        diagnostic_path.display()
+                    ),
+                    source,
+                )
+            })?,
+            name: name.to_owned(),
+            diagnostic_path,
+            identity: FileIdentity::from_metadata(&metadata),
+        }))
     }
 
     pub(crate) fn require_child_directory_identity(
@@ -2924,33 +2996,33 @@ fn validate_recovered_adapter_effect(
         }
     }
 
-    let candidate_bytes = case_root.read_bounded_optional(
-        "candidate.state",
-        MAXIMUM_STATE_BYTES,
-        "fixture candidate state",
-    )?;
-    let candidate_state = if candidate_bytes.is_some() {
-        read_state(case_root, "candidate.state").ok()
-    } else {
-        None
+    let candidate_state = match read_candidate_state_once(case_root, adapter) {
+        CandidateStateOutcome::ReadIoSecurityError(error) => return Err(error),
+        outcome => outcome,
     };
     let actual_effect_matches = match adapter {
         QualityFixtureAdapter::CandidatePersistence | QualityFixtureAdapter::ProcessCrash => {
-            candidate_state
-                .as_deref()
-                .is_some_and(|candidate| candidate != reopened)
+            matches!(
+                &candidate_state,
+                CandidateStateOutcome::ValidState(candidate) if candidate != reopened
+            )
         },
         QualityFixtureAdapter::PublicationPersistence | QualityFixtureAdapter::Restart => {
-            candidate_bytes.is_none()
+            matches!(candidate_state, CandidateStateOutcome::Absent)
         },
         QualityFixtureAdapter::PartialWrite | QualityFixtureAdapter::Corruption => {
-            candidate_bytes.is_some() && candidate_state.is_none()
+            matches!(
+                candidate_state,
+                CandidateStateOutcome::IntentionallyMalformedState
+            )
         },
         QualityFixtureAdapter::BoundedStorage
         | QualityFixtureAdapter::ControlledClock
         | QualityFixtureAdapter::Cancellation
         | QualityFixtureAdapter::NetworkPublication
-        | QualityFixtureAdapter::ProviderPublication => candidate_bytes.is_none(),
+        | QualityFixtureAdapter::ProviderPublication => {
+            matches!(candidate_state, CandidateStateOutcome::Absent)
+        },
     };
     if !actual_effect_matches {
         return Err(XtaskError::invalid(
@@ -2962,6 +3034,83 @@ fn validate_recovered_adapter_effect(
         ));
     }
     Ok(expected)
+}
+
+fn read_candidate_state_once(
+    case_root: &DirectoryCapability,
+    adapter: QualityFixtureAdapter,
+) -> CandidateStateOutcome {
+    let candidate = match case_root
+        .open_file_capability_optional("candidate.state", "fixture candidate state")
+    {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => return CandidateStateOutcome::Absent,
+        Err(error) => return CandidateStateOutcome::ReadIoSecurityError(error),
+    };
+    let bytes = match candidate.read_bounded(MAXIMUM_STATE_BYTES, "fixture candidate state") {
+        Ok(bytes) => bytes,
+        Err(error) => return CandidateStateOutcome::ReadIoSecurityError(error),
+    };
+    if let Err(error) = case_root.require_child_file_identity(
+        "candidate.state",
+        candidate.identity(),
+        "fixture candidate state",
+    ) {
+        return CandidateStateOutcome::ReadIoSecurityError(error);
+    }
+    match parse_candidate_state_bytes(&bytes) {
+        Ok(state) => CandidateStateOutcome::ValidState(state),
+        Err(CandidateStateParseError::WrongFieldCount)
+            if adapter == QualityFixtureAdapter::PartialWrite
+                && bytes.as_slice() == b"partial-state" =>
+        {
+            CandidateStateOutcome::IntentionallyMalformedState
+        },
+        Err(CandidateStateParseError::RegisteredCorruption)
+            if adapter == QualityFixtureAdapter::Corruption =>
+        {
+            CandidateStateOutcome::IntentionallyMalformedState
+        },
+        Err(error) => CandidateStateOutcome::ReadIoSecurityError(XtaskError::invalid_path(
+            candidate.diagnostic_path(),
+            format!("fixture candidate state is unexpectedly malformed: {error:?}"),
+        )),
+    }
+}
+
+fn parse_candidate_state_bytes(bytes: &[u8]) -> Result<String, CandidateStateParseError> {
+    let content = std::str::from_utf8(bytes).map_err(|_| CandidateStateParseError::NotUtf8)?;
+    let fields = content.lines().collect::<Vec<_>>();
+    let [state, catalog, audit, digest] = fields.as_slice() else {
+        return Err(CandidateStateParseError::WrongFieldCount);
+    };
+    if *catalog != format!("catalog-{state}")
+        || *audit != format!("audit-{state}")
+        || *digest != state_digest(state, catalog, audit)
+    {
+        if is_registered_corruption(bytes, catalog, audit, digest) {
+            return Err(CandidateStateParseError::RegisteredCorruption);
+        }
+        return Err(CandidateStateParseError::IntegrityMismatch);
+    }
+    Ok((*state).to_owned())
+}
+
+fn is_registered_corruption(bytes: &[u8], catalog: &str, audit: &str, digest: &str) -> bool {
+    let Some(original_state) = catalog.strip_prefix("catalog-") else {
+        return false;
+    };
+    if audit != format!("audit-{original_state}")
+        || digest != state_digest(original_state, catalog, audit)
+    {
+        return false;
+    }
+    let mut expected = format!("{original_state}\n{catalog}\n{audit}\n{digest}\n").into_bytes();
+    let Some(first_byte) = expected.first_mut() else {
+        return false;
+    };
+    *first_byte = if *first_byte == b'x' { b'y' } else { b'x' };
+    expected == bytes
 }
 
 fn read_adapter_observation(
