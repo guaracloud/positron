@@ -233,6 +233,16 @@
             "content_type": { "const": "-" },
             "reason": { "const": "report-retention-failed" }
           }
+        },
+        {
+          "properties": {
+            "applicability": { "const": "not-applicable" },
+            "path": { "const": "-" },
+            "sha256": { "const": "-" },
+            "bytes": { "const": 0 },
+            "content_type": { "const": "-" },
+            "reason": { "const": "report-encoding-failed" }
+          }
         }
       ]
     },

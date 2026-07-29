@@ -717,6 +717,88 @@ fn quality_rejects_missing_retained_raw_report_evidence() -> TestResult {
 }
 
 #[test]
+fn quality_rejects_a_retained_v3_attempt_with_its_report_directory_removed() -> TestResult {
+    assert_invalid_retained_raw_report(
+        |fixture, _evidence_path, evidence| {
+            let report = exact_raw_report_path(&fixture.root, evidence, "EG-00")?;
+            let directory = report.parent().ok_or_else(|| {
+                std::io::Error::other("retained report fixture has no attempt directory")
+            })?;
+            fs::remove_dir_all(directory)?;
+            Ok(())
+        },
+        "retained raw report is missing",
+    )
+}
+
+#[test]
+fn quality_rejects_an_orphan_report_file() -> TestResult {
+    assert_invalid_retained_raw_report(
+        |fixture, _evidence_path, evidence| {
+            let report = exact_raw_report_path(&fixture.root, evidence, "EG-00")?;
+            let directory = report.parent().ok_or_else(|| {
+                std::io::Error::other("retained report fixture has no attempt directory")
+            })?;
+            fs::write(directory.join("EG-ORPHAN.json"), "{}\n")?;
+            Ok(())
+        },
+        "orphan retained raw report",
+    )
+}
+
+#[test]
+fn quality_rejects_an_orphan_report_attempt_directory() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let orphan = fixture
+            .root
+            .join("target/quality/evidence-reports/orphan-attempt");
+        fs::create_dir_all(&orphan)?;
+        fs::write(orphan.join("EG-00.json"), "{}\n")?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "orphan retained raw report")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_adversarial_retained_evidence_filename() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence = fixture
+            .root
+            .join("target/quality/evidence/not an owned attempt.json");
+        fs::write(evidence, "{\"schema_version\":3}\n")?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "retained evidence filename is not attempt-owned")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let evidence_directory = fixture.root.join("target/quality/evidence");
+        fs::create_dir_all(&evidence_directory)?;
+        fs::write(
+            evidence_directory.join("legacy-attempt.json"),
+            "{\"schema_version\":1,\"attempt_id\":\"legacy-attempt\"}\n",
+        )?;
+        fixture.quality()
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_tampered_retained_raw_report_evidence() -> TestResult {
     assert_invalid_retained_raw_report(
         |fixture, _, evidence| {
@@ -806,6 +888,26 @@ fn quality_capture_is_attempt_owned_and_charges_resources_before_copying() -> Te
             "gate capture copies report streams before enforcing resource bounds",
         )
         .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn quality_report_serializer_bounds_encoded_bytes_before_copying() -> TestResult {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = fs::read_to_string(root.join("tools/xtask/src/quality.rs"))?;
+    for required in [
+        "struct BoundedJsonWriter",
+        "fn encoded_json_string_bytes",
+        "try_reserve_exact",
+        "encoded raw report exceeds",
+    ] {
+        if !source.contains(required) {
+            return Err(std::io::Error::other(format!(
+                "raw-report serialization omitted bounded encoded-size contract `{required}`"
+            ))
+            .into());
+        }
     }
     Ok(())
 }

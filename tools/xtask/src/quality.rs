@@ -56,6 +56,8 @@ const MAXIMUM_CAPTURED_REPORT_STREAM_BYTES: usize = 131_072;
 const MAXIMUM_RAW_REPORT_BYTES: usize = 8_388_608;
 const MAXIMUM_RETAINED_EVIDENCE_BYTES: usize = 2_097_152;
 const MAXIMUM_CONTROLLED_REPORT_STEPS: usize = 128;
+const MAXIMUM_RETAINED_ATTEMPTS: usize = 4_096;
+const MAXIMUM_REPORTS_PER_ATTEMPT: usize = CANONICAL_GATE_IDS.len();
 const RAW_REPORT_CONTENT_TYPE: &str = "application/vnd.positron.quality-gate-report+json;version=1";
 const COLLISION_SLOT_COUNT: usize = 16;
 const COLLISION_OCCUPIED_SET: &str = "collision-00,collision-01,collision-02,collision-03,collision-04,collision-05,collision-06,collision-07,collision-08,collision-09,collision-10,collision-11,collision-12,collision-13,collision-14,collision-15";
@@ -506,6 +508,7 @@ enum NotApplicableReason {
     NoApprovalClaimed,
     NoExceptionApplied,
     GateNotSelected,
+    ReportEncodingFailed,
     ReportRetentionFailed,
     UnavailableBeforeRegistryValidation,
 }
@@ -529,6 +532,7 @@ impl NotApplicableReason {
             Self::NoApprovalClaimed => "no-approval-claimed",
             Self::NoExceptionApplied => "no-exception-applied",
             Self::GateNotSelected => "gate-not-selected",
+            Self::ReportEncodingFailed => "report-encoding-failed",
             Self::ReportRetentionFailed => "report-retention-failed",
             Self::UnavailableBeforeRegistryValidation => "unavailable-before-registry-validation",
         }
@@ -1022,37 +1026,64 @@ fn build_gate_attempt(
     definition: GateAttemptDefinition,
     outcome: GateAttemptOutcome,
 ) -> GateAttempt {
+    build_gate_attempt_with_report_limit(attempt_id, definition, outcome, MAXIMUM_RAW_REPORT_BYTES)
+}
+
+fn build_gate_attempt_with_report_limit(
+    attempt_id: &str,
+    definition: GateAttemptDefinition,
+    outcome: GateAttemptOutcome,
+    maximum_report_bytes: usize,
+) -> GateAttempt {
     let command_digest = command_digest(&definition.invocation);
-    let (raw_report, raw_report_content) = if outcome.result == GateStatus::NotSelected {
-        (
-            RawReportBinding::NotApplicable(NotApplicableReason::GateNotSelected),
-            None,
-        )
-    } else {
-        let content = raw_report_json(RawReportDocument {
-            attempt_id,
-            gate_id: &definition.gate_id,
-            result: outcome.result,
-            duration_ms: outcome.duration_ms,
-            invocation_digest: &command_digest,
-            invocation: &definition.invocation,
-            detail: &outcome.detail,
-            controlled_steps: &outcome.controlled_steps,
-        });
-        let path = raw_report_relative_path(attempt_id, &definition.gate_id);
-        (
-            RawReportBinding::Exact {
-                path,
-                digest: sha256_digest(content.as_bytes()),
-                bytes: content.len(),
-                content_type: RAW_REPORT_CONTENT_TYPE,
-            },
-            Some(content),
-        )
-    };
+    let (raw_report, raw_report_content, encoding_failure) =
+        if outcome.result == GateStatus::NotSelected {
+            (
+                RawReportBinding::NotApplicable(NotApplicableReason::GateNotSelected),
+                None,
+                None,
+            )
+        } else {
+            let report = raw_report_json_with_limit(
+                RawReportDocument {
+                    attempt_id,
+                    gate_id: &definition.gate_id,
+                    result: outcome.result,
+                    duration_ms: outcome.duration_ms,
+                    invocation_digest: &command_digest,
+                    invocation: &definition.invocation,
+                    detail: &outcome.detail,
+                    controlled_steps: &outcome.controlled_steps,
+                },
+                maximum_report_bytes,
+            );
+            let path = raw_report_relative_path(attempt_id, &definition.gate_id);
+            match report {
+                Ok(content) => (
+                    RawReportBinding::Exact {
+                        path,
+                        digest: sha256_digest(content.as_bytes()),
+                        bytes: content.len(),
+                        content_type: RAW_REPORT_CONTENT_TYPE,
+                    },
+                    Some(content),
+                    None,
+                ),
+                Err(error) => (
+                    RawReportBinding::NotApplicable(NotApplicableReason::ReportEncodingFailed),
+                    None,
+                    Some(error.to_string()),
+                ),
+            }
+        };
+    let report_encoding_failed = encoding_failure.is_some();
     GateAttempt {
         gate_id: definition.gate_id,
-        result: outcome.result,
+        result: if report_encoding_failed {
+            GateStatus::Failed
+        } else {
+            outcome.result
+        },
         duration_ms: outcome.duration_ms,
         budget_seconds: definition.budget_seconds,
         invocation: definition.invocation,
@@ -1060,7 +1091,13 @@ fn build_gate_attempt(
         owner: definition.owner,
         raw_report,
         raw_report_content,
-        detail: outcome.detail,
+        detail: if let Some(error) = encoding_failure {
+            bounded_detail(&format!(
+                "{error}; failed closed before oversized allocation"
+            ))
+        } else {
+            outcome.detail
+        },
     }
 }
 
@@ -2422,6 +2459,9 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
     }
     let entries = fs::read_dir(&directory)
         .map_err(|source| XtaskError::io(format!("read {}", directory.display()), source))?;
+    let mut attempt_count = 0_usize;
+    let mut v3_attempts = BTreeSet::new();
+    let mut expected_reports = BTreeSet::new();
     for entry in entries {
         let entry = entry
             .map_err(|source| XtaskError::io(format!("read {}", directory.display()), source))?;
@@ -2429,15 +2469,38 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
         if path.extension().and_then(OsStr::to_str) != Some("json") {
             continue;
         }
+        attempt_count = attempt_count.checked_add(1).ok_or_else(|| {
+            XtaskError::invalid_path(&directory, "retained attempt count overflowed")
+        })?;
+        if attempt_count > MAXIMUM_RETAINED_ATTEMPTS {
+            return Err(XtaskError::invalid_path(
+                &directory,
+                format!("retained attempt count exceeds {MAXIMUM_RETAINED_ATTEMPTS}"),
+            ));
+        }
+        let file_type = entry.file_type().map_err(|source| {
+            XtaskError::io(
+                format!("inspect retained evidence {}", path.display()),
+                source,
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(XtaskError::invalid_path(
+                &path,
+                "retained evidence candidate must be a regular JSON file",
+            ));
+        }
         let Some(attempt_id) = path.file_stem().and_then(OsStr::to_str) else {
-            continue;
+            return Err(XtaskError::invalid_path(
+                &path,
+                "retained evidence filename is not valid UTF-8",
+            ));
         };
-        if !root
-            .join("target/quality/evidence-reports")
-            .join(attempt_id)
-            .is_dir()
-        {
-            continue;
+        if !valid_owned_evidence_component(attempt_id) {
+            return Err(XtaskError::invalid_path(
+                &path,
+                "retained evidence filename is not attempt-owned",
+            ));
         }
         let metadata = fs::metadata(&path)
             .map_err(|source| XtaskError::io(format!("inspect {}", path.display()), source))?;
@@ -2451,12 +2514,50 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
         }
         let evidence = fs::read_to_string(&path)
             .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-        validate_retained_v3_reports(root, &path, &evidence).map_err(|error| {
-            XtaskError::invalid_path(
+        let mut object = parse_object(&path, &evidence, "retained engineering evidence")?;
+        let schema_version = require_any_integer(&mut object, "schema_version", &path)?;
+        let recorded_attempt = require_string(&mut object, "attempt_id", &path)?;
+        if recorded_attempt != attempt_id {
+            return Err(XtaskError::invalid_path(
                 &path,
-                format!("retained engineering evidence is invalid: {error}"),
-            )
-        })?;
+                "retained evidence attempt_id does not match its owned filename",
+            ));
+        }
+        match schema_version {
+            1 | 2 => {},
+            3 => {
+                let reports =
+                    validate_retained_v3_reports(root, &path, &evidence).map_err(|error| {
+                        XtaskError::invalid_path(
+                            &path,
+                            format!("retained engineering evidence is invalid: {error}"),
+                        )
+                    })?;
+                v3_attempts.insert(recorded_attempt);
+                expected_reports.extend(reports);
+            },
+            _ => {
+                return Err(XtaskError::invalid_path(
+                    &path,
+                    format!(
+                        "unsupported retained evidence schema version `{schema_version}`; only legacy versions 1/2 and current version 3 are accepted"
+                    ),
+                ));
+            },
+        }
+    }
+    let actual_reports = enumerate_retained_raw_reports(root, &v3_attempts)?;
+    if let Some(orphan) = actual_reports.difference(&expected_reports).next() {
+        return Err(XtaskError::invalid_path(
+            orphan,
+            "orphan retained raw report is not bound by current schema-v3 evidence",
+        ));
+    }
+    if let Some(missing) = expected_reports.difference(&actual_reports).next() {
+        return Err(XtaskError::invalid_path(
+            missing,
+            "retained raw report is missing",
+        ));
     }
     Ok(())
 }
@@ -2465,8 +2566,9 @@ fn validate_retained_v3_reports(
     root: &Path,
     evidence_path: &Path,
     evidence: &str,
-) -> Result<(), XtaskError> {
+) -> Result<BTreeSet<PathBuf>, XtaskError> {
     let parsed = parse_evidence_record(evidence_path, evidence)?;
+    let mut expected_reports = BTreeSet::new();
     for gate in parsed.gates {
         if gate.raw_report.applicability == "not-applicable" {
             continue;
@@ -2488,6 +2590,7 @@ fn validate_retained_v3_reports(
             ));
         }
         let report_path = root.join(relative_path);
+        expected_reports.insert(report_path.clone());
         if !report_path.is_file() {
             return Err(XtaskError::invalid_path(
                 &report_path,
@@ -2539,7 +2642,106 @@ fn validate_retained_v3_reports(
             ));
         }
     }
-    Ok(())
+    Ok(expected_reports)
+}
+
+fn enumerate_retained_raw_reports(
+    root: &Path,
+    v3_attempts: &BTreeSet<String>,
+) -> Result<BTreeSet<PathBuf>, XtaskError> {
+    let directory = root.join("target/quality/evidence-reports");
+    if !directory.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let attempts = fs::read_dir(&directory)
+        .map_err(|source| XtaskError::io(format!("read {}", directory.display()), source))?;
+    let mut attempt_count = 0_usize;
+    let mut reports = BTreeSet::new();
+    for attempt in attempts {
+        let attempt = attempt
+            .map_err(|source| XtaskError::io(format!("read {}", directory.display()), source))?;
+        let attempt_path = attempt.path();
+        attempt_count = attempt_count.checked_add(1).ok_or_else(|| {
+            XtaskError::invalid_path(&directory, "retained report attempt count overflowed")
+        })?;
+        if attempt_count > MAXIMUM_RETAINED_ATTEMPTS {
+            return Err(XtaskError::invalid_path(
+                &directory,
+                format!("retained report attempt count exceeds {MAXIMUM_RETAINED_ATTEMPTS}"),
+            ));
+        }
+        let file_type = attempt.file_type().map_err(|source| {
+            XtaskError::io(
+                format!("inspect retained report {}", attempt_path.display()),
+                source,
+            )
+        })?;
+        let Some(attempt_id) = attempt.file_name().to_str().map(str::to_owned) else {
+            return Err(XtaskError::invalid_path(
+                &attempt_path,
+                "retained report attempt path is not valid UTF-8",
+            ));
+        };
+        if !file_type.is_dir()
+            || !valid_owned_evidence_component(&attempt_id)
+            || !v3_attempts.contains(&attempt_id)
+        {
+            return Err(XtaskError::invalid_path(
+                &attempt_path,
+                "orphan retained raw report attempt directory is not bound by current schema-v3 evidence",
+            ));
+        }
+        let entries = fs::read_dir(&attempt_path)
+            .map_err(|source| XtaskError::io(format!("read {}", attempt_path.display()), source))?;
+        let mut report_count = 0_usize;
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                XtaskError::io(format!("read {}", attempt_path.display()), source)
+            })?;
+            let report_path = entry.path();
+            report_count = report_count.checked_add(1).ok_or_else(|| {
+                XtaskError::invalid_path(&attempt_path, "retained report count overflowed")
+            })?;
+            if report_count > MAXIMUM_REPORTS_PER_ATTEMPT {
+                return Err(XtaskError::invalid_path(
+                    &attempt_path,
+                    format!(
+                        "retained report count exceeds {MAXIMUM_REPORTS_PER_ATTEMPT} per attempt"
+                    ),
+                ));
+            }
+            let file_type = entry.file_type().map_err(|source| {
+                XtaskError::io(
+                    format!("inspect retained report {}", report_path.display()),
+                    source,
+                )
+            })?;
+            let gate_id = report_path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .filter(|_| report_path.extension().and_then(OsStr::to_str) == Some("json"));
+            if !file_type.is_file()
+                || gate_id.is_none_or(|gate_id| !CANONICAL_GATE_IDS.contains(&gate_id))
+            {
+                return Err(XtaskError::invalid_path(
+                    &report_path,
+                    "orphan retained raw report path is not a canonical gate JSON file",
+                ));
+            }
+            reports.insert(report_path);
+        }
+    }
+    Ok(reports)
+}
+
+fn valid_owned_evidence_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[derive(Debug)]
@@ -2663,6 +2865,7 @@ fn parse_gate_record(
     match (result.as_str(), raw_report.applicability.as_str()) {
         ("not-selected", "not-applicable") if raw_report.reason == "gate-not-selected" => {},
         ("passed" | "failed", "exact") => {},
+        ("failed", "not-applicable") if raw_report.reason == "report-encoding-failed" => {},
         ("failed", "not-applicable") if raw_report.reason == "report-retention-failed" => {},
         _ => {
             return invalid_json(
@@ -2798,7 +3001,7 @@ fn parse_raw_report_binding(
                 && content_type == "-"
                 && matches!(
                     reason.as_str(),
-                    "gate-not-selected" | "report-retention-failed"
+                    "gate-not-selected" | "report-encoding-failed" | "report-retention-failed"
                 ) => {},
         _ => return invalid_json(path, "raw report binding is invalid"),
     }
@@ -5197,6 +5400,11 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
                 None,
                 GateStatus::Failed,
             ) if gate.gate_id == "EG-00" => {},
+            (
+                RawReportBinding::NotApplicable(NotApplicableReason::ReportEncodingFailed),
+                None,
+                GateStatus::Failed,
+            ) => {},
             (RawReportBinding::Exact { .. }, Some(_), GateStatus::Passed | GateStatus::Failed) => {
                 validate_raw_report_binding(&evidence.attempt_id, gate)?;
             },
@@ -5661,46 +5869,221 @@ fn controlled_invocation_json(invocation: &ControlledInvocation) -> String {
     )
 }
 
-fn raw_report_json(report: RawReportDocument<'_>) -> String {
-    let steps = report
-        .controlled_steps
-        .iter()
-        .map(|step| {
-            format!(
-                "{{\"invocation\":{},\"verdict\":{},\"stdout\":{},\"stderr\":{}}}",
-                controlled_invocation_json(&step.invocation),
-                json_string(&step.verdict),
-                json_string(&step.stdout),
-                json_string(&step.stderr),
+fn raw_report_json_with_limit(
+    report: RawReportDocument<'_>,
+    maximum_bytes: usize,
+) -> Result<String, XtaskError> {
+    let mut output = BoundedJsonWriter::new(maximum_bytes);
+    output.push_literal("{\n  \"schema_version\": 1,\n  \"content_type\": ")?;
+    output.push_json_string(RAW_REPORT_CONTENT_TYPE)?;
+    output.push_literal(",\n  \"attempt_id\": ")?;
+    output.push_json_string(report.attempt_id)?;
+    output.push_literal(",\n  \"gate_id\": ")?;
+    output.push_json_string(report.gate_id)?;
+    output.push_literal(",\n  \"verdict\": ")?;
+    output.push_json_string(report.result.as_str())?;
+    output.push_literal(",\n  \"duration_ms\": ")?;
+    output.push_number(report.duration_ms)?;
+    output.push_literal(",\n  \"invocation_digest\": ")?;
+    output.push_json_string(report.invocation_digest)?;
+    output.push_literal(",\n  \"invocation\": ")?;
+    push_gate_invocation_json(&mut output, report.invocation)?;
+    output.push_literal(",\n  \"detail\": ")?;
+    output.push_json_string(report.detail)?;
+    output.push_literal(",\n  \"controlled_steps\": [")?;
+    for (index, step) in report.controlled_steps.iter().enumerate() {
+        if index != 0 {
+            output.push_literal(",")?;
+        }
+        output.push_literal("{\"invocation\":")?;
+        push_controlled_invocation_json(&mut output, &step.invocation)?;
+        output.push_literal(",\"verdict\":")?;
+        output.push_json_string(&step.verdict)?;
+        output.push_literal(",\"stdout\":")?;
+        output.push_json_string(&step.stdout)?;
+        output.push_literal(",\"stderr\":")?;
+        output.push_json_string(&step.stderr)?;
+        output.push_literal("}")?;
+    }
+    output.push_literal("]\n}\n")?;
+    Ok(output.finish())
+}
+
+fn push_gate_invocation_json(
+    output: &mut BoundedJsonWriter,
+    invocation: &GateInvocation,
+) -> Result<(), XtaskError> {
+    output.push_literal("{\"program\":")?;
+    output.push_json_string(&invocation.program)?;
+    output.push_literal(",\"arguments\":[")?;
+    for (index, argument) in invocation.arguments.iter().enumerate() {
+        if index != 0 {
+            output.push_literal(",")?;
+        }
+        output.push_json_string(argument)?;
+    }
+    output.push_literal("],\"working_directory\":")?;
+    output.push_json_string(&invocation.working_directory)?;
+    output.push_literal(",\"environment_digest\":")?;
+    output.push_json_string(&invocation.environment_digest)?;
+    output.push_literal(",\"timeout_seconds\":")?;
+    output.push_number(invocation.timeout_seconds)?;
+    output.push_literal(",\"memory_mib\":")?;
+    output.push_number(invocation.memory_mib)?;
+    output.push_literal(",\"activation\":")?;
+    output.push_json_string(&invocation.activation)?;
+    output.push_literal(",\"exception_class\":")?;
+    output.push_json_string(&invocation.exception_class)?;
+    output.push_literal(",\"controlled_steps\":[")?;
+    for (index, step) in invocation.controlled_steps.iter().enumerate() {
+        if index != 0 {
+            output.push_literal(",")?;
+        }
+        push_controlled_invocation_json(output, step)?;
+    }
+    output.push_literal("]}")
+}
+
+fn push_controlled_invocation_json(
+    output: &mut BoundedJsonWriter,
+    invocation: &ControlledInvocation,
+) -> Result<(), XtaskError> {
+    output.push_literal("{\"program\":")?;
+    output.push_json_string(&invocation.program)?;
+    output.push_literal(",\"resolved_program\":")?;
+    output.push_json_string(&invocation.resolved_program)?;
+    output.push_literal(",\"arguments\":[")?;
+    for (index, argument) in invocation.arguments.iter().enumerate() {
+        if index != 0 {
+            output.push_literal(",")?;
+        }
+        output.push_json_string(argument)?;
+    }
+    output.push_literal("],\"working_directory\":")?;
+    output.push_json_string(&invocation.working_directory)?;
+    output.push_literal(",\"environment_digest\":")?;
+    output.push_json_string(&invocation.environment_digest)?;
+    output.push_literal(",\"timeout_ms\":")?;
+    output.push_number(invocation.timeout_ms)?;
+    output.push_literal(",\"input_kind\":")?;
+    output.push_json_string(&invocation.input_kind)?;
+    output.push_literal(",\"input_bytes\":")?;
+    output.push_number(invocation.input_bytes)?;
+    output.push_literal(",\"input_sha256\":")?;
+    output.push_json_string(&invocation.input_sha256)?;
+    output.push_literal("}")
+}
+
+struct BoundedJsonWriter {
+    output: String,
+    maximum_bytes: usize,
+}
+
+impl BoundedJsonWriter {
+    fn new(maximum_bytes: usize) -> Self {
+        Self {
+            output: String::new(),
+            maximum_bytes,
+        }
+    }
+
+    fn push_literal(&mut self, value: &str) -> Result<(), XtaskError> {
+        self.reserve(value.len())?;
+        self.output.push_str(value);
+        Ok(())
+    }
+
+    fn push_number(&mut self, value: impl ToString) -> Result<(), XtaskError> {
+        let value = value.to_string();
+        self.push_literal(&value)
+    }
+
+    fn push_json_string(&mut self, value: &str) -> Result<(), XtaskError> {
+        let encoded_bytes = encoded_json_string_bytes(value)?;
+        self.reserve(encoded_bytes)?;
+        self.output.push('"');
+        for character in value.chars() {
+            match character {
+                '"' => self.output.push_str("\\\""),
+                '\\' => self.output.push_str("\\\\"),
+                '\n' => self.output.push_str("\\n"),
+                '\r' => self.output.push_str("\\r"),
+                '\t' => self.output.push_str("\\t"),
+                control if control.is_control() => {
+                    let code = u32::from(control);
+                    if code <= u32::from(u16::MAX) {
+                        push_json_hex_quad(&mut self.output, code as u16);
+                    } else {
+                        let scalar = code - 0x1_0000;
+                        let high = 0xD800 | ((scalar >> 10) as u16);
+                        let low = 0xDC00 | ((scalar & 0x03FF) as u16);
+                        push_json_hex_quad(&mut self.output, high);
+                        push_json_hex_quad(&mut self.output, low);
+                    }
+                },
+                other => self.output.push(other),
+            }
+        }
+        self.output.push('"');
+        Ok(())
+    }
+
+    fn reserve(&mut self, additional: usize) -> Result<(), XtaskError> {
+        let encoded_bytes = self.output.len().checked_add(additional).ok_or_else(|| {
+            XtaskError::invalid(
+                "gate report resource limit",
+                "encoded raw report byte accounting overflowed",
+            )
+        })?;
+        if encoded_bytes > self.maximum_bytes {
+            return Err(XtaskError::invalid(
+                "gate report resource limit",
+                format!("encoded raw report exceeds {} bytes", self.maximum_bytes),
+            ));
+        }
+        self.output.try_reserve_exact(additional).map_err(|_| {
+            XtaskError::invalid(
+                "gate report resource limit",
+                "encoded raw report allocation could not be reserved",
             )
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        concat!(
-            "{{\n",
-            "  \"schema_version\": 1,\n",
-            "  \"content_type\": {},\n",
-            "  \"attempt_id\": {},\n",
-            "  \"gate_id\": {},\n",
-            "  \"verdict\": {},\n",
-            "  \"duration_ms\": {},\n",
-            "  \"invocation_digest\": {},\n",
-            "  \"invocation\": {},\n",
-            "  \"detail\": {},\n",
-            "  \"controlled_steps\": [{}]\n",
-            "}}\n"
-        ),
-        json_string(RAW_REPORT_CONTENT_TYPE),
-        json_string(report.attempt_id),
-        json_string(report.gate_id),
-        json_string(report.result.as_str()),
-        report.duration_ms,
-        json_string(report.invocation_digest),
-        gate_invocation_json(report.invocation),
-        json_string(report.detail),
-        steps,
-    )
+    }
+
+    fn finish(self) -> String {
+        self.output
+    }
+}
+
+fn encoded_json_string_bytes(value: &str) -> Result<usize, XtaskError> {
+    let mut bytes = 2_usize;
+    for character in value.chars() {
+        let encoded = match character {
+            '"' | '\\' | '\n' | '\r' | '\t' => 2,
+            control if control.is_control() && u32::from(control) <= u32::from(u16::MAX) => 6,
+            control if control.is_control() => 12,
+            other => other.len_utf8(),
+        };
+        bytes = bytes.checked_add(encoded).ok_or_else(|| {
+            XtaskError::invalid(
+                "gate report resource limit",
+                "encoded JSON string byte accounting overflowed",
+            )
+        })?;
+    }
+    Ok(bytes)
+}
+
+fn push_json_hex_quad(output: &mut String, value: u16) {
+    output.push_str("\\u");
+    for shift in [12, 8, 4, 0] {
+        let nibble = ((value >> shift) & 0x000F) as u8;
+        let encoded = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        output.push(char::from(encoded));
+    }
 }
 
 fn push_raw_report_binding(
@@ -5795,9 +6178,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        EnvironmentSnapshot, ExecutionTools, M0_02_MUTATION_SELECTOR, M0_03_MUTATION_SELECTOR,
-        M0_04_MUTATION_SELECTOR, Options, Profile, json_string, run_generation_matrix_gate,
-        validate_configuration_parser_threat_model_text,
+        CANONICAL_GATE_IDS, ControlledInvocation, ControlledStepReport, EnvironmentSnapshot,
+        Evidence, ExecutionTools, GateAttemptDefinition, GateAttemptOutcome, GateInvocation,
+        GateStatus, IdentityBinding, M0_02_MUTATION_SELECTOR, M0_03_MUTATION_SELECTOR,
+        M0_04_MUTATION_SELECTOR, NotApplicableReason, Options, Profile, RawReportBinding,
+        RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit, evidence_json,
+        json_string, raw_report_json_with_limit, run_generation_matrix_gate, sha256_digest,
+        unavailable_evidence_identity, validate_configuration_parser_threat_model_text,
+        validate_serialized_evidence,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -6138,6 +6526,190 @@ mod tests {
             "\"line\\n\\\"secret-like\\\"\\\\path\"",
             "evidence JSON must escape control and delimiter characters"
         );
+    }
+
+    #[test]
+    fn raw_report_limit_applies_to_exact_encoded_bytes() -> TestResult {
+        let invocation = report_test_invocation(Vec::new());
+        let control_characters = "\u{0001}".repeat(256);
+        let unencoded_control_bytes = control_characters.len();
+        let steps = vec![report_test_step(control_characters)];
+        let encoded =
+            raw_report_json_with_limit(report_test_document(&invocation, &steps), 32_768)?;
+        assert!(
+            encoded.len() > unencoded_control_bytes,
+            "control-character expansion must be included in encoded-size accounting"
+        );
+
+        let just_under_limit = encoded.len() + 1;
+        let under = raw_report_json_with_limit(
+            report_test_document(&invocation, &steps),
+            just_under_limit,
+        )?;
+        assert_eq!(under.len() + 1, just_under_limit);
+
+        let at =
+            raw_report_json_with_limit(report_test_document(&invocation, &steps), encoded.len())?;
+        assert_eq!(at.len(), encoded.len());
+
+        let over = raw_report_json_with_limit(
+            report_test_document(&invocation, &steps),
+            encoded.len() - 1,
+        );
+        assert!(
+            over.as_ref().is_err_and(|error| {
+                let detail = error.to_string();
+                detail.contains("gate report resource limit")
+                    && detail.contains("encoded raw report exceeds")
+            }),
+            "one encoded byte beyond the limit must fail with a typed resource error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_encoding_failure_is_retained_as_schema_valid_failed_evidence() -> TestResult {
+        let attempt_id = "report-encoding-failure-attempt";
+        let oversized_step = report_test_step("\u{0001}".repeat(256));
+        let oversized_invocation = report_test_invocation(vec![oversized_step.invocation.clone()]);
+        let mut gates = Vec::with_capacity(CANONICAL_GATE_IDS.len());
+        for gate_id in CANONICAL_GATE_IDS {
+            let selected = gate_id == "EG-00";
+            let invocation = if selected {
+                oversized_invocation.clone()
+            } else {
+                report_test_invocation(Vec::new())
+            };
+            gates.push(build_gate_attempt_with_report_limit(
+                attempt_id,
+                GateAttemptDefinition {
+                    gate_id: gate_id.to_owned(),
+                    budget_seconds: 60,
+                    invocation,
+                    owner: if selected {
+                        IdentityBinding::exact("Quality Engineering")
+                    } else {
+                        IdentityBinding::not_applicable(
+                            NotApplicableReason::UnavailableBeforeRegistryValidation,
+                        )
+                    },
+                },
+                GateAttemptOutcome {
+                    result: if selected {
+                        GateStatus::Passed
+                    } else {
+                        GateStatus::NotSelected
+                    },
+                    duration_ms: if selected { 1 } else { 0 },
+                    detail: if selected {
+                        "encoded-size retention boundary".to_owned()
+                    } else {
+                        "blocked before registry validation".to_owned()
+                    },
+                    controlled_steps: if selected {
+                        vec![oversized_step.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                },
+                1_024,
+            ));
+        }
+        let source = SourceIdentity {
+            revision: "0000000000000000000000000000000000000000".to_owned(),
+            dirty: true,
+            trusted_ci: false,
+            revision_matches_ci: false,
+        };
+        let evidence = Evidence {
+            attempt_id: attempt_id.to_owned(),
+            collision_of: IdentityBinding::not_applicable(NotApplicableReason::NoCollision),
+            collision_slots: IdentityBinding::not_applicable(NotApplicableReason::NoCollision),
+            profile: Profile::PreCommit,
+            result: GateStatus::Failed,
+            merge_eligible: false,
+            identity: unavailable_evidence_identity(&source),
+            source,
+            started_unix_ms: 1,
+            ended_unix_ms: 2,
+            registry_digest: "unavailable-registry-digest".to_owned(),
+            environment_digest: "unavailable-registry-digest".to_owned(),
+            gates,
+        };
+        let serialized = evidence_json(&evidence);
+        validate_serialized_evidence(&evidence, &serialized)?;
+        let encoding_failure = evidence
+            .gates
+            .iter()
+            .find(|gate| gate.gate_id == "EG-00")
+            .ok_or("missing EG-00 regression fixture")?;
+        assert_eq!(encoding_failure.result, GateStatus::Failed);
+        assert_eq!(
+            encoding_failure.raw_report,
+            RawReportBinding::NotApplicable(NotApplicableReason::ReportEncodingFailed)
+        );
+        assert!(encoding_failure.raw_report_content.is_none());
+        assert!(
+            encoding_failure
+                .detail
+                .contains("gate report resource limit"),
+            "the retained failure must explain its typed resource rejection"
+        );
+        Ok(())
+    }
+
+    fn report_test_document<'report>(
+        invocation: &'report GateInvocation,
+        steps: &'report [ControlledStepReport],
+    ) -> RawReportDocument<'report> {
+        RawReportDocument {
+            attempt_id: "encoded-boundary-attempt",
+            gate_id: "EG-00",
+            result: GateStatus::Passed,
+            duration_ms: 1,
+            invocation_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            invocation,
+            detail: "encoded-size boundary",
+            controlled_steps: steps,
+        }
+    }
+
+    fn report_test_invocation(controlled_steps: Vec<ControlledInvocation>) -> GateInvocation {
+        GateInvocation {
+            program: "cargo-xtask-quality/internal".to_owned(),
+            arguments: vec![
+                "quality".to_owned(),
+                "--report-boundary".to_owned(),
+                "EG-00".to_owned(),
+            ],
+            working_directory: "engineering-workspace".to_owned(),
+            environment_digest:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            timeout_seconds: 60,
+            memory_mib: 256,
+            activation: "always".to_owned(),
+            exception_class: "none".to_owned(),
+            controlled_steps,
+        }
+    }
+
+    fn report_test_step(stdout: String) -> ControlledStepReport {
+        ControlledStepReport {
+            invocation: ControlledInvocation {
+                program: "cargo".to_owned(),
+                resolved_program: "/usr/bin/cargo".to_owned(),
+                arguments: vec!["check".to_owned()],
+                working_directory: "engineering-workspace".to_owned(),
+                environment_digest: sha256_digest(b"report-test-environment"),
+                timeout_ms: 1,
+                input_kind: "null".to_owned(),
+                input_bytes: 0,
+                input_sha256: "-".to_owned(),
+            },
+            verdict: "passed".to_owned(),
+            stdout,
+            stderr: String::new(),
+        }
     }
 
     #[test]
