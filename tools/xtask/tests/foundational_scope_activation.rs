@@ -6376,8 +6376,8 @@ fn publish_staged_reports(
     match phase {
         "staging" => replace_once(
             &source,
-            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_staging_files,\n        )?;\n        sync_directory(&self.report_staging_path)?;\n",
-            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_staging_files,\n        )?;\n        inject_non_owned_publication_content(&self.report_staging_path)?;\n",
+            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_staging_files,\n        )?;\n        staging_area.sync()?;\n",
+            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_staging_files,\n        )?;\n        inject_non_owned_publication_content(&self.report_staging_path)?;\n        staging_area.sync()?;\n",
         ),
         "final" => replace_once(
             &source,
@@ -6434,8 +6434,8 @@ fn inject_staged_report_file_sync_failure(root: &Path) -> TestResult {
 fn inject_staging_directory_sync_failure(root: &Path) -> TestResult {
     replace_once(
         &root.join("tools/xtask/src/quality.rs"),
-        "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n",
-        "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n    if path.parent().and_then(Path::file_name).and_then(OsStr::to_str)\n        == Some(\"evidence-report-staging\")\n    {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"staging directory sync failed\",\n        ));\n    }\n",
+        "    fn sync(&self) -> Result<(), XtaskError> {\n        self.require_identity()?;\n        self.leaf.sync()?;\n        self.parent.sync()\n    }\n",
+        "    fn sync(&self) -> Result<(), XtaskError> {\n        self.require_identity()?;\n        self.leaf.sync()?;\n        Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"staging directory sync failed\",\n        ))\n    }\n",
     )
 }
 
@@ -6466,8 +6466,8 @@ fn inject_report_parent_chain_sync_failure(root: &Path) -> TestResult {
 fn inject_staging_child_parent_sync_failure(root: &Path) -> TestResult {
     replace_once(
         &root.join("tools/xtask/src/quality.rs"),
-        "    sync_directory(child)?;\n    sync_directory(parent)\n",
-        "    sync_directory(child)?;\n    if parent.file_name().and_then(OsStr::to_str)\n        == Some(\"evidence-report-staging\")\n    {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"staging child parent sync failed\",\n        ));\n    }\n    sync_directory(parent)\n",
+        "    fn sync(&self) -> Result<(), XtaskError> {\n        self.require_identity()?;\n        self.leaf.sync()?;\n        self.parent.sync()\n    }\n",
+        "    fn sync(&self) -> Result<(), XtaskError> {\n        self.require_identity()?;\n        self.leaf.sync()?;\n        Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"staging child parent sync failed\",\n        ))\n    }\n",
     )
 }
 
