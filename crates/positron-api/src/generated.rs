@@ -100,7 +100,7 @@ impl SchemaDigest {
     /// Returns the digest embedded by deterministic generation.
     #[must_use]
     pub const fn canonical() -> Self {
-        Self("dec4904c90127c22273f6f60287f054c3b6266731971d3418148517956d1e2f7")
+        Self("2807ac4ab5ada79d1dac1e9c64e01b57e9e61c22646296dc59a06652fa122036")
     }
 
     /// Returns the lowercase hexadecimal digest value.
