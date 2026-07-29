@@ -6,7 +6,7 @@ pub(crate) const MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_DEPTH: usize = 32;
 pub(crate) const MAX_COLLECTION_ITEMS: usize = 512;
 pub(crate) const MAX_STRING_BYTES: usize = 128 * 1024;
-const INITIAL_STRING_CAPACITY: usize = 8;
+const INITIAL_DECODED_STRING_CAPACITY: usize = 8;
 
 pub(crate) type JsonObject = BTreeMap<String, JsonValue>;
 
@@ -58,15 +58,18 @@ pub(crate) fn parse_with_maximum_bytes(
     input: &str,
     maximum_bytes: usize,
 ) -> Result<JsonValue, JsonError> {
-    parse_document(input, maximum_bytes).map(|(value, _)| value)
+    parse_bounded_document(input, maximum_bytes).map(|(value, _)| value)
 }
 
 #[cfg(test)]
-fn parse_with_allocation_growth_count(input: &str) -> Result<(JsonValue, usize), JsonError> {
-    parse_document(input, MAX_INPUT_BYTES)
+fn parse_with_capacity_growth_count(input: &str) -> Result<(JsonValue, usize), JsonError> {
+    parse_bounded_document(input, MAX_INPUT_BYTES)
 }
 
-fn parse_document(input: &str, maximum_bytes: usize) -> Result<(JsonValue, usize), JsonError> {
+fn parse_bounded_document(
+    input: &str,
+    maximum_bytes: usize,
+) -> Result<(JsonValue, usize), JsonError> {
     if input.len() > maximum_bytes {
         return Err(JsonError::new(format!(
             "JSON input exceeds the {maximum_bytes}-byte limit"
@@ -76,7 +79,7 @@ fn parse_document(input: &str, maximum_bytes: usize) -> Result<(JsonValue, usize
     let mut parser = Parser {
         input,
         position: 0,
-        string_allocation_growths: 0,
+        string_capacity_growths: 0,
     };
     parser.skip_whitespace()?;
     let value = parser.parse_value(0)?;
@@ -85,7 +88,7 @@ fn parse_document(input: &str, maximum_bytes: usize) -> Result<(JsonValue, usize
         return Err(parser.error("unexpected trailing content"));
     }
 
-    Ok((value, parser.string_allocation_growths))
+    Ok((value, parser.string_capacity_growths))
 }
 
 pub(crate) fn take_required(object: &mut JsonObject, field: &str) -> Result<JsonValue, JsonError> {
@@ -106,7 +109,7 @@ pub(crate) fn reject_unknown_fields(object: JsonObject, subject: &str) -> Result
 struct Parser<'input> {
     input: &'input str,
     position: usize,
-    string_allocation_growths: usize,
+    string_capacity_growths: usize,
 }
 
 impl Parser<'_> {
@@ -363,7 +366,7 @@ impl Parser<'_> {
                 .capacity()
                 .checked_mul(2)
                 .unwrap_or(MAX_STRING_BYTES)
-                .clamp(INITIAL_STRING_CAPACITY, MAX_STRING_BYTES);
+                .clamp(INITIAL_DECODED_STRING_CAPACITY, MAX_STRING_BYTES);
             let target_capacity = doubled_capacity.max(next_length);
             let additional = target_capacity
                 .checked_sub(value.len())
@@ -371,8 +374,8 @@ impl Parser<'_> {
             value
                 .try_reserve_exact(additional)
                 .map_err(|_| self.error("cannot reserve JSON string storage"))?;
-            self.string_allocation_growths = self
-                .string_allocation_growths
+            self.string_capacity_growths = self
+                .string_capacity_growths
                 .checked_add(1)
                 .ok_or_else(|| self.error("JSON string allocation growth count overflow"))?;
         }
@@ -459,7 +462,7 @@ impl Parser<'_> {
 mod tests {
     use super::{
         JsonError, JsonValue, MAX_COLLECTION_ITEMS, MAX_DEPTH, MAX_INPUT_BYTES, MAX_STRING_BYTES,
-        parse, parse_with_allocation_growth_count, reject_unknown_fields, take_required,
+        parse, parse_with_capacity_growth_count, reject_unknown_fields, take_required,
     };
 
     #[test]
@@ -541,7 +544,7 @@ mod tests {
         let escaped_input = format!("\"{}\"", "\\u0061".repeat(MAX_STRING_BYTES));
 
         for input in [&plain_input, &escaped_input] {
-            let (value, growth_count) = parse_with_allocation_growth_count(input)?;
+            let (value, growth_count) = parse_with_capacity_growth_count(input)?;
             assert!(
                 matches!(value, JsonValue::String(value) if value.len() == MAX_STRING_BYTES),
                 "maximum decoded string must round-trip"

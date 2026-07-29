@@ -4247,7 +4247,7 @@ case "$command" in
     document_root="$target/doc"
     search_index="$document_root/search.index/7ee4fc406f.js"
     mkdir -p "$(dirname "$search_index")"
-    token_prefix=$(printf '\163\161\060\141\164\160\055')
+    token_prefix='sq0atp-'
     : > "$search_index"
     if [ -f target/quality-tools/emit-search-index-square-canary ]; then
       printf '%s%s\n' "$token_prefix" '1111111111111111111111' > "$search_index"
@@ -4314,8 +4314,7 @@ if [ -z "$target" ]; then
 fi
 search_index="$target/search.index/7ee4fc406f.js"
 if [ -f "$search_index" ]; then
-  square_pattern=$(printf '\163\161\060\141\164\160\055[0-9]{22}')
-  if grep -E "$square_pattern" "$search_index" >/dev/null; then
+  if grep -E 'sq0atp-[0-9]{22}' "$search_index" >/dev/null; then
     printf '%s\n' 'fixture detected Square-shaped secret canary' >&2
     exit 78
   fi
