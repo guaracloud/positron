@@ -27,7 +27,7 @@
       "Before the primary evidence path is touched or any report is published, the attempt create-news, flushes, synchronizes, and directory-synchronizes one schema-valid recovery record bound to the canonical attempt. A pre-existing recovery record prevents primary creation, and a primary collision after recovery reservation preserves both the recovery verdict and occupied primary bytes.",
       "Every selected report is create-new written, flushed, file-synchronized, and read back in one bounded staging directory. The staging directory is synchronized before rename; after rename, the final directory and report parent are synchronized before primary evidence is written, flushed, and synchronized. Recovery deletion is followed by evidence-parent synchronization, and any durability or reconciliation failure removes attempt-owned partial state as far as safe while retaining or restoring the recovery verdict.",
       "EVIDENCE_V3_CONSTRAINTS_V1 is the canonical runtime constraint owner for string, digest, path, count, and size boundaries. The checked schema names this owner and is verified by its exact SHA-256 after structural checks, so enum, pattern, length, range, required-field, or additional-properties drift fails closed. Runtime parsing enforces lowercase 40/64-character source and registry identities, lowercase SHA-256, and every declared maximum.",
-      "Retained structured invocations are parsed into typed ordered fields, including repeated arguments, canonicalized with the writer's positron-quality-command-v2 NUL-domain-separated JSON algorithm, and SHA-256 recomputed independently for both evidence and raw reports before their stored digests are cross-compared. Current-schema gate identity, owner, budget, selection, program, ordered arguments, working directory, environment, timeout, activation, exception, exact controlled-step cardinality, and ordered commands are then compared with the canonical gate, toolchain, profile, stage, and scope registries rather than accepted from the retained record itself.",
+      "Retained structured invocations are parsed into typed ordered fields, including repeated arguments, canonicalized with the writer's positron-quality-command-v2 NUL-domain-separated JSON algorithm, and SHA-256 recomputed independently for both evidence and raw reports before their stored digests are cross-compared. Current-schema gate identity, owner, budget, selection, program, ordered arguments, working directory, environment, timeout, activation, exception, and ordered commands are then compared with the canonical gate, toolchain, profile, stage, and scope registries rather than accepted from the retained record itself. Passed selected gates require their complete canonical controlled-step sequence; failed selected gates require the non-empty canonical prefix ending at the executed failure; only a canonically zero-step internal gate may retain an empty executed sequence.",
       "Exceptional retained attempts use an explicit typed mode derived from their collision bindings. Collision records canonically retain collision-retention and blocked-by-collision invocations; publication-recovery records retain report-retention-failure and blocked-by-EG-00 invocations. The public EG-EVIDENCE validator applies the matching closed semantics on the next run."
     ],
     "unchanged": [
@@ -53,7 +53,7 @@
     "Uppercase hashes, overlong constrained identities, and any checked-schema constraint drift fail EG-EVIDENCE.",
     "Retained reports one byte below and exactly at the 8388608-byte raw-report limit are accepted, while a report one byte over the limit is rejected from metadata before parsing.",
     "Coordinated edits to an invocation plus independently valid recomputed command digests are rejected against the canonical registries while ordered repeated arguments and dynamic resolved tool identities remain lossless.",
-    "Deleting every controlled step from a selected external gate and recomputing valid evidence and report digests fails exact registry-derived cardinality, while a registered internal runner whose canonical sequence is empty remains valid.",
+    "Deleting every controlled step from a selected external gate and recomputing valid evidence and report digests fails registry-derived cardinality. A passed selected gate requires the complete canonical sequence, a failed selected gate requires its non-empty canonical prefix, and a registered internal runner whose canonical sequence is empty remains valid.",
     "Retained collision and publication-recovery records remain valid under their distinct typed invocation modes during the next EG-EVIDENCE pass."
   ],
   "detection_lost": [],
@@ -75,19 +75,20 @@
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_overwritten_engineering_evidence_attempt -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_collision_exhaustion_without_changing_any_occupied_bytes -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_external_gate_with_all_controlled_steps_deleted -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_accepts_a_registered_internal_gate_with_zero_controlled_steps -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_coordinated_invocation_and_stored_digest_tampering -- --exact",
         "cargo test --locked --package xtask --bin xtask quality::tests::dependency_runner_matches_each_registered_controlled_step_in_order -- --exact",
         "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact"
       ],
-      "result": "All 22 focused tests passed. They cover distinct collision and recovery validation on the next EG-EVIDENCE pass; recovery-first primary reservation; primary collision preservation; report file and directory durability failures; primary write, flush, and recovery cleanup failures; atomic report cleanup across first, middle, last, and staging-cleanup failures; occupied reports and collision exhaustion; external controlled-step deletion with recomputed valid digests; legitimate internal zero-step gates; coordinated invocation tampering; and ordered dependency and repeated-argument preservation. These local results are diagnostic only."
+      "result": "All 23 focused tests passed. They cover distinct collision and recovery validation on the next EG-EVIDENCE pass; recovery-first primary reservation; primary collision preservation; report file and directory durability failures; primary write, flush, and recovery cleanup failures; atomic report cleanup across first, middle, last, and staging-cleanup failures; occupied reports and collision exhaustion; external controlled-step deletion with recomputed valid digests; legitimate failed canonical prefixes and internal zero-step gates; coordinated invocation tampering; and ordered dependency and repeated-argument preservation. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "c379c213eb0d44ee904aeb64cf68af073bc0c91e",
-      "source_tree": "57aef108d36145f146c3eb2fc790d7c8dfb6b961",
-      "fixture_sha256": "6afe6dd3844125acb72c4269fc7845c6124f864302675abb4f687a48821117d8",
+      "source_revision": "4312e606d86f82d1c9ba7f0fbb92e7352838fc84",
+      "source_tree": "2ddfcbf7452c5d3c36d463fc06a2bb4fd6cdeaee",
+      "fixture_sha256": "c95b1c6fc0444149d3a00cfbcef7a12bbf293dfcbe18d585126790c7ad3e3d9d",
       "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
-      "runner_sha256": "c5aa407c18d2dfeb67e89ab90ac24016b6e096612493839adb16b5089b31d7d9",
+      "runner_sha256": "fe074a042d2442cf52c9d3aa9f71adbd74de5cf9f58a2ebc7b116f2e0b982c4d",
       "parser_sha256": "3406b96639f8c8ed7e7bfcd7f6676404502f027cad942e65dad12878d8ab7972",
       "exact_fixture_results": [
         "quality_validates_a_retained_recovery_on_the_next_evidence_pass: passed",
@@ -108,6 +109,7 @@
         "quality_rejects_an_overwritten_engineering_evidence_attempt: passed",
         "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
         "quality_rejects_an_external_gate_with_all_controlled_steps_deleted: passed",
+        "quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix: passed",
         "quality_accepts_a_registered_internal_gate_with_zero_controlled_steps: passed",
         "quality_rejects_coordinated_invocation_and_stored_digest_tampering: passed",
         "quality::tests::dependency_runner_matches_each_registered_controlled_step_in_order: passed",
