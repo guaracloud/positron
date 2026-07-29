@@ -1,11 +1,13 @@
 # Canonical Positron v1 API source
 
-This is the reserved location for the single hand-edited versioned Protobuf
-definition required by ADR-0028.
+`positron.proto` is the sole hand-edited versioned public contract required by
+ADR-0028. Run `cargo xtask generate-api` to regenerate the Rust v1 types,
+HTTP/JSON route map, OpenAPI document, and SHA-256 Schema Digest. Generated
+files in this directory and `crates/positron-api/src/generated.rs` are never
+edited by hand.
 
-The API scope is scaffold-only. Do not add placeholder messages, generated
-output, transport-specific domain behavior, or a generator selected by
-convenience. Activation requires the accepted public message and stable error
-taxonomy decision, exact pinned Buf/Protobuf/Rust generator identities,
-breaking-change baseline, schema-digest contract, generation command, and
-clean-regeneration gate.
+The foundation exposes only capability negotiation: it reports the canonical
+v1 package and Schema Digest or explicitly refuses an incompatible major with
+a stable code, retry class, completion state, and non-secret source. It does
+not introduce SDK publication, a listener, a persistence format, or any
+deferred product capability.

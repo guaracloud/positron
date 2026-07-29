@@ -78,6 +78,24 @@ const M0_02_MUTATION_SELECTOR: &str = concat!(
     "exceeds_byte_limit|exceeds_collection_limit",
 );
 const M0_02_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-02-domain-final-post-lint";
+const M0_03_MUTATION_SELECTOR: &str = concat!(
+    "RequestedApiMajor::from_major|RequestedApiMajor::major|",
+    "Capability::wire_value|Capability::from_wire|",
+    "SchemaDigest::canonical|SchemaDigest::as_str|",
+    "ApiError::unsupported_api_version|ApiError::capability_unavailable|",
+    "ApiError::capability_unsupported|ApiError::malformed|ApiError::too_large|",
+    "ApiError::unknown_field|CapabilityRequest::for_version|",
+    "CapabilityRequest::for_capability|CapabilityRequest::for_requested_major|",
+    "CapabilityRequest::unknown|CapabilityRequest::wire_major|",
+    "CapabilityResponse::availability|CapabilityResponse::api_major|",
+    "CapabilityResponse::schema_digest|CapabilityResponse::refusal|",
+    "CapabilityResponse::deprecation|CapabilityResponse::capability|",
+    "Transport::source|EncodedRequest::push|EncodedRequest::extend|",
+    "CapabilityClient::encode|CapabilityService::negotiate|",
+    "CapabilityService::decode_and_negotiate|encode_grpc|encode_http|",
+    "encode_varint|decode_grpc|decode_varint|decode_http|parse_json_u32",
+);
+const M0_03_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-03-api-final";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoverageTarget {
@@ -191,12 +209,14 @@ impl Profile {
 pub(crate) struct Options {
     profile: Profile,
     retain_m0_02_mutation: bool,
+    retain_m0_03_mutation: bool,
 }
 
 impl Options {
     pub(crate) fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, XtaskError> {
         let mut profile = Profile::Pr;
         let mut retain_m0_02_mutation = false;
+        let mut retain_m0_03_mutation = false;
         let mut arguments = arguments.peekable();
         while let Some(argument) = arguments.next() {
             if argument == "--profile" {
@@ -208,6 +228,8 @@ impl Options {
                 profile = Profile::parse(value)?;
             } else if argument == "--retain-m0-02-mutation" {
                 retain_m0_02_mutation = true;
+            } else if argument == "--retain-m0-03-mutation" {
+                retain_m0_03_mutation = true;
             } else {
                 return Err(XtaskError::usage(format!(
                     "unexpected quality argument `{argument}`"
@@ -219,9 +241,20 @@ impl Options {
                 "`--retain-m0-02-mutation` requires `--profile ext`".to_owned(),
             ));
         }
+        if retain_m0_03_mutation && profile != Profile::Ext {
+            return Err(XtaskError::usage(
+                "`--retain-m0-03-mutation` requires `--profile ext`".to_owned(),
+            ));
+        }
+        if retain_m0_02_mutation && retain_m0_03_mutation {
+            return Err(XtaskError::usage(
+                "select exactly one retained focused mutation campaign per EXT attempt".to_owned(),
+            ));
+        }
         Ok(Self {
             profile,
             retain_m0_02_mutation,
+            retain_m0_03_mutation,
         })
     }
 }
@@ -389,14 +422,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             gate.id, gate.runner, gate.timeout_seconds, gate.memory_mib
         );
         let started = Instant::now();
-        let execution = execute_gate(
-            &root,
-            &registry,
-            gate,
-            options.profile,
-            options.retain_m0_02_mutation,
-            &environment,
-        );
+        let execution = execute_gate(&root, &registry, gate, options, &environment);
         let duration_ms = started.elapsed().as_millis();
         match execution {
             Ok(command) => {
@@ -575,16 +601,22 @@ fn execute_gate(
     root: &Path,
     registry: &Registry,
     gate: &Gate,
-    profile: Profile,
-    retain_m0_02_mutation: bool,
+    options: &Options,
     environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
-        "registry" => run_registry_gate(root, registry, profile, budget, environment),
+        "registry" => run_registry_gate(root, registry, options.profile, budget, environment),
         "architecture" => run_architecture_gate(root, registry, budget, environment),
-        "build" => run_build_gate(root, profile, budget, environment),
-        "coverage" => run_coverage_gate(root, registry, budget, retain_m0_02_mutation, environment),
+        "build" => run_build_gate(root, options.profile, budget, environment),
+        "coverage" => run_coverage_gate(
+            root,
+            registry,
+            budget,
+            options.retain_m0_02_mutation,
+            options.retain_m0_03_mutation,
+            environment,
+        ),
         "dynamic-analysis" => run_dynamic_analysis_gate(root, registry, budget, environment),
         "dependencies" => run_dependency_gate(root, registry, budget, environment),
         "documentation" => run_documentation_gate(root, budget, environment),
@@ -593,14 +625,50 @@ fn execute_gate(
         "policy" => run_policy_gate(root, registry),
         "rust" => run_rust_gate(root, budget, environment),
         "safety" => run_safety_gate(root, registry),
-        "secrets" => run_secret_gate(root, profile, budget, environment),
-        "supply" => run_supply_gate(root, registry, profile, budget, environment),
+        "secrets" => run_secret_gate(root, options.profile, budget, environment),
+        "supply" => run_supply_gate(root, registry, options.profile, budget, environment),
         "test" => run_test_gate(root, budget, environment),
+        "matrix" => run_canonical_api_matrix_gate(root),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
             "an active risk scope selected a gate whose executable harness has not been implemented",
         )),
     }
+}
+
+fn run_canonical_api_matrix_gate(root: &Path) -> Result<String, XtaskError> {
+    const ARTIFACTS: [&str; 4] = [
+        "api/positron/v1/http.json",
+        "api/positron/v1/openapi.json",
+        "api/positron/v1/schema.sha256",
+        "crates/positron-api/src/generated.rs",
+    ];
+    let before = ARTIFACTS
+        .iter()
+        .map(|relative| {
+            let path = root.join(relative);
+            let contents = fs::read(&path).map_err(|source| {
+                XtaskError::io(
+                    format!("read canonical API artifact {}", path.display()),
+                    source,
+                )
+            })?;
+            Ok((path, contents))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::api_generation::generate(root)?;
+    for (path, contents) in before {
+        let regenerated = fs::read(&path).map_err(|source| {
+            XtaskError::io(format!("read regenerated {}", path.display()), source)
+        })?;
+        if regenerated != contents {
+            return Err(XtaskError::invalid_path(
+                &path,
+                "canonical API generation is not clean and deterministic",
+            ));
+        }
+    }
+    Ok("canonical API generation parity is clean across Rust, HTTP/JSON, OpenAPI, and Schema Digest".to_owned())
 }
 
 fn run_dynamic_analysis_gate(
@@ -650,6 +718,7 @@ fn run_coverage_gate(
     registry: &Registry,
     budget: Duration,
     retain_m0_02_mutation: bool,
+    retain_m0_03_mutation: bool,
     environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
@@ -670,8 +739,19 @@ fn run_coverage_gate(
     if registry.has_m0_01_foundational_scope() {
         results.push(run_m0_01_coverage(root, registry, deadline, environment)?);
     }
+    if registry.has_m0_03_canonical_api_scope() {
+        results.push(run_m0_03_canonical_api_coverage(
+            root,
+            registry,
+            deadline,
+            environment,
+        )?);
+    }
     if retain_m0_02_mutation {
         results.push(run_m0_02_mutation(root, registry, deadline, environment)?);
+    }
+    if retain_m0_03_mutation {
+        results.push(run_m0_03_mutation(root, registry, deadline, environment)?);
     }
     if results.is_empty() {
         return Err(XtaskError::invalid(
@@ -749,6 +829,83 @@ fn run_m0_02_mutation(
             "--locked",
             "--test",
             "foundational_domain_types",
+        ],
+        remaining(deadline)?,
+        &[],
+    )?;
+    Ok(format!(
+        "cargo-mutants={}; {}",
+        tool.version, outcome.display
+    ))
+}
+
+fn run_m0_03_mutation(
+    root: &Path,
+    registry: &Registry,
+    deadline: Instant,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    if !registry.has_m0_03_canonical_api_scope() {
+        return Err(XtaskError::invalid(
+            "M0-03 mutation runner",
+            "the retained M0-03 mutation campaign requires the active canonical API scope",
+        ));
+    }
+    let tool = registry
+        .tools
+        .iter()
+        .find(|tool| tool.id == "cargo-mutants")
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "M0-03 mutation detector registry",
+                "missing required detector `cargo-mutants`",
+            )
+        })?;
+    let version = run_capture(
+        root,
+        environment,
+        &tool.command,
+        tool.version_arguments.iter().map(String::as_str),
+        remaining(deadline)?,
+        &[],
+    )?;
+    if !version.stdout.contains(&tool.version) {
+        return Err(XtaskError::invalid(
+            "M0-03 mutation detector `cargo-mutants`",
+            format!(
+                "expected version `{}`, command reported `{}`",
+                tool.version,
+                one_line(&version.stdout)
+            ),
+        ));
+    }
+    let output = root.join(M0_03_MUTATION_OUTPUT);
+    fs::create_dir_all(&output)
+        .map_err(|source| XtaskError::io(format!("create {}", output.display()), source))?;
+    let outcome = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "mutants",
+            "--no-config",
+            "--package",
+            "positron-api",
+            "--re",
+            M0_03_MUTATION_SELECTOR,
+            "--test-tool",
+            "cargo",
+            "--output",
+            M0_03_MUTATION_OUTPUT,
+            "--timeout",
+            "30",
+            "--jobs",
+            "1",
+            "--no-times",
+            "--",
+            "--locked",
+            "--test",
+            "canonical_public_interface",
         ],
         remaining(deadline)?,
         &[],
@@ -839,6 +996,44 @@ fn run_m0_02_domain_types_coverage(
     ))
 }
 
+fn run_m0_03_canonical_api_coverage(
+    root: &Path,
+    registry: &Registry,
+    deadline: Instant,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    let report = "target/quality/coverage/m0-03-api.json";
+    let outcome = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "+nightly-2026-07-20",
+            "llvm-cov",
+            "--locked",
+            "--package",
+            "positron-api",
+            "--test",
+            "canonical_public_interface",
+            "--branch",
+            "--json",
+            "--summary-only",
+            "--ignore-filename-regex",
+            "crates/positron-api/tests/.*",
+            "--output-path",
+            report,
+        ],
+        remaining(deadline)?,
+        &[],
+    )?;
+    let measurements = read_coverage_measurements(&root.join(report))?;
+    enforce_m0_03_canonical_api_coverage_baselines(registry, &measurements)?;
+    Ok(format!(
+        "M0-03 canonical API: {}; total(branch={:.2}, line={:.2}, region={:.2})",
+        outcome.display, measurements.branch, measurements.line, measurements.region,
+    ))
+}
+
 fn verify_coverage_detectors(
     root: &Path,
     registry: &Registry,
@@ -914,6 +1109,28 @@ fn enforce_m0_02_domain_types_coverage_baselines(
                 "M0-02 coverage baseline",
                 format!(
                     "domain coverage {label} {actual:.2} is below frozen M0-02 baseline {baseline:.2}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_m0_03_canonical_api_coverage_baselines(
+    registry: &Registry,
+    measurements: &CoverageMeasurements,
+) -> Result<(), XtaskError> {
+    for (identity, actual, label) in [
+        ("api-coverage-branch", measurements.branch, "branch"),
+        ("api-coverage-line", measurements.line, "line"),
+        ("api-coverage-region", measurements.region, "region"),
+    ] {
+        let baseline = registry.measured_baseline(identity)?;
+        if actual < baseline {
+            return Err(XtaskError::invalid(
+                "M0-03 coverage baseline",
+                format!(
+                    "canonical API coverage {label} {actual:.2} is below frozen M0-03 baseline {baseline:.2}"
                 ),
             ));
         }
@@ -1516,6 +1733,14 @@ fn validate_coverage_workflow_provisioning(root: &Path) -> Result<(), XtaskError
             &path,
             format!(
                 "coverage-selected workflow `{relative}` is missing the authoritative retained M0-02 mutation selection"
+            ),
+        ));
+    }
+    if !content.contains("cargo xtask quality --profile ext --retain-m0-03-mutation") {
+        return Err(XtaskError::invalid_path(
+            &path,
+            format!(
+                "coverage-selected workflow `{relative}` is missing the authoritative retained M0-03 mutation selection"
             ),
         ));
     }
@@ -3017,12 +3242,13 @@ fn one_line(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
     use super::{
-        EnvironmentSnapshot, ExecutionTools, M0_02_MUTATION_SELECTOR, Options, Profile, json_string,
+        EnvironmentSnapshot, ExecutionTools, M0_02_MUTATION_SELECTOR, M0_03_MUTATION_SELECTOR,
+        Options, Profile, json_string,
     };
 
     #[test]
@@ -3034,6 +3260,7 @@ mod tests {
                 Ok(Options {
                     profile: Profile::Pr,
                     retain_m0_02_mutation: false,
+                    retain_m0_03_mutation: false,
                 })
             ),
             "quality must default to the authoritative PR profile"
@@ -3053,6 +3280,7 @@ mod tests {
                 Ok(Options {
                     profile: Profile::Ext,
                     retain_m0_02_mutation: true,
+                    retain_m0_03_mutation: false,
                 })
             ),
             "the explicit retained mutation campaign must be accepted only as an EXT option"
@@ -3066,6 +3294,36 @@ mod tests {
         assert!(
             rejected.is_err(),
             "routine PR quality must not select the focused mutation campaign"
+        );
+    }
+
+    #[test]
+    fn retained_m0_03_mutation_requires_the_extended_profile() {
+        let options = Options::parse(
+            ["--profile", "ext", "--retain-m0-03-mutation"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(
+            matches!(
+                options,
+                Ok(Options {
+                    profile: Profile::Ext,
+                    retain_m0_02_mutation: false,
+                    retain_m0_03_mutation: true,
+                })
+            ),
+            "the explicit M0-03 mutation campaign must be accepted only as an EXT option"
+        );
+
+        let rejected = Options::parse(
+            ["--profile", "pr", "--retain-m0-03-mutation"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(
+            rejected.is_err(),
+            "routine PR quality must not select the M0-03 mutation campaign"
         );
     }
 
@@ -3090,6 +3348,93 @@ mod tests {
                 "focused mutation selection omitted invariant owner `{owner}`"
             );
         }
+    }
+
+    #[test]
+    fn focused_m0_03_mutation_selection_covers_public_boundary_owners() {
+        let selected = M0_03_MUTATION_SELECTOR.split('|').collect::<BTreeSet<_>>();
+        for owner in [
+            "RequestedApiMajor::from_major",
+            "RequestedApiMajor::major",
+            "Capability::from_wire",
+            "ApiError::unsupported_api_version",
+            "CapabilityRequest::for_version",
+            "CapabilityRequest::for_requested_major",
+            "CapabilityResponse::api_major",
+            "CapabilityService::negotiate",
+            "CapabilityService::decode_and_negotiate",
+            "encode_grpc",
+            "decode_grpc",
+            "decode_http",
+        ] {
+            assert!(
+                selected.contains(owner),
+                "focused M0-03 mutation selection omitted public owner `{owner}`"
+            );
+        }
+        // `ApiVersion` is the closed canonical v1 enum, so replacing
+        // `ApiVersion::major` with the literal `1` is identical for its
+        // complete input domain. Requested-major behavior remains observable
+        // through the separately selected checked owner and request/service
+        // seams.
+        assert!(
+            !selected.contains("ApiVersion::major"),
+            "the equivalent closed-v1 accessor must not replace requested-major owners"
+        );
+        let generated = generated_rust_owner_names(include_str!(
+            "../../../crates/positron-api/src/generated.rs"
+        ));
+        let stale = selected
+            .iter()
+            .filter(|owner| !generated.contains(**owner))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            stale.is_empty(),
+            "focused M0-03 mutation selection contains stale or nonexistent owners: {stale:?}"
+        );
+    }
+
+    fn generated_rust_owner_names(source: &str) -> BTreeSet<String> {
+        let mut owners = BTreeSet::new();
+        let mut implementation = None;
+        let mut implementation_depth = 0_usize;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if implementation.is_none()
+                && let Some(owner) = trimmed
+                    .strip_prefix("impl ")
+                    .and_then(|value| value.strip_suffix(" {"))
+            {
+                implementation = Some(owner);
+                implementation_depth = 1;
+                continue;
+            }
+            if let Some(name) = rust_function_name(trimmed) {
+                if let Some(owner) = implementation {
+                    owners.insert(format!("{owner}::{name}"));
+                } else {
+                    owners.insert(name.to_owned());
+                }
+            }
+            if implementation.is_some() {
+                implementation_depth =
+                    implementation_depth.saturating_add(trimmed.matches('{').count());
+                implementation_depth =
+                    implementation_depth.saturating_sub(trimmed.matches('}').count());
+                if implementation_depth == 0 {
+                    implementation = None;
+                }
+            }
+        }
+        owners
+    }
+
+    fn rust_function_name(line: &str) -> Option<&str> {
+        line.split_once("fn ")
+            .and_then(|(_, suffix)| suffix.split_once('('))
+            .map(|(name, _)| name.trim())
+            .filter(|name| !name.is_empty())
     }
 
     #[test]

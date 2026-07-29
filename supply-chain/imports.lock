@@ -1,2 +1,75 @@
 
 # cargo-vet imports lock
+
+[[audits.bytecode-alliance.audits.block-buffer]]
+who = "Benjamin Bouvier <public@benj.me>"
+criteria = "safe-to-deploy"
+delta = "0.9.0 -> 0.10.2"
+
+[[audits.bytecode-alliance.audits.cfg-if]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "I am the author of this crate."
+
+[audits.google.audits]
+
+[[audits.isrg.audits.block-buffer]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+version = "0.9.0"
+
+[[audits.isrg.audits.cfg-if]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "1.0.0 -> 1.0.1"
+
+[[audits.isrg.audits.cfg-if]]
+who = "J.C. Jones <jc@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "1.0.1 -> 1.0.3"
+
+[[audits.isrg.audits.cfg-if]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "1.0.3 -> 1.0.4"
+
+[[audits.isrg.audits.sha2]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+version = "0.10.2"
+
+[[audits.isrg.audits.sha2]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.10.8 -> 0.10.9"
+
+[[audits.mozilla.audits.block-buffer]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+delta = "0.10.2 -> 0.10.3"
+aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.sha2]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+delta = "0.10.2 -> 0.10.6"
+aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.sha2]]
+who = "Jeff Muizelaar <jmuizelaar@mozilla.com>"
+criteria = "safe-to-deploy"
+delta = "0.10.6 -> 0.10.8"
+notes = """
+The bulk of this is https://github.com/RustCrypto/hashes/pull/490 which adds aarch64 support along with another PR adding longson.
+I didn't check the implementation thoroughly but there wasn't anything obviously nefarious. 0.10.8 has been out for more than a year
+which suggests no one else has found anything either.
+"""
+aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
+
+[[audits.zcash.audits.block-buffer]]
+who = "Jack Grigg <jack@electriccoin.co>"
+criteria = "safe-to-deploy"
+delta = "0.10.3 -> 0.10.4"
+notes = "Adds panics to prevent a block size of zero from causing unsoundness."
+aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
