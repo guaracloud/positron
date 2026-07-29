@@ -25,12 +25,17 @@ stdout/stderr verdict. Captured streams are limited to 128 KiB each and one
 gate report is limited to 8 MiB. Not-selected gates retain an explicit
 `gate-not-selected` applicability instead of creating a report.
 
-Each local attempt path is create-new. A collision preserves the original
-bytes and retains a distinct failed record in one of 16 deterministic,
-atomically claimed collision slots. When all 16 slots already exist, the
-invocation create-news one reserved `<attempt>-collision-exhausted.json`
-failure bound to the canonical attempt and the complete occupied-slot set. If
-that reserved record already exists, it is treated as the previously retained
-exhaustion state and is never overwritten. A stale trusted-CI revision or a
-missing or retried trusted-CI attempt also retains a failed aggregator verdict.
-None may replace an earlier result.
+Each local attempt candidate is selected with create-new reservation. Candidate
+collisions discovered while selecting the canonical or numbered identities
+advance through 16 deterministic, atomically claimed collision slots. When all
+16 slots are occupied, the invocation create-news one reserved
+`<attempt>-collision-exhausted.json` failure bound to the canonical attempt and
+the complete occupied-slot set. If that reserved record already exists, it is
+treated as the previously retained exhaustion state and is never overwritten.
+For each selected candidate, the runner durably reserves its recovery record
+before atomically create-new claiming the primary path. If that primary claim
+loses a race, the immutable candidate-specific recovery record remains the
+authoritative failed verdict; neither path is overwritten and selection does
+not advance to another slot. A stale trusted-CI revision or a missing or
+retried trusted-CI attempt also retains a failed aggregator verdict. None may
+replace an earlier result.
