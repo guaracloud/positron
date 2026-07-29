@@ -69,15 +69,16 @@
         "cargo test --locked --package xtask --bin xtask quality::tests::evidence_v3_constraint_owner_enforces_every_string_and_digest_boundary -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_coordinated_invocation_and_stored_digest_tampering -- --exact",
         "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_raw_report_command_digest_mismatch -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_incomplete_evidence_identity_schema -- --exact"
       ],
-      "result": "The focused public runner fixtures prove atomic complete-directory report publication and failed-attempt retention across first, middle, last, and cleanup failures; exact checked-schema drift, uppercase identity, and overlong identity rejection; canonical invocation-digest recomputation under coordinated tampering; and lossless repeated arguments. The pre-existing occupied-report and incomplete-schema guards also pass. These local results are diagnostic only."
+      "result": "The focused public runner fixtures prove atomic complete-directory report publication and failed-attempt retention across first, middle, last, and cleanup failures; exact checked-schema drift, uppercase identity, and overlong identity rejection; canonical invocation-digest recomputation under coordinated tampering; and lossless repeated arguments. The pre-existing single-digest mismatch, occupied-report, and incomplete-schema guards also pass. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "1929347e80d1e46deb22003be222d6949200e9d4",
-      "source_tree": "1bcb7685c2a6e7d00d1f23624910a6fc8ec56c2d",
-      "fixture_sha256": "499e200543bda784709f88e275d52dfe4cd6eedaf886008c997e4f92eeefe633",
+      "source_revision": "ef5a2383ee083d28170c54dce22bd5cd5d44b2ee",
+      "source_tree": "692d446c649bbce71ab821f460fdeeb6a96eb02c",
+      "fixture_sha256": "d2f14ce816e07745afb51739eba989f28779a2929018eb08115bd019deeecdd5",
       "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
       "runner_sha256": "9c63a1d866ead1e595baa3267fa0103f0e3789c93c551cf54ed6c4701744b54b",
       "parser_sha256": "84f149f0478df4e7f13f99d674fa367c23196721bcdcade583a899fcbfa7032b",
@@ -92,6 +93,7 @@
         "quality::tests::evidence_v3_constraint_owner_enforces_every_string_and_digest_boundary: passed",
         "quality_rejects_coordinated_invocation_and_stored_digest_tampering: passed",
         "quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments: passed",
+        "quality_rejects_a_raw_report_command_digest_mismatch: passed",
         "quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied: passed",
         "quality_rejects_an_incomplete_evidence_identity_schema: passed"
       ]
