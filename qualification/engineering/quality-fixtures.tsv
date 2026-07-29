@@ -1,0 +1,5 @@
+fixture_id	gate_id	publication_point	fault_schedule	seed	predecessor	successor	expected_reopen
+correctness-before-publication	EG-CORRECT	before-publication	crash-after-candidate-sync	seed-correctness-before-v1	state-v1	state-v2	state-v1
+correctness-after-publication	EG-CORRECT	after-publication	crash-after-publication-sync	seed-correctness-after-v1	state-v1	state-v2	state-v2
+fault-before-publication	EG-FAULT	before-publication	crash-after-candidate-sync	seed-fault-before-v1	state-v1	state-v2	state-v1
+fault-after-publication	EG-FAULT	after-publication	crash-after-publication-sync	seed-fault-after-v1	state-v1	state-v2	state-v2

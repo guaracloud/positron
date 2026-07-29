@@ -438,7 +438,8 @@ fn quality_runs_correctness_through_the_registered_public_seam() -> TestResult {
             "\"schema_version\": 1",
             "\"gate_id\": \"EG-CORRECT\"",
             "\"verdict\": \"passed\"",
-            "\"controlled_steps\": [",
+            "correctness-before-publication:crash-after-candidate-sync:state-v1",
+            "correctness-after-publication:crash-after-publication-sync:state-v2",
         ] {
             if !report.contains(expected) {
                 return Err(std::io::Error::other(format!(
@@ -464,25 +465,97 @@ fn quality_runs_correctness_through_the_registered_public_seam() -> TestResult {
 }
 
 #[test]
-fn quality_rejects_a_correctness_self_test_without_a_terminal_test_verdict() -> TestResult {
+fn quality_rejects_a_malformed_correctness_fixture_registry() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
-        fs::write(
-            fixture
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
                 .root
-                .join("target/quality-tools/malformed-correctness-self-test-output"),
-            "",
+                .join("qualification/engineering/quality-fixtures.tsv"),
+            "fixture_id\tgate_id\tpublication_point",
+            "fixture\tgate_id\tpublication_point",
         )?;
         let output = fixture.quality_output_for("pr")?;
-        assert_rejected_output(
-            &output,
-            "invalid correctness self-test: did not report exactly one passing test",
-        )?;
+        assert_rejected_output(&output, "fixture registry header is not exact")?;
         let evidence = fixture.latest_evidence()?;
         let record = gate_record(&evidence, "EG-CORRECT")?;
         if !record.contains("\"result\": \"failed\"") {
             return Err(std::io::Error::other(
-                "malformed correctness output did not retain a failed gate outcome",
+                "malformed correctness registry did not retain a failed gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_correctness_fixture_with_a_false_reopen_oracle() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("qualification/engineering/quality-fixtures.tsv"),
+            "correctness-before-publication\tEG-CORRECT\tbefore-publication\tcrash-after-candidate-sync\tseed-correctness-before-v1\tstate-v1\tstate-v2\tstate-v1\n",
+            "correctness-before-publication\tEG-CORRECT\tbefore-publication\tcrash-after-candidate-sync\tseed-correctness-before-v1\tstate-v1\tstate-v2\tstate-v2\n",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "expected reopen state does not match the registered publication-point oracle",
+        )?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-CORRECT")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "false correctness oracle did not retain a failed gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_correctness_fixture_registry_over_its_resource_ceiling() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        fs::write(
+            fixture
+                .root
+                .join("qualification/engineering/quality-fixtures.tsv"),
+            vec![b'x'; 16_385],
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "fixture registry exceeds 16384 bytes")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-CORRECT")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "oversized correctness registry did not retain a failed gate outcome",
             )
             .into());
         }
@@ -526,7 +599,8 @@ fn quality_runs_fault_through_the_registered_public_seam() -> TestResult {
             "\"schema_version\": 1",
             "\"gate_id\": \"EG-FAULT\"",
             "\"verdict\": \"passed\"",
-            "\"controlled_steps\": [",
+            "fault-before-publication:crash-after-candidate-sync:state-v1",
+            "fault-after-publication:crash-after-publication-sync:state-v2",
         ] {
             if !report.contains(expected) {
                 return Err(std::io::Error::other(format!(
@@ -534,6 +608,43 @@ fn quality_runs_fault_through_the_registered_public_seam() -> TestResult {
                 ))
                 .into());
             }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_fault_registry_without_one_schedule_per_publication_point() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("qualification/engineering/quality-fixtures.tsv"),
+            "fault-after-publication\tEG-FAULT\tafter-publication\tcrash-after-publication-sync\tseed-fault-after-v1\tstate-v1\tstate-v2\tstate-v2\n",
+            "",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "invalid EG-FAULT fixture registry: expected exactly 2 publication-point fixtures, found 1",
+        )?;
+        let evidence = fixture.latest_evidence()?;
+        let record = gate_record(&evidence, "EG-FAULT")?;
+        if !record.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "incomplete fault registry did not retain a failed public outcome",
+            )
+            .into());
         }
         Ok(())
     })();
@@ -575,7 +686,10 @@ fn quality_runs_integrity_through_the_registered_public_seam() -> TestResult {
             "\"schema_version\": 1",
             "\"gate_id\": \"EG-INTEGRITY\"",
             "\"verdict\": \"passed\"",
-            "\"controlled_steps\": [",
+            "integrity-verified:verified:original-preserved",
+            "integrity-corrupt-payload:digest-mismatch:original-preserved",
+            "integrity-delete-object:missing-object:original-preserved",
+            "identity=revision+artifact+target+environment+command+fixtures+seed+schedule+result",
         ] {
             if !report.contains(expected) {
                 return Err(std::io::Error::other(format!(
@@ -583,6 +697,102 @@ fn quality_runs_integrity_through_the_registered_public_seam() -> TestResult {
                 ))
                 .into());
             }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_integrity_fixture_with_a_false_reopen_outcome() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-INTEGRITY|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("qualification/engineering/integrity-fixtures.tsv"),
+            "integrity-corrupt-payload\tcorrupt-payload\tseed-integrity-corrupt-v1\tdigest-mismatch\n",
+            "integrity-corrupt-payload\tcorrupt-payload\tseed-integrity-corrupt-v1\tverified\n",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "registered expected outcome does not match its mutation",
+        )?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-INTEGRITY")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "false integrity oracle did not retain a failed gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_preserves_a_failed_correctness_attempt_before_a_later_pass() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let registry = fixture
+            .root
+            .join("qualification/engineering/quality-fixtures.tsv");
+        let valid = fs::read_to_string(&registry)?;
+        fs::write(
+            &registry,
+            valid.replace(
+                "correctness-before-publication\tEG-CORRECT\tbefore-publication\tcrash-after-candidate-sync\tseed-correctness-before-v1\tstate-v1\tstate-v2\tstate-v1\n",
+                "correctness-before-publication\tEG-CORRECT\tbefore-publication\tcrash-after-candidate-sync\tseed-correctness-before-v1\tstate-v1\tstate-v2\tstate-v2\n",
+            ),
+        )?;
+        let failed = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &failed,
+            "expected reopen state does not match the registered publication-point oracle",
+        )?;
+        let failed_path = fixture.latest_evidence_path()?;
+        let failed_bytes = fs::read(&failed_path)?;
+        fs::write(&registry, valid)?;
+        let passed = fixture.quality_output_for("pr")?;
+        if !passed.status.success() {
+            return Err(std::io::Error::other(format!(
+                "corrected public quality attempt did not pass: {}\n{}",
+                String::from_utf8_lossy(&passed.stdout),
+                String::from_utf8_lossy(&passed.stderr),
+            ))
+            .into());
+        }
+        if fs::read(&failed_path)? != failed_bytes {
+            return Err(std::io::Error::other(
+                "later correctness pass rewrote the prior failed attempt",
+            )
+            .into());
+        }
+        let evidence_count = fs::read_dir(fixture.root.join("target/quality/evidence"))?
+            .collect::<Result<Vec<_>, _>>()?
+            .len();
+        if evidence_count != 2 {
+            return Err(std::io::Error::other(format!(
+                "retry fixture retained {evidence_count} attempts instead of exactly 2"
+            ))
+            .into());
         }
         Ok(())
     })();
@@ -5150,11 +5360,8 @@ case "$command" in
       exit 75
     fi
     if [ "$package" = "xtask" ]; then
-      if [ -f target/quality-tools/malformed-correctness-self-test-output ]; then
-        printf '%s\n' 'malformed fixture self-test output'
-      else
-        printf '%s\n' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
-      fi
+      printf '%s\n' 'private runner self-tests are not qualification fixtures' >&2
+      exit 77
     fi
     ;;
   tree)

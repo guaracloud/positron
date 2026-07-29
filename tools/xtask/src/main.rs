@@ -13,6 +13,7 @@ mod error;
 mod evidence_json;
 mod generation;
 mod hooks;
+mod qualification_fixtures;
 mod quality;
 mod registry;
 

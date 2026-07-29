@@ -1,0 +1,4 @@
+fixture_id	mutation	seed	expected_reopen
+integrity-verified	none	seed-integrity-verified-v1	verified
+integrity-corrupt-payload	corrupt-payload	seed-integrity-corrupt-v1	digest-mismatch
+integrity-delete-object	delete-object	seed-integrity-delete-v1	missing-object

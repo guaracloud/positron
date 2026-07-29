@@ -406,6 +406,15 @@ struct GateCapture {
     charged_bytes: usize,
 }
 
+struct GateExecutionContext<'context> {
+    root: &'context Path,
+    registry: &'context Registry,
+    options: &'context Options,
+    environment: &'context EnvironmentSnapshot,
+    source: &'context SourceIdentity,
+    identity: &'context EvidenceIdentity,
+}
+
 impl GateCapture {
     fn new() -> Self {
         Self {
@@ -569,6 +578,15 @@ impl IdentityBinding {
     }
 }
 
+fn identity_binding_text(binding: &IdentityBinding) -> String {
+    match binding {
+        IdentityBinding::Exact(value) => format!("exact:{value}"),
+        IdentityBinding::NotApplicable(reason) => {
+            format!("not-applicable:{}", reason.as_str())
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 struct EvidenceIdentity {
     release_manifest: IdentityBinding,
@@ -663,6 +681,7 @@ fn engineering_evidence_identity(
     root: &Path,
     source: &SourceIdentity,
     environment: &EnvironmentSnapshot,
+    qualification_fixture_selected: bool,
 ) -> Result<EvidenceIdentity, XtaskError> {
     let target_registry_digest =
         digest_relative_files(root, environment, &["qualification/targets/registry.json"])?;
@@ -677,14 +696,25 @@ fn engineering_evidence_identity(
     let fixture_registry_digest = digest_relative_files(
         root,
         environment,
-        &["qualification/fixtures/adversarial/manifest.json"],
+        &[
+            "qualification/fixtures/adversarial/manifest.json",
+            "qualification/engineering/quality-fixtures.tsv",
+            "qualification/engineering/integrity-fixtures.tsv",
+        ],
     )?;
-    Ok(EvidenceIdentity {
+    let (seed_digest, fault_schedule_digest) =
+        crate::qualification_fixtures::seed_and_schedule_digests(root)?;
+    let mut identity = EvidenceIdentity {
         target_registry_digest,
         toolchain_digest,
         fixture_registry_digest,
         ..unavailable_evidence_identity(source)
-    })
+    };
+    if qualification_fixture_selected {
+        identity.seed = IdentityBinding::exact(seed_digest);
+        identity.fault_schedule = IdentityBinding::exact(fault_schedule_digest);
+    }
+    Ok(identity)
 }
 
 fn digest_relative_files(
@@ -777,7 +807,17 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             );
         },
     };
-    let identity = match engineering_evidence_identity(&root, &source, &environment) {
+    let activated_risk_gates = registry.activated_risk_gates();
+    let qualification_fixture_selected = registry.gates.iter().any(|gate| {
+        matches!(gate.id.as_str(), "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY")
+            && gate_selected(gate, options.profile, &activated_risk_gates)
+    });
+    let identity = match engineering_evidence_identity(
+        &root,
+        &source,
+        &environment,
+        qualification_fixture_selected,
+    ) {
         Ok(identity) => identity,
         Err(error) => {
             return retain_aggregator_failure(
@@ -794,8 +834,6 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             );
         },
     };
-    let activated_risk_gates = registry.activated_risk_gates();
-
     println!(
         "Positron engineering quality: profile={}, revision={}, dirty={}",
         options.profile.as_str(),
@@ -827,7 +865,18 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         );
         let started = Instant::now();
         let mut capture = GateCapture::new();
-        let execution = execute_gate(&root, &registry, gate, options, &environment, &mut capture);
+        let execution = execute_gate(
+            GateExecutionContext {
+                root: &root,
+                registry: &registry,
+                options,
+                environment: &environment,
+                source: &source,
+                identity: &identity,
+            },
+            gate,
+            &mut capture,
+        );
         let controlled_steps = capture.finish();
         let duration_ms = started.elapsed().as_millis();
         match execution {
@@ -1000,7 +1049,27 @@ fn gate_attempt(
     environment_digest: &str,
     outcome: GateAttemptOutcome,
 ) -> GateAttempt {
-    let invocation = GateInvocation {
+    let invocation =
+        canonical_gate_invocation(gate, profile, environment_digest, &outcome.controlled_steps);
+    build_gate_attempt(
+        attempt_id,
+        GateAttemptDefinition {
+            gate_id: gate.id.clone(),
+            budget_seconds: gate.timeout_seconds,
+            invocation,
+            owner: IdentityBinding::exact(gate.coordinator.clone()),
+        },
+        outcome,
+    )
+}
+
+fn canonical_gate_invocation(
+    gate: &Gate,
+    profile: Profile,
+    environment_digest: &str,
+    controlled_steps: &[ControlledStepReport],
+) -> GateInvocation {
+    GateInvocation {
         program: "cargo-xtask-quality/internal".to_owned(),
         arguments: vec![
             "quality".to_owned(),
@@ -1017,22 +1086,11 @@ fn gate_attempt(
         memory_mib: gate.memory_mib,
         activation: gate.activation.clone(),
         exception_class: gate.exception_class.clone(),
-        controlled_steps: outcome
-            .controlled_steps
+        controlled_steps: controlled_steps
             .iter()
             .map(|step| step.invocation.clone())
             .collect(),
-    };
-    build_gate_attempt(
-        attempt_id,
-        GateAttemptDefinition {
-            gate_id: gate.id.clone(),
-            budget_seconds: gate.timeout_seconds,
-            invocation,
-            owner: IdentityBinding::exact(gate.coordinator.clone()),
-        },
-        outcome,
-    )
+    }
 }
 
 fn build_gate_attempt(
@@ -1246,13 +1304,18 @@ fn not_selected_reason(gate: &Gate, profile: Profile) -> String {
 }
 
 fn execute_gate(
-    root: &Path,
-    registry: &Registry,
+    context: GateExecutionContext<'_>,
     gate: &Gate,
-    options: &Options,
-    environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let GateExecutionContext {
+        root,
+        registry,
+        options,
+        environment,
+        source,
+        identity,
+    } = context;
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
         "registry" => run_registry_gate(
@@ -1271,9 +1334,9 @@ fn execute_gate(
         },
         "dependencies" => run_dependency_gate(root, registry, budget, environment, capture),
         "documentation" => run_documentation_gate(root, budget, environment, capture),
-        "correctness" => run_correctness_gate(root, budget, environment, capture),
-        "fault" => run_fault_gate(root, budget, environment, capture),
-        "integrity" => run_integrity_gate(root, budget, environment, capture),
+        "correctness" => run_correctness_gate(root, environment),
+        "fault" => run_fault_gate(root, environment),
+        "integrity" => run_integrity_gate(root, gate, options, environment, source, identity),
         "error-policy" => run_error_policy_gate(root, registry),
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
@@ -1300,108 +1363,38 @@ fn execute_gate(
 
 fn run_correctness_gate(
     root: &Path,
-    budget: Duration,
     environment: &EnvironmentSnapshot,
-    capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
-    let deadline = Instant::now() + budget;
-    let model = run_status(
-        root,
-        environment,
-        "cargo",
-        [
-            "test",
-            "--locked",
-            "--package",
-            "xtask",
-            "--bin",
-            "xtask",
-            "--",
-            "quality::tests::correctness_runner_rejects_mixed_publication_state",
-            "--exact",
-        ],
-        remaining(deadline)?,
-        capture,
-    )?;
-    verify_runner_self_test_output("correctness", &model.stdout)?;
-    Ok(format!(
-        "{}; internal:predecessor-or-successor publication-state model",
-        model.display
-    ))
+    crate::qualification_fixtures::run_correctness(root, &environment.temporary_root)
 }
 
-fn run_fault_gate(
-    root: &Path,
-    budget: Duration,
-    environment: &EnvironmentSnapshot,
-    capture: &mut GateCapture,
-) -> Result<String, XtaskError> {
-    let deadline = Instant::now() + budget;
-    let matrix = run_status(
-        root,
-        environment,
-        "cargo",
-        [
-            "test",
-            "--locked",
-            "--package",
-            "xtask",
-            "--bin",
-            "xtask",
-            "--",
-            "quality::tests::fault_runner_rejects_an_unmapped_publication_point",
-            "--exact",
-        ],
-        remaining(deadline)?,
-        capture,
-    )?;
-    verify_runner_self_test_output("fault", &matrix.stdout)?;
-    Ok(format!(
-        "{}; internal:one-to-one publication-point fault matrix",
-        matrix.display
-    ))
+fn run_fault_gate(root: &Path, environment: &EnvironmentSnapshot) -> Result<String, XtaskError> {
+    crate::qualification_fixtures::run_fault(root, &environment.temporary_root)
 }
 
 fn run_integrity_gate(
     root: &Path,
-    budget: Duration,
+    gate: &Gate,
+    options: &Options,
     environment: &EnvironmentSnapshot,
-    capture: &mut GateCapture,
+    source: &SourceIdentity,
+    identity: &EvidenceIdentity,
 ) -> Result<String, XtaskError> {
-    let deadline = Instant::now() + budget;
-    let evidence = run_status(
+    let invocation = canonical_gate_invocation(gate, options.profile, environment.digest(), &[]);
+    let integrity_identity = crate::qualification_fixtures::IntegrityIdentity {
+        revision: source.revision.clone(),
+        artifact: identity_binding_text(&identity.artifact),
+        target: identity_binding_text(&identity.target),
+        environment: environment.digest().to_owned(),
+        command: command_digest(&invocation),
+        fixtures: identity.fixture_registry_digest.clone(),
+        result: GateStatus::Passed.as_str().to_owned(),
+    };
+    crate::qualification_fixtures::run_integrity(
         root,
-        environment,
-        "cargo",
-        [
-            "test",
-            "--locked",
-            "--package",
-            "xtask",
-            "--bin",
-            "xtask",
-            "--",
-            "quality::tests::integrity_runner_rejects_corrupted_or_missing_evidence",
-            "--exact",
-        ],
-        remaining(deadline)?,
-        capture,
-    )?;
-    verify_runner_self_test_output("integrity", &evidence.stdout)?;
-    Ok(format!(
-        "{}; internal:immutable evidence integrity and restart-readability model",
-        evidence.display
-    ))
-}
-
-fn verify_runner_self_test_output(gate: &str, stdout: &str) -> Result<(), XtaskError> {
-    if stdout.contains("test result: ok. 1 passed; 0 failed;") {
-        return Ok(());
-    }
-    Err(XtaskError::invalid(
-        format!("{gate} self-test"),
-        "did not report exactly one passing test",
-    ))
+        &environment.temporary_root,
+        &integrity_identity,
+    )
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
@@ -2912,9 +2905,9 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
         "dynamic-analysis" => 2,
         "dependencies" => 3,
         "documentation" | "rust" | "test" => 2,
-        "correctness" => 1,
-        "fault" => 1,
-        "integrity" => 1,
+        "correctness" => 0,
+        "fault" => 0,
+        "integrity" => 0,
         "safety" => usize::from(registry.has_m0_04_configuration_scope()),
         "security" => 1,
         "secrets" | "supply" => {
@@ -2940,51 +2933,6 @@ fn registered_runner_command_matches(
 ) -> bool {
     let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     match runner {
-        "correctness" => {
-            program == "cargo"
-                && args
-                    == [
-                        "test",
-                        "--locked",
-                        "--package",
-                        "xtask",
-                        "--bin",
-                        "xtask",
-                        "--",
-                        "quality::tests::correctness_runner_rejects_mixed_publication_state",
-                        "--exact",
-                    ]
-        },
-        "fault" => {
-            program == "cargo"
-                && args
-                    == [
-                        "test",
-                        "--locked",
-                        "--package",
-                        "xtask",
-                        "--bin",
-                        "xtask",
-                        "--",
-                        "quality::tests::fault_runner_rejects_an_unmapped_publication_point",
-                        "--exact",
-                    ]
-        },
-        "integrity" => {
-            program == "cargo"
-                && args
-                    == [
-                        "test",
-                        "--locked",
-                        "--package",
-                        "xtask",
-                        "--bin",
-                        "xtask",
-                        "--",
-                        "quality::tests::integrity_runner_rejects_corrupted_or_missing_evidence",
-                        "--exact",
-                    ]
-        },
         "registry" => registry
             .tools
             .iter()
@@ -3201,8 +3149,8 @@ fn registered_runner_command_matches(
                 && args.first() == Some(&"+nightly-2026-07-20")
                 && args.get(1) == Some(&"llvm-cov")
         },
-        "concurrency" | "crypto" | "error-policy" | "evidence" | "matrix" | "performance"
-        | "policy" | "resource" | "soak" => false,
+        "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
+        | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => false,
         _ => false,
     }
 }
@@ -7051,16 +6999,6 @@ fn validate_evidence_identity(evidence: &Evidence) -> Result<(), XtaskError> {
             NotApplicableReason::NoCorpusSelected,
         ),
         (
-            "seed",
-            &evidence.identity.seed,
-            NotApplicableReason::NoSeedSelected,
-        ),
-        (
-            "fault_schedule",
-            &evidence.identity.fault_schedule,
-            NotApplicableReason::NoFaultScheduleSelected,
-        ),
-        (
             "approval",
             &evidence.identity.approval,
             NotApplicableReason::NoApprovalClaimed,
@@ -7077,6 +7015,35 @@ fn validate_evidence_identity(evidence: &Evidence) -> Result<(), XtaskError> {
                 format!("`{field}` must use its exact not-applicable reason"),
             ));
         }
+    }
+    let qualification_fixture_selected = evidence.gates.iter().any(|gate| {
+        matches!(
+            gate.gate_id.as_str(),
+            "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY"
+        ) && gate.result != GateStatus::NotSelected
+    });
+    match (
+        qualification_fixture_selected,
+        &evidence.identity.seed,
+        &evidence.identity.fault_schedule,
+    ) {
+        (_, IdentityBinding::Exact(seed), IdentityBinding::Exact(schedule))
+            if valid_sha256_digest(seed) && valid_sha256_digest(schedule) => {},
+        (
+            false,
+            IdentityBinding::NotApplicable(NotApplicableReason::NoSeedSelected),
+            IdentityBinding::NotApplicable(NotApplicableReason::NoFaultScheduleSelected),
+        ) => {},
+        _ => {
+            return Err(XtaskError::invalid(
+                "engineering evidence",
+                format!(
+                    "fixture-selected attempts and their recovery records require exact seed and fault-schedule digests; selected={qualification_fixture_selected}, seed={}, schedule={}",
+                    identity_binding_text(&evidence.identity.seed),
+                    identity_binding_text(&evidence.identity.fault_schedule),
+                ),
+            ));
+        },
     }
     if evidence.identity.target != IdentityBinding::exact("engineering-workspace")
         || evidence.identity.verifier != verifier_identity(&evidence.source)
@@ -7696,99 +7663,6 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum PublicationRecoveryState {
-        Predecessor,
-        Successor,
-        Mixed,
-    }
-
-    fn publication_state_is_truthful(state: PublicationRecoveryState) -> bool {
-        matches!(
-            state,
-            PublicationRecoveryState::Predecessor | PublicationRecoveryState::Successor
-        )
-    }
-
-    #[test]
-    fn correctness_runner_rejects_mixed_publication_state() {
-        assert!(publication_state_is_truthful(
-            PublicationRecoveryState::Predecessor
-        ));
-        assert!(publication_state_is_truthful(
-            PublicationRecoveryState::Successor
-        ));
-        assert!(
-            !publication_state_is_truthful(PublicationRecoveryState::Mixed),
-            "correctness evidence must reject a crash state that is neither predecessor nor successor"
-        );
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum PublicationPoint {
-        CommitRecord,
-        PublicationMarker,
-    }
-
-    fn fault_schedule_covers_each_publication_point_once(
-        publication_points: &[PublicationPoint],
-        scheduled_points: &[PublicationPoint],
-    ) -> bool {
-        publication_points.iter().all(|publication_point| {
-            scheduled_points
-                .iter()
-                .filter(|scheduled_point| scheduled_point == &publication_point)
-                .count()
-                == 1
-        }) && scheduled_points.len() == publication_points.len()
-    }
-
-    #[test]
-    fn fault_runner_rejects_an_unmapped_publication_point() {
-        let publication_points = [
-            PublicationPoint::CommitRecord,
-            PublicationPoint::PublicationMarker,
-        ];
-        assert!(fault_schedule_covers_each_publication_point_once(
-            &publication_points,
-            &publication_points,
-        ));
-        assert!(
-            !fault_schedule_covers_each_publication_point_once(
-                &publication_points,
-                &[PublicationPoint::CommitRecord],
-            ),
-            "every registered publication point must have one crash schedule"
-        );
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum RetainedEvidenceState {
-        Verified,
-        Corrupted,
-        Missing,
-    }
-
-    fn evidence_remains_readable_after_restart(state: RetainedEvidenceState) -> bool {
-        state == RetainedEvidenceState::Verified
-    }
-
-    #[test]
-    fn integrity_runner_rejects_corrupted_or_missing_evidence() {
-        assert!(evidence_remains_readable_after_restart(
-            RetainedEvidenceState::Verified
-        ));
-        for invalid in [
-            RetainedEvidenceState::Corrupted,
-            RetainedEvidenceState::Missing,
-        ] {
-            assert!(
-                !evidence_remains_readable_after_restart(invalid),
-                "corrupted or missing immutable evidence must not become valid after restart"
-            );
-        }
-    }
 
     #[test]
     fn defaults_to_the_complete_pull_request_profile() {

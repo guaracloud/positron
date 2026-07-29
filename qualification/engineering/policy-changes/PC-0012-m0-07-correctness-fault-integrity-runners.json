@@ -17,10 +17,10 @@
     "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
     "runner_changes": [
       "The active xtask tooling scope participates in risk-gate selection only through its own registered risk_gates set; no application, artifact, or deferred gate is inferred.",
-      "EG-CORRECT retains one bounded controlled state-model test that rejects mixed crash publication states and accepts only predecessor or successor recovery states.",
-      "EG-FAULT retains one bounded controlled fault-matrix test that rejects a missing publication-point schedule and requires one schedule per registered point.",
-      "EG-INTEGRITY retains one bounded controlled evidence-state test that rejects corrupted or missing retained evidence after restart.",
-      "Each selected runner command, timeout, memory declaration, stdout, stderr, verdict, command digest, and immutable raw-report binding remains validated by the existing evidence contract."
+      "EG-CORRECT directly consumes the bounded Quality Engineering fixture registry, durably writes predecessor and candidate state, injects the registered before-publication and after-publication crash schedules, reopens the published bytes, and accepts only the exact registered predecessor-or-successor oracle.",
+      "EG-FAULT matches the two instrumented publication points one-to-one with the registered schedules, executes every schedule through the same durable crash/reopen fixture, and retains every observed state in the immutable raw report.",
+      "EG-INTEGRITY persists identity-bound fixture objects, reopens the golden object, corrupts and deletes attempt-owned copies, requires digest-mismatch and missing-object failures, and proves the untouched prior object remains readable after each adversarial case.",
+      "Engineering evidence binds the quality and integrity fixture registries plus exact seed and schedule digests; the existing evidence contract continues to validate gate result, owner, registered invocation, command digest, and immutable raw-report binding."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, coordinators, timeouts, memory declarations, exception classes, targets, thresholds, and application activation ledgers.",
@@ -29,12 +29,23 @@
     ]
   },
   "detection_gained": [
-    "An active xtask scope can no longer select EG-CORRECT, EG-FAULT, or EG-INTEGRITY and receive an unsupported-runner failure instead of a retained controlled result.",
-    "A mixed publication state, a missing fault schedule, and corrupted or absent restart evidence each fail their named registered runner through the public quality seam.",
-    "A successful controlled command with malformed or zero-test self-test output fails the named gate and retains its immutable failed evidence rather than being accepted as a pass.",
+    "An active xtask scope can no longer select EG-CORRECT, EG-FAULT, or EG-INTEGRITY and receive an unsupported-runner failure instead of a retained fixture result.",
+    "A false predecessor-or-successor oracle, a malformed or oversized fixture registry, and a missing publication-point schedule fail closed through the public quality seam and retain a failed named-gate outcome.",
+    "Corrupt fixture bytes are classified as a digest mismatch, deleted fixture objects are classified as missing, and neither adversarial case can mutate or replace its prior persisted object.",
+    "The retained report records exact fixture IDs, seeds, fault schedules, reopened states, identity-field coverage, and the fixture-registry binding rather than a synthesized cargo self-test verdict.",
     "The active tooling selection regression test proves EG-CONCURRENCY, EG-CRYPTO, EG-RESOURCE, and EG-SOAK remain explicitly not selected when xtask selects only its registered gates."
   ],
   "detection_lost": [],
+  "lifecycle_test_map": {
+    "pass": "The three quality_runs_*_through_the_registered_public_seam fixtures execute the real durable detectors and inspect named-gate evidence and immutable raw reports.",
+    "fail": "The false correctness oracle, missing fault schedule, and false integrity reopen outcome fixtures each return a failed named-gate outcome through cargo xtask quality.",
+    "timeout_and_cancellation": "The M0-06 controlled-execution owner tests retain closed deadline and cancellation outcomes for every external step in the same quality attempt. These three detectors add no child process, detached task, retry, or queue; their registry and object work is synchronously bounded and no separate external timeout claim is made.",
+    "missing_tool": "The M0-06 environment snapshot and controlled launch-failure tests fail the attempt before an unavailable external detector can run. EG-CORRECT, EG-FAULT, and EG-INTEGRITY themselves use only owned Rust and filesystem operations and make no missing-tool claim.",
+    "malformed": "quality_rejects_a_malformed_correctness_fixture_registry and the existing malformed retained-evidence/raw-report tests reject malformed detector inputs and durable outputs.",
+    "stale": "quality_rejects_stale_trusted_ci_source_identity and the existing registered command, environment, registry, report-digest, and result cross-reference checks remain gate-generic and cover attempts containing these named gates.",
+    "retry": "quality_preserves_a_failed_correctness_attempt_before_a_later_pass proves a later successful detector run cannot erase or rewrite the prior failed attempt; the existing trusted-CI retry rejection remains unchanged.",
+    "resource_ceiling": "quality_rejects_a_correctness_fixture_registry_over_its_resource_ceiling proves the 16384-byte detector registry ceiling; existing M0-06 raw-report step, stream, report, path, environment, and retained-attempt ceilings remain shared."
+  },
   "representative_old_new_evidence": {
     "old": {
       "status": "failed-focused-public-regression",
@@ -44,15 +55,16 @@
     "new": {
       "status": "passed-focused-local-diagnostic",
       "commands": [
-        "cargo test --locked --package xtask --bin xtask runner_ -- --nocapture",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_ -- --nocapture"
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_correctness_through_the_registered_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation fault_ -- --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_integrity_through_the_registered_public_seam -- --exact"
       ],
-      "result": "The named state, fault, and integrity models and their three registry-selected public seams passed locally. These local results are diagnostic only."
+      "result": "The named durable state-transition, one-to-one fault schedule, and identity-bound corruption/deletion fixtures passed through their registry-selected public seams locally. These local results are diagnostic only."
     }
   },
   "compatibility_and_recovery": {
-    "compatibility": "The cargo xtask quality command and evidence schema remain unchanged. Correctness, fault, and integrity reports use the existing immutable selected-gate raw-report contract.",
-    "recovery": "Correct the failing model or controlled command and create a new quality attempt. Retain every failed attempt and its raw report; do not overwrite or reclassify earlier evidence."
+    "compatibility": "The cargo xtask quality command and evidence schema remain unchanged. Correctness, fault, and integrity reports use the existing immutable selected-gate raw-report contract; exact seed and fault-schedule identity bindings are populated only when these fixture gates are selected.",
+    "recovery": "Correct the failing registered fixture, instrumentation mapping, or persisted-object behavior and create a new quality attempt. Retain every failed attempt and its raw report; do not overwrite or reclassify earlier evidence."
   },
   "approvals_required": [
     "Architecture",
