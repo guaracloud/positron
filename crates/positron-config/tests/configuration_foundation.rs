@@ -4,8 +4,8 @@ use std::error::Error;
 
 use positron_config::{
     CommandLineOverrides, ConfigurationFailure, ConfigurationFailureCode, ConfigurationInputs,
-    ConfigurationPlan, EnvironmentOverrides, LogLevel, Setting, SettingSource, ValueDomain,
-    generated_json_schema, generated_reference, resolve, setting_definition,
+    ConfigurationPlan, EnvironmentOverrides, FailureSource, LogLevel, Setting, SettingSource,
+    ValueDomain, generated_json_schema, generated_reference, resolve, setting_definition,
 };
 
 #[test]
@@ -50,14 +50,7 @@ fn resolves_non_secret_settings_in_deterministic_source_precedence_order()
 }
 
 #[test]
-fn rejects_unknown_secret_and_unsafe_configuration_without_echoing_values() {
-    let unknown =
-        inputs(Some("schema_version = 1\n[unknown]\nvalue = 1\n"), [], []).and_then(resolve);
-    assert!(matches!(
-        unknown,
-        Err(error) if error.code() == ConfigurationFailureCode::UnknownSetting
-    ));
-
+fn rejects_secret_and_unsafe_configuration_without_echoing_values() {
     let secret_override = inputs(
         None,
         [("POSITRON__SECURITY__LOCAL_KEY_FILE", "/private/secret")],
@@ -84,6 +77,45 @@ fn rejects_unknown_secret_and_unsafe_configuration_without_echoing_values() {
         unsafe_roots,
         Err(error) if error.code() == ConfigurationFailureCode::UnsafeCombination
     ));
+}
+
+#[test]
+fn rejects_empty_unknown_root_table_before_iterating_children() {
+    let result = inputs(Some("schema_version = 1\n[unknown]\n"), [], []).and_then(resolve);
+
+    assert!(matches!(
+        result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ConfigurationDocument
+    ));
+}
+
+#[test]
+fn rejects_nonempty_unknown_root_table() {
+    let result =
+        inputs(Some("schema_version = 1\n[unknown]\nvalue = 1\n"), [], []).and_then(resolve);
+
+    assert!(matches!(
+        result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ConfigurationDocument
+    ));
+}
+
+#[test]
+fn accepts_known_empty_root_tables_without_changing_default_values()
+-> Result<(), ConfigurationFailure> {
+    let default_reference = inputs(None, [], []).and_then(resolve)?.redacted_reference();
+
+    for section in ["diagnostics", "runtime", "listener", "storage", "security"] {
+        let document = format!("schema_version = 1\n[{section}]\n");
+        let effective = inputs(Some(&document), [], []).and_then(resolve)?;
+
+        assert_eq!(effective.redacted_reference(), default_reference);
+    }
+    Ok(())
 }
 
 #[test]

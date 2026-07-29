@@ -297,6 +297,18 @@
       "result": "EG-TEST reached all intended fixture assertions except the one that rebuilds xtask from the reconstructed source. That test correctly rejected the copied modern lockfile after TOML was removed from the historical manifest. The fixture must generate its dependency-free lockfile offline before invoking Cargo with --locked."
     },
     {
+      "id": "empty-unknown-root-table-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation rejects_empty_unknown_root_table_before_iterating_children",
+      "result": "The public resolve boundary silently accepted an empty unknown root table because setting validation occurred only while iterating child keys."
+    },
+    {
+      "id": "root-table-validation-green",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation",
+      "result": "All 13 public configuration tests passed. Empty and nonempty unknown root tables return UnknownSetting from ConfigurationDocument, while every canonical empty root table remains accepted with unchanged default values."
+    },
+    {
       "id": "trusted-exact-head-coverage-and-mutation",
       "status": "pending-external-execution",
       "command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
@@ -309,6 +321,7 @@
     "Raw environment, command-line, and file input wrappers cannot reveal secret canaries through Debug, Display, errors, provenance, effective references, or generated references.",
     "One Rust-owned seven-setting definition contains path, type, default, value domain, secrecy, provenance, and mutability; runtime resolution and deterministic JSON Schema/reference generation consume it.",
     "The generated schema carries the same loopback-only listener constraint enforced by runtime validation.",
+    "Every root TOML table name is checked against the Rust-owned canonical setting definitions before child iteration, so an empty unknown table cannot bypass UnknownSetting while known empty tables preserve their default-valued behavior.",
     "TM-0001-m0-04-toml-parser and the activated EG-SAFETY and EG-SECURITY selectors fail closed on parser-resource or security-review drift and execute the mapped adversarial tests.",
     "EG-MATRIX fails when either generated configuration artifact differs from deterministic regeneration.",
     "The authoritative EXT runner owns the registered M0-04 coverage report, 90 percent line and region floors, and the explicit exact-owner focused mutation campaign.",

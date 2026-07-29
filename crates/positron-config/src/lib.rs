@@ -1054,15 +1054,18 @@ fn apply_toml(candidate: &mut Candidate, file: &str) -> Result<(), Configuration
     };
     apply_toml_value(candidate, Setting::SchemaVersion, schema_version)?;
 
+    for section in table.keys().filter(|section| *section != "schema_version") {
+        if !is_known_toml_section(section) {
+            return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
+        }
+    }
+
     for (section, value) in &table {
         if section == "schema_version" {
             continue;
         }
         let toml::Value::Table(settings) = value else {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::UnknownSetting,
-                FailureSource::ConfigurationDocument,
-            ));
+            return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
         };
         for (key, setting_value) in settings {
             let mut path = String::with_capacity(section.len() + key.len() + 1);
@@ -1079,6 +1082,13 @@ fn apply_toml(candidate: &mut Candidate, file: &str) -> Result<(), Configuration
         }
     }
     Ok(())
+}
+
+fn is_known_toml_section(section: &str) -> bool {
+    contract::SETTING_DEFINITIONS
+        .iter()
+        .filter_map(|definition| definition.path().split_once('.'))
+        .any(|(known_section, _)| known_section == section)
 }
 
 fn apply_toml_value(
