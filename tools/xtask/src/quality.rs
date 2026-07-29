@@ -79,7 +79,7 @@ const M0_02_MUTATION_SELECTOR: &str = concat!(
 );
 const M0_02_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-02-domain-final-post-lint";
 const M0_03_MUTATION_SELECTOR: &str = concat!(
-    "ApiVersion::major|Capability::wire_value|Capability::from_wire|",
+    "Capability::wire_value|Capability::from_wire|",
     "SchemaDigest::canonical|SchemaDigest::as_str|",
     "ApiError::unsupported_api_version|ApiError::capability_unavailable|",
     "ApiError::capability_unsupported|ApiError::malformed|ApiError::too_large|",
@@ -3354,6 +3354,7 @@ mod tests {
         for owner in [
             "Capability::from_wire",
             "ApiError::unsupported_api_version",
+            "CapabilityRequest::for_version",
             "CapabilityResponse::api_major",
             "CapabilityService::negotiate",
             "CapabilityService::decode_and_negotiate",
@@ -3366,6 +3367,10 @@ mod tests {
                 "focused M0-03 mutation selection omitted public owner `{owner}`"
             );
         }
+        assert!(
+            !selected.contains("ApiVersion::major"),
+            "the closed v1 discriminant must not retain an equivalent accessor mutation target"
+        );
         let generated = generated_rust_owner_names(include_str!(
             "../../../crates/positron-api/src/generated.rs"
         ));

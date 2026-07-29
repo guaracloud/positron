@@ -11,7 +11,7 @@ use std::hint::black_box;
 fn v1_capability_statement_is_typed_and_bound_to_the_canonical_schema() {
     let response = CapabilityService::negotiate(CapabilityRequest::for_version(ApiVersion::V1));
 
-    assert_eq!(ApiVersion::V1.major(), 1);
+    assert_eq!(ApiVersion::V1 as u32, 1);
     assert_eq!(response.availability(), CapabilityAvailability::Implemented);
     assert_eq!(response.api_major(), ApiVersion::V1);
     assert_eq!(response.schema_digest(), SchemaDigest::canonical());
@@ -369,6 +369,127 @@ fn maximum_api_major_round_trips_to_an_explicit_version_refusal() -> Result<(), 
     assert_eq!(
         response.refusal().map(|error| error.code()),
         Some(ApiErrorCode::UnsupportedApiVersion)
+    );
+    Ok(())
+}
+
+#[test]
+fn grpc_u32_varint_encoding_is_bounded_and_round_trips() -> Result<(), std::io::Error> {
+    for (api_major, expected_body, expected_availability, expected_refusal) in [
+        (
+            0,
+            &[0x08, 0x00, 0x10, 0x01][..],
+            CapabilityAvailability::VersionIncompatible,
+            Some(ApiErrorCode::UnsupportedApiVersion),
+        ),
+        (
+            1,
+            &[0x08, 0x01, 0x10, 0x01][..],
+            CapabilityAvailability::Implemented,
+            None,
+        ),
+        (
+            127,
+            &[0x08, 0x7f, 0x10, 0x01][..],
+            CapabilityAvailability::VersionIncompatible,
+            Some(ApiErrorCode::UnsupportedApiVersion),
+        ),
+        (
+            128,
+            &[0x08, 0x80, 0x01, 0x10, 0x01][..],
+            CapabilityAvailability::VersionIncompatible,
+            Some(ApiErrorCode::UnsupportedApiVersion),
+        ),
+        (
+            u32::MAX,
+            &[0x08, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x10, 0x01][..],
+            CapabilityAvailability::VersionIncompatible,
+            Some(ApiErrorCode::UnsupportedApiVersion),
+        ),
+    ] {
+        let request = CapabilityRequest::unknown(api_major, Capability::CanonicalPublicInterface);
+        let encoded = CapabilityClient::encode(request, Transport::GrpcProtobuf);
+        let response =
+            CapabilityService::decode_and_negotiate(Transport::GrpcProtobuf, encoded.as_bytes())
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+
+        assert_eq!(encoded.as_bytes(), expected_body);
+        assert!(encoded.as_bytes().len() <= MAX_PUBLIC_REQUEST_BYTES);
+        assert_eq!(response.availability(), expected_availability);
+        assert_eq!(response.api_major(), ApiVersion::V1);
+        assert_eq!(response.schema_digest(), SchemaDigest::canonical());
+        assert_eq!(
+            response.refusal().map(|error| error.code()),
+            expected_refusal
+        );
+        assert_eq!(
+            response.refusal().map(|error| error.retry_class()),
+            expected_refusal.map(|_| RetryClass::Never)
+        );
+        assert_eq!(
+            response.refusal().map(|error| error.completion_state()),
+            expected_refusal.map(|_| CompletionState::Rejected)
+        );
+        assert_eq!(
+            response.refusal().map(|error| error.source()),
+            expected_refusal.map(|_| ApiFailureSource::CapabilityNegotiation)
+        );
+        assert_eq!(
+            response.refusal().map(|error| error.safe_detail()),
+            expected_refusal.map(|_| SafeDetail::ApiMajorUnsupported)
+        );
+        assert_eq!(response.deprecation(), DeprecationState::Current);
+        assert_eq!(response.capability(), Capability::CanonicalPublicInterface);
+    }
+    Ok(())
+}
+
+#[test]
+fn multi_byte_grpc_values_preserve_high_order_chunks() -> Result<(), std::io::Error> {
+    let version_response = CapabilityService::decode_and_negotiate(
+        Transport::GrpcProtobuf,
+        &[0x08, 0x81, 0x01, 0x10, 0x01],
+    )
+    .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    let refusal = version_response.refusal().ok_or_else(|| {
+        std::io::Error::other("multi-byte unsupported API major returned no refusal")
+    })?;
+
+    assert_eq!(
+        version_response.availability(),
+        CapabilityAvailability::VersionIncompatible
+    );
+    assert_eq!(version_response.api_major(), ApiVersion::V1);
+    assert_eq!(version_response.schema_digest(), SchemaDigest::canonical());
+    assert_eq!(version_response.deprecation(), DeprecationState::Current);
+    assert_eq!(
+        version_response.capability(),
+        Capability::CanonicalPublicInterface
+    );
+    assert_eq!(refusal.code(), ApiErrorCode::UnsupportedApiVersion);
+    assert_eq!(refusal.retry_class(), RetryClass::Never);
+    assert_eq!(refusal.completion_state(), CompletionState::Rejected);
+    assert_eq!(refusal.source(), ApiFailureSource::CapabilityNegotiation);
+    assert_eq!(refusal.safe_detail(), SafeDetail::ApiMajorUnsupported);
+
+    let capability_error = CapabilityService::decode_and_negotiate(
+        Transport::GrpcProtobuf,
+        &[0x08, 0x01, 0x10, 0x81, 0x01],
+    )
+    .err()
+    .ok_or_else(|| {
+        std::io::Error::other("multi-byte unknown capability negotiated successfully")
+    })?;
+    assert_eq!(capability_error.code(), ApiErrorCode::CapabilityUnsupported);
+    assert_eq!(capability_error.retry_class(), RetryClass::Never);
+    assert_eq!(
+        capability_error.completion_state(),
+        CompletionState::Rejected
+    );
+    assert_eq!(capability_error.source(), ApiFailureSource::GrpcDecode);
+    assert_eq!(
+        capability_error.safe_detail(),
+        SafeDetail::CapabilityNotSupported
     );
     Ok(())
 }

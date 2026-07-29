@@ -177,6 +177,20 @@
         "cargo clippy --locked --package xtask --all-targets -- -D warnings"
       ],
       "result": "Eleven generator tests, nineteen public-interface tests, and the exact-owner selector regression passed. Every generated enum value, capability outcome, transport ordering, unknown capability, malformed grammar, exact body boundary, safe failure context, and typed encoding bound is exercised through public behavior. Typed encoding is infallible under the bounded generated model, impossible private encoder failures were removed, and two consecutive generations were byte-identical. No local coverage or mutation campaign was run."
+    },
+    {
+      "id": "trusted-ci-extended-30412989230",
+      "status": "failed-trusted-ci",
+      "source_revision": "5d0fe2a6e4e195e9105b540498a585c7bb5c9771",
+      "workflow_run_id": 30412989230,
+      "workflow_attempt": 1,
+      "artifact_id": 8709357587,
+      "artifact_name": "extended-evidence-30412989230-1-5d0fe2a6e4e195e9105b540498a585c7bb5c9771",
+      "artifact_digest": "sha256:8892607dd8d10df7c13eeb0502583b3aa8b140767cc9250f33d16aa3bce194b0",
+      "evidence_attempt_id": "1785287818503-5d0fe2a6e4e1-29039",
+      "coverage_report": "target/quality/coverage/m0-03-api.json",
+      "mutation_report": "target/quality/mutation/m0-03-api-final/mutants.out/outcomes.json",
+      "result": "EG-COVERAGE failed after the canonical API reached 100 percent branch, function, line, and region coverage. The retained mutation campaign selected 88 mutants: 50 caught, 34 unviable, 3 missed, and 1 timed out. The missed outcomes were the semantic-equivalent closed-v1 ApiVersion::major return, an algebraically equivalent encode_varint bitwise-OR replacement, and a decode_varint right-shift replacement not distinguished by the public multi-byte cases. Mutating encode_varint termination from equality to inequality timed out. This exact trusted-CI failure remains immutable and is not merge-eligible."
     }
   ],
   "detection_gained": [
