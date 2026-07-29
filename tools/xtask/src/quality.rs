@@ -96,6 +96,20 @@ const M0_03_MUTATION_SELECTOR: &str = concat!(
     "encode_varint|decode_grpc|decode_varint|decode_http|parse_json_u32",
 );
 const M0_03_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-03-api-final";
+const M0_04_MUTATION_SELECTOR: &str = concat!(
+    "LogLevel::parse|ProtectedFileReference::parse|",
+    "EnvironmentOverrides::try_from_pairs|CommandLineOverrides::try_from_pairs|",
+    "ConfigurationInputs::try_new|EffectiveConfiguration::redacted_reference|",
+    "EffectiveConfiguration::plan_update|EffectiveConfiguration::setting_differs|",
+    "ConfigurationPlan::from_changes|resolve|Candidate::defaults|Candidate::apply|",
+    "Candidate::validate|collect_pairs|preflight_toml|content_before_comment|",
+    "preflight_table_header|unquoted_equals|preflight_key|preflight_scalar|environment_path|",
+    "apply_toml|",
+    "apply_toml_value|apply_environment|apply_command_line|parse_schema_version|",
+    "parse_shutdown_grace_seconds|parse_canonical_u16|parse_loopback_address|checked_path|validate_path",
+);
+const M0_04_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-04-config-final";
+const M0_04_COVERAGE_FLOOR: f64 = 90.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoverageTarget {
@@ -210,6 +224,7 @@ pub(crate) struct Options {
     profile: Profile,
     retain_m0_02_mutation: bool,
     retain_m0_03_mutation: bool,
+    retain_m0_04_mutation: bool,
 }
 
 impl Options {
@@ -217,6 +232,7 @@ impl Options {
         let mut profile = Profile::Pr;
         let mut retain_m0_02_mutation = false;
         let mut retain_m0_03_mutation = false;
+        let mut retain_m0_04_mutation = false;
         let mut arguments = arguments.peekable();
         while let Some(argument) = arguments.next() {
             if argument == "--profile" {
@@ -230,6 +246,8 @@ impl Options {
                 retain_m0_02_mutation = true;
             } else if argument == "--retain-m0-03-mutation" {
                 retain_m0_03_mutation = true;
+            } else if argument == "--retain-m0-04-mutation" {
+                retain_m0_04_mutation = true;
             } else {
                 return Err(XtaskError::usage(format!(
                     "unexpected quality argument `{argument}`"
@@ -246,7 +264,21 @@ impl Options {
                 "`--retain-m0-03-mutation` requires `--profile ext`".to_owned(),
             ));
         }
-        if retain_m0_02_mutation && retain_m0_03_mutation {
+        if retain_m0_04_mutation && profile != Profile::Ext {
+            return Err(XtaskError::usage(
+                "`--retain-m0-04-mutation` requires `--profile ext`".to_owned(),
+            ));
+        }
+        if [
+            retain_m0_02_mutation,
+            retain_m0_03_mutation,
+            retain_m0_04_mutation,
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count()
+            > 1
+        {
             return Err(XtaskError::usage(
                 "select exactly one retained focused mutation campaign per EXT attempt".to_owned(),
             ));
@@ -255,6 +287,7 @@ impl Options {
             profile,
             retain_m0_02_mutation,
             retain_m0_03_mutation,
+            retain_m0_04_mutation,
         })
     }
 }
@@ -609,14 +642,7 @@ fn execute_gate(
         "registry" => run_registry_gate(root, registry, options.profile, budget, environment),
         "architecture" => run_architecture_gate(root, registry, budget, environment),
         "build" => run_build_gate(root, options.profile, budget, environment),
-        "coverage" => run_coverage_gate(
-            root,
-            registry,
-            budget,
-            options.retain_m0_02_mutation,
-            options.retain_m0_03_mutation,
-            environment,
-        ),
+        "coverage" => run_coverage_gate(root, registry, budget, options, environment),
         "dynamic-analysis" => run_dynamic_analysis_gate(root, registry, budget, environment),
         "dependencies" => run_dependency_gate(root, registry, budget, environment),
         "documentation" => run_documentation_gate(root, budget, environment),
@@ -624,11 +650,12 @@ fn execute_gate(
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
         "rust" => run_rust_gate(root, budget, environment),
-        "safety" => run_safety_gate(root, registry),
+        "safety" => run_safety_gate(root, registry, budget, environment),
+        "security" => run_security_gate(root, registry, budget, environment),
         "secrets" => run_secret_gate(root, options.profile, budget, environment),
         "supply" => run_supply_gate(root, registry, options.profile, budget, environment),
         "test" => run_test_gate(root, budget, environment),
-        "matrix" => run_canonical_api_matrix_gate(root),
+        "matrix" => run_generation_matrix_gate(root),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
             "an active risk scope selected a gate whose executable harness has not been implemented",
@@ -636,11 +663,13 @@ fn execute_gate(
     }
 }
 
-fn run_canonical_api_matrix_gate(root: &Path) -> Result<String, XtaskError> {
-    const ARTIFACTS: [&str; 4] = [
+fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
+    const ARTIFACTS: [&str; 6] = [
         "api/positron/v1/http.json",
         "api/positron/v1/openapi.json",
         "api/positron/v1/schema.sha256",
+        "configuration/reference.md",
+        "configuration/schema.json",
         "crates/positron-api/src/generated.rs",
     ];
     let before = ARTIFACTS
@@ -657,6 +686,7 @@ fn run_canonical_api_matrix_gate(root: &Path) -> Result<String, XtaskError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     crate::api_generation::generate(root)?;
+    crate::config_generation::generate(root)?;
     for (path, contents) in before {
         let regenerated = fs::read(&path).map_err(|source| {
             XtaskError::io(format!("read regenerated {}", path.display()), source)
@@ -664,11 +694,11 @@ fn run_canonical_api_matrix_gate(root: &Path) -> Result<String, XtaskError> {
         if regenerated != contents {
             return Err(XtaskError::invalid_path(
                 &path,
-                "canonical API generation is not clean and deterministic",
+                "canonical generation is not clean and deterministic",
             ));
         }
     }
-    Ok("canonical API generation parity is clean across Rust, HTTP/JSON, OpenAPI, and Schema Digest".to_owned())
+    Ok("canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, and Schema Digest".to_owned())
 }
 
 fn run_dynamic_analysis_gate(
@@ -717,8 +747,7 @@ fn run_coverage_gate(
     root: &Path,
     registry: &Registry,
     budget: Duration,
-    retain_m0_02_mutation: bool,
-    retain_m0_03_mutation: bool,
+    options: &Options,
     environment: &EnvironmentSnapshot,
 ) -> Result<String, XtaskError> {
     let deadline = Instant::now() + budget;
@@ -747,11 +776,21 @@ fn run_coverage_gate(
             environment,
         )?);
     }
-    if retain_m0_02_mutation {
+    if registry.has_m0_04_configuration_scope() {
+        results.push(run_m0_04_configuration_coverage(
+            root,
+            deadline,
+            environment,
+        )?);
+    }
+    if options.retain_m0_02_mutation {
         results.push(run_m0_02_mutation(root, registry, deadline, environment)?);
     }
-    if retain_m0_03_mutation {
+    if options.retain_m0_03_mutation {
         results.push(run_m0_03_mutation(root, registry, deadline, environment)?);
+    }
+    if options.retain_m0_04_mutation {
+        results.push(run_m0_04_mutation(root, registry, deadline, environment)?);
     }
     if results.is_empty() {
         return Err(XtaskError::invalid(
@@ -916,6 +955,83 @@ fn run_m0_03_mutation(
     ))
 }
 
+fn run_m0_04_mutation(
+    root: &Path,
+    registry: &Registry,
+    deadline: Instant,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    if !registry.has_m0_04_configuration_scope() {
+        return Err(XtaskError::invalid(
+            "M0-04 mutation runner",
+            "the retained M0-04 mutation campaign requires the active Configuration scope",
+        ));
+    }
+    let tool = registry
+        .tools
+        .iter()
+        .find(|tool| tool.id == "cargo-mutants")
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "M0-04 mutation detector registry",
+                "missing required detector `cargo-mutants`",
+            )
+        })?;
+    let version = run_capture(
+        root,
+        environment,
+        &tool.command,
+        tool.version_arguments.iter().map(String::as_str),
+        remaining(deadline)?,
+        &[],
+    )?;
+    if !version.stdout.contains(&tool.version) {
+        return Err(XtaskError::invalid(
+            "M0-04 mutation detector `cargo-mutants`",
+            format!(
+                "expected version `{}`, command reported `{}`",
+                tool.version,
+                one_line(&version.stdout)
+            ),
+        ));
+    }
+    let output = root.join(M0_04_MUTATION_OUTPUT);
+    fs::create_dir_all(&output)
+        .map_err(|source| XtaskError::io(format!("create {}", output.display()), source))?;
+    let outcome = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "mutants",
+            "--no-config",
+            "--package",
+            "positron-config",
+            "--re",
+            M0_04_MUTATION_SELECTOR,
+            "--test-tool",
+            "cargo",
+            "--output",
+            M0_04_MUTATION_OUTPUT,
+            "--timeout",
+            "30",
+            "--jobs",
+            "1",
+            "--no-times",
+            "--",
+            "--locked",
+            "--test",
+            "configuration_foundation",
+        ],
+        remaining(deadline)?,
+        &[],
+    )?;
+    Ok(format!(
+        "cargo-mutants={}; {}",
+        tool.version, outcome.display
+    ))
+}
+
 fn run_m0_01_coverage(
     root: &Path,
     registry: &Registry,
@@ -1030,6 +1146,52 @@ fn run_m0_03_canonical_api_coverage(
     enforce_m0_03_canonical_api_coverage_baselines(registry, &measurements)?;
     Ok(format!(
         "M0-03 canonical API: {}; total(branch={:.2}, line={:.2}, region={:.2})",
+        outcome.display, measurements.branch, measurements.line, measurements.region,
+    ))
+}
+
+fn run_m0_04_configuration_coverage(
+    root: &Path,
+    deadline: Instant,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    let report = "target/quality/coverage/m0-04-config.json";
+    let outcome = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "+nightly-2026-07-20",
+            "llvm-cov",
+            "--locked",
+            "--package",
+            "positron-config",
+            "--test",
+            "configuration_foundation",
+            "--branch",
+            "--json",
+            "--summary-only",
+            "--ignore-filename-regex",
+            "crates/positron-config/tests/.*",
+            "--output-path",
+            report,
+        ],
+        remaining(deadline)?,
+        &[],
+    )?;
+    let measurements = read_coverage_measurements(&root.join(report))?;
+    for (actual, label) in [(measurements.line, "line"), (measurements.region, "region")] {
+        if actual < M0_04_COVERAGE_FLOOR {
+            return Err(XtaskError::invalid(
+                "M0-04 coverage floor",
+                format!(
+                    "Configuration coverage {label} {actual:.2} is below the candidate floor {M0_04_COVERAGE_FLOOR:.2}"
+                ),
+            ));
+        }
+    }
+    Ok(format!(
+        "M0-04 Configuration: {}; total(branch={:.2}, line={:.2}, region={:.2})",
         outcome.display, measurements.branch, measurements.line, measurements.region,
     ))
 }
@@ -1744,6 +1906,14 @@ fn validate_coverage_workflow_provisioning(root: &Path) -> Result<(), XtaskError
             ),
         ));
     }
+    if !content.contains("cargo xtask quality --profile ext --retain-m0-04-mutation") {
+        return Err(XtaskError::invalid_path(
+            &path,
+            format!(
+                "coverage-selected workflow `{relative}` is missing the authoritative retained M0-04 mutation selection"
+            ),
+        ));
+    }
     if !content
         .lines()
         .any(|line| line.trim() == "path: target/quality/")
@@ -1790,7 +1960,12 @@ fn run_rust_gate(
     Ok(format!("{} | {}", format.display, clippy.display))
 }
 
-fn run_safety_gate(root: &Path, registry: &Registry) -> Result<String, XtaskError> {
+fn run_safety_gate(
+    root: &Path,
+    registry: &Registry,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     for scope in &registry.scopes {
         let source_root = root.join(&scope.path).join("src");
         let mut sources = Vec::new();
@@ -1838,7 +2013,95 @@ fn run_safety_gate(root: &Path, registry: &Registry) -> Result<String, XtaskErro
             ),
         ],
     )?;
-    Ok("internal:forbid-unsafe-and-unbounded-source-policy scan".to_owned())
+    let mut evidence = vec!["internal:forbid-unsafe-and-unbounded-source-policy scan".to_owned()];
+    if registry.has_m0_04_configuration_scope() {
+        evidence
+            .push(run_configuration_parser_adversarial_tests(root, budget, environment)?.display);
+    }
+    Ok(evidence.join(" | "))
+}
+
+fn run_security_gate(
+    root: &Path,
+    registry: &Registry,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    if !registry.has_m0_04_configuration_scope() {
+        return Err(XtaskError::invalid(
+            "security gate",
+            "EG-SECURITY was selected without an applicable active boundary",
+        ));
+    }
+    let path = root.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json");
+    let threat_model = fs::read_to_string(&path)
+        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    validate_configuration_parser_threat_model_text(&threat_model)?;
+    let adversarial = run_configuration_parser_adversarial_tests(root, budget, environment)?;
+    Ok(format!(
+        "internal:versioned-parser-threat-model-and-pending-security-owner-review validation | {}",
+        adversarial.display
+    ))
+}
+
+fn run_configuration_parser_adversarial_tests(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<CommandOutcome, XtaskError> {
+    run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "positron-config",
+            "--test",
+            "configuration_foundation",
+            "preflight_",
+        ],
+        budget,
+        &[],
+    )
+}
+
+fn validate_configuration_parser_threat_model_text(content: &str) -> Result<(), XtaskError> {
+    if !content.trim_start().starts_with('{') || !content.trim_end().ends_with('}') {
+        return Err(XtaskError::invalid(
+            "M0-04 parser threat model",
+            "versioned threat-model record is not a complete JSON object",
+        ));
+    }
+    for required in [
+        "\"schema_version\": 1",
+        "\"id\": \"TM-0001-m0-04-toml-parser\"",
+        "\"version\": 1",
+        "\"status\": \"proposed-for-security-owner-review\"",
+        "\"security_owner\": \"Security and Key Management\"",
+        "\"maximum_document_bytes\": 16384",
+        "\"maximum_table_depth\": 1",
+        "\"maximum_entries_including_table_headers\": 16",
+        "\"maximum_key_bytes\": 64",
+        "\"maximum_scalar_token_bytes\": 256",
+        "\"failure\": \"ResourceLimit before toml::Table allocation\"",
+        "\"failure\": \"Malformed before publication; standard TOML parser remains final syntax authority\"",
+        "\"command\": \"cargo test --locked --package positron-config --test configuration_foundation preflight_\"",
+        "\"required\": \"Security and Key Management\"",
+        "\"status\": \"pending-independent-review\"",
+        "\"reviewer\": \"\"",
+        "\"reviewed_revision\": \"\"",
+        "\"reviewed_at\": \"\"",
+    ] {
+        if !content.contains(required) {
+            return Err(XtaskError::invalid(
+                "M0-04 parser threat model",
+                format!("required fail-closed field is missing or drifted: `{required}`"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run_secret_gate(
@@ -3243,13 +3506,19 @@ fn one_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::error::Error;
     use std::ffi::OsString;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         EnvironmentSnapshot, ExecutionTools, M0_02_MUTATION_SELECTOR, M0_03_MUTATION_SELECTOR,
-        Options, Profile, json_string,
+        M0_04_MUTATION_SELECTOR, Options, Profile, json_string, run_generation_matrix_gate,
+        validate_configuration_parser_threat_model_text,
     };
+
+    type TestResult = Result<(), Box<dyn Error>>;
 
     #[test]
     fn defaults_to_the_complete_pull_request_profile() {
@@ -3261,6 +3530,7 @@ mod tests {
                     profile: Profile::Pr,
                     retain_m0_02_mutation: false,
                     retain_m0_03_mutation: false,
+                    retain_m0_04_mutation: false,
                 })
             ),
             "quality must default to the authoritative PR profile"
@@ -3281,6 +3551,7 @@ mod tests {
                     profile: Profile::Ext,
                     retain_m0_02_mutation: true,
                     retain_m0_03_mutation: false,
+                    retain_m0_04_mutation: false,
                 })
             ),
             "the explicit retained mutation campaign must be accepted only as an EXT option"
@@ -3311,6 +3582,7 @@ mod tests {
                     profile: Profile::Ext,
                     retain_m0_02_mutation: false,
                     retain_m0_03_mutation: true,
+                    retain_m0_04_mutation: false,
                 })
             ),
             "the explicit M0-03 mutation campaign must be accepted only as an EXT option"
@@ -3324,6 +3596,37 @@ mod tests {
         assert!(
             rejected.is_err(),
             "routine PR quality must not select the M0-03 mutation campaign"
+        );
+    }
+
+    #[test]
+    fn retained_m0_04_mutation_requires_the_extended_profile() {
+        let options = Options::parse(
+            ["--profile", "ext", "--retain-m0-04-mutation"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(
+            matches!(
+                options,
+                Ok(Options {
+                    profile: Profile::Ext,
+                    retain_m0_02_mutation: false,
+                    retain_m0_03_mutation: false,
+                    retain_m0_04_mutation: true,
+                })
+            ),
+            "the explicit M0-04 mutation campaign must be accepted only as an EXT option"
+        );
+
+        let rejected = Options::parse(
+            ["--profile", "pr", "--retain-m0-04-mutation"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(
+            rejected.is_err(),
+            "routine PR quality must not select the M0-04 mutation campaign"
         );
     }
 
@@ -3395,6 +3698,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn focused_m0_04_mutation_selection_covers_configuration_invariant_owners() {
+        let selected = M0_04_MUTATION_SELECTOR.split('|').collect::<BTreeSet<_>>();
+        for owner in [
+            "EnvironmentOverrides::try_from_pairs",
+            "CommandLineOverrides::try_from_pairs",
+            "ConfigurationInputs::try_new",
+            "EffectiveConfiguration::redacted_reference",
+            "EffectiveConfiguration::plan_update",
+            "ConfigurationPlan::from_changes",
+            "resolve",
+            "Candidate::apply",
+            "Candidate::validate",
+            "preflight_toml",
+            "preflight_table_header",
+            "preflight_scalar",
+            "apply_toml",
+            "apply_toml_value",
+            "apply_environment",
+            "apply_command_line",
+            "parse_schema_version",
+            "parse_loopback_address",
+            "validate_path",
+        ] {
+            assert!(
+                selected.contains(owner),
+                "focused M0-04 mutation selection omitted Configuration owner `{owner}`"
+            );
+        }
+        let owners =
+            generated_rust_owner_names(include_str!("../../../crates/positron-config/src/lib.rs"));
+        let stale = selected
+            .iter()
+            .filter(|owner| !owners.contains(**owner))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            stale.is_empty(),
+            "focused M0-04 mutation selection contains stale or nonexistent owners: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn generation_matrix_rejects_configuration_artifact_drift() -> TestResult {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "positron-generation-matrix-{}-{timestamp}",
+            std::process::id()
+        ));
+        for relative in [
+            "api/positron/v1/positron.proto",
+            "api/positron/v1/http.json",
+            "api/positron/v1/openapi.json",
+            "api/positron/v1/schema.sha256",
+            "configuration/reference.md",
+            "configuration/schema.json",
+            "crates/positron-api/src/generated.rs",
+            "crates/positron-config/src/contract.rs",
+        ] {
+            let destination = fixture.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(repository.join(relative), destination)?;
+        }
+
+        let result = (|| {
+            run_generation_matrix_gate(&fixture)?;
+            fs::write(fixture.join("configuration/schema.json"), b"drift\n")?;
+            let drift = run_generation_matrix_gate(&fixture);
+            assert!(
+                drift.is_err(),
+                "EG-MATRIX must reject a checked configuration artifact that differs from regeneration"
+            );
+            Ok(())
+        })();
+        fs::remove_dir_all(&fixture)?;
+        result
+    }
+
+    #[test]
+    fn configuration_parser_threat_model_fails_closed_on_limit_or_review_drift() -> TestResult {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let threat_model = fs::read_to_string(
+            repository.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json"),
+        )?;
+        validate_configuration_parser_threat_model_text(&threat_model)?;
+        for drifted in [
+            threat_model.replace(
+                "\"maximum_document_bytes\": 16384",
+                "\"maximum_document_bytes\": 16385",
+            ),
+            threat_model.replace(
+                "\"reviewer\": \"\"",
+                "\"reviewer\": \"implementation-author\"",
+            ),
+        ] {
+            assert!(
+                validate_configuration_parser_threat_model_text(&drifted).is_err(),
+                "the M0-04 parser threat model must reject limit or owner-review drift"
+            );
+        }
+        Ok(())
+    }
+
     fn generated_rust_owner_names(source: &str) -> BTreeSet<String> {
         let mut owners = BTreeSet::new();
         let mut implementation = None;
@@ -3434,6 +3843,7 @@ mod tests {
         line.split_once("fn ")
             .and_then(|(_, suffix)| suffix.split_once('('))
             .map(|(name, _)| name.trim())
+            .map(|name| name.split_once('<').map_or(name, |(plain, _)| plain))
             .filter(|name| !name.is_empty())
     }
 

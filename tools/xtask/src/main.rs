@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod api_generation;
+mod config_generation;
 mod controlled_execution;
 mod error;
 mod hooks;
@@ -42,6 +43,12 @@ fn run() -> Result<(), XtaskError> {
                 .map_err(|source| XtaskError::io("resolve current directory", source))?;
             api_generation::generate(&root)
         },
+        "generate-config" => {
+            ensure_no_more_arguments(arguments)?;
+            let root = env::current_dir()
+                .map_err(|source| XtaskError::io("resolve current directory", source))?;
+            config_generation::generate(&root)
+        },
         "quality" => {
             let options = quality::Options::parse(arguments)?;
             quality::run(&options)
@@ -75,7 +82,7 @@ fn ensure_no_more_arguments(mut arguments: impl Iterator<Item = String>) -> Resu
 
 fn usage() -> String {
     format!(
-        "Usage:\n  cargo xtask generate-api\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation|--retain-m0-03-mutation]\n  cargo xtask setup\n  cargo xtask help",
+        "Usage:\n  cargo xtask generate-api\n  cargo xtask generate-config\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation|--retain-m0-03-mutation|--retain-m0-04-mutation]\n  cargo xtask setup\n  cargo xtask help",
         Profile::accepted_values()
     )
 }
