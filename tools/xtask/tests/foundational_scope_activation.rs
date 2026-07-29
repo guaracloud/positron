@@ -846,7 +846,7 @@ fn quality_rejects_a_raw_report_command_digest_mismatch() -> TestResult {
                 "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             )
         },
-        "raw report invocation digest does not match its evidence command digest",
+        "command digest does not match its canonical structured invocation",
     )
 }
 
