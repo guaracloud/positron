@@ -1585,7 +1585,18 @@ impl FrozenQualificationFixtures {
         )?;
         let harness_registry_bytes =
             read_frozen_input(root, HARNESS_REGISTRY_PATH, MAXIMUM_IDENTITY_REGISTRY_BYTES)?;
-        let bounded_runners = FrozenBoundedRunnerRegistry::capture(root)?;
+        let bounded_runner_bytes = read_frozen_input(
+            root,
+            "qualification/engineering/concurrency-fixtures.tsv",
+            16_384,
+        )?;
+        let bounded_spawn_site_bytes = read_frozen_input(
+            root,
+            "qualification/engineering/concurrency-spawn-sites.tsv",
+            16_384,
+        )?;
+        let bounded_runners =
+            FrozenBoundedRunnerRegistry::capture(bounded_runner_bytes, bounded_spawn_site_bytes)?;
         let quality_registry =
             match FixtureRegistry::parse(&root.join(REGISTRY_PATH), &quality_registry_bytes) {
                 Ok(registry) => FrozenRegistry::Valid(registry),
@@ -1635,6 +1646,10 @@ impl FrozenQualificationFixtures {
             (
                 "qualification/engineering/concurrency-fixtures.tsv",
                 self.bounded_runners.bytes(),
+            ),
+            (
+                "qualification/engineering/concurrency-spawn-sites.tsv",
+                self.bounded_runners.spawn_site_bytes(),
             ),
         ] {
             payload.extend_from_slice(relative.as_bytes());

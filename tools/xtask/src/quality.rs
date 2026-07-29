@@ -1401,7 +1401,7 @@ fn execute_gate(
         "test" => run_test_gate(root, budget, environment, capture),
         "matrix" => run_generation_matrix_gate(root),
         "resource" => {
-            crate::bounded_runners::run_resource(qualification_fixtures.bounded_runners())
+            crate::bounded_runners::run_resource(qualification_fixtures.bounded_runners(), root)
         },
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),

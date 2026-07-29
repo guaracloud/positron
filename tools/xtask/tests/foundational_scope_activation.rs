@@ -488,11 +488,11 @@ fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() ->
         for (gate, required) in [
             (
                 "EG-CONCURRENCY",
-                "registered-tasks=3; cancellation=observed; joined-and-reaped=3; verifier=independent",
+                "measurement-v1;scenario=concurrency-cancel-join;schedule=cancel-then-join-v1;seed=seed-concurrency-v1;registered=3;workers=0:0:cancelled,1:1:executed,2:2:executed;retries=0;reservations=0;queue-empty=true;joined=3;deadline-ms=100",
             ),
             (
                 "EG-RESOURCE",
-                "reservation-capacity=2; fairness=round-robin; pressure=hard; retry-storm=bounded; leaks=none; shutdown=bounded; verifier=independent",
+                "measurement-v1;scenario=resource-fair-pressure;schedule=round-robin-pressure-v1;seed=seed-resource-v1;registered=3;workers=0:0:executed,1:1:executed,2:2:executed;retries=2;reservations=0;queue-empty=true;joined=3;deadline-ms=100",
             ),
         ] {
             let record = gate_record(&evidence, gate)?;
@@ -534,8 +534,7 @@ fn quality_rejects_an_unregistered_tooling_spawn_site_through_the_public_seam() 
             "\n#[allow(dead_code)]\nfn unregistered_spawn_regression() -> std::io::Result<()> {\n    let _child = std::process::Command::new(\"true\").spawn()?;\n    Ok(())\n}\n",
         );
         fs::write(&source, content)?;
-        fixture.build_fixture_xtask()?;
-        let output = fixture.quality_output_for("pr")?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, "unregistered process or task spawn")?;
         let evidence = fixture.latest_evidence()?;
         if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
@@ -545,6 +544,52 @@ fn quality_rejects_an_unregistered_tooling_spawn_site_through_the_public_seam() 
             .into());
         }
         Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_multiline_direct_thread_spawn_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str("\n#[allow(dead_code)]\nfn multiline_spawn_regression() {\n    let _handle = std::thread::\n        spawn(|| {});\n}\n");
+        fs::write(&source, content)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "direct unregistered thread spawn")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_aliased_thread_spawn_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str("\nuse std::thread as SpawnAlias;\n#[allow(dead_code)]\nfn aliased_spawn_regression() { let _handle = SpawnAlias::spawn(|| {}); }\n");
+        fs::write(&source, content)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "direct unregistered thread spawn")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -568,12 +613,90 @@ fn quality_rejects_a_stale_semantic_spawn_site_through_the_public_seam() -> Test
             "RegisteredTasks::spawn\tthread\tquality-bounded-worker-v1",
             "RegisteredTasks::spawn\tthread\tstale-bounded-worker-v1",
         )?;
+        fixture.build_fixture_xtask()?;
         let output = fixture.quality_output_for("pr")?;
         assert_rejected_output(&output, "unregistered semantic spawn site")?;
         let evidence = fixture.latest_evidence()?;
         if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
             return Err(std::io::Error::other(
                 "stale semantic spawn site did not retain a failed concurrency gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_duplicate_observed_semantic_spawn_site_through_the_public_seam() -> TestResult
+{
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n// positron-concurrency-spawn: RegisteredTasks::spawn\\tquality-bounded-worker-v1\n#[allow(dead_code)]\nfn duplicate_registered_spawn_regression() { let _worker = thread::Builder::new().spawn(|| {}); }\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "duplicate observed semantic spawn site")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_new_unobserved_semantic_spawn_site_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let registry = fixture
+            .root
+            .join("qualification/engineering/concurrency-spawn-sites.tsv");
+        let mut content = fs::read_to_string(&registry)?;
+        content.push_str(
+            "tools/xtask/src/bounded_runners.rs\tnew_registered_spawn\tthread\tnew-bounded-worker-v1\n",
+        );
+        fs::write(&registry, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "registered spawn-site set does not exactly match active tooling source",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_unregistered_spawn_in_a_resource_only_profile_through_the_public_seam()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n#[allow(dead_code)]\nfn resource_only_unregistered_spawn_regression() { let _worker = thread::Builder::new().spawn(|| {}); }\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "unregistered process or task spawn")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-RESOURCE")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "resource-only scan bypass did not retain a failed resource gate outcome",
             )
             .into());
         }
@@ -614,6 +737,255 @@ fn quality_rejects_resource_capacity_drift_through_the_public_seam() -> TestResu
             .into());
         }
         Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_oversized_frozen_concurrency_registry_through_the_public_seam() -> TestResult
+{
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        fs::write(
+            fixture
+                .root
+                .join("qualification/engineering/concurrency-fixtures.tsv"),
+            vec![b'x'; 16_385],
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "fixture identity input exceeds 16384 bytes")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_oversized_frozen_concurrency_spawn_registry_through_the_public_seam()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        fs::write(
+            fixture
+                .root
+                .join("qualification/engineering/concurrency-spawn-sites.tsv"),
+            vec![b'x'; 16_385],
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "fixture identity input exceeds 16384 bytes")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_symbolic_link_frozen_concurrency_spawn_registry_through_the_public_seam()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let registry = fixture
+            .root
+            .join("qualification/engineering/concurrency-spawn-sites.tsv");
+        let external = fixture
+            .root
+            .join("target/quality-tools/external-spawn-sites.tsv");
+        fs::write(&external, fs::read(&registry)?)?;
+        fs::remove_file(&registry)?;
+        std::os::unix::fs::symlink(&external, &registry)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "registry symlinks are forbidden")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_uses_the_frozen_spawn_registry_after_a_post_capture_swap_through_the_public_seam()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    validate_registered_spawn_sites(root, registry)?;\n    let scenario = registry.scenario(ScenarioGate::Concurrency)?;",
+            "    fs::write(root.join(SPAWN_SITE_REGISTRY_PATH), b\"swapped after frozen capture\").map_err(|error| XtaskError::io(\"test post-capture spawn registry swap\", error))?;\n    validate_registered_spawn_sites(root, registry)?;\n    let scenario = registry.scenario(ScenarioGate::Concurrency)?;",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "post-capture registry swap changed frozen runner behavior: {}\\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_reconciles_after_a_partial_registered_spawn_failure_through_the_public_seam()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "            let worker_results = results_sender.clone();\n",
+            "            if id == 1 { return owner.reconcile_failure(XtaskError::invalid(\"test lifecycle spawn\", \"injected partial spawn failure\")); }\n            let worker_results = results_sender.clone();\n",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "injected partial spawn failure")?;
+        assert_concurrency_lifecycle_failure(&fixture, "0")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_reconciles_after_a_mid_dispatch_failure_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "        tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n        tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n        Ok(())",
+            "        Err(XtaskError::invalid(\"test lifecycle dispatch\", \"injected mid-dispatch failure\"))",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "injected mid-dispatch failure")?;
+        assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_reconciles_after_a_result_timeout_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    let (completion, schedule_slot) = match command {",
+            "    thread::sleep(Duration::from_millis(250));\n    let (completion, schedule_slot) = match command {",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "did not report before the shutdown deadline")?;
+        assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_reconciles_after_worker_error_and_panic_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            ") -> Result<(), XtaskError> {\n    let command = receiver",
+            ") -> Result<(), XtaskError> {\n    if id == 1 { return Err(XtaskError::invalid(\"test lifecycle worker\", \"injected worker error\")); }\n    if id == 2 { panic!(\"injected worker panic\"); }\n    let command = receiver",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "injected worker error")?;
+        assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_omitted_serialized_worker_measurement_through_the_public_seam() -> TestResult
+{
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    verify_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
+            "    let record = record.replacen(\"workers=\", \"workers=;omitted-\", 1);\n    verify_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "worker measurement is malformed")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_tampered_serialized_resource_schedule_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+            "    let record = record.replacen(\"workers=\", \"workers=2:0:executed,1:1:executed,0:2:executed;tampered-\", 1);\n    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "retained schedule and measurements do not prove fair bounded leak-free recovery",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_tampered_serialized_resource_pressure_and_leak_state() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+            "    let record = record.replace(\"retries=2;reservations=0;queue-empty=true\", \"retries=3;reservations=1;queue-empty=false\");\n    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "retained schedule and measurements do not prove fair bounded leak-free recovery",
+        )
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -4933,6 +5305,42 @@ fn assert_existing_fixture_rejected(
 ) -> TestResult {
     let output = fixture.quality_output_for(profile)?;
     assert_rejected_output(&output, expected_failure)
+}
+
+fn enable_concurrency_gate(fixture: &Fixture) -> TestResult {
+    set_scope_field(
+        &fixture.root,
+        "xtask",
+        "risk_gates",
+        "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+    )
+}
+
+fn assert_concurrency_lifecycle_failure(fixture: &Fixture, spawned_ids: &str) -> TestResult {
+    let evidence = fixture.latest_evidence()?;
+    if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
+        return Err(std::io::Error::other(
+            "lifecycle fault did not retain a failed concurrency gate outcome",
+        )
+        .into());
+    }
+    let report = fs::read_to_string(exact_raw_report_path(
+        &fixture.root,
+        &evidence,
+        "EG-CONCURRENCY",
+    )?)?;
+    let required = format!("lifecycle-v1;spawned-ids={spawned_ids};cancelled-ids=");
+    if !report.contains(&required)
+        || !report.contains(&format!(
+            "completed-ids={spawned_ids};joined-ids={spawned_ids};live=0"
+        ))
+    {
+        return Err(std::io::Error::other(format!(
+            "lifecycle failure did not retain reconciliation evidence `{required}`"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn assert_rejected_output(output: &std::process::Output, expected_failure: &str) -> TestResult {

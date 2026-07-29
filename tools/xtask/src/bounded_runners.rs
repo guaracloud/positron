@@ -8,7 +8,7 @@
 //! derives the accepted result from those retained measurements rather than a
 //! runner verdict.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -27,6 +27,9 @@ const MAXIMUM_FIELD_BYTES: usize = 96;
 const REGISTERED_SPAWN_SITE: &str = "quality-bounded-worker-v1";
 const CONCURRENCY_GATE: &str = "EG-CONCURRENCY";
 const RESOURCE_GATE: &str = "EG-RESOURCE";
+
+type SpawnSiteKey = (String, String, String);
+type SpawnSiteRegistry = BTreeMap<SpawnSiteKey, String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScenarioGate {
@@ -72,32 +75,38 @@ struct Scenario {
 #[derive(Debug)]
 pub(crate) struct FrozenBoundedRunnerRegistry {
     bytes: Box<[u8]>,
+    spawn_site_bytes: Box<[u8]>,
     scenarios: Vec<Scenario>,
+    spawn_sites: SpawnSiteRegistry,
 }
 
 impl FrozenBoundedRunnerRegistry {
-    pub(crate) fn capture(root: &Path) -> Result<Self, XtaskError> {
-        let path = root.join(REGISTRY_PATH);
-        let bytes = fs::read(&path)
-            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    pub(crate) fn capture(bytes: Vec<u8>, spawn_site_bytes: Vec<u8>) -> Result<Self, XtaskError> {
+        let path = Path::new(REGISTRY_PATH);
         if bytes.len() > MAXIMUM_REGISTRY_BYTES {
             return Err(XtaskError::invalid_path(
-                &path,
+                path,
                 format!("bounded runner registry exceeds {MAXIMUM_REGISTRY_BYTES} bytes"),
             ));
         }
+        if spawn_site_bytes.len() > MAXIMUM_REGISTRY_BYTES {
+            return Err(XtaskError::invalid_path(
+                Path::new(SPAWN_SITE_REGISTRY_PATH),
+                format!("bounded spawn-site registry exceeds {MAXIMUM_REGISTRY_BYTES} bytes"),
+            ));
+        }
         let text = std::str::from_utf8(&bytes)
-            .map_err(|_| XtaskError::invalid_path(&path, "bounded runner registry is not UTF-8"))?;
+            .map_err(|_| XtaskError::invalid_path(path, "bounded runner registry is not UTF-8"))?;
         let mut lines = text.lines();
         let Some(header) = lines.next() else {
             return Err(XtaskError::invalid_path(
-                &path,
+                path,
                 "bounded runner registry is empty",
             ));
         };
         if header != REGISTRY_HEADER {
             return Err(XtaskError::invalid_path(
-                &path,
+                path,
                 "bounded runner registry header does not match the registered schema",
             ));
         }
@@ -105,7 +114,7 @@ impl FrozenBoundedRunnerRegistry {
         for (line_number, line) in lines.enumerate() {
             if scenarios.len() >= MAXIMUM_SCENARIOS {
                 return Err(XtaskError::invalid_path(
-                    &path,
+                    path,
                     format!("bounded runner registry exceeds {MAXIMUM_SCENARIOS} scenarios"),
                 ));
             }
@@ -125,7 +134,7 @@ impl FrozenBoundedRunnerRegistry {
             ] = fields.as_slice()
             else {
                 return Err(XtaskError::invalid_path(
-                    &path,
+                    path,
                     format!(
                         "bounded runner registry row {} has the wrong field count",
                         line_number + 2
@@ -147,7 +156,7 @@ impl FrozenBoundedRunnerRegistry {
             ] {
                 if value.is_empty() || value.len() > MAXIMUM_FIELD_BYTES {
                     return Err(XtaskError::invalid_path(
-                        &path,
+                        path,
                         format!(
                             "bounded runner registry row {} contains an invalid bounded field",
                             line_number + 2
@@ -156,19 +165,19 @@ impl FrozenBoundedRunnerRegistry {
                 }
             }
             let gate = ScenarioGate::parse(gate)?;
-            let max_tasks = parse_positive(&path, max_tasks, "max_tasks")?;
-            let queue_capacity = parse_positive(&path, queue_capacity, "queue_capacity")?;
+            let max_tasks = parse_positive(path, max_tasks, "max_tasks")?;
+            let queue_capacity = parse_positive(path, queue_capacity, "queue_capacity")?;
             let reservation_capacity =
-                parse_positive(&path, reservation_capacity, "reservation_capacity")?;
-            let retry_limit = parse_positive(&path, retry_limit, "retry_limit")?;
+                parse_positive(path, reservation_capacity, "reservation_capacity")?;
+            let retry_limit = parse_positive(path, retry_limit, "retry_limit")?;
             let shutdown = Duration::from_millis(
-                u64::try_from(parse_positive(&path, shutdown_ms, "shutdown_ms")?).map_err(
-                    |_| XtaskError::invalid_path(&path, "shutdown_ms cannot be represented"),
-                )?,
+                u64::try_from(parse_positive(path, shutdown_ms, "shutdown_ms")?).map_err(|_| {
+                    XtaskError::invalid_path(path, "shutdown_ms cannot be represented")
+                })?,
             );
             if *spawn_site != REGISTERED_SPAWN_SITE {
                 return Err(XtaskError::invalid_path(
-                    &path,
+                    path,
                     "bounded runner registry denied an unregistered spawn site",
                 ));
             }
@@ -188,7 +197,7 @@ impl FrozenBoundedRunnerRegistry {
         }
         if scenarios.len() != 2 {
             return Err(XtaskError::invalid_path(
-                &path,
+                path,
                 "bounded runner registry must contain exactly one scenario per registered gate",
             ));
         }
@@ -200,19 +209,30 @@ impl FrozenBoundedRunnerRegistry {
                 != 1
             {
                 return Err(XtaskError::invalid_path(
-                    &path,
+                    path,
                     format!("{} must have exactly one registered scenario", gate.label()),
                 ));
             }
         }
+        let spawn_sites = parse_spawn_site_registry(&spawn_site_bytes)?;
         Ok(Self {
             bytes: bytes.into_boxed_slice(),
+            spawn_site_bytes: spawn_site_bytes.into_boxed_slice(),
             scenarios,
+            spawn_sites,
         })
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn spawn_site_bytes(&self) -> &[u8] {
+        &self.spawn_site_bytes
+    }
+
+    fn spawn_sites(&self) -> &SpawnSiteRegistry {
+        &self.spawn_sites
     }
 
     fn scenario(&self, gate: ScenarioGate) -> Result<&Scenario, XtaskError> {
@@ -235,6 +255,70 @@ fn parse_positive(path: &Path, value: &str, field: &str) -> Result<usize, XtaskE
         })
 }
 
+fn parse_spawn_site_registry(bytes: &[u8]) -> Result<SpawnSiteRegistry, XtaskError> {
+    let path = Path::new(SPAWN_SITE_REGISTRY_PATH);
+    let registry = std::str::from_utf8(bytes)
+        .map_err(|_| XtaskError::invalid_path(path, "frozen spawn-site registry is not UTF-8"))?;
+    let mut rows = registry.lines();
+    let Some(header) = rows.next() else {
+        return Err(XtaskError::invalid_path(
+            path,
+            "spawn-site registry is empty",
+        ));
+    };
+    if header != SPAWN_SITE_REGISTRY_HEADER {
+        return Err(XtaskError::invalid_path(
+            path,
+            "spawn-site registry header does not match the registered schema",
+        ));
+    }
+    let mut registered = BTreeMap::new();
+    for (offset, row) in rows.enumerate() {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        let [source, symbol, kind, id] = fields.as_slice() else {
+            return Err(XtaskError::invalid_path(
+                path,
+                format!(
+                    "spawn-site registry row {} has the wrong field count",
+                    offset + 2
+                ),
+            ));
+        };
+        if source.is_empty()
+            || symbol.is_empty()
+            || id.is_empty()
+            || source.len() > MAXIMUM_FIELD_BYTES
+            || symbol.len() > MAXIMUM_FIELD_BYTES
+            || id.len() > MAXIMUM_FIELD_BYTES
+            || !matches!(*kind, "process" | "thread")
+        {
+            return Err(XtaskError::invalid_path(
+                path,
+                "spawn-site registry contains an invalid bounded lifecycle owner",
+            ));
+        }
+        if registered
+            .insert(
+                ((*source).to_owned(), (*symbol).to_owned(), (*id).to_owned()),
+                (*kind).to_owned(),
+            )
+            .is_some()
+        {
+            return Err(XtaskError::invalid_path(
+                path,
+                "spawn-site registry contains a duplicate semantic spawn site",
+            ));
+        }
+    }
+    if registered.is_empty() {
+        return Err(XtaskError::invalid_path(
+            path,
+            "spawn-site registry contains no registered lifecycle owners",
+        ));
+    }
+    Ok(registered)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerCommand {
     Execute { schedule_slot: usize },
@@ -255,7 +339,8 @@ struct WorkerMeasurement {
 }
 
 struct RegisteredTask {
-    sender: SyncSender<WorkerCommand>,
+    id: usize,
+    sender: Option<SyncSender<WorkerCommand>>,
     handle: Option<thread::JoinHandle<Result<(), XtaskError>>>,
 }
 
@@ -266,6 +351,18 @@ struct RegisteredTasks {
 }
 
 impl RegisteredTasks {
+    fn execute<T>(
+        scenario: &Scenario,
+        operation: impl FnOnce(&mut Self) -> Result<T, XtaskError>,
+    ) -> Result<(T, Vec<WorkerMeasurement>), XtaskError> {
+        let mut owner = Self::spawn(scenario)?;
+        let value = match operation(&mut owner) {
+            Ok(value) => value,
+            Err(error) => return owner.reconcile_failure(error),
+        };
+        let measurements = owner.reconcile()?;
+        Ok((value, measurements))
+    }
     fn spawn(scenario: &Scenario) -> Result<Self, XtaskError> {
         if scenario.spawn_site != REGISTERED_SPAWN_SITE {
             return Err(XtaskError::invalid(
@@ -282,23 +379,34 @@ impl RegisteredTasks {
                 )
             })?;
         let (results_sender, results) = mpsc::sync_channel(scenario.max_tasks);
-        let mut tasks = Vec::with_capacity(scenario.max_tasks);
+        let mut owner = Self {
+            tasks: Vec::with_capacity(scenario.max_tasks),
+            results,
+            deadline,
+        };
         for id in 0..scenario.max_tasks {
             let (sender, receiver) = mpsc::sync_channel(1);
-            tasks.push(RegisteredTask {
-                sender,
+            owner.tasks.push(RegisteredTask {
+                id,
+                sender: Some(sender),
                 handle: None,
             });
             let worker_results = results_sender.clone();
-            let handle = thread::Builder::new()
+            let handle = match thread::Builder::new()
                 .name(format!("positron-quality-worker-{id}"))
                 // positron-concurrency-spawn: RegisteredTasks::spawn\tquality-bounded-worker-v1
                 .spawn(move || worker_loop(id, receiver, worker_results))
-                .map_err(|source| {
-                    XtaskError::io("spawn registered bounded quality task", source)
-                })?;
-            let Some(task) = tasks.last_mut() else {
-                return Err(XtaskError::invalid(
+            {
+                Ok(handle) => handle,
+                Err(source) => {
+                    return owner.reconcile_failure(XtaskError::io(
+                        "spawn registered bounded quality task",
+                        source,
+                    ));
+                },
+            };
+            let Some(task) = owner.tasks.last_mut() else {
+                return owner.reconcile_failure(XtaskError::invalid(
                     "bounded task registration",
                     "registered task disappeared before its handle was retained",
                 ));
@@ -306,21 +414,23 @@ impl RegisteredTasks {
             task.handle = Some(handle);
         }
         drop(results_sender);
-        Ok(Self {
-            tasks,
-            results,
-            deadline,
-        })
+        Ok(owner)
     }
 
-    fn dispatch(&self, id: usize, command: WorkerCommand) -> Result<(), XtaskError> {
+    fn dispatch(&mut self, id: usize, command: WorkerCommand) -> Result<(), XtaskError> {
         let task = self.tasks.get(id).ok_or_else(|| {
             XtaskError::invalid(
                 "bounded task dispatch",
                 "schedule referenced an unregistered task",
             )
         })?;
-        task.sender.try_send(command).map_err(|error| match error {
+        let sender = task.sender.as_ref().ok_or_else(|| {
+            XtaskError::invalid(
+                "bounded task dispatch",
+                "registered task sender was already closed",
+            )
+        })?;
+        sender.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => XtaskError::invalid(
                 "bounded task dispatch",
                 "registered task command queue reached its finite capacity",
@@ -336,7 +446,7 @@ impl RegisteredTasks {
         let mut measurements = Vec::with_capacity(self.tasks.len());
         while measurements.len() < self.tasks.len() {
             if Instant::now() >= self.deadline {
-                return Err(XtaskError::invalid(
+                return self.reconcile_failure(XtaskError::invalid(
                     "bounded task shutdown",
                     "registered tasks did not report before the shutdown deadline",
                 ));
@@ -345,7 +455,7 @@ impl RegisteredTasks {
                 Ok(measurement) => measurements.push(measurement),
                 Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
                 Err(TryRecvError::Disconnected) => {
-                    return Err(XtaskError::invalid(
+                    return self.reconcile_failure(XtaskError::invalid(
                         "bounded task shutdown",
                         "registered task result channel closed before every task reported",
                     ));
@@ -354,16 +464,16 @@ impl RegisteredTasks {
         }
         for task in &mut self.tasks {
             let Some(handle) = task.handle.take() else {
-                return Err(XtaskError::invalid(
+                return self.reconcile_failure(XtaskError::invalid(
                     "bounded task shutdown",
                     "registered task has no retained join handle",
                 ));
             };
             match handle.join() {
                 Ok(Ok(())) => {},
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => return self.reconcile_failure(error),
                 Err(_) => {
-                    return Err(XtaskError::invalid(
+                    return self.reconcile_failure(XtaskError::invalid(
                         "bounded task shutdown",
                         "registered task panicked instead of returning a closed outcome",
                     ));
@@ -378,6 +488,90 @@ impl RegisteredTasks {
         }
         Ok(measurements)
     }
+
+    fn reconcile_failure<T>(mut self, original: XtaskError) -> Result<T, XtaskError> {
+        let spawned_ids = self
+            .tasks
+            .iter()
+            .filter(|task| task.handle.is_some())
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        let mut cancelled_ids = Vec::new();
+        for task in &mut self.tasks {
+            if let Some(sender) = task.sender.as_ref() {
+                let _ = sender.try_send(WorkerCommand::Cancel {
+                    schedule_slot: usize::MAX,
+                });
+                cancelled_ids.push(task.id);
+            }
+            task.sender = None;
+        }
+        let mut cleanup_errors = Vec::new();
+        let mut reported_ids = Vec::new();
+        while Instant::now() < self.deadline {
+            match self.results.try_recv() {
+                Ok(measurement) => reported_ids.push(measurement.id),
+                Err(TryRecvError::Empty) => thread::yield_now(),
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        let mut joined_ids = Vec::new();
+        for task in &mut self.tasks {
+            let Some(handle) = task.handle.take() else {
+                continue;
+            };
+            joined_ids.push(task.id);
+            match handle.join() {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => cleanup_errors.push(error.to_string()),
+                Err(_) => {
+                    cleanup_errors.push("registered task panicked during reconciliation".to_owned())
+                },
+            }
+        }
+        while let Ok(measurement) = self.results.try_recv() {
+            reported_ids.push(measurement.id);
+        }
+        let mut completed_ids = joined_ids.clone();
+        for ids in [
+            &mut cancelled_ids,
+            &mut reported_ids,
+            &mut completed_ids,
+            &mut joined_ids,
+        ] {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        let lifecycle = format!(
+            "lifecycle-v1;spawned-ids={};cancelled-ids={};reported-ids={};completed-ids={};joined-ids={};live=0",
+            format_ids(&spawned_ids),
+            format_ids(&cancelled_ids),
+            format_ids(&reported_ids),
+            format_ids(&completed_ids),
+            format_ids(&joined_ids),
+        );
+        if cleanup_errors.is_empty() {
+            Err(XtaskError::invalid(
+                "bounded task lifecycle reconciliation",
+                format!("{original}; {lifecycle}"),
+            ))
+        } else {
+            Err(XtaskError::invalid(
+                "bounded task lifecycle reconciliation",
+                format!(
+                    "{original}; reconciliation failures: {}; {lifecycle}",
+                    cleanup_errors.join("; "),
+                ),
+            ))
+        }
+    }
+}
+
+fn format_ids(ids: &[usize]) -> String {
+    ids.iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn worker_loop(
@@ -496,77 +690,238 @@ pub(crate) fn run_concurrency(
     registry: &FrozenBoundedRunnerRegistry,
     root: &Path,
 ) -> Result<String, XtaskError> {
-    validate_registered_spawn_sites(root)?;
+    validate_registered_spawn_sites(root, registry)?;
     let scenario = registry.scenario(ScenarioGate::Concurrency)?;
     validate_concurrency_scenario(scenario)?;
-    let tasks = RegisteredTasks::spawn(scenario)?;
-    tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;
-    tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;
-    tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;
-    let measurements = tasks.reconcile()?;
-    verify_concurrency(scenario, &measurements)?;
-    Ok(format!(
-        "scenario={}; schedule={}; seed={}; registered-tasks=3; cancellation=observed; joined-and-reaped=3; verifier=independent",
-        scenario.id, scenario.schedule, scenario.seed
-    ))
+    let ((), measurements) = RegisteredTasks::execute(scenario, |tasks| {
+        tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;
+        tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;
+        tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;
+        Ok(())
+    })?;
+    let record = measurement_record(scenario, &measurements, 0, 0, true);
+    verify_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;
+    Ok(record)
 }
 
-pub(crate) fn run_resource(registry: &FrozenBoundedRunnerRegistry) -> Result<String, XtaskError> {
+pub(crate) fn run_resource(
+    registry: &FrozenBoundedRunnerRegistry,
+    root: &Path,
+) -> Result<String, XtaskError> {
+    validate_registered_spawn_sites(root, registry)?;
     let scenario = registry.scenario(ScenarioGate::Resource)?;
     validate_resource_scenario(scenario)?;
-    let tasks = RegisteredTasks::spawn(scenario)?;
-    let mut queue = BoundedWorkQueue::new(scenario.queue_capacity);
-    for task in 0..scenario.max_tasks {
-        queue.enqueue(task)?;
-    }
-    let mut ledger = ReservationLedger::new(scenario.reservation_capacity);
-    let mut retries = 0_usize;
-    let first = queue.dequeue()?;
-    if ledger.reserve() != ReservationOutcome::Granted {
-        return Err(XtaskError::invalid(
-            "bounded resource runner",
-            "first reservation was rejected",
-        ));
-    }
-    tasks.dispatch(first, WorkerCommand::Execute { schedule_slot: 0 })?;
-    let second = queue.dequeue()?;
-    if ledger.reserve() != ReservationOutcome::Granted {
-        return Err(XtaskError::invalid(
-            "bounded resource runner",
-            "second reservation was rejected",
-        ));
-    }
-    tasks.dispatch(second, WorkerCommand::Execute { schedule_slot: 1 })?;
-    let third = queue.dequeue()?;
-    while ledger.reserve() == ReservationOutcome::HardPressure {
-        retries = retries.checked_add(1).ok_or_else(|| {
-            XtaskError::invalid("bounded resource runner", "retry accounting overflowed")
+    let ((retries, reservations, queue_empty), measurements) =
+        RegisteredTasks::execute(scenario, |tasks| {
+            let mut queue = BoundedWorkQueue::new(scenario.queue_capacity);
+            for task in 0..scenario.max_tasks {
+                queue.enqueue(task)?;
+            }
+            let mut ledger = ReservationLedger::new(scenario.reservation_capacity);
+            let mut retries = 0_usize;
+            let first = queue.dequeue()?;
+            if ledger.reserve() != ReservationOutcome::Granted {
+                return Err(XtaskError::invalid(
+                    "bounded resource runner",
+                    "first reservation was rejected",
+                ));
+            }
+            tasks.dispatch(first, WorkerCommand::Execute { schedule_slot: 0 })?;
+            let second = queue.dequeue()?;
+            if ledger.reserve() != ReservationOutcome::Granted {
+                return Err(XtaskError::invalid(
+                    "bounded resource runner",
+                    "second reservation was rejected",
+                ));
+            }
+            tasks.dispatch(second, WorkerCommand::Execute { schedule_slot: 1 })?;
+            let third = queue.dequeue()?;
+            while ledger.reserve() == ReservationOutcome::HardPressure {
+                retries = retries.checked_add(1).ok_or_else(|| {
+                    XtaskError::invalid("bounded resource runner", "retry accounting overflowed")
+                })?;
+                if retries > scenario.retry_limit {
+                    return Err(XtaskError::invalid(
+                        "bounded resource runner",
+                        "retry storm exceeded the registered attempt ceiling",
+                    ));
+                }
+                if retries == scenario.retry_limit {
+                    ledger.release()?;
+                }
+            }
+            tasks.dispatch(third, WorkerCommand::Execute { schedule_slot: 2 })?;
+            ledger.release()?;
+            ledger.release()?;
+            Ok((retries, ledger.in_use, queue.is_empty()))
         })?;
-        if retries > scenario.retry_limit {
+    let record = measurement_record(scenario, &measurements, retries, reservations, queue_empty);
+    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;
+    Ok(record)
+}
+
+fn measurement_record(
+    scenario: &Scenario,
+    measurements: &[WorkerMeasurement],
+    retries: usize,
+    reservations: usize,
+    queue_empty: bool,
+) -> String {
+    let mut ordered = measurements.to_vec();
+    ordered.sort_by_key(|measurement| measurement.schedule_slot);
+    let workers = ordered
+        .iter()
+        .map(|m| {
+            format!(
+                "{}:{}:{}",
+                m.id,
+                m.schedule_slot,
+                match m.completion {
+                    WorkerCompletion::Executed => "executed",
+                    WorkerCompletion::Cancelled => "cancelled",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "measurement-v1;scenario={};schedule={};seed={};registered={};workers={workers};retries={retries};reservations={reservations};queue-empty={queue_empty};joined={};deadline-ms={}",
+        scenario.id,
+        scenario.schedule,
+        scenario.seed,
+        scenario.max_tasks,
+        measurements.len(),
+        scenario.shutdown.as_millis()
+    )
+}
+
+fn verify_measurement_record(
+    scenario: &Scenario,
+    record: &str,
+    gate: ScenarioGate,
+) -> Result<(), XtaskError> {
+    if record.len() > 4_096 || !record.starts_with("measurement-v1;") {
+        return Err(XtaskError::invalid(
+            "independent bounded measurement verifier",
+            "measurement record is missing or exceeds its bound",
+        ));
+    }
+    let mut fields = BTreeMap::new();
+    for field in record.split(';').skip(1) {
+        let Some((key, value)) = field.split_once('=') else {
             return Err(XtaskError::invalid(
-                "bounded resource runner",
-                "retry storm exceeded the registered attempt ceiling",
+                "independent bounded measurement verifier",
+                "measurement record contains a malformed field",
+            ));
+        };
+        if key.is_empty() || value.is_empty() || fields.insert(key, value).is_some() {
+            return Err(XtaskError::invalid(
+                "independent bounded measurement verifier",
+                "measurement record contains a duplicate or empty field",
             ));
         }
-        if retries == scenario.retry_limit {
-            ledger.release()?;
-        }
     }
-    tasks.dispatch(third, WorkerCommand::Execute { schedule_slot: 2 })?;
-    ledger.release()?;
-    ledger.release()?;
-    let measurements = tasks.reconcile()?;
-    verify_resource(
-        scenario,
-        &measurements,
-        retries,
-        ledger.in_use,
-        queue.is_empty(),
-    )?;
-    Ok(format!(
-        "scenario={}; schedule={}; seed={}; reservation-capacity=2; fairness=round-robin; pressure=hard; retry-storm=bounded; leaks=none; shutdown=bounded; verifier=independent",
-        scenario.id, scenario.schedule, scenario.seed
-    ))
+    if fields.get("scenario") != Some(&scenario.id.as_str())
+        || fields.get("schedule") != Some(&scenario.schedule.as_str())
+        || fields.get("seed") != Some(&scenario.seed.as_str())
+    {
+        return Err(XtaskError::invalid(
+            "independent bounded measurement verifier",
+            "frozen scenario identity is missing from measurement record",
+        ));
+    }
+    let workers = fields.get("workers").ok_or_else(|| {
+        XtaskError::invalid(
+            "independent bounded measurement verifier",
+            "worker measurements are omitted",
+        )
+    })?;
+    let parsed = workers
+        .split(',')
+        .map(|worker| {
+            let parts = worker.split(':').collect::<Vec<_>>();
+            let [id, schedule_slot, completion] = parts.as_slice() else {
+                return Err(XtaskError::invalid(
+                    "independent bounded measurement verifier",
+                    "worker measurement is malformed",
+                ));
+            };
+            Ok(WorkerMeasurement {
+                id: id.parse().map_err(|_| {
+                    XtaskError::invalid(
+                        "independent bounded measurement verifier",
+                        "worker id is malformed",
+                    )
+                })?,
+                schedule_slot: schedule_slot.parse().map_err(|_| {
+                    XtaskError::invalid(
+                        "independent bounded measurement verifier",
+                        "worker slot is malformed",
+                    )
+                })?,
+                completion: match *completion {
+                    "executed" => WorkerCompletion::Executed,
+                    "cancelled" => WorkerCompletion::Cancelled,
+                    _ => {
+                        return Err(XtaskError::invalid(
+                            "independent bounded measurement verifier",
+                            "worker completion is malformed",
+                        ));
+                    },
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if fields
+        .get("registered")
+        .and_then(|value| value.parse::<usize>().ok())
+        != Some(parsed.len())
+    {
+        return Err(XtaskError::invalid(
+            "independent bounded measurement verifier",
+            "worker measurement count does not match the retained registration",
+        ));
+    }
+    if fields
+        .get("joined")
+        .and_then(|value| value.parse::<usize>().ok())
+        != Some(parsed.len())
+        || fields
+            .get("deadline-ms")
+            .and_then(|value| value.parse::<u128>().ok())
+            != Some(scenario.shutdown.as_millis())
+    {
+        return Err(XtaskError::invalid(
+            "independent bounded measurement verifier",
+            "worker join or deadline evidence does not match the frozen lifecycle bound",
+        ));
+    }
+    match gate {
+        ScenarioGate::Concurrency => verify_concurrency(scenario, &parsed),
+        ScenarioGate::Resource => verify_resource(
+            scenario,
+            &parsed,
+            fields
+                .get("retries")
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| {
+                    XtaskError::invalid(
+                        "independent bounded measurement verifier",
+                        "retry record is malformed",
+                    )
+                })?,
+            fields
+                .get("reservations")
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| {
+                    XtaskError::invalid(
+                        "independent bounded measurement verifier",
+                        "reservation record is malformed",
+                    )
+                })?,
+            fields.get("queue-empty") == Some(&"true"),
+        ),
+    }
 }
 
 fn validate_concurrency_scenario(scenario: &Scenario) -> Result<(), XtaskError> {
@@ -613,11 +968,22 @@ fn verify_concurrency(
     }
     let outcomes = measurements
         .iter()
-        .map(|measurement| (measurement.id, measurement.completion))
+        .map(|measurement| {
+            (
+                measurement.id,
+                (measurement.schedule_slot, measurement.completion),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
-    if outcomes.get(&0) != Some(&WorkerCompletion::Cancelled)
-        || outcomes.get(&1) != Some(&WorkerCompletion::Executed)
-        || outcomes.get(&2) != Some(&WorkerCompletion::Executed)
+    if outcomes.len() != measurements.len() {
+        return Err(XtaskError::invalid(
+            "independent concurrency verifier",
+            "worker identifiers are not unique in the retained schedule",
+        ));
+    }
+    if outcomes.get(&0) != Some(&(0, WorkerCompletion::Cancelled))
+        || outcomes.get(&1) != Some(&(1, WorkerCompletion::Executed))
+        || outcomes.get(&2) != Some(&(2, WorkerCompletion::Executed))
     {
         return Err(XtaskError::invalid(
             "independent concurrency verifier",
@@ -644,7 +1010,12 @@ fn verify_resource(
         .iter()
         .map(|measurement| measurement.id)
         .collect::<Vec<_>>();
+    let unique_ids = retained_order
+        .iter()
+        .map(|measurement| measurement.id)
+        .collect::<BTreeSet<_>>();
     if completed != scenario.max_tasks
+        || unique_ids.len() != measurements.len()
         || fair_order != [0, 1, 2]
         || retries != scenario.retry_limit
         || reservations != 0
@@ -658,67 +1029,12 @@ fn verify_resource(
     Ok(())
 }
 
-fn validate_registered_spawn_sites(root: &Path) -> Result<(), XtaskError> {
-    let registry_path = root.join(SPAWN_SITE_REGISTRY_PATH);
-    let registry = fs::read_to_string(&registry_path)
-        .map_err(|source| XtaskError::io(format!("read {}", registry_path.display()), source))?;
-    let mut rows = registry.lines();
-    let Some(header) = rows.next() else {
-        return Err(XtaskError::invalid_path(
-            &registry_path,
-            "spawn-site registry is empty",
-        ));
-    };
-    if header != SPAWN_SITE_REGISTRY_HEADER {
-        return Err(XtaskError::invalid_path(
-            &registry_path,
-            "spawn-site registry header does not match the registered schema",
-        ));
-    }
-    let mut registered = BTreeMap::new();
-    for (offset, row) in rows.enumerate() {
-        let fields = row.split('\t').collect::<Vec<_>>();
-        let [path, symbol, kind, id] = fields.as_slice() else {
-            return Err(XtaskError::invalid_path(
-                &registry_path,
-                format!(
-                    "spawn-site registry row {} has the wrong field count",
-                    offset + 2
-                ),
-            ));
-        };
-        if path.is_empty()
-            || symbol.is_empty()
-            || id.is_empty()
-            || path.len() > MAXIMUM_FIELD_BYTES
-            || symbol.len() > MAXIMUM_FIELD_BYTES
-            || id.len() > MAXIMUM_FIELD_BYTES
-            || !matches!(*kind, "process" | "thread")
-        {
-            return Err(XtaskError::invalid_path(
-                &registry_path,
-                "spawn-site registry contains an invalid bounded lifecycle owner",
-            ));
-        }
-        if registered
-            .insert(
-                ((*path).to_owned(), (*symbol).to_owned(), (*id).to_owned()),
-                (*kind).to_owned(),
-            )
-            .is_some()
-        {
-            return Err(XtaskError::invalid_path(
-                &registry_path,
-                "spawn-site registry contains a duplicate semantic spawn site",
-            ));
-        }
-    }
-    if registered.is_empty() {
-        return Err(XtaskError::invalid_path(
-            &registry_path,
-            "spawn-site registry contains no registered lifecycle owners",
-        ));
-    }
+fn validate_registered_spawn_sites(
+    root: &Path,
+    frozen: &FrozenBoundedRunnerRegistry,
+) -> Result<(), XtaskError> {
+    let registry_path = Path::new(SPAWN_SITE_REGISTRY_PATH);
+    let registered = frozen.spawn_sites();
     let source_root = root.join("tools/xtask/src");
     let mut files = Vec::new();
     crate::registry::collect_files_with_extension(&source_root, "rs", 0, &mut files)?;
@@ -738,19 +1054,53 @@ fn validate_registered_spawn_sites(root: &Path) -> Result<(), XtaskError> {
         let production = test_start
             .and_then(|index| tokenized.get(..index))
             .unwrap_or(&tokenized);
-        let production_lines = production.lines().collect::<Vec<_>>();
-        let mut marker = None;
-        for (index, (raw_line, line)) in source_text
-            .lines()
-            .take(production_lines.len())
-            .zip(production_lines)
-            .enumerate()
+        let compact_production = production
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if compact_production.contains("std::thread::spawn(")
+            || compact_production.contains("thread::spawn(")
         {
-            let line_number = index + 1;
-            if let Some(value) = raw_line
-                .trim_start()
-                .strip_prefix("// positron-concurrency-spawn: ")
-            {
+            return Err(XtaskError::invalid_path(
+                &source,
+                "direct unregistered thread spawn in activated tooling source",
+            ));
+        }
+        for alias in imported_spawn_aliases(&compact_production) {
+            if compact_production.contains(&alias) {
+                return Err(XtaskError::invalid_path(
+                    &source,
+                    "direct unregistered thread spawn through an imported alias",
+                ));
+            }
+        }
+        if [
+            "mpsc::channel(",
+            "unbounded_channel(",
+            "VecDeque::new(",
+            "tokio::spawn(",
+            "async_std::task::spawn(",
+        ]
+        .into_iter()
+        .any(|primitive| compact_production.contains(primitive))
+        {
+            return Err(XtaskError::invalid_path(
+                &source,
+                "unbounded concurrency primitive in activated tooling source",
+            ));
+        }
+        let production_line_count = production.lines().count();
+        let markers = source_text
+            .lines()
+            .take(production_line_count)
+            .enumerate()
+            .filter_map(|(offset, raw_line)| {
+                raw_line
+                    .trim_start()
+                    .strip_prefix("// positron-concurrency-spawn: ")
+                    .map(|value| (offset + 1, value))
+            })
+            .map(|(line_number, value)| {
                 let Some((symbol, id)) = value.split_once("\\t") else {
                     return Err(XtaskError::invalid_path(
                         &source,
@@ -763,72 +1113,86 @@ fn validate_registered_spawn_sites(root: &Path) -> Result<(), XtaskError> {
                         format!("spawn marker at tooling line {line_number} is incomplete"),
                     ));
                 }
-                marker = Some((symbol.to_owned(), id.to_owned()));
-                continue;
-            }
-            if line.contains("mpsc::channel(")
-                || line.contains("unbounded_channel(")
-                || line.contains("VecDeque::new(")
-                || line.contains("tokio::spawn(")
-                || line.contains("async_std::task::spawn(")
-            {
+                Ok((line_number, symbol.to_owned(), id.to_owned()))
+            })
+            .collect::<Result<Vec<_>, XtaskError>>()?;
+        let spawn_count = compact_production.match_indices(".spawn(").count();
+        if spawn_count != markers.len() {
+            return Err(XtaskError::invalid_path(
+                &source,
+                "unregistered process or task spawn: every active method spawn must have exactly one registered marker",
+            ));
+        }
+        for (line_number, symbol, id) in markers {
+            let key = (relative.clone(), symbol, id);
+            let Some(kind) = registered.get(&key) else {
                 return Err(XtaskError::invalid_path(
                     &source,
-                    format!(
-                        "unbounded concurrency primitive at registered tooling line {line_number}"
-                    ),
+                    format!("unregistered semantic spawn site at tooling line {line_number}"),
+                ));
+            };
+            let actual = if key.2 == REGISTERED_SPAWN_SITE {
+                "thread"
+            } else {
+                "process"
+            };
+            if kind != actual {
+                return Err(XtaskError::invalid_path(
+                    &source,
+                    format!("spawn-site kind drift at tooling line {line_number}"),
                 ));
             }
-            if line.contains("thread::spawn(") {
+            if observed.insert(key, kind.clone()).is_some() {
                 return Err(XtaskError::invalid_path(
                     &source,
-                    format!("direct unregistered thread spawn at tooling line {line_number}"),
-                ));
-            }
-            if line.contains(".spawn(") {
-                let Some((symbol, id)) = marker.take() else {
-                    return Err(XtaskError::invalid_path(
-                        &source,
-                        format!("unregistered process or task spawn at tooling line {line_number}"),
-                    ));
-                };
-                let key = (relative.clone(), symbol, id);
-                let Some(kind) = registered.get(&key) else {
-                    return Err(XtaskError::invalid_path(
-                        &source,
-                        format!("unregistered semantic spawn site at tooling line {line_number}"),
-                    ));
-                };
-                let actual = if key.2 == REGISTERED_SPAWN_SITE {
-                    "thread"
-                } else {
-                    "process"
-                };
-                if kind != actual {
-                    return Err(XtaskError::invalid_path(
-                        &source,
-                        format!("spawn-site kind drift at tooling line {line_number}"),
-                    ));
-                }
-                observed.insert(key, kind.clone());
-            } else if marker.is_some() && !line.trim().is_empty() {
-                let marker_line = line_number.saturating_sub(1);
-                return Err(XtaskError::invalid_path(
-                    &source,
-                    format!(
-                        "spawn marker at tooling line {marker_line} is not attached to a spawn"
-                    ),
+                    format!("duplicate observed semantic spawn site at tooling line {line_number}"),
                 ));
             }
         }
     }
-    if observed != registered {
+    if observed != *registered {
         return Err(XtaskError::invalid_path(
-            &registry_path,
+            registry_path,
             "registered spawn-site set does not exactly match active tooling source",
         ));
     }
     Ok(())
+}
+
+fn imported_spawn_aliases(compact: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for import in compact.split("use").skip(1) {
+        let Some(import) = import.split(';').next() else {
+            continue;
+        };
+        if let Some(alias) = import.strip_prefix("std::threadas")
+            && is_identifier(alias)
+        {
+            aliases.push(format!("{alias}::spawn("));
+        }
+        if let Some(alias) = import.strip_prefix("stdas")
+            && is_identifier(alias)
+        {
+            aliases.push(format!("{alias}::thread::spawn("));
+        }
+        if let Some(alias) = import
+            .strip_prefix("std::thread::spawnas")
+            .or_else(|| import.strip_prefix("std::thread::{spawnas"))
+        {
+            let alias = alias.trim_end_matches('}');
+            if is_identifier(alias) {
+                aliases.push(format!("{alias}("));
+            }
+        }
+    }
+    aliases
+}
+
+fn is_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 fn tokenized_source(source: &str) -> String {
