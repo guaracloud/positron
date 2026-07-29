@@ -2350,6 +2350,45 @@ fn quality_atomically_retains_one_verdict_for_each_parallel_collision_slot_racer
 
 #[cfg(unix)]
 #[test]
+fn quality_keeps_shared_staging_infrastructure_when_a_parallel_leaf_cleans_up() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let canonical = "1700000000000-111111111111-1";
+        let evidence_directory = fixture.root.join("target/quality/evidence");
+        fs::create_dir_all(&evidence_directory)?;
+        fs::write(
+            evidence_directory.join(format!("{canonical}-recovery.json")),
+            b"{\"schema_version\":1,\"attempt_id\":\"legacy-blocker\"}\n",
+        )?;
+        inject_staging_parent_sync_barrier(&fixture.root)?;
+
+        let collision = format!("{canonical}-collision-00");
+        let outputs = run_parallel_reservation_racers(&fixture, &collision)?;
+        for output in &outputs {
+            assert_rejected_output(output, "engineering evidence attempt collision")?;
+        }
+        let staging_parent = fixture.root.join("target/quality/evidence-report-staging");
+        if !staging_parent.is_dir() {
+            return Err(std::io::Error::other(
+                "one racer removed shared staging infrastructure before its peer synchronized it",
+            )
+            .into());
+        }
+        if fs::read_dir(&staging_parent)?.next().transpose()?.is_some() {
+            return Err(std::io::Error::other(
+                "parallel staging cleanup left an attempt-owned leaf behind",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
 fn quality_never_replaces_a_concurrently_claimed_final_report_directory() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -6150,6 +6189,61 @@ fn inject_reservation_barrier(root: &Path) -> TestResult {
 }
 
 fn reserve_new_file(path: &Path) -> Result<fs::File, std::io::Error> {
+"#,
+    )
+}
+
+#[cfg(unix)]
+fn inject_staging_parent_sync_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/quality.rs");
+    replace_once(
+        &source,
+        "        self.leaf.sync()?;\n        self.parent.sync()\n",
+        "        self.leaf.sync()?;\n        staging_parent_sync_fixture_wait(&self.parent, &self.leaf_name)?;\n        self.parent.sync()\n",
+    )?;
+    replace_once(
+        &source,
+        "        self.parent.remove_child_directory_by_identity(\n            &self.leaf_name,\n            self.leaf_identity,\n            \"attempt-owned evidence staging leaf\",\n        )\n",
+        "        self.parent.remove_child_directory_by_identity(\n            &self.leaf_name,\n            self.leaf_identity,\n            \"attempt-owned evidence staging leaf\",\n        )?;\n        staging_parent_sync_fixture_release(&self.parent, &self.leaf_name)\n",
+    )?;
+    replace_once(
+        &source,
+        "enum ReservationOutcome {\n",
+        r#"fn staging_parent_sync_fixture_root(parent: &DirectoryCapability) -> Result<PathBuf, XtaskError> {
+    parent.diagnostic_path().parent().and_then(Path::parent).and_then(Path::parent).map(Path::to_path_buf).ok_or_else(|| XtaskError::invalid_path(parent.diagnostic_path(), "staging fixture parent has no workspace root"))
+}
+
+fn staging_parent_sync_fixture_wait(parent: &DirectoryCapability, leaf_name: &str) -> Result<(), XtaskError> {
+    let root = staging_parent_sync_fixture_root(parent)?;
+    let barrier = root.join("target/quality-tools/staging-parent-sync-barrier");
+    fs::create_dir_all(&barrier).map_err(|source| XtaskError::io("create staging parent sync barrier", source))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    if leaf_name.ends_with("-collision-00") {
+        fs::write(barrier.join("first-ready"), b"ready\n").map_err(|source| XtaskError::io("publish staging parent sync first participant", source))?;
+        while !barrier.join("second-cleaned-leaf").is_file() {
+            if Instant::now() >= deadline {
+                return Err(XtaskError::invalid("staging parent sync fixture barrier", "second publisher did not clean its owned leaf"));
+            }
+            std::thread::yield_now();
+        }
+    } else if leaf_name.ends_with("-collision-01") {
+        while !barrier.join("first-ready").is_file() {
+            if Instant::now() >= deadline {
+                return Err(XtaskError::invalid("staging parent sync fixture barrier", "first publisher did not reach its held-parent synchronization point"));
+            }
+            std::thread::yield_now();
+        }
+    }
+    Ok(())
+}
+
+fn staging_parent_sync_fixture_release(parent: &DirectoryCapability, leaf_name: &str) -> Result<(), XtaskError> {
+    if !leaf_name.ends_with("-collision-01") { return Ok(()); }
+    let root = staging_parent_sync_fixture_root(parent)?;
+    fs::write(root.join("target/quality-tools/staging-parent-sync-barrier/second-cleaned-leaf"), b"released\n").map_err(|source| XtaskError::io("release staging parent sync first participant", source))
+}
+
+enum ReservationOutcome {
 "#,
     )
 }

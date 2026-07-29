@@ -15,7 +15,7 @@ use crate::controlled_execution::{
 use crate::error::XtaskError;
 use crate::evidence_json as bounded_json;
 use crate::hooks;
-use crate::qualification_fixtures::{DirectoryCapability, FileCapability};
+use crate::qualification_fixtures::{DirectoryCapability, DirectoryIdentity, FileCapability};
 use crate::registry::{self, Gate, Registry};
 
 const CANONICAL_GATE_IDS: [&str; 25] = [
@@ -6244,8 +6244,7 @@ fn unix_time_ms() -> Result<u128, XtaskError> {
 
 fn write_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, XtaskError> {
     let directory = root.join("target/quality/evidence");
-    let owned_directories =
-        OwnedDirectoryChain::create(root, &directory, OwnedLeaf::ExistingAllowed)?;
+    let owned_directories = OwnedDirectoryChain::create(root, &directory)?;
     let reservation = match AttemptReservation::reserve(root, &directory, evidence) {
         Ok(ReservationOutcome::Claimed(reservation)) => *reservation,
         Ok(ReservationOutcome::RetainedCollision { path }) => {
@@ -6267,13 +6266,107 @@ struct AttemptReservation {
     recovery_path: PathBuf,
     recovery_bytes: String,
     report_staging_path: PathBuf,
+    report_staging_area: Option<OwnedStagingReportArea>,
     report_final_path: PathBuf,
     report_staging_files: Vec<PathBuf>,
     report_final_files: Vec<PathBuf>,
-    report_staging_directories: OwnedDirectoryChain,
     report_final_directories: OwnedDirectoryChain,
     evidence: Evidence,
     collided: bool,
+}
+
+/// A publisher owns only its attempt-named staging leaf. The shared staging
+/// ancestor is a stable capability-managed infrastructure directory: a racer
+/// must never remove it while another publisher may still synchronize it.
+struct OwnedStagingReportArea {
+    root: DirectoryCapability,
+    target: DirectoryCapability,
+    quality: DirectoryCapability,
+    parent: DirectoryCapability,
+    leaf: DirectoryCapability,
+    root_identity: DirectoryIdentity,
+    target_identity: DirectoryIdentity,
+    quality_identity: DirectoryIdentity,
+    parent_identity: DirectoryIdentity,
+    leaf_identity: DirectoryIdentity,
+    leaf_name: String,
+}
+
+impl OwnedStagingReportArea {
+    fn create(root: &Path, attempt_id: &str) -> Result<Self, XtaskError> {
+        let root = DirectoryCapability::open(root, "engineering evidence workspace root")?;
+        let target =
+            root.open_or_create_child_directory("target", "engineering evidence target")?;
+        let quality =
+            target.open_or_create_child_directory("quality", "engineering evidence quality")?;
+        let parent = quality.open_or_create_child_directory(
+            "evidence-report-staging",
+            "engineering evidence staging infrastructure",
+        )?;
+        let leaf =
+            parent.create_child_directory(attempt_id, "attempt-owned evidence staging leaf")?;
+        Ok(Self {
+            root_identity: root.identity()?,
+            target_identity: target.identity()?,
+            quality_identity: quality.identity()?,
+            parent_identity: parent.identity()?,
+            leaf_identity: leaf.identity()?,
+            root,
+            target,
+            quality,
+            parent,
+            leaf,
+            leaf_name: attempt_id.to_owned(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.leaf.diagnostic_path()
+    }
+
+    fn require_identity(&self) -> Result<(), XtaskError> {
+        if self.root.identity()? != self.root_identity {
+            return Err(XtaskError::invalid_path(
+                self.root.diagnostic_path(),
+                "engineering evidence workspace root identity changed",
+            ));
+        }
+        self.root.require_child_directory_identity(
+            "target",
+            self.target_identity,
+            "engineering evidence target",
+        )?;
+        self.target.require_child_directory_identity(
+            "quality",
+            self.quality_identity,
+            "engineering evidence quality",
+        )?;
+        self.quality.require_child_directory_identity(
+            "evidence-report-staging",
+            self.parent_identity,
+            "engineering evidence staging infrastructure",
+        )?;
+        self.parent.require_child_directory_identity(
+            &self.leaf_name,
+            self.leaf_identity,
+            "attempt-owned evidence staging leaf",
+        )
+    }
+
+    fn sync(&self) -> Result<(), XtaskError> {
+        self.require_identity()?;
+        self.leaf.sync()?;
+        self.parent.sync()
+    }
+
+    fn cleanup_leaf(&self) -> Result<(), XtaskError> {
+        self.require_identity()?;
+        self.parent.remove_child_directory_by_identity(
+            &self.leaf_name,
+            self.leaf_identity,
+            "attempt-owned evidence staging leaf",
+        )
+    }
 }
 
 enum ReservationOutcome {
@@ -6433,12 +6526,12 @@ impl AttemptReservation {
             report_staging_path: root
                 .join("target/quality/evidence-report-staging")
                 .join(&evidence.attempt_id),
+            report_staging_area: None,
             report_final_path: root
                 .join("target/quality/evidence-reports")
                 .join(&evidence.attempt_id),
             report_staging_files: Vec::new(),
             report_final_files: Vec::new(),
-            report_staging_directories: OwnedDirectoryChain::default(),
             report_final_directories: OwnedDirectoryChain::default(),
             evidence,
             collided,
@@ -6459,16 +6552,27 @@ impl AttemptReservation {
         let final_parent = self.report_final_path.parent().ok_or_else(|| {
             XtaskError::invalid_path(&self.report_final_path, "report path has no parent")
         })?;
-        self.report_final_directories =
-            OwnedDirectoryChain::create(root, final_parent, OwnedLeaf::ExistingAllowed)?;
-        self.report_staging_directories =
-            OwnedDirectoryChain::create(root, &self.report_staging_path, OwnedLeaf::MustCreate)?;
+        self.report_final_directories = OwnedDirectoryChain::create(root, final_parent)?;
+        let staging_area = OwnedStagingReportArea::create(root, &self.evidence.attempt_id)?;
+        if staging_area.path() != self.report_staging_path {
+            return Err(XtaskError::invalid_path(
+                staging_area.path(),
+                "descriptor-created evidence staging leaf does not match the reserved attempt path",
+            ));
+        }
+        self.report_staging_area = Some(staging_area);
+        let staging_area = self.report_staging_area.as_ref().ok_or_else(|| {
+            XtaskError::invalid(
+                "engineering evidence staging",
+                "staging area was not retained",
+            )
+        })?;
         stage_raw_reports(
             &self.report_staging_path,
             &self.evidence,
             &mut self.report_staging_files,
         )?;
-        sync_directory(&self.report_staging_path)?;
+        staging_area.sync()?;
         claim_final_report_directory(
             &self.report_final_path,
             final_parent,
@@ -6482,7 +6586,7 @@ impl AttemptReservation {
         sync_directory(&self.report_final_path)?;
         sync_directory(final_parent)?;
         cleanup_owned_report_files(&self.report_staging_files)?;
-        self.report_staging_directories.cleanup_empty()?;
+        staging_area.cleanup_leaf()?;
         self.file
             .write_all(serialized.as_bytes())
             .and_then(|()| self.file.flush())
@@ -6517,7 +6621,9 @@ impl AttemptReservation {
             cleanup_owned_report_files(&self.report_staging_files),
             cleanup_owned_report_files(&self.report_final_files),
             cleanup_primary_evidence(&self.path),
-            self.report_staging_directories.cleanup_empty(),
+            self.report_staging_area
+                .as_ref()
+                .map_or(Ok(()), OwnedStagingReportArea::cleanup_leaf),
             self.report_final_directories.cleanup_empty(),
         ] {
             if let Err(cleanup_error) = cleanup {
@@ -6562,14 +6668,8 @@ struct OwnedDirectoryChain {
     created: Vec<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
-enum OwnedLeaf {
-    ExistingAllowed,
-    MustCreate,
-}
-
 impl OwnedDirectoryChain {
-    fn create(root: &Path, target: &Path, leaf: OwnedLeaf) -> Result<Self, XtaskError> {
+    fn create(root: &Path, target: &Path) -> Result<Self, XtaskError> {
         let relative = target.strip_prefix(root).map_err(|source| {
             XtaskError::invalid_path(
                 target,
@@ -6578,15 +6678,14 @@ impl OwnedDirectoryChain {
         })?;
         let mut chain = Self::default();
         let mut current = root.to_path_buf();
-        let component_count = relative.components().count();
-        if component_count == 0 {
+        if relative.as_os_str().is_empty() {
             return Err(XtaskError::invalid_path(
                 target,
                 "owned directory target must be below its evidence root",
             ));
         }
 
-        for (index, component) in relative.components().enumerate() {
+        for component in relative.components() {
             let Component::Normal(name) = component else {
                 return Err(chain.reconcile_failure(XtaskError::invalid_path(
                     target,
@@ -6595,7 +6694,6 @@ impl OwnedDirectoryChain {
             };
             let parent = current.clone();
             current.push(name);
-            let is_leaf = index + 1 == component_count;
             match fs::create_dir(&current) {
                 Ok(()) => {
                     chain.created.push(current.clone());
@@ -6604,12 +6702,6 @@ impl OwnedDirectoryChain {
                     }
                 },
                 Err(source) if source.kind() == ErrorKind::AlreadyExists => {
-                    if is_leaf && matches!(leaf, OwnedLeaf::MustCreate) {
-                        return Err(chain.reconcile_failure(XtaskError::invalid_path(
-                            &current,
-                            "owned evidence directory is already occupied",
-                        )));
-                    }
                     if !current.is_dir() {
                         return Err(chain.reconcile_failure(XtaskError::invalid_path(
                             &current,
