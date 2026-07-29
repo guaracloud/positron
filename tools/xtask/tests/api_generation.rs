@@ -17,7 +17,7 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> TestResult {
     let source = canonical_source()?
         .replace("rpc Negotiate(", "rpc Inspect(")
-        .replace("uint32 api_major = 1;", "uint32 requested_major = 3;");
+        .replacen("uint32 api_major = 1;", "uint32 requested_major = 3;", 1);
     let fixture = GeneratorFixture::create(&source)?;
     let result = (|| {
         fixture.assert_success()?;
@@ -27,7 +27,7 @@ fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> Tes
 
         assert!(rust.contains("CapabilityService/Inspect"));
         assert!(rust.contains("const GRPC_API_MAJOR_TAG: u8 = 24;"));
-        assert!(rust.contains("\"requested_major\""));
+        assert!(rust.contains("requested_major: u32"));
         assert!(openapi.contains("/v1/capabilities:inspect"));
         assert!(openapi.contains("\"operationId\": \"InspectCapabilityResponse\""));
         assert!(openapi.contains("\"requested_major\""));
@@ -35,6 +35,84 @@ fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> Tes
         assert!(http.contains("\"path\": \"/v1/capabilities:inspect\""));
         assert!(http.contains("\"proto\": \"requested_major\""));
         assert!(http.contains("\"number\": 3"));
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn response_field_changes_propagate_to_generated_schema_surfaces() -> TestResult {
+    let source =
+        canonical_source()?.replace("string schema_digest = 2;", "string source_digest = 7;");
+    let fixture = GeneratorFixture::create(&source)?;
+    let result = (|| {
+        fixture.assert_success()?;
+        let rust = fixture.read("crates/positron-api/src/generated.rs")?;
+        let openapi = fixture.read("api/positron/v1/openapi.json")?;
+        let http = fixture.read("api/positron/v1/http.json")?;
+
+        assert!(rust.contains("source_digest: SchemaDigest"));
+        assert!(openapi.contains("\"source_digest\""));
+        assert!(http.contains("\"proto\": \"source_digest\""));
+        assert!(http.contains("\"number\": 7"));
+        assert!(!rust.contains("schema_digest: SchemaDigest"));
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn public_error_field_changes_propagate_to_generated_schema_surfaces() -> TestResult {
+    let source = canonical_source()?.replace(
+        "SafeDetail safe_detail = 5;",
+        "SafeDetail redacted_detail = 9 [deprecated = true];",
+    );
+    let fixture = GeneratorFixture::create(&source)?;
+    let result = (|| {
+        fixture.assert_success()?;
+        let rust = fixture.read("crates/positron-api/src/generated.rs")?;
+        let openapi = fixture.read("api/positron/v1/openapi.json")?;
+        let http = fixture.read("api/positron/v1/http.json")?;
+
+        assert!(rust.contains("redacted_detail: SafeDetail"));
+        assert!(rust.contains("pub const fn redacted_detail"));
+        assert!(openapi.contains("\"redacted_detail\""));
+        assert!(openapi.contains("\"x-protobuf-field-number\": 9"));
+        assert!(openapi.contains("\"deprecated\": true"));
+        assert!(http.contains("\"proto\": \"redacted_detail\""));
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn capability_and_enum_value_changes_propagate_to_generated_schema_surfaces() -> TestResult {
+    let source = canonical_source()?
+        .replace(
+            "CAPABILITY_METRICS = 3;",
+            "CAPABILITY_METRICS = 9 [deprecated = true];",
+        )
+        .replace(
+            "CAPABILITY_AVAILABILITY_UNAVAILABLE = 2;",
+            "CAPABILITY_AVAILABILITY_UNAVAILABLE = 7;",
+        );
+    let fixture = GeneratorFixture::create(&source)?;
+    let result = (|| {
+        fixture.assert_success()?;
+        let rust = fixture.read("crates/positron-api/src/generated.rs")?;
+        let openapi = fixture.read("api/positron/v1/openapi.json")?;
+        let http = fixture.read("api/positron/v1/http.json")?;
+
+        assert!(rust.contains("Metrics = 9"));
+        assert!(rust.contains("Unavailable = 7"));
+        assert!(rust.contains("Self::Metrics => true"));
+        assert!(openapi.contains("\"enum\": [0, 1, 2, 9]"));
+        assert!(openapi.contains("\"enum\": [0, 1, 7, 3, 4]"));
+        assert!(http.contains("\"CAPABILITY_METRICS\", \"number\": 9, \"deprecated\": true"));
+        assert!(http.contains("\"CAPABILITY_AVAILABILITY_UNAVAILABLE\", \"number\": 7"));
         Ok(())
     })();
     fixture.remove()?;
@@ -58,7 +136,41 @@ fn ambiguous_request_field_numbers_fail_closed() -> TestResult {
     let source =
         canonical_source()?.replace("Capability capability = 2;", "Capability capability = 1;");
     let fixture = GeneratorFixture::create(&source)?;
-    let result = fixture.assert_failure_containing("request fields are missing or ambiguous");
+    let result = fixture
+        .assert_failure_containing("message `CapabilityRequest` fields are missing or ambiguous");
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn ambiguous_enum_numbers_fail_closed() -> TestResult {
+    let source = canonical_source()?.replace("CAPABILITY_METRICS = 3;", "CAPABILITY_METRICS = 2;");
+    let fixture = GeneratorFixture::create(&source)?;
+    let result = fixture.assert_failure_containing("values are missing, ambiguous, or unsupported");
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn unsupported_proto_constructs_fail_closed() -> TestResult {
+    let source = canonical_source()?.replace(
+        "string schema_digest = 2;",
+        "oneof digest_value {\n    string schema_digest = 2;\n  }",
+    );
+    let fixture = GeneratorFixture::create(&source)?;
+    let result = fixture.assert_failure_containing("request field");
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn unsupported_top_level_proto_constructs_fail_closed() -> TestResult {
+    let source = canonical_source()?.replace(
+        "package positron.v1;",
+        "package positron.v1;\nimport \"google/protobuf/empty.proto\";",
+    );
+    let fixture = GeneratorFixture::create(&source)?;
+    let result = fixture.assert_failure_containing("unsupported protobuf statement");
     fixture.remove()?;
     result
 }

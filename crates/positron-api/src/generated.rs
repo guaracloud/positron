@@ -23,29 +23,42 @@ impl ApiVersion {
     }
 }
 
-/// The concrete behaviors described by the generated capability statement.
+/// Generated closed values from `Capability`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum Capability {
-    /// This canonical generated public interface.
-    CanonicalPublicInterface,
-    /// Release 1 query behavior, which is known but not yet available.
-    ReleaseOneQuery,
-    /// Metrics, which is explicitly outside Release 1 product scope.
-    Metrics,
+    /// Generated from `CAPABILITY_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `CAPABILITY_CANONICAL_PUBLIC_INTERFACE`.
+    CanonicalPublicInterface = 1,
+    /// Generated from `CAPABILITY_RELEASE_ONE_QUERY`.
+    ReleaseOneQuery = 2,
+    /// Generated from `CAPABILITY_METRICS`.
+    Metrics = 3,
+}
+
+impl Capability {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::CanonicalPublicInterface => false,
+            Self::ReleaseOneQuery => false,
+            Self::Metrics => false,
+        }
+    }
 }
 
 impl Capability {
     const fn wire_value(self) -> u32 {
-        match self {
-            Self::CanonicalPublicInterface => 1,
-            Self::ReleaseOneQuery => 2,
-            Self::Metrics => 3,
-        }
+        self as u32
     }
 
     fn from_wire(value: u32, source: ApiFailureSource) -> Result<Self, ApiError> {
         match value {
-            0 | 1 => Ok(Self::CanonicalPublicInterface),
+            0 => Ok(Self::CanonicalPublicInterface),
+            1 => Ok(Self::CanonicalPublicInterface),
             2 => Ok(Self::ReleaseOneQuery),
             3 => Ok(Self::Metrics),
             _ => Err(ApiError::capability_unsupported(source)),
@@ -71,89 +84,205 @@ impl SchemaDigest {
     }
 }
 
-/// The closed availability truth returned by capability negotiation.
+/// Generated closed values from `CapabilityAvailability`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum CapabilityAvailability {
-    /// The requested API package is implemented by this server.
-    Implemented,
-    /// A known capability is not available in this server state.
-    Unavailable,
-    /// The server does not support the requested capability.
-    Unsupported,
-    /// The request requires an API package this server cannot interpret.
-    VersionIncompatible,
+    /// Generated from `CAPABILITY_AVAILABILITY_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `CAPABILITY_AVAILABILITY_IMPLEMENTED`.
+    Implemented = 1,
+    /// Generated from `CAPABILITY_AVAILABILITY_UNAVAILABLE`.
+    Unavailable = 2,
+    /// Generated from `CAPABILITY_AVAILABILITY_UNSUPPORTED`.
+    Unsupported = 3,
+    /// Generated from `CAPABILITY_AVAILABILITY_VERSION_INCOMPATIBLE`.
+    VersionIncompatible = 4,
 }
 
-/// The explicit public deprecation truth for a negotiated behavior.
+impl CapabilityAvailability {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Implemented => false,
+            Self::Unavailable => false,
+            Self::Unsupported => false,
+            Self::VersionIncompatible => false,
+        }
+    }
+}
+
+/// Generated closed values from `DeprecationState`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum DeprecationState {
-    /// The behavior is current and has no deprecation notice.
-    Current,
-    /// The behavior remains accepted but has a published replacement.
-    Deprecated,
+    /// Generated from `DEPRECATION_STATE_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `DEPRECATION_STATE_CURRENT`.
+    Current = 1,
+    /// Generated from `DEPRECATION_STATE_DEPRECATED`.
+    Deprecated = 2,
 }
 
-/// The closed retry classification attached to a public failure.
+impl DeprecationState {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Current => false,
+            Self::Deprecated => false,
+        }
+    }
+}
+
+/// Generated closed values from `RetryClass`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum RetryClass {
-    /// Retrying the same request cannot change the outcome.
-    Never,
-    /// The caller may retry after an owner-directed bounded backoff.
-    AfterBackoff,
-    /// The caller must first correct its input.
-    AfterInputCorrection,
+    /// Generated from `RETRY_CLASS_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `RETRY_CLASS_NEVER`.
+    Never = 1,
+    /// Generated from `RETRY_CLASS_AFTER_BACKOFF`.
+    AfterBackoff = 2,
+    /// Generated from `RETRY_CLASS_AFTER_INPUT_CORRECTION`.
+    AfterInputCorrection = 3,
 }
 
-/// The closed completion truth attached to a public failure.
+impl RetryClass {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Never => false,
+            Self::AfterBackoff => false,
+            Self::AfterInputCorrection => false,
+        }
+    }
+}
+
+/// Generated closed values from `CompletionState`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum CompletionState {
-    /// The request was rejected before work began.
-    Rejected,
+    /// Generated from `COMPLETION_STATE_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `COMPLETION_STATE_REJECTED`.
+    Rejected = 1,
 }
 
-/// Stable public error codes for the generated capability foundation.
+impl CompletionState {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Rejected => false,
+        }
+    }
+}
+
+/// Generated closed values from `PublicErrorCode`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum ApiErrorCode {
-    /// The requested API major has no compatible handler.
-    UnsupportedApiVersion,
-    /// The capability is known but unavailable in this server state.
-    CapabilityUnavailable,
-    /// The capability is outside this server's supported product scope.
-    CapabilityUnsupported,
-    /// The transport body cannot be decoded.
-    MalformedRequest,
-    /// The transport body exceeds its published bound.
-    RequestTooLarge,
-    /// The transport body contains a field this interface does not accept.
-    UnknownField,
+    /// Generated from `PUBLIC_ERROR_CODE_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `PUBLIC_ERROR_CODE_UNSUPPORTED_API_VERSION`.
+    UnsupportedApiVersion = 1,
+    /// Generated from `PUBLIC_ERROR_CODE_CAPABILITY_UNAVAILABLE`.
+    CapabilityUnavailable = 2,
+    /// Generated from `PUBLIC_ERROR_CODE_CAPABILITY_UNSUPPORTED`.
+    CapabilityUnsupported = 3,
+    /// Generated from `PUBLIC_ERROR_CODE_MALFORMED_REQUEST`.
+    MalformedRequest = 4,
+    /// Generated from `PUBLIC_ERROR_CODE_REQUEST_TOO_LARGE`.
+    RequestTooLarge = 5,
+    /// Generated from `PUBLIC_ERROR_CODE_UNKNOWN_FIELD`.
+    UnknownField = 6,
 }
 
-/// A non-secret semantic location for a public failure.
+impl ApiErrorCode {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::UnsupportedApiVersion => false,
+            Self::CapabilityUnavailable => false,
+            Self::CapabilityUnsupported => false,
+            Self::MalformedRequest => false,
+            Self::RequestTooLarge => false,
+            Self::UnknownField => false,
+        }
+    }
+}
+
+/// Generated closed values from `FailureSource`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum ApiFailureSource {
-    /// API package negotiation rejected the request.
-    CapabilityNegotiation,
-    /// The generated gRPC protobuf boundary rejected the body.
-    GrpcDecode,
-    /// The generated HTTP JSON boundary rejected the body.
-    HttpDecode,
+    /// Generated from `FAILURE_SOURCE_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `FAILURE_SOURCE_CAPABILITY_NEGOTIATION`.
+    CapabilityNegotiation = 1,
+    /// Generated from `FAILURE_SOURCE_GRPC_DECODE`.
+    GrpcDecode = 2,
+    /// Generated from `FAILURE_SOURCE_HTTP_DECODE`.
+    HttpDecode = 3,
 }
 
-/// Closed, redaction-safe detail for every public failure.
+impl ApiFailureSource {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::CapabilityNegotiation => false,
+            Self::GrpcDecode => false,
+            Self::HttpDecode => false,
+        }
+    }
+}
+
+/// Generated closed values from `SafeDetail`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum SafeDetail {
-    /// The requested API major is not supported.
-    ApiMajorUnsupported,
-    /// The known capability is not available.
-    CapabilityNotAvailable,
-    /// The requested capability is not supported.
-    CapabilityNotSupported,
-    /// The request body is malformed.
-    RequestMalformed,
-    /// The request body exceeds the declared limit.
-    RequestLimitExceeded,
-    /// A request field is not recognized.
-    FieldNotRecognized,
+    /// Generated from `SAFE_DETAIL_UNSPECIFIED`.
+    Unspecified = 0,
+    /// Generated from `SAFE_DETAIL_API_MAJOR_UNSUPPORTED`.
+    ApiMajorUnsupported = 1,
+    /// Generated from `SAFE_DETAIL_CAPABILITY_NOT_AVAILABLE`.
+    CapabilityNotAvailable = 2,
+    /// Generated from `SAFE_DETAIL_CAPABILITY_NOT_SUPPORTED`.
+    CapabilityNotSupported = 3,
+    /// Generated from `SAFE_DETAIL_REQUEST_MALFORMED`.
+    RequestMalformed = 4,
+    /// Generated from `SAFE_DETAIL_REQUEST_LIMIT_EXCEEDED`.
+    RequestLimitExceeded = 5,
+    /// Generated from `SAFE_DETAIL_FIELD_NOT_RECOGNIZED`.
+    FieldNotRecognized = 6,
+}
+
+impl SafeDetail {
+    /// Returns the protobuf deprecation option for this value.
+    #[must_use]
+    pub const fn is_deprecated(self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::ApiMajorUnsupported => false,
+            Self::CapabilityNotAvailable => false,
+            Self::CapabilityNotSupported => false,
+            Self::RequestMalformed => false,
+            Self::RequestLimitExceeded => false,
+            Self::FieldNotRecognized => false,
+        }
+    }
 }
 
 /// A closed typed public failure with no caller-controlled diagnostic text.
@@ -298,7 +427,7 @@ impl CapabilityRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilityResponse {
     availability: CapabilityAvailability,
-    api_version: ApiVersion,
+    api_major: ApiVersion,
     schema_digest: SchemaDigest,
     refusal: Option<ApiError>,
     deprecation: DeprecationState,
@@ -314,8 +443,8 @@ impl CapabilityResponse {
 
     /// Returns the negotiated public API package.
     #[must_use]
-    pub const fn api_version(self) -> ApiVersion {
-        self.api_version
+    pub const fn api_major(self) -> ApiVersion {
+        self.api_major
     }
 
     /// Returns the generated source identity.
@@ -414,10 +543,46 @@ impl EncodedRequest {
     }
 }
 
+/// Published allocation and copy bounds for generated client encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientEncodingBounds;
+
+impl ClientEncodingBounds {
+    /// Maximum emitted body bytes for either generated transport.
+    #[must_use]
+    pub const fn maximum_body_bytes(self) -> usize {
+        MAX_PUBLIC_REQUEST_BYTES
+    }
+
+    /// One 64-byte body buffer is reserved before encoding.
+    #[must_use]
+    pub const fn maximum_heap_buffers(self) -> usize {
+        1
+    }
+
+    /// Encoding creates no intermediate heap-backed body.
+    #[must_use]
+    pub const fn maximum_intermediate_heap_bytes(self) -> usize {
+        0
+    }
+
+    /// Encoding never copies a completed body into another buffer.
+    #[must_use]
+    pub const fn maximum_full_body_copies(self) -> usize {
+        0
+    }
+}
+
 /// Generated client encoder contract with no I/O or ambient authority.
 pub struct CapabilityClient;
 
 impl CapabilityClient {
+    /// Returns the externally reachable client encoding resource contract.
+    #[must_use]
+    pub const fn encoding_bounds() -> ClientEncodingBounds {
+        ClientEncodingBounds
+    }
+
     /// Encodes one typed request into its bounded generated transport body.
     pub fn encode(
         request: CapabilityRequest,
@@ -440,7 +605,7 @@ impl CapabilityService {
         if request.api_major != ApiVersion::V1.major() {
             return CapabilityResponse {
                 availability: CapabilityAvailability::VersionIncompatible,
-                api_version: ApiVersion::V1,
+                api_major: ApiVersion::V1,
                 schema_digest: SchemaDigest::canonical(),
                 refusal: Some(ApiError::unsupported_api_version()),
                 deprecation: DeprecationState::Current,
@@ -448,9 +613,9 @@ impl CapabilityService {
             };
         }
         match request.capability {
-            Capability::CanonicalPublicInterface => CapabilityResponse {
+            Capability::Unspecified | Capability::CanonicalPublicInterface => CapabilityResponse {
                 availability: CapabilityAvailability::Implemented,
-                api_version: ApiVersion::V1,
+                api_major: ApiVersion::V1,
                 schema_digest: SchemaDigest::canonical(),
                 refusal: None,
                 deprecation: DeprecationState::Current,
@@ -458,7 +623,7 @@ impl CapabilityService {
             },
             Capability::ReleaseOneQuery => CapabilityResponse {
                 availability: CapabilityAvailability::Unavailable,
-                api_version: ApiVersion::V1,
+                api_major: ApiVersion::V1,
                 schema_digest: SchemaDigest::canonical(),
                 refusal: Some(ApiError::capability_unavailable()),
                 deprecation: DeprecationState::Current,
@@ -466,7 +631,7 @@ impl CapabilityService {
             },
             Capability::Metrics => CapabilityResponse {
                 availability: CapabilityAvailability::Unsupported,
-                api_version: ApiVersion::V1,
+                api_major: ApiVersion::V1,
                 schema_digest: SchemaDigest::canonical(),
                 refusal: Some(ApiError::capability_unsupported(
                     ApiFailureSource::CapabilityNegotiation,
@@ -506,13 +671,39 @@ fn encode_grpc(request: CapabilityRequest) -> Result<EncodedRequest, ApiError> {
 fn encode_http(request: CapabilityRequest) -> Result<EncodedRequest, ApiError> {
     let source = ApiFailureSource::HttpDecode;
     let mut encoded = EncodedRequest::empty("/v1/capabilities:negotiate");
-    let body = format!(
-        r#"{{"api_major":{},"capability":{}}}"#,
-        request.api_major,
-        request.capability.wire_value()
-    );
-    encoded.extend(body.as_bytes(), source)?;
+    encoded.extend(b"{\"api_major\":", source)?;
+    encode_json_u32(request.api_major, &mut encoded, source)?;
+    encoded.extend(b",\"capability\":", source)?;
+    encode_json_u32(request.capability.wire_value(), &mut encoded, source)?;
+    encoded.extend(b"}", source)?;
     Ok(encoded)
+}
+
+fn encode_json_u32(
+    mut value: u32,
+    encoded: &mut EncodedRequest,
+    source: ApiFailureSource,
+) -> Result<(), ApiError> {
+    if value == 0 {
+        return encoded.push(b'0', source);
+    }
+    let mut digits = [0_u8; 10];
+    let mut cursor = digits.len();
+    while value != 0 {
+        cursor = cursor
+            .checked_sub(1)
+            .ok_or_else(|| ApiError::too_large(source))?;
+        let digit = u8::try_from(value % 10).map_err(|_| ApiError::malformed(source))?;
+        let Some(slot) = digits.get_mut(cursor) else {
+            return Err(ApiError::too_large(source));
+        };
+        *slot = b'0' + digit;
+        value /= 10;
+    }
+    let Some(decimal) = digits.get(cursor..) else {
+        return Err(ApiError::malformed(source));
+    };
+    encoded.extend(decimal, source)
 }
 
 fn encode_varint(

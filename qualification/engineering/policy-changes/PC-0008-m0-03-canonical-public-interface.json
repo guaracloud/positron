@@ -67,6 +67,41 @@
       "result": "Five bounded generator tests passed. RPC, request field name, and request field number mutations propagated to generated Rust, HTTP, and OpenAPI; ambiguous declarations, duplicate field numbers, and oversized sources failed closed; repeated generation was byte-identical."
     },
     {
+      "id": "canonical-model-red-final-review-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p xtask --test api_generation response_field_changes_propagate_to_generated_schema_surfaces",
+      "result": "The response-field mutation test failed because the bounded generator did not yet derive the changed response field from the canonical Protobuf model."
+    },
+    {
+      "id": "http-client-allocation-red-final-review-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p positron-api --test canonical_public_interface http_client_publishes_and_honors_its_single_buffer_encoding_bound",
+      "result": "The public allocation-contract test failed to compile because CapabilityClient did not yet publish its encoding bounds."
+    },
+    {
+      "id": "unsupported-top-level-construct-red-final-review-remediation",
+      "status": "failed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p xtask --test api_generation unsupported_top_level_proto_constructs_fail_closed",
+      "result": "The unsupported-import regression test failed because the bounded parser had not yet rejected unsupported top-level Protobuf statements."
+    },
+    {
+      "id": "canonical-model-green-final-review-remediation",
+      "status": "passed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p xtask --test api_generation",
+      "result": "Eleven bounded generator tests passed. Request and response messages, PublicError, Capability and seven supporting enums, field and enum numbers, and supported deprecation options propagate from the canonical Protobuf model to generated Rust, HTTP, and OpenAPI. Ambiguous numbers, unsupported nested or top-level constructs, oversized sources, extra declarations, and ambiguous declarations fail closed; repeated generation is byte-identical."
+    },
+    {
+      "id": "http-client-allocation-green-final-review-remediation",
+      "status": "passed-local-diagnostic",
+      "source_dirty": true,
+      "command": "cargo test -p positron-api --test canonical_public_interface",
+      "result": "Ten deterministic public tests passed. HTTP client encoding publishes and honors one pre-reserved 64-byte heap buffer, a 10-byte stack-only decimal scratch area, zero intermediate heap-body bytes, and zero completed-body copies."
+    },
+    {
       "id": "dependency-vet-and-deny-green",
       "status": "passed-local-diagnostic",
       "source_dirty": true,
@@ -79,6 +114,8 @@
   ],
   "detection_gained": [
     "one bounded parsed versioned Protobuf source generates the Rust, gRPC and HTTP decode mapping, client contract, OpenAPI, and Schema Digest foundations",
+    "the bounded canonical model covers required request, response, PublicError, Capability, supporting-enum, field-number, enum-number, and supported deprecation semantics while rejecting ambiguity and unsupported constructs",
+    "the HTTP client publishes and tests an exact one-buffer allocation contract with no intermediate heap body and no completed-body copy",
     "the public contract proves implemented, unavailable, unsupported, and version-incompatible capability outcomes with safe typed errors and no wire or domain leakage",
     "the canonical artifact scope cannot return to scaffold, accept unknown fields, exceed its 64-byte request bound, or drift from deterministic generation",
     "the authoritative EXT runner owns M0-03 coverage and the explicit exact-selector mutation campaign without changing routine PR selection"

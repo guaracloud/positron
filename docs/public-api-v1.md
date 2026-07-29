@@ -34,7 +34,10 @@ surface is `current`; no v1 behavior is deprecated by this milestone.
 Generated gRPC protobuf and HTTP/JSON capability request bodies are limited to
 64 bytes. Decoding rejects malformed bodies, duplicate fields, unknown fields,
 unknown capability values, and oversized bodies. Client encoding allocates at
-most the same 64-byte body and performs no I/O.
+most one heap buffer, reserves that buffer once at the 64-byte body limit, and
+performs no I/O. HTTP/JSON encoding writes directly into that buffer: decimal
+conversion uses a 10-byte stack scratch area, with zero intermediate heap-body
+bytes and zero completed-body copies.
 
 Public failures contain only a stable code, safe closed detail, retry class,
 completion state, and source. Caller text is never reflected. Input failures

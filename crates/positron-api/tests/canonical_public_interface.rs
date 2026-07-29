@@ -12,7 +12,7 @@ fn v1_capability_statement_is_typed_and_bound_to_the_canonical_schema() {
 
     assert_eq!(ApiVersion::V1.major(), 1);
     assert_eq!(response.availability(), CapabilityAvailability::Implemented);
-    assert_eq!(response.api_version(), ApiVersion::V1);
+    assert_eq!(response.api_major(), ApiVersion::V1);
     assert_eq!(response.schema_digest(), SchemaDigest::canonical());
     assert_eq!(
         response.schema_digest().as_str(),
@@ -120,6 +120,26 @@ fn generated_grpc_and_http_clients_map_to_the_same_checked_outcome() -> Result<(
         grpc_response.availability(),
         CapabilityAvailability::Unavailable
     );
+    Ok(())
+}
+
+#[test]
+fn http_client_publishes_and_honors_its_single_buffer_encoding_bound() -> Result<(), std::io::Error>
+{
+    let bounds = CapabilityClient::encoding_bounds();
+    let request = CapabilityRequest::unknown(u32::MAX, Capability::Metrics);
+    let encoded = CapabilityClient::encode(request, Transport::HttpJson)
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+
+    assert_eq!(bounds.maximum_body_bytes(), MAX_PUBLIC_REQUEST_BYTES);
+    assert_eq!(bounds.maximum_heap_buffers(), 1);
+    assert_eq!(bounds.maximum_intermediate_heap_bytes(), 0);
+    assert_eq!(bounds.maximum_full_body_copies(), 0);
+    assert_eq!(
+        encoded.as_bytes(),
+        br#"{"api_major":4294967295,"capability":3}"#
+    );
+    assert!(encoded.as_bytes().len() <= bounds.maximum_body_bytes());
     Ok(())
 }
 
