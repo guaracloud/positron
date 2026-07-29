@@ -5,9 +5,10 @@ The canonical hand-edited contract is
 source and the Rust-owned Configuration Contract, then deterministically
 produces the Rust contract, gRPC and HTTP/JSON mappings, OpenAPI description,
 generated client request surface, SHA-256 Schema Digest, JSON Schema, and
-reference documentation. `cargo xtask verify-generation` rejects checked
-generated output that is not byte-identical to that regeneration. Generated
-files are not edited directly.
+reference documentation plus bounded API and configuration validation
+fixtures. `cargo xtask verify-generation` rejects checked generated output
+that is not byte-identical to that regeneration. Generated files are not
+edited directly.
 
 This milestone exposes an in-memory contract and generated transport mapping;
 it does not start a listener, publish an SDK, or implement query execution.

@@ -14,6 +14,26 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn generation_publishes_positive_boundary_negative_and_adversarial_validation_fixtures()
+-> TestResult {
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    let result = (|| {
+        fixture.assert_success()?;
+        let validation = fixture.read("configuration/validation-fixtures.json")?;
+        for class in ["positive", "boundary", "negative", "adversarial"] {
+            assert!(validation.contains(&format!("\"class\": \"{class}\"")));
+        }
+        assert!(validation.contains("schema_version = 1"));
+        assert!(validation.contains("shutdown_grace_seconds = 3600"));
+        assert!(validation.contains("unknown.setting"));
+        assert!(validation.contains("maximum_document_bytes"));
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
 fn canonical_setting_changes_propagate_to_schema_and_reference() -> TestResult {
     let source = canonical_source()?.replace(
         "RuntimeShutdownGraceSeconds | \"runtime.shutdown_grace_seconds\" | Integer | \"30\" | UnsignedIntegerRange(1, 3600)",
@@ -24,10 +44,13 @@ fn canonical_setting_changes_propagate_to_schema_and_reference() -> TestResult {
         fixture.assert_success()?;
         let schema = fixture.read("configuration/schema.json")?;
         let reference = fixture.read("configuration/reference.md")?;
+        let validation = fixture.read("configuration/validation-fixtures.json")?;
         assert!(schema.contains("\"maximum\": 7200"));
         assert!(reference.contains("`45`"));
+        assert!(validation.contains("shutdown_grace_seconds = 7200"));
         assert!(!schema.contains("\"maximum\": 3600"));
         assert!(!reference.contains("`30`"));
+        assert!(!validation.contains("shutdown_grace_seconds = 3600"));
         fixture.assert_mutated_runtime_uses_default_and_range(45, 7200)?;
         Ok(())
     })();
@@ -136,10 +159,14 @@ impl GeneratorFixture {
     }
 
     fn generated_artifacts(&self) -> TestResult<Vec<Vec<u8>>> {
-        ["configuration/schema.json", "configuration/reference.md"]
-            .iter()
-            .map(|path| Ok(fs::read(self.root.join(path))?))
-            .collect()
+        [
+            "configuration/schema.json",
+            "configuration/reference.md",
+            "configuration/validation-fixtures.json",
+        ]
+        .iter()
+        .map(|path| Ok(fs::read(self.root.join(path))?))
+        .collect()
     }
 
     fn assert_mutated_runtime_uses_default_and_range(

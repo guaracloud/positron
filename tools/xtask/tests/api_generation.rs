@@ -14,6 +14,27 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn generation_publishes_cross_transport_validation_fixtures_for_each_required_class() -> TestResult
+{
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    let result = (|| {
+        fixture.assert_success()?;
+        let validation = fixture.read("api/positron/v1/validation-fixtures.json")?;
+        for class in ["positive", "boundary", "negative", "adversarial"] {
+            assert!(validation.contains(&format!("\"class\": \"{class}\"")));
+        }
+        assert!(validation.contains("grpc_hex"));
+        assert!(validation.contains("http_json"));
+        assert!(validation.contains("CAPABILITY_AVAILABILITY_IMPLEMENTED"));
+        assert!(validation.contains("PUBLIC_ERROR_CODE_UNKNOWN_FIELD"));
+        assert!(validation.contains("PUBLIC_ERROR_CODE_MALFORMED_REQUEST"));
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
 fn combined_generation_emits_every_public_api_and_configuration_artifact_twice() -> TestResult {
     let fixture = GeneratorFixture::create(&canonical_source()?)?;
     fixture.copy_configuration_source()?;
@@ -46,6 +67,59 @@ fn generation_verification_rejects_a_hand_edited_checked_artifact() -> TestResul
 }
 
 #[test]
+fn generation_verification_preserves_every_simultaneously_drifted_artifact() -> TestResult {
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    fixture.copy_configuration_source()?;
+    let result = (|| {
+        fixture.assert_combined_success()?;
+        let api_drift = b"hand-edited OpenAPI\n";
+        let configuration_drift = b"hand-edited configuration schema\n";
+        fs::write(fixture.root.join("api/positron/v1/openapi.json"), api_drift)?;
+        fs::write(
+            fixture.root.join("configuration/schema.json"),
+            configuration_drift,
+        )?;
+        fixture.assert_verification_failure_containing("not clean and deterministic")?;
+        assert_eq!(
+            fs::read(fixture.root.join("api/positron/v1/openapi.json"))?,
+            api_drift
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("configuration/schema.json"))?,
+            configuration_drift
+        );
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn generation_verification_restores_outputs_when_a_later_generator_fails() -> TestResult {
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    fixture.copy_configuration_source()?;
+    let result = (|| {
+        fixture.assert_combined_success()?;
+        let api_drift = b"hand-edited OpenAPI before configuration failure\n";
+        fs::write(fixture.root.join("api/positron/v1/openapi.json"), api_drift)?;
+        let configuration_path = fixture.root.join("crates/positron-config/src/contract.rs");
+        let invalid_configuration = fs::read_to_string(&configuration_path)?.replace(
+            "pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 7] = define_settings! {",
+            "pub(crate) const SETTING_DEFINITIONS = define_settings! {",
+        );
+        fs::write(configuration_path, invalid_configuration)?;
+        fixture.assert_verification_failure_containing("header is not exact")?;
+        assert_eq!(
+            fs::read(fixture.root.join("api/positron/v1/openapi.json"))?,
+            api_drift
+        );
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
 fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> TestResult {
     let source = canonical_source()?
         .replace("rpc Negotiate(", "rpc Inspect(")
@@ -56,6 +130,7 @@ fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> Tes
         let rust = fixture.read("crates/positron-api/src/generated.rs")?;
         let openapi = fixture.read("api/positron/v1/openapi.json")?;
         let http = fixture.read("api/positron/v1/http.json")?;
+        let validation = fixture.read("api/positron/v1/validation-fixtures.json")?;
 
         assert!(rust.contains("CapabilityService/Inspect"));
         assert!(rust.contains("const GRPC_API_MAJOR_TAG: u8 = 24;"));
@@ -67,6 +142,7 @@ fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> Tes
         assert!(http.contains("\"path\": \"/v1/capabilities:inspect\""));
         assert!(http.contains("\"proto\": \"requested_major\""));
         assert!(http.contains("\"number\": 3"));
+        assert!(validation.contains("\\\"requested_major\\\":1"));
         Ok(())
     })();
     fixture.remove()?;
@@ -333,6 +409,7 @@ impl GeneratorFixture {
             "api/positron/v1/schema.sha256",
             "api/positron/v1/openapi.json",
             "api/positron/v1/http.json",
+            "api/positron/v1/validation-fixtures.json",
         ]
         .iter()
         .map(|path| Ok(fs::read(self.root.join(path))?))
@@ -345,8 +422,10 @@ impl GeneratorFixture {
             "api/positron/v1/schema.sha256",
             "api/positron/v1/openapi.json",
             "api/positron/v1/http.json",
+            "api/positron/v1/validation-fixtures.json",
             "configuration/schema.json",
             "configuration/reference.md",
+            "configuration/validation-fixtures.json",
         ]
         .iter()
         .map(|path| Ok(fs::read(self.root.join(path))?))

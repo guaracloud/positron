@@ -1500,6 +1500,7 @@ fn restore_m0_01_api_source_shape(root: &Path) -> TestResult {
         "api/positron/v1/openapi.json",
         "api/positron/v1/positron.proto",
         "api/positron/v1/schema.sha256",
+        "api/positron/v1/validation-fixtures.json",
     ] {
         let path = root.join(path);
         if path.is_file() {

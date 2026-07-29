@@ -12,6 +12,7 @@ const GENERATED_RUST: &str = crate::generation::API_RUST;
 const SCHEMA_DIGEST: &str = crate::generation::API_SCHEMA_DIGEST;
 const OPENAPI: &str = crate::generation::API_OPENAPI;
 const HTTP_MAPPING: &str = crate::generation::API_HTTP_MAPPING;
+const VALIDATION_FIXTURES: &str = crate::generation::API_VALIDATION_FIXTURES;
 const MAX_SOURCE_BYTES: usize = 65_536;
 const MAX_DECLARATIONS: usize = 128;
 
@@ -75,6 +76,11 @@ pub(crate) fn generate(root: &Path) -> Result<(), XtaskError> {
     write_generated(root, SCHEMA_DIGEST, &format!("{digest}\n"))?;
     write_generated(root, OPENAPI, &openapi(&model, &digest)?)?;
     write_generated(root, HTTP_MAPPING, &http_mapping(&model, &digest)?)?;
+    write_generated(
+        root,
+        VALIDATION_FIXTURES,
+        &validation_fixtures(&model, &digest)?,
+    )?;
     Ok(())
 }
 
@@ -655,6 +661,75 @@ fn required_field<'a>(message: &'a ProtoMessage, kind: &str) -> Result<&'a Proto
                 format!("message `{}` is missing `{kind}`", message.name),
             )
         })
+}
+
+fn validation_fixtures(model: &ApiModel, digest: &str) -> Result<String, XtaskError> {
+    let api_major = required_field(&model.request, "uint32")?;
+    let capability = required_field(&model.request, "Capability")?;
+    let canonical = required_variant(&model.capability, "CAPABILITY_CANONICAL_PUBLIC_INTERFACE")?;
+    let unknown_field = (1_u8..=127)
+        .find(|number| {
+            model
+                .request
+                .fields
+                .iter()
+                .all(|field| field.number != *number)
+        })
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "canonical API model",
+                "no bounded unknown validation field remains",
+            )
+        })?;
+    let current_grpc = format!(
+        "{}{}",
+        protobuf_field_hex(api_major.number, 1),
+        protobuf_field_hex(capability.number, canonical.number),
+    );
+    let maximum_grpc = format!(
+        "{}{}",
+        protobuf_field_hex(api_major.number, u32::MAX),
+        protobuf_field_hex(capability.number, canonical.number),
+    );
+    let unknown_grpc = format!("{current_grpc}{}", protobuf_field_hex(unknown_field, 1));
+    let malformed_grpc = format!(
+        "{}ff",
+        protobuf_varint_hex(u32::from(api_major.number) << 3)
+    );
+    Ok(format!(
+        "{{\n  \"schema_version\": 1,\n  \"generated_from\": \"{SOURCE}\",\n  \"schema_digest\": \"{digest}\",\n  \"cases\": [\n    {{\"id\": \"current-client\", \"class\": \"positive\", \"grpc_hex\": \"{current_grpc}\", \"http_json\": \"{{\\\"{}\\\":1,\\\"{}\\\":{}}}\", \"expected_availability\": \"CAPABILITY_AVAILABILITY_IMPLEMENTED\", \"expected_error\": \"PUBLIC_ERROR_CODE_UNSPECIFIED\"}},\n    {{\"id\": \"maximum-api-major\", \"class\": \"boundary\", \"grpc_hex\": \"{maximum_grpc}\", \"http_json\": \"{{\\\"{}\\\":4294967295,\\\"{}\\\":{}}}\", \"expected_availability\": \"CAPABILITY_AVAILABILITY_VERSION_INCOMPATIBLE\", \"expected_error\": \"PUBLIC_ERROR_CODE_UNSUPPORTED_API_VERSION\"}},\n    {{\"id\": \"unknown-field\", \"class\": \"negative\", \"grpc_hex\": \"{unknown_grpc}\", \"http_json\": \"{{\\\"{}\\\":1,\\\"{}\\\":{},\\\"unknown\\\":1}}\", \"expected_error\": \"PUBLIC_ERROR_CODE_UNKNOWN_FIELD\"}},\n    {{\"id\": \"truncated-input\", \"class\": \"adversarial\", \"grpc_hex\": \"{malformed_grpc}\", \"http_json\": \"{{\", \"expected_error\": \"PUBLIC_ERROR_CODE_MALFORMED_REQUEST\"}}\n  ]\n}}\n",
+        api_major.name,
+        capability.name,
+        canonical.number,
+        api_major.name,
+        capability.name,
+        canonical.number,
+        api_major.name,
+        capability.name,
+        canonical.number,
+    ))
+}
+
+fn protobuf_field_hex(number: u8, value: u32) -> String {
+    format!(
+        "{}{}",
+        protobuf_varint_hex(u32::from(number) << 3),
+        protobuf_varint_hex(value)
+    )
+}
+
+fn protobuf_varint_hex(mut value: u32) -> String {
+    let mut output = String::with_capacity(10);
+    loop {
+        let [least, _, _, _] = value.to_le_bytes();
+        let low = least & 0x7f;
+        value >>= 7;
+        let byte = if value == 0 { low } else { low | 0x80 };
+        output.push_str(&format!("{byte:02x}"));
+        if value == 0 {
+            return output;
+        }
+    }
 }
 
 fn required_variant<'a>(

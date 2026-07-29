@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "generated_from": "crates/positron-config/src/contract.rs",
+  "maximum_document_bytes": 16384,
+  "cases": [
+    {"id": "minimal-valid-document", "class": "positive", "toml": "schema_version = 1\n", "expected": "accepted"},
+    {"id": "shutdown-upper-bound", "class": "boundary", "toml": "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 3600\n", "expected": "accepted"},
+    {"id": "unknown-setting", "class": "negative", "toml": "schema_version = 1\nunknown.setting = true\n", "expected": "unknown_setting"},
+    {"id": "oversized-document", "class": "adversarial", "recipe": {"repeat": "#", "bytes": 16385}, "expected": "resource_limit"}
+  ]
+}

@@ -665,7 +665,7 @@ fn execute_gate(
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
     crate::generation::verify(root)?;
-    Ok("canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, and Schema Digest".to_owned())
+    Ok("canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, Schema Digest, and validation fixtures".to_owned())
 }
 
 fn run_dynamic_analysis_gate(
@@ -3720,8 +3720,10 @@ mod tests {
             "api/positron/v1/http.json",
             "api/positron/v1/openapi.json",
             "api/positron/v1/schema.sha256",
+            "api/positron/v1/validation-fixtures.json",
             "configuration/reference.md",
             "configuration/schema.json",
+            "configuration/validation-fixtures.json",
             "crates/positron-api/src/generated.rs",
             "crates/positron-config/src/contract.rs",
         ] {
