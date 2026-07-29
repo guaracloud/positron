@@ -2763,13 +2763,7 @@ fn registered_runner_command_matches(
                         "--all-features",
                     ]
         },
-        "dependencies" => match index {
-            0 => {
-                program == "cargo-machete" && args == ["--with-metadata", "--skip-target-dir", "."]
-            },
-            1 => program == "cargo" && args == ["deny", "check", "bans", "licenses", "sources"],
-            _ => false,
-        },
+        "dependencies" => registered_dependency_command_matches(index, program, &args),
         "documentation" => {
             (program == "cargo"
                 && args
@@ -2857,6 +2851,15 @@ fn registered_runner_command_matches(
         },
         "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
         | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => false,
+        _ => false,
+    }
+}
+
+fn registered_dependency_command_matches(index: usize, program: &str, args: &[&str]) -> bool {
+    match index {
+        0 => program == "cargo" && args == ["metadata", "--locked", "--format-version", "1"],
+        1 => program == "cargo-machete" && args == ["--with-metadata", "--skip-target-dir", "."],
+        2 => program == "cargo" && args == ["deny", "check", "bans", "licenses", "sources"],
         _ => false,
     }
 }
@@ -6976,10 +6979,11 @@ mod tests {
         MAXIMUM_RESOLVED_PROGRAM_CHARACTERS, NotApplicableReason, Options, Profile,
         RawReportBinding, RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
         character_count_in_range, evidence_json, gate_invocation_json, json_string,
-        parse_gate_invocation_value, raw_report_json_with_limit, run_generation_matrix_gate,
-        sha256_digest, unavailable_evidence_identity, valid_hex_identity,
-        valid_raw_report_schema_path, valid_sha256_digest,
-        validate_configuration_parser_threat_model_text, validate_serialized_evidence,
+        parse_gate_invocation_value, raw_report_json_with_limit,
+        registered_dependency_command_matches, run_generation_matrix_gate, sha256_digest,
+        unavailable_evidence_identity, valid_hex_identity, valid_raw_report_schema_path,
+        valid_sha256_digest, validate_configuration_parser_threat_model_text,
+        validate_serialized_evidence,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -7411,6 +7415,30 @@ mod tests {
             parse_gate_invocation_value(value, std::path::Path::new("retained-invocation.json"))?;
         assert_eq!(parsed.typed.arguments, invocation.arguments);
         Ok(())
+    }
+
+    #[test]
+    fn dependency_runner_matches_each_registered_controlled_step_in_order() {
+        assert!(registered_dependency_command_matches(
+            0,
+            "cargo",
+            &["metadata", "--locked", "--format-version", "1"]
+        ));
+        assert!(registered_dependency_command_matches(
+            1,
+            "cargo-machete",
+            &["--with-metadata", "--skip-target-dir", "."]
+        ));
+        assert!(registered_dependency_command_matches(
+            2,
+            "cargo",
+            &["deny", "check", "bans", "licenses", "sources"]
+        ));
+        assert!(!registered_dependency_command_matches(
+            0,
+            "cargo-machete",
+            &["--with-metadata", "--skip-target-dir", "."]
+        ));
     }
 
     #[test]
