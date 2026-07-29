@@ -400,10 +400,12 @@ fn http_u32_values_require_canonical_integer_grammar() {
         &br#"{"api_major":+1}"#[..],
         &br#"{"api_major":01}"#[..],
         &br#"{"api_major":-1}"#[..],
-        &br#"{"api_major": 1}"#[..],
-        &br#"{"api_major":1 }"#[..],
         &br#"{"api_major":1e0}"#[..],
         &br#"{"api_major":1.0}"#[..],
+        &br#"{"api_major":1 0}"#[..],
+        &b"{\"api_major\":1\t0}"[..],
+        &b"{\"api_major\":1\r0}"[..],
+        &b"{\"api_major\":1\n0}"[..],
         &br#"{"api_major":1,"capability":+1}"#[..],
         &br#"{"api_major":1,"capability":01}"#[..],
     ] {
@@ -411,6 +413,21 @@ fn http_u32_values_require_canonical_integer_grammar() {
         assert_eq!(
             result.map_err(|error| error.code()),
             Err(ApiErrorCode::MalformedRequest)
+        );
+    }
+
+    for bytes in [
+        &br#"{"api_major": 1}"#[..],
+        &br#"{"api_major":1 }"#[..],
+        &b"\t{\r\n\"api_major\"\t:\r1 \n,\t\"capability\" :\n0\r}\n"[..],
+    ] {
+        let response = CapabilityService::decode_and_negotiate(Transport::HttpJson, bytes);
+        assert_eq!(
+            response.map(|value| (value.availability(), value.capability())),
+            Ok((
+                CapabilityAvailability::Implemented,
+                Capability::CanonicalPublicInterface
+            ))
         );
     }
 

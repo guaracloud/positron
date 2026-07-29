@@ -1422,6 +1422,7 @@ fn decode_http(body: &[u8]) -> Result<{request}, ApiError> {{
 }}
 
 fn parse_json_u32(value: &str, source: ApiFailureSource) -> Result<u32, ApiError> {{
+    let value = value.trim_matches(&[' ', '\t', '\r', '\n'][..]);
     let bytes = value.as_bytes();
     let canonical = match bytes {{
         [b'0'] => true,
