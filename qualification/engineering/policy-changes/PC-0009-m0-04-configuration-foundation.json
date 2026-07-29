@@ -6,10 +6,11 @@
     "CONTRIBUTING.md",
     "docs/adr/0055-adopt-one-versioned-transactional-configuration-contract.md",
     "docs/application-design.md",
+    "docs/engineering/standards.md",
     "docs/engineering/quality-gates.md",
     "docs/release-1-qualification.md"
   ],
-  "purpose": "Activate the M0-04 Configuration Contract, its generated artifact source, and the exact coverage and focused mutation selections required by issue #5 without publishing runtime state or claiming qualification.",
+  "purpose": "Activate the M0-04 Configuration Contract, one Rust-owned generated artifact source, bounded pre-parse resource enforcement, and the exact coverage, safety, security, and focused mutation selections required by issue #5 without publishing runtime state or claiming qualification.",
   "change": {
     "issue": 5,
     "scope_activation": "M0-04 behavior ownership replaces only the historical M0-01 configuration scaffold activation for positron-config.",
@@ -30,7 +31,9 @@
     "mutation_command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
     "mutation_selector_owner": "tools/xtask/src/quality.rs::M0_04_MUTATION_SELECTOR",
     "mutation_rule": "Any viable surviving or timed-out selected invariant mutant fails the cargo-mutants command and therefore EG-COVERAGE.",
-    "matrix_change": "EG-MATRIX now regenerates and byte-compares configuration/schema.json and configuration/reference.md from configuration/spec.tsv in addition to the existing canonical API artifacts.",
+    "canonical_source": "crates/positron-config/src/contract.rs is the only seven-setting declaration. Runtime defaults, value domains, secrecy, provenance, and mutability consume its static SettingDefinition table; xtask reads the same bounded define_settings invocation without a workspace dependency.",
+    "matrix_change": "EG-MATRIX regenerates and byte-compares configuration/schema.json and configuration/reference.md from crates/positron-config/src/contract.rs in addition to the existing canonical API artifacts. The standalone TSV specification is removed.",
+    "risk_gate_change": "The active M0-04 scope selects exactly EG-COVERAGE, EG-SAFETY, and EG-SECURITY. EG-SAFETY and EG-SECURITY execute the focused preflight adversarial tests; EG-SECURITY also validates TM-0001-m0-04-toml-parser with pending Security and Key Management review.",
     "workflow_change": ".github/workflows/extended.yml exposes the mutually exclusive retain_m0_04_mutation dispatch and retains target/quality for the exact workflow revision."
   },
   "dependency_review": {
@@ -58,9 +61,9 @@
       ]
     },
     "necessity": "The Configuration Contract requires standards-compliant TOML comments, escapes, duplicate-key rejection, and malformed-document rejection; the removed handwritten line parser could not supply that contract.",
-    "bounded_use": "The complete document is limited to 16384 bytes before parsing. The accepted value tree is then limited to depth 2, 16 entries, 64-byte keys, 256-byte scalar strings, known setting paths, and exact integer or string value shapes. No file I/O or ambient environment reading is delegated to the dependency.",
+    "bounded_use": "The complete document is limited to 16384 bytes before ownership. Before toml::Table allocation, the canonical preflight limits table depth to one, entries including table headers to 16, keys to 64 bytes, and scalar tokens to 256 bytes while rejecting arrays, inline tables, and nested tables. The accepted parsed tree then permits only known integer or string settings. No file I/O or ambient environment reading is delegated to the dependency.",
     "maintenance_review": "toml-rs is the maintained Rust TOML implementation used through its current exact release; its declared rust-version is below the repository's pinned Rust 1.96 toolchain.",
-    "security_review": "Rejected parser diagnostics are collapsed to Positron's closed InvalidSyntax code and never expose source bytes. Cargo Audit, Cargo Deny, Cargo Vet, secret scanning, and the Configuration canary tests remain blocking.",
+    "security_review": "Rejected parser diagnostics are collapsed to Positron's closed Malformed or ResourceLimit codes and never expose source bytes. TM-0001-m0-04-toml-parser records assets, actors, abuse cases, hard limits, failure behavior, mitigations, mapped adversarial tests, the Security and Key Management owner, and empty pending review attribution. Cargo Audit, Cargo Deny, Cargo Vet, secret scanning, and the Configuration canary tests remain blocking.",
     "removal_condition": "Remove if the Rust standard library gains the required bounded standards-compliant TOML parser or an accepted Configuration Contract ADR changes the file format.",
     "cargo_deny": "Exact lower and upper version bans were added for toml 1.1.4; advisories, bans, licenses, and sources pass.",
     "cargo_vet": {
@@ -90,30 +93,27 @@
     "intentional_break": "A supplied TOML document without an explicit root schema_version is now rejected with MissingSchemaVersion from SchemaVersion. Compiled defaults still own version 1 only when no file source is supplied.",
     "supported_version": 1,
     "unsupported_version_behavior": "A declared non-v1 version is rejected with UnsupportedValue from SchemaVersion.",
-    "syntax_migration": "Valid TOML inline comments and escapes are now accepted. Malformed tables, duplicate keys, arrays or unsupported scalar shapes, unknown settings, excessive depth, and excessive sizes fail closed.",
+    "syntax_migration": "Valid bounded TOML inline comments, quoted strings, and escapes are accepted. Oversized documents, table or entry fanout, keys, and scalar tokens return ResourceLimit before toml::Table allocation. Arrays, inline tables, nested tables, malformed strings or tables, duplicate keys, unsupported scalar shapes, and unknown settings fail closed as Malformed or UnknownSetting according to the public boundary.",
     "source_precedence": "Compiled defaults, file, non-secret environment, and non-secret command-line precedence is unchanged.",
     "secret_behavior": "Environment and command-line secret overrides remain forbidden. Raw input wrappers now use bounded redacted Debug implementations; generated and effective references retain only the redaction marker.",
     "publication_boundary": "No watcher, file reader, global singleton, runtime publication, task spawning, remote provider, or live reload executor is introduced."
   },
   "representative_old_new_evidence": {
-    "status": "old-local-pr-completed-new-exact-head-pending",
+    "status": "reviewed-pr-head-retained-final-remediation-exact-head-pending",
     "old": {
-      "source_revision": "13b4367f92f0228dc9f2f6a308d5d379b935dc53",
-      "status": "passed-local-committed-pr-profile-before-independent-review-findings",
-      "evidence": "target/quality/evidence/1785293379977-13b4367f92f0-4507.json",
-      "limitations": "The candidate retained the handwritten TOML parser, leaked raw override values through derived Debug, defaulted a missing file schema version, and did not implement cargo xtask generate-config. Its pass is retained but is not evidence for the replacement detector set."
+      "source_revision": "cb7649046b148c127ce9c8d7d936b839b1f634fa",
+      "status": "passed-local-clean-committed-pr-profile-before-final-review-blockers",
+      "evidence": "target/quality/evidence/1785294929945-cb7649046b14-74953.json",
+      "limitations": "The pass is retained, but the standalone TSV specification remained an independent authority while runtime duplicated defaults and constraints, and TOML resource checks occurred only after toml::Table allocation. It is not evidence for the replacement canonical-source, preflight, safety, or security detector set."
     },
     "new": {
-      "source_revision": "pending final remediation commit; GitHub Actions will bind github.sha",
-      "status": "pending-one-future-exact-head-trusted-ci-run",
-      "workflow": ".github/workflows/extended.yml",
-      "dispatch_input": "retain_m0_04_mutation=true",
-      "command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
-      "artifact_name_template": "extended-evidence-<github.run_id>-<github.run_attempt>-<github.sha>",
-      "artifact_contents": "target/quality including immutable evidence JSON, target/quality/coverage/m0-04-config.json, and target/quality/mutation/m0-04-config-final outcomes",
-      "result": "not run; no coverage baseline, mutation score, merge eligibility, implementation qualification, or release qualification is claimed"
+      "source_revision": "pending final remediation commit",
+      "status": "pending-one-final-clean-committed-pr-profile",
+      "command": "cargo xtask quality --profile pr",
+      "expected_selected_gates": "EG-SAFETY and EG-SECURITY are selected by the M0-04 risk ledger in addition to existing PR gates; coverage and mutation remain EXT-only and are not run locally.",
+      "result": "not run; no replacement PR evidence, merge eligibility, implementation qualification, or release qualification is claimed"
     },
-    "dual_run_conclusion": "The old local committed PR result remains immutable. Focused local red/green tests compare the old and replacement behavior. Only one future trusted exact-head campaign may establish the pending measurements."
+    "dual_run_conclusion": "The cb76490 local committed PR result and earlier failed attempts remain immutable. Focused local red/green tests compare the reviewed and replacement behavior. The one final clean committed PR profile may establish only local PR evidence; trusted exact-head coverage and mutation measurements remain pending external work."
   },
   "attempts": [
     {
@@ -215,6 +215,74 @@
       "result": "The EXT-only option and exact owner selector passed without executing mutation; the authoritative generation matrix rejected a drifted configuration schema."
     },
     {
+      "id": "rust-owned-contract-red",
+      "status": "failed-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package positron-config --test configuration_foundation rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity",
+        "cargo test --locked --package xtask --test config_generation canonical_setting_changes_propagate_to_schema_and_reference"
+      ],
+      "result": "The public contract lacked SettingDefinition and ValueDomain metadata, stable Malformed and ResourceLimit codes, the checked schema lacked a loopback constraint, and no Rust-owned declaration source existed for generator mutation."
+    },
+    {
+      "id": "rust-owned-contract-and-preflight-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package positron-config --test configuration_foundation",
+        "cargo test --locked --package xtask --test config_generation"
+      ],
+      "result": "Public runtime tests proved shutdown default and range plus listener loopback behavior match Rust metadata and generated schema. Black-box source mutation changed both generated artifacts, and exact bounded grammar, ambiguity, and repeatability tests passed. Preflight adversarial tests proved byte, entry, depth, key, scalar, comment, quoted-string, and escape behavior with stable Malformed and ResourceLimit outcomes before toml::Table allocation."
+    },
+    {
+      "id": "parser-threat-model-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package xtask --bin xtask configuration_parser_threat_model_fails_closed_on_limit_or_review_drift",
+      "result": "The focused security policy test did not compile because no versioned parser threat-model validator existed."
+    },
+    {
+      "id": "parser-threat-model-and-risk-selection-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --bin xtask configuration_parser_threat_model_fails_closed_on_limit_or_review_drift",
+        "cargo test --locked --package xtask --test foundational_scope_activation live_m0_04_configuration_ledger_names_only_its_contract_and_artifact"
+      ],
+      "result": "The versioned parser threat model fails closed on limit or review attribution drift, required owner attribution remains pending and empty, and the live M0-04 ledger selects exactly EG-COVERAGE, EG-SAFETY, and EG-SECURITY."
+    },
+    {
+      "id": "rust-contract-historical-fixture-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package xtask",
+      "result": "Thirty-five historical scaffold and M0-01 fixture tests failed closed because the newly added positron-config/src/contract.rs remained present while those fixtures truthfully require the older single-source scaffold shape."
+    },
+    {
+      "id": "rust-contract-historical-fixture-green",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation",
+      "result": "All 63 activation, scaffold, matrix, controlled-execution, and historical fixture cases passed after the fixture transition explicitly removed the later Rust contract source when reconstructing M0-01 or scaffold state."
+    },
+    {
+      "id": "final-remediation-clippy-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+      "result": "Clippy rejected the first static definition constructor for eight arguments and then rejected one test-only expect_err call. The constructor was removed in favor of a bounded macro struct literal and the assertion now matches the typed result without panicking."
+    },
+    {
+      "id": "final-remediation-static-checks-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo fmt --all -- --check",
+        "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+        "cargo deny check",
+        "cargo vet check --locked"
+      ],
+      "result": "Formatting and Clippy passed; Cargo Deny reported advisories, bans, licenses, and sources ok; Cargo Vet succeeded with 3 fully audited and 22 exact exemptions."
+    },
+    {
+      "id": "rust-contract-generation-repeat",
+      "status": "passed-local-diagnostic",
+      "command": "cargo xtask generate-config twice",
+      "result": "Both runs produced schema SHA-256 321a3120610af656125681325d38f617822879074cb85a70fc3584be4a1dcfeb and reference SHA-256 1a1eb91d42fdea0e47acc508d4c62ef6a7a6ff982791d2d20fa7a91422d5ee81."
+    },
+    {
       "id": "final-pr-profile-before-historical-fixture-repair",
       "status": "failed-local-diagnostic",
       "command": "cargo xtask quality --profile pr",
@@ -237,9 +305,11 @@
   ],
   "detection_gained": [
     "File-backed configuration cannot silently inherit a compiled schema version; missing and unsupported versions have stable typed outcomes.",
-    "A maintained standards-compliant TOML parser accepts comments and escapes while rejecting malformed or duplicate documents before publication.",
+    "A bounded preflight enforces document, table-depth, entry, key, and scalar-token limits before toml::Table allocation while tracking comments, quoted strings, and escapes; the maintained TOML parser remains the final syntax authority.",
     "Raw environment, command-line, and file input wrappers cannot reveal secret canaries through Debug, Display, errors, provenance, effective references, or generated references.",
-    "One bounded seven-setting specification generates the checked JSON Schema and operator reference through cargo xtask generate-config.",
+    "One Rust-owned seven-setting definition contains path, type, default, value domain, secrecy, provenance, and mutability; runtime resolution and deterministic JSON Schema/reference generation consume it.",
+    "The generated schema carries the same loopback-only listener constraint enforced by runtime validation.",
+    "TM-0001-m0-04-toml-parser and the activated EG-SAFETY and EG-SECURITY selectors fail closed on parser-resource or security-review drift and execute the mapped adversarial tests.",
     "EG-MATRIX fails when either generated configuration artifact differs from deterministic regeneration.",
     "The authoritative EXT runner owns the registered M0-04 coverage report, 90 percent line and region floors, and the explicit exact-owner focused mutation campaign.",
     "The extended workflow can retain the exact issue #5 campaign without broadening routine mutation selection.",
@@ -258,9 +328,12 @@
     "required": [
       "Recovery and Lifecycle",
       "Architecture",
-      "Quality Engineering"
+      "Quality Engineering",
+      "Security and Key Management"
     ],
     "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
     "technical_review": "The initial PR candidate received independent findings that triggered this remediation. Finding closure requires a fresh review of the final commit.",
     "attribution": "No author, implementation agent, or technical reviewer is recorded as granting a required owner approval."
   },

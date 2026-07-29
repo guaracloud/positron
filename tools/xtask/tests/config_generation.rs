@@ -16,8 +16,8 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[test]
 fn canonical_setting_changes_propagate_to_schema_and_reference() -> TestResult {
     let source = canonical_source()?.replace(
-        "30 seconds\tpublic\trestart-required\trange:1:3600",
-        "45 seconds\tpublic\trestart-required\trange:1:7200",
+        "RuntimeShutdownGraceSeconds | \"runtime.shutdown_grace_seconds\" | Integer | \"30\" | UnsignedIntegerRange(1, 3600)",
+        "RuntimeShutdownGraceSeconds | \"runtime.shutdown_grace_seconds\" | Integer | \"45\" | UnsignedIntegerRange(1, 7200)",
     );
     let fixture = GeneratorFixture::create(&source)?;
     let result = (|| {
@@ -25,9 +25,10 @@ fn canonical_setting_changes_propagate_to_schema_and_reference() -> TestResult {
         let schema = fixture.read("configuration/schema.json")?;
         let reference = fixture.read("configuration/reference.md")?;
         assert!(schema.contains("\"maximum\": 7200"));
-        assert!(reference.contains("`45 seconds`"));
+        assert!(reference.contains("`45`"));
         assert!(!schema.contains("\"maximum\": 3600"));
-        assert!(!reference.contains("`30 seconds`"));
+        assert!(!reference.contains("`30`"));
+        fixture.assert_mutated_runtime_uses_default_and_range(45, 7200)?;
         Ok(())
     })();
     fixture.remove()?;
@@ -37,8 +38,8 @@ fn canonical_setting_changes_propagate_to_schema_and_reference() -> TestResult {
 #[test]
 fn duplicate_or_missing_setting_declarations_fail_closed() -> TestResult {
     let source = canonical_source()?.replace(
-        "schema_version\tinteger\t1\tpublic\timmutable after initialization\tconst:1",
-        "diagnostics.log_level\tinteger\t1\tpublic\timmutable after initialization\tconst:1",
+        "SchemaVersion | \"schema_version\" | Integer | \"1\" | ExactUnsignedInteger(1)",
+        "SchemaVersion | \"diagnostics.log_level\" | Integer | \"1\" | ExactUnsignedInteger(1)",
     );
     let fixture = GeneratorFixture::create(&source)?;
     let result = fixture.assert_failure_containing("missing or ambiguous");
@@ -49,8 +50,8 @@ fn duplicate_or_missing_setting_declarations_fail_closed() -> TestResult {
 #[test]
 fn unsupported_specification_grammar_fails_closed() -> TestResult {
     let source = canonical_source()?.replace(
-        "path\tkind\tdefault\tsecrecy\tmutability\tconstraint",
-        "path\tkind\tdefault\tconstraint",
+        "pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 7] = define_settings! {",
+        "pub(crate) const SETTING_DEFINITIONS = define_settings! {",
     );
     let fixture = GeneratorFixture::create(&source)?;
     let result = fixture.assert_failure_containing("header is not exact");
@@ -76,7 +77,7 @@ fn generation_is_byte_identical_when_repeated() -> TestResult {
 fn canonical_source() -> TestResult<String> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     Ok(fs::read_to_string(
-        manifest.join("../../configuration/spec.tsv"),
+        manifest.join("../../crates/positron-config/src/contract.rs"),
     )?)
 }
 
@@ -93,7 +94,8 @@ impl GeneratorFixture {
             std::process::id()
         ));
         fs::create_dir_all(root.join("configuration"))?;
-        fs::write(root.join("configuration/spec.tsv"), source)?;
+        fs::create_dir_all(root.join("crates/positron-config/src"))?;
+        fs::write(root.join("crates/positron-config/src/contract.rs"), source)?;
         Ok(Self { root })
     }
 
@@ -138,6 +140,99 @@ impl GeneratorFixture {
             .iter()
             .map(|path| Ok(fs::read(self.root.join(path))?))
             .collect()
+    }
+
+    fn assert_mutated_runtime_uses_default_and_range(
+        &self,
+        expected_default: u16,
+        expected_maximum: u16,
+    ) -> TestResult {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        fs::copy(
+            repository.join("crates/positron-config/src/lib.rs"),
+            self.root.join("crates/positron-config/src/lib.rs"),
+        )?;
+        fs::copy(
+            repository.join("crates/positron-config/Cargo.toml"),
+            self.root.join("crates/positron-config/Cargo.toml"),
+        )?;
+        fs::copy(repository.join("Cargo.lock"), self.root.join("Cargo.lock"))?;
+        fs::create_dir_all(self.root.join("crates/positron-config/tests"))?;
+        fs::write(
+            self.root.join("Cargo.toml"),
+            "[workspace]\n\
+             members = [\"crates/positron-config\"]\n\
+             resolver = \"3\"\n\n\
+             [workspace.package]\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\
+             rust-version = \"1.96.0\"\n\
+             authors = [\"Guara Cloud\"]\n\
+             license = \"MIT\"\n\
+             repository = \"https://github.com/guaracloud/positron\"\n\
+             homepage = \"https://github.com/guaracloud/positron\"\n\n\
+             [workspace.lints.rust]\n\
+             warnings = \"deny\"\n\
+             unsafe_code = \"forbid\"\n\n\
+             [workspace.lints.clippy]\n\
+             all = \"deny\"\n",
+        )?;
+        fs::write(
+            self.root
+                .join("crates/positron-config/tests/mutated_contract.rs"),
+            format!(
+                "use positron_config::{{ConfigurationFailureCode, ConfigurationInputs, EnvironmentOverrides, CommandLineOverrides, resolve}};\n\
+                 fn inputs(file: Option<&str>) -> ConfigurationInputs {{\n\
+                     ConfigurationInputs::try_new(\n\
+                         file,\n\
+                         EnvironmentOverrides::try_from_pairs::<&str, &str>([]).expect(\"bounded empty environment\"),\n\
+                         CommandLineOverrides::try_from_pairs::<&str, &str>([]).expect(\"bounded empty command line\"),\n\
+                     ).expect(\"bounded input\")\n\
+                 }}\n\
+                 #[test]\n\
+                 fn runtime_consumes_mutated_rust_contract() {{\n\
+                     assert_eq!(resolve(inputs(None)).expect(\"valid defaults\").shutdown_grace_seconds(), {expected_default});\n\
+                     let accepted = format!(\"schema_version = 1\\n[runtime]\\nshutdown_grace_seconds = {expected_maximum}\\n\");\n\
+                     assert!(resolve(inputs(Some(&accepted))).is_ok());\n\
+                     let rejected_value = {expected_maximum} + 1;\n\
+                     let rejected = format!(\"schema_version = 1\\n[runtime]\\nshutdown_grace_seconds = {{rejected_value}}\\n\");\n\
+                     assert!(matches!(resolve(inputs(Some(&rejected))), Err(error) if error.code() == ConfigurationFailureCode::UnsupportedValue));\n\
+                 }}\n"
+            ),
+        )?;
+        let lock = Command::new("cargo")
+            .current_dir(&self.root)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        if !lock.status.success() {
+            return Err(std::io::Error::other(format!(
+                "mutated Rust contract fixture lock failed: {}\n{}",
+                String::from_utf8_lossy(&lock.stdout),
+                String::from_utf8_lossy(&lock.stderr)
+            ))
+            .into());
+        }
+        let output = Command::new("cargo")
+            .current_dir(&self.root)
+            .args([
+                "test",
+                "--locked",
+                "--offline",
+                "--package",
+                "positron-config",
+                "--test",
+                "mutated_contract",
+            ])
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "mutated Rust contract did not change runtime behavior: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into())
     }
 
     fn read(&self, path: &str) -> TestResult<String> {

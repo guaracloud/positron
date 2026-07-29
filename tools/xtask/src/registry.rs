@@ -1062,7 +1062,12 @@ fn validate_m0_04_configuration_ledger(
         || scope.semantic_owner != "Recovery and Lifecycle"
         || scope.activation_scope_set != m0_04_configuration_scope_set()
         || scope.allowed_edges != foundational_edges(&scope.package)
-        || scope.risk_gates != BTreeSet::from(["EG-COVERAGE".to_owned()])
+        || scope.risk_gates
+            != BTreeSet::from([
+                "EG-COVERAGE".to_owned(),
+                "EG-SAFETY".to_owned(),
+                "EG-SECURITY".to_owned(),
+            ])
         || scope.test_commands
             != "cargo test --locked --package positron-config --test configuration_foundation"
         || scope.coverage_baseline

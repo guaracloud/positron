@@ -263,7 +263,7 @@ fn live_m0_04_configuration_ledger_names_only_its_contract_and_artifact() -> Tes
     let root = repository_root()?;
     let scopes = fs::read_to_string(root.join("qualification/engineering/scopes.tsv"))?;
     let required = format!(
-        "positron-config\tcrates/positron-config\tRecovery and Lifecycle\tapplication\tactive\tM0-04\tpositron-config\tpositron-runtime->positron-config\tEG-COVERAGE\tcargo test --locked --package positron-config --test configuration_foundation\tconfig-coverage-branch|config-coverage-line|config-coverage-region\tconfig-mutation-score\ttoml\t{M0_04_POLICY_CHANGE}"
+        "positron-config\tcrates/positron-config\tRecovery and Lifecycle\tapplication\tactive\tM0-04\tpositron-config\tpositron-runtime->positron-config\tEG-COVERAGE|EG-SAFETY|EG-SECURITY\tcargo test --locked --package positron-config --test configuration_foundation\tconfig-coverage-branch|config-coverage-line|config-coverage-region\tconfig-mutation-score\ttoml\t{M0_04_POLICY_CHANGE}"
     );
     if !scopes.contains(&required) {
         return Err(std::io::Error::other("live M0-04 configuration ledger drifted").into());
@@ -1525,6 +1525,10 @@ fn restore_m0_01_api_source_shape(root: &Path) -> TestResult {
 }
 
 fn restore_m0_01_config_source_shape(root: &Path) -> TestResult {
+    let rust_contract = root.join("crates/positron-config/src/contract.rs");
+    if rust_contract.is_file() {
+        fs::remove_file(rust_contract)?;
+    }
     let contract_test = root.join("crates/positron-config/tests/configuration_foundation.rs");
     if contract_test.is_file() {
         fs::remove_file(contract_test)?;
@@ -2363,6 +2367,12 @@ fn remove_scaffold_markers(root: &Path) -> TestResult {
 }
 
 fn restore_scaffold_marker(root: &Path, package: &str) -> TestResult {
+    if package == "positron-config" {
+        let rust_contract = root.join("crates/positron-config/src/contract.rs");
+        if rust_contract.is_file() {
+            fs::remove_file(rust_contract)?;
+        }
+    }
     let path = root.join("crates").join(package).join("src/lib.rs");
     let content = fs::read_to_string(&path)?;
     if content.starts_with("//! @positron-scaffold-only\n") {

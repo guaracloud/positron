@@ -102,9 +102,11 @@ const M0_04_MUTATION_SELECTOR: &str = concat!(
     "ConfigurationInputs::try_new|EffectiveConfiguration::redacted_reference|",
     "EffectiveConfiguration::plan_update|EffectiveConfiguration::setting_differs|",
     "ConfigurationPlan::from_changes|resolve|Candidate::defaults|Candidate::apply|",
-    "Candidate::validate|collect_pairs|apply_toml|validate_toml_bounds|",
+    "Candidate::validate|collect_pairs|preflight_toml|content_before_comment|",
+    "preflight_table_header|unquoted_equals|preflight_key|preflight_scalar|environment_path|",
+    "apply_toml|",
     "apply_toml_value|apply_environment|apply_command_line|parse_schema_version|",
-    "parse_shutdown_grace_seconds|parse_canonical_u16|parse_loopback_address|validate_path",
+    "parse_shutdown_grace_seconds|parse_canonical_u16|parse_loopback_address|checked_path|validate_path",
 );
 const M0_04_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-04-config-final";
 const M0_04_COVERAGE_FLOOR: f64 = 90.0;
@@ -648,7 +650,8 @@ fn execute_gate(
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
         "rust" => run_rust_gate(root, budget, environment),
-        "safety" => run_safety_gate(root, registry),
+        "safety" => run_safety_gate(root, registry, budget, environment),
+        "security" => run_security_gate(root, registry, budget, environment),
         "secrets" => run_secret_gate(root, options.profile, budget, environment),
         "supply" => run_supply_gate(root, registry, options.profile, budget, environment),
         "test" => run_test_gate(root, budget, environment),
@@ -1957,7 +1960,12 @@ fn run_rust_gate(
     Ok(format!("{} | {}", format.display, clippy.display))
 }
 
-fn run_safety_gate(root: &Path, registry: &Registry) -> Result<String, XtaskError> {
+fn run_safety_gate(
+    root: &Path,
+    registry: &Registry,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
     for scope in &registry.scopes {
         let source_root = root.join(&scope.path).join("src");
         let mut sources = Vec::new();
@@ -2005,7 +2013,95 @@ fn run_safety_gate(root: &Path, registry: &Registry) -> Result<String, XtaskErro
             ),
         ],
     )?;
-    Ok("internal:forbid-unsafe-and-unbounded-source-policy scan".to_owned())
+    let mut evidence = vec!["internal:forbid-unsafe-and-unbounded-source-policy scan".to_owned()];
+    if registry.has_m0_04_configuration_scope() {
+        evidence
+            .push(run_configuration_parser_adversarial_tests(root, budget, environment)?.display);
+    }
+    Ok(evidence.join(" | "))
+}
+
+fn run_security_gate(
+    root: &Path,
+    registry: &Registry,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    if !registry.has_m0_04_configuration_scope() {
+        return Err(XtaskError::invalid(
+            "security gate",
+            "EG-SECURITY was selected without an applicable active boundary",
+        ));
+    }
+    let path = root.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json");
+    let threat_model = fs::read_to_string(&path)
+        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    validate_configuration_parser_threat_model_text(&threat_model)?;
+    let adversarial = run_configuration_parser_adversarial_tests(root, budget, environment)?;
+    Ok(format!(
+        "internal:versioned-parser-threat-model-and-pending-security-owner-review validation | {}",
+        adversarial.display
+    ))
+}
+
+fn run_configuration_parser_adversarial_tests(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+) -> Result<CommandOutcome, XtaskError> {
+    run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "positron-config",
+            "--test",
+            "configuration_foundation",
+            "preflight_",
+        ],
+        budget,
+        &[],
+    )
+}
+
+fn validate_configuration_parser_threat_model_text(content: &str) -> Result<(), XtaskError> {
+    if !content.trim_start().starts_with('{') || !content.trim_end().ends_with('}') {
+        return Err(XtaskError::invalid(
+            "M0-04 parser threat model",
+            "versioned threat-model record is not a complete JSON object",
+        ));
+    }
+    for required in [
+        "\"schema_version\": 1",
+        "\"id\": \"TM-0001-m0-04-toml-parser\"",
+        "\"version\": 1",
+        "\"status\": \"proposed-for-security-owner-review\"",
+        "\"security_owner\": \"Security and Key Management\"",
+        "\"maximum_document_bytes\": 16384",
+        "\"maximum_table_depth\": 1",
+        "\"maximum_entries_including_table_headers\": 16",
+        "\"maximum_key_bytes\": 64",
+        "\"maximum_scalar_token_bytes\": 256",
+        "\"failure\": \"ResourceLimit before toml::Table allocation\"",
+        "\"failure\": \"Malformed before publication; standard TOML parser remains final syntax authority\"",
+        "\"command\": \"cargo test --locked --package positron-config --test configuration_foundation preflight_\"",
+        "\"required\": \"Security and Key Management\"",
+        "\"status\": \"pending-independent-review\"",
+        "\"reviewer\": \"\"",
+        "\"reviewed_revision\": \"\"",
+        "\"reviewed_at\": \"\"",
+    ] {
+        if !content.contains(required) {
+            return Err(XtaskError::invalid(
+                "M0-04 parser threat model",
+                format!("required fail-closed field is missing or drifted: `{required}`"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run_secret_gate(
@@ -3419,6 +3515,7 @@ mod tests {
     use super::{
         EnvironmentSnapshot, ExecutionTools, M0_02_MUTATION_SELECTOR, M0_03_MUTATION_SELECTOR,
         M0_04_MUTATION_SELECTOR, Options, Profile, json_string, run_generation_matrix_gate,
+        validate_configuration_parser_threat_model_text,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -3614,8 +3711,10 @@ mod tests {
             "resolve",
             "Candidate::apply",
             "Candidate::validate",
+            "preflight_toml",
+            "preflight_table_header",
+            "preflight_scalar",
             "apply_toml",
-            "validate_toml_bounds",
             "apply_toml_value",
             "apply_environment",
             "apply_command_line",
@@ -3654,10 +3753,10 @@ mod tests {
             "api/positron/v1/http.json",
             "api/positron/v1/openapi.json",
             "api/positron/v1/schema.sha256",
-            "configuration/spec.tsv",
             "configuration/reference.md",
             "configuration/schema.json",
             "crates/positron-api/src/generated.rs",
+            "crates/positron-config/src/contract.rs",
         ] {
             let destination = fixture.join(relative);
             if let Some(parent) = destination.parent() {
@@ -3678,6 +3777,31 @@ mod tests {
         })();
         fs::remove_dir_all(&fixture)?;
         result
+    }
+
+    #[test]
+    fn configuration_parser_threat_model_fails_closed_on_limit_or_review_drift() -> TestResult {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let threat_model = fs::read_to_string(
+            repository.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json"),
+        )?;
+        validate_configuration_parser_threat_model_text(&threat_model)?;
+        for drifted in [
+            threat_model.replace(
+                "\"maximum_document_bytes\": 16384",
+                "\"maximum_document_bytes\": 16385",
+            ),
+            threat_model.replace(
+                "\"reviewer\": \"\"",
+                "\"reviewer\": \"implementation-author\"",
+            ),
+        ] {
+            assert!(
+                validate_configuration_parser_threat_model_text(&drifted).is_err(),
+                "the M0-04 parser threat model must reject limit or owner-review drift"
+            );
+        }
+        Ok(())
     }
 
     fn generated_rust_owner_names(source: &str) -> BTreeSet<String> {

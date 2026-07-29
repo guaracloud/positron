@@ -4,8 +4,8 @@ use std::error::Error;
 
 use positron_config::{
     CommandLineOverrides, ConfigurationFailure, ConfigurationFailureCode, ConfigurationInputs,
-    ConfigurationPlan, EnvironmentOverrides, LogLevel, Setting, SettingSource,
-    generated_json_schema, generated_reference, resolve,
+    ConfigurationPlan, EnvironmentOverrides, LogLevel, Setting, SettingSource, ValueDomain,
+    generated_json_schema, generated_reference, resolve, setting_definition,
 };
 
 #[test]
@@ -184,6 +184,66 @@ fn generated_schema_and_reference_are_deterministic_and_secret_safe() {
 }
 
 #[test]
+fn rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity()
+-> Result<(), ConfigurationFailure> {
+    let shutdown = setting_definition(Setting::RuntimeShutdownGraceSeconds);
+    assert_eq!(shutdown.default_value(), "30");
+    assert_eq!(
+        shutdown.domain(),
+        ValueDomain::UnsignedIntegerRange(1, 3600)
+    );
+    assert_eq!(
+        inputs(None, [], [])
+            .and_then(resolve)?
+            .shutdown_grace_seconds(),
+        30
+    );
+    for value in ["0", "3601"] {
+        let rejected = inputs(
+            Some(Box::leak(
+                format!("schema_version = 1\n[runtime]\nshutdown_grace_seconds = {value}\n")
+                    .into_boxed_str(),
+            )),
+            [],
+            [],
+        )
+        .and_then(resolve);
+        assert!(matches!(
+            rejected,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnsupportedValue
+                    && error.source()
+                        == positron_config::FailureSource::RuntimeShutdownGraceSeconds
+        ));
+    }
+
+    let listener = setting_definition(Setting::ListenerControlBindAddress);
+    assert_eq!(listener.domain(), ValueDomain::LoopbackSocketAddress(256));
+    let non_loopback = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             control_bind_address = \"0.0.0.0:4317\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        non_loopback,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnsafeCombination
+                && error.source()
+                    == positron_config::FailureSource::ListenerControlBindAddress
+    ));
+
+    let schema = generated_json_schema();
+    assert!(schema.contains("\"minimum\": 1, \"maximum\": 3600"));
+    assert!(schema.contains("\"x-positron-address-scope\": \"loopback-only\""));
+    Ok(())
+}
+
+#[test]
 fn raw_configuration_inputs_and_failures_never_format_secret_canaries() -> Result<(), Box<dyn Error>>
 {
     const CANARY: &str = "never-render-this-secret-canary";
@@ -290,14 +350,14 @@ fn accepts_canonical_toml_comments_and_escapes_and_rejects_ambiguous_documents()
     .and_then(resolve);
     assert!(matches!(
         malformed,
-        Err(error) if error.code() == ConfigurationFailureCode::InvalidSyntax
+        Err(error) if error.code() == ConfigurationFailureCode::Malformed
     ));
 
     let duplicate =
         inputs(Some("schema_version = 1\nschema_version = 1\n"), [], []).and_then(resolve);
     assert!(matches!(
         duplicate,
-        Err(error) if error.code() == ConfigurationFailureCode::InvalidSyntax
+        Err(error) if error.code() == ConfigurationFailureCode::Malformed
     ));
 
     let unsupported_value_shape = inputs(
@@ -308,7 +368,7 @@ fn accepts_canonical_toml_comments_and_escapes_and_rejects_ambiguous_documents()
     .and_then(resolve);
     assert!(matches!(
         unsupported_value_shape,
-        Err(error) if error.code() == ConfigurationFailureCode::InvalidSyntax
+        Err(error) if error.code() == ConfigurationFailureCode::Malformed
     ));
 
     let unknown = inputs(
@@ -319,9 +379,93 @@ fn accepts_canonical_toml_comments_and_escapes_and_rejects_ambiguous_documents()
     .and_then(resolve);
     assert!(matches!(
         unknown,
-        Err(error) if error.code() == ConfigurationFailureCode::UnknownSetting
+        Err(error) if error.code() == ConfigurationFailureCode::Malformed
     ));
     Ok(())
+}
+
+#[test]
+fn preflight_rejects_adversarial_toml_before_unbounded_parse_allocation() {
+    let oversized = "x".repeat(16 * 1024 + 1);
+    let oversized_rejected = inputs(Some(Box::leak(oversized.into_boxed_str())), [], []);
+    assert!(matches!(
+        oversized_rejected,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::ResourceLimit
+                && error.source() == positron_config::FailureSource::ConfigurationDocument
+    ));
+
+    for document in [
+        "schema_version = 1\n[diagnostics.extra]\nvalue = \"warn\"\n",
+        "schema_version = 1\n[diagnostics]\nlog_level = [\"warn\"]\n",
+    ] {
+        let rejected = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            rejected,
+            Err(error) if error.code() == ConfigurationFailureCode::Malformed
+        ));
+    }
+
+    let mut many_entries = String::from("schema_version = 1\n[diagnostics]\n");
+    for index in 0..17 {
+        many_entries.push_str(&format!("entry_{index} = \"x\"\n"));
+    }
+    assert_resource_limit(&many_entries);
+
+    let long_key = format!(
+        "schema_version = 1\n[diagnostics]\n{} = \"x\"\n",
+        "k".repeat(65)
+    );
+    assert_resource_limit(&long_key);
+
+    let long_scalar = format!(
+        "schema_version = 1\n[diagnostics]\nlog_level = \"{}\"\n",
+        "x".repeat(257)
+    );
+    assert_resource_limit(&long_scalar);
+}
+
+#[test]
+fn preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax() {
+    let accepted = inputs(
+        Some(
+            "schema_version = 1 # [not.a.table] = [\"not\", \"an\", \"array\"]\n\
+             [diagnostics]\n\
+             log_level = \"w\\u0061rn\" # trailing delimiters []= are comments\n\
+             [security]\n\
+             local_key_file = \"/var/lib/positron-secrets/key#[]=\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve);
+    assert!(accepted.is_ok());
+
+    for malformed in [
+        "schema_version = 1\n[diagnostics]\nlog_level = \"unterminated\n",
+        "schema_version = 1\n[[diagnostics]]\nlog_level = \"warn\"\n",
+    ] {
+        let rejected = inputs(Some(malformed), [], []).and_then(resolve);
+        assert!(matches!(
+            rejected,
+            Err(error) if error.code() == ConfigurationFailureCode::Malformed
+        ));
+    }
+}
+
+fn assert_resource_limit(document: &str) {
+    let rejected = inputs(
+        Some(Box::leak(document.to_owned().into_boxed_str())),
+        [],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        rejected,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::ResourceLimit
+                && error.source() == positron_config::FailureSource::ConfigurationDocument
+    ));
 }
 
 fn inputs(

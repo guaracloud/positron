@@ -1,0 +1,43 @@
+//! Rust-owned canonical setting declarations.
+//!
+//! The deliberately bounded `define_settings!` invocation below is also read
+//! by `cargo xtask generate-config`. Keep each declaration on one line and use
+//! only the closed grammar accepted by that generator.
+
+use super::{
+    MutabilityClass, ProvenancePolicy, SecrecyClass, Setting, SettingDefinition, SettingKind,
+    ValueDomain,
+};
+
+macro_rules! define_settings {
+    ($(
+        $setting:ident | $path:literal | $kind:ident | $default:literal |
+        $domain:ident ( $($domain_value:expr),+ ) |
+        $secrecy:ident | $provenance:ident | $mutability:ident;
+    )+) => {
+        [
+            $(
+                SettingDefinition {
+                    setting: Setting::$setting,
+                    path: $path,
+                    kind: SettingKind::$kind,
+                    default_value: $default,
+                    domain: ValueDomain::$domain($($domain_value),+),
+                    secrecy: SecrecyClass::$secrecy,
+                    provenance: ProvenancePolicy::$provenance,
+                    mutability: MutabilityClass::$mutability,
+                },
+            )+
+        ]
+    };
+}
+
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 7] = define_settings! {
+    SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
+    DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
+    RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
+    ListenerControlBindAddress | "listener.control_bind_address" | String | "127.0.0.1:4317" | LoopbackSocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
+    StorageDataDirectory | "storage.data_directory" | String | "/var/lib/positron" | AbsolutePath(256) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
+    StorageSecretsDirectory | "storage.secrets_directory" | String | "/var/lib/positron-secrets" | AbsolutePath(256) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
+    SecurityLocalKeyFile | "security.local_key_file" | String | "/var/lib/positron-secrets/local-root-key" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | ImmutableAfterInitialization;
+};

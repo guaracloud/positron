@@ -10,22 +10,13 @@
 
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 
 const MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
 const MAX_OVERRIDE_PAIRS: usize = 16;
 const MAX_TOML_ENTRIES: usize = 16;
-const MAX_TOML_DEPTH: usize = 2;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 256;
-const MAX_PATH_BYTES: usize = 256;
-const CURRENT_SCHEMA_VERSION: u16 = 1;
-const DEFAULT_DATA_DIRECTORY: &str = "/var/lib/positron";
-const DEFAULT_SECRETS_DIRECTORY: &str = "/var/lib/positron-secrets";
-const DEFAULT_LOCAL_KEY_FILE: &str = "/var/lib/positron-secrets/local-root-key";
-const DEFAULT_BIND_ADDRESS: SocketAddr =
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 4317));
-const DEFAULT_SHUTDOWN_GRACE_SECONDS: u16 = 30;
 
 /// A source supplied to the Configuration Contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +53,120 @@ pub enum MutabilityClass {
     ImmutableAfterInitialization,
 }
 
+/// The TOML scalar shape owned by one setting definition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingKind {
+    /// A canonical unsigned integer.
+    Integer,
+    /// A TOML string.
+    String,
+}
+
+/// The closed value domain owned by one setting definition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueDomain {
+    /// One exact unsigned integer.
+    ExactUnsignedInteger(u16),
+    /// One of the listed stable string values.
+    StringEnumeration(&'static [&'static str]),
+    /// An inclusive unsigned-integer range.
+    UnsignedIntegerRange(u16, u16),
+    /// A socket address with a byte ceiling whose IP must be loopback.
+    LoopbackSocketAddress(usize),
+    /// An absolute normalized path with a byte ceiling.
+    AbsolutePath(usize),
+    /// A secret-bearing absolute normalized path with a byte ceiling.
+    ProtectedAbsolutePath(usize),
+}
+
+/// The exact source policy declared for one setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvenancePolicy {
+    /// Compiled defaults and the canonical configuration file only.
+    ConfigurationFileOnly,
+    /// Compiled defaults, file, environment, and command-line sources.
+    NonSecretOverrides,
+    /// Compiled defaults and file references; literal secret overrides are forbidden.
+    ProtectedConfigurationFileOnly,
+}
+
+impl ProvenancePolicy {
+    const fn allows(self, source: SettingSource) -> bool {
+        match self {
+            Self::ConfigurationFileOnly | Self::ProtectedConfigurationFileOnly => {
+                matches!(
+                    source,
+                    SettingSource::CompiledDefault | SettingSource::ConfigurationFile
+                )
+            },
+            Self::NonSecretOverrides => true,
+        }
+    }
+}
+
+/// Read-only metadata for one canonical Configuration Contract setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SettingDefinition {
+    setting: Setting,
+    path: &'static str,
+    kind: SettingKind,
+    default_value: &'static str,
+    domain: ValueDomain,
+    secrecy: SecrecyClass,
+    provenance: ProvenancePolicy,
+    mutability: MutabilityClass,
+}
+
+impl SettingDefinition {
+    /// Returns the setting represented by this definition.
+    #[must_use]
+    pub const fn setting(self) -> Setting {
+        self.setting
+    }
+
+    /// Returns the stable dotted path.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        self.path
+    }
+
+    /// Returns the canonical TOML scalar kind.
+    #[must_use]
+    pub const fn kind(self) -> SettingKind {
+        self.kind
+    }
+
+    /// Returns the compiled default before secrecy-aware rendering.
+    #[must_use]
+    pub const fn default_value(self) -> &'static str {
+        self.default_value
+    }
+
+    /// Returns the complete closed validation domain.
+    #[must_use]
+    pub const fn domain(self) -> ValueDomain {
+        self.domain
+    }
+
+    /// Returns the diagnostic secrecy class.
+    #[must_use]
+    pub const fn secrecy(self) -> SecrecyClass {
+        self.secrecy
+    }
+
+    /// Returns the exact allowed source policy.
+    #[must_use]
+    pub const fn provenance(self) -> ProvenancePolicy {
+        self.provenance
+    }
+
+    /// Returns the lifecycle mutability class.
+    #[must_use]
+    pub const fn mutability(self) -> MutabilityClass {
+        self.mutability
+    }
+}
+
 /// Canonical settings owned by the M0 Configuration Contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Setting {
@@ -85,43 +190,44 @@ impl Setting {
     /// Returns the stable dotted path used by canonical TOML and overrides.
     #[must_use]
     pub const fn path(self) -> &'static str {
-        match self {
-            Self::SchemaVersion => "schema_version",
-            Self::DiagnosticsLogLevel => "diagnostics.log_level",
-            Self::RuntimeShutdownGraceSeconds => "runtime.shutdown_grace_seconds",
-            Self::ListenerControlBindAddress => "listener.control_bind_address",
-            Self::StorageDataDirectory => "storage.data_directory",
-            Self::StorageSecretsDirectory => "storage.secrets_directory",
-            Self::SecurityLocalKeyFile => "security.local_key_file",
-        }
+        setting_definition(self).path()
     }
 
     /// Returns the setting's one declared secrecy class.
     #[must_use]
     pub const fn secrecy(self) -> SecrecyClass {
-        match self {
-            Self::SecurityLocalKeyFile => SecrecyClass::SecretBearing,
-            Self::SchemaVersion
-            | Self::DiagnosticsLogLevel
-            | Self::RuntimeShutdownGraceSeconds
-            | Self::ListenerControlBindAddress
-            | Self::StorageDataDirectory
-            | Self::StorageSecretsDirectory => SecrecyClass::Public,
-        }
+        setting_definition(self).secrecy()
     }
 
     /// Returns the setting's one declared mutability class.
     #[must_use]
     pub const fn mutability(self) -> MutabilityClass {
-        match self {
-            Self::DiagnosticsLogLevel => MutabilityClass::LiveReloadable,
-            Self::ListenerControlBindAddress => MutabilityClass::DrainAndReload,
-            Self::RuntimeShutdownGraceSeconds => MutabilityClass::RestartRequired,
-            Self::SchemaVersion
-            | Self::StorageDataDirectory
-            | Self::StorageSecretsDirectory
-            | Self::SecurityLocalKeyFile => MutabilityClass::ImmutableAfterInitialization,
-        }
+        setting_definition(self).mutability()
+    }
+}
+
+mod contract;
+
+/// Returns the Rust-owned canonical definition for one setting.
+#[must_use]
+pub const fn setting_definition(setting: Setting) -> SettingDefinition {
+    let [
+        schema_version,
+        diagnostics_log_level,
+        runtime_shutdown_grace_seconds,
+        listener_control_bind_address,
+        storage_data_directory,
+        storage_secrets_directory,
+        security_local_key_file,
+    ] = contract::SETTING_DEFINITIONS;
+    match setting {
+        Setting::SchemaVersion => schema_version,
+        Setting::DiagnosticsLogLevel => diagnostics_log_level,
+        Setting::RuntimeShutdownGraceSeconds => runtime_shutdown_grace_seconds,
+        Setting::ListenerControlBindAddress => listener_control_bind_address,
+        Setting::StorageDataDirectory => storage_data_directory,
+        Setting::StorageSecretsDirectory => storage_secrets_directory,
+        Setting::SecurityLocalKeyFile => security_local_key_file,
     }
 }
 
@@ -140,6 +246,19 @@ pub enum LogLevel {
 
 impl LogLevel {
     fn parse(value: &str) -> Result<Self, ConfigurationFailure> {
+        let ValueDomain::StringEnumeration(allowed) =
+            setting_definition(Setting::DiagnosticsLogLevel).domain()
+        else {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::Malformed,
+                FailureSource::DiagnosticsLogLevel,
+            ));
+        };
+        if !allowed.contains(&value) {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::DiagnosticsLogLevel,
+            ));
+        }
         match value {
             "error" => Ok(Self::Error),
             "warn" => Ok(Self::Warn),
@@ -169,7 +288,7 @@ pub struct ProtectedFileReference {
 
 impl ProtectedFileReference {
     fn parse(value: &str) -> Result<Self, ConfigurationFailure> {
-        validate_path(value, FailureSource::SecurityLocalKeyFile)?;
+        validate_path(value, Setting::SecurityLocalKeyFile)?;
         Ok(Self {
             path: value.to_owned(),
         })
@@ -180,7 +299,7 @@ impl ProtectedFileReference {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigurationFailureCode {
     /// The bounded source cannot be parsed as the canonical subset of TOML.
-    InvalidSyntax,
+    Malformed,
     /// A supplied configuration document omits its required schema version.
     MissingSchemaVersion,
     /// A supplied key is not part of the canonical Configuration Contract.
@@ -194,7 +313,7 @@ pub enum ConfigurationFailureCode {
     /// A secret-bearing setting attempted an environment or CLI override.
     SecretOverrideNotAllowed,
     /// An input exceeds a declared byte, pair, or path bound.
-    InputLimitExceeded,
+    ResourceLimit,
     /// A plan tries to modify initialized immutable configuration.
     ImmutableSettingChanged,
 }
@@ -291,7 +410,7 @@ impl ConfigurationFailure {
 impl Display for ConfigurationFailure {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self.code {
-            ConfigurationFailureCode::InvalidSyntax => "invalid canonical configuration syntax",
+            ConfigurationFailureCode::Malformed => "malformed canonical configuration",
             ConfigurationFailureCode::MissingSchemaVersion => {
                 "configuration schema version is required"
             },
@@ -302,7 +421,7 @@ impl Display for ConfigurationFailure {
             ConfigurationFailureCode::SecretOverrideNotAllowed => {
                 "secret configuration override is not allowed"
             },
-            ConfigurationFailureCode::InputLimitExceeded => "configuration input limit exceeded",
+            ConfigurationFailureCode::ResourceLimit => "configuration resource limit exceeded",
             ConfigurationFailureCode::ImmutableSettingChanged => {
                 "immutable initialized configuration changed"
             },
@@ -400,7 +519,7 @@ impl ConfigurationInputs {
             Some(value) => {
                 if value.len() > MAX_CONFIGURATION_BYTES {
                     return Err(ConfigurationFailure::new(
-                        ConfigurationFailureCode::InputLimitExceeded,
+                        ConfigurationFailureCode::ResourceLimit,
                         FailureSource::ConfigurationDocument,
                     ));
                 }
@@ -489,7 +608,8 @@ impl EffectiveConfiguration {
     /// Compares two checked candidates without publishing either one.
     pub fn plan_update(&self, candidate: &Self) -> Result<ConfigurationPlan, ConfigurationFailure> {
         let mut changes = Vec::with_capacity(7);
-        for setting in SETTINGS {
+        for definition in contract::SETTING_DEFINITIONS {
+            let setting = definition.setting();
             if self.setting_differs(candidate, setting) {
                 if setting.mutability() == MutabilityClass::ImmutableAfterInitialization {
                     return Err(ConfigurationFailure::new(
@@ -604,16 +724,6 @@ pub fn generated_reference() -> String {
     include_str!("../../../configuration/reference.md").to_owned()
 }
 
-const SETTINGS: [Setting; 7] = [
-    Setting::SchemaVersion,
-    Setting::DiagnosticsLogLevel,
-    Setting::RuntimeShutdownGraceSeconds,
-    Setting::ListenerControlBindAddress,
-    Setting::StorageDataDirectory,
-    Setting::StorageSecretsDirectory,
-    Setting::SecurityLocalKeyFile,
-];
-
 #[derive(Clone)]
 struct Candidate {
     schema_version: u16,
@@ -628,14 +738,21 @@ struct Candidate {
 
 impl Candidate {
     fn defaults() -> Result<Self, ConfigurationFailure> {
+        let schema_version = setting_definition(Setting::SchemaVersion).default_value();
+        let log_level = setting_definition(Setting::DiagnosticsLogLevel).default_value();
+        let shutdown = setting_definition(Setting::RuntimeShutdownGraceSeconds).default_value();
+        let listener = setting_definition(Setting::ListenerControlBindAddress).default_value();
+        let data = setting_definition(Setting::StorageDataDirectory).default_value();
+        let secrets = setting_definition(Setting::StorageSecretsDirectory).default_value();
+        let local_key = setting_definition(Setting::SecurityLocalKeyFile).default_value();
         Ok(Self {
-            schema_version: CURRENT_SCHEMA_VERSION,
-            log_level: LogLevel::Info,
-            shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
-            control_bind_address: DEFAULT_BIND_ADDRESS,
-            data_directory: DEFAULT_DATA_DIRECTORY.to_owned(),
-            secrets_directory: DEFAULT_SECRETS_DIRECTORY.to_owned(),
-            local_key_file: ProtectedFileReference::parse(DEFAULT_LOCAL_KEY_FILE)?,
+            schema_version: parse_schema_version(schema_version)?,
+            log_level: LogLevel::parse(log_level)?,
+            shutdown_grace_seconds: parse_shutdown_grace_seconds(shutdown)?,
+            control_bind_address: parse_loopback_address(listener)?,
+            data_directory: checked_path(data, Setting::StorageDataDirectory)?,
+            secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
+            local_key_file: ProtectedFileReference::parse(local_key)?,
             sources: [SettingSource::CompiledDefault; 7],
         })
     }
@@ -646,6 +763,15 @@ impl Candidate {
         value: &str,
         source: SettingSource,
     ) -> Result<(), ConfigurationFailure> {
+        let definition = setting_definition(setting);
+        if !definition.provenance().allows(source) {
+            let code = if definition.secrecy() == SecrecyClass::SecretBearing {
+                ConfigurationFailureCode::SecretOverrideNotAllowed
+            } else {
+                ConfigurationFailureCode::UnknownSetting
+            };
+            return Err(ConfigurationFailure::new(code, failure_source(setting)));
+        }
         match setting {
             Setting::SchemaVersion => {
                 self.schema_version = parse_schema_version(value)?;
@@ -658,12 +784,10 @@ impl Candidate {
                 self.control_bind_address = parse_loopback_address(value)?;
             },
             Setting::StorageDataDirectory => {
-                validate_path(value, FailureSource::StorageDataDirectory)?;
-                self.data_directory = value.to_owned();
+                self.data_directory = checked_path(value, setting)?;
             },
             Setting::StorageSecretsDirectory => {
-                validate_path(value, FailureSource::StorageSecretsDirectory)?;
-                self.secrets_directory = value.to_owned();
+                self.secrets_directory = checked_path(value, setting)?;
             },
             Setting::SecurityLocalKeyFile => {
                 self.local_key_file = ProtectedFileReference::parse(value)?
@@ -671,7 +795,7 @@ impl Candidate {
         }
         let Some(entry) = self.sources.get_mut(setting_index(setting)) else {
             return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::InvalidSyntax,
+                ConfigurationFailureCode::Malformed,
                 FailureSource::ConfigurationDocument,
             ));
         };
@@ -716,7 +840,7 @@ where
             || value.len() > MAX_VALUE_BYTES
         {
             return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::InputLimitExceeded,
+                ConfigurationFailureCode::ResourceLimit,
                 source,
             ));
         }
@@ -731,15 +855,196 @@ where
     Ok(collected)
 }
 
+fn preflight_toml(file: &str) -> Result<(), ConfigurationFailure> {
+    let mut entry_count = 0_usize;
+    for raw_line in file.lines() {
+        let line = content_before_comment(raw_line)?.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            preflight_table_header(line)?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| document_failure(ConfigurationFailureCode::ResourceLimit))?;
+            if entry_count > MAX_TOML_ENTRIES {
+                return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
+            }
+            continue;
+        }
+        let Some(separator) = unquoted_equals(line)? else {
+            return Err(document_failure(ConfigurationFailureCode::Malformed));
+        };
+        let key = line
+            .get(..separator)
+            .ok_or_else(|| document_failure(ConfigurationFailureCode::Malformed))?
+            .trim();
+        let value = line
+            .get(separator.saturating_add(1)..)
+            .ok_or_else(|| document_failure(ConfigurationFailureCode::Malformed))?
+            .trim();
+        preflight_key(key)?;
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| document_failure(ConfigurationFailureCode::ResourceLimit))?;
+        if entry_count > MAX_TOML_ENTRIES {
+            return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
+        }
+        preflight_scalar(value)?;
+    }
+    Ok(())
+}
+
+fn content_before_comment(line: &str) -> Result<&str, ConfigurationFailure> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some('"') if character == '"' => quote = None,
+            Some('\'') if character == '\'' => quote = None,
+            Some(_) => {},
+            None if character == '"' || character == '\'' => quote = Some(character),
+            None if character == '#' => {
+                return line
+                    .get(..index)
+                    .ok_or_else(|| document_failure(ConfigurationFailureCode::Malformed));
+            },
+            None => {},
+        }
+    }
+    if quote.is_some() || escaped {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    Ok(line)
+}
+
+fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
+    if line.starts_with("[[") || !line.ends_with(']') {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    let name = line
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| document_failure(ConfigurationFailureCode::Malformed))?
+        .trim();
+    if name.len() > MAX_KEY_BYTES {
+        return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
+    }
+    if name.is_empty()
+        || name.contains('.')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    Ok(())
+}
+
+fn unquoted_equals(line: &str) -> Result<Option<usize>, ConfigurationFailure> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some('"') if character == '"' => quote = None,
+            Some('\'') if character == '\'' => quote = None,
+            Some(_) => {},
+            None if character == '"' || character == '\'' => quote = Some(character),
+            None if character == '=' => return Ok(Some(index)),
+            None => {},
+        }
+    }
+    if quote.is_some() || escaped {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    Ok(None)
+}
+
+fn preflight_key(key: &str) -> Result<(), ConfigurationFailure> {
+    if key.len() > MAX_KEY_BYTES {
+        return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
+    }
+    if key.is_empty()
+        || key.contains('.')
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    Ok(())
+}
+
+fn preflight_scalar(value: &str) -> Result<(), ConfigurationFailure> {
+    if value.is_empty() {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    if value.starts_with('[') || value.starts_with('{') {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
+    let scalar_bytes = if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+    {
+        if value.starts_with("\"\"\"") {
+            return Err(document_failure(ConfigurationFailureCode::Malformed));
+        }
+        inner.len()
+    } else if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
+        if value.starts_with("'''") {
+            return Err(document_failure(ConfigurationFailureCode::Malformed));
+        }
+        inner.len()
+    } else {
+        value.len()
+    };
+    if scalar_bytes > MAX_VALUE_BYTES {
+        return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
+    }
+    Ok(())
+}
+
+const fn document_failure(code: ConfigurationFailureCode) -> ConfigurationFailure {
+    ConfigurationFailure::new(code, FailureSource::ConfigurationDocument)
+}
+
+fn environment_path(key: &str) -> Option<String> {
+    let suffix = key.strip_prefix("POSITRON__")?;
+    if suffix.is_empty()
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    let segments = suffix.split("__").collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    Some(
+        segments
+            .into_iter()
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
 fn apply_toml(candidate: &mut Candidate, file: &str) -> Result<(), ConfigurationFailure> {
+    preflight_toml(file)?;
     let table = file.parse::<toml::Table>().map_err(|_| {
         ConfigurationFailure::new(
-            ConfigurationFailureCode::InvalidSyntax,
+            ConfigurationFailureCode::Malformed,
             FailureSource::ConfigurationDocument,
         )
     })?;
-    let mut entry_count = 0_usize;
-    validate_toml_bounds(&table, 0, &mut entry_count)?;
 
     let Some(schema_version) = table.get("schema_version") else {
         return Err(ConfigurationFailure::new(
@@ -776,79 +1081,22 @@ fn apply_toml(candidate: &mut Candidate, file: &str) -> Result<(), Configuration
     Ok(())
 }
 
-fn validate_toml_bounds(
-    table: &toml::Table,
-    depth: usize,
-    entry_count: &mut usize,
-) -> Result<(), ConfigurationFailure> {
-    if depth > MAX_TOML_DEPTH {
-        return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::InputLimitExceeded,
-            FailureSource::ConfigurationDocument,
-        ));
-    }
-    for (key, value) in table {
-        *entry_count = entry_count.checked_add(1).ok_or_else(|| {
-            ConfigurationFailure::new(
-                ConfigurationFailureCode::InputLimitExceeded,
-                FailureSource::ConfigurationDocument,
-            )
-        })?;
-        if *entry_count > MAX_TOML_ENTRIES || key.len() > MAX_KEY_BYTES {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::InputLimitExceeded,
-                FailureSource::ConfigurationDocument,
-            ));
-        }
-        match value {
-            toml::Value::String(value) if value.len() > MAX_VALUE_BYTES => {
-                return Err(ConfigurationFailure::new(
-                    ConfigurationFailureCode::InputLimitExceeded,
-                    FailureSource::ConfigurationDocument,
-                ));
-            },
-            toml::Value::Table(nested) => {
-                validate_toml_bounds(nested, depth.saturating_add(1), entry_count)?;
-            },
-            toml::Value::Array(_)
-            | toml::Value::Float(_)
-            | toml::Value::Boolean(_)
-            | toml::Value::Datetime(_) => {
-                return Err(ConfigurationFailure::new(
-                    ConfigurationFailureCode::InvalidSyntax,
-                    FailureSource::ConfigurationDocument,
-                ));
-            },
-            toml::Value::String(_) | toml::Value::Integer(_) => {},
-        }
-    }
-    Ok(())
-}
-
 fn apply_toml_value(
     candidate: &mut Candidate,
     setting: Setting,
     value: &toml::Value,
 ) -> Result<(), ConfigurationFailure> {
-    match (setting, value) {
-        (
-            Setting::SchemaVersion | Setting::RuntimeShutdownGraceSeconds,
-            toml::Value::Integer(value),
-        ) => candidate.apply(
+    match (setting_definition(setting).kind(), value) {
+        (SettingKind::Integer, toml::Value::Integer(value)) => candidate.apply(
             setting,
             &value.to_string(),
             SettingSource::ConfigurationFile,
         ),
-        (
-            Setting::DiagnosticsLogLevel
-            | Setting::ListenerControlBindAddress
-            | Setting::StorageDataDirectory
-            | Setting::StorageSecretsDirectory
-            | Setting::SecurityLocalKeyFile,
-            toml::Value::String(value),
-        ) => candidate.apply(setting, value, SettingSource::ConfigurationFile),
+        (SettingKind::String, toml::Value::String(value)) => {
+            candidate.apply(setting, value, SettingSource::ConfigurationFile)
+        },
         _ => Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::InvalidSyntax,
+            ConfigurationFailureCode::Malformed,
             FailureSource::ConfigurationDocument,
         )),
     }
@@ -859,22 +1107,17 @@ fn apply_environment(
     overrides: &EnvironmentOverrides,
 ) -> Result<(), ConfigurationFailure> {
     for (key, value) in &overrides.pairs {
-        let setting = match key.as_str() {
-            "POSITRON__DIAGNOSTICS__LOG_LEVEL" => Setting::DiagnosticsLogLevel,
-            "POSITRON__RUNTIME__SHUTDOWN_GRACE_SECONDS" => Setting::RuntimeShutdownGraceSeconds,
-            "POSITRON__LISTENER__CONTROL_BIND_ADDRESS" => Setting::ListenerControlBindAddress,
-            "POSITRON__SECURITY__LOCAL_KEY_FILE" => {
-                return Err(ConfigurationFailure::new(
-                    ConfigurationFailureCode::SecretOverrideNotAllowed,
-                    FailureSource::SecurityLocalKeyFile,
-                ));
-            },
-            _ => {
-                return Err(ConfigurationFailure::new(
-                    ConfigurationFailureCode::UnknownSetting,
-                    FailureSource::EnvironmentOverride,
-                ));
-            },
+        let Some(path) = environment_path(key) else {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::UnknownSetting,
+                FailureSource::EnvironmentOverride,
+            ));
+        };
+        let Some(setting) = setting_for_path(&path) else {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::UnknownSetting,
+                FailureSource::EnvironmentOverride,
+            ));
         };
         candidate.apply(setting, value, SettingSource::Environment)?;
     }
@@ -886,22 +1129,11 @@ fn apply_command_line(
     overrides: &CommandLineOverrides,
 ) -> Result<(), ConfigurationFailure> {
     for (key, value) in &overrides.pairs {
-        let setting = match key.as_str() {
-            "diagnostics.log_level" => Setting::DiagnosticsLogLevel,
-            "runtime.shutdown_grace_seconds" => Setting::RuntimeShutdownGraceSeconds,
-            "listener.control_bind_address" => Setting::ListenerControlBindAddress,
-            "security.local_key_file" => {
-                return Err(ConfigurationFailure::new(
-                    ConfigurationFailureCode::SecretOverrideNotAllowed,
-                    FailureSource::SecurityLocalKeyFile,
-                ));
-            },
-            _ => {
-                return Err(ConfigurationFailure::new(
-                    ConfigurationFailureCode::UnknownSetting,
-                    FailureSource::CommandLineOverride,
-                ));
-            },
+        let Some(setting) = setting_for_path(key) else {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::UnknownSetting,
+                FailureSource::CommandLineOverride,
+            ));
         };
         candidate.apply(setting, value, SettingSource::CommandLine)?;
     }
@@ -910,7 +1142,15 @@ fn apply_command_line(
 
 fn parse_schema_version(value: &str) -> Result<u16, ConfigurationFailure> {
     let version = parse_canonical_u16(value, FailureSource::SchemaVersion)?;
-    if version != CURRENT_SCHEMA_VERSION {
+    let ValueDomain::ExactUnsignedInteger(expected) =
+        setting_definition(Setting::SchemaVersion).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            FailureSource::SchemaVersion,
+        ));
+    };
+    if version != expected {
         return Err(ConfigurationFailure::unsupported_value(
             FailureSource::SchemaVersion,
         ));
@@ -920,7 +1160,15 @@ fn parse_schema_version(value: &str) -> Result<u16, ConfigurationFailure> {
 
 fn parse_shutdown_grace_seconds(value: &str) -> Result<u16, ConfigurationFailure> {
     let seconds = parse_canonical_u16(value, FailureSource::RuntimeShutdownGraceSeconds)?;
-    if !(1..=3600).contains(&seconds) {
+    let ValueDomain::UnsignedIntegerRange(minimum, maximum) =
+        setting_definition(Setting::RuntimeShutdownGraceSeconds).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            FailureSource::RuntimeShutdownGraceSeconds,
+        ));
+    };
+    if !(minimum..=maximum).contains(&seconds) {
         return Err(ConfigurationFailure::unsupported_value(
             FailureSource::RuntimeShutdownGraceSeconds,
         ));
@@ -935,7 +1183,7 @@ fn parse_canonical_u16(value: &str, source: FailureSource) -> Result<u16, Config
         || (value.len() > 1 && value.starts_with('0'))
     {
         return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::InvalidSyntax,
+            ConfigurationFailureCode::Malformed,
             source,
         ));
     }
@@ -945,15 +1193,23 @@ fn parse_canonical_u16(value: &str, source: FailureSource) -> Result<u16, Config
 }
 
 fn parse_loopback_address(value: &str) -> Result<SocketAddr, ConfigurationFailure> {
-    if value.len() > MAX_VALUE_BYTES {
+    let ValueDomain::LoopbackSocketAddress(maximum_bytes) =
+        setting_definition(Setting::ListenerControlBindAddress).domain()
+    else {
         return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::InputLimitExceeded,
+            ConfigurationFailureCode::Malformed,
+            FailureSource::ListenerControlBindAddress,
+        ));
+    };
+    if value.len() > maximum_bytes {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::ResourceLimit,
             FailureSource::ListenerControlBindAddress,
         ));
     }
     let address = value.parse::<SocketAddr>().map_err(|_| {
         ConfigurationFailure::new(
-            ConfigurationFailureCode::InvalidSyntax,
+            ConfigurationFailureCode::Malformed,
             FailureSource::ListenerControlBindAddress,
         )
     })?;
@@ -966,10 +1222,25 @@ fn parse_loopback_address(value: &str) -> Result<SocketAddr, ConfigurationFailur
     Ok(address)
 }
 
-fn validate_path(value: &str, source: FailureSource) -> Result<(), ConfigurationFailure> {
-    if value.is_empty() || value.len() > MAX_PATH_BYTES {
+fn checked_path(value: &str, setting: Setting) -> Result<String, ConfigurationFailure> {
+    validate_path(value, setting)?;
+    Ok(value.to_owned())
+}
+
+fn validate_path(value: &str, setting: Setting) -> Result<(), ConfigurationFailure> {
+    let maximum_bytes = match setting_definition(setting).domain() {
+        ValueDomain::AbsolutePath(maximum) | ValueDomain::ProtectedAbsolutePath(maximum) => maximum,
+        _ => {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::Malformed,
+                failure_source(setting),
+            ));
+        },
+    };
+    let source = failure_source(setting);
+    if value.is_empty() || value.len() > maximum_bytes {
         return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::InputLimitExceeded,
+            ConfigurationFailureCode::ResourceLimit,
             source,
         ));
     }
@@ -995,7 +1266,10 @@ const fn setting_index(setting: Setting) -> usize {
 }
 
 fn setting_for_path(path: &str) -> Option<Setting> {
-    SETTINGS.into_iter().find(|setting| setting.path() == path)
+    contract::SETTING_DEFINITIONS
+        .into_iter()
+        .find(|definition| definition.path() == path)
+        .map(SettingDefinition::setting)
 }
 
 const fn failure_source(setting: Setting) -> FailureSource {
