@@ -589,7 +589,15 @@ fn quality_rejects_an_aliased_thread_spawn_through_the_public_seam() -> TestResu
         fs::write(&source, content)?;
         fixture.build_fixture_xtask()?;
         let output = fixture.quality_output_for("pr")?;
-        assert_rejected_output(&output, "direct unregistered thread spawn")
+        assert_rejected_output(&output, "unregistered imported concurrency primitive alias")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "aliased thread spawn did not retain a failed concurrency gate outcome",
+            )
+            .into());
+        }
+        Ok(())
     })();
     let cleanup = fixture.remove();
     cleanup?;
