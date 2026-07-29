@@ -48,7 +48,8 @@ fn run() -> Result<(), XtaskError> {
             ensure_no_more_arguments(arguments)?;
             let root = env::current_dir()
                 .map_err(|source| XtaskError::io("resolve current directory", source))?;
-            generation::verify(&root)
+            let invocation = generation::VerificationInvocation::claim(&root)?;
+            generation::verify(&root, invocation)
         },
         "generate-api" => {
             ensure_no_more_arguments(arguments)?;

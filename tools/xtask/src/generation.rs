@@ -1,12 +1,12 @@
 //! Canonical generated-artifact registration and reproducibility checks.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::XtaskError;
 
-static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAXIMUM_PARALLEL_VERIFICATIONS: u8 = 64;
 
 /// The hand-edited Protobuf input for the public interface generator.
 pub(crate) const API_INPUT: &str = "api/positron/v1/positron.proto";
@@ -49,18 +49,51 @@ pub(crate) fn generate(root: &Path) -> Result<(), XtaskError> {
     crate::config_generation::generate(root)
 }
 
-/// Rejects checked generated output that differs from deterministic regeneration.
-pub(crate) fn verify(root: &Path) -> Result<(), XtaskError> {
-    for input in INPUTS {
-        let path = root.join(input);
-        fs::metadata(&path).map_err(|source| {
-            XtaskError::io(format!("read registered input {}", path.display()), source)
+/// One explicitly owned generated-artifact verification attempt.
+pub(crate) struct VerificationInvocation {
+    staging: PathBuf,
+}
+
+impl VerificationInvocation {
+    /// Claims one root-scoped staging slot without mutable process-global state.
+    pub(crate) fn claim(root: &Path) -> Result<Self, XtaskError> {
+        let parent = root.join("target/quality/tmp");
+        fs::create_dir_all(&parent).map_err(|source| {
+            XtaskError::io(
+                format!("create staging parent {}", parent.display()),
+                source,
+            )
         })?;
+        for slot in 0..MAXIMUM_PARALLEL_VERIFICATIONS {
+            let staging = parent.join(format!("verify-generation-{slot}"));
+            match fs::create_dir(&staging) {
+                Ok(()) => return Ok(Self { staging }),
+                Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
+                Err(source) => {
+                    return Err(XtaskError::io(
+                        format!("claim staging {}", staging.display()),
+                        source,
+                    ));
+                },
+            }
+        }
+        Err(XtaskError::invalid(
+            "canonical generation staging",
+            format!("all {MAXIMUM_PARALLEL_VERIFICATIONS} bounded verification slots are occupied"),
+        ))
     }
-    let staging = create_staging_root(root)?;
-    let verification = verify_staged(root, &staging);
-    let cleanup = fs::remove_dir_all(&staging)
-        .map_err(|source| XtaskError::io(format!("remove staging {}", staging.display()), source));
+}
+
+/// Rejects checked generated output that differs from deterministic regeneration.
+pub(crate) fn verify(root: &Path, invocation: VerificationInvocation) -> Result<(), XtaskError> {
+    let verification =
+        validate_registered_inputs(root).and_then(|()| verify_staged(root, &invocation.staging));
+    let cleanup = fs::remove_dir_all(&invocation.staging).map_err(|source| {
+        XtaskError::io(
+            format!("remove staging {}", invocation.staging.display()),
+            source,
+        )
+    });
     match (verification, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(failure), Ok(())) => Err(failure),
@@ -72,32 +105,14 @@ pub(crate) fn verify(root: &Path) -> Result<(), XtaskError> {
     }
 }
 
-fn create_staging_root(root: &Path) -> Result<PathBuf, XtaskError> {
-    let sequence = STAGING_SEQUENCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .map_err(|_| {
-            XtaskError::invalid(
-                "canonical generation staging",
-                "bounded staging identity space is exhausted",
-            )
+fn validate_registered_inputs(root: &Path) -> Result<(), XtaskError> {
+    for input in INPUTS {
+        let path = root.join(input);
+        fs::metadata(&path).map_err(|source| {
+            XtaskError::io(format!("read registered input {}", path.display()), source)
         })?;
-    let parent = root.join("target/quality/tmp");
-    fs::create_dir_all(&parent).map_err(|source| {
-        XtaskError::io(
-            format!("create staging parent {}", parent.display()),
-            source,
-        )
-    })?;
-    let staging = parent.join(format!(
-        "verify-generation-{}-{sequence}",
-        std::process::id()
-    ));
-    fs::create_dir(&staging).map_err(|source| {
-        XtaskError::io(format!("create staging {}", staging.display()), source)
-    })?;
-    Ok(staging)
+    }
+    Ok(())
 }
 
 fn verify_staged(root: &Path, staging: &Path) -> Result<(), XtaskError> {

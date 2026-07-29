@@ -4,10 +4,12 @@
 
 use std::error::Error;
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -135,6 +137,40 @@ fn generation_verification_detects_read_only_drift_without_mutating_checked_outp
         fixture.assert_verification_failure_containing("not clean and deterministic")?;
         assert_eq!(fs::read(&path)?, drift);
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o444);
+        assert!(
+            fs::read_dir(fixture.root.join("target/quality/tmp"))?
+                .collect::<Result<Vec<_>, _>>()?
+                .is_empty()
+        );
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn parallel_generation_verifications_claim_distinct_bounded_staging() -> TestResult {
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    fixture.copy_configuration_source()?;
+    let result = (|| {
+        fixture.assert_combined_success()?;
+        let outputs = thread::scope(|scope| {
+            let first = scope.spawn(|| fixture.verification_output());
+            let second = scope.spawn(|| fixture.verification_output());
+            [first.join(), second.join()]
+        });
+        for joined in outputs {
+            let output =
+                joined.map_err(|_| io::Error::other("parallel verification thread panicked"))??;
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "parallel verification failed: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+                .into());
+            }
+        }
         assert!(
             fs::read_dir(fixture.root.join("target/quality/tmp"))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -396,10 +432,7 @@ impl GeneratorFixture {
     }
 
     fn assert_verification_failure_containing(&self, expected: &str) -> TestResult {
-        let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
-            .current_dir(&self.root)
-            .arg("verify-generation")
-            .output()?;
+        let output = self.verification_output()?;
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -412,6 +445,13 @@ impl GeneratorFixture {
             "generation verification did not fail with `{expected}`: {combined}"
         ))
         .into())
+    }
+
+    fn verification_output(&self) -> io::Result<Output> {
+        Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .current_dir(&self.root)
+            .arg("verify-generation")
+            .output()
     }
 
     fn assert_failure_containing(&self, expected: &str) -> TestResult {
