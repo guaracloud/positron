@@ -6,31 +6,263 @@
     "CONTRIBUTING.md",
     "docs/adr/0055-adopt-one-versioned-transactional-configuration-contract.md",
     "docs/application-design.md",
+    "docs/engineering/quality-gates.md",
     "docs/release-1-qualification.md"
   ],
-  "purpose": "Activate only the Configuration-owned generated artifact scope required by M0-04; positron-config was already active under the retained M0-01 foundational activation.",
+  "purpose": "Activate the M0-04 Configuration Contract, its generated artifact source, and the exact coverage and focused mutation selections required by issue #5 without publishing runtime state or claiming qualification.",
   "change": {
     "issue": 5,
-    "artifact_scope": "configuration-artifacts",
-    "generation_command": "cargo xtask generate-config",
-    "public_test_command": "cargo test --locked --package positron-config --test configuration_foundation",
-    "scope_activation": "M0-04 behavior ownership replaces only the historical M0-01 configuration scaffold activation",
-    "edges": "positron-runtime->positron-config moves to M0-04",
-    "dependencies": "none; generator reuses the Configuration owner through a local workspace path dependency"
-  },
-  "tests": {
-    "required_behavior": [
-      "deterministic precedence",
-      "closed typed rejection",
-      "secret redaction",
-      "mutability planning without publication",
-      "byte-identical schema and reference generation"
+    "scope_activation": "M0-04 behavior ownership replaces only the historical M0-01 configuration scaffold activation for positron-config.",
+    "scope_set": [
+      "positron-config"
     ],
-    "qualification_claim": "none; configuration coverage and mutation measurements are pending one final exact-head trusted-CI campaign",
-    "retained_failures": ["local PR profile rejected the M0-01 activation-only scope before this ledger transition", "local corrected PR profile rejected empty M0-04 baseline identities before pending final-CI registration"]
+    "artifact_scope": "configuration-artifacts",
+    "semantic_owner": "Recovery and Lifecycle",
+    "edge": "positron-runtime->positron-config moves to M0-04",
+    "public_test_command": "cargo test --locked --package positron-config --test configuration_foundation",
+    "generation_command": "cargo xtask generate-config",
+    "coverage_command": "cargo +nightly-2026-07-20 llvm-cov --locked --package positron-config --test configuration_foundation --branch --json --summary-only --ignore-filename-regex crates/positron-config/tests/.* --output-path target/quality/coverage/m0-04-config.json",
+    "coverage_floor": {
+      "line_percent": 90,
+      "region_percent": 90,
+      "branch": "measured and retained; final exact-head baseline remains pending"
+    },
+    "mutation_command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
+    "mutation_selector_owner": "tools/xtask/src/quality.rs::M0_04_MUTATION_SELECTOR",
+    "mutation_rule": "Any viable surviving or timed-out selected invariant mutant fails the cargo-mutants command and therefore EG-COVERAGE.",
+    "matrix_change": "EG-MATRIX now regenerates and byte-compares configuration/schema.json and configuration/reference.md from configuration/spec.tsv in addition to the existing canonical API artifacts.",
+    "workflow_change": ".github/workflows/extended.yml exposes the mutually exclusive retain_m0_04_mutation dispatch and retains target/quality for the exact workflow revision."
+  },
+  "dependency_review": {
+    "direct_dependency_count": 1,
+    "package": "toml",
+    "manifest_requirement": "=1.1.4",
+    "resolved_version": "1.1.4+spec-1.1.0",
+    "source": "https://crates.io/crates/toml/1.1.4+spec-1.1.0",
+    "repository": "https://github.com/toml-rs/toml",
+    "license": "MIT OR Apache-2.0",
+    "rust_version": "1.85",
+    "features": {
+      "default_features": false,
+      "enabled": [
+        "parse",
+        "serde",
+        "std"
+      ],
+      "excluded_by_manifest": [
+        "debug",
+        "display",
+        "fast_hash",
+        "preserve_order",
+        "unbounded"
+      ]
+    },
+    "necessity": "The Configuration Contract requires standards-compliant TOML comments, escapes, duplicate-key rejection, and malformed-document rejection; the removed handwritten line parser could not supply that contract.",
+    "bounded_use": "The complete document is limited to 16384 bytes before parsing. The accepted value tree is then limited to depth 2, 16 entries, 64-byte keys, 256-byte scalar strings, known setting paths, and exact integer or string value shapes. No file I/O or ambient environment reading is delegated to the dependency.",
+    "maintenance_review": "toml-rs is the maintained Rust TOML implementation used through its current exact release; its declared rust-version is below the repository's pinned Rust 1.96 toolchain.",
+    "security_review": "Rejected parser diagnostics are collapsed to Positron's closed InvalidSyntax code and never expose source bytes. Cargo Audit, Cargo Deny, Cargo Vet, secret scanning, and the Configuration canary tests remain blocking.",
+    "removal_condition": "Remove if the Rust standard library gains the required bounded standards-compliant TOML parser or an accepted Configuration Contract ADR changes the file format.",
+    "cargo_deny": "Exact lower and upper version bans were added for toml 1.1.4; advisories, bans, licenses, and sources pass.",
+    "cargo_vet": {
+      "first_result": "failed closed on 15 newly resolved crates",
+      "final_local_result": "passed with 3 fully audited and 22 exact-version safe-to-deploy exemptions in the complete workspace graph",
+      "new_exact_exemptions": [
+        "equivalent 1.0.2",
+        "hashbrown 0.17.1",
+        "indexmap 2.14.0",
+        "proc-macro2 1.0.107",
+        "quote 1.0.47",
+        "serde_core 1.0.229",
+        "serde_derive 1.0.229",
+        "serde_spanned 1.1.1",
+        "syn 3.0.3",
+        "toml 1.1.4+spec-1.1.0",
+        "toml_datetime 1.1.1+spec-1.1.0",
+        "toml_parser 1.1.3+spec-1.1.0",
+        "toml_writer 1.1.2+spec-1.1.0",
+        "unicode-ident 1.0.24",
+        "winnow 1.0.4"
+      ],
+      "qualification_limit": "Exact exemptions are recorded policy, not independent audits or a qualification claim."
+    }
+  },
+  "compatibility_and_migration": {
+    "intentional_break": "A supplied TOML document without an explicit root schema_version is now rejected with MissingSchemaVersion from SchemaVersion. Compiled defaults still own version 1 only when no file source is supplied.",
+    "supported_version": 1,
+    "unsupported_version_behavior": "A declared non-v1 version is rejected with UnsupportedValue from SchemaVersion.",
+    "syntax_migration": "Valid TOML inline comments and escapes are now accepted. Malformed tables, duplicate keys, arrays or unsupported scalar shapes, unknown settings, excessive depth, and excessive sizes fail closed.",
+    "source_precedence": "Compiled defaults, file, non-secret environment, and non-secret command-line precedence is unchanged.",
+    "secret_behavior": "Environment and command-line secret overrides remain forbidden. Raw input wrappers now use bounded redacted Debug implementations; generated and effective references retain only the redaction marker.",
+    "publication_boundary": "No watcher, file reader, global singleton, runtime publication, task spawning, remote provider, or live reload executor is introduced."
+  },
+  "representative_old_new_evidence": {
+    "status": "old-local-pr-completed-new-exact-head-pending",
+    "old": {
+      "source_revision": "13b4367f92f0228dc9f2f6a308d5d379b935dc53",
+      "status": "passed-local-committed-pr-profile-before-independent-review-findings",
+      "evidence": "target/quality/evidence/1785293379977-13b4367f92f0-4507.json",
+      "limitations": "The candidate retained the handwritten TOML parser, leaked raw override values through derived Debug, defaulted a missing file schema version, and did not implement cargo xtask generate-config. Its pass is retained but is not evidence for the replacement detector set."
+    },
+    "new": {
+      "source_revision": "pending final remediation commit; GitHub Actions will bind github.sha",
+      "status": "pending-one-future-exact-head-trusted-ci-run",
+      "workflow": ".github/workflows/extended.yml",
+      "dispatch_input": "retain_m0_04_mutation=true",
+      "command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
+      "artifact_name_template": "extended-evidence-<github.run_id>-<github.run_attempt>-<github.sha>",
+      "artifact_contents": "target/quality including immutable evidence JSON, target/quality/coverage/m0-04-config.json, and target/quality/mutation/m0-04-config-final outcomes",
+      "result": "not run; no coverage baseline, mutation score, merge eligibility, implementation qualification, or release qualification is claimed"
+    },
+    "dual_run_conclusion": "The old local committed PR result remains immutable. Focused local red/green tests compare the old and replacement behavior. Only one future trusted exact-head campaign may establish the pending measurements."
+  },
+  "attempts": [
+    {
+      "id": "m0-01-activation-only-ledger",
+      "status": "failed-local-diagnostic",
+      "result": "The PR profile rejected application behavior while positron-config remained attributed only to the historical M0-01 scaffold activation."
+    },
+    {
+      "id": "empty-m0-04-baseline-identities",
+      "status": "failed-local-diagnostic",
+      "result": "The PR profile rejected the first M0-04 ledger because its required coverage and mutation identities were empty."
+    },
+    {
+      "id": "architecture-edge-transition",
+      "status": "failed-local-diagnostic",
+      "result": "The architecture fixture rejected the stale M0-01 ownership expectation for positron-runtime->positron-config before the M0-04 transition was represented."
+    },
+    {
+      "id": "forbidden-generator-workspace-edge",
+      "status": "failed-local-diagnostic",
+      "result": "The first generator design added an xtask->positron-config edge and an unreviewed wildcard path dependency. Architecture and dependency policy rejected it; the edge and dependency were removed."
+    },
+    {
+      "id": "explicit-schema-version-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test -p positron-config --test configuration_foundation requires_an_explicit_supported_schema_version_for_file_configuration --locked",
+      "result": "The public contract did not compile because MissingSchemaVersion did not exist and missing file versions inherited the compiled default."
+    },
+    {
+      "id": "explicit-schema-version-green",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test -p positron-config --test configuration_foundation requires_an_explicit_supported_schema_version_for_file_configuration --locked",
+      "result": "No-file defaults, explicit v1, missing file version, and unsupported version cases passed through stable public outcomes."
+    },
+    {
+      "id": "secret-formatting-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test -p positron-config --test configuration_foundation raw_configuration_inputs_and_failures_never_format_secret_canaries --locked",
+      "result": "The canary was observable through raw derived Debug on override and input wrappers."
+    },
+    {
+      "id": "secret-formatting-green",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test -p positron-config --test configuration_foundation raw_configuration_inputs_and_failures_never_format_secret_canaries --locked",
+      "result": "Forbidden overrides, protected file references, malformed secret-shaped values, errors, provenance, effective Debug, and generated references exposed no canary bytes."
+    },
+    {
+      "id": "canonical-toml-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test -p positron-config --test configuration_foundation accepts_canonical_toml_comments_and_escapes_and_rejects_ambiguous_documents --locked",
+      "result": "The handwritten parser rejected valid TOML escapes and inline comments."
+    },
+    {
+      "id": "canonical-toml-green",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test -p positron-config --test configuration_foundation accepts_canonical_toml_comments_and_escapes_and_rejects_ambiguous_documents --locked",
+      "result": "Standards-compliant comments and escapes passed; malformed tables, duplicates, unsupported arrays, and unknown nesting failed closed."
+    },
+    {
+      "id": "dependency-vet-before-exemptions",
+      "status": "failed-local-diagnostic",
+      "command": "cargo vet check --locked",
+      "result": "Cargo Vet rejected 15 newly resolved exact crates before their safe-to-deploy exemptions were recorded."
+    },
+    {
+      "id": "dependency-vet-and-deny-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo vet check --locked",
+        "cargo deny check"
+      ],
+      "result": "Cargo Vet passed with 3 audited and 22 exempted crates in the complete workspace graph; Cargo Deny accepted advisories, exact version bans, licenses, and sources."
+    },
+    {
+      "id": "configuration-generator-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test -p xtask --test config_generation --locked",
+      "result": "All four black-box tests failed because cargo xtask generate-config was not implemented."
+    },
+    {
+      "id": "configuration-generator-green",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test -p xtask --test config_generation --locked",
+      "result": "Four black-box tests proved specification mutation propagation, duplicate or missing declaration rejection, unsupported grammar rejection, and byte-identical repeated generation."
+    },
+    {
+      "id": "real-tree-generation-repeat",
+      "status": "passed-local-diagnostic",
+      "command": "cargo xtask generate-config twice",
+      "result": "Both runs produced schema SHA-256 0f21f316a526c02c32c616bc12e50ab662a1a13071b60a04ed526c3026082afb and reference SHA-256 5ba005216987a65be42d80808c4f4fe314a7c64457a58208c3aa7ea4c5bd8111."
+    },
+    {
+      "id": "m0-04-selection-and-matrix-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo test -p xtask --bin xtask m0_04 --locked",
+        "cargo test -p xtask --bin xtask generation_matrix_rejects_configuration_artifact_drift --locked"
+      ],
+      "result": "The EXT-only option and exact owner selector passed without executing mutation; the authoritative generation matrix rejected a drifted configuration schema."
+    },
+    {
+      "id": "final-pr-profile-before-historical-fixture-repair",
+      "status": "failed-local-diagnostic",
+      "command": "cargo xtask quality --profile pr",
+      "evidence": "target/quality/evidence/1785294704729-13b4367f92f0-48947.json",
+      "result": "EG-TEST failed because the historical M0-01 fixture removed the configuration directory but retained the newly EG-MATRIX-selected active configuration artifact row. The retained failure is not merge-eligible; the fixture restore path must remove the current row and the new direct dependency when reconstructing historical M0-01."
+    },
+    {
+      "id": "final-pr-profile-before-historical-lockfile-repair",
+      "status": "failed-local-diagnostic",
+      "command": "cargo xtask quality --profile pr",
+      "evidence": "target/quality/evidence/1785294785517-13b4367f92f0-55742.json",
+      "result": "EG-TEST reached all intended fixture assertions except the one that rebuilds xtask from the reconstructed source. That test correctly rejected the copied modern lockfile after TOML was removed from the historical manifest. The fixture must generate its dependency-free lockfile offline before invoking Cargo with --locked."
+    },
+    {
+      "id": "trusted-exact-head-coverage-and-mutation",
+      "status": "pending-external-execution",
+      "command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
+      "result": "Not run locally and not dispatched. No trusted result exists yet."
+    }
+  ],
+  "detection_gained": [
+    "File-backed configuration cannot silently inherit a compiled schema version; missing and unsupported versions have stable typed outcomes.",
+    "A maintained standards-compliant TOML parser accepts comments and escapes while rejecting malformed or duplicate documents before publication.",
+    "Raw environment, command-line, and file input wrappers cannot reveal secret canaries through Debug, Display, errors, provenance, effective references, or generated references.",
+    "One bounded seven-setting specification generates the checked JSON Schema and operator reference through cargo xtask generate-config.",
+    "EG-MATRIX fails when either generated configuration artifact differs from deterministic regeneration.",
+    "The authoritative EXT runner owns the registered M0-04 coverage report, 90 percent line and region floors, and the explicit exact-owner focused mutation campaign.",
+    "The extended workflow can retain the exact issue #5 campaign without broadening routine mutation selection.",
+    "The direct TOML dependency, exact version bans, lock resolution, Cargo Vet policy, and removal condition are registered and fail closed."
+  ],
+  "detection_lost": [],
+  "detection_lost_analysis": "No gate, target, threshold identity, corpus, workflow retention path, owner, or evidence field is removed or weakened. The handwritten parser's rejection of standards-compliant comments and escapes was incorrect behavior, not a retained detector.",
+  "baselines": {
+    "config-coverage-line": "pending-measured-baseline",
+    "config-coverage-region": "pending-measured-baseline",
+    "config-coverage-branch": "pending-measured-baseline",
+    "config-mutation-score": "pending-measured-baseline",
+    "measurement_rule": "Only the future trusted exact-head artifact may replace pending values with measured baselines through a separately reviewed policy update."
   },
   "approval": {
-    "required": ["Recovery and Lifecycle", "Architecture", "Quality Engineering"],
-    "status": "pending-independent-review"
-  }
+    "required": [
+      "Recovery and Lifecycle",
+      "Architecture",
+      "Quality Engineering"
+    ],
+    "status": "pending-independent-review",
+    "technical_review": "The initial PR candidate received independent findings that triggered this remediation. Finding closure requires a fresh review of the final commit.",
+    "attribution": "No author, implementation agent, or technical reviewer is recorded as granting a required owner approval."
+  },
+  "qualification_claim": "None. The implementation may be reviewed after the final PR profile passes, but M0-04 remains unqualified until required independent approvals and the exact-head trusted coverage and mutation evidence exist."
 }

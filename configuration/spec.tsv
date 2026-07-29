@@ -1,0 +1,8 @@
+path	kind	default	secrecy	mutability	constraint
+schema_version	integer	1	public	immutable after initialization	const:1
+diagnostics.log_level	string	info	public	live-reloadable	enum:error,warn,info,debug
+runtime.shutdown_grace_seconds	integer	30 seconds	public	restart-required	range:1:3600
+listener.control_bind_address	string	127.0.0.1:4317	public	drain-and-reload	max-length:256
+storage.data_directory	string	/var/lib/positron	public	immutable after initialization	max-length:256
+storage.secrets_directory	string	/var/lib/positron-secrets	public	immutable after initialization	max-length:256
+security.local_key_file	string	redacted protected-file reference	secret-bearing (redacted)	immutable after initialization	max-length-write-only:256

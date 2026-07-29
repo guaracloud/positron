@@ -263,7 +263,7 @@ fn live_m0_04_configuration_ledger_names_only_its_contract_and_artifact() -> Tes
     let root = repository_root()?;
     let scopes = fs::read_to_string(root.join("qualification/engineering/scopes.tsv"))?;
     let required = format!(
-        "positron-config\tcrates/positron-config\tRecovery and Lifecycle\tapplication\tactive\tM0-04\tpositron-config\tpositron-runtime->positron-config\tEG-COVERAGE\tcargo test --locked --package positron-config --test configuration_foundation\tconfig-coverage-branch|config-coverage-line|config-coverage-region\tconfig-mutation-score\tnone\t{M0_04_POLICY_CHANGE}"
+        "positron-config\tcrates/positron-config\tRecovery and Lifecycle\tapplication\tactive\tM0-04\tpositron-config\tpositron-runtime->positron-config\tEG-COVERAGE\tcargo test --locked --package positron-config --test configuration_foundation\tconfig-coverage-branch|config-coverage-line|config-coverage-region\tconfig-mutation-score\ttoml\t{M0_04_POLICY_CHANGE}"
     );
     if !scopes.contains(&required) {
         return Err(std::io::Error::other("live M0-04 configuration ledger drifted").into());
@@ -1533,6 +1533,26 @@ fn restore_m0_01_config_source_shape(root: &Path) -> TestResult {
         root.join("crates/positron-config/src/lib.rs"),
         "//! Historical M0-01 activation-only fixture.\n#![forbid(unsafe_code)]\n",
     )?;
+    let manifest = root.join("crates/positron-config/Cargo.toml");
+    let content = fs::read_to_string(&manifest)?;
+    fs::write(
+        manifest,
+        content.replace(
+            "\n[dependencies]\ntoml = { version = \"=1.1.4\", default-features = false, features = [\"parse\", \"serde\", \"std\"] }\n",
+            "",
+        ),
+    )?;
+    let lockfile = Command::new(env!("CARGO"))
+        .current_dir(root)
+        .args(["generate-lockfile", "--offline"])
+        .output()?;
+    if !lockfile.status.success() {
+        return Err(std::io::Error::other(format!(
+            "historical fixture lockfile generation failed: {}",
+            String::from_utf8_lossy(&lockfile.stderr)
+        ))
+        .into());
+    }
     let configuration = root.join("configuration");
     if configuration.is_dir() {
         fs::remove_dir_all(configuration)?;
@@ -1558,7 +1578,7 @@ fn restore_m0_01_config_source_shape(root: &Path) -> TestResult {
     fs::write(
         artifacts,
         content.replace(
-            "configuration-artifacts\tconfiguration\tRecovery and Lifecycle\tactive\t-\tEG-DOCS|EG-ERROR|EG-SECRETS|EG-TEST\n",
+            "configuration-artifacts\tconfiguration\tRecovery and Lifecycle\tactive\t-\tEG-DOCS|EG-ERROR|EG-MATRIX|EG-SECRETS|EG-TEST\n",
             "",
         ),
     )?;

@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-positron-generated-from": "configuration/spec.tsv",
   "title": "Positron Configuration Contract v1",
   "type": "object",
   "additionalProperties": false,

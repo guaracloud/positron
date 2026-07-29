@@ -274,6 +274,15 @@ impl Registry {
         })
     }
 
+    pub(crate) fn has_m0_04_configuration_scope(&self) -> bool {
+        self.scopes.iter().any(|scope| {
+            scope.package == "positron-config"
+                && scope.kind == "application"
+                && scope.state == "active"
+                && scope.activation_id == "M0-04"
+        })
+    }
+
     pub(crate) fn activated_risk_gates(&self) -> BTreeSet<String> {
         let mut activated = self
             .scopes
@@ -993,7 +1002,9 @@ fn validate_activation_ledgers(
                     reviewed_dependencies,
                 )?;
             },
-            "M0-04" => validate_m0_04_configuration_ledger(root, scope)?,
+            "M0-04" => {
+                validate_m0_04_configuration_ledger(root, scope, thresholds, reviewed_dependencies)?
+            },
             _ => {
                 return Err(XtaskError::invalid(
                     "application activation ledger",
@@ -1041,7 +1052,12 @@ fn m0_04_configuration_scope_set() -> BTreeSet<String> {
     ["positron-config"].into_iter().map(str::to_owned).collect()
 }
 
-fn validate_m0_04_configuration_ledger(root: &Path, scope: &Scope) -> Result<(), XtaskError> {
+fn validate_m0_04_configuration_ledger(
+    root: &Path,
+    scope: &Scope,
+    thresholds: &BTreeMap<String, Threshold>,
+    reviewed_dependencies: &BTreeSet<String>,
+) -> Result<(), XtaskError> {
     if scope.package != "positron-config"
         || scope.semantic_owner != "Recovery and Lifecycle"
         || scope.activation_scope_set != m0_04_configuration_scope_set()
@@ -1056,12 +1072,43 @@ fn validate_m0_04_configuration_ledger(root: &Path, scope: &Scope) -> Result<(),
                 "config-coverage-region".to_owned(),
             ])
         || scope.mutation_baseline != "config-mutation-score"
-        || scope.dependency_review != "none"
+        || scope.dependency_review != "toml"
     {
         return Err(XtaskError::invalid(
             "application activation ledger",
             "M0-04 Configuration has an incomplete or forbidden activation ledger",
         ));
+    }
+    for baseline in scope
+        .coverage_baseline
+        .iter()
+        .chain(std::iter::once(&scope.mutation_baseline))
+    {
+        let Some(threshold) = thresholds.get(baseline) else {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!("M0-04 Configuration references unknown baseline `{baseline}`"),
+            ));
+        };
+        if threshold.state != "pending-measured-baseline"
+            || threshold.value != "-"
+            || threshold.evidence != scope.contract_evidence
+        {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!(
+                    "M0-04 Configuration pending baseline `{baseline}` is not traceable to its contract evidence"
+                ),
+            ));
+        }
+    }
+    for dependency in split_set(&scope.dependency_review) {
+        if !reviewed_dependencies.contains(&dependency) {
+            return Err(XtaskError::invalid(
+                "application activation ledger",
+                format!("M0-04 Configuration names unreviewed dependency `{dependency}`"),
+            ));
+        }
     }
     let evidence = root.join(&scope.contract_evidence);
     if !evidence.is_file() {
@@ -1070,7 +1117,7 @@ fn validate_m0_04_configuration_ledger(root: &Path, scope: &Scope) -> Result<(),
             "M0-04 Configuration contract evidence is missing",
         ));
     }
-    validate_dependency_free_scope(root, scope)
+    Ok(())
 }
 
 fn validate_foundational_scope_ledger(

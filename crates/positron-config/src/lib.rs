@@ -14,6 +14,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 const MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
 const MAX_OVERRIDE_PAIRS: usize = 16;
+const MAX_TOML_ENTRIES: usize = 16;
+const MAX_TOML_DEPTH: usize = 2;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 256;
@@ -172,12 +174,6 @@ impl ProtectedFileReference {
             path: value.to_owned(),
         })
     }
-
-    /// Borrows the protected path only for a module-specific adapter.
-    #[must_use]
-    pub fn protected_path(&self) -> &str {
-        &self.path
-    }
 }
 
 /// A closed stable class for a rejected configuration operation.
@@ -185,6 +181,8 @@ impl ProtectedFileReference {
 pub enum ConfigurationFailureCode {
     /// The bounded source cannot be parsed as the canonical subset of TOML.
     InvalidSyntax,
+    /// A supplied configuration document omits its required schema version.
+    MissingSchemaVersion,
     /// A supplied key is not part of the canonical Configuration Contract.
     UnknownSetting,
     /// A setting has a valid shape but an unsupported value.
@@ -294,6 +292,9 @@ impl Display for ConfigurationFailure {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self.code {
             ConfigurationFailureCode::InvalidSyntax => "invalid canonical configuration syntax",
+            ConfigurationFailureCode::MissingSchemaVersion => {
+                "configuration schema version is required"
+            },
             ConfigurationFailureCode::UnknownSetting => "unknown configuration setting",
             ConfigurationFailureCode::UnsupportedValue => "unsupported configuration value",
             ConfigurationFailureCode::UnsafeCombination => "unsafe configuration combination",
@@ -312,7 +313,7 @@ impl Display for ConfigurationFailure {
 impl Error for ConfigurationFailure {}
 
 /// Bounded non-secret environment overrides.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct EnvironmentOverrides {
     pairs: Vec<(String, String)>,
 }
@@ -330,8 +331,18 @@ impl EnvironmentOverrides {
     }
 }
 
+impl Debug for EnvironmentOverrides {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvironmentOverrides")
+            .field("pairs", &"<redacted>")
+            .field("pair_count", &self.pairs.len())
+            .finish()
+    }
+}
+
 /// Bounded non-secret explicit command-line overrides.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CommandLineOverrides {
     pairs: Vec<(String, String)>,
 }
@@ -349,12 +360,33 @@ impl CommandLineOverrides {
     }
 }
 
+impl Debug for CommandLineOverrides {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandLineOverrides")
+            .field("pairs", &"<redacted>")
+            .field("pair_count", &self.pairs.len())
+            .finish()
+    }
+}
+
 /// All bounded source inputs required to resolve one candidate.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ConfigurationInputs {
     file: Option<String>,
     environment: EnvironmentOverrides,
     command_line: CommandLineOverrides,
+}
+
+impl Debug for ConfigurationInputs {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigurationInputs")
+            .field("file", &self.file.as_ref().map(|_| "<redacted>"))
+            .field("environment", &self.environment)
+            .field("command_line", &self.command_line)
+            .finish()
+    }
 }
 
 impl ConfigurationInputs {
@@ -560,49 +592,16 @@ pub fn resolve(
     candidate.validate()
 }
 
-/// Generates the canonical JSON Schema from the Rust-owned setting inventory.
+/// Returns the generated canonical JSON Schema.
 #[must_use]
 pub fn generated_json_schema() -> String {
-    let mut schema = String::with_capacity(2048);
-    schema.push_str("{\n  \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n");
-    schema.push_str("  \"title\": \"Positron Configuration Contract v1\",\n");
-    schema.push_str("  \"type\": \"object\",\n  \"additionalProperties\": false,\n");
-    schema.push_str("  \"properties\": {\n    \"schema_version\": {\"const\": 1},\n");
-    schema.push_str("    \"diagnostics\": {\"type\": \"object\", \"additionalProperties\": false, \"properties\": {\"log_level\": {\"enum\": [\"error\", \"warn\", \"info\", \"debug\"]}}},\n");
-    schema.push_str("    \"runtime\": {\"type\": \"object\", \"additionalProperties\": false, \"properties\": {\"shutdown_grace_seconds\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 3600}}},\n");
-    schema.push_str("    \"listener\": {\"type\": \"object\", \"additionalProperties\": false, \"properties\": {\"control_bind_address\": {\"type\": \"string\", \"maxLength\": 256}}},\n");
-    schema.push_str("    \"storage\": {\"type\": \"object\", \"additionalProperties\": false, \"properties\": {\"data_directory\": {\"type\": \"string\", \"maxLength\": 256}, \"secrets_directory\": {\"type\": \"string\", \"maxLength\": 256}}},\n");
-    schema.push_str("    \"security\": {\"type\": \"object\", \"additionalProperties\": false, \"properties\": {\"local_key_file\": {\"type\": \"string\", \"maxLength\": 256, \"writeOnly\": true}}}\n  },\n  \"required\": [\"schema_version\"]\n}\n");
-    schema
+    include_str!("../../../configuration/schema.json").to_owned()
 }
 
-/// Generates the canonical operator/reference documentation without secrets.
+/// Returns the generated operator/reference documentation without secrets.
 #[must_use]
 pub fn generated_reference() -> String {
-    let mut reference = String::with_capacity(2048);
-    reference.push_str("# Positron Configuration Contract v1\n\n");
-    reference.push_str("Precedence: compiled defaults, TOML file, non-secret POSITRON__ overrides, then non-secret CLI overrides.\n\n");
-    reference.push_str("| Setting | Default | Secrecy | Mutability |\n| --- | --- | --- | --- |\n");
-    for setting in SETTINGS {
-        reference.push_str("| `");
-        reference.push_str(setting.path());
-        reference.push_str("` | ");
-        reference.push_str(default_description(setting));
-        reference.push_str(" | ");
-        reference.push_str(match setting.secrecy() {
-            SecrecyClass::Public => "public",
-            SecrecyClass::SecretBearing => "secret-bearing (redacted)",
-        });
-        reference.push_str(" | ");
-        reference.push_str(match setting.mutability() {
-            MutabilityClass::LiveReloadable => "live-reloadable",
-            MutabilityClass::DrainAndReload => "drain-and-reload",
-            MutabilityClass::RestartRequired => "restart-required",
-            MutabilityClass::ImmutableAfterInitialization => "immutable after initialization",
-        });
-        reference.push_str(" |\n");
-    }
-    reference
+    include_str!("../../../configuration/reference.md").to_owned()
 }
 
 const SETTINGS: [Setting; 7] = [
@@ -733,99 +732,126 @@ where
 }
 
 fn apply_toml(candidate: &mut Candidate, file: &str) -> Result<(), ConfigurationFailure> {
-    let mut section = "";
-    let mut seen = [false; 7];
-    for line in file.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+    let table = file.parse::<toml::Table>().map_err(|_| {
+        ConfigurationFailure::new(
+            ConfigurationFailureCode::InvalidSyntax,
+            FailureSource::ConfigurationDocument,
+        )
+    })?;
+    let mut entry_count = 0_usize;
+    validate_toml_bounds(&table, 0, &mut entry_count)?;
+
+    let Some(schema_version) = table.get("schema_version") else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::MissingSchemaVersion,
+            FailureSource::SchemaVersion,
+        ));
+    };
+    apply_toml_value(candidate, Setting::SchemaVersion, schema_version)?;
+
+    for (section, value) in &table {
+        if section == "schema_version" {
             continue;
         }
-        if let Some(name) = trimmed
-            .strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-        {
-            section = match name {
-                "diagnostics" | "runtime" | "listener" | "storage" | "security" => name,
-                _ => {
-                    return Err(ConfigurationFailure::new(
-                        ConfigurationFailureCode::UnknownSetting,
-                        FailureSource::ConfigurationDocument,
-                    ));
-                },
-            };
-            continue;
-        }
-        let Some((key, raw_value)) = trimmed.split_once('=') else {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::InvalidSyntax,
-                FailureSource::ConfigurationDocument,
-            ));
-        };
-        let key = key.trim();
-        let value = parse_toml_scalar(raw_value.trim())?;
-        let path = if section.is_empty() {
-            key.to_owned()
-        } else {
-            let mut path = String::with_capacity(section.len() + key.len() + 1);
-            path.push_str(section);
-            path.push('.');
-            path.push_str(key);
-            path
-        };
-        let Some(setting) = setting_for_path(&path) else {
+        let toml::Value::Table(settings) = value else {
             return Err(ConfigurationFailure::new(
                 ConfigurationFailureCode::UnknownSetting,
                 FailureSource::ConfigurationDocument,
             ));
         };
-        let index = setting_index(setting);
-        let Some(already_seen) = seen.get(index).copied() else {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::InvalidSyntax,
-                FailureSource::ConfigurationDocument,
-            ));
-        };
-        if already_seen {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::ConflictingSetting,
-                FailureSource::ConfigurationDocument,
-            ));
+        for (key, setting_value) in settings {
+            let mut path = String::with_capacity(section.len() + key.len() + 1);
+            path.push_str(section);
+            path.push('.');
+            path.push_str(key);
+            let Some(setting) = setting_for_path(&path) else {
+                return Err(ConfigurationFailure::new(
+                    ConfigurationFailureCode::UnknownSetting,
+                    FailureSource::ConfigurationDocument,
+                ));
+            };
+            apply_toml_value(candidate, setting, setting_value)?;
         }
-        let Some(entry) = seen.get_mut(index) else {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::InvalidSyntax,
-                FailureSource::ConfigurationDocument,
-            ));
-        };
-        *entry = true;
-        candidate.apply(setting, value, SettingSource::ConfigurationFile)?;
     }
     Ok(())
 }
 
-fn parse_toml_scalar(value: &str) -> Result<&str, ConfigurationFailure> {
-    if let Some(inner) = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    {
-        if inner.contains('"') || inner.contains('\\') || inner.len() > MAX_VALUE_BYTES {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::InvalidSyntax,
-                FailureSource::ConfigurationDocument,
-            ));
-        }
-        return Ok(inner);
-    }
-    if value.is_empty()
-        || value.len() > MAX_VALUE_BYTES
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
+fn validate_toml_bounds(
+    table: &toml::Table,
+    depth: usize,
+    entry_count: &mut usize,
+) -> Result<(), ConfigurationFailure> {
+    if depth > MAX_TOML_DEPTH {
         return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::InvalidSyntax,
+            ConfigurationFailureCode::InputLimitExceeded,
             FailureSource::ConfigurationDocument,
         ));
     }
-    Ok(value)
+    for (key, value) in table {
+        *entry_count = entry_count.checked_add(1).ok_or_else(|| {
+            ConfigurationFailure::new(
+                ConfigurationFailureCode::InputLimitExceeded,
+                FailureSource::ConfigurationDocument,
+            )
+        })?;
+        if *entry_count > MAX_TOML_ENTRIES || key.len() > MAX_KEY_BYTES {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::InputLimitExceeded,
+                FailureSource::ConfigurationDocument,
+            ));
+        }
+        match value {
+            toml::Value::String(value) if value.len() > MAX_VALUE_BYTES => {
+                return Err(ConfigurationFailure::new(
+                    ConfigurationFailureCode::InputLimitExceeded,
+                    FailureSource::ConfigurationDocument,
+                ));
+            },
+            toml::Value::Table(nested) => {
+                validate_toml_bounds(nested, depth.saturating_add(1), entry_count)?;
+            },
+            toml::Value::Array(_)
+            | toml::Value::Float(_)
+            | toml::Value::Boolean(_)
+            | toml::Value::Datetime(_) => {
+                return Err(ConfigurationFailure::new(
+                    ConfigurationFailureCode::InvalidSyntax,
+                    FailureSource::ConfigurationDocument,
+                ));
+            },
+            toml::Value::String(_) | toml::Value::Integer(_) => {},
+        }
+    }
+    Ok(())
+}
+
+fn apply_toml_value(
+    candidate: &mut Candidate,
+    setting: Setting,
+    value: &toml::Value,
+) -> Result<(), ConfigurationFailure> {
+    match (setting, value) {
+        (
+            Setting::SchemaVersion | Setting::RuntimeShutdownGraceSeconds,
+            toml::Value::Integer(value),
+        ) => candidate.apply(
+            setting,
+            &value.to_string(),
+            SettingSource::ConfigurationFile,
+        ),
+        (
+            Setting::DiagnosticsLogLevel
+            | Setting::ListenerControlBindAddress
+            | Setting::StorageDataDirectory
+            | Setting::StorageSecretsDirectory
+            | Setting::SecurityLocalKeyFile,
+            toml::Value::String(value),
+        ) => candidate.apply(setting, value, SettingSource::ConfigurationFile),
+        _ => Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::InvalidSyntax,
+            FailureSource::ConfigurationDocument,
+        )),
+    }
 }
 
 fn apply_environment(
@@ -981,17 +1007,5 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::StorageDataDirectory => FailureSource::StorageDataDirectory,
         Setting::StorageSecretsDirectory => FailureSource::StorageSecretsDirectory,
         Setting::SecurityLocalKeyFile => FailureSource::SecurityLocalKeyFile,
-    }
-}
-
-const fn default_description(setting: Setting) -> &'static str {
-    match setting {
-        Setting::SchemaVersion => "`1`",
-        Setting::DiagnosticsLogLevel => "`info`",
-        Setting::RuntimeShutdownGraceSeconds => "`30` seconds",
-        Setting::ListenerControlBindAddress => "`127.0.0.1:4317`",
-        Setting::StorageDataDirectory => "`/var/lib/positron`",
-        Setting::StorageSecretsDirectory => "`/var/lib/positron-secrets`",
-        Setting::SecurityLocalKeyFile => "redacted protected-file reference",
     }
 }
