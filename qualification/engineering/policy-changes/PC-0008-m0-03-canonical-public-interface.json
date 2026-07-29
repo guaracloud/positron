@@ -142,6 +142,41 @@
         "cargo test -p xtask --bin xtask focused_m0_03_mutation_selection_covers_public_boundary_owners"
       ],
       "result": "Eleven generator tests, twelve public-interface tests, and the exact-owner selector regression passed. Overflowing fifth-byte u32 varints fail closed for version and capability fields; HTTP u32 parsing accepts only canonical decimal forms including exact zero and maximum boundaries; every selected mutation owner exists in generated Rust."
+    },
+    {
+      "id": "trusted-ci-extended-30410763179",
+      "status": "failed-trusted-ci",
+      "source_revision": "9fbce67bb58d3474bd2ee779710512fb3021b2a6",
+      "workflow_run_id": 30410763179,
+      "workflow_attempt": 1,
+      "artifact_id": 8708546900,
+      "artifact_digest": "sha256:6c3af9599982739ad28035b8684533d6a614affaaa3ef6a807ddbeb789569678",
+      "report": "target/quality/coverage/m0-03-api.json",
+      "result": "EG-COVERAGE failed before mutation: canonical API branch coverage was 76.92 percent against the frozen 100 percent baseline. The immutable report also recorded 81.31 percent line, 80.33 percent region, and 77.42 percent function coverage. Mutation did not run, so no mutation totals exist for this attempt."
+    },
+    {
+      "id": "unspecified-capability-transport-parity-red-coverage-remediation",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-api --test canonical_public_interface unspecified_capability_defaults_identically_across_public_transports -- --exact",
+      "result": "The direct generated service returned capability Unspecified while both generated transport decoders returned CanonicalPublicInterface for the additive zero/default value."
+    },
+    {
+      "id": "typed-client-infallibility-red-coverage-remediation",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-api --test canonical_public_interface every_typed_request_encodes_infallibly_within_the_published_bound -- --exact",
+      "result": "The public contract failed to compile because CapabilityClient::encode exposed a Result even though the generated two-u32 request model cannot exceed the published 64-byte encoding bound."
+    },
+    {
+      "id": "public-contract-green-coverage-remediation",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test api_generation",
+        "cargo test --locked --package positron-api --test canonical_public_interface",
+        "cargo test --locked --package xtask --bin xtask focused_m0_03_mutation_selection_covers_public_boundary_owners",
+        "cargo clippy --locked --package positron-api --all-targets -- -D warnings",
+        "cargo clippy --locked --package xtask --all-targets -- -D warnings"
+      ],
+      "result": "Eleven generator tests, nineteen public-interface tests, and the exact-owner selector regression passed. Every generated enum value, capability outcome, transport ordering, unknown capability, malformed grammar, exact body boundary, safe failure context, and typed encoding bound is exercised through public behavior. Typed encoding is infallible under the bounded generated model, impossible private encoder failures were removed, and two consecutive generations were byte-identical. No local coverage or mutation campaign was run."
     }
   ],
   "detection_gained": [

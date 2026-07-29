@@ -505,23 +505,12 @@ impl EncodedRequest {
         }
     }
 
-    fn push(&mut self, byte: u8, source: ApiFailureSource) -> Result<(), ApiError> {
-        if self.body.len() >= MAX_PUBLIC_REQUEST_BYTES {
-            return Err(ApiError::too_large(source));
-        }
+    fn push(&mut self, byte: u8) {
         self.body.push(byte);
-        Ok(())
     }
 
-    fn extend(&mut self, bytes: &[u8], source: ApiFailureSource) -> Result<(), ApiError> {
-        let Some(end) = self.body.len().checked_add(bytes.len()) else {
-            return Err(ApiError::too_large(source));
-        };
-        if end > MAX_PUBLIC_REQUEST_BYTES {
-            return Err(ApiError::too_large(source));
-        }
+    fn extend(&mut self, bytes: &[u8]) {
         self.body.extend_from_slice(bytes);
-        Ok(())
     }
 
     /// Returns the generated HTTP method.
@@ -584,10 +573,11 @@ impl CapabilityClient {
     }
 
     /// Encodes one typed request into its bounded generated transport body.
-    pub fn encode(
-        request: CapabilityRequest,
-        transport: Transport,
-    ) -> Result<EncodedRequest, ApiError> {
+    ///
+    /// The generated two-`u32` request model cannot exceed the published body
+    /// bound, so typed client encoding has no input-dependent failure.
+    #[must_use]
+    pub fn encode(request: CapabilityRequest, transport: Transport) -> EncodedRequest {
         match transport {
             Transport::GrpcProtobuf => encode_grpc(request),
             Transport::HttpJson => encode_http(request),
@@ -619,7 +609,7 @@ impl CapabilityService {
                 schema_digest: SchemaDigest::canonical(),
                 refusal: None,
                 deprecation: DeprecationState::Current,
-                capability: request.capability,
+                capability: Capability::CanonicalPublicInterface,
             },
             Capability::ReleaseOneQuery => CapabilityResponse {
                 availability: CapabilityAvailability::Unavailable,
@@ -658,67 +648,54 @@ impl CapabilityService {
     }
 }
 
-fn encode_grpc(request: CapabilityRequest) -> Result<EncodedRequest, ApiError> {
-    let source = ApiFailureSource::GrpcDecode;
+fn encode_grpc(request: CapabilityRequest) -> EncodedRequest {
     let mut encoded = EncodedRequest::empty("/positron.v1.CapabilityService/Negotiate");
-    encoded.push(GRPC_API_MAJOR_TAG, source)?;
-    encode_varint(request.api_major, &mut encoded, source)?;
-    encoded.push(GRPC_CAPABILITY_TAG, source)?;
-    encode_varint(request.capability.wire_value(), &mut encoded, source)?;
-    Ok(encoded)
+    encoded.push(GRPC_API_MAJOR_TAG);
+    encode_varint(request.api_major, &mut encoded);
+    encoded.push(GRPC_CAPABILITY_TAG);
+    encode_varint(request.capability.wire_value(), &mut encoded);
+    encoded
 }
 
-fn encode_http(request: CapabilityRequest) -> Result<EncodedRequest, ApiError> {
-    let source = ApiFailureSource::HttpDecode;
+fn encode_http(request: CapabilityRequest) -> EncodedRequest {
     let mut encoded = EncodedRequest::empty("/v1/capabilities:negotiate");
-    encoded.extend(b"{\"api_major\":", source)?;
-    encode_json_u32(request.api_major, &mut encoded, source)?;
-    encoded.extend(b",\"capability\":", source)?;
-    encode_json_u32(request.capability.wire_value(), &mut encoded, source)?;
-    encoded.extend(b"}", source)?;
-    Ok(encoded)
+    encoded.extend(b"{\"api_major\":");
+    encode_json_u32(request.api_major, &mut encoded);
+    encoded.extend(b",\"capability\":");
+    encode_json_u32(request.capability.wire_value(), &mut encoded);
+    encoded.extend(b"}");
+    encoded
 }
 
-fn encode_json_u32(
-    mut value: u32,
-    encoded: &mut EncodedRequest,
-    source: ApiFailureSource,
-) -> Result<(), ApiError> {
+fn encode_json_u32(mut value: u32, encoded: &mut EncodedRequest) {
     if value == 0 {
-        return encoded.push(b'0', source);
+        encoded.push(b'0');
+        return;
     }
     let mut digits = [0_u8; 10];
-    let mut cursor = digits.len();
-    while value != 0 {
-        cursor = cursor
-            .checked_sub(1)
-            .ok_or_else(|| ApiError::too_large(source))?;
-        let digit = u8::try_from(value % 10).map_err(|_| ApiError::malformed(source))?;
-        let Some(slot) = digits.get_mut(cursor) else {
-            return Err(ApiError::too_large(source));
-        };
+    let digit_count = value.ilog10() as usize + 1;
+    for slot in digits.iter_mut().rev().take(digit_count) {
+        // The modulo bounds this narrowing conversion to `0..=9`.
+        let digit = (value % 10) as u8;
         *slot = b'0' + digit;
         value /= 10;
     }
-    let Some(decimal) = digits.get(cursor..) else {
-        return Err(ApiError::malformed(source));
-    };
-    encoded.extend(decimal, source)
+    let first_digit = digits.len() - digit_count;
+    for digit in digits.into_iter().skip(first_digit) {
+        encoded.push(digit);
+    }
 }
 
-fn encode_varint(
-    mut value: u32,
-    encoded: &mut EncodedRequest,
-    source: ApiFailureSource,
-) -> Result<(), ApiError> {
+fn encode_varint(mut value: u32, encoded: &mut EncodedRequest) {
     loop {
-        let byte = u8::try_from(value & 0x7f).map_err(|_| ApiError::malformed(source))?;
+        // The mask bounds this narrowing conversion to seven bits.
+        let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
-            encoded.push(byte, source)?;
-            return Ok(());
+            encoded.push(byte);
+            return;
         }
-        encoded.push(byte | 0x80, source)?;
+        encoded.push(byte | 0x80);
     }
 }
 
@@ -727,10 +704,7 @@ fn decode_grpc(body: &[u8]) -> Result<CapabilityRequest, ApiError> {
     let mut cursor = 0;
     let mut api_major = None;
     let mut capability = None;
-    while cursor < body.len() {
-        let Some(tag) = body.get(cursor).copied() else {
-            return Err(ApiError::malformed(source));
-        };
+    while let Some(tag) = body.get(cursor).copied() {
         cursor += 1;
         let (value, next) = decode_varint(body, cursor, source)?;
         cursor = next;
