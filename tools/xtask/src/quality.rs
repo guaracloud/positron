@@ -79,6 +79,7 @@ const M0_02_MUTATION_SELECTOR: &str = concat!(
 );
 const M0_02_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-02-domain-final-post-lint";
 const M0_03_MUTATION_SELECTOR: &str = concat!(
+    "ApiVersion::from_major|ApiVersion::major|",
     "Capability::wire_value|Capability::from_wire|",
     "SchemaDigest::canonical|SchemaDigest::as_str|",
     "ApiError::unsupported_api_version|ApiError::capability_unavailable|",
@@ -3352,6 +3353,8 @@ mod tests {
     fn focused_m0_03_mutation_selection_covers_public_boundary_owners() {
         let selected = M0_03_MUTATION_SELECTOR.split('|').collect::<BTreeSet<_>>();
         for owner in [
+            "ApiVersion::from_major",
+            "ApiVersion::major",
             "Capability::from_wire",
             "ApiError::unsupported_api_version",
             "CapabilityRequest::for_version",
@@ -3367,14 +3370,6 @@ mod tests {
                 "focused M0-03 mutation selection omitted public owner `{owner}`"
             );
         }
-        // `ApiVersion` is a closed single-variant v1 enum, so replacing
-        // `ApiVersion::major` with the literal `1` is identical for every
-        // possible input. The observable version invariants remain selected
-        // through request construction, response access, and negotiation.
-        assert!(
-            !selected.contains("ApiVersion::major"),
-            "the proven-equivalent closed-v1 accessor must not replace observable version owners"
-        );
         let generated = generated_rust_owner_names(include_str!(
             "../../../crates/positron-api/src/generated.rs"
         ));

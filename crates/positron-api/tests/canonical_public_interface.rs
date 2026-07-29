@@ -30,6 +30,54 @@ fn v1_capability_statement_is_typed_and_bound_to_the_canonical_schema() {
 }
 
 #[test]
+fn another_nonzero_api_major_is_typed_and_refused_consistently() -> Result<(), std::io::Error> {
+    let version =
+        ApiVersion::from_major(2).map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    let request = CapabilityRequest::for_capability(version, Capability::CanonicalPublicInterface);
+    let encoded = CapabilityClient::encode(request, Transport::GrpcProtobuf);
+    let response =
+        CapabilityService::decode_and_negotiate(Transport::GrpcProtobuf, encoded.as_bytes())
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+
+    assert_eq!(version.major(), 2);
+    assert_eq!(encoded.as_bytes(), &[0x08, 0x02, 0x10, 0x01]);
+    assert_eq!(
+        response.availability(),
+        CapabilityAvailability::VersionIncompatible
+    );
+    assert_eq!(response.api_major(), ApiVersion::V1);
+    assert_eq!(
+        response.refusal().map(|error| error.code()),
+        Some(ApiErrorCode::UnsupportedApiVersion)
+    );
+    Ok(())
+}
+
+#[test]
+fn zero_api_major_fails_closed_with_the_existing_typed_error() -> Result<(), std::io::Error> {
+    let error = match ApiVersion::from_major(0) {
+        Ok(_) => return Err(std::io::Error::other("zero API major was accepted")),
+        Err(error) => error,
+    };
+    let response = CapabilityService::negotiate(CapabilityRequest::unknown(
+        0,
+        Capability::CanonicalPublicInterface,
+    ));
+
+    assert_eq!(error.code(), ApiErrorCode::UnsupportedApiVersion);
+    assert_eq!(error.retry_class(), RetryClass::Never);
+    assert_eq!(error.completion_state(), CompletionState::Rejected);
+    assert_eq!(error.source(), ApiFailureSource::CapabilityNegotiation);
+    assert_eq!(error.safe_detail(), SafeDetail::ApiMajorUnsupported);
+    assert_eq!(
+        response.availability(),
+        CapabilityAvailability::VersionIncompatible
+    );
+    assert_eq!(response.refusal(), Some(error));
+    Ok(())
+}
+
+#[test]
 fn every_generated_enum_value_preserves_its_public_number_and_deprecation_state() {
     for (value, number) in [
         (Capability::Unspecified, 0),

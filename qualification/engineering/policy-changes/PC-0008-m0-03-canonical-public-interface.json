@@ -223,38 +223,54 @@
       "limits": "This analysis does not reclassify any viable mutant, change the 100 percent mutation baseline, remove any observable invariant owner, weaken EG-COVERAGE, or alter the immutable failed attempt."
     }
   ],
-  "selector_policy_authorization": {
-    "status": "authorized-by-repository-owner-autonomous-delegation",
-    "recorded_at_utc": "2026-07-29T01:43:58Z",
-    "authorized_by": "@vicotrbb",
-    "authorization_capacity": "repository owner delegating Architecture, Public API and SDK, and Quality Engineering approval for autonomous ticket execution",
-    "session_instruction_verbatim": "For all the other tickets, ignore this manual approval gate! Just work autonomously while keeping high quality bar... Never ask this approval to me again, ever",
-    "approved_scope": "Exclude the single generated ApiVersion::major replacement-with-1 target proven equivalent by EA-0001 while retaining every viable mutation target and the observable version owners CapabilityRequest::for_version, CapabilityResponse::api_major, and CapabilityService::negotiate.",
-    "not_approved": [
-      "removal or exclusion of any viable invariant owner",
-      "change to a mutation or coverage threshold",
-      "weakening, skipping, renaming, or reclassification of any gate",
-      "change to public or wire behavior",
-      "qualification or merge-eligibility claim"
-    ],
-    "github_review_claimed": false,
-    "technical_review": {
+  "equivalence_analysis_corrections": [
+    {
+      "id": "EA-0001-CORRECTION-0001",
+      "status": "retracted-and-superseded-without-deleting-history",
+      "recorded_at_utc": "2026-07-29T01:53:08Z",
+      "corrects": "EA-0001-api-version-major-literal-one",
+      "factual_correction": "EA-0001 incorrectly states that source revision 5d0fe2a6e4e195e9105b540498a585c7bb5c9771 declared #[repr(u32)] ApiVersion::V1 = 1. That revision instead declared a closed single-variant ApiVersion enum with V1 and an exhaustive major match returning 1.",
+      "superseding_implementation": "The generated ApiVersion is now an invariant-bearing NonZeroU32 newtype. ApiVersion::V1 remains source-compatible as an associated constant, from_major checks every requested major and rejects zero with the existing typed error, and major returns the represented nonzero value.",
+      "equivalence_removed": "A valid ApiVersion can now represent major 2, for which major returns 2. Replacing ApiVersion::major with the literal 1 is therefore observably incorrect rather than equivalent.",
+      "selector_correction": "ApiVersion::from_major and ApiVersion::major are both selected mutation owners alongside CapabilityRequest::for_version, CapabilityResponse::api_major, and CapabilityService::negotiate. No selector exception remains.",
+      "implementation_revision": "pending final commit; the committed-candidate PR profile and future trusted-CI artifact bind the exact revision",
+      "qualification_claim": "none"
+    }
+  ],
+  "technical_review_history": [
+    {
       "reviewed_candidate_revision": "47b0b157c558219d357839b277f1e35a5a06aebb",
       "recorded_after_completion_at_utc": "2026-07-29T01:43:58Z",
       "review_kind": "fresh independent Terra two-axis code review",
       "standards": {
         "reviewer": "Bohr",
         "task_id": "/root/m0_03_tdd_implementation/review_standards",
-        "result": "Two hard findings: the bounded selector exclusion lacked recorded policy authorization and the retained trusted-CI result had been rewritten. This policy-only remediation records the authorization and restores the immutable result verbatim."
+        "result": "Two hard findings: the bounded selector exclusion lacked recorded policy authorization and the retained trusted-CI result had been rewritten."
       },
       "spec": {
         "reviewer": "Noether",
         "task_id": "/root/m0_03_tdd_implementation/review_spec",
         "result": "Pass with no findings."
       },
-      "attribution": "This is independent technical review evidence, not a GitHub approval and not a claim that either reviewer held a required human role."
+      "attribution": "Independent technical review evidence only; no reviewer role approval is claimed."
+    },
+    {
+      "reviewed_candidate_revision": "d2d97565d1f04abf7fcbf4f0cf8c47885687b6d5",
+      "recorded_after_completion_at_utc": "2026-07-29T01:53:08Z",
+      "review_kind": "fresh independent Terra two-axis code review",
+      "standards": {
+        "reviewer": "Bohr",
+        "task_id": "/root/m0_03_tdd_implementation/review_standards",
+        "result": "Three hard findings: false self-approval attribution, approval claimed before pending new evidence existed, and EA-0001 bound a false representation premise to revision 5d0fe2a6e4e195e9105b540498a585c7bb5c9771."
+      },
+      "spec": {
+        "reviewer": "Noether",
+        "task_id": "/root/m0_03_tdd_implementation/review_spec",
+        "result": "One P1 finding: required approval criteria were incorrectly recorded as roles performed by the repository owner."
+      },
+      "attribution": "Independent technical review evidence only; the findings remain visible and no reviewer role approval is claimed."
     }
-  },
+  ],
   "representative_old_new_evidence": {
     "status": "old-completed-new-pending-trusted-ci",
     "old": {
@@ -280,7 +296,7 @@
       "artifact_contents": "The existing upload-artifact step retains target/quality, including the revision-bound evidence JSON, coverage report, and focused mutation outcomes.",
       "result": "not run; no pass, mutation score, merge-eligibility, or qualification claim is made before the external exact-head artifact exists."
     },
-    "comparison_scope": "The representative comparison is limited to the authorized exclusion of one proven-equivalent generated accessor target. The final trusted-CI artifact must demonstrate that all viable observable owners, thresholds, and gates remain selected and passing on the exact final commit."
+    "comparison_scope": "The implementation removes the prior equivalence instead of excluding a target. The final trusted-CI artifact must demonstrate that ApiVersion::from_major, ApiVersion::major, all other viable observable owners, thresholds, and gates remain selected and passing on the exact final commit."
   },
   "detection_gained": [
     "one bounded parsed versioned Protobuf source generates the Rust, gRPC and HTTP decode mapping, client contract, OpenAPI, and Schema Digest foundations",
@@ -288,7 +304,7 @@
     "the HTTP client publishes and tests an exact one-buffer allocation contract with no intermediate heap body and no completed-body copy",
     "public decoding rejects overflowing terminal u32 varints before shifting or capability negotiation",
     "HTTP u32 decoding accepts canonical unsigned decimal grammar with RFC JSON boundary whitespace and rejects signed, zero-padded, fractional, exponent, internal-whitespace, and non-RFC-whitespace forms",
-    "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail; it retains observable version owners while excluding only the documented semantic-equivalent single-variant ApiVersion::major target",
+    "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail; it selects ApiVersion::from_major, ApiVersion::major, and the observable request, response, and negotiation owners with no target exception",
     "the public contract proves implemented, unavailable, unsupported, and version-incompatible capability outcomes with safe typed errors and no wire or domain leakage",
     "the canonical artifact scope cannot return to scaffold, accept unknown fields, exceed its 64-byte request bound, or drift from deterministic generation",
     "the authoritative EXT runner owns M0-03 coverage and the explicit exact-selector mutation campaign without changing routine PR selection"
@@ -296,15 +312,7 @@
   "detection_lost": [],
   "migration": "No durable format, SDK publication, listener, provider, query, signal-store, clustering, or Release 1 qualification claim is introduced. The implemented candidate remains unqualified until exact-artifact M6 evidence.",
   "approvals_required": ["Architecture", "Public API and SDK", "Quality Engineering"],
-  "approval_status": "approved-by-repository-owner-autonomous-delegation-for-bounded-selector-exclusion",
-  "approved_by": [
-    {
-      "principal": "@vicotrbb",
-      "capacity": "repository owner autonomous delegation",
-      "roles": ["Architecture", "Public API and SDK", "Quality Engineering"],
-      "recorded_at_utc": "2026-07-29T01:43:58Z",
-      "scope": "Only the single proven-equivalent generated ApiVersion::major replacement-with-1 selector exclusion described by EA-0001."
-    }
-  ],
+  "approval_status": "pending-final-independent-technical-review-and-exact-head-trusted-ci",
+  "approved_by": [],
   "immutable_after_acceptance": true
 }
