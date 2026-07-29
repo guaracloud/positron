@@ -3070,6 +3070,7 @@ fn validate_retained_engineering_evidence(
     let entries = fs::read_dir(&directory)
         .map_err(|source| XtaskError::io(format!("read {}", directory.display()), source))?;
     let mut attempt_count = 0_usize;
+    let mut retained_attempts = BTreeSet::new();
     let mut v3_attempts = BTreeSet::new();
     let mut expected_reports = BTreeSet::new();
     for entry in entries {
@@ -3109,6 +3110,7 @@ fn validate_retained_engineering_evidence(
                 "retained evidence filename is not attempt-owned",
             ));
         }
+        retained_attempts.insert(attempt_id.to_owned());
         let metadata = fs::metadata(&path)
             .map_err(|source| XtaskError::io(format!("inspect {}", path.display()), source))?;
         if metadata.len() > MAXIMUM_RETAINED_EVIDENCE_BYTES as u64 {
@@ -3156,6 +3158,16 @@ fn validate_retained_engineering_evidence(
                 ));
             },
         }
+    }
+    if let Some(recovery) = retained_attempts.iter().find(|attempt| {
+        attempt
+            .strip_suffix("-recovery")
+            .is_some_and(|primary| retained_attempts.contains(primary))
+    }) {
+        return Err(XtaskError::invalid_path(
+            &directory.join(format!("{recovery}.json")),
+            "primary evidence and its authoritative recovery marker coexist",
+        ));
     }
     let actual_reports = enumerate_retained_raw_reports(root, &v3_attempts)?;
     if let Some(orphan) = actual_reports.difference(&expected_reports).next() {
@@ -5838,7 +5850,8 @@ struct AttemptReservation {
     recovery_bytes: String,
     report_staging_path: PathBuf,
     report_final_path: PathBuf,
-    report_files: Vec<PathBuf>,
+    report_staging_files: Vec<PathBuf>,
+    report_final_files: Vec<PathBuf>,
     report_staging_directories: OwnedDirectoryChain,
     report_final_directories: OwnedDirectoryChain,
     evidence: Evidence,
@@ -6005,7 +6018,8 @@ impl AttemptReservation {
             report_final_path: root
                 .join("target/quality/evidence-reports")
                 .join(&evidence.attempt_id),
-            report_files: Vec::new(),
+            report_staging_files: Vec::new(),
+            report_final_files: Vec::new(),
             report_staging_directories: OwnedDirectoryChain::default(),
             report_final_directories: OwnedDirectoryChain::default(),
             evidence,
@@ -6034,20 +6048,23 @@ impl AttemptReservation {
         stage_raw_reports(
             &self.report_staging_path,
             &self.evidence,
-            &mut self.report_files,
+            &mut self.report_staging_files,
         )?;
         sync_directory(&self.report_staging_path)?;
-        publish_staged_reports(&self.report_staging_path, &self.report_final_path)?;
-        self.report_final_directories
-            .adopt_renamed_directory(&self.report_final_path);
-        for report in &mut self.report_files {
-            let name = report.file_name().ok_or_else(|| {
-                XtaskError::invalid_path(report, "owned report file has no filename")
-            })?;
-            *report = self.report_final_path.join(name);
-        }
+        claim_final_report_directory(
+            &self.report_final_path,
+            final_parent,
+            &mut self.report_final_directories,
+        )?;
+        publish_staged_reports(
+            &self.report_staging_files,
+            &self.report_final_path,
+            &mut self.report_final_files,
+        )?;
         sync_directory(&self.report_final_path)?;
         sync_directory(final_parent)?;
+        cleanup_owned_report_files(&self.report_staging_files)?;
+        self.report_staging_directories.cleanup_empty()?;
         self.file
             .write_all(serialized.as_bytes())
             .and_then(|()| self.file.flush())
@@ -6079,7 +6096,8 @@ impl AttemptReservation {
     fn reconcile_failed_publication(&self, error: XtaskError) -> XtaskError {
         let mut cleanup_errors = Vec::new();
         for cleanup in [
-            cleanup_owned_report_files(&self.report_files),
+            cleanup_owned_report_files(&self.report_staging_files),
+            cleanup_owned_report_files(&self.report_final_files),
             cleanup_primary_evidence(&self.path),
             self.report_staging_directories.cleanup_empty(),
             self.report_final_directories.cleanup_empty(),
@@ -6192,7 +6210,7 @@ impl OwnedDirectoryChain {
         Ok(chain)
     }
 
-    fn adopt_renamed_directory(&mut self, directory: &Path) {
+    fn adopt_created_directory(&mut self, directory: &Path) {
         self.created.push(directory.to_path_buf());
     }
 
@@ -6386,23 +6404,69 @@ fn stage_raw_reports(
     Ok(())
 }
 
-fn publish_staged_reports(staging_path: &Path, final_path: &Path) -> Result<(), XtaskError> {
-    if final_path.exists() {
-        return Err(XtaskError::invalid_path(
+fn claim_final_report_directory(
+    final_path: &Path,
+    final_parent: &Path,
+    owned_directories: &mut OwnedDirectoryChain,
+) -> Result<(), XtaskError> {
+    match fs::create_dir(final_path) {
+        Ok(()) => {
+            owned_directories.adopt_created_directory(final_path);
+            sync_owned_directory_entry(final_parent, final_path)
+        },
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => Err(XtaskError::invalid_path(
             final_path,
             "engineering evidence raw report attempt path is already occupied",
-        ));
-    }
-    fs::rename(staging_path, final_path).map_err(|source| {
-        XtaskError::io(
+        )),
+        Err(source) => Err(XtaskError::io(
             format!(
-                "atomically publish report directory {} to {}",
-                staging_path.display(),
+                "claim engineering evidence raw report attempt path {}",
                 final_path.display()
             ),
             source,
-        )
-    })
+        )),
+    }
+}
+
+fn publish_staged_reports(
+    staging_files: &[PathBuf],
+    final_path: &Path,
+    owned_files: &mut Vec<PathBuf>,
+) -> Result<(), XtaskError> {
+    for staging_file in staging_files {
+        let name = staging_file.file_name().ok_or_else(|| {
+            XtaskError::invalid_path(staging_file, "staged report file has no filename")
+        })?;
+        let final_file = final_path.join(name);
+        match fs::hard_link(staging_file, &final_file) {
+            Ok(()) => owned_files.push(final_file.clone()),
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+                return Err(XtaskError::invalid_path(
+                    &final_file,
+                    "engineering evidence raw report final path is already occupied",
+                ));
+            },
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!(
+                        "publish staged report {} to {}",
+                        staging_file.display(),
+                        final_file.display()
+                    ),
+                    source,
+                ));
+            },
+        }
+        fs::File::open(&final_file)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| {
+                XtaskError::io(
+                    format!("synchronize published report {}", final_file.display()),
+                    source,
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn cleanup_owned_report_files(paths: &[PathBuf]) -> Result<(), XtaskError> {
@@ -6428,7 +6492,20 @@ fn cleanup_owned_report_files(paths: &[PathBuf]) -> Result<(), XtaskError> {
 
 fn cleanup_primary_evidence(path: &Path) -> Result<(), XtaskError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let parent = path.parent().ok_or_else(|| {
+                XtaskError::invalid_path(path, "incomplete primary evidence has no parent")
+            })?;
+            sync_directory(parent).map_err(|error| {
+                XtaskError::invalid(
+                    "incomplete primary evidence cleanup",
+                    format!(
+                        "removed {} but could not synchronize its parent: {error}",
+                        path.display()
+                    ),
+                )
+            })
+        },
         Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
         Err(source) => Err(XtaskError::io(
             format!("remove incomplete primary evidence {}", path.display()),

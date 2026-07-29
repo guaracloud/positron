@@ -6,6 +6,8 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -592,15 +594,12 @@ fn quality_validates_a_retained_collision_on_the_next_evidence_pass() -> TestRes
     let fixture = Fixture::create()?;
     let result = (|| {
         pin_fixture_attempt_identity(&fixture.root)?;
-        let first = fixture.quality_output_from_fixture_source("pre-commit")?;
-        if !first.status.success() {
-            return Err(std::io::Error::other(format!(
-                "fixture could not publish the canonical evidence record: {}\n{}",
-                String::from_utf8_lossy(&first.stdout),
-                String::from_utf8_lossy(&first.stderr)
-            ))
-            .into());
-        }
+        let evidence_directory = fixture.root.join("target/quality/evidence");
+        fs::create_dir_all(&evidence_directory)?;
+        fs::write(
+            evidence_directory.join("1700000000000-111111111111-1-recovery.json"),
+            b"{\"schema_version\":1,\"attempt_id\":\"legacy-blocker\"}\n",
+        )?;
         let collision = fixture.quality_output_from_fixture_source("pre-commit")?;
         assert_rejected_output(&collision, "engineering evidence attempt collision")?;
 
@@ -727,7 +726,16 @@ fn quality_atomically_retains_one_verdict_for_each_parallel_canonical_racer() ->
             .count();
         if successful != 1 {
             return Err(std::io::Error::other(format!(
-                "parallel canonical racers produced {successful} successful verdicts instead of one"
+                "parallel canonical racers produced {successful} successful verdicts instead of one: {}",
+                outputs
+                    .iter()
+                    .map(|output| format!(
+                        "stdout={} stderr={}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ))
             .into());
         }
@@ -782,6 +790,121 @@ fn quality_atomically_retains_one_verdict_for_each_parallel_collision_slot_racer
                 format!("{canonical}-collision-01.json"),
             ],
             &[format!("{canonical}-recovery.json")],
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_never_replaces_a_concurrently_claimed_final_report_directory() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject_final_report_claim_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture()?;
+        let ready = fixture
+            .root
+            .join("target/quality-tools/report-publication-barrier-ready");
+        wait_for_path(&ready, Duration::from_secs(30))?;
+
+        let attempt_id = "1700000000000-111111111111-1";
+        let final_path = fixture
+            .root
+            .join("target/quality/evidence-reports")
+            .join(attempt_id);
+        fs::create_dir_all(&final_path)?;
+        let claimed = fs::metadata(&final_path)?;
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/report-publication-barrier-release"),
+            b"release\n",
+        )?;
+
+        let output = child.wait_with_output()?;
+        assert_rejected_output(
+            &output,
+            "engineering evidence raw report attempt path is already occupied",
+        )?;
+        let retained = fs::metadata(&final_path)?;
+        if retained.dev() != claimed.dev() || retained.ino() != claimed.ino() {
+            return Err(std::io::Error::other(
+                "report publication replaced the concurrently claimed final directory",
+            )
+            .into());
+        }
+        if fs::read_dir(&final_path)?.next().is_some() {
+            return Err(std::io::Error::other(
+                "report publication wrote into the concurrently claimed final directory",
+            )
+            .into());
+        }
+        assert_schema_valid_recovery(&fixture.root, attempt_id)?;
+        assert_exact_parallel_retained_verdicts(
+            &fixture.root,
+            &[format!("{attempt_id}-recovery.json")],
+            &[],
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_synchronizes_the_evidence_parent_after_removing_an_incomplete_primary() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject_primary_evidence_write_failure(&fixture.root)?;
+        inject_primary_cleanup_parent_sync_failure(&fixture.root)?;
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "injected primary cleanup parent sync failure")?;
+
+        let attempt_id = "1700000000000-111111111111-1";
+        let primary = fixture
+            .root
+            .join("target/quality/evidence")
+            .join(format!("{attempt_id}.json"));
+        if primary.exists() {
+            return Err(std::io::Error::other(
+                "primary cleanup parent-sync failure left incomplete primary evidence",
+            )
+            .into());
+        }
+        assert_schema_valid_recovery(&fixture.root, attempt_id)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_primary_resurrected_next_to_its_authoritative_recovery() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        let first = fixture.quality_output_from_fixture_source("pre-commit")?;
+        if !first.status.success() {
+            return Err(std::io::Error::other(format!(
+                "fixture could not publish primary evidence: {}\n{}",
+                String::from_utf8_lossy(&first.stdout),
+                String::from_utf8_lossy(&first.stderr),
+            ))
+            .into());
+        }
+        let collision = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&collision, "engineering evidence attempt collision")?;
+        assert_schema_valid_recovery(&fixture.root, "1700000000000-111111111111-1")?;
+
+        let validation = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &validation,
+            "primary evidence and its authoritative recovery marker coexist",
         )
     })();
     let cleanup = fixture.remove();
@@ -2970,6 +3093,24 @@ fn wait_for_child_exit(
 }
 
 #[cfg(unix)]
+fn wait_for_path(path: &Path, timeout: Duration) -> TestResult {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if path.try_exists()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "timed out waiting for fixture path {}",
+                path.display()
+            ))
+            .into());
+        }
+        thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
 fn read_child_output(child: &mut Child) -> TestResult<(String, String)> {
     let stdout = child
         .stdout
@@ -3875,8 +4016,92 @@ fn inject_report_write_failure(root: &Path, gate_id: &str) -> TestResult {
 fn inject_report_cleanup_failure(root: &Path) -> TestResult {
     replace_once(
         &root.join("tools/xtask/src/quality.rs"),
-        "fn cleanup_primary_evidence(path: &Path) -> Result<(), XtaskError> {\n    match fs::remove_file(path) {\n        Ok(()) => Ok(()),\n        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),",
-        "fn cleanup_primary_evidence(path: &Path) -> Result<(), XtaskError> {\n    match fs::remove_file(path) {\n        Ok(()) => Err(XtaskError::invalid(\n            \"injected report staging failure\",\n            \"cleanup reported failure after removing the incomplete primary\",\n        )),\n        Err(source) if source.kind() == ErrorKind::NotFound => Err(XtaskError::invalid(\n            \"injected report staging failure\",\n            \"cleanup reported failure after confirming the incomplete primary was absent\",\n        )),",
+        "        Ok(()) => {\n            let parent = path.parent().ok_or_else(|| {\n                XtaskError::invalid_path(path, \"incomplete primary evidence has no parent\")\n            })?;\n            sync_directory(parent).map_err(|error| {\n                XtaskError::invalid(\n                    \"incomplete primary evidence cleanup\",\n                    format!(\n                        \"removed {} but could not synchronize its parent: {error}\",\n                        path.display()\n                    ),\n                )\n            })\n        },",
+        "        Ok(()) => {\n            let parent = path.parent().ok_or_else(|| {\n                XtaskError::invalid_path(path, \"incomplete primary evidence has no parent\")\n            })?;\n            sync_directory(parent)?;\n            Err(XtaskError::invalid(\n                \"injected report staging failure\",\n                \"cleanup reported failure after removing the incomplete primary\",\n            ))\n        },",
+    )
+}
+
+#[cfg(unix)]
+fn inject_final_report_claim_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/quality.rs");
+    replace_once(
+        &source,
+        "fn claim_final_report_directory(\n",
+        r#"fn report_publication_fixture_barrier(final_path: &Path) -> Result<(), XtaskError> {
+    let target = final_path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| XtaskError::invalid_path(final_path, "fixture final path has no target ancestor"))?;
+    let tools = target.join("quality-tools");
+    let ready = tools.join("report-publication-barrier-ready");
+    let release = tools.join("report-publication-barrier-release");
+    fs::write(&ready, b"ready\n")
+        .map_err(|source| XtaskError::io("publish report fixture barrier", source))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if release
+            .try_exists()
+            .map_err(|source| XtaskError::io("inspect report fixture barrier", source))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(XtaskError::invalid(
+                "report fixture barrier",
+                "publication racer did not release the barrier",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn claim_final_report_directory(
+"#,
+    )?;
+    replace_once(
+        &source,
+        ") -> Result<(), XtaskError> {\n    match fs::create_dir(final_path) {\n",
+        ") -> Result<(), XtaskError> {\n    report_publication_fixture_barrier(final_path)?;\n    match fs::create_dir(final_path) {\n",
+    )
+}
+
+fn inject_primary_cleanup_parent_sync_failure(root: &Path) -> TestResult {
+    fs::write(
+        root.join("target/quality-tools/fail-primary-cleanup-parent-sync"),
+        b"1700000000000-111111111111-1\n",
+    )?;
+    let source = root.join("tools/xtask/src/quality.rs");
+    replace_once(
+        &source,
+        "            .and_then(|()| Err(std::io::Error::other(\n                \"injected primary evidence publication failure: primary write failed\",\n            )))\n",
+        "            .and_then(|()| {\n                fs::write(\n                    root.join(\"target/quality-tools/primary-cleanup-sync-armed\"),\n                    b\"armed\\n\",\n                )?;\n                Err(std::io::Error::other(\n                    \"injected primary evidence publication failure: primary write failed\",\n                ))\n            })\n",
+    )?;
+    replace_once(
+        &source,
+        "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n",
+        r#"fn sync_directory(path: &Path) -> Result<(), XtaskError> {
+    let tools = path
+        .parent()
+        .and_then(Path::parent)
+        .map(|target| target.join("quality-tools"));
+    if let Some(tools) = tools {
+        let marker = tools.join("fail-primary-cleanup-parent-sync");
+        if let Ok(attempt) = fs::read_to_string(marker) {
+            let attempt = attempt.trim();
+            if tools.join("primary-cleanup-sync-armed").exists()
+                && path.ends_with("target/quality/evidence")
+                && !path.join(format!("{attempt}.json")).exists()
+                && path.join(format!("{attempt}-recovery.json")).exists()
+            {
+                return Err(XtaskError::invalid(
+                    "injected primary cleanup parent sync failure",
+                    "evidence parent synchronization failed after primary unlink",
+                ));
+            }
+        }
+    }
+"#,
     )
 }
 
@@ -3885,7 +4110,7 @@ fn inject_non_owned_report_content(root: &Path, phase: &str) -> TestResult {
     let source = root.join("tools/xtask/src/quality.rs");
     replace_once(
         &source,
-        "fn publish_staged_reports(staging_path: &Path, final_path: &Path) -> Result<(), XtaskError> {\n",
+        "fn publish_staged_reports(\n",
         r#"fn inject_non_owned_publication_content(path: &Path) -> Result<(), XtaskError> {
     fs::write(path.join("injected-file"), b"non-owned bytes\n")
         .map_err(|source| XtaskError::io("inject non-owned publication file", source))?;
@@ -3900,19 +4125,19 @@ fn inject_non_owned_report_content(root: &Path, phase: &str) -> TestResult {
     ))
 }
 
-fn publish_staged_reports(staging_path: &Path, final_path: &Path) -> Result<(), XtaskError> {
+fn publish_staged_reports(
 "#,
     )?;
     match phase {
         "staging" => replace_once(
             &source,
-            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_files,\n        )?;\n        sync_directory(&self.report_staging_path)?;\n",
-            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_files,\n        )?;\n        inject_non_owned_publication_content(&self.report_staging_path)?;\n",
+            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_staging_files,\n        )?;\n        sync_directory(&self.report_staging_path)?;\n",
+            "        stage_raw_reports(\n            &self.report_staging_path,\n            &self.evidence,\n            &mut self.report_staging_files,\n        )?;\n        inject_non_owned_publication_content(&self.report_staging_path)?;\n",
         ),
         "final" => replace_once(
             &source,
-            "            *report = self.report_final_path.join(name);\n        }\n        sync_directory(&self.report_final_path)?;\n",
-            "            *report = self.report_final_path.join(name);\n        }\n        inject_non_owned_publication_content(&self.report_final_path)?;\n",
+            "        publish_staged_reports(\n            &self.report_staging_files,\n            &self.report_final_path,\n            &mut self.report_final_files,\n        )?;\n        sync_directory(&self.report_final_path)?;\n",
+            "        publish_staged_reports(\n            &self.report_staging_files,\n            &self.report_final_path,\n            &mut self.report_final_files,\n        )?;\n        inject_non_owned_publication_content(&self.report_final_path)?;\n",
         ),
         _ => Err(std::io::Error::other(format!(
             "unknown non-owned publication injection phase `{phase}`"
