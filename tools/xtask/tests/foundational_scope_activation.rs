@@ -1141,6 +1141,45 @@ fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> 
 }
 
 #[test]
+fn quality_accepts_a_failed_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let evidence_directory = fixture.root.join("target/quality/evidence");
+        fs::create_dir_all(&evidence_directory)?;
+        let malformed = evidence_directory.join("1700000000000-111111111111-1.json");
+        fs::write(&malformed, "{")?;
+
+        let failed = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&failed, "retained engineering evidence is invalid")?;
+        let retained = fixture.latest_evidence()?;
+        let evidence_gate = gate_record(&retained, "EG-EVIDENCE")?;
+        if !evidence_gate.contains("\"result\": \"failed\"")
+            || !evidence_gate.contains("\"controlled_steps\":[]")
+        {
+            return Err(std::io::Error::other(
+                "failed internal EG-EVIDENCE did not retain its canonical zero-step sequence",
+            )
+            .into());
+        }
+
+        fs::remove_file(malformed)?;
+        let next = fixture.quality_output_for("pr")?;
+        if !next.status.success() {
+            return Err(std::io::Error::other(format!(
+                "EG-EVIDENCE rejected a legitimate failed internal zero-step gate: {}\n{}",
+                String::from_utf8_lossy(&next.stdout),
+                String::from_utf8_lossy(&next.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
