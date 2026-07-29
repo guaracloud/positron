@@ -50,9 +50,16 @@ impl fmt::Display for JsonError {
 impl Error for JsonError {}
 
 pub(crate) fn parse(input: &str) -> Result<JsonValue, JsonError> {
-    if input.len() > MAX_INPUT_BYTES {
+    parse_with_maximum_bytes(input, MAX_INPUT_BYTES)
+}
+
+pub(crate) fn parse_with_maximum_bytes(
+    input: &str,
+    maximum_bytes: usize,
+) -> Result<JsonValue, JsonError> {
+    if input.len() > maximum_bytes {
         return Err(JsonError::new(format!(
-            "JSON input exceeds the {MAX_INPUT_BYTES}-byte limit"
+            "JSON input exceeds the {maximum_bytes}-byte limit"
         )));
     }
 

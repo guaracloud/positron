@@ -835,6 +835,74 @@ fn quality_rejects_an_oversized_retained_raw_report_binding() -> TestResult {
 }
 
 #[test]
+fn quality_accepts_a_valid_retained_raw_report_one_byte_below_its_limit() -> TestResult {
+    assert_valid_large_retained_raw_report(8_388_607)
+}
+
+#[test]
+fn quality_accepts_a_valid_retained_raw_report_at_its_limit() -> TestResult {
+    assert_valid_large_retained_raw_report(8_388_608)
+}
+
+#[test]
+fn quality_rejects_a_retained_raw_report_one_byte_over_its_limit_before_parsing() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        let evidence = fs::read_to_string(&evidence_path)?;
+        resize_retained_raw_report(&fixture, &evidence_path, &evidence, 8_388_609, false)?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "retained raw report exceeds 8388608 bytes")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn assert_valid_large_retained_raw_report(target_bytes: usize) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        let evidence = fs::read_to_string(&evidence_path)?;
+        resize_retained_raw_report(&fixture, &evidence_path, &evidence, target_bytes, true)?;
+        fixture.quality_profile("pr")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn resize_retained_raw_report(
+    fixture: &Fixture,
+    evidence_path: &Path,
+    evidence: &str,
+    target_bytes: usize,
+    update_bound_length: bool,
+) -> TestResult {
+    let report_path = exact_raw_report_path(&fixture.root, evidence, "EG-00")?;
+    let mut report = fs::read_to_string(&report_path)?;
+    let padding = target_bytes
+        .checked_sub(report.len())
+        .ok_or_else(|| std::io::Error::other("raw report fixture already exceeds target size"))?;
+    report.push_str(&" ".repeat(padding));
+    fs::write(&report_path, &report)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(report.as_bytes()));
+    rewrite_gate_field(evidence_path, evidence, "EG-00", "\"sha256\": \"", &digest)?;
+    if update_bound_length {
+        rewrite_gate_field(
+            evidence_path,
+            evidence,
+            "EG-00",
+            "\"bytes\": ",
+            &target_bytes.to_string(),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 fn quality_rejects_a_raw_report_command_digest_mismatch() -> TestResult {
     assert_invalid_retained_raw_report(
         |_, evidence_path, evidence| {
@@ -864,8 +932,6 @@ fn quality_rejects_coordinated_invocation_and_stored_digest_tampering() -> TestR
             extract_json_string_after(original_gate, "\"sha256\": \"")?.to_owned();
         let original_command_digest =
             extract_json_string_after(original_gate, "\"command_digest\": \"")?.to_owned();
-        let forged_command_digest =
-            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
         evidence = replace_once_in_string(
             evidence,
@@ -873,17 +939,30 @@ fn quality_rejects_coordinated_invocation_and_stored_digest_tampering() -> TestR
             "\"--profIle\"",
             "evidence invocation argument",
         )?;
-        evidence = replace_once_in_string(
-            evidence,
-            &format!("\"command_digest\": \"{original_command_digest}\""),
-            &format!("\"command_digest\": \"{forged_command_digest}\""),
-            "evidence command digest",
-        )?;
         report = replace_once_in_string(
             report,
             "\"--profile\"",
             "\"--profIle\"",
             "raw report invocation argument",
+        )?;
+        let tampered_gate = gate_record(&evidence, "EG-00")?;
+        let (_, invocation_tail) = tampered_gate
+            .split_once("\"invocation\": ")
+            .ok_or_else(|| std::io::Error::other("tampered gate omitted invocation"))?;
+        let (canonical_invocation, _) = invocation_tail
+            .split_once(",\n      \"command_digest\"")
+            .ok_or_else(|| {
+            std::io::Error::other("tampered gate invocation has no command digest boundary")
+        })?;
+        let mut command_hasher = Sha256::new();
+        command_hasher.update(b"positron-quality-command-v2\0");
+        command_hasher.update(canonical_invocation.as_bytes());
+        let forged_command_digest = format!("sha256:{:x}", command_hasher.finalize());
+        evidence = replace_once_in_string(
+            evidence,
+            &format!("\"command_digest\": \"{original_command_digest}\""),
+            &format!("\"command_digest\": \"{forged_command_digest}\""),
+            "evidence command digest",
         )?;
         report = replace_once_in_string(
             report,
@@ -902,10 +981,7 @@ fn quality_rejects_coordinated_invocation_and_stored_digest_tampering() -> TestR
         fs::write(&evidence_path, evidence)?;
 
         let output = fixture.quality_output_for("pr")?;
-        assert_rejected_output(
-            &output,
-            "command digest does not match its canonical structured invocation",
-        )
+        assert_rejected_output(&output, "does not match its canonical registered gate")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -1089,25 +1165,7 @@ fn quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occup
             .into());
         }
 
-        let evidence = fixture
-            .root
-            .join("target/quality/evidence/1700000000000-111111111111-1.json");
-        let retained = fs::read_to_string(&evidence)?;
-        assert_complete_evidence_contract(&retained)?;
-        for expected in [
-            "\"result\": \"failed\"",
-            "\"merge_eligible\": false",
-            "\"gate_id\": \"EG-00\"",
-            "raw report",
-        ] {
-            if !retained.contains(expected) {
-                return Err(std::io::Error::other(format!(
-                    "raw-report collision did not retain failed evidence field `{expected}`"
-                ))
-                .into());
-            }
-        }
-        Ok(())
+        assert_schema_valid_recovery(&fixture.root, "1700000000000-111111111111-1")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -1137,6 +1195,83 @@ fn quality_retains_failed_attempt_without_final_reports_when_staging_cleanup_fai
     assert_staged_report_write_failure("EG-POLICY", true)
 }
 
+#[test]
+fn quality_retains_recovery_evidence_when_the_primary_evidence_write_fails() -> TestResult {
+    assert_primary_evidence_publication_failure(inject_primary_evidence_write_failure)
+}
+
+#[test]
+fn quality_retains_recovery_evidence_when_the_primary_evidence_flush_fails() -> TestResult {
+    assert_primary_evidence_publication_failure(inject_primary_evidence_flush_failure)
+}
+
+#[test]
+fn quality_retains_recovery_evidence_when_recovery_reconciliation_fails() -> TestResult {
+    assert_primary_evidence_publication_failure(inject_recovery_cleanup_failure)
+}
+
+fn assert_primary_evidence_publication_failure(
+    inject: impl FnOnce(&Path) -> TestResult,
+) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject(&fixture.root)?;
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "injected primary evidence publication failure")?;
+        assert_recovered_failed_attempt(&fixture.root, "1700000000000-111111111111-1")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn assert_recovered_failed_attempt(root: &Path, attempt_id: &str) -> TestResult {
+    for directory in [
+        root.join("target/quality/evidence-reports")
+            .join(attempt_id),
+        root.join("target/quality/evidence-report-staging")
+            .join(attempt_id),
+    ] {
+        if directory.exists() {
+            return Err(std::io::Error::other(format!(
+                "failed evidence publication left a successful report bundle {}",
+                directory.display()
+            ))
+            .into());
+        }
+    }
+    assert_schema_valid_recovery(root, attempt_id)
+}
+
+fn assert_schema_valid_recovery(root: &Path, attempt_id: &str) -> TestResult {
+    let evidence_directory = root.join("target/quality/evidence");
+    let mut retained_failure = false;
+    for entry in fs::read_dir(&evidence_directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(retained) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if retained.contains(&format!("\"value\": \"{attempt_id}\""))
+            && retained.contains("\"result\": \"failed\"")
+            && retained.contains("\"reason\": \"report-retention-failed\"")
+        {
+            assert_complete_evidence_contract(&retained)?;
+            retained_failure = true;
+        }
+    }
+    if !retained_failure {
+        return Err(std::io::Error::other(
+            "failed evidence publication omitted a schema-valid recovery record",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn assert_staged_report_write_failure(gate_id: &str, inject_cleanup_failure: bool) -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -1149,47 +1284,7 @@ fn assert_staged_report_write_failure(gate_id: &str, inject_cleanup_failure: boo
         assert_rejected_output(&output, "injected report staging failure")?;
 
         let attempt_id = "1700000000000-111111111111-1";
-        let final_reports = fixture
-            .root
-            .join("target/quality/evidence-reports")
-            .join(attempt_id);
-        if final_reports.exists() {
-            return Err(std::io::Error::other(format!(
-                "failed report staging published final attempt directory {}",
-                final_reports.display()
-            ))
-            .into());
-        }
-        let staged_reports = fixture
-            .root
-            .join("target/quality/evidence-report-staging")
-            .join(attempt_id);
-        if staged_reports.exists() {
-            return Err(std::io::Error::other(format!(
-                "failed report staging left unreconciled directory {}",
-                staged_reports.display()
-            ))
-            .into());
-        }
-        let evidence = fixture
-            .root
-            .join("target/quality/evidence")
-            .join(format!("{attempt_id}.json"));
-        let retained = fs::read_to_string(evidence)?;
-        assert_complete_evidence_contract(&retained)?;
-        for expected in [
-            "\"result\": \"failed\"",
-            "\"merge_eligible\": false",
-            "\"reason\": \"report-retention-failed\"",
-        ] {
-            if !retained.contains(expected) {
-                return Err(std::io::Error::other(format!(
-                    "staging failure omitted retained evidence field `{expected}`"
-                ))
-                .into());
-            }
-        }
-        Ok(())
+        assert_recovered_failed_attempt(&fixture.root, attempt_id)
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -2977,6 +3072,30 @@ fn inject_report_cleanup_failure(root: &Path) -> TestResult {
         &root.join("tools/xtask/src/quality.rs"),
         "fn cleanup_report_staging(path: &Path) -> Result<(), XtaskError> {\n    match fs::remove_dir_all(path) {\n        Ok(()) => Ok(()),",
         "fn cleanup_report_staging(path: &Path) -> Result<(), XtaskError> {\n    match fs::remove_dir_all(path) {\n        Ok(()) => Err(XtaskError::invalid(\n            \"injected report staging failure\",\n            \"cleanup reported failure after removing staging\",\n        )),",
+    )
+}
+
+fn inject_primary_evidence_write_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "            .write_all(serialized.as_bytes())\n",
+        "            .write_all(serialized.as_bytes())\n            .and_then(|()| Err(std::io::Error::other(\n                \"injected primary evidence publication failure: primary write failed\",\n            )))\n",
+    )
+}
+
+fn inject_primary_evidence_flush_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "            .and_then(|()| self.file.flush())\n",
+        "            .and_then(|()| Err(std::io::Error::other(\n                \"injected primary evidence publication failure: primary flush failed\",\n            )))\n",
+    )
+}
+
+fn inject_recovery_cleanup_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "fn cleanup_recovery_marker(path: &Path) -> Result<(), XtaskError> {\n    fs::remove_file(path).map_err(|source| {\n        XtaskError::io(\n            format!(\"reconcile recovery evidence {}\", path.display()),\n            source,\n        )\n    })\n}",
+        "fn cleanup_recovery_marker(_path: &Path) -> Result<(), XtaskError> {\n    Err(XtaskError::invalid(\n        \"injected primary evidence publication failure\",\n        \"recovery cleanup failed\",\n    ))\n}",
     )
 }
 
