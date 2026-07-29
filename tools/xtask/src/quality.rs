@@ -2517,15 +2517,15 @@ fn validate_retained_engineering_evidence(root: &Path) -> Result<(), XtaskError>
         let mut object = parse_object(&path, &evidence, "retained engineering evidence")?;
         let schema_version = require_any_integer(&mut object, "schema_version", &path)?;
         let recorded_attempt = require_string(&mut object, "attempt_id", &path)?;
-        if recorded_attempt != attempt_id {
-            return Err(XtaskError::invalid_path(
-                &path,
-                "retained evidence attempt_id does not match its owned filename",
-            ));
-        }
         match schema_version {
             1 | 2 => {},
             3 => {
+                if recorded_attempt != attempt_id {
+                    return Err(XtaskError::invalid_path(
+                        &path,
+                        "retained evidence attempt_id does not match its owned filename",
+                    ));
+                }
                 let reports =
                     validate_retained_v3_reports(root, &path, &evidence).map_err(|error| {
                         XtaskError::invalid_path(

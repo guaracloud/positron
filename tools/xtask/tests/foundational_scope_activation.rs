@@ -788,10 +788,10 @@ fn quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports() -> T
         let evidence_directory = fixture.root.join("target/quality/evidence");
         fs::create_dir_all(&evidence_directory)?;
         fs::write(
-            evidence_directory.join("legacy-attempt.json"),
-            "{\"schema_version\":1,\"attempt_id\":\"legacy-attempt\"}\n",
+            evidence_directory.join("legacy-historical-label.json"),
+            "{\"schema_version\":1,\"attempt_id\":\"legacy-embedded-attempt\"}\n",
         )?;
-        fixture.quality()
+        fixture.quality_profile("pr")
     })();
     let cleanup = fixture.remove();
     cleanup?;
