@@ -99,7 +99,7 @@
     "publication_boundary": "No watcher, file reader, global singleton, runtime publication, task spawning, remote provider, or live reload executor is introduced."
   },
   "representative_old_new_evidence": {
-    "status": "reviewed-pr-head-retained-final-remediation-exact-head-pending",
+    "status": "trusted-exact-head-coverage-failed-remediation-in-progress",
     "old": {
       "source_revision": "cb7649046b148c127ce9c8d7d936b839b1f634fa",
       "status": "passed-local-clean-committed-pr-profile-before-final-review-blockers",
@@ -107,13 +107,29 @@
       "limitations": "The pass is retained, but the standalone TSV specification remained an independent authority while runtime duplicated defaults and constraints, and TOML resource checks occurred only after toml::Table allocation. It is not evidence for the replacement canonical-source, preflight, safety, or security detector set."
     },
     "new": {
-      "source_revision": "pending final remediation commit",
-      "status": "pending-one-final-clean-committed-pr-profile",
-      "command": "cargo xtask quality --profile pr",
-      "expected_selected_gates": "EG-SAFETY and EG-SECURITY are selected by the M0-04 risk ledger in addition to existing PR gates; coverage and mutation remain EXT-only and are not run locally.",
-      "result": "not run; no replacement PR evidence, merge eligibility, implementation qualification, or release qualification is claimed"
+      "source_revision": "96d8d27f43ec2dc9461627822ea69b52c700b7fd",
+      "status": "failed-trusted-ci-exact-head",
+      "command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
+      "run": "https://github.com/guaracloud/positron/actions/runs/30420864277",
+      "artifact": "8712033138:extended-evidence-30420864277-1-96d8d27f43ec2dc9461627822ea69b52c700b7fd:sha256:f449c61b56a3d2f49301c8950e5ee825a1a7643c12852b7a9e56bf103a62ba95",
+      "evidence_attempt": "1785297982952-96d8d27f43ec-28720",
+      "result": "EG-COVERAGE failed: M0-04 line coverage was 640/785 (81.528662 percent) below 90 percent; region coverage was 917/1082 (84.750462 percent) below 90 percent; branch coverage was retained at 115/182 (63.186813 percent). Mutation did not execute after the coverage-floor failure, so no mutation totals exist. EG-SAFETY and EG-SECURITY passed. The attempt is retained, trusted, failed, and not merge-eligible."
     },
-    "dual_run_conclusion": "The cb76490 local committed PR result and earlier failed attempts remain immutable. Focused local red/green tests compare the reviewed and replacement behavior. The one final clean committed PR profile may establish only local PR evidence; trusted exact-head coverage and mutation measurements remain pending external work."
+    "dual_run_conclusion": "The cb76490 local committed PR result and every failed attempt remain immutable. Trusted run 30420864277 established the first exact-head M0-04 measurement and failed closed before mutation. The static public-behavior remediation adds no threshold, selector, exclusion, or production-policy change. A later trusted exact-head run is separately authorized work and cannot erase this failure."
+  },
+  "static_coverage_gap_to_public_test_map": {
+    "canonical_metadata_defaults_and_provenance": "exposes_the_complete_canonical_setting_contract_and_compiled_defaults",
+    "all_file_settings_and_file_sources": "resolves_every_setting_from_the_canonical_file_with_file_provenance",
+    "all_overrideable_settings_and_source_precedence": "applies_environment_then_command_line_to_every_overrideable_setting",
+    "override_bounds_conflicts_unknowns_and_forbidden_sources": "rejects_bounded_conflicting_unknown_and_forbidden_overrides",
+    "value_domain_positive_and_exact_boundaries": "accepts_each_closed_value_and_exact_numeric_and_address_boundaries",
+    "value_domain_invalid_types_values_and_paths": "rejects_invalid_shapes_and_values_from_each_closed_value_domain",
+    "schema_and_root_table_variants": "requires_an_explicit_supported_schema_version_for_file_configuration; rejects_empty_unknown_root_table_before_iterating_children; rejects_nonempty_unknown_root_table; rejects_unknown_or_non_table_root_sections_before_setting_application; accepts_known_empty_root_tables_without_changing_default_values",
+    "preflight_resource_malformed_comment_string_and_escape_paths": "preflight_rejects_adversarial_toml_before_unbounded_parse_allocation; preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape; preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax; preflight_preserves_blank_lines_single_quoted_literals_and_escaped_quotes",
+    "redaction_and_opaque_protected_references": "raw_configuration_inputs_and_failures_never_format_secret_canaries; rejects_each_reachable_immutable_change_with_its_semantic_source",
+    "mutability_classes_combinations_and_priority": "returns_only_checked_mutability_plans_and_rejects_immutable_changes; plans_no_change_and_mixed_mutability_with_closed_priority; rejects_each_reachable_immutable_change_with_its_semantic_source",
+    "generated_metadata_schema_and_reference": "exposes_the_complete_canonical_setting_contract_and_compiled_defaults; generated_schema_and_reference_are_deterministic_and_secret_safe; rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity",
+    "closed_failure_code_display_debug_retry_completion_and_source": "closed_failures_expose_stable_safe_details_for_every_failure_code"
   },
   "attempts": [
     {
@@ -310,9 +326,20 @@
     },
     {
       "id": "trusted-exact-head-coverage-and-mutation",
-      "status": "pending-external-execution",
+      "status": "failed-trusted-ci",
       "command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
-      "result": "Not run locally and not dispatched. No trusted result exists yet."
+      "source_revision": "96d8d27f43ec2dc9461627822ea69b52c700b7fd",
+      "run_id": 30420864277,
+      "artifact_id": 8712033138,
+      "artifact_digest": "sha256:f449c61b56a3d2f49301c8950e5ee825a1a7643c12852b7a9e56bf103a62ba95",
+      "evidence_attempt": "1785297982952-96d8d27f43ec-28720",
+      "result": "EG-COVERAGE failed with M0-04 line 640/785 (81.528662 percent), region 917/1082 (84.750462 percent), and branch 115/182 (63.186813 percent). Line and region were below their unchanged 90 percent candidate floors. Mutation did not execute and produced no totals. EG-SAFETY, EG-SECURITY, and every selected non-coverage gate passed. The exact trusted failure is retained and not merge-eligible."
+    },
+    {
+      "id": "static-public-coverage-gap-suite-green",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation",
+      "result": "All 25 public contract tests passed after the static gap-to-test mapping added canonical metadata, every source and setting, exact domain boundaries and invalid outcomes, reachable preflight branches, mutability combinations, generated surfaces, opaque protected references, and closed failure details. No local coverage or mutation command was run, and no claim is made that this diagnostic predicts a trusted percentage."
     }
   ],
   "detection_gained": [
