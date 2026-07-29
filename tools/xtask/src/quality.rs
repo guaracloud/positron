@@ -2697,7 +2697,7 @@ fn validate_gate_invocation_value(
     if !(3..=16).contains(&arguments.len()) {
         return invalid_json(path, "gate invocation arguments are out of bounds");
     }
-    validate_string_values(arguments, path, "gate invocation arguments")?;
+    validate_nonempty_string_values(arguments, path, "gate invocation arguments")?;
     let environment_digest = require_string(&mut object, "environment_digest", path)?;
     if !valid_sha256_digest(&environment_digest) {
         return invalid_json(path, "gate invocation environment digest is invalid");
@@ -2739,7 +2739,7 @@ fn validate_controlled_invocation_value(
     if arguments.len() > 256 {
         return invalid_json(path, "controlled invocation contains too many arguments");
     }
-    validate_string_values(arguments, path, "controlled invocation arguments")?;
+    validate_nonempty_string_values(arguments, path, "controlled invocation arguments")?;
     if require_string(&mut object, "working_directory", path)? != "engineering-workspace" {
         return invalid_json(path, "controlled invocation working directory is invalid");
     }
@@ -3169,6 +3169,22 @@ fn validate_string_values(
         }
     }
     Ok(strings)
+}
+
+fn validate_nonempty_string_values(
+    values: Vec<bounded_json::JsonValue>,
+    path: &Path,
+    subject: &str,
+) -> Result<(), XtaskError> {
+    for value in values {
+        let bounded_json::JsonValue::String(value) = value else {
+            return invalid_json(path, format!("{subject} must contain only strings"));
+        };
+        if value.is_empty() {
+            return invalid_json(path, format!("{subject} contains an empty value"));
+        }
+    }
+    Ok(())
 }
 
 fn reject_unknown(
