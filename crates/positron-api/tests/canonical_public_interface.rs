@@ -6,7 +6,202 @@ use positron_api::generated::{
     EncodedRequest, MAX_PUBLIC_REQUEST_BYTES, RequestedApiMajor, RetryClass, SafeDetail,
     SchemaDigest, Transport,
 };
-use std::hint::black_box;
+use std::{hint::black_box, io};
+
+#[derive(Debug)]
+struct GeneratedApiFixture {
+    id: String,
+    class: String,
+    grpc: Vec<u8>,
+    http: String,
+    availability: Option<CapabilityAvailability>,
+    error: ApiErrorCode,
+}
+
+#[test]
+fn generated_validation_fixtures_execute_through_both_public_transports()
+-> Result<(), Box<dyn std::error::Error>> {
+    let document = include_str!("../../../api/positron/v1/validation-fixtures.json");
+    let fixtures = parse_generated_api_fixtures(document)?;
+    assert_eq!(
+        fixtures
+            .iter()
+            .map(|fixture| fixture.class.as_str())
+            .collect::<Vec<_>>(),
+        ["positive", "boundary", "negative", "adversarial"]
+    );
+
+    let digest = json_string_field(document, "schema_digest")?;
+    assert_eq!(digest, SchemaDigest::canonical().as_str());
+    assert!(include_str!("../../../api/positron/v1/openapi.json").contains(&digest));
+
+    for fixture in fixtures {
+        assert_fixture_outcome(&fixture, Transport::GrpcProtobuf, fixture.grpc.as_slice())?;
+        assert_fixture_outcome(&fixture, Transport::HttpJson, fixture.http.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn parse_generated_api_fixtures(
+    document: &str,
+) -> Result<Vec<GeneratedApiFixture>, Box<dyn std::error::Error>> {
+    let proto = include_str!("../../../api/positron/v1/positron.proto");
+    let http_mapping = include_str!("../../../api/positron/v1/http.json");
+    let mut fixtures = Vec::new();
+    for line in document.lines().map(str::trim) {
+        if !line.starts_with("{\"id\":") {
+            continue;
+        }
+        let availability_name = optional_json_string_field(line, "expected_availability")?;
+        let error_name = json_string_field(line, "expected_error")?;
+        assert!(proto.contains(&error_name));
+        assert!(http_mapping.contains(&error_name));
+        if let Some(name) = availability_name.as_deref() {
+            assert!(proto.contains(name));
+            assert!(http_mapping.contains(name));
+        }
+        fixtures.push(GeneratedApiFixture {
+            id: json_string_field(line, "id")?,
+            class: json_string_field(line, "class")?,
+            grpc: decode_fixture_hex(&json_string_field(line, "grpc_hex")?)?,
+            http: json_string_field(line, "http_json")?,
+            availability: availability_name
+                .as_deref()
+                .map(parse_fixture_availability)
+                .transpose()?,
+            error: parse_fixture_error(&error_name)?,
+        });
+    }
+    if fixtures.len() != 4 {
+        return Err(io::Error::other("expected exactly four generated API fixtures").into());
+    }
+    Ok(fixtures)
+}
+
+fn assert_fixture_outcome(
+    fixture: &GeneratedApiFixture,
+    transport: Transport,
+    payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match CapabilityService::decode_and_negotiate(transport, payload) {
+        Ok(response) => {
+            let availability = fixture.availability.ok_or_else(|| {
+                io::Error::other(format!(
+                    "fixture `{}` accepted without an expected availability",
+                    fixture.id
+                ))
+            })?;
+            assert_eq!(response.availability(), availability, "{}", fixture.id);
+            assert_eq!(
+                response
+                    .refusal()
+                    .map_or(ApiErrorCode::Unspecified, |error| error.code()),
+                fixture.error,
+                "{}",
+                fixture.id
+            );
+        },
+        Err(error) => {
+            assert_eq!(error.code(), fixture.error, "{}", fixture.id);
+            assert!(
+                fixture.availability.is_none(),
+                "fixture `{}` unexpectedly declared an availability",
+                fixture.id
+            );
+        },
+    }
+    Ok(())
+}
+
+fn parse_fixture_availability(
+    name: &str,
+) -> Result<CapabilityAvailability, Box<dyn std::error::Error>> {
+    match name {
+        "CAPABILITY_AVAILABILITY_IMPLEMENTED" => Ok(CapabilityAvailability::Implemented),
+        "CAPABILITY_AVAILABILITY_VERSION_INCOMPATIBLE" => {
+            Ok(CapabilityAvailability::VersionIncompatible)
+        },
+        _ => Err(io::Error::other(format!(
+            "unknown generated capability availability `{name}`"
+        ))
+        .into()),
+    }
+}
+
+fn parse_fixture_error(name: &str) -> Result<ApiErrorCode, Box<dyn std::error::Error>> {
+    match name {
+        "PUBLIC_ERROR_CODE_UNSPECIFIED" => Ok(ApiErrorCode::Unspecified),
+        "PUBLIC_ERROR_CODE_UNSUPPORTED_API_VERSION" => Ok(ApiErrorCode::UnsupportedApiVersion),
+        "PUBLIC_ERROR_CODE_UNKNOWN_FIELD" => Ok(ApiErrorCode::UnknownField),
+        "PUBLIC_ERROR_CODE_MALFORMED_REQUEST" => Ok(ApiErrorCode::MalformedRequest),
+        _ => Err(io::Error::other(format!("unknown generated public error `{name}`")).into()),
+    }
+}
+
+fn decode_fixture_hex(hex: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(io::Error::other("generated hexadecimal payload has odd length").into());
+    }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair)
+                .map_err(|error| io::Error::other(format!("invalid hexadecimal UTF-8: {error}")))?;
+            u8::from_str_radix(digits, 16)
+                .map_err(|error| io::Error::other(format!("invalid hexadecimal byte: {error}")))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn optional_json_string_field(
+    document: &str,
+    field: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let needle = format!("\"{field}\": \"");
+    if !document.contains(&needle) {
+        return Ok(None);
+    }
+    json_string_field(document, field).map(Some)
+}
+
+fn json_string_field(document: &str, field: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let needle = format!("\"{field}\": \"");
+    let start = document
+        .find(&needle)
+        .map(|offset| offset + needle.len())
+        .ok_or_else(|| io::Error::other(format!("missing generated fixture field `{field}`")))?;
+    let encoded = document
+        .get(start..)
+        .ok_or_else(|| io::Error::other(format!("invalid fixture field offset for `{field}`")))?;
+    let mut decoded = String::new();
+    let mut escaped = false;
+    for character in encoded.chars() {
+        if escaped {
+            decoded.push(match character {
+                '"' => '"',
+                '\\' => '\\',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "unsupported JSON escape in generated fixture field `{field}`"
+                    ))
+                    .into());
+                },
+            });
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Ok(decoded);
+        } else {
+            decoded.push(character);
+        }
+    }
+    Err(io::Error::other(format!("unterminated generated fixture field `{field}`")).into())
+}
 
 #[test]
 fn v1_capability_statement_is_typed_and_bound_to_the_canonical_schema() {

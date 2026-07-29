@@ -25,7 +25,7 @@ fn generation_publishes_positive_boundary_negative_and_adversarial_validation_fi
         }
         assert!(validation.contains("schema_version = 1"));
         assert!(validation.contains("shutdown_grace_seconds = 3600"));
-        assert!(validation.contains("unknown.setting"));
+        assert!(validation.contains("unknown_setting"));
         assert!(validation.contains("maximum_document_bytes"));
         Ok(())
     })();

@@ -4,6 +4,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,6 +113,32 @@ fn generation_verification_restores_outputs_when_a_later_generator_fails() -> Te
         assert_eq!(
             fs::read(fixture.root.join("api/positron/v1/openapi.json"))?,
             api_drift
+        );
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
+fn generation_verification_detects_read_only_drift_without_mutating_checked_output() -> TestResult {
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    fixture.copy_configuration_source()?;
+    let result = (|| {
+        fixture.assert_combined_success()?;
+        let path = fixture.root.join("api/positron/v1/openapi.json");
+        let drift = b"read-only hand-edited OpenAPI\n";
+        fs::write(&path, drift)?;
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o444);
+        fs::set_permissions(&path, permissions)?;
+        fixture.assert_verification_failure_containing("not clean and deterministic")?;
+        assert_eq!(fs::read(&path)?, drift);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o444);
+        assert!(
+            fs::read_dir(fixture.root.join("target/quality/tmp"))?
+                .collect::<Result<Vec<_>, _>>()?
+                .is_empty()
         );
         Ok(())
     })();

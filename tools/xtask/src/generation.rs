@@ -2,8 +2,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::XtaskError;
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The hand-edited Protobuf input for the public interface generator.
 pub(crate) const API_INPUT: &str = "api/positron/v1/positron.proto";
@@ -54,82 +57,103 @@ pub(crate) fn verify(root: &Path) -> Result<(), XtaskError> {
             XtaskError::io(format!("read registered input {}", path.display()), source)
         })?;
     }
-    let before = ARTIFACTS
-        .iter()
-        .map(|relative| {
-            let path = root.join(relative);
-            let contents = fs::read(&path)
-                .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-            Ok((path, contents))
-        })
-        .collect::<Result<Vec<(PathBuf, Vec<u8>)>, XtaskError>>()?;
-    if let Err(generation_error) = generate(root) {
-        return restore_after_failure(&before, generation_error);
-    }
-    let comparison = first_mismatch(&before);
-    let mismatch = match comparison {
-        Ok(mismatch) => mismatch,
-        Err(comparison_error) => return restore_after_failure(&before, comparison_error),
-    };
-    let Some(path) = mismatch else {
-        return Ok(());
-    };
-    if let Err(restore_error) = restore_all(&before) {
-        return Err(XtaskError::invalid(
-            "canonical generation rollback",
-            format!(
-                "detected drift at {}; restoring the complete artifact set failed: {restore_error}",
-                path.display()
-            ),
-        ));
-    }
-    Err(XtaskError::invalid_path(
-        &path,
-        "canonical generation is not clean and deterministic",
-    ))
-}
-
-fn first_mismatch(before: &[(PathBuf, Vec<u8>)]) -> Result<Option<PathBuf>, XtaskError> {
-    for (path, contents) in before {
-        let regenerated = fs::read(path).map_err(|source| {
-            XtaskError::io(format!("read regenerated {}", path.display()), source)
-        })?;
-        if regenerated.as_slice() != contents.as_slice() {
-            return Ok(Some(path.clone()));
-        }
-    }
-    Ok(None)
-}
-
-fn restore_after_failure(
-    before: &[(PathBuf, Vec<u8>)],
-    failure: XtaskError,
-) -> Result<(), XtaskError> {
-    match restore_all(before) {
-        Ok(()) => Err(failure),
-        Err(restore_error) => Err(XtaskError::invalid(
-            "canonical generation rollback",
-            format!(
-                "generation failed: {failure}; restoring every artifact failed: {restore_error}"
-            ),
+    let staging = create_staging_root(root)?;
+    let verification = verify_staged(root, &staging);
+    let cleanup = fs::remove_dir_all(&staging)
+        .map_err(|source| XtaskError::io(format!("remove staging {}", staging.display()), source));
+    match (verification, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(failure), Ok(())) => Err(failure),
+        (Ok(()), Err(cleanup_failure)) => Err(cleanup_failure),
+        (Err(failure), Err(cleanup_failure)) => Err(XtaskError::invalid(
+            "canonical generation staging",
+            format!("verification failed: {failure}; staging cleanup failed: {cleanup_failure}"),
         )),
     }
 }
 
-fn restore_all(before: &[(PathBuf, Vec<u8>)]) -> Result<(), XtaskError> {
-    let mut first_failure = None;
-    for (path, contents) in before {
-        if let Err(source) = fs::write(path, contents)
-            && first_failure.is_none()
-        {
-            first_failure = Some(XtaskError::io(
-                format!("restore {}", path.display()),
-                source,
+fn create_staging_root(root: &Path) -> Result<PathBuf, XtaskError> {
+    let sequence = STAGING_SEQUENCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| {
+            XtaskError::invalid(
+                "canonical generation staging",
+                "bounded staging identity space is exhausted",
+            )
+        })?;
+    let parent = root.join("target/quality/tmp");
+    fs::create_dir_all(&parent).map_err(|source| {
+        XtaskError::io(
+            format!("create staging parent {}", parent.display()),
+            source,
+        )
+    })?;
+    let staging = parent.join(format!(
+        "verify-generation-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&staging).map_err(|source| {
+        XtaskError::io(format!("create staging {}", staging.display()), source)
+    })?;
+    Ok(staging)
+}
+
+fn verify_staged(root: &Path, staging: &Path) -> Result<(), XtaskError> {
+    prepare_staging_inputs(root, staging)?;
+    generate(staging)?;
+    for relative in ARTIFACTS {
+        let checked_path = root.join(relative);
+        let staged_path = staging.join(relative);
+        let checked = fs::read(&checked_path).map_err(|source| {
+            XtaskError::io(format!("read checked {}", checked_path.display()), source)
+        })?;
+        let generated = fs::read(&staged_path).map_err(|source| {
+            XtaskError::io(format!("read staged {}", staged_path.display()), source)
+        })?;
+        if checked != generated {
+            return Err(XtaskError::invalid_path(
+                &checked_path,
+                "canonical generation is not clean and deterministic",
             ));
         }
     }
-    match first_failure {
-        Some(failure) => Err(failure),
-        None => Ok(()),
+    Ok(())
+}
+
+fn prepare_staging_inputs(root: &Path, staging: &Path) -> Result<(), XtaskError> {
+    for relative in INPUTS {
+        let source_path = root.join(relative);
+        let staged_path = staging.join(relative);
+        let parent = staged_path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&staged_path, "registered input has no staging parent")
+        })?;
+        fs::create_dir_all(parent).map_err(|source| {
+            XtaskError::io(format!("create staging input {}", parent.display()), source)
+        })?;
+        fs::copy(&source_path, &staged_path).map_err(|source| {
+            XtaskError::io(
+                format!(
+                    "copy registered input {} to {}",
+                    source_path.display(),
+                    staged_path.display()
+                ),
+                source,
+            )
+        })?;
     }
+    for relative in ARTIFACTS {
+        let staged_path = staging.join(relative);
+        let parent = staged_path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&staged_path, "registered artifact has no staging parent")
+        })?;
+        fs::create_dir_all(parent).map_err(|source| {
+            XtaskError::io(
+                format!("create staging artifact {}", parent.display()),
+                source,
+            )
+        })?;
+    }
+    Ok(())
 }
