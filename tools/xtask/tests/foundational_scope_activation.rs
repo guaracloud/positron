@@ -959,12 +959,37 @@ fn quality_records_cancel_delivered_reconciliation_through_the_public_seam() -> 
 
 #[test]
 fn quality_records_already_queued_reconciliation_through_the_public_seam() -> TestResult {
-    assert_cancellation_state(
-        "        tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;\n",
-        "registered task command queue reached its finite capacity",
-        "already-queued-ids=0",
-        "        tasks.dispatch(0, WorkerCommand::Execute { schedule_slot: 9 })?;\n        tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;\n",
-    )
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        replace_once(
+            &source,
+            "const RESOURCE_GATE: &str = \"EG-RESOURCE\";\n",
+            "const RESOURCE_GATE: &str = \"EG-RESOURCE\";\nstatic TEST_FULL_SLOT_BARRIER: std::sync::OnceLock<std::sync::Barrier> = std::sync::OnceLock::new();\n",
+        )?;
+        replace_once(
+            &source,
+            ") -> Result<(), XtaskError> {\n    let command = receiver",
+            ") -> Result<(), XtaskError> {\n    if id == 0 { TEST_FULL_SLOT_BARRIER.get_or_init(|| std::sync::Barrier::new(2)).wait(); }\n    let command = receiver",
+        )?;
+        replace_once(
+            &source,
+            "        tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;\n        tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n        tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n        Ok(())",
+            "        tasks.dispatch(0, WorkerCommand::Execute { schedule_slot: 9 })?;\n        Err(XtaskError::invalid(\"test cancellation state\", \"injected full-slot failure\"))",
+        )?;
+        replace_once(
+            &source,
+            "        let mut cleanup_errors = Vec::new();\n",
+            "        TEST_FULL_SLOT_BARRIER.get_or_init(|| std::sync::Barrier::new(2)).wait();\n        let mut cleanup_errors = Vec::new();\n",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "injected full-slot failure")?;
+        assert_lifecycle_state(&fixture, "already-queued-ids=0")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
 }
 
 #[test]
