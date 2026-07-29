@@ -467,6 +467,8 @@ fn quality_runs_correctness_through_the_registered_public_seam() -> TestResult {
 
 #[path = "foundational_scope_activation/m0_08_lifecycle_resource.rs"]
 mod m0_08_lifecycle_resource;
+#[path = "foundational_scope_activation/m0_08_parent_verifier.rs"]
+mod m0_08_parent_verifier;
 #[path = "foundational_scope_activation/m0_08_scanner_policy.rs"]
 mod m0_08_scanner_policy;
 #[path = "foundational_scope_activation/m0_08_support.rs"]

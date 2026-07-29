@@ -1373,8 +1373,7 @@ fn execute_gate(
         "concurrency" => run_bounded_runner_gate(
             qualification_fixtures.bounded_runners(),
             root,
-            "EG-CONCURRENCY",
-            budget,
+            gate,
             environment,
             capture,
         ),
@@ -1408,8 +1407,7 @@ fn execute_gate(
         "resource" => run_bounded_runner_gate(
             qualification_fixtures.bounded_runners(),
             root,
-            "EG-RESOURCE",
-            budget,
+            gate,
             environment,
             capture,
         ),
@@ -1423,13 +1421,14 @@ fn execute_gate(
 fn run_bounded_runner_gate(
     registry: &crate::bounded_runners::FrozenBoundedRunnerRegistry,
     root: &Path,
-    gate: &str,
-    execution_timeout: Duration,
+    gate: &Gate,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let execution_timeout = Duration::from_secs(gate.timeout_seconds);
+    let gate_id = gate.id.as_str();
     crate::bounded_runners::validate_source_policy(registry, root)?;
-    let shutdown = registry.shutdown_bound(gate)?;
+    let shutdown = registry.shutdown_bound(gate_id)?;
     let program = env::current_exe()
         .map_err(|source| XtaskError::io("resolve bounded runner executable", source))?;
     if !program.is_absolute() || !program.is_file() {
@@ -1442,7 +1441,7 @@ fn run_bounded_runner_gate(
     let path_stem = format!(
         "bounded-runner-{}-{}-{nonce}",
         std::process::id(),
-        gate.to_ascii_lowercase(),
+        gate_id.to_ascii_lowercase(),
     );
     let outcome_path = environment
         .temporary_root()
@@ -1454,7 +1453,7 @@ fn run_bounded_runner_gate(
         .temporary_root()
         .join(format!("{path_stem}.cancel"));
     let arguments =
-        registry.child_arguments(gate, &outcome_path, execution_timeout, &readiness_path)?;
+        registry.child_arguments(gate_id, &outcome_path, execution_timeout, &readiness_path)?;
     let invocation_environment = environment.invocation_environment(&[])?;
     let input = InvocationInput::Null;
     let invocation = controlled_invocation(
@@ -1563,7 +1562,20 @@ fn run_bounded_runner_gate(
             ),
         ));
     }
-    Ok(format!("{record}; {}", completed_lifecycle("completed")))
+    let verified = crate::bounded_measurement_verifier::verify(
+        crate::bounded_measurement_verifier::VerificationInput {
+            gate,
+            scenario_registry: registry.bytes(),
+            spawn_registry: registry.spawn_site_bytes(),
+            measurement: record,
+            execution: &verdict,
+        },
+    )?;
+    Ok(format!(
+        "{record}; {}; {}",
+        verified.evidence(),
+        completed_lifecycle("completed"),
+    ))
 }
 
 fn take_bounded_runner_outcome(path: &Path) -> Result<String, XtaskError> {

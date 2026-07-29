@@ -55,9 +55,9 @@ pub(super) fn assert_tampered_resource_slots_rejected(
         )?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+            "    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
             &format!(
-                "    let record = record.replace(\"{original}\", \"{tampered}\");\n    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n"
+                "    let record = record.replace(\"{original}\", \"{tampered}\");\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n"
             ),
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;

@@ -1,7 +1,9 @@
 //! Registered, bounded Quality Engineering task and resource scenarios.
 //!
 //! This module owns the frozen scenarios, resource accounting, measurement
-//! serialization, and independent verification. `registered_task_lifecycle`
+//! serialization, and child-side diagnostic verification. Parent-owned truth
+//! is decided independently by `bounded_measurement_verifier`.
+//! `registered_task_lifecycle`
 //! owns worker registration, cancellation, completion, and exact join
 //! observation; `concurrency_source_policy` owns spawn-site and forbidden
 //! primitive resolution. The resource scenario uses real bounded channels, a
@@ -664,7 +666,7 @@ fn run_concurrency_scenario(
         },
     )?;
     let record = measurement_record(scenario, &measurements, &joined_ids, 0, 0, true);
-    verify_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;
+    verify_child_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;
     Ok(record)
 }
 
@@ -740,7 +742,7 @@ fn run_resource_scenario(
         reservations,
         queue_empty,
     );
-    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;
+    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;
     Ok(record)
 }
 
@@ -786,14 +788,14 @@ fn measurement_record(
     )
 }
 
-fn verify_measurement_record(
+fn verify_child_measurement_record(
     scenario: &Scenario,
     record: &str,
     gate: ScenarioGate,
 ) -> Result<(), XtaskError> {
     if record.len() > 4_096 || !record.starts_with("measurement-v1;") {
         return Err(XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "measurement record is missing or exceeds its bound",
         ));
     }
@@ -801,13 +803,13 @@ fn verify_measurement_record(
     for field in record.split(';').skip(1) {
         let Some((key, value)) = field.split_once('=') else {
             return Err(XtaskError::invalid(
-                "independent bounded measurement verifier",
+                "child diagnostic bounded measurement verifier",
                 "measurement record contains a malformed field",
             ));
         };
         if key.is_empty() || value.is_empty() || fields.insert(key, value).is_some() {
             return Err(XtaskError::invalid(
-                "independent bounded measurement verifier",
+                "child diagnostic bounded measurement verifier",
                 "measurement record contains a duplicate or empty field",
             ));
         }
@@ -817,13 +819,13 @@ fn verify_measurement_record(
         || fields.get("seed") != Some(&scenario.seed.as_str())
     {
         return Err(XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "frozen scenario identity is missing from measurement record",
         ));
     }
     let workers = fields.get("workers").ok_or_else(|| {
         XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "worker measurements are omitted",
         )
     })?;
@@ -833,20 +835,20 @@ fn verify_measurement_record(
             let parts = worker.split(':').collect::<Vec<_>>();
             let [id, schedule_slot, completion] = parts.as_slice() else {
                 return Err(XtaskError::invalid(
-                    "independent bounded measurement verifier",
+                    "child diagnostic bounded measurement verifier",
                     "worker measurement is malformed",
                 ));
             };
             Ok(WorkerMeasurement {
                 id: id.parse().map_err(|_| {
                     XtaskError::invalid(
-                        "independent bounded measurement verifier",
+                        "child diagnostic bounded measurement verifier",
                         "worker id is malformed",
                     )
                 })?,
                 schedule_slot: schedule_slot.parse().map_err(|_| {
                     XtaskError::invalid(
-                        "independent bounded measurement verifier",
+                        "child diagnostic bounded measurement verifier",
                         "worker slot is malformed",
                     )
                 })?,
@@ -855,7 +857,7 @@ fn verify_measurement_record(
                     "cancelled" => WorkerCompletion::Cancelled,
                     _ => {
                         return Err(XtaskError::invalid(
-                            "independent bounded measurement verifier",
+                            "child diagnostic bounded measurement verifier",
                             "worker completion is malformed",
                         ));
                     },
@@ -869,7 +871,7 @@ fn verify_measurement_record(
         != Some(parsed.len())
     {
         return Err(XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "worker measurement count does not match the retained registration",
         ));
     }
@@ -880,7 +882,7 @@ fn verify_measurement_record(
         .collect::<BTreeSet<_>>();
     if worker_ids != expected_identity || worker_ids.len() != parsed.len() {
         return Err(XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "worker identifiers do not exactly match the registered workers",
         ));
     }
@@ -890,7 +892,7 @@ fn verify_measurement_record(
         .collect::<BTreeSet<_>>();
     if schedule_slots != expected_identity || schedule_slots.len() != parsed.len() {
         return Err(XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "worker schedule slots are not unique and contiguous",
         ));
     }
@@ -898,7 +900,7 @@ fn verify_measurement_record(
         .get("joined-ids")
         .ok_or_else(|| {
             XtaskError::invalid(
-                "independent bounded measurement verifier",
+                "child diagnostic bounded measurement verifier",
                 "observed join records are omitted",
             )
         })?
@@ -906,7 +908,7 @@ fn verify_measurement_record(
         .map(|id| {
             id.parse::<usize>().map_err(|_| {
                 XtaskError::invalid(
-                    "independent bounded measurement verifier",
+                    "child diagnostic bounded measurement verifier",
                     "observed join record is malformed",
                 )
             })
@@ -915,7 +917,7 @@ fn verify_measurement_record(
     let expected_joined_ids = (0..scenario.max_tasks).collect::<Vec<_>>();
     if joined_ids != expected_joined_ids {
         return Err(XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "observed join records do not match the registered workers",
         ));
     }
@@ -925,7 +927,7 @@ fn verify_measurement_record(
         != Some(scenario.shutdown.as_millis())
     {
         return Err(XtaskError::invalid(
-            "independent bounded measurement verifier",
+            "child diagnostic bounded measurement verifier",
             "worker join or deadline evidence does not match the frozen lifecycle bound",
         ));
     }
@@ -939,7 +941,7 @@ fn verify_measurement_record(
                 .and_then(|v| v.parse().ok())
                 .ok_or_else(|| {
                     XtaskError::invalid(
-                        "independent bounded measurement verifier",
+                        "child diagnostic bounded measurement verifier",
                         "retry record is malformed",
                     )
                 })?,
@@ -948,7 +950,7 @@ fn verify_measurement_record(
                 .and_then(|v| v.parse().ok())
                 .ok_or_else(|| {
                     XtaskError::invalid(
-                        "independent bounded measurement verifier",
+                        "child diagnostic bounded measurement verifier",
                         "reservation record is malformed",
                     )
                 })?,

@@ -46,6 +46,27 @@ fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() ->
                 ))
                 .into());
             }
+            for parent_binding in [
+                "parent-measurement-verification-v1",
+                "identity=parent-bounded-measurement-verifier-v1",
+                "version=1",
+                "verifier-sha256=sha256:20a2dc38a14b0fdf864234b574144df77cfadf33b79335fe7124f68832d20be3",
+                "verdict=passed",
+                &format!("gate={gate}"),
+                "gate-descriptor-sha256=sha256:",
+                "scenario-registry-sha256=sha256:",
+                "spawn-registry-sha256=sha256:",
+                "measurement-sha256=sha256:",
+                "child-self-verification=diagnostic-only",
+                "process-reaped=true;live=0",
+            ] {
+                if !report.contains(parent_binding) {
+                    return Err(std::io::Error::other(format!(
+                        "{gate} immutable raw report omitted parent verification binding `{parent_binding}`"
+                    ))
+                    .into());
+                }
+            }
         }
         Ok(())
     })();
@@ -389,8 +410,8 @@ fn quality_rejects_an_omitted_serialized_worker_measurement_through_the_public_s
         )?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "    verify_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
-            "    let record = record.replacen(\"workers=\", \"workers=;omitted-\", 1);\n    verify_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
+            "    verify_child_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
+            "    let record = record.replacen(\"workers=\", \"workers=;omitted-\", 1);\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(
@@ -436,8 +457,8 @@ fn quality_rejects_a_tampered_serialized_resource_schedule_through_the_public_se
         )?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
-            "    let record = record.replacen(\"workers=\", \"workers=2:0:executed,1:1:executed,0:2:executed;tampered-\", 1);\n    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+            "    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+            "    let record = record.replacen(\"workers=\", \"workers=2:0:executed,1:1:executed,0:2:executed;tampered-\", 1);\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, "measurement record contains a malformed field")
@@ -476,8 +497,8 @@ fn quality_rejects_tampered_serialized_resource_pressure_and_leak_state() -> Tes
         )?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
-            "    let record = record.replace(\"retries=2;reservations=0;queue-empty=true\", \"retries=3;reservations=1;queue-empty=false\");\n    verify_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+            "    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
+            "    let record = record.replace(\"retries=2;reservations=0;queue-empty=true\", \"retries=3;reservations=1;queue-empty=false\");\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(
