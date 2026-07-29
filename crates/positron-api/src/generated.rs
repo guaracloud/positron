@@ -416,7 +416,7 @@ impl ApiError {
 /// Generated wire request for one API-major capability negotiation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilityRequest {
-    api_major: Option<RequestedApiMajor>,
+    api_major: u32,
     capability: Capability,
 }
 
@@ -425,7 +425,7 @@ impl CapabilityRequest {
     #[must_use]
     pub const fn for_version(version: ApiVersion) -> Self {
         Self {
-            api_major: Some(RequestedApiMajor::for_version(version)),
+            api_major: RequestedApiMajor::for_version(version).major(),
             capability: Capability::CanonicalPublicInterface,
         }
     }
@@ -434,7 +434,7 @@ impl CapabilityRequest {
     #[must_use]
     pub const fn for_capability(version: ApiVersion, capability: Capability) -> Self {
         Self {
-            api_major: Some(RequestedApiMajor::for_version(version)),
+            api_major: RequestedApiMajor::for_version(version).major(),
             capability,
         }
     }
@@ -446,7 +446,7 @@ impl CapabilityRequest {
         capability: Capability,
     ) -> Self {
         Self {
-            api_major: Some(requested_major),
+            api_major: requested_major.major(),
             capability,
         }
     }
@@ -454,10 +454,6 @@ impl CapabilityRequest {
     /// Creates a request carrying an unknown wire major for checked refusal.
     #[must_use]
     pub const fn unknown(api_major: u32, capability: Capability) -> Self {
-        let api_major = match RequestedApiMajor::from_major(api_major) {
-            Ok(api_major) => Some(api_major),
-            Err(_) => None,
-        };
         Self {
             api_major,
             capability,
@@ -465,10 +461,7 @@ impl CapabilityRequest {
     }
 
     const fn wire_major(self) -> u32 {
-        match self.api_major {
-            Some(api_major) => api_major.major(),
-            None => 0,
-        }
+        self.api_major
     }
 }
 
@@ -641,9 +634,10 @@ impl CapabilityService {
     /// Negotiates one bounded, versioned public API request without ambient state.
     #[must_use]
     pub const fn negotiate(request: CapabilityRequest) -> CapabilityResponse {
-        let version_refusal = match request.api_major {
-            Some(requested_major) if requested_major.major() == ApiVersion::V1.major() => None,
-            Some(_) | None => Some(ApiError::unsupported_api_version()),
+        let version_refusal = match RequestedApiMajor::from_major(request.api_major) {
+            Ok(requested_major) if requested_major.major() == ApiVersion::V1.major() => None,
+            Ok(_) => Some(ApiError::unsupported_api_version()),
+            Err(error) => Some(error),
         };
         if let Some(refusal) = version_refusal {
             return CapabilityResponse {

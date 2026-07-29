@@ -1041,7 +1041,7 @@ impl ApiError {{
 /// Generated wire request for one API-major capability negotiation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct {request} {{
-    {api_major_name}: Option<RequestedApiMajor>,
+    {api_major_name}: u32,
     {capability_name}: Capability,
 }}
 
@@ -1050,7 +1050,7 @@ impl {request} {{
     #[must_use]
     pub const fn for_version(version: ApiVersion) -> Self {{
         Self {{
-            {api_major_name}: Some(RequestedApiMajor::for_version(version)),
+            {api_major_name}: RequestedApiMajor::for_version(version).major(),
             {capability_name}: Capability::{capability_canonical},
         }}
     }}
@@ -1059,7 +1059,7 @@ impl {request} {{
     #[must_use]
     pub const fn for_capability(version: ApiVersion, capability: Capability) -> Self {{
         Self {{
-            {api_major_name}: Some(RequestedApiMajor::for_version(version)),
+            {api_major_name}: RequestedApiMajor::for_version(version).major(),
             {request_capability_assignment},
         }}
     }}
@@ -1071,7 +1071,7 @@ impl {request} {{
         capability: Capability,
     ) -> Self {{
         Self {{
-            {api_major_name}: Some(requested_major),
+            {api_major_name}: requested_major.major(),
             {request_capability_assignment},
         }}
     }}
@@ -1079,10 +1079,6 @@ impl {request} {{
     /// Creates a request carrying an unknown wire major for checked refusal.
     #[must_use]
     pub const fn unknown(api_major: u32, capability: Capability) -> Self {{
-        let api_major = match RequestedApiMajor::from_major(api_major) {{
-            Ok(api_major) => Some(api_major),
-            Err(_) => None,
-        }};
         Self {{
             {request_api_major_assignment},
             {request_capability_assignment},
@@ -1090,10 +1086,7 @@ impl {request} {{
     }}
 
     const fn wire_major(self) -> u32 {{
-        match self.{api_major_name} {{
-            Some(api_major) => api_major.major(),
-            None => 0,
-        }}
+        self.{api_major_name}
     }}
 }}
 
@@ -1266,9 +1259,10 @@ impl {service} {{
     /// Negotiates one bounded, versioned public API request without ambient state.
     #[must_use]
     pub const fn negotiate(request: {request}) -> {response} {{
-        let version_refusal = match request.{api_major_name} {{
-            Some(requested_major) if requested_major.major() == ApiVersion::V1.major() => None,
-            Some(_) | None => Some(ApiError::unsupported_api_version()),
+        let version_refusal = match RequestedApiMajor::from_major(request.{api_major_name}) {{
+            Ok(requested_major) if requested_major.major() == ApiVersion::V1.major() => None,
+            Ok(_) => Some(ApiError::unsupported_api_version()),
+            Err(error) => Some(error),
         }};
         if let Some(refusal) = version_refusal {{
             return {response} {{

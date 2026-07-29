@@ -27,7 +27,7 @@ fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> Tes
 
         assert!(rust.contains("CapabilityService/Inspect"));
         assert!(rust.contains("const GRPC_API_MAJOR_TAG: u8 = 24;"));
-        assert!(rust.contains("requested_major: Option<RequestedApiMajor>"));
+        assert!(rust.contains("requested_major: u32"));
         assert!(openapi.contains("/v1/capabilities:inspect"));
         assert!(openapi.contains("\"operationId\": \"InspectCapabilityResponse\""));
         assert!(openapi.contains("\"requested_major\""));
