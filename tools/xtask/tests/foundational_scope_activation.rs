@@ -1465,6 +1465,36 @@ removed_fault_adapter_regression!(
     "Provider"
 );
 
+macro_rules! bypassed_fault_operation_regression {
+    ($name:ident, $adapter:literal) => {
+        #[test]
+        fn $name() -> TestResult {
+            assert_bypassed_fault_operation_is_rejected($adapter)
+        }
+    };
+}
+
+bypassed_fault_operation_regression!(
+    quality_rejects_a_bypassed_bounded_storage_operation,
+    "BoundedStorage"
+);
+bypassed_fault_operation_regression!(
+    quality_rejects_a_bypassed_controlled_clock_operation,
+    "ControlledClock"
+);
+bypassed_fault_operation_regression!(
+    quality_rejects_a_bypassed_cancellation_operation,
+    "Cancellation"
+);
+bypassed_fault_operation_regression!(
+    quality_rejects_a_bypassed_network_publication_operation,
+    "NetworkPublication"
+);
+bypassed_fault_operation_regression!(
+    quality_rejects_a_bypassed_provider_publication_operation,
+    "ProviderPublication"
+);
+
 fn assert_removed_fault_adapter_is_rejected(variant: &str) -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -1484,6 +1514,35 @@ fn assert_removed_fault_adapter_is_rejected(variant: &str) -> TestResult {
         if !gate_record(&evidence, "EG-FAULT")?.contains("\"result\": \"failed\"") {
             return Err(std::io::Error::other(format!(
                 "removing the {variant} adapter did not retain a failed EG-FAULT verdict"
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn assert_bypassed_fault_operation_is_rejected(adapter: &str) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        bypass_fault_operation(&fixture.root, adapter)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture
+            .quality_child_from_built_fixture_for("pr")?
+            .wait_with_output()?;
+        assert_rejected_output(&output, "fixture recovery process")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-FAULT")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(format!(
+                "bypassing the {adapter} operation did not retain a failed EG-FAULT verdict"
             ))
             .into());
         }
@@ -3977,6 +4036,33 @@ fn quality_rejects_a_replaced_dependency_metadata_directory_without_touching_its
     result
 }
 
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_parent_sync_failure_after_creating_dependency_metadata_directory() -> TestResult
+{
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-DEPS|EG-EVIDENCE|EG-POLICY",
+        )?;
+        inject_dependency_metadata_parent_sync_failure(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture
+            .quality_child_from_built_fixture_for("pr")?
+            .wait_with_output()?;
+        assert_rejected_output(
+            &output,
+            "injected dependency metadata parent synchronization failure",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 #[test]
 fn quality_rejects_an_activation_without_its_registered_owner() -> TestResult {
     assert_fixture_rejected(missing_domain_owner, "unknown semantic owner `-`")
@@ -5481,6 +5567,25 @@ fn remove_fault_adapter_invocation(root: &Path, variant: &str) -> TestResult {
     replace_once(&source, original, &replacement)
 }
 
+fn bypass_fault_operation(root: &Path, adapter: &str) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    if !matches!(
+        adapter,
+        "BoundedStorage"
+            | "ControlledClock"
+            | "Cancellation"
+            | "NetworkPublication"
+            | "ProviderPublication"
+    ) {
+        return Err(std::io::Error::other(format!("unknown bypassed adapter `{adapter}`")).into());
+    }
+    let original = "            let receipt = exercise_deterministic_fault(case_root, adapter, candidate, successor)?;\n";
+    let replacement = format!(
+        "            let receipt = if adapter == QualityFixtureAdapter::{adapter} {{\n                FaultOperationReceipt {{\n                    observation: adapter.expected_observation(),\n                    error_identity: \"forged-operation-bypass\".to_owned(),\n                }}\n            }} else {{\n                exercise_deterministic_fault(case_root, adapter, candidate, successor)?\n            }};\n"
+    );
+    replace_once(&source, original, &replacement)
+}
+
 #[cfg(unix)]
 fn inject_dependency_metadata_artifact_barrier(root: &Path) -> TestResult {
     let source = root.join("tools/xtask/src/quality.rs");
@@ -5528,6 +5633,15 @@ fn inject_dependency_metadata_artifact_barrier(root: &Path) -> TestResult {
 
 fn bounded_stream_summary(stream: &str) -> String {
 "#,
+    )
+}
+
+#[cfg(unix)]
+fn inject_dependency_metadata_parent_sync_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/qualification_fixtures.rs"),
+        "            Ok(()) => {\n                self.sync()?;\n                self.open_child_directory(name, label)\n            },\n",
+        "            Ok(()) => {\n                return Err(XtaskError::invalid(\n                    \"injected dependency metadata parent synchronization failure\",\n                    format!(\"created {} but could not synchronize its parent\", path.display()),\n                ));\n            },\n",
     )
 }
 

@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -187,6 +189,132 @@ enum QualityFixtureAdapter {
 struct AdapterObservation {
     adapter: &'static str,
     injection: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FaultOperationReceipt {
+    observation: AdapterObservation,
+    error_identity: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureFault {
+    CapacityExhausted,
+    ClockRegressed,
+    Cancelled,
+    NetworkUnavailable,
+    ProviderUnavailable,
+}
+
+impl FixtureFault {
+    fn observation(self) -> AdapterObservation {
+        match self {
+            Self::CapacityExhausted => AdapterObservation {
+                adapter: "bounded-storage-adapter",
+                injection: "capacity-exhausted",
+            },
+            Self::ClockRegressed => AdapterObservation {
+                adapter: "controlled-clock-adapter",
+                injection: "clock-regressed",
+            },
+            Self::Cancelled => AdapterObservation {
+                adapter: "cancellation-adapter",
+                injection: "cancelled-before-publication",
+            },
+            Self::NetworkUnavailable => AdapterObservation {
+                adapter: "network-publication-adapter",
+                injection: "network-unavailable",
+            },
+            Self::ProviderUnavailable => AdapterObservation {
+                adapter: "provider-publication-adapter",
+                injection: "provider-unavailable",
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BoundedCandidateWriter {
+    remaining_bytes: usize,
+}
+
+#[derive(Debug)]
+enum BoundedCandidateWriteError {
+    CapacityExhausted {
+        attempted_bytes: usize,
+        remaining_bytes: usize,
+    },
+    Persistence(XtaskError),
+}
+
+impl BoundedCandidateWriter {
+    fn persist(
+        &mut self,
+        case_root: &DirectoryCapability,
+        candidate: &str,
+        bytes: &[u8],
+    ) -> Result<(), BoundedCandidateWriteError> {
+        if bytes.len() > self.remaining_bytes {
+            return Err(BoundedCandidateWriteError::CapacityExhausted {
+                attempted_bytes: bytes.len(),
+                remaining_bytes: self.remaining_bytes,
+            });
+        }
+        write_fault_bytes(case_root, candidate, bytes)
+            .map_err(BoundedCandidateWriteError::Persistence)?;
+        self.remaining_bytes -= bytes.len();
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ControlledPublicationClock {
+    ticks: [u64; 2],
+    next: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegressedClockError {
+    fault: FixtureFault,
+    last_observed: u64,
+    publication: u64,
+}
+
+impl ControlledPublicationClock {
+    fn regressed() -> Self {
+        Self {
+            ticks: [2, 1],
+            next: 0,
+        }
+    }
+
+    fn tick(&mut self) -> Result<u64, XtaskError> {
+        let tick = self.ticks.get(self.next).copied().ok_or_else(|| {
+            XtaskError::invalid(
+                "controlled clock fixture",
+                "publication consumed more than two registered ticks",
+            )
+        })?;
+        self.next += 1;
+        Ok(tick)
+    }
+}
+
+#[derive(Debug)]
+struct FixtureCancellationToken {
+    requested: bool,
+}
+
+impl FixtureCancellationToken {
+    fn requested() -> Self {
+        Self { requested: true }
+    }
+
+    fn consume(&mut self) -> bool {
+        let requested = self.requested;
+        self.requested = false;
+        requested
+    }
 }
 
 impl QualityFixtureAdapter {
@@ -533,9 +661,18 @@ impl DirectoryCapability {
         name: &str,
         label: &str,
     ) -> Result<Self, XtaskError> {
-        match self.create_child_directory(name, label) {
-            Ok(directory) => Ok(directory),
-            Err(_) => self.open_child_directory(name, label),
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        match rustix::fs::mkdirat(&self.file, name, Mode::RWXU) {
+            Ok(()) => {
+                self.sync()?;
+                self.open_child_directory(name, label)
+            },
+            Err(rustix::io::Errno::EXIST) => self.open_child_directory(name, label),
+            Err(source) => Err(XtaskError::io(
+                format!("create {label} {}", path.display()),
+                rustix_io(source),
+            )),
         }
     }
 
@@ -2368,76 +2505,312 @@ fn execute_fixture_adapter(
     published: &str,
     successor: &str,
 ) -> Result<AdapterObservation, XtaskError> {
-    match adapter {
+    let observation = match adapter {
         QualityFixtureAdapter::CandidatePersistence => {
             write_state(case_root, candidate, successor)?;
+            adapter.expected_observation()
         },
         QualityFixtureAdapter::PublicationPersistence | QualityFixtureAdapter::Restart => {
             write_state(case_root, candidate, successor)?;
             case_root.rename(candidate, published)?;
             case_root.sync()?;
+            adapter.expected_observation()
         },
         QualityFixtureAdapter::PartialWrite => {
             write_fault_bytes(case_root, candidate, b"partial-state")?;
+            adapter.expected_observation()
         },
         QualityFixtureAdapter::ProcessCrash => {
             write_state(case_root, candidate, successor)?;
+            adapter.expected_observation()
         },
         QualityFixtureAdapter::Corruption => {
             write_state(case_root, candidate, successor)?;
             corrupt_state_file(case_root, candidate)?;
+            adapter.expected_observation()
         },
+        QualityFixtureAdapter::BoundedStorage
+        | QualityFixtureAdapter::ControlledClock
+        | QualityFixtureAdapter::Cancellation
+        | QualityFixtureAdapter::NetworkPublication
+        | QualityFixtureAdapter::ProviderPublication => {
+            let receipt = exercise_deterministic_fault(case_root, adapter, candidate, successor)?;
+            write_fault_operation_receipt(case_root, &receipt)?;
+            receipt.observation
+        },
+    };
+    write_adapter_observation(case_root, observation)?;
+    Ok(observation)
+}
+
+fn exercise_deterministic_fault(
+    case_root: &DirectoryCapability,
+    adapter: QualityFixtureAdapter,
+    candidate: &str,
+    successor: &str,
+) -> Result<FaultOperationReceipt, XtaskError> {
+    let (fault, error_identity) = match adapter {
         QualityFixtureAdapter::BoundedStorage => {
             let attempted = encoded_state(successor)?;
-            let remaining_bytes = 0_usize;
-            if attempted.len() <= remaining_bytes {
-                return Err(XtaskError::invalid(
-                    "bounded storage fixture adapter",
-                    "full-disk injection did not exhaust the candidate persistence budget",
-                ));
+            let mut writer = BoundedCandidateWriter { remaining_bytes: 0 };
+            match writer.persist(case_root, candidate, &attempted) {
+                Err(BoundedCandidateWriteError::CapacityExhausted {
+                    attempted_bytes,
+                    remaining_bytes,
+                }) => (
+                    FixtureFault::CapacityExhausted,
+                    format!(
+                        "capacity-exhausted-attempted-positive-{}-remaining-{remaining_bytes}",
+                        attempted_bytes > 0
+                    ),
+                ),
+                Err(BoundedCandidateWriteError::Persistence(error)) => {
+                    return Err(error);
+                },
+                Ok(()) => {
+                    return Err(XtaskError::invalid(
+                        "bounded storage fixture adapter",
+                        "zero-capacity candidate writer accepted persisted bytes",
+                    ));
+                },
             }
         },
         QualityFixtureAdapter::ControlledClock => {
-            let last_observed_tick = 2_u64;
-            let publication_tick = 1_u64;
-            if publication_tick >= last_observed_tick {
-                return Err(XtaskError::invalid(
-                    "controlled clock fixture adapter",
-                    "clock injection did not regress before publication",
-                ));
+            let mut clock = ControlledPublicationClock::regressed();
+            match validate_monotonic_publication(&mut clock)? {
+                Err(RegressedClockError {
+                    fault: fault @ FixtureFault::ClockRegressed,
+                    last_observed,
+                    publication,
+                }) => (
+                    fault,
+                    format!("clock-regressed-last-{last_observed}-publication-{publication}"),
+                ),
+                Err(error) => {
+                    return Err(unexpected_fixture_fault(adapter, error.fault));
+                },
+                Ok(()) => {
+                    return Err(XtaskError::invalid(
+                        "controlled clock fixture adapter",
+                        "regressed publication timestamp passed monotonic validation",
+                    ));
+                },
             }
         },
         QualityFixtureAdapter::Cancellation => {
-            let cancellation_requested = true;
-            if !cancellation_requested {
-                return Err(XtaskError::invalid(
-                    "cancellation fixture adapter",
-                    "cancellation injection was not observed before publication",
-                ));
+            let mut cancellation = FixtureCancellationToken::requested();
+            match validate_publication_cancellation(&mut cancellation) {
+                Err(fault @ FixtureFault::Cancelled) => {
+                    (fault, "cancellation-consumed-requested-true".to_owned())
+                },
+                Err(fault) => {
+                    return Err(unexpected_fixture_fault(adapter, fault));
+                },
+                Ok(()) => {
+                    return Err(XtaskError::invalid(
+                        "cancellation fixture adapter",
+                        "requested cancellation did not abort publication",
+                    ));
+                },
             }
         },
         QualityFixtureAdapter::NetworkPublication => {
-            let network_available = false;
-            if network_available {
-                return Err(XtaskError::invalid(
-                    "network publication fixture adapter",
-                    "network injection remained available",
-                ));
+            match send_over_closed_network(successor.as_bytes())? {
+                Err((fault @ FixtureFault::NetworkUnavailable, identity)) => (fault, identity),
+                Err(fault) => {
+                    return Err(unexpected_fixture_fault(adapter, fault.0));
+                },
+                Ok(()) => {
+                    return Err(XtaskError::invalid(
+                        "network publication fixture adapter",
+                        "closed network endpoint accepted publication bytes",
+                    ));
+                },
             }
         },
         QualityFixtureAdapter::ProviderPublication => {
-            let provider_available = false;
-            if provider_available {
-                return Err(XtaskError::invalid(
-                    "provider publication fixture adapter",
-                    "provider injection remained available",
-                ));
+            match send_to_closed_provider(successor.as_bytes())? {
+                Err((fault @ FixtureFault::ProviderUnavailable, identity)) => (fault, identity),
+                Err(fault) => {
+                    return Err(unexpected_fixture_fault(adapter, fault.0));
+                },
+                Ok(()) => {
+                    return Err(XtaskError::invalid(
+                        "provider publication fixture adapter",
+                        "closed provider process accepted publication bytes",
+                    ));
+                },
             }
         },
+        _ => {
+            return Err(XtaskError::invalid(
+                "deterministic fixture fault",
+                "adapter does not own a deterministic fault operation",
+            ));
+        },
+    };
+    Ok(FaultOperationReceipt {
+        observation: fault.observation(),
+        error_identity,
+    })
+}
+
+fn unexpected_fixture_fault(adapter: QualityFixtureAdapter, fault: FixtureFault) -> XtaskError {
+    XtaskError::invalid(
+        "deterministic fixture fault",
+        format!("adapter `{adapter:?}` produced unexpected fault `{fault:?}`"),
+    )
+}
+
+fn validate_monotonic_publication(
+    clock: &mut ControlledPublicationClock,
+) -> Result<Result<(), RegressedClockError>, XtaskError> {
+    let last_observed = clock.tick()?;
+    let publication = clock.tick()?;
+    if publication < last_observed {
+        return Ok(Err(RegressedClockError {
+            fault: FixtureFault::ClockRegressed,
+            last_observed,
+            publication,
+        }));
     }
-    let observation = adapter.expected_observation();
-    write_adapter_observation(case_root, observation)?;
-    Ok(observation)
+    Ok(Ok(()))
+}
+
+fn validate_publication_cancellation(
+    cancellation: &mut FixtureCancellationToken,
+) -> Result<(), FixtureFault> {
+    if cancellation.consume() {
+        return Err(FixtureFault::Cancelled);
+    }
+    Ok(())
+}
+
+fn send_over_closed_network(
+    bytes: &[u8],
+) -> Result<Result<(), (FixtureFault, String)>, XtaskError> {
+    let (mut publisher, receiver) = UnixStream::pair()
+        .map_err(|source| XtaskError::io("create hermetic network socket pair", source))?;
+    receiver
+        .shutdown(Shutdown::Both)
+        .map_err(|source| XtaskError::io("close hermetic network receiver", source))?;
+    drop(receiver);
+    match publisher.write_all(bytes) {
+        Ok(()) => Ok(Ok(())),
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            Ok(Err((
+                FixtureFault::NetworkUnavailable,
+                format!(
+                    "closed-unix-stream-send-os-{}",
+                    source.raw_os_error().unwrap_or_default()
+                ),
+            )))
+        },
+        Err(source) => Err(XtaskError::io(
+            "send through hermetic network boundary",
+            source,
+        )),
+    }
+}
+
+fn send_to_closed_provider(bytes: &[u8]) -> Result<Result<(), (FixtureFault, String)>, XtaskError> {
+    let executable = std::env::current_exe()
+        .map_err(|source| XtaskError::io("resolve provider fixture executable", source))?;
+    let mut provider = Command::new(executable)
+        .arg("quality-fixture")
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| XtaskError::io("launch hermetic provider process", source))?;
+    let mut input = provider.stdin.take().ok_or_else(|| {
+        XtaskError::invalid(
+            "hermetic provider process",
+            "provider IPC input descriptor was unavailable",
+        )
+    })?;
+    let status = observe_provider_exit(&mut provider)?;
+    match input.write_all(bytes) {
+        Ok(()) => Ok(Ok(())),
+        Err(source) if source.kind() == std::io::ErrorKind::BrokenPipe => Ok(Err((
+            FixtureFault::ProviderUnavailable,
+            format!(
+                "closed-provider-ipc-status-{}-os-{}",
+                status.code().unwrap_or_default(),
+                source.raw_os_error().unwrap_or_default()
+            ),
+        ))),
+        Err(source) => Err(XtaskError::io(
+            "send through hermetic provider IPC boundary",
+            source,
+        )),
+    }
+}
+
+fn observe_provider_exit(
+    provider: &mut std::process::Child,
+) -> Result<std::process::ExitStatus, XtaskError> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match provider.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            Ok(None) => {
+                provider.kill().map_err(|source| {
+                    XtaskError::io("terminate stalled hermetic provider process", source)
+                })?;
+                let reap_deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    match provider.try_wait() {
+                        Ok(Some(_)) => {
+                            return Err(XtaskError::invalid(
+                                "hermetic provider process",
+                                "provider did not close its IPC endpoint before the bounded deadline",
+                            ));
+                        },
+                        Ok(None) if Instant::now() < reap_deadline => {
+                            thread::sleep(Duration::from_millis(1));
+                        },
+                        Ok(None) => {
+                            return Err(XtaskError::invalid(
+                                "hermetic provider process",
+                                "terminated provider could not be reaped before the bounded deadline",
+                            ));
+                        },
+                        Err(source) => {
+                            return Err(XtaskError::io(
+                                "reap terminated hermetic provider process",
+                                source,
+                            ));
+                        },
+                    }
+                }
+            },
+            Err(source) => {
+                return Err(XtaskError::io("observe hermetic provider process", source));
+            },
+        }
+    }
+}
+
+fn write_fault_operation_receipt(
+    case_root: &DirectoryCapability,
+    receipt: &FaultOperationReceipt,
+) -> Result<(), XtaskError> {
+    let content = format!(
+        "fixture-fault-operation-v1\t{}\t{}\t{}\n",
+        receipt.observation.adapter, receipt.observation.injection, receipt.error_identity
+    );
+    write_process_record(case_root, "fault.operation", content.as_bytes())?;
+    case_root.sync()
 }
 
 fn write_adapter_observation(
@@ -2512,6 +2885,43 @@ fn validate_recovered_adapter_effect(
                 observed.adapter, observed.injection, expected.adapter, expected.injection
             ),
         ));
+    }
+    if matches!(
+        adapter,
+        QualityFixtureAdapter::BoundedStorage
+            | QualityFixtureAdapter::ControlledClock
+            | QualityFixtureAdapter::Cancellation
+            | QualityFixtureAdapter::NetworkPublication
+            | QualityFixtureAdapter::ProviderPublication
+    ) {
+        let durable_receipt = read_fault_operation_receipt(case_root)?;
+        if durable_receipt.observation != expected {
+            return Err(XtaskError::invalid(
+                "fixture recovery fault operation",
+                format!(
+                    "durable operation `{}/{}` does not match registered `{}/{}`",
+                    durable_receipt.observation.adapter,
+                    durable_receipt.observation.injection,
+                    expected.adapter,
+                    expected.injection
+                ),
+            ));
+        }
+        let independent_receipt = exercise_deterministic_fault(
+            case_root,
+            adapter,
+            "recovery-probe.state",
+            expected_reopen,
+        )?;
+        if independent_receipt != durable_receipt {
+            return Err(XtaskError::invalid(
+                "fixture recovery fault operation",
+                format!(
+                    "independent operation result `{}` does not match durable `{}`",
+                    independent_receipt.error_identity, durable_receipt.error_identity
+                ),
+            ));
+        }
     }
 
     let candidate_bytes = case_root.read_bounded_optional(
@@ -2608,6 +3018,55 @@ fn read_adapter_observation(
         ));
     }
     Ok(observation)
+}
+
+fn read_fault_operation_receipt(
+    case_root: &DirectoryCapability,
+) -> Result<FaultOperationReceipt, XtaskError> {
+    let path = case_root.diagnostic_path.join("fault.operation");
+    let bytes = case_root.read_bounded(
+        "fault.operation",
+        MAXIMUM_PROCESS_RECORD_BYTES,
+        "fixture fault operation receipt",
+    )?;
+    let content = std::str::from_utf8(&bytes).map_err(|_| {
+        XtaskError::invalid_path(&path, "fixture fault operation receipt is not UTF-8")
+    })?;
+    let fields = content.trim_end().split('\t').collect::<Vec<_>>();
+    let [protocol, adapter, injection, error_identity] = fields.as_slice() else {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "fixture fault operation receipt does not contain exactly four fields",
+        ));
+    };
+    if *protocol != "fixture-fault-operation-v1" {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "fixture fault operation receipt protocol is not registered",
+        ));
+    }
+    validate_field(&path, 0, "fault error identity", error_identity)?;
+    let observation = [
+        CrashSchedule::FullDisk,
+        CrashSchedule::Clock,
+        CrashSchedule::Cancellation,
+        CrashSchedule::Network,
+        CrashSchedule::Provider,
+    ]
+    .into_iter()
+    .map(QualityFixtureAdapter::for_schedule)
+    .map(QualityFixtureAdapter::expected_observation)
+    .find(|candidate| candidate.adapter == *adapter && candidate.injection == *injection)
+    .ok_or_else(|| {
+        XtaskError::invalid_path(
+            &path,
+            "fixture fault operation receipt names an unknown result",
+        )
+    })?;
+    Ok(FaultOperationReceipt {
+        observation,
+        error_identity: (*error_identity).to_owned(),
+    })
 }
 
 fn claim_process_root(claim: &ProcessRootClaim<'_>) -> Result<DirectoryCapability, XtaskError> {
