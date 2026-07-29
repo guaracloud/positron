@@ -619,6 +619,20 @@ fn quality_rejects_a_braced_channel_alias_through_the_public_seam() -> TestResul
 }
 
 #[test]
+fn quality_rejects_a_module_aliased_generic_channel_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::sync::mpsc as m;\n#[allow(dead_code)] fn module_alias_channel() { let _queue = m::channel::<()>(); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_nested_grouped_spawn_alias_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::{thread::spawn as launch};\n#[allow(dead_code)] fn nested_grouped_spawn() { let _worker = launch(|| {}); }\n",
+    )
+}
+
+#[test]
 fn quality_rejects_a_multiline_grouped_spawn_alias_through_the_public_seam() -> TestResult {
     assert_imported_concurrency_alias_rejected(
         "use std::thread::{\n    spawn as launch,\n};\n#[allow(dead_code)] fn multiline_grouped_alias() { let _worker = launch(|| {}); }\n",
@@ -922,11 +936,50 @@ fn quality_reconciles_after_a_result_timeout_through_the_public_seam() -> TestRe
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
             "    let (completion, schedule_slot) = match command {",
-            "    thread::sleep(Duration::from_millis(250));\n    let (completion, schedule_slot) = match command {",
+            "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, "did not report before the shutdown deadline")?;
         assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    let (completion, schedule_slot) = match command {",
+            "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "did not report before the shutdown deadline")?;
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-CONCURRENCY",
+        )?)?;
+        let (_, duration) = report
+            .split_once("shutdown-ms=")
+            .ok_or_else(|| std::io::Error::other("lifecycle evidence omitted shutdown-ms"))?;
+        let duration = duration
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .parse::<u128>()?;
+        if duration > 100 {
+            return Err(std::io::Error::other(format!(
+                "worker reconciliation exceeded the registered 100ms shutdown deadline: {duration}ms"
+            ))
+            .into());
+        }
+        assert_lifecycle_state(&fixture, "live=0")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -940,8 +993,8 @@ fn quality_reconciles_after_worker_error_and_panic_through_the_public_seam() -> 
         enable_concurrency_gate(&fixture)?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            ") -> Result<(), XtaskError> {\n    let command = receiver",
-            ") -> Result<(), XtaskError> {\n    if id == 1 { return Err(XtaskError::invalid(\"test lifecycle worker\", \"injected worker error\")); }\n    if id == 2 { panic!(\"injected worker panic\"); }\n    let command = receiver",
+            ") -> Result<(), XtaskError> {\n    if cancel.load(Ordering::Acquire) {",
+            ") -> Result<(), XtaskError> {\n    if id == 1 { return Err(XtaskError::invalid(\"test lifecycle worker\", \"injected worker error\")); }\n    if id == 2 { panic!(\"injected worker panic\"); }\n    if cancel.load(Ordering::Acquire) {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, "injected worker error")?;
@@ -970,8 +1023,8 @@ fn quality_records_already_queued_reconciliation_through_the_public_seam() -> Te
         )?;
         replace_once(
             &source,
-            ") -> Result<(), XtaskError> {\n    let command = receiver",
-            ") -> Result<(), XtaskError> {\n    if id == 0 { TEST_FULL_SLOT_BARRIER.get_or_init(|| std::sync::Barrier::new(2)).wait(); }\n    let command = receiver",
+            ") -> Result<(), XtaskError> {\n    if cancel.load(Ordering::Acquire) {",
+            ") -> Result<(), XtaskError> {\n    if id == 0 { TEST_FULL_SLOT_BARRIER.get_or_init(|| std::sync::Barrier::new(2)).wait(); }\n    if cancel.load(Ordering::Acquire) {",
         )?;
         replace_once(
             &source,
@@ -1004,13 +1057,13 @@ fn quality_records_disconnected_reconciliation_through_the_public_seam() -> Test
         )?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            ") -> Result<(), XtaskError> {\n    let command = receiver",
-            ") -> Result<(), XtaskError> {\n    if id == 0 { return Ok(()); }\n    let command = receiver",
+            ") -> Result<(), XtaskError> {\n    if cancel.load(Ordering::Acquire) {",
+            ") -> Result<(), XtaskError> {\n    if id == 0 { return Ok(()); }\n    if cancel.load(Ordering::Acquire) {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(
             &output,
-            "registered task result channel closed before every task reported",
+            "registered task exited before its command was delivered",
         )?;
         assert_lifecycle_state(&fixture, "disconnected-ids=0")
     })();
@@ -5440,9 +5493,9 @@ fn assert_concurrency_lifecycle_failure(fixture: &Fixture, spawned_ids: &str) ->
     )?)?;
     let required = format!("lifecycle-v1;spawned-ids={spawned_ids};cancelled-ids=");
     if !report.contains(&required)
-        || !report.contains(&format!(
-            "completed-ids={spawned_ids};joined-ids={spawned_ids};live=0"
-        ))
+        || !report.contains(&format!("completed-ids={spawned_ids};"))
+        || !report.contains(&format!("joined-ids={spawned_ids};"))
+        || !report.contains(";live=0")
     {
         return Err(std::io::Error::other(format!(
             "lifecycle failure did not retain reconciliation evidence `{required}`"
@@ -5459,7 +5512,10 @@ fn assert_lifecycle_state(fixture: &Fixture, state: &str) -> TestResult {
         &evidence,
         "EG-CONCURRENCY",
     )?)?;
-    if !report.contains(state) || !report.contains("joined-ids=0,1,2;live=0") {
+    if !report.contains(state)
+        || !report.contains("joined-ids=0,1,2;")
+        || !report.contains(";live=0")
+    {
         return Err(
             std::io::Error::other(format!("missing truthful lifecycle state `{state}`")).into(),
         );

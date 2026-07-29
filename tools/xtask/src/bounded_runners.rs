@@ -11,6 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -340,6 +342,7 @@ struct WorkerMeasurement {
 
 struct RegisteredTask {
     id: usize,
+    cancel: Arc<AtomicBool>,
     sender: Option<SyncSender<WorkerCommand>>,
     handle: Option<thread::JoinHandle<Result<(), XtaskError>>>,
 }
@@ -355,6 +358,7 @@ struct RegisteredTasks {
     tasks: Vec<RegisteredTask>,
     results: Receiver<WorkerMeasurement>,
     deadline: Instant,
+    shutdown: Duration,
 }
 
 impl RegisteredTasks {
@@ -390,11 +394,14 @@ impl RegisteredTasks {
             tasks: Vec::with_capacity(scenario.max_tasks),
             results,
             deadline,
+            shutdown: scenario.shutdown,
         };
         for id in 0..scenario.max_tasks {
             let (sender, receiver) = mpsc::sync_channel(1);
+            let cancel = Arc::new(AtomicBool::new(false));
             owner.tasks.push(RegisteredTask {
                 id,
+                cancel: Arc::clone(&cancel),
                 sender: Some(sender),
                 handle: None,
             });
@@ -402,7 +409,7 @@ impl RegisteredTasks {
             let handle = match thread::Builder::new()
                 .name(format!("positron-quality-worker-{id}"))
                 // positron-concurrency-spawn: RegisteredTasks::spawn\tquality-bounded-worker-v1
-                .spawn(move || worker_loop(id, receiver, worker_results))
+                .spawn(move || worker_loop(id, cancel, receiver, worker_results))
             {
                 Ok(handle) => handle,
                 Err(source) => {
@@ -497,6 +504,10 @@ impl RegisteredTasks {
     }
 
     fn reconcile_failure<T>(mut self, original: XtaskError) -> Result<T, XtaskError> {
+        let cleanup_started = Instant::now();
+        let cleanup_deadline = cleanup_started
+            .checked_add(self.shutdown)
+            .unwrap_or(cleanup_started);
         let spawned_ids = self
             .tasks
             .iter()
@@ -505,6 +516,7 @@ impl RegisteredTasks {
             .collect::<Vec<_>>();
         let mut cancellation = Vec::new();
         for task in &mut self.tasks {
+            task.cancel.store(true, Ordering::Release);
             if let Some(sender) = task.sender.as_ref() {
                 let state = match sender.try_send(WorkerCommand::Cancel {
                     schedule_slot: usize::MAX,
@@ -519,12 +531,32 @@ impl RegisteredTasks {
         }
         let mut cleanup_errors = Vec::new();
         let mut reported_ids = Vec::new();
-        while Instant::now() < self.deadline {
+        while Instant::now() < cleanup_deadline {
             match self.results.try_recv() {
                 Ok(measurement) => reported_ids.push(measurement.id),
                 Err(TryRecvError::Empty) => thread::yield_now(),
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+        while self
+            .tasks
+            .iter()
+            .filter_map(|task| task.handle.as_ref())
+            .any(|handle| !handle.is_finished())
+            && Instant::now() < cleanup_deadline
+        {
+            thread::yield_now();
+        }
+        if self
+            .tasks
+            .iter()
+            .filter_map(|task| task.handle.as_ref())
+            .any(|handle| !handle.is_finished())
+        {
+            eprintln!(
+                "controlled bounded worker violated cooperative shutdown before the registered deadline"
+            );
+            std::process::abort();
         }
         let mut joined_ids = Vec::new();
         for task in &mut self.tasks {
@@ -568,7 +600,7 @@ impl RegisteredTasks {
             ids.dedup();
         }
         let lifecycle = format!(
-            "lifecycle-v1;spawned-ids={};cancelled-ids={};already-queued-ids={};disconnected-ids={};reported-ids={};completed-ids={};joined-ids={};live=0",
+            "lifecycle-v1;spawned-ids={};cancelled-ids={};already-queued-ids={};disconnected-ids={};reported-ids={};completed-ids={};joined-ids={};shutdown-ms={};live=0",
             format_ids(&spawned_ids),
             format_ids(&cancelled_ids),
             format_ids(&already_queued_ids),
@@ -576,6 +608,7 @@ impl RegisteredTasks {
             format_ids(&reported_ids),
             format_ids(&completed_ids),
             format_ids(&joined_ids),
+            cleanup_started.elapsed().as_millis(),
         );
         if cleanup_errors.is_empty() {
             Err(XtaskError::invalid(
@@ -603,9 +636,16 @@ fn format_ids(ids: &[usize]) -> String {
 
 fn worker_loop(
     id: usize,
+    cancel: Arc<AtomicBool>,
     receiver: Receiver<WorkerCommand>,
     results: SyncSender<WorkerMeasurement>,
 ) -> Result<(), XtaskError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(XtaskError::invalid(
+            "bounded task worker",
+            "worker observed cooperative cancellation before command receipt",
+        ));
+    }
     let command = receiver
         .recv_timeout(Duration::from_millis(25))
         .map_err(|error| {
@@ -614,6 +654,13 @@ fn worker_loop(
                 format!("worker command did not arrive within its finite wait: {error}"),
             )
         })?;
+    cooperative_pause(&cancel, Duration::ZERO)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(XtaskError::invalid(
+            "bounded task worker",
+            "worker observed cooperative cancellation before command execution",
+        ));
+    }
     let (completion, schedule_slot) = match command {
         WorkerCommand::Execute { schedule_slot } => (WorkerCompletion::Executed, schedule_slot),
         WorkerCommand::Cancel { schedule_slot } => (WorkerCompletion::Cancelled, schedule_slot),
@@ -634,6 +681,20 @@ fn worker_loop(
                 "task owner dropped its measurement queue before join",
             ),
         })
+}
+
+fn cooperative_pause(cancel: &AtomicBool, duration: Duration) -> Result<(), XtaskError> {
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        if cancel.load(Ordering::Acquire) {
+            return Err(XtaskError::invalid(
+                "bounded task worker",
+                "worker observed cooperative cancellation during bounded work",
+            ));
+        }
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1207,6 +1268,11 @@ fn imported_forbidden_alias_invocations(compact: &str) -> Vec<String> {
         {
             aliases.push(format!("{alias}::thread::spawn("));
         }
+        if let Some(alias) = import.strip_prefix("std::sync::mpscas")
+            && is_identifier(alias)
+        {
+            aliases.push(format!("{alias}::channel("));
+        }
         if let Some(alias) = import
             .strip_prefix("std::thread::spawnas")
             .or_else(|| import.strip_prefix("std::thread::{spawnas"))
@@ -1218,7 +1284,9 @@ fn imported_forbidden_alias_invocations(compact: &str) -> Vec<String> {
         }
         for (needle, invocation) in [
             ("std::thread::{spawnas", "("),
+            ("std::{thread::spawnas", "("),
             ("std::sync::mpsc::{channelas", "("),
+            ("std::{sync::mpsc::channelas", "("),
             ("std::sync::mpsc::{sync_channelas", "("),
         ] {
             let mut remaining = import;
