@@ -1105,6 +1105,42 @@ fn quality_rejects_an_external_gate_with_all_controlled_steps_deleted() -> TestR
 }
 
 #[test]
+fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        inject_rust_gate_failure_after_format(&fixture.root)?;
+        let failed = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&failed, "injected canonical prefix failure")?;
+
+        let retained = fixture.latest_evidence()?;
+        let rust = gate_record(&retained, "EG-RUST")?;
+        if !rust.contains("\"result\": \"failed\"")
+            || !rust.contains("\"arguments\":[\"fmt\",\"--all\",\"--\",\"--check\"]")
+            || rust.contains("\"arguments\":[\"clippy\"")
+        {
+            return Err(std::io::Error::other(
+                "failed EG-RUST evidence did not retain exactly its executed canonical prefix",
+            )
+            .into());
+        }
+
+        let next = fixture.quality_output_for("pr")?;
+        if !next.status.success() {
+            return Err(std::io::Error::other(format!(
+                "EG-EVIDENCE rejected a legitimate failed canonical prefix: {}\n{}",
+                String::from_utf8_lossy(&next.stdout),
+                String::from_utf8_lossy(&next.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -3399,6 +3435,19 @@ fn inject_final_report_parent_sync_failure(root: &Path) -> TestResult {
         "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n",
         "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n    if path.file_name().and_then(OsStr::to_str) == Some(\"evidence-reports\") {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"final report parent sync failed\",\n        ));\n    }\n",
     )
+}
+
+fn inject_rust_gate_failure_after_format(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "    let clippy = run_status(\n",
+        "    if root\n        .join(\"target/quality-tools/inject-rust-gate-failure\")\n        .is_file()\n    {\n        return Err(XtaskError::invalid(\n            \"injected canonical prefix failure\",\n            \"rust gate stopped after its first canonical step\",\n        ));\n    }\n    let clippy = run_status(\n",
+    )?;
+    fs::write(
+        root.join("target/quality-tools/inject-rust-gate-failure"),
+        "",
+    )?;
+    Ok(())
 }
 
 fn remove_one_m0_01b_owner_coverage_target(root: &Path) -> TestResult {

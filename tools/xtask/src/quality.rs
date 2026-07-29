@@ -2563,7 +2563,18 @@ fn validate_registered_gate_bindings(
         }
 
         let expected_arguments = if let Some(mode) = exceptional_mode {
-            special_gate_arguments(mode, retained.gate_id.as_str())
+            let aggregator = retained.gate_id == "EG-00";
+            let mode_argument = match (mode, aggregator) {
+                (ExceptionalAttemptMode::Collision, true) => "--collision-retention",
+                (ExceptionalAttemptMode::Collision, false) => "--blocked-by-collision",
+                (ExceptionalAttemptMode::Recovery, true) => "--report-retention-failure",
+                (ExceptionalAttemptMode::Recovery, false) => "--blocked-by-eg-00",
+            };
+            vec![
+                "quality".to_owned(),
+                mode_argument.to_owned(),
+                retained.gate_id.clone(),
+            ]
         } else {
             vec![
                 "quality".to_owned(),
@@ -2621,27 +2632,12 @@ fn validate_registered_gate_bindings(
             registered,
             evidence.profile,
             exceptional_mode.is_some() || retained.result == "not-selected",
-            &retained.typed_invocation.controlled_steps,
+            retained,
             registry,
             path,
         )?;
     }
     Ok(())
-}
-
-fn special_gate_arguments(mode: ExceptionalAttemptMode, gate_id: &str) -> Vec<String> {
-    let aggregator = gate_id == "EG-00";
-    let mode_argument = match (mode, aggregator) {
-        (ExceptionalAttemptMode::Collision, true) => "--collision-retention",
-        (ExceptionalAttemptMode::Collision, false) => "--blocked-by-collision",
-        (ExceptionalAttemptMode::Recovery, true) => "--report-retention-failure",
-        (ExceptionalAttemptMode::Recovery, false) => "--blocked-by-eg-00",
-    };
-    vec![
-        "quality".to_owned(),
-        mode_argument.to_owned(),
-        gate_id.to_owned(),
-    ]
 }
 
 fn validate_pre_registry_gate_binding(
@@ -2696,10 +2692,12 @@ fn validate_registered_controlled_steps(
     gate: &Gate,
     profile: Profile,
     must_be_empty: bool,
-    steps: &[ControlledInvocation],
+    retained: &ParsedGateRecord,
     registry: &Registry,
     path: &Path,
 ) -> Result<(), XtaskError> {
+    let retained_result = retained.result.as_str();
+    let steps = &retained.typed_invocation.controlled_steps;
     if must_be_empty {
         if steps.is_empty() {
             return Ok(());
@@ -2713,12 +2711,22 @@ fn validate_registered_controlled_steps(
         );
     }
     let expected_step_count = canonical_controlled_step_count(gate, profile, registry);
-    if steps.len() != expected_step_count {
+    let cardinality_matches = match retained_result {
+        "passed" => steps.len() == expected_step_count,
+        "failed" => expected_step_count > 0 && (1..=expected_step_count).contains(&steps.len()),
+        _ => false,
+    };
+    if !cardinality_matches {
         return invalid_json(
             path,
             format!(
-                "retained gate `{}` does not contain its exact canonical controlled steps: expected {expected_step_count}, found {}",
+                "retained gate `{}` does not contain its exact canonical controlled steps: result {retained_result}, expected {}, found {}",
                 gate.id,
+                if retained_result == "failed" {
+                    format!("a non-empty prefix of {expected_step_count}")
+                } else {
+                    expected_step_count.to_string()
+                },
                 steps.len()
             ),
         );
@@ -6272,7 +6280,17 @@ fn exceptional_gate_attempts(
                 GateStatus::NotSelected
             };
             let mut invocation = attempt.invocation.clone();
-            invocation.arguments = special_gate_arguments(mode, attempt.gate_id.as_str());
+            let mode_argument = match (mode, is_aggregator) {
+                (ExceptionalAttemptMode::Collision, true) => "--collision-retention",
+                (ExceptionalAttemptMode::Collision, false) => "--blocked-by-collision",
+                (ExceptionalAttemptMode::Recovery, true) => "--report-retention-failure",
+                (ExceptionalAttemptMode::Recovery, false) => "--blocked-by-eg-00",
+            };
+            invocation.arguments = vec![
+                "quality".to_owned(),
+                mode_argument.to_owned(),
+                attempt.gate_id.clone(),
+            ];
             invocation.controlled_steps.clear();
             build_gate_attempt(
                 attempt_id,
