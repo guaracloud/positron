@@ -22,11 +22,11 @@
       "Trusted CI rejects a GITHUB_SHA that differs from the controlled git revision before gate selection.",
       "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a missing or retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass.",
       "Engineering evidence schema version 3 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact structured-invocation digests.",
-      "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. A bounded typed JSON parser rejects malformed, duplicate, missing, unknown, oversized, or cross-reference-inconsistent evidence and reports. Controlled steps are charged before stream copies, with 128 steps, 131072 bytes per stream, and 8388608 encoded bytes per report; the serializer reserves each exact escaped JSON field before copying and retains a schema-valid failed attempt if encoding reaches the limit.",
+      "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. Typed retained-document parsing enforces the evidence schema's 2097152-byte limit and the raw-report schema's independent 8388608-byte limit, with filesystem metadata rejected before either file is read. Controlled steps are charged before stream copies, with 128 steps, 131072 bytes per stream, and 8388608 encoded bytes per report; the serializer reserves each exact escaped JSON field before copying and retains a schema-valid failed attempt if encoding reaches the limit.",
       "Retained evidence files and raw-report directories are enumerated independently under bounded counts. Current schema-v3 evidence requires every exact report even when its report directory is absent, orphan report files and attempt directories fail closed, schema-v3 attempt-owned filenames are constrained, and bounded schema-v1/v2 records remain explicit legacy inputs with their historical filename labels and without schema-v3 report requirements.",
-      "The reserved attempt owns one bounded attempt-derived report staging directory. Every selected report is create-new written and read back there; one same-filesystem directory rename atomically publishes the complete set only after all reports pass, and the reserved evidence record commits afterward. Any first, middle, last, publication, or staging-cleanup failure retains one schema-valid failed attempt without publishing partial final reports.",
+      "Before any report is published, the reserved attempt create-news, flushes, and synchronizes one schema-valid recovery record bound to the canonical attempt. Every selected report is create-new written and read back in one bounded staging directory; one same-filesystem directory rename publishes the complete set only after all reports pass, and the primary evidence record commits afterward. The recovery record is removed only after the primary evidence is flushed and synchronized. Any report, publication, primary-write, primary-flush, or reconciliation failure removes attempt-owned final reports and an incomplete primary record while preserving the immutable recovery verdict.",
       "EVIDENCE_V3_CONSTRAINTS_V1 is the canonical runtime constraint owner for string, digest, path, count, and size boundaries. The checked schema names this owner and is verified by its exact SHA-256 after structural checks, so enum, pattern, length, range, required-field, or additional-properties drift fails closed. Runtime parsing enforces lowercase 40/64-character source and registry identities, lowercase SHA-256, and every declared maximum.",
-      "Retained structured invocations are parsed into typed ordered fields, including repeated arguments, canonicalized with the writer's positron-quality-command-v2 NUL-domain-separated JSON algorithm, and SHA-256 recomputed independently for both evidence and raw reports before their stored digests are cross-compared."
+      "Retained structured invocations are parsed into typed ordered fields, including repeated arguments, canonicalized with the writer's positron-quality-command-v2 NUL-domain-separated JSON algorithm, and SHA-256 recomputed independently for both evidence and raw reports before their stored digests are cross-compared. Current-schema gate identity, owner, budget, selection, program, ordered arguments, working directory, environment, timeout, activation, exception, and controlled-step commands are then compared with the canonical gate, toolchain, profile, and stage registries rather than accepted from the retained record itself."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
@@ -42,12 +42,13 @@
     "Every current runner attempt exposes exact or explicitly non-applicable evidence identities with validated structured invocation and registry digests.",
     "Missing, tampered, oversized, malformed, duplicate-field, or command-mismatched selected-gate raw reports fail the public EG-EVIDENCE validator.",
     "Retained evidence with missing, duplicate, or extra canonical gates, aggregate-result overwrite, or schema-version removal fails closed.",
-    "A raw-report collision or encoded-size rejection cannot consume the attempt without a schema-valid failed evidence record.",
+    "A raw-report collision, encoded-size rejection, evidence write failure, or evidence flush failure cannot consume the attempt without a pre-reserved schema-valid failed recovery record.",
     "Deleting an entire schema-v3 report directory, adding an orphan report file or attempt directory, or presenting an adversarial retained-evidence filename fails the public validator.",
     "Bounded legacy schema-v1/v2 evidence is explicitly preserved without being reinterpreted as schema-v3 report evidence.",
-    "A report failure at any position cannot expose a partial final report directory, and a cleanup failure cannot erase the retained failed verdict.",
+    "A report failure at any position cannot expose a partial final report directory; reconciliation removes only attempt-owned publication and cannot erase the retained failed verdict or overwrite a pre-existing report directory.",
     "Uppercase hashes, overlong constrained identities, and any checked-schema constraint drift fail EG-EVIDENCE.",
-    "Coordinated edits to an invocation plus both stored command digests fail canonical digest recomputation while ordered repeated arguments remain lossless."
+    "Retained reports one byte below and exactly at the 8388608-byte raw-report limit are accepted, while a report one byte over the limit is rejected from metadata before parsing.",
+    "Coordinated edits to an invocation plus independently valid recomputed command digests are rejected against the canonical registries while ordered repeated arguments and dynamic resolved tool identities remain lossless."
   ],
   "detection_lost": [],
   "representative_old_new_evidence": {
@@ -59,43 +60,39 @@
     "new": {
       "status": "passed-focused-local-diagnostic",
       "commands": [
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_first_staged_write_fails -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_middle_staged_write_fails -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_last_staged_write_fails -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_staging_cleanup_fails -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_evidence_schema_constraint_drift -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_schema_v3_uppercase_source_identity -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_schema_v3_overlong_exact_identity_value -- --exact",
-        "cargo test --locked --package xtask --bin xtask quality::tests::evidence_v3_constraint_owner_enforces_every_string_and_digest_boundary -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_accepts_a_valid_retained_raw_report_ -- --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retained_raw_report_one_byte_over_its_limit_before_parsing -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_evidence_ -- --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports_when_ -- --nocapture",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_coordinated_invocation_and_stored_digest_tampering -- --exact",
-        "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_raw_report_command_digest_mismatch -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_incomplete_evidence_identity_schema -- --exact"
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_collision_exhaustion_without_changing_any_occupied_bytes -- --exact",
+        "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact"
       ],
-      "result": "The focused public runner fixtures prove atomic complete-directory report publication and failed-attempt retention across first, middle, last, and cleanup failures; exact checked-schema drift, uppercase identity, and overlong identity rejection; canonical invocation-digest recomputation under coordinated tampering; and lossless repeated arguments. The pre-existing single-digest mismatch, occupied-report, and incomplete-schema guards also pass. These local results are diagnostic only."
+      "result": "All 14 focused tests passed. They cover the raw-report byte-limit boundary; pre-reserved recovery across evidence write, flush, and reconciliation failures; atomic report cleanup across first, middle, last, and staging-cleanup failures; occupied-report preservation; collision exhaustion; rejection of coordinated invocation tampering with a valid recomputed digest; and lossless repeated arguments. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "ef5a2383ee083d28170c54dce22bd5cd5d44b2ee",
-      "source_tree": "692d446c649bbce71ab821f460fdeeb6a96eb02c",
-      "fixture_sha256": "d2f14ce816e07745afb51739eba989f28779a2929018eb08115bd019deeecdd5",
+      "source_revision": "b677e86e8d145619847f20b039836401a2464087",
+      "source_tree": "00f69a21923f410910bd5524cbb9769d6409d114",
+      "fixture_sha256": "fe21171c04a5a6b3bf24721d2aebbefd192994f15b2e155ebb6381e517d25b73",
       "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
-      "runner_sha256": "9c63a1d866ead1e595baa3267fa0103f0e3789c93c551cf54ed6c4701744b54b",
-      "parser_sha256": "84f149f0478df4e7f13f99d674fa367c23196721bcdcade583a899fcbfa7032b",
+      "runner_sha256": "dd347a089f99d5df711c4886a1fe92c34ca1c6eecdee39816cc1e89b68f58545",
+      "parser_sha256": "3406b96639f8c8ed7e7bfcd7f6676404502f027cad942e65dad12878d8ab7972",
       "exact_fixture_results": [
+        "quality_accepts_a_valid_retained_raw_report_one_byte_below_its_limit: passed",
+        "quality_accepts_a_valid_retained_raw_report_at_its_limit: passed",
+        "quality_rejects_a_retained_raw_report_one_byte_over_its_limit_before_parsing: passed",
+        "quality_retains_recovery_evidence_when_recovery_reconciliation_fails: passed",
+        "quality_retains_recovery_evidence_when_the_primary_evidence_flush_fails: passed",
+        "quality_retains_recovery_evidence_when_the_primary_evidence_write_fails: passed",
         "quality_retains_failed_attempt_without_final_reports_when_first_staged_write_fails: passed",
         "quality_retains_failed_attempt_without_final_reports_when_middle_staged_write_fails: passed",
         "quality_retains_failed_attempt_without_final_reports_when_last_staged_write_fails: passed",
         "quality_retains_failed_attempt_without_final_reports_when_staging_cleanup_fails: passed",
-        "quality_rejects_evidence_schema_constraint_drift: passed",
-        "quality_rejects_schema_v3_uppercase_source_identity: passed",
-        "quality_rejects_schema_v3_overlong_exact_identity_value: passed",
-        "quality::tests::evidence_v3_constraint_owner_enforces_every_string_and_digest_boundary: passed",
         "quality_rejects_coordinated_invocation_and_stored_digest_tampering: passed",
-        "quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments: passed",
-        "quality_rejects_a_raw_report_command_digest_mismatch: passed",
         "quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied: passed",
-        "quality_rejects_an_incomplete_evidence_identity_schema: passed"
+        "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
+        "quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments: passed"
       ]
     },
     "dual_run_artifacts": {
