@@ -183,6 +183,61 @@ fn parallel_generation_verifications_claim_distinct_bounded_staging() -> TestRes
 }
 
 #[test]
+fn two_clean_generations_ignore_preexisting_staging_contamination_and_report_parity() -> TestResult
+{
+    let fixture = GeneratorFixture::create(&canonical_source()?)?;
+    fixture.copy_configuration_source()?;
+    let result = (|| {
+        fixture.assert_combined_success()?;
+        let contaminated = fixture
+            .root
+            .join("target/quality/tmp/verify-generation-0/api/positron/v1/openapi.json");
+        let parent = contaminated
+            .parent()
+            .ok_or_else(|| io::Error::other("contaminated fixture has no parent"))?;
+        fs::create_dir_all(parent)?;
+        fs::write(&contaminated, b"preexisting staging contamination\n")?;
+
+        let output = fixture.verification_output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "two-clean verification failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        let stdout = String::from_utf8(output.stdout)?;
+        let (_, digests) = stdout
+            .split_once("clean generation A sha256:")
+            .ok_or_else(|| io::Error::other("first clean generation digest is missing"))?;
+        let (first, second_with_verdict) = digests
+            .split_once("; clean generation B sha256:")
+            .ok_or_else(|| io::Error::other("second clean generation digest is missing"))?;
+        let (second, verdict) = second_with_verdict
+            .split_once("; parity=")
+            .ok_or_else(|| io::Error::other("clean generation parity verdict is missing"))?;
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first, second);
+        assert_eq!(verdict.trim(), "byte-identical");
+        assert_eq!(
+            fs::read(&contaminated)?,
+            b"preexisting staging contamination\n"
+        );
+        let remaining = fs::read_dir(fixture.root.join("target/quality/tmp"))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let [remaining] = remaining.as_slice() else {
+            return Err(io::Error::other("owned staging roots were not both removed").into());
+        };
+        assert_eq!(remaining.file_name(), "verify-generation-0");
+        Ok(())
+    })();
+    fixture.remove()?;
+    result
+}
+
+#[test]
 fn semantic_rpc_changes_propagate_to_every_generated_transport_artifact() -> TestResult {
     let source = canonical_source()?
         .replace("rpc Negotiate(", "rpc Inspect(")

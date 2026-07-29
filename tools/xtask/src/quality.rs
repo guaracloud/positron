@@ -665,8 +665,11 @@ fn execute_gate(
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
     let invocation = crate::generation::VerificationInvocation::claim(root)?;
-    crate::generation::verify(root, invocation)?;
-    Ok("canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, Schema Digest, and validation fixtures".to_owned())
+    let report = crate::generation::verify(root, invocation)?;
+    Ok(format!(
+        "canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, Schema Digest, and validation fixtures; {}",
+        report.display()
+    ))
 }
 
 fn run_dynamic_analysis_gate(
