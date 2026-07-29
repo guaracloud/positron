@@ -108,8 +108,7 @@ fn quality_reconciles_after_a_result_timeout_through_the_public_seam() -> TestRe
             "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(&output, "did not report before the shutdown deadline")?;
-        assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+        assert_controlled_process_deadline_failure(&fixture, &output)
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -129,7 +128,7 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
             "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(&output, "did not report before the shutdown deadline")?;
+        assert_controlled_process_deadline_failure(&fixture, &output)?;
         let evidence = fixture.latest_evidence()?;
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
@@ -140,7 +139,7 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
             std::io::Error::other("lifecycle evidence omitted total deadline elapsed time")
         })?;
         let duration = duration
-            .split(';')
+            .split(|character: char| !character.is_ascii_digit())
             .next()
             .unwrap_or_default()
             .parse::<u128>()?;
@@ -150,7 +149,7 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
             ))
             .into());
         }
-        assert_lifecycle_state(&fixture, "live=0")
+        Ok(())
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -170,7 +169,9 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
         )?;
         fixture.build_fixture_xtask()?;
         let mut quality = fixture.quality_child_from_built_fixture_for("pr")?;
-        let status = match wait_for_child_exit(&mut quality, Duration::from_secs(10)) {
+        // This outer test-infrastructure watchdog includes fixture startup and broad
+        // nextest contention; the product lifecycle bound asserted below remains 100ms.
+        let status = match wait_for_child_exit(&mut quality, Duration::from_secs(30)) {
             Ok(status) => status,
             Err(error) => {
                 drop(quality.kill());
@@ -237,7 +238,7 @@ fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence(
             "            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            std::thread::sleep(Duration::from_millis(60));\n            Err(XtaskError::invalid(\"test lifecycle deadline\", \"injected single-deadline failure\"))",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(&output, "injected single-deadline failure")?;
+        assert_controlled_process_deadline_failure(&fixture, &output)?;
         let evidence = fixture.latest_evidence()?;
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
@@ -248,7 +249,7 @@ fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence(
             std::io::Error::other("lifecycle evidence omitted total deadline elapsed time")
         })?;
         let elapsed = elapsed
-            .split(';')
+            .split(|character: char| !character.is_ascii_digit())
             .next()
             .unwrap_or_default()
             .parse::<u128>()?;
@@ -258,7 +259,7 @@ fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence(
             ))
             .into());
         }
-        assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+        Ok(())
     })();
     let cleanup = fixture.remove();
     cleanup?;

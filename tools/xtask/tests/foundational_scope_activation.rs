@@ -2848,7 +2848,7 @@ fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> 
 }
 
 #[test]
-fn quality_accepts_a_failed_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
+fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
         let evidence_directory = fixture.root.join("target/quality/evidence");
@@ -2868,12 +2868,44 @@ fn quality_accepts_a_failed_registered_internal_gate_with_zero_controlled_steps(
             )
             .into());
         }
+        let concurrency_gate = gate_record(&retained, "EG-CONCURRENCY")?;
+        if !concurrency_gate.contains("\"result\": \"passed\"")
+            || concurrency_gate
+                .matches("\"program\":\"cargo-xtask-quality/bounded-runner\"")
+                .count()
+                != 1
+        {
+            return Err(std::io::Error::other(
+                "process-backed EG-CONCURRENCY did not retain exactly one controlled child step",
+            )
+            .into());
+        }
+        let concurrency_report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &retained,
+            "EG-CONCURRENCY",
+        )?)?;
+        for required in [
+            "\"verdict\":\"exit-status:exit status: 0\"",
+            "process-lifecycle-v1;phase=completed",
+            "termination-requested=false",
+            "process-reaped=true",
+            "live=0",
+            "deadline-ms=100",
+        ] {
+            if !concurrency_report.contains(required) {
+                return Err(std::io::Error::other(format!(
+                    "process-backed EG-CONCURRENCY report omitted `{required}`"
+                ))
+                .into());
+            }
+        }
 
         fs::remove_file(malformed)?;
         let next = fixture.quality_output_for("pr")?;
         if !next.status.success() {
             return Err(std::io::Error::other(format!(
-                "EG-EVIDENCE rejected a legitimate failed internal zero-step gate: {}\n{}",
+                "EG-EVIDENCE rejected a legitimate process-backed controlled step: {}\n{}",
                 String::from_utf8_lossy(&next.stdout),
                 String::from_utf8_lossy(&next.stderr)
             ))

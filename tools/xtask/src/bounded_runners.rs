@@ -9,7 +9,7 @@
 //! than a runner verdict.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ const MAXIMUM_FIELD_BYTES: usize = 96;
 const REGISTERED_SPAWN_SITE: &str = "quality-bounded-worker-v1";
 const CONCURRENCY_GATE: &str = "EG-CONCURRENCY";
 const RESOURCE_GATE: &str = "EG-RESOURCE";
-const CHILD_PROCESS_RECONCILIATION_RESERVE: Duration = Duration::from_millis(25);
+const CHILD_PROCESS_RECONCILIATION_RESERVE: Duration = Duration::from_millis(50);
 const MAXIMUM_CHILD_ARGUMENT_BYTES: usize = 32_768;
 const MAXIMUM_CHILD_OUTCOME_BYTES: usize = 8_192;
 
@@ -262,6 +262,49 @@ impl FrozenBoundedRunnerRegistry {
             OsString::from(spawn_sites),
             outcome.as_os_str().to_owned(),
         ])
+    }
+
+    pub(crate) fn retained_child_invocation_matches(
+        gate: &str,
+        timeout_ms: u128,
+        arguments: &[&str],
+    ) -> bool {
+        let [
+            "quality-bounded-runner",
+            recorded_gate,
+            registry,
+            spawn_sites,
+            outcome,
+        ] = arguments
+        else {
+            return false;
+        };
+        if *recorded_gate != gate {
+            return false;
+        }
+        let outcome = Path::new(outcome);
+        let outcome_name_matches = outcome
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("bounded-runner-") && name.ends_with(".out"));
+        if !outcome.is_absolute() || !outcome_name_matches {
+            return false;
+        }
+        let Ok(registry_bytes) = hex_decode(registry) else {
+            return false;
+        };
+        let Ok(spawn_site_bytes) = hex_decode(spawn_sites) else {
+            return false;
+        };
+        let Ok(parsed_gate) = ScenarioGate::parse(gate) else {
+            return false;
+        };
+        FrozenBoundedRunnerRegistry::capture(registry_bytes, spawn_site_bytes)
+            .and_then(|frozen| {
+                frozen.scenario(parsed_gate)?;
+                frozen.process_work_budget(gate)
+            })
+            .is_ok_and(|budget| budget.as_millis() == timeout_ms)
     }
 
     pub(crate) fn process_work_budget(&self, gate: &str) -> Result<Duration, XtaskError> {

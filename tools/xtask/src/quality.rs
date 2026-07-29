@@ -1537,7 +1537,7 @@ fn run_bounded_runner_gate(
             ),
         ));
     }
-    Ok(record.to_owned())
+    Ok(format!("{record}; {}", lifecycle("completed")))
 }
 
 fn take_bounded_runner_outcome(path: &Path) -> Result<String, XtaskError> {
@@ -3287,13 +3287,22 @@ fn validate_registered_controlled_steps(
             XtaskError::invalid_path(path, "registered gate timeout milliseconds overflow")
         })?;
     for (index, step) in steps.iter().enumerate() {
-        let registered_program = registry
-            .tools
-            .iter()
-            .any(|tool| tool.command == step.program);
+        let process_backed_runner = matches!(gate.runner.as_str(), "concurrency" | "resource");
+        let registered_program = if process_backed_runner {
+            step.program == "cargo-xtask-quality/bounded-runner"
+        } else {
+            registry
+                .tools
+                .iter()
+                .any(|tool| tool.command == step.program)
+        };
         let resolved = Path::new(&step.resolved_program);
         let resolved_matches = resolved.is_absolute()
-            && resolved.file_name().and_then(OsStr::to_str) == Some(step.program.as_str());
+            && if process_backed_runner {
+                resolved.file_stem().and_then(OsStr::to_str) == Some("xtask")
+            } else {
+                resolved.file_name().and_then(OsStr::to_str) == Some(step.program.as_str())
+            };
         if !registered_program
             || !resolved_matches
             || step.timeout_ms > maximum_timeout_ms
@@ -3304,8 +3313,7 @@ fn validate_registered_controlled_steps(
                 gate.runner.as_str(),
                 profile,
                 index,
-                step.program.as_str(),
-                &step.arguments,
+                step,
                 registry,
             )
         {
@@ -3359,8 +3367,8 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
                 1
             }
         },
-        "concurrency" | "crypto" | "error-policy" | "evidence" | "matrix" | "performance"
-        | "policy" | "resource" | "soak" => 0,
+        "concurrency" | "resource" => 1,
+        "crypto" | "error-policy" | "evidence" | "matrix" | "performance" | "policy" | "soak" => 0,
         _ => 0,
     }
 }
@@ -3369,11 +3377,15 @@ fn registered_runner_command_matches(
     runner: &str,
     profile: Profile,
     index: usize,
-    program: &str,
-    arguments: &[String],
+    step: &ControlledInvocation,
     registry: &Registry,
 ) -> bool {
-    let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let program = step.program.as_str();
+    let args = step
+        .arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     match runner {
         "registry" => registry
             .tools
@@ -3578,8 +3590,22 @@ fn registered_runner_command_matches(
                 && args.first() == Some(&"+nightly-2026-07-20")
                 && args.get(1) == Some(&"llvm-cov")
         },
-        "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
-        | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => false,
+        "concurrency" => index == 0
+            && program == "cargo-xtask-quality/bounded-runner"
+            && crate::bounded_runners::FrozenBoundedRunnerRegistry::retained_child_invocation_matches(
+                "EG-CONCURRENCY",
+                step.timeout_ms,
+                &args,
+            ),
+        "resource" => index == 0
+            && program == "cargo-xtask-quality/bounded-runner"
+            && crate::bounded_runners::FrozenBoundedRunnerRegistry::retained_child_invocation_matches(
+                "EG-RESOURCE",
+                step.timeout_ms,
+                &args,
+            ),
+        "correctness" | "crypto" | "error-policy" | "evidence" | "fault" | "integrity"
+        | "matrix" | "performance" | "policy" | "soak" => false,
         _ => false,
     }
 }

@@ -125,6 +125,47 @@ pub(super) fn assert_lifecycle_state(fixture: &Fixture, state: &str) -> TestResu
     Ok(())
 }
 
+pub(super) fn assert_controlled_process_deadline_failure(
+    fixture: &Fixture,
+    output: &std::process::Output,
+) -> TestResult {
+    assert_rejected_output(output, "controlled runner failed during deadline")?;
+    let evidence = fixture.latest_evidence()?;
+    let gate = gate_record(&evidence, "EG-CONCURRENCY")?;
+    if !gate.contains("\"result\": \"failed\"")
+        || gate
+            .matches("\"program\":\"cargo-xtask-quality/bounded-runner\"")
+            .count()
+            != 1
+    {
+        return Err(std::io::Error::other(
+            "deadline failure did not retain exactly one controlled runner invocation",
+        )
+        .into());
+    }
+    let report = fs::read_to_string(exact_raw_report_path(
+        &fixture.root,
+        &evidence,
+        "EG-CONCURRENCY",
+    )?)?;
+    for required in [
+        "\"verdict\":\"controlled-failure:deadline\"",
+        "process-lifecycle-v1;phase=deadline",
+        "termination-requested=true",
+        "process-reaped=true",
+        "live=0",
+        "deadline-ms=100",
+    ] {
+        if !report.contains(required) {
+            return Err(std::io::Error::other(format!(
+                "controlled deadline report omitted `{required}`"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn assert_cancellation_state(
     original_dispatch: &str,
     expected_error: &str,
