@@ -488,11 +488,11 @@ fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() ->
         for (gate, required) in [
             (
                 "EG-CONCURRENCY",
-                "measurement-v1;scenario=concurrency-cancel-join;schedule=cancel-then-join-v1;seed=seed-concurrency-v1;registered=3;workers=0:0:cancelled,1:1:executed,2:2:executed;retries=0;reservations=0;queue-empty=true;joined=3;deadline-ms=100",
+                "measurement-v1;scenario=concurrency-cancel-join;schedule=cancel-then-join-v1;seed=seed-concurrency-v1;registered=3;workers=0:0:cancelled,1:1:executed,2:2:executed;retries=0;reservations=0;queue-empty=true;joined-ids=0,1,2;deadline-ms=100",
             ),
             (
                 "EG-RESOURCE",
-                "measurement-v1;scenario=resource-fair-pressure;schedule=round-robin-pressure-v1;seed=seed-resource-v1;registered=3;workers=0:0:executed,1:1:executed,2:2:executed;retries=2;reservations=0;queue-empty=true;joined=3;deadline-ms=100",
+                "measurement-v1;scenario=resource-fair-pressure;schedule=round-robin-pressure-v1;seed=seed-resource-v1;registered=3;workers=0:0:executed,1:1:executed,2:2:executed;retries=2;reservations=0;queue-empty=true;joined-ids=0,1,2;deadline-ms=100",
             ),
         ] {
             let record = gate_record(&evidence, gate)?;
@@ -619,9 +619,31 @@ fn quality_rejects_a_braced_channel_alias_through_the_public_seam() -> TestResul
 }
 
 #[test]
+fn quality_rejects_a_direct_generic_channel_through_the_public_seam() -> TestResult {
+    assert_unbounded_concurrency_primitive_rejected(
+        "use std::sync::mpsc;\n#[allow(dead_code)] fn direct_generic_channel() { let _queue = mpsc::channel::<()>(); }\n",
+    )
+}
+
+#[test]
 fn quality_rejects_a_module_aliased_generic_channel_through_the_public_seam() -> TestResult {
     assert_imported_concurrency_alias_rejected(
         "use std::sync::mpsc as m;\n#[allow(dead_code)] fn module_alias_channel() { let _queue = m::channel::<()>(); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_grouped_module_aliased_generic_channel_through_the_public_seam() -> TestResult
+{
+    assert_imported_concurrency_alias_rejected(
+        "use std::sync::{mpsc as m};\n#[allow(dead_code)] fn grouped_module_alias_channel() { let _queue = m::channel::<()>(); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_nested_grouped_module_aliased_channel_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::{sync::{mpsc as m}};\n#[allow(dead_code)] fn nested_grouped_module_alias_channel() { let _queue = m::channel::<()>(); }\n",
     )
 }
 
@@ -637,6 +659,33 @@ fn quality_rejects_a_multiline_grouped_spawn_alias_through_the_public_seam() -> 
     assert_imported_concurrency_alias_rejected(
         "use std::thread::{\n    spawn as launch,\n};\n#[allow(dead_code)] fn multiline_grouped_alias() { let _worker = launch(|| {}); }\n",
     )
+}
+
+#[test]
+fn quality_accepts_a_nested_grouped_bounded_channel_alias_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "use std::{sync::{mpsc::{sync_channel as bounded}}};\n#[allow(dead_code)] fn bounded_channel_alias() { let (_sender, _receiver) = bounded::<()>(1); }\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "the public quality seam falsely rejected a bounded channel alias: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
 }
 
 #[test]
@@ -686,7 +735,9 @@ fn quality_rejects_a_duplicate_observed_semantic_spawn_site_through_the_public_s
     let fixture = Fixture::create()?;
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
-        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let source = fixture
+            .root
+            .join("tools/xtask/src/registered_task_lifecycle.rs");
         let mut content = fs::read_to_string(&source)?;
         content.push_str(
             "\n// positron-concurrency-spawn: RegisteredTasks::spawn\\tquality-bounded-worker-v1\n#[allow(dead_code)]\nfn duplicate_registered_spawn_regression() { let _worker = thread::Builder::new().spawn(|| {}); }\n",
@@ -870,8 +921,8 @@ fn quality_uses_the_frozen_spawn_registry_after_a_post_capture_swap_through_the_
         enable_concurrency_gate(&fixture)?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "    validate_registered_spawn_sites(root, registry)?;\n    let scenario = registry.scenario(ScenarioGate::Concurrency)?;",
-            "    fs::write(root.join(SPAWN_SITE_REGISTRY_PATH), b\"swapped after frozen capture\").map_err(|error| XtaskError::io(\"test post-capture spawn registry swap\", error))?;\n    validate_registered_spawn_sites(root, registry)?;\n    let scenario = registry.scenario(ScenarioGate::Concurrency)?;",
+            "    crate::concurrency_source_policy::validate_registered_spawn_sites(\n        root,\n        Path::new(SPAWN_SITE_REGISTRY_PATH),\n        registry.spawn_sites(),\n        REGISTERED_SPAWN_SITE,\n    )?;\n    let scenario = registry.scenario(ScenarioGate::Concurrency)?;",
+            "    std::fs::write(root.join(SPAWN_SITE_REGISTRY_PATH), b\"swapped after frozen capture\").map_err(|error| XtaskError::io(\"test post-capture spawn registry swap\", error))?;\n    crate::concurrency_source_policy::validate_registered_spawn_sites(\n        root,\n        Path::new(SPAWN_SITE_REGISTRY_PATH),\n        registry.spawn_sites(),\n        REGISTERED_SPAWN_SITE,\n    )?;\n    let scenario = registry.scenario(ScenarioGate::Concurrency)?;",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         if !output.status.success() {
@@ -896,7 +947,9 @@ fn quality_reconciles_after_a_partial_registered_spawn_failure_through_the_publi
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/registered_task_lifecycle.rs"),
             "            let worker_results = results_sender.clone();\n",
             "            if id == 1 { return owner.reconcile_failure(XtaskError::invalid(\"test lifecycle spawn\", \"injected partial spawn failure\")); }\n            let worker_results = results_sender.clone();\n",
         )?;
@@ -916,8 +969,8 @@ fn quality_reconciles_after_a_mid_dispatch_failure_through_the_public_seam() -> 
         enable_concurrency_gate(&fixture)?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "        tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n        tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n        Ok(())",
-            "        Err(XtaskError::invalid(\"test lifecycle dispatch\", \"injected mid-dispatch failure\"))",
+            "            tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            Ok(())",
+            "            Err(XtaskError::invalid(\"test lifecycle dispatch\", \"injected mid-dispatch failure\"))",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, "injected mid-dispatch failure")?;
@@ -934,7 +987,9 @@ fn quality_reconciles_after_a_result_timeout_through_the_public_seam() -> TestRe
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/registered_task_lifecycle.rs"),
             "    let (completion, schedule_slot) = match command {",
             "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
         )?;
@@ -953,7 +1008,9 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/registered_task_lifecycle.rs"),
             "    let (completion, schedule_slot) = match command {",
             "    cooperative_pause(&cancel, Duration::from_millis(250))?;\n    let (completion, schedule_slot) = match command {",
         )?;
@@ -965,9 +1022,9 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
             &evidence,
             "EG-CONCURRENCY",
         )?)?;
-        let (_, duration) = report
-            .split_once("shutdown-ms=")
-            .ok_or_else(|| std::io::Error::other("lifecycle evidence omitted shutdown-ms"))?;
+        let (_, duration) = report.split_once("deadline-elapsed-ms=").ok_or_else(|| {
+            std::io::Error::other("lifecycle evidence omitted total deadline elapsed time")
+        })?;
         let duration = duration
             .split(';')
             .next()
@@ -987,18 +1044,59 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
 }
 
 #[test]
-fn quality_reconciles_after_worker_error_and_panic_through_the_public_seam() -> TestResult {
+fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            ") -> Result<(), XtaskError> {\n    if cancel.load(Ordering::Acquire) {",
-            ") -> Result<(), XtaskError> {\n    if id == 1 { return Err(XtaskError::invalid(\"test lifecycle worker\", \"injected worker error\")); }\n    if id == 2 { panic!(\"injected worker panic\"); }\n    if cancel.load(Ordering::Acquire) {",
+            "            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            Ok(())",
+            "            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            std::thread::sleep(Duration::from_millis(60));\n            Err(XtaskError::invalid(\"test lifecycle deadline\", \"injected single-deadline failure\"))",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "injected single-deadline failure")?;
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-CONCURRENCY",
+        )?)?;
+        let (_, elapsed) = report.split_once("deadline-elapsed-ms=").ok_or_else(|| {
+            std::io::Error::other("lifecycle evidence omitted total deadline elapsed time")
+        })?;
+        let elapsed = elapsed
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .parse::<u128>()?;
+        if elapsed > 100 {
+            return Err(std::io::Error::other(format!(
+                "work, cancellation, join, and evidence exceeded one registered 100ms deadline: {elapsed}ms"
+            ))
+            .into());
+        }
+        assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_reconciles_after_worker_error_and_panic_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/registered_task_lifecycle.rs"),
+            ") -> Result<(), XtaskError> {\n    let command = loop {",
+            ") -> Result<(), XtaskError> {\n    if id == 1 { return Err(XtaskError::invalid(\"test lifecycle worker\", \"injected worker error\")); }\n    if id == 2 { panic!(\"injected worker panic\"); }\n    let command = loop {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, "injected worker error")?;
-        assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+        assert_lifecycle_observations(&fixture, "0,1,2", "0,1,2", "0,1")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -1015,24 +1113,27 @@ fn quality_records_already_queued_reconciliation_through_the_public_seam() -> Te
     let fixture = Fixture::create()?;
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
-        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let lifecycle_source = fixture
+            .root
+            .join("tools/xtask/src/registered_task_lifecycle.rs");
+        let runner_source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
         replace_once(
-            &source,
-            "const RESOURCE_GATE: &str = \"EG-RESOURCE\";\n",
-            "const RESOURCE_GATE: &str = \"EG-RESOURCE\";\nstatic TEST_FULL_SLOT_BARRIER: std::sync::OnceLock<std::sync::Barrier> = std::sync::OnceLock::new();\n",
+            &lifecycle_source,
+            "const CANCELLATION_JOIN_RESERVE: Duration = Duration::from_millis(25);\n",
+            "const CANCELLATION_JOIN_RESERVE: Duration = Duration::from_millis(25);\nstatic TEST_FULL_SLOT_BARRIER: std::sync::OnceLock<std::sync::Barrier> = std::sync::OnceLock::new();\n",
         )?;
         replace_once(
-            &source,
-            ") -> Result<(), XtaskError> {\n    if cancel.load(Ordering::Acquire) {",
-            ") -> Result<(), XtaskError> {\n    if id == 0 { TEST_FULL_SLOT_BARRIER.get_or_init(|| std::sync::Barrier::new(2)).wait(); }\n    if cancel.load(Ordering::Acquire) {",
+            &lifecycle_source,
+            ") -> Result<(), XtaskError> {\n    let command = loop {",
+            ") -> Result<(), XtaskError> {\n    if id == 0 { TEST_FULL_SLOT_BARRIER.get_or_init(|| std::sync::Barrier::new(2)).wait(); }\n    let command = loop {",
         )?;
         replace_once(
-            &source,
-            "        tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;\n        tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n        tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n        Ok(())",
-            "        tasks.dispatch(0, WorkerCommand::Execute { schedule_slot: 9 })?;\n        Err(XtaskError::invalid(\"test cancellation state\", \"injected full-slot failure\"))",
+            &runner_source,
+            "            tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;\n            tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            Ok(())",
+            "            tasks.dispatch(0, WorkerCommand::Execute { schedule_slot: 9 })?;\n            Err(XtaskError::invalid(\"test cancellation state\", \"injected full-slot failure\"))",
         )?;
         replace_once(
-            &source,
+            &lifecycle_source,
             "        let mut cleanup_errors = Vec::new();\n",
             "        TEST_FULL_SLOT_BARRIER.get_or_init(|| std::sync::Barrier::new(2)).wait();\n        let mut cleanup_errors = Vec::new();\n",
         )?;
@@ -1051,14 +1152,18 @@ fn quality_records_disconnected_reconciliation_through_the_public_seam() -> Test
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "    let ((), measurements) = RegisteredTasks::execute(scenario, |tasks| {",
-            "    thread::sleep(Duration::from_millis(30));\n    let ((), measurements) = RegisteredTasks::execute(scenario, |tasks| {",
+            &fixture
+                .root
+                .join("tools/xtask/src/registered_task_lifecycle.rs"),
+            "        let value = match operation(&mut owner) {",
+            "        thread::sleep(Duration::from_millis(30));\n        let value = match operation(&mut owner) {",
         )?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            ") -> Result<(), XtaskError> {\n    if cancel.load(Ordering::Acquire) {",
-            ") -> Result<(), XtaskError> {\n    if id == 0 { return Ok(()); }\n    if cancel.load(Ordering::Acquire) {",
+            &fixture
+                .root
+                .join("tools/xtask/src/registered_task_lifecycle.rs"),
+            ") -> Result<(), XtaskError> {\n    let command = loop {",
+            ") -> Result<(), XtaskError> {\n    if id == 0 { return Ok(()); }\n    let command = loop {",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(
@@ -1092,6 +1197,27 @@ fn quality_rejects_an_omitted_serialized_worker_measurement_through_the_public_s
         assert_rejected_output(
             &output,
             "measurement record contains a duplicate or empty field",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_tampered_serialized_join_observations_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    let record = measurement_record(scenario, &measurements, &joined_ids, 0, 0, true);\n",
+            "    let record = measurement_record(scenario, &measurements, &joined_ids, 0, 0, true);\n    let record = record.replace(\"joined-ids=0,1,2\", \"joined-ids=0,1,1\");\n",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "observed join records do not match the registered workers",
         )
     })();
     let cleanup = fixture.remove();
@@ -5478,7 +5604,32 @@ fn assert_imported_concurrency_alias_rejected(source_append: &str) -> TestResult
     result
 }
 
+fn assert_unbounded_concurrency_primitive_rejected(source_append: &str) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(source_append);
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "unbounded concurrency primitive")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 fn assert_concurrency_lifecycle_failure(fixture: &Fixture, spawned_ids: &str) -> TestResult {
+    assert_lifecycle_observations(fixture, spawned_ids, spawned_ids, spawned_ids)
+}
+
+fn assert_lifecycle_observations(
+    fixture: &Fixture,
+    spawned_ids: &str,
+    completed_ids: &str,
+    joined_ids: &str,
+) -> TestResult {
     let evidence = fixture.latest_evidence()?;
     if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
         return Err(std::io::Error::other(
@@ -5493,8 +5644,8 @@ fn assert_concurrency_lifecycle_failure(fixture: &Fixture, spawned_ids: &str) ->
     )?)?;
     let required = format!("lifecycle-v1;spawned-ids={spawned_ids};cancelled-ids=");
     if !report.contains(&required)
-        || !report.contains(&format!("completed-ids={spawned_ids};"))
-        || !report.contains(&format!("joined-ids={spawned_ids};"))
+        || !report.contains(&format!("completed-ids={completed_ids};"))
+        || !report.contains(&format!("joined-ids={joined_ids};"))
         || !report.contains(";live=0")
     {
         return Err(std::io::Error::other(format!(
@@ -5538,8 +5689,8 @@ fn assert_cancellation_state(
         }
         replace_once(
             &source,
-            "        tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n        tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n        Ok(())",
-            "        Err(XtaskError::invalid(\"test cancellation state\", \"injected mid-dispatch failure\"))",
+            "            tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            Ok(())",
+            "            Err(XtaskError::invalid(\"test cancellation state\", \"injected mid-dispatch failure\"))",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, expected_error)?;

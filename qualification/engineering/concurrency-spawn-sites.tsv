@@ -1,5 +1,5 @@
 path	symbol	kind	id
-tools/xtask/src/bounded_runners.rs	RegisteredTasks::spawn	thread	quality-bounded-worker-v1
+tools/xtask/src/registered_task_lifecycle.rs	RegisteredTasks::spawn	thread	quality-bounded-worker-v1
 tools/xtask/src/controlled_execution.rs	execute_unix	process	controlled-command-v1
 tools/xtask/src/controlled_execution.rs	run_platform_kill	process	controlled-platform-kill-v1
 tools/xtask/src/controlled_execution.rs	InputBroker::start	process	controlled-input-broker-v1

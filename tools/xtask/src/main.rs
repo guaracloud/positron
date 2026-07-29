@@ -8,6 +8,7 @@
 
 mod api_generation;
 mod bounded_runners;
+mod concurrency_source_policy;
 mod config_generation;
 mod controlled_execution;
 mod error;
@@ -16,6 +17,7 @@ mod generation;
 mod hooks;
 mod qualification_fixtures;
 mod quality;
+mod registered_task_lifecycle;
 mod registry;
 
 use std::env;
