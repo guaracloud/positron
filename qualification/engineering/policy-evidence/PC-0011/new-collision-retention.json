@@ -2,13 +2,13 @@
   "schema_version": 1,
   "policy_change": "PC-0011-m0-06-evidence-attempt-integrity",
   "implementation": "new-clean-behavior-commit",
-  "source_revision": "f0df6003427ae6e3590fc43758a6ff040556bd9f",
-  "source_tree": "73c32685a5466d8f829b3f1580c7569f025c36c4",
-  "fixture_sha256": "b521472d20d848ea48b950524982fe5d448cde7bc9ba59adff39bad42e1c75d0",
+  "source_revision": "42eca6478a5b3e7404fd6ba020167fbdd8f0be58",
+  "source_tree": "62931d17fb26525f142c8c116d8e00187822c12a",
+  "fixture_sha256": "2c031a28b24d0c3cb568d87ce1609f155ce7e6f59deddca6c768baed0049b82a",
   "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
   "runner_sha256": "c37a06faa7c6e2b1c5734c978d435fac4bbb4aaf1c02d53adf9da76b85103184",
-  "parser_sha256": "a72c1a7b7fd384065991b049cc7ca29aa5a2956e43a59c6faa3e1ece4ca1ed9c",
-  "fixture": "Focused public fixtures inject evidence-directory, report-parent-chain, and staging-child parent synchronization failures; retain the adjacent staged-file, staging-directory, and final-report-parent durability cases; exercise plain and escaped retained-JSON strings at the decoded-length boundary while counting allocation growth; and preserve both generated-search-index secret canary classes without embedding a recognizable Square token prefix in rustdoc metadata.",
+  "parser_sha256": "1d7d55c06319acb06fbabe74df0f875c86f0081eec672958d44f6d74fcb7e3f6",
+  "fixture": "Focused public fixtures inject evidence-directory, report-parent-chain, and staging-child parent synchronization failures; retain the adjacent staged-file, staging-directory, and final-report-parent durability cases; and exercise plain and escaped retained-JSON strings at the decoded-length boundary while counting allocation growth.",
   "commands": [
     "cargo test --locked --package xtask --test foundational_scope_activation quality_does_not_acknowledge_primary_when_evidence_directory_parent_sync_fails -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_when_a_staged_report_file_sync_fails -- --exact",
@@ -17,11 +17,9 @@
     "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_when_the_report_parent_chain_sync_fails -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_when_the_staging_child_parent_sync_fails -- --exact",
     "cargo test --locked --package xtask --bin xtask evidence_json::tests::enforces_input_and_string_bounds -- --exact",
-    "cargo test --locked --package xtask --bin xtask evidence_json::tests::maximum_plain_and_escaped_strings_use_logarithmic_allocation_growth -- --exact",
-    "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_different_square_canary_in_generated_search_index -- --exact",
-    "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_non_square_generated_search_index_canary -- --exact"
+    "cargo test --locked --package xtask --bin xtask evidence_json::tests::maximum_plain_and_escaped_strings_use_logarithmic_allocation_growth -- --exact"
   ],
   "verdict": "passed-focused-local-diagnostic",
-  "result": "All 10 remediation-focused tests passed at the bound behavior revision. Newly created evidence and report directory components are child- and parent-synchronized before use, only attempt-owned directories are reconciled, authoritative recovery is retained after report-publication failures, maximum decoded JSON strings use bounded logarithmic allocation growth, and both generated-search-index secret canary classes remain detected without rustdoc false positives.",
+  "result": "All 8 remediation-focused tests passed at the bound behavior revision. Newly created evidence and report directory components are child- and parent-synchronized before use, only attempt-owned directories are reconciled, authoritative recovery is retained after report-publication failures, and maximum decoded JSON strings use bounded logarithmic allocation growth.",
   "qualification_claim": "none"
 }

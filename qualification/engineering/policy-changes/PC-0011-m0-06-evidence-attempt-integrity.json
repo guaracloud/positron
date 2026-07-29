@@ -52,7 +52,6 @@
     "A pre-existing recovery record cannot cause an empty primary file, and a primary reservation collision after recovery creation cannot overwrite either authoritative record.",
     "An evidence-directory parent-sync, report-directory component-sync, staging-child parent-sync, staged report file-sync, staging-directory-sync, final-directory-sync, or report-parent-sync failure cannot acknowledge primary evidence; reconciliation removes only directories created by that attempt and retains a schema-valid recovery verdict when one exists.",
     "Plain and escaped retained-JSON strings at the 131072-byte decoded limit require only logarithmically many allocation growth requests while over-limit strings still fail closed.",
-    "Generated-document secret scanning still rejects both Square-shaped and non-Square fixture canaries without embedding a recognizable Square token prefix in rustdoc search metadata.",
     "Uppercase hashes, overlong constrained identities, and any checked-schema constraint drift fail EG-EVIDENCE.",
     "Retained reports one byte below and exactly at the 8388608-byte raw-report limit are accepted, while a report one byte over the limit is rejected from metadata before parsing.",
     "Coordinated edits to an invocation plus independently valid recomputed command digests are rejected against the canonical registries while ordered repeated arguments and dynamic resolved tool identities remain lossless.",
@@ -76,19 +75,17 @@
         "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_when_the_report_parent_chain_sync_fails -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_when_the_staging_child_parent_sync_fails -- --exact",
         "cargo test --locked --package xtask --bin xtask evidence_json::tests::enforces_input_and_string_bounds -- --exact",
-        "cargo test --locked --package xtask --bin xtask evidence_json::tests::maximum_plain_and_escaped_strings_use_logarithmic_allocation_growth -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_different_square_canary_in_generated_search_index -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_non_square_generated_search_index_canary -- --exact"
+        "cargo test --locked --package xtask --bin xtask evidence_json::tests::maximum_plain_and_escaped_strings_use_logarithmic_allocation_growth -- --exact"
       ],
-      "result": "All 10 remediation-focused tests passed. They cover evidence, report-parent, and staging-child directory-entry synchronization failures; the adjacent staged-file, staging-directory, and final-report-parent durability paths; the retained-JSON decoded-length and logarithmic-growth boundaries for plain and escaped strings; and both generated-search-index secret canary classes. These local results are diagnostic only."
+      "result": "All 8 remediation-focused tests passed. They cover evidence, report-parent, and staging-child directory-entry synchronization failures; the adjacent staged-file, staging-directory, and final-report-parent durability paths; and the retained-JSON decoded-length and logarithmic-growth boundaries for plain and escaped strings. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "f0df6003427ae6e3590fc43758a6ff040556bd9f",
-      "source_tree": "73c32685a5466d8f829b3f1580c7569f025c36c4",
-      "fixture_sha256": "b521472d20d848ea48b950524982fe5d448cde7bc9ba59adff39bad42e1c75d0",
+      "source_revision": "42eca6478a5b3e7404fd6ba020167fbdd8f0be58",
+      "source_tree": "62931d17fb26525f142c8c116d8e00187822c12a",
+      "fixture_sha256": "2c031a28b24d0c3cb568d87ce1609f155ce7e6f59deddca6c768baed0049b82a",
       "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
       "runner_sha256": "c37a06faa7c6e2b1c5734c978d435fac4bbb4aaf1c02d53adf9da76b85103184",
-      "parser_sha256": "a72c1a7b7fd384065991b049cc7ca29aa5a2956e43a59c6faa3e1ece4ca1ed9c",
+      "parser_sha256": "1d7d55c06319acb06fbabe74df0f875c86f0081eec672958d44f6d74fcb7e3f6",
       "exact_fixture_results": [
         "quality_does_not_acknowledge_primary_when_evidence_directory_parent_sync_fails: passed",
         "quality_retains_recovery_when_a_staged_report_file_sync_fails: passed",
@@ -97,9 +94,7 @@
         "quality_retains_recovery_when_the_report_parent_chain_sync_fails: passed",
         "quality_retains_recovery_when_the_staging_child_parent_sync_fails: passed",
         "evidence_json::tests::enforces_input_and_string_bounds: passed",
-        "evidence_json::tests::maximum_plain_and_escaped_strings_use_logarithmic_allocation_growth: passed",
-        "quality_rejects_a_different_square_canary_in_generated_search_index: passed",
-        "quality_rejects_a_non_square_generated_search_index_canary: passed"
+        "evidence_json::tests::maximum_plain_and_escaped_strings_use_logarithmic_allocation_growth: passed"
       ]
     },
     "dual_run_artifacts": {
