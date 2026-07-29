@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Positron Configuration Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "diagnostics": {"type": "object", "additionalProperties": false, "properties": {"log_level": {"enum": ["error", "warn", "info", "debug"]}}},
+    "runtime": {"type": "object", "additionalProperties": false, "properties": {"shutdown_grace_seconds": {"type": "integer", "minimum": 1, "maximum": 3600}}},
+    "listener": {"type": "object", "additionalProperties": false, "properties": {"control_bind_address": {"type": "string", "maxLength": 256}}},
+    "storage": {"type": "object", "additionalProperties": false, "properties": {"data_directory": {"type": "string", "maxLength": 256}, "secrets_directory": {"type": "string", "maxLength": 256}}},
+    "security": {"type": "object", "additionalProperties": false, "properties": {"local_key_file": {"type": "string", "maxLength": 256, "writeOnly": true}}}
+  },
+  "required": ["schema_version"]
+}

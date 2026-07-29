@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "id": "PC-0009-m0-04-configuration-foundation",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0055-adopt-one-versioned-transactional-configuration-contract.md",
+    "docs/application-design.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Activate only the Configuration-owned generated artifact scope required by M0-04; positron-config was already active under the retained M0-01 foundational activation.",
+  "change": {
+    "issue": 5,
+    "artifact_scope": "configuration-artifacts",
+    "generation_command": "cargo xtask generate-config",
+    "public_test_command": "cargo test --locked --package positron-config --test configuration_foundation",
+    "scope_activation": "M0-04 behavior ownership replaces only the historical M0-01 configuration scaffold activation",
+    "edges": "positron-runtime->positron-config moves to M0-04",
+    "dependencies": "none; generator reuses the Configuration owner through a local workspace path dependency"
+  },
+  "tests": {
+    "required_behavior": [
+      "deterministic precedence",
+      "closed typed rejection",
+      "secret redaction",
+      "mutability planning without publication",
+      "byte-identical schema and reference generation"
+    ],
+    "qualification_claim": "none; configuration coverage and mutation measurements are pending one final exact-head trusted-CI campaign",
+    "retained_failures": ["local PR profile rejected the M0-01 activation-only scope before this ledger transition", "local corrected PR profile rejected empty M0-04 baseline identities before pending final-CI registration"]
+  },
+  "approval": {
+    "required": ["Recovery and Lifecycle", "Architecture", "Quality Engineering"],
+    "status": "pending-independent-review"
+  }
+}

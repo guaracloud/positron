@@ -26,6 +26,8 @@ const M0_02_ACTIVATION_ID: &str = "M0-02";
 const M0_02_ACTIVATION_SET: &str = "positron-domain";
 const M0_02_POLICY_CHANGE: &str =
     "qualification/engineering/policy-changes/PC-0007-m0-02-domain-types.json";
+const M0_04_POLICY_CHANGE: &str =
+    "qualification/engineering/policy-changes/PC-0009-m0-04-configuration-foundation.json";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -254,6 +256,24 @@ fn quality_accepts_the_narrow_m0_02_domain_types_transition() -> TestResult {
     let cleanup = fixture.remove();
     cleanup?;
     result
+}
+
+#[test]
+fn live_m0_04_configuration_ledger_names_only_its_contract_and_artifact() -> TestResult {
+    let root = repository_root()?;
+    let scopes = fs::read_to_string(root.join("qualification/engineering/scopes.tsv"))?;
+    let required = format!(
+        "positron-config\tcrates/positron-config\tRecovery and Lifecycle\tapplication\tactive\tM0-04\tpositron-config\tpositron-runtime->positron-config\tEG-COVERAGE\tcargo test --locked --package positron-config --test configuration_foundation\tconfig-coverage-branch|config-coverage-line|config-coverage-region\tconfig-mutation-score\tnone\t{M0_04_POLICY_CHANGE}"
+    );
+    if !scopes.contains(&required) {
+        return Err(std::io::Error::other("live M0-04 configuration ledger drifted").into());
+    }
+    let artifacts = fs::read_to_string(root.join("qualification/engineering/artifact-scopes.tsv"))?;
+    if !artifacts.contains("configuration-artifacts\tconfiguration\tRecovery and Lifecycle\tactive")
+    {
+        return Err(std::io::Error::other("M0-04 configuration artifact scope is missing").into());
+    }
+    Ok(())
 }
 
 #[test]
@@ -1442,6 +1462,7 @@ fn configure_activation_ledger(root: &Path) -> TestResult {
     remove_scaffold_markers(root)?;
     restore_m0_01_domain_source_shape(root)?;
     restore_m0_01_api_source_shape(root)?;
+    restore_m0_01_config_source_shape(root)?;
     Ok(())
 }
 
@@ -1500,6 +1521,47 @@ fn restore_m0_01_api_source_shape(root: &Path) -> TestResult {
             ),
         )?;
     }
+    Ok(())
+}
+
+fn restore_m0_01_config_source_shape(root: &Path) -> TestResult {
+    let contract_test = root.join("crates/positron-config/tests/configuration_foundation.rs");
+    if contract_test.is_file() {
+        fs::remove_file(contract_test)?;
+    }
+    fs::write(
+        root.join("crates/positron-config/src/lib.rs"),
+        "//! Historical M0-01 activation-only fixture.\n#![forbid(unsafe_code)]\n",
+    )?;
+    let configuration = root.join("configuration");
+    if configuration.is_dir() {
+        fs::remove_dir_all(configuration)?;
+    }
+    for (field, value) in [
+        ("activation_id", "M0-01"),
+        ("activation_scope_set", ACTIVATION_SET),
+        (
+            "test_commands",
+            "cargo test --locked --package xtask --test foundational_scope_activation",
+        ),
+        (
+            "coverage_baseline",
+            "coverage-branch|coverage-changed-code|coverage-line|coverage-region",
+        ),
+        ("mutation_baseline", "mutation-score"),
+        ("contract_evidence", POLICY_CHANGE),
+    ] {
+        set_scope_field(root, "positron-config", field, value)?;
+    }
+    let artifacts = root.join("qualification/engineering/artifact-scopes.tsv");
+    let content = fs::read_to_string(&artifacts)?;
+    fs::write(
+        artifacts,
+        content.replace(
+            "configuration-artifacts\tconfiguration\tRecovery and Lifecycle\tactive\t-\tEG-DOCS|EG-ERROR|EG-SECRETS|EG-TEST\n",
+            "",
+        ),
+    )?;
     Ok(())
 }
 

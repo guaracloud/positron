@@ -962,7 +962,15 @@ fn validate_activation_ledgers(
         && groups.get("M0-01") == Some(&m0_01_config_scope_set())
         && groups.get("M0-02") == Some(&m0_02_domain_scope_set())
         && groups.get("M0-03") == Some(&m0_03_api_scope_set());
-    if !m0_01_complete && !m0_02_domain_transition && !m0_03_api_transition {
+    let m0_04_configuration_transition = groups.len() == 3
+        && groups.get("M0-02") == Some(&m0_02_domain_scope_set())
+        && groups.get("M0-03") == Some(&m0_03_api_scope_set())
+        && groups.get("M0-04") == Some(&m0_04_configuration_scope_set());
+    if !m0_01_complete
+        && !m0_02_domain_transition
+        && !m0_03_api_transition
+        && !m0_04_configuration_transition
+    {
         return Err(XtaskError::invalid(
             "application activation ledger",
             "active application scopes must be the complete M0-01 foundation, the narrow M0-02 Domain Types transition, or the narrow M0-03 canonical API transition",
@@ -985,6 +993,7 @@ fn validate_activation_ledgers(
                     reviewed_dependencies,
                 )?;
             },
+            "M0-04" => validate_m0_04_configuration_ledger(root, scope)?,
             _ => {
                 return Err(XtaskError::invalid(
                     "application activation ledger",
@@ -993,7 +1002,12 @@ fn validate_activation_ledgers(
             },
         }
     }
-    validate_foundational_edges(edges, m0_02_domain_transition, m0_03_api_transition)?;
+    validate_foundational_edges(
+        edges,
+        m0_02_domain_transition,
+        m0_03_api_transition,
+        m0_04_configuration_transition,
+    )?;
     Ok(())
 }
 
@@ -1021,6 +1035,42 @@ fn m0_02_domain_scope_set() -> BTreeSet<String> {
 
 fn m0_03_api_scope_set() -> BTreeSet<String> {
     ["positron-api"].into_iter().map(str::to_owned).collect()
+}
+
+fn m0_04_configuration_scope_set() -> BTreeSet<String> {
+    ["positron-config"].into_iter().map(str::to_owned).collect()
+}
+
+fn validate_m0_04_configuration_ledger(root: &Path, scope: &Scope) -> Result<(), XtaskError> {
+    if scope.package != "positron-config"
+        || scope.semantic_owner != "Recovery and Lifecycle"
+        || scope.activation_scope_set != m0_04_configuration_scope_set()
+        || scope.allowed_edges != foundational_edges(&scope.package)
+        || scope.risk_gates != BTreeSet::from(["EG-COVERAGE".to_owned()])
+        || scope.test_commands
+            != "cargo test --locked --package positron-config --test configuration_foundation"
+        || scope.coverage_baseline
+            != BTreeSet::from([
+                "config-coverage-branch".to_owned(),
+                "config-coverage-line".to_owned(),
+                "config-coverage-region".to_owned(),
+            ])
+        || scope.mutation_baseline != "config-mutation-score"
+        || scope.dependency_review != "none"
+    {
+        return Err(XtaskError::invalid(
+            "application activation ledger",
+            "M0-04 Configuration has an incomplete or forbidden activation ledger",
+        ));
+    }
+    let evidence = root.join(&scope.contract_evidence);
+    if !evidence.is_file() {
+        return Err(XtaskError::invalid_path(
+            &evidence,
+            "M0-04 Configuration contract evidence is missing",
+        ));
+    }
+    validate_dependency_free_scope(root, scope)
 }
 
 fn validate_foundational_scope_ledger(
@@ -1391,6 +1441,7 @@ fn validate_foundational_edges(
     edges: &[ArchitectureEdge],
     m0_02_domain_transition: bool,
     m0_03_api_transition: bool,
+    m0_04_configuration_transition: bool,
 ) -> Result<(), XtaskError> {
     let foundational = foundational_scope_set();
     let mut actual = BTreeMap::<String, BTreeSet<(String, String)>>::new();
@@ -1403,10 +1454,16 @@ fn validate_foundational_edges(
             &edge.dependency
         };
         let expected_activation_id =
-            if (m0_02_domain_transition || m0_03_api_transition) && package == "positron-domain" {
+            if (m0_02_domain_transition || m0_03_api_transition || m0_04_configuration_transition)
+                && package == "positron-domain"
+            {
                 "M0-02"
-            } else if m0_03_api_transition && package == "positron-api" {
+            } else if (m0_03_api_transition || m0_04_configuration_transition)
+                && package == "positron-api"
+            {
                 "M0-03"
+            } else if m0_04_configuration_transition && package == "positron-config" {
+                "M0-04"
             } else {
                 "M0-01"
             };
