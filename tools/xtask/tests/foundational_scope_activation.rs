@@ -464,6 +464,161 @@ fn quality_runs_correctness_through_the_registered_public_seam() -> TestResult {
     result
 }
 
+#[test]
+fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "registered concurrency/resource runners did not complete successfully: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        for (gate, required) in [
+            (
+                "EG-CONCURRENCY",
+                "registered-tasks=3; cancellation=observed; joined-and-reaped=3; verifier=independent",
+            ),
+            (
+                "EG-RESOURCE",
+                "reservation-capacity=2; fairness=round-robin; pressure=hard; retry-storm=bounded; leaks=none; shutdown=bounded; verifier=independent",
+            ),
+        ] {
+            let record = gate_record(&evidence, gate)?;
+            if !record.contains("\"result\": \"passed\"") {
+                return Err(std::io::Error::other(format!(
+                    "{gate} did not retain a passing public outcome"
+                ))
+                .into());
+            }
+            let report =
+                fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, gate)?)?;
+            if !report.contains(required) {
+                return Err(std::io::Error::other(format!(
+                    "{gate} immutable raw report omitted lifecycle evidence `{required}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_unregistered_tooling_spawn_site_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n#[allow(dead_code)]\nfn unregistered_spawn_regression() -> std::io::Result<()> {\n    let _child = std::process::Command::new(\"true\").spawn()?;\n    Ok(())\n}\n",
+        );
+        fs::write(&source, content)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "unregistered process or task spawn")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "unregistered tooling spawn did not retain a failed concurrency gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_stale_semantic_spawn_site_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("qualification/engineering/concurrency-spawn-sites.tsv"),
+            "RegisteredTasks::spawn\tthread\tquality-bounded-worker-v1",
+            "RegisteredTasks::spawn\tthread\tstale-bounded-worker-v1",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "unregistered semantic spawn site")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "stale semantic spawn site did not retain a failed concurrency gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_resource_capacity_drift_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("qualification/engineering/concurrency-fixtures.tsv"),
+            "resource-fair-pressure\tEG-RESOURCE\tquality-bounded-worker-v1\tround-robin-pressure-v1\tseed-resource-v1\t3\t3\t2\t2\t100\tfair-pressure-retry-leak-free-v1",
+            "resource-fair-pressure\tEG-RESOURCE\tquality-bounded-worker-v1\tround-robin-pressure-v1\tseed-resource-v1\t3\t3\t3\t2\t100\tfair-pressure-retry-leak-free-v1",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "registered resource bounds or deterministic schedule drifted",
+        )?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-RESOURCE")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "resource capacity drift did not retain a failed resource gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 #[cfg(unix)]
 #[test]
 fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> TestResult {

@@ -294,6 +294,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
     configure_standard_descriptors(&mut command, &specification.output, &specification.input);
     configure_isolated_process_group(&mut command);
 
+    // positron-concurrency-spawn: execute_unix\tcontrolled-command-v1
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -617,6 +618,7 @@ fn run_platform_kill(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // positron-concurrency-spawn: run_platform_kill\tcontrolled-platform-kill-v1
         .spawn()
         .map_err(|source| {
             ExecutionFailure::new(
@@ -877,6 +879,7 @@ impl InputBroker {
             .stdin(Stdio::from(source))
             .stdout(Stdio::from(input))
             .stderr(Stdio::null())
+            // positron-concurrency-spawn: InputBroker::start\tcontrolled-input-broker-v1
             .spawn()
         {
             Ok(child) => child,
@@ -1506,6 +1509,7 @@ impl CaptureReader {
             .stdin(input)
             .stdout(Stdio::from(output))
             .stderr(Stdio::null())
+            // positron-concurrency-spawn: CaptureReader::start\tcontrolled-capture-broker-v1
             .spawn()
             .map_err(|source| {
                 ExecutionFailure::new(

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod api_generation;
+mod bounded_runners;
 mod config_generation;
 mod controlled_execution;
 mod error;

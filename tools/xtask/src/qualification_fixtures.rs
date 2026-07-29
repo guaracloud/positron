@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
+use crate::bounded_runners::FrozenBoundedRunnerRegistry;
 use crate::error::XtaskError;
 
 const REGISTRY_PATH: &str = "qualification/engineering/quality-fixtures.tsv";
@@ -1187,6 +1188,7 @@ pub(crate) struct FrozenQualificationFixtures {
     quality_registry_bytes: Box<[u8]>,
     integrity_registry_bytes: Box<[u8]>,
     harness_registry_bytes: Box<[u8]>,
+    bounded_runners: FrozenBoundedRunnerRegistry,
     quality_registry: FrozenRegistry<FixtureRegistry>,
     integrity_registry: FrozenRegistry<IntegrityRegistry>,
     harness: HarnessInterface,
@@ -1549,6 +1551,7 @@ impl FrozenQualificationFixtures {
         )?;
         let harness_registry_bytes =
             read_frozen_input(root, HARNESS_REGISTRY_PATH, MAXIMUM_IDENTITY_REGISTRY_BYTES)?;
+        let bounded_runners = FrozenBoundedRunnerRegistry::capture(root)?;
         let quality_registry =
             match FixtureRegistry::parse(&root.join(REGISTRY_PATH), &quality_registry_bytes) {
                 Ok(registry) => FrozenRegistry::Valid(registry),
@@ -1563,13 +1566,17 @@ impl FrozenQualificationFixtures {
         };
         let harness =
             HarnessInterface::parse(&root.join(HARNESS_REGISTRY_PATH), &harness_registry_bytes)?;
-        let (seed_digest, fault_schedule_digest) =
-            seed_and_schedule_digests(&quality_registry_bytes, &integrity_registry_bytes);
+        let (seed_digest, fault_schedule_digest) = seed_and_schedule_digests(
+            &quality_registry_bytes,
+            &integrity_registry_bytes,
+            bounded_runners.bytes(),
+        );
         Ok(Self {
             adversarial_manifest: adversarial_manifest.into_boxed_slice(),
             quality_registry_bytes: quality_registry_bytes.into_boxed_slice(),
             integrity_registry_bytes: integrity_registry_bytes.into_boxed_slice(),
             harness_registry_bytes: harness_registry_bytes.into_boxed_slice(),
+            bounded_runners,
             quality_registry,
             integrity_registry,
             harness,
@@ -1591,6 +1598,10 @@ impl FrozenQualificationFixtures {
                 self.integrity_registry_bytes.as_ref(),
             ),
             (HARNESS_REGISTRY_PATH, self.harness_registry_bytes.as_ref()),
+            (
+                "qualification/engineering/concurrency-fixtures.tsv",
+                self.bounded_runners.bytes(),
+            ),
         ] {
             payload.extend_from_slice(relative.as_bytes());
             payload.push(0);
@@ -1606,6 +1617,10 @@ impl FrozenQualificationFixtures {
 
     pub(crate) fn fault_schedule_digest(&self) -> &str {
         &self.fault_schedule_digest
+    }
+
+    pub(crate) fn bounded_runners(&self) -> &FrozenBoundedRunnerRegistry {
+        &self.bounded_runners
     }
 }
 
@@ -1694,17 +1709,21 @@ pub(crate) fn run_integrity(
     fixture_root.finish(outcome)
 }
 
-fn seed_and_schedule_digests(quality: &[u8], integrity: &[u8]) -> (String, String) {
+fn seed_and_schedule_digests(quality: &[u8], integrity: &[u8], bounded: &[u8]) -> (String, String) {
     let mut seed_hasher = Sha256::new();
     seed_hasher.update(b"positron-quality-fixture-seeds-v1\0");
     seed_hasher.update(quality);
     seed_hasher.update(b"\0");
     seed_hasher.update(integrity);
+    seed_hasher.update(b"\0");
+    seed_hasher.update(bounded);
     let mut schedule_hasher = Sha256::new();
     schedule_hasher.update(b"positron-quality-fault-schedules-v1\0");
     schedule_hasher.update(quality);
     schedule_hasher.update(b"\0");
     schedule_hasher.update(integrity);
+    schedule_hasher.update(b"\0");
+    schedule_hasher.update(bounded);
     (
         format!("sha256:{:x}", seed_hasher.finalize()),
         format!("sha256:{:x}", schedule_hasher.finalize()),
@@ -2076,6 +2095,7 @@ fn execute_state_transition(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // positron-concurrency-spawn: execute_state_transition\tfixture-writer-v1
         .spawn()
         .map_err(|source| XtaskError::io("launch fixture writer process", source))?;
     let writer_pid = writer.id();
@@ -2135,6 +2155,7 @@ fn execute_state_transition(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // positron-concurrency-spawn: execute_state_transition\tfixture-recovery-v1
         .spawn()
         .map_err(|source| XtaskError::io("launch fresh fixture recovery process", source))?;
     let recovery_pid = recovery.id();
@@ -2801,6 +2822,7 @@ fn send_to_closed_provider(bytes: &[u8]) -> Result<Result<(), (FixtureFault, Str
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // positron-concurrency-spawn: send_to_closed_provider\tfixture-provider-v1
         .spawn()
         .map_err(|source| XtaskError::io("launch hermetic provider process", source))?;
     let mut input = provider.stdin.take().ok_or_else(|| {

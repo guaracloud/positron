@@ -818,8 +818,10 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     };
     let activated_risk_gates = registry.activated_risk_gates();
     let qualification_fixture_selected = registry.gates.iter().any(|gate| {
-        matches!(gate.id.as_str(), "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY")
-            && gate_selected(gate, options.profile, &activated_risk_gates)
+        matches!(
+            gate.id.as_str(),
+            "EG-CONCURRENCY" | "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY" | "EG-RESOURCE"
+        ) && gate_selected(gate, options.profile, &activated_risk_gates)
     });
     let qualification_fixtures =
         match crate::qualification_fixtures::FrozenQualificationFixtures::capture(&root) {
@@ -1368,6 +1370,9 @@ fn execute_gate(
             run_dependency_gate(attempt_id, root, registry, budget, environment, capture)
         },
         "documentation" => run_documentation_gate(root, budget, environment, capture),
+        "concurrency" => {
+            crate::bounded_runners::run_concurrency(qualification_fixtures.bounded_runners(), root)
+        },
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
         "fault" => run_fault_gate(qualification_fixtures, environment),
         "integrity" => run_integrity_gate(
@@ -1395,6 +1400,9 @@ fn execute_gate(
         ),
         "test" => run_test_gate(root, budget, environment, capture),
         "matrix" => run_generation_matrix_gate(root),
+        "resource" => {
+            crate::bounded_runners::run_resource(qualification_fixtures.bounded_runners())
+        },
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
             "an active risk scope selected a gate whose executable harness has not been implemented",
@@ -7324,7 +7332,7 @@ fn validate_evidence_identity(evidence: &Evidence) -> Result<(), XtaskError> {
     let qualification_fixture_selected = evidence.gates.iter().any(|gate| {
         matches!(
             gate.gate_id.as_str(),
-            "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY"
+            "EG-CONCURRENCY" | "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY" | "EG-RESOURCE"
         ) && gate.result != GateStatus::NotSelected
     });
     match (

@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "id": "PC-0013-m0-08-concurrency-resource-runners",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Implement the existing EG-CONCURRENCY and EG-RESOURCE runners for the active xtask tooling scope without application behavior or Qualification Cell advancement.",
+  "change": {
+    "issue": 9,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and immutable target/quality/evidence report",
+    "dependency_review": {
+      "new_dependencies": "none",
+      "rationale": "The implementation uses only Rust std bounded sync channels, threads, queues, and existing reviewed xtask dependencies."
+    },
+    "runner_changes": [
+      "The active xtask scope selects only the existing EG-CONCURRENCY and EG-RESOURCE risk gates; all gate IDs, stages, budgets, coordinators, exception classes, cells, and product scopes remain unchanged.",
+      "FrozenQualificationFixtures captures concurrency-fixtures.tsv once, binds its bytes into fixture, seed, and schedule identities, and supplies those same immutable bytes to both runners and retained evidence.",
+      "EG-CONCURRENCY registers three Quality Engineering workers before Builder::spawn, gives each a one-command bounded channel and shared bounded measurement channel, sends concrete cancellation or work commands, observes completion before a 100ms registered shutdown deadline, and retains every join handle until join succeeds.",
+      "EG-RESOURCE performs real FIFO work admission, two-unit reservations, hard-pressure denial, a two-attempt retry storm bound, reservation release, queue-empty and leak checks, and three joined workers. The verifier derives fairness from worker-recorded schedule slots and validates retained measurements rather than a runner verdict.",
+      "concurrency-spawn-sites.tsv declares stable path, symbol, kind, and semantic site IDs. The concurrency runner tokenizes production tooling source with comments and literals excluded, denies direct/unbounded spawn primitives, and fails closed if observed semantic sites are duplicate, stale, missing, or newly unregistered."
+    ],
+    "unchanged": [
+      "No application, runtime, Metrics, Profiles, replication, clustering, distribution, or provider behavior is added.",
+      "Developer evidence remains diagnostic and non-merge-eligible. Every Qualification Cell remains Specified; this harness implementation is Implemented only.",
+      "No dependency, unsafe boundary, threshold, timeout, memory declaration, selector, test command, or existing gate behavior is weakened."
+    ]
+  },
+  "detection_gained": [
+    "Selecting either newly active gate executes a concrete bounded runner and retains a named immutable outcome instead of returning unsupported-runner failure.",
+    "An unregistered direct spawn, unbounded channel/deque/async primitive, duplicate semantic registration, stale semantic registration, capacity drift, excess retries, pressure bypass, missing cancellation, missing join, non-FIFO schedule, or residual reservation fails closed through cargo xtask quality.",
+    "The immutable report identifies the frozen scenario, schedule, seed, lifecycle bounds, hard pressure, retry limit, leak result, bounded shutdown, and independent verifier result."
+  ],
+  "detection_lost": [],
+  "lifecycle_test_map": {
+    "pass": "quality_runs_concurrency_and_resource_through_the_registered_public_seam verifies passed named outcomes and immutable reports.",
+    "fail": "quality_rejects_an_unregistered_tooling_spawn_site_through_the_public_seam and quality_rejects_a_stale_semantic_spawn_site_through_the_public_seam retain failed EG-CONCURRENCY outcomes; quality_rejects_resource_capacity_drift_through_the_public_seam retains a failed EG-RESOURCE outcome.",
+    "timeout_and_cancellation": "Gate-specific proof: the concurrency scenario delivers one concrete cancellation and requires all three worker reports and joins before the registered 100ms shutdown deadline; failure is a closed gate error. Shared M0-06 proof: quality_kills_reaps_and_cleans_a_timed_out_fixture_writer and quality_fails_with_bounded_evidence_when_writer_reap_observation_stalls prove timeout, forced termination, direct-child reap, and typed cleanup failure for registered process lifecycle owners.",
+    "retry_and_resource": "The resource scenario records hard pressure at capacity two, limits retries to two, releases all reservations, and independently verifies FIFO worker schedule slots and empty queue state.",
+    "missing_tool": "Gate-specific proof: these hermetic Rust std runners introduce no external tool dependency. Shared M0-06 proof: environment snapshot and controlled launch-failure tests preserve missing-tool failures before external detector execution.",
+    "malformed": "The frozen concurrency fixture parser rejects bounded registry size, header, field-count, finite integer, duplicate gate, and spawn-site violations before execution; shared M0-06 fixture/evidence parser tests retain malformed report and registry proof.",
+    "stale": "Gate-specific proof: the stable semantic spawn-site registry must match every observed source marker exactly, so stale or duplicate registrations fail before work runs. Shared M0-06 evidence identity checks cover stale revision, command, environment, raw report, and registry digest bindings."
+  },
+  "representative_old_new_evidence": {
+    "old": {
+      "status": "failed-focused-public-regression",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_concurrency_and_resource_through_the_registered_public_seam -- --exact",
+      "result": "Before the change, activated EG-CONCURRENCY and EG-RESOURCE each returned an unsupported runner failure."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_concurrency_and_resource_through_the_registered_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_unregistered_tooling_spawn_site_through_the_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_stale_semantic_spawn_site_through_the_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_resource_capacity_drift_through_the_public_seam -- --exact"
+      ],
+      "result": "Focused local diagnostics passed after the retained RED unsupported-runner failure. They are not Qualification Evidence and do not establish merge eligibility."
+    }
+  },
+  "compatibility_and_recovery": {
+    "compatibility": "The cargo xtask quality command and evidence schema remain unchanged. New reports use the existing selected-gate immutable raw-report contract.",
+    "recovery": "Correct the registered scenario, semantic spawn marker, resource measurement, or lifecycle operation; retain the failed attempt and create a new attempt without overwriting prior evidence."
+  },
+  "approvals_required": ["Architecture", "Quality Engineering"],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
+    "attribution": "No implementation agent, reviewer, or repository owner is recorded as granting a required approval."
+  },
+  "qualification_claim": "None. This is Quality Engineering harness behavior only. It does not claim a Qualified cell, trusted CI pass, merge eligibility, release readiness, or role approval."
+}
