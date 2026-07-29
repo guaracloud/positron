@@ -2,13 +2,13 @@
   "schema_version": 1,
   "policy_change": "PC-0011-m0-06-evidence-attempt-integrity",
   "implementation": "new-clean-behavior-commit",
-  "source_revision": "4312e606d86f82d1c9ba7f0fbb92e7352838fc84",
-  "source_tree": "2ddfcbf7452c5d3c36d463fc06a2bb4fd6cdeaee",
-  "fixture_sha256": "c95b1c6fc0444149d3a00cfbcef7a12bbf293dfcbe18d585126790c7ad3e3d9d",
+  "source_revision": "4ec67445612767a3ad1b4f0e24fe60437d336035",
+  "source_tree": "a46b80c840dd654048396be19944539b7f43c93d",
+  "fixture_sha256": "7d4d5970ed5509177ce8142f9f2e59a011d8c4b4e67b84ec8aa4315b3748e1be",
   "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
-  "runner_sha256": "fe074a042d2442cf52c9d3aa9f71adbd74de5cf9f58a2ebc7b116f2e0b982c4d",
+  "runner_sha256": "e49dbe85cf682428185d43dad9560354145eb01e29ba25bdf7257256ac20bcc2",
   "parser_sha256": "3406b96639f8c8ed7e7bfcd7f6676404502f027cad942e65dad12878d8ab7972",
-  "fixture": "Focused public fixtures validate distinct collision and recovery records on the next EG-EVIDENCE pass; inject pre-existing recovery and post-recovery primary collisions; inject report file, staging-directory, and final-parent synchronization failures; retain primary write, flush, reconciliation, staged-write, occupied-report, and collision-exhaustion cases; delete all external controlled steps while independently recomputing valid command and report digests; and retain a failed external gate after its first canonical controlled step.",
+  "fixture": "Focused public fixtures validate distinct collision and recovery records on the next EG-EVIDENCE pass; inject pre-existing recovery and post-recovery primary collisions; inject report file, staging-directory, and final-parent synchronization failures; retain primary write, flush, reconciliation, staged-write, occupied-report, and collision-exhaustion cases; delete all external controlled steps while independently recomputing valid command and report digests; retain a failed external gate after its first canonical controlled step; and retain a failed internal gate with its canonical zero-step sequence.",
   "commands": [
     "cargo test --locked --package xtask --test foundational_scope_activation quality_validates_a_retained_ -- --nocapture",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_ -- --nocapture",
@@ -20,12 +20,13 @@
     "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_collision_exhaustion_without_changing_any_occupied_bytes -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_external_gate_with_all_controlled_steps_deleted -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation quality_accepts_a_failed_registered_internal_gate_with_zero_controlled_steps -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_accepts_a_registered_internal_gate_with_zero_controlled_steps -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_coordinated_invocation_and_stored_digest_tampering -- --exact",
     "cargo test --locked --package xtask --bin xtask quality::tests::dependency_runner_matches_each_registered_controlled_step_in_order -- --exact",
     "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact"
   ],
   "verdict": "passed-focused-local-diagnostic",
-  "result": "All 23 focused tests passed at the bound behavior revision. Collision and recovery records use distinct typed invocation modes and validate on the next EG-EVIDENCE pass. Recovery is durable before primary reservation; reports are file- and directory-synchronized through publication before primary evidence is committed; failure preserves or restores recovery. Registry-derived validation requires the full canonical selected-runner sequence for a pass, the non-empty canonical prefix for a failure, and an empty sequence only for canonically zero-step internal gates.",
+  "result": "All 24 focused tests passed at the bound behavior revision. Collision and recovery records use distinct typed invocation modes and validate on the next EG-EVIDENCE pass. Recovery is durable before primary reservation; reports are file- and directory-synchronized through publication before primary evidence is committed; failure preserves or restores recovery. Registry-derived validation requires the full canonical selected-runner sequence for a pass, the non-empty canonical prefix for a failure, and an empty sequence only for canonically zero-step internal gates, whether those internal gates pass or fail.",
   "qualification_claim": "none"
 }
