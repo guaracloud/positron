@@ -2467,6 +2467,7 @@ struct ParsedGateRecord {
 struct ParsedEvidenceRecord {
     attempt_id: String,
     collision_of: ParsedIdentityBinding,
+    collision_slots: ParsedIdentityBinding,
     profile: Profile,
     registry_digest: String,
     environment_digest: String,
@@ -2491,6 +2492,36 @@ enum RetainedDocumentKind {
     RawReport,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExceptionalAttemptMode {
+    Collision,
+    Recovery,
+}
+
+fn retained_exceptional_mode(
+    collision_of: &ParsedIdentityBinding,
+    collision_slots: &ParsedIdentityBinding,
+    path: &Path,
+) -> Result<Option<ExceptionalAttemptMode>, XtaskError> {
+    match (
+        collision_of.applicability.as_str(),
+        collision_slots.applicability.as_str(),
+        collision_slots.value.as_str(),
+    ) {
+        ("not-applicable", "not-applicable", "-") => Ok(None),
+        ("exact", "exact", "recovery") => Ok(Some(ExceptionalAttemptMode::Recovery)),
+        ("exact", "exact", value)
+            if value.starts_with("collision-") || value == COLLISION_OCCUPIED_SET =>
+        {
+            Ok(Some(ExceptionalAttemptMode::Collision))
+        },
+        _ => invalid_json(
+            path,
+            "retained collision identity does not name a canonical attempt mode",
+        ),
+    }
+}
+
 impl RetainedDocumentKind {
     fn maximum_bytes(self) -> usize {
         match self {
@@ -2507,7 +2538,8 @@ fn validate_registered_gate_bindings(
 ) -> Result<(), XtaskError> {
     let registry_available = evidence.registry_digest != "invalid-registry"
         && evidence.registry_digest != "unavailable-registry-digest";
-    let recovery_or_collision = evidence.collision_of.applicability == "exact";
+    let exceptional_mode =
+        retained_exceptional_mode(&evidence.collision_of, &evidence.collision_slots, path)?;
     let activated_risk_gates = registry.activated_risk_gates();
     let expected_environment_digest = sha256_digest(evidence.environment_digest.as_bytes());
 
@@ -2530,16 +2562,8 @@ fn validate_registered_gate_bindings(
             continue;
         }
 
-        let expected_arguments = if recovery_or_collision {
-            vec![
-                "quality".to_owned(),
-                if retained.gate_id == "EG-00" {
-                    "--collision-retention".to_owned()
-                } else {
-                    "--blocked-by-collision".to_owned()
-                },
-                retained.gate_id.clone(),
-            ]
+        let expected_arguments = if let Some(mode) = exceptional_mode {
+            special_gate_arguments(mode, retained.gate_id.as_str())
         } else {
             vec![
                 "quality".to_owned(),
@@ -2551,7 +2575,7 @@ fn validate_registered_gate_bindings(
                 registered.runner.clone(),
             ]
         };
-        let expected_result = if recovery_or_collision {
+        let expected_result = if exceptional_mode.is_some() {
             if retained.gate_id == "EG-00" {
                 "failed"
             } else {
@@ -2596,13 +2620,28 @@ fn validate_registered_gate_bindings(
         validate_registered_controlled_steps(
             registered,
             evidence.profile,
-            recovery_or_collision || retained.result == "not-selected",
+            exceptional_mode.is_some() || retained.result == "not-selected",
             &retained.typed_invocation.controlled_steps,
             registry,
             path,
         )?;
     }
     Ok(())
+}
+
+fn special_gate_arguments(mode: ExceptionalAttemptMode, gate_id: &str) -> Vec<String> {
+    let aggregator = gate_id == "EG-00";
+    let mode_argument = match (mode, aggregator) {
+        (ExceptionalAttemptMode::Collision, true) => "--collision-retention",
+        (ExceptionalAttemptMode::Collision, false) => "--blocked-by-collision",
+        (ExceptionalAttemptMode::Recovery, true) => "--report-retention-failure",
+        (ExceptionalAttemptMode::Recovery, false) => "--blocked-by-eg-00",
+    };
+    vec![
+        "quality".to_owned(),
+        mode_argument.to_owned(),
+        gate_id.to_owned(),
+    ]
 }
 
 fn validate_pre_registry_gate_binding(
@@ -2673,6 +2712,17 @@ fn validate_registered_controlled_steps(
             ),
         );
     }
+    let expected_step_count = canonical_controlled_step_count(gate, profile, registry);
+    if steps.len() != expected_step_count {
+        return invalid_json(
+            path,
+            format!(
+                "retained gate `{}` does not contain its exact canonical controlled steps: expected {expected_step_count}, found {}",
+                gate.id,
+                steps.len()
+            ),
+        );
+    }
     let maximum_timeout_ms = u128::from(gate.timeout_seconds)
         .checked_mul(1_000)
         .ok_or_else(|| {
@@ -2713,9 +2763,50 @@ fn validate_registered_controlled_steps(
     Ok(())
 }
 
+fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Registry) -> usize {
+    match gate.runner.as_str() {
+        "registry" => registry
+            .tools
+            .iter()
+            .filter(|tool| {
+                tool_required(tool.required_profiles.iter().map(String::as_str), profile)
+            })
+            .count(),
+        "architecture" => registry.scopes.len(),
+        "build" => {
+            if matches!(profile, Profile::Ext | Profile::Qual) {
+                5
+            } else {
+                1
+            }
+        },
+        "coverage" => {
+            1 + usize::from(registry.has_m0_02_domain_types_scope())
+                + (2 * usize::from(registry.has_m0_01_foundational_scope()))
+                + usize::from(registry.has_m0_03_canonical_api_scope())
+                + usize::from(registry.has_m0_04_configuration_scope())
+        },
+        "dynamic-analysis" => 2,
+        "dependencies" => 3,
+        "documentation" | "rust" | "test" => 2,
+        "safety" => usize::from(registry.has_m0_04_configuration_scope()),
+        "security" => 1,
+        "secrets" | "supply" => {
+            if matches!(profile, Profile::Ext | Profile::Qual) {
+                2
+            } else {
+                1
+            }
+        },
+        "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
+        | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => 0,
+        _ => 0,
+    }
+}
+
 fn registered_runner_command_matches(
     runner: &str,
-    _profile: Profile,
+    profile: Profile,
     index: usize,
     program: &str,
     arguments: &[String],
@@ -2723,20 +2814,32 @@ fn registered_runner_command_matches(
 ) -> bool {
     let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     match runner {
-        "registry" => registry.tools.iter().any(|tool| {
-            tool.command == program
-                && tool
-                    .version_arguments
-                    .iter()
-                    .map(String::as_str)
-                    .eq(args.iter().copied())
-        }),
+        "registry" => registry
+            .tools
+            .iter()
+            .filter(|tool| {
+                tool_required(tool.required_profiles.iter().map(String::as_str), profile)
+            })
+            .nth(index)
+            .is_some_and(|tool| {
+                tool.command == program
+                    && tool
+                        .version_arguments
+                        .iter()
+                        .map(String::as_str)
+                        .eq(args.iter().copied())
+            }),
         "architecture" => {
             program == "cargo"
                 && args.len() == 12
                 && args.first() == Some(&"tree")
                 && args.get(1) == Some(&"--locked")
                 && args.get(2) == Some(&"--package")
+                && args.get(3).copied()
+                    == registry
+                        .scopes
+                        .get(index)
+                        .map(|scope| scope.package.as_str())
                 && args.get(4..)
                     == Some(
                         [
@@ -2752,30 +2855,59 @@ fn registered_runner_command_matches(
                         .as_slice(),
                     )
         },
-        "build" => {
-            program == "cargo"
-                && args
-                    == [
-                        "check",
-                        "--locked",
-                        "--workspace",
-                        "--all-targets",
-                        "--all-features",
-                    ]
+        "build" => match index {
+            0 => {
+                program == "cargo"
+                    && args
+                        == [
+                            "check",
+                            "--locked",
+                            "--workspace",
+                            "--all-targets",
+                            "--all-features",
+                        ]
+            },
+            1..=4 if matches!(profile, Profile::Ext | Profile::Qual) => {
+                let targets = [
+                    "aarch64-apple-darwin",
+                    "aarch64-unknown-linux-gnu",
+                    "x86_64-apple-darwin",
+                    "x86_64-unknown-linux-gnu",
+                ];
+                program == "cargo"
+                    && index
+                        .checked_sub(1)
+                        .and_then(|target_index| targets.get(target_index))
+                        .is_some_and(|target| {
+                            args == [
+                                "check",
+                                "--locked",
+                                "--workspace",
+                                "--all-targets",
+                                "--all-features",
+                                "--target",
+                                *target,
+                            ]
+                        })
+            },
+            _ => false,
         },
         "dependencies" => registered_dependency_command_matches(index, program, &args),
-        "documentation" => {
-            (program == "cargo"
-                && args
-                    == [
-                        "doc",
-                        "--locked",
-                        "--workspace",
-                        "--all-features",
-                        "--no-deps",
-                        "--document-private-items",
-                    ])
-                || (program == "gitleaks"
+        "documentation" => match index {
+            0 => {
+                program == "cargo"
+                    && args
+                        == [
+                            "doc",
+                            "--locked",
+                            "--workspace",
+                            "--all-features",
+                            "--no-deps",
+                            "--document-private-items",
+                        ]
+            },
+            1 => {
+                program == "gitleaks"
                     && args.starts_with(&[
                         "dir",
                         "--no-banner",
@@ -2783,12 +2915,15 @@ fn registered_runner_command_matches(
                         "--redact=100",
                         "--max-target-megabytes=20",
                     ])
-                    && args.len() == 6)
+                    && args.len() == 6
+            },
+            _ => false,
         },
-        "rust" => {
-            program == "cargo"
-                && (args == ["fmt", "--all", "--", "--check"]
-                    || args
+        "rust" => match index {
+            0 => program == "cargo" && args == ["fmt", "--all", "--", "--check"],
+            1 => {
+                program == "cargo"
+                    && args
                         == [
                             "clippy",
                             "--locked",
@@ -2798,10 +2933,13 @@ fn registered_runner_command_matches(
                             "--",
                             "-D",
                             "warnings",
-                        ])
+                        ]
+            },
+            _ => false,
         },
         "safety" | "security" => {
-            program == "cargo"
+            index == 0
+                && program == "cargo"
                 && args
                     == [
                         "test",
@@ -2813,36 +2951,79 @@ fn registered_runner_command_matches(
                         "preflight_",
                     ]
         },
-        "secrets" => {
-            program == "gitleaks"
-                && matches!(args.first(), Some(&"dir" | &"git"))
-                && args.contains(&"--redact=100")
+        "secrets" => match index {
+            0 => {
+                program == "gitleaks"
+                    && args
+                        == [
+                            "dir",
+                            "--no-banner",
+                            "--no-color",
+                            "--redact=100",
+                            "--max-target-megabytes=20",
+                            ".",
+                        ]
+            },
+            1 if matches!(profile, Profile::Ext | Profile::Qual) => {
+                program == "gitleaks"
+                    && args
+                        == [
+                            "git",
+                            "--no-banner",
+                            "--no-color",
+                            "--redact=100",
+                            "--log-opts=--all",
+                            ".",
+                        ]
+            },
+            _ => false,
         },
-        "supply" => {
-            program == "cargo"
-                && (args == ["audit", "--deny", "warnings"] || args == ["vet", "--locked"])
+        "supply" => match index {
+            0 => program == "cargo" && args == ["audit", "--deny", "warnings"],
+            1 if matches!(profile, Profile::Ext | Profile::Qual) => {
+                program == "cargo" && args == ["vet", "--locked"]
+            },
+            _ => false,
         },
-        "test" => {
-            program == "cargo"
-                && (args
-                    == [
-                        "nextest",
-                        "run",
-                        "--locked",
-                        "--workspace",
-                        "--all-targets",
-                        "--all-features",
-                        "--profile",
-                        "ci",
-                    ]
-                    || args == ["test", "--locked", "--workspace", "--doc", "--all-features"])
+        "test" => match index {
+            0 => {
+                program == "cargo"
+                    && args
+                        == [
+                            "nextest",
+                            "run",
+                            "--locked",
+                            "--workspace",
+                            "--all-targets",
+                            "--all-features",
+                            "--profile",
+                            "ci",
+                        ]
+            },
+            1 => {
+                program == "cargo"
+                    && args == ["test", "--locked", "--workspace", "--doc", "--all-features"]
+            },
+            _ => false,
         },
-        "dynamic-analysis" => {
-            program == "cargo"
-                && matches!(
-                    args.first(),
-                    Some(&"test" | &"mutants" | &"+nightly-2026-07-20")
-                )
+        "dynamic-analysis" => match index {
+            0 => {
+                program == "cargo"
+                    && args
+                        == [
+                            "test",
+                            "--locked",
+                            "--package",
+                            "positron-domain",
+                            "--test",
+                            "foundational_domain_types",
+                        ]
+            },
+            1 => {
+                program == "cargo"
+                    && args == ["test", "--locked", "--package", "positron-domain", "--doc"]
+            },
+            _ => false,
         },
         "coverage" => {
             program == "cargo"
@@ -3198,7 +3379,8 @@ fn parse_evidence_record(path: &Path, content: &str) -> Result<ParsedEvidenceRec
     )?;
     let collision_of =
         parse_identity_binding(take_value(&mut object, "collision_of", path)?, path)?;
-    validate_identity_binding(take_value(&mut object, "collision_slots", path)?, path)?;
+    let collision_slots =
+        parse_identity_binding(take_value(&mut object, "collision_slots", path)?, path)?;
     let profile = require_string(&mut object, "profile", path)?;
     let profile = Profile::parse(&profile)
         .map_err(|_| XtaskError::invalid_path(path, "profile has an invalid value"))?;
@@ -3260,6 +3442,7 @@ fn parse_evidence_record(path: &Path, content: &str) -> Result<ParsedEvidenceRec
     Ok(ParsedEvidenceRecord {
         attempt_id,
         collision_of,
+        collision_slots,
         profile,
         registry_digest,
         environment_digest,
@@ -5635,6 +5818,7 @@ struct AttemptReservation {
     path: PathBuf,
     file: fs::File,
     recovery_path: PathBuf,
+    recovery_bytes: String,
     report_staging_path: PathBuf,
     report_final_path: PathBuf,
     reports_published: bool,
@@ -5645,69 +5829,41 @@ struct AttemptReservation {
 impl AttemptReservation {
     fn reserve(root: &Path, directory: &Path, attempted: &Evidence) -> Result<Self, XtaskError> {
         let canonical = directory.join(format!("{}.json", attempted.attempt_id));
-        match reserve_new_file(&canonical) {
-            Ok(file) => {
-                return Self::new(root, canonical, file, attempted.clone(), false);
-            },
-            Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
-            Err(source) => {
-                return Err(XtaskError::io(
-                    format!("reserve engineering evidence {}", canonical.display()),
-                    source,
-                ));
-            },
+        if !path_exists(&canonical)? {
+            return Self::new(root, canonical, attempted.clone(), false);
         }
 
         for slot in 0..COLLISION_SLOT_COUNT {
             let collision_id = format!("{}-collision-{slot:02}", attempted.attempt_id);
             let path = directory.join(format!("{collision_id}.json"));
-            match reserve_new_file(&path) {
-                Ok(file) => {
-                    let evidence = collision_evidence(
-                        attempted,
-                        collision_id,
-                        format!("collision-{slot:02}"),
-                        "engineering evidence attempt collision; original bytes preserved",
-                    )?;
-                    return Self::new(root, path, file, evidence, true);
-                },
-                Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
-                Err(source) => {
-                    return Err(XtaskError::io(
-                        format!("reserve collision evidence {}", path.display()),
-                        source,
-                    ));
-                },
+            if !path_exists(&path)? {
+                let evidence = collision_evidence(
+                    attempted,
+                    collision_id,
+                    format!("collision-{slot:02}"),
+                    "engineering evidence attempt collision; original bytes preserved",
+                )?;
+                return Self::new(root, path, evidence, true);
             }
         }
 
         let exhaustion_id = format!("{}-collision-exhausted", attempted.attempt_id);
         let path = directory.join(format!("{exhaustion_id}.json"));
-        let file = match reserve_new_file(&path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
-                return Err(collision_error(attempted, &path));
-            },
-            Err(source) => {
-                return Err(XtaskError::io(
-                    format!("reserve collision-exhaustion evidence {}", path.display()),
-                    source,
-                ));
-            },
-        };
+        if path_exists(&path)? {
+            return Err(collision_error(attempted, &path));
+        }
         let evidence = collision_evidence(
             attempted,
             exhaustion_id,
             COLLISION_OCCUPIED_SET.to_owned(),
             "all 16 deterministic collision slots were already occupied; every existing byte was preserved",
         )?;
-        Self::new(root, path, file, evidence, true)
+        Self::new(root, path, evidence, true)
     }
 
     fn new(
         root: &Path,
         path: PathBuf,
-        file: fs::File,
         evidence: Evidence,
         collided: bool,
     ) -> Result<Self, XtaskError> {
@@ -5748,17 +5904,28 @@ impl AttemptReservation {
         recovery_file
             .write_all(recovery_bytes.as_bytes())
             .and_then(|()| recovery_file.flush())
-            .and_then(|()| recovery_file.sync_data())
+            .and_then(|()| recovery_file.sync_all())
             .map_err(|source| {
                 XtaskError::io(
                     format!("write recovery evidence {}", recovery_path.display()),
                     source,
                 )
             })?;
+        let evidence_directory = recovery_path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&recovery_path, "recovery evidence path has no parent")
+        })?;
+        sync_directory(evidence_directory)?;
+        let file = reserve_new_file(&path).map_err(|source| {
+            XtaskError::io(
+                format!("reserve primary engineering evidence {}", path.display()),
+                source,
+            )
+        })?;
         Ok(Self {
             path,
             file,
             recovery_path,
+            recovery_bytes,
             report_staging_path: root
                 .join("target/quality/evidence-report-staging")
                 .join(&evidence.attempt_id),
@@ -5782,24 +5949,41 @@ impl AttemptReservation {
     }
 
     fn publish_primary(&mut self, serialized: &str) -> Result<(), XtaskError> {
-        self.stage_and_publish_reports()?;
+        stage_raw_reports(&self.report_staging_path, &self.evidence)?;
+        sync_directory(&self.report_staging_path)?;
+        publish_staged_reports(&self.report_staging_path, &self.report_final_path)?;
         self.reports_published = true;
+        sync_directory(&self.report_final_path)?;
+        let final_parent = self.report_final_path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&self.report_final_path, "report path has no parent")
+        })?;
+        sync_directory(final_parent)?;
         self.file
             .write_all(serialized.as_bytes())
             .and_then(|()| self.file.flush())
-            .and_then(|()| self.file.sync_data())
+            .and_then(|()| self.file.sync_all())
             .map_err(|source| {
                 XtaskError::io(
                     format!("write engineering evidence {}", self.path.display()),
                     source,
                 )
             })?;
-        cleanup_recovery_marker(&self.recovery_path)
-    }
-
-    fn stage_and_publish_reports(&self) -> Result<(), XtaskError> {
-        stage_raw_reports(&self.report_staging_path, &self.evidence)?;
-        publish_staged_reports(&self.report_staging_path, &self.report_final_path)
+        cleanup_recovery_marker(&self.recovery_path)?;
+        let evidence_parent = self.path.parent().ok_or_else(|| {
+            XtaskError::invalid_path(&self.path, "primary evidence path has no parent")
+        })?;
+        if let Err(error) = sync_directory(evidence_parent) {
+            let restoration =
+                restore_recovery_marker(&self.recovery_path, self.recovery_bytes.as_bytes());
+            return match restoration {
+                Ok(()) => Err(error),
+                Err(restoration_error) => Err(XtaskError::invalid(
+                    "engineering evidence recovery restoration",
+                    format!("{error}; recovery restoration also failed: {restoration_error}"),
+                )),
+            };
+        }
+        Ok(())
     }
 
     fn reconcile_failed_publication(&self, error: XtaskError) -> XtaskError {
@@ -5818,6 +6002,11 @@ impl AttemptReservation {
                 cleanup_errors.push(cleanup_error.to_string());
             }
         }
+        if let Err(recovery_error) =
+            ensure_recovery_marker(&self.recovery_path, self.recovery_bytes.as_bytes())
+        {
+            cleanup_errors.push(recovery_error.to_string());
+        }
         if cleanup_errors.is_empty() {
             error
         } else {
@@ -5831,6 +6020,19 @@ impl AttemptReservation {
             )
         }
     }
+}
+
+fn path_exists(path: &Path) -> Result<bool, XtaskError> {
+    path.try_exists()
+        .map_err(|source| XtaskError::io(format!("inspect {}", path.display()), source))
+}
+
+fn sync_directory(path: &Path) -> Result<(), XtaskError> {
+    let directory = fs::File::open(path)
+        .map_err(|source| XtaskError::io(format!("open directory {}", path.display()), source))?;
+    directory
+        .sync_all()
+        .map_err(|source| XtaskError::io(format!("sync directory {}", path.display()), source))
 }
 
 fn reserve_new_file(path: &Path) -> Result<fs::File, std::io::Error> {
@@ -5853,7 +6055,12 @@ fn collision_evidence(
     collision.result = GateStatus::Failed;
     collision.merge_eligible = false;
     collision.ended_unix_ms = unix_time_ms()?;
-    collision.gates = collision_gate_attempts(&collision.attempt_id, &attempted.gates, detail);
+    collision.gates = exceptional_gate_attempts(
+        ExceptionalAttemptMode::Collision,
+        &collision.attempt_id,
+        &attempted.gates,
+        detail,
+    );
     Ok(collision)
 }
 
@@ -5866,7 +6073,12 @@ fn report_retention_failure_evidence(
     failed.merge_eligible = false;
     failed.ended_unix_ms = unix_time_ms()?;
     let detail = bounded_detail(&format!("raw report retention failed closed: {error}"));
-    failed.gates = collision_gate_attempts(&failed.attempt_id, &reserved.gates, &detail);
+    failed.gates = exceptional_gate_attempts(
+        ExceptionalAttemptMode::Recovery,
+        &failed.attempt_id,
+        &reserved.gates,
+        &detail,
+    );
     for gate in &mut failed.gates {
         if gate.gate_id == "EG-00" {
             gate.raw_report =
@@ -5934,6 +6146,8 @@ fn stage_raw_reports(staging_path: &Path, evidence: &Evidence) -> Result<(), Xta
                 )
             })?;
         file.write_all(content.as_bytes())
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
             .map_err(|source| XtaskError::io(format!("write {}", report_path.display()), source))?;
         let retained = fs::read(&report_path)
             .map_err(|source| XtaskError::io(format!("read {}", report_path.display()), source))?;
@@ -6013,7 +6227,37 @@ fn cleanup_recovery_marker(path: &Path) -> Result<(), XtaskError> {
     })
 }
 
-fn collision_gate_attempts(
+fn ensure_recovery_marker(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+    if path_exists(path)? {
+        return Ok(());
+    }
+    restore_recovery_marker(path, bytes)
+}
+
+fn restore_recovery_marker(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+    let mut file = reserve_new_file(path).map_err(|source| {
+        XtaskError::io(
+            format!("restore recovery evidence {}", path.display()),
+            source,
+        )
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(|source| {
+            XtaskError::io(
+                format!("restore recovery evidence {}", path.display()),
+                source,
+            )
+        })?;
+    let parent = path.parent().ok_or_else(|| {
+        XtaskError::invalid_path(path, "recovery evidence path has no parent directory")
+    })?;
+    sync_directory(parent)
+}
+
+fn exceptional_gate_attempts(
+    mode: ExceptionalAttemptMode,
     attempt_id: &str,
     attempts: &[GateAttempt],
     aggregator_detail: &str,
@@ -6028,15 +6272,7 @@ fn collision_gate_attempts(
                 GateStatus::NotSelected
             };
             let mut invocation = attempt.invocation.clone();
-            invocation.arguments = vec![
-                "quality".to_owned(),
-                if is_aggregator {
-                    "--collision-retention".to_owned()
-                } else {
-                    "--blocked-by-eg-00".to_owned()
-                },
-                attempt.gate_id.clone(),
-            ];
+            invocation.arguments = special_gate_arguments(mode, attempt.gate_id.as_str());
             invocation.controlled_steps.clear();
             build_gate_attempt(
                 attempt_id,
@@ -6052,8 +6288,15 @@ fn collision_gate_attempts(
                     detail: if is_aggregator {
                         aggregator_detail.to_owned()
                     } else {
-                        "EG-00 failed closed during collision retention; gate was not selected"
-                            .to_owned()
+                        match mode {
+                            ExceptionalAttemptMode::Collision => {
+                                "EG-00 failed closed during collision retention; gate was not selected"
+                            }
+                            ExceptionalAttemptMode::Recovery => {
+                                "EG-00 failed closed during publication recovery; gate was not selected"
+                            }
+                        }
+                        .to_owned()
                     },
                     controlled_steps: Vec::new(),
                 },

@@ -579,6 +579,39 @@ fn quality_rejects_an_overwritten_engineering_evidence_attempt() -> TestResult {
 }
 
 #[test]
+fn quality_validates_a_retained_collision_on_the_next_evidence_pass() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        let first = fixture.quality_output_from_fixture_source("pre-commit")?;
+        if !first.status.success() {
+            return Err(std::io::Error::other(format!(
+                "fixture could not publish the canonical evidence record: {}\n{}",
+                String::from_utf8_lossy(&first.stdout),
+                String::from_utf8_lossy(&first.stderr)
+            ))
+            .into());
+        }
+        let collision = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&collision, "engineering evidence attempt collision")?;
+
+        let next = fixture.quality_output_for("pr")?;
+        if !next.status.success() {
+            return Err(std::io::Error::other(format!(
+                "the next EG-EVIDENCE pass rejected a schema-valid collision record: {}\n{}",
+                String::from_utf8_lossy(&next.stdout),
+                String::from_utf8_lossy(&next.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_retains_collision_exhaustion_without_changing_any_occupied_bytes() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -989,6 +1022,118 @@ fn quality_rejects_coordinated_invocation_and_stored_digest_tampering() -> TestR
 }
 
 #[test]
+fn quality_rejects_an_external_gate_with_all_controlled_steps_deleted() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        let mut evidence = fs::read_to_string(&evidence_path)?;
+        let report_path = exact_raw_report_path(&fixture.root, &evidence, "EG-RUST")?;
+        let mut report = fs::read_to_string(&report_path)?;
+        let original_gate = gate_record(&evidence, "EG-RUST")?;
+        let original_report_digest =
+            extract_json_string_after(original_gate, "\"sha256\": \"")?.to_owned();
+        let original_command_digest =
+            extract_json_string_after(original_gate, "\"command_digest\": \"")?.to_owned();
+
+        evidence = empty_json_arrays_after(
+            evidence,
+            "\"gate_id\": \"EG-RUST\"",
+            "\"controlled_steps\"",
+            1,
+        )?;
+        report = empty_json_arrays_after(
+            report,
+            "\"gate_id\": \"EG-RUST\"",
+            "\"controlled_steps\"",
+            2,
+        )?;
+        let tampered_gate = gate_record(&evidence, "EG-RUST")?;
+        let (_, invocation_tail) = tampered_gate
+            .split_once("\"invocation\": ")
+            .ok_or_else(|| std::io::Error::other("tampered gate omitted invocation"))?;
+        let (canonical_invocation, _) = invocation_tail
+            .split_once(",\n      \"command_digest\"")
+            .ok_or_else(|| {
+            std::io::Error::other("tampered gate invocation has no command digest boundary")
+        })?;
+        let mut command_hasher = Sha256::new();
+        command_hasher.update(b"positron-quality-command-v2\0");
+        command_hasher.update(canonical_invocation.as_bytes());
+        let forged_command_digest = format!("sha256:{:x}", command_hasher.finalize());
+        evidence = replace_once_in_string(
+            evidence,
+            &format!("\"command_digest\": \"{original_command_digest}\""),
+            &format!("\"command_digest\": \"{forged_command_digest}\""),
+            "evidence command digest",
+        )?;
+        report = replace_once_in_string(
+            report,
+            &format!("\"invocation_digest\": \"{original_command_digest}\""),
+            &format!("\"invocation_digest\": \"{forged_command_digest}\""),
+            "raw report invocation digest",
+        )?;
+        let forged_report_bytes = report.len();
+        let forged_report_digest = format!("sha256:{:x}", Sha256::digest(report.as_bytes()));
+        evidence = replace_once_in_string(
+            evidence,
+            &format!("\"sha256\": \"{original_report_digest}\""),
+            &format!("\"sha256\": \"{forged_report_digest}\""),
+            "evidence raw report digest",
+        )?;
+        let current_gate = gate_record(&evidence, "EG-RUST")?.to_owned();
+        let original_report_bytes =
+            extract_unsigned_after(&current_gate, "\"bytes\": ")?.to_string();
+        evidence = replace_once_in_string(
+            evidence,
+            &format!("\"bytes\": {original_report_bytes}"),
+            &format!("\"bytes\": {forged_report_bytes}"),
+            "evidence raw report byte length",
+        )?;
+        fs::write(&report_path, report)?;
+        fs::write(&evidence_path, evidence)?;
+
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "does not contain its exact canonical controlled steps",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence = fixture.latest_evidence()?;
+        let policy = gate_record(&evidence, "EG-POLICY")?;
+        if !policy.contains("\"controlled_steps\":[]") {
+            return Err(std::io::Error::other(
+                "registered internal policy gate did not retain its canonical zero-step sequence",
+            )
+            .into());
+        }
+        let next = fixture.quality_output_for("pr")?;
+        if !next.status.success() {
+            return Err(std::io::Error::other(format!(
+                "EG-EVIDENCE rejected a legitimate internal zero-step gate: {}\n{}",
+                String::from_utf8_lossy(&next.stdout),
+                String::from_utf8_lossy(&next.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_malformed_retained_engineering_evidence_json() -> TestResult {
     assert_invalid_retained_engineering_evidence(
         |evidence_path, evidence| {
@@ -1208,6 +1353,131 @@ fn quality_retains_recovery_evidence_when_the_primary_evidence_flush_fails() -> 
 #[test]
 fn quality_retains_recovery_evidence_when_recovery_reconciliation_fails() -> TestResult {
     assert_primary_evidence_publication_failure(inject_recovery_cleanup_failure)
+}
+
+#[test]
+fn quality_validates_a_retained_recovery_on_the_next_evidence_pass() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject_primary_evidence_write_failure(&fixture.root)?;
+        let failed = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&failed, "injected primary evidence publication failure")?;
+        assert_schema_valid_recovery(&fixture.root, "1700000000000-111111111111-1")?;
+
+        let next = fixture.quality_output_for("pr")?;
+        if !next.status.success() {
+            return Err(std::io::Error::other(format!(
+                "the next EG-EVIDENCE pass rejected a schema-valid recovery record: {}\n{}",
+                String::from_utf8_lossy(&next.stdout),
+                String::from_utf8_lossy(&next.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_does_not_touch_primary_evidence_when_recovery_is_preexisting() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject_primary_evidence_write_failure(&fixture.root)?;
+        let first = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&first, "injected primary evidence publication failure")?;
+
+        let attempt_id = "1700000000000-111111111111-1";
+        let evidence_directory = fixture.root.join("target/quality/evidence");
+        let primary = evidence_directory.join(format!("{attempt_id}.json"));
+        let recovery = evidence_directory.join(format!("{attempt_id}-recovery.json"));
+        let recovery_bytes = fs::read(&recovery)?;
+        if primary.exists() {
+            return Err(std::io::Error::other(
+                "first failed publication left its incomplete primary evidence",
+            )
+            .into());
+        }
+
+        let second = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&second, "reserve recovery evidence")?;
+        if primary.exists() {
+            return Err(std::io::Error::other(
+                "pre-existing recovery reservation allowed the primary path to be touched",
+            )
+            .into());
+        }
+        if fs::read(&recovery)? != recovery_bytes {
+            return Err(std::io::Error::other(
+                "repeated recovery reservation changed the pre-existing recovery bytes",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_preserves_recovery_when_primary_reservation_collides_afterward() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject_primary_reservation_collision(&fixture.root)?;
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "reserve primary engineering evidence")?;
+
+        let attempt_id = "1700000000000-111111111111-1";
+        let primary = fixture
+            .root
+            .join("target/quality/evidence")
+            .join(format!("{attempt_id}.json"));
+        let occupied = b"{\"injected\":\"primary-reservation-collision\"}\n";
+        if fs::read(&primary)? != occupied {
+            return Err(std::io::Error::other(
+                "primary reservation collision changed the occupied primary bytes",
+            )
+            .into());
+        }
+        assert_schema_valid_recovery(&fixture.root, attempt_id)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_retains_recovery_when_a_staged_report_file_sync_fails() -> TestResult {
+    assert_report_durability_failure(inject_staged_report_file_sync_failure)
+}
+
+#[test]
+fn quality_retains_recovery_when_the_staging_directory_sync_fails() -> TestResult {
+    assert_report_durability_failure(inject_staging_directory_sync_failure)
+}
+
+#[test]
+fn quality_retains_recovery_when_the_final_report_parent_sync_fails() -> TestResult {
+    assert_report_durability_failure(inject_final_report_parent_sync_failure)
+}
+
+fn assert_report_durability_failure(inject: impl FnOnce(&Path) -> TestResult) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        inject(&fixture.root)?;
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "injected report durability failure")?;
+        assert_recovered_failed_attempt(&fixture.root, "1700000000000-111111111111-1")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
 }
 
 fn assert_primary_evidence_publication_failure(
@@ -3099,6 +3369,38 @@ fn inject_recovery_cleanup_failure(root: &Path) -> TestResult {
     )
 }
 
+fn inject_primary_reservation_collision(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "        let file = reserve_new_file(&path).map_err(|source| {\n",
+        "        fs::write(&path, b\"{\\\"injected\\\":\\\"primary-reservation-collision\\\"}\\n\")\n            .map_err(|source| XtaskError::io(\n                format!(\"inject primary reservation collision {}\", path.display()),\n                source,\n            ))?;\n        let file = reserve_new_file(&path).map_err(|source| {\n",
+    )
+}
+
+fn inject_staged_report_file_sync_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "        file.write_all(content.as_bytes())\n            .and_then(|()| file.flush())\n            .and_then(|()| file.sync_all())\n",
+        "        file.write_all(content.as_bytes())\n            .and_then(|()| file.flush())\n            .and_then(|()| Err(std::io::Error::other(\n                \"injected report durability failure: staged report file sync failed\",\n            )))\n",
+    )
+}
+
+fn inject_staging_directory_sync_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n",
+        "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n    if path.parent().and_then(Path::file_name).and_then(OsStr::to_str)\n        == Some(\"evidence-report-staging\")\n    {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"staging directory sync failed\",\n        ));\n    }\n",
+    )
+}
+
+fn inject_final_report_parent_sync_failure(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/quality.rs"),
+        "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n",
+        "fn sync_directory(path: &Path) -> Result<(), XtaskError> {\n    if path.file_name().and_then(OsStr::to_str) == Some(\"evidence-reports\") {\n        return Err(XtaskError::invalid(\n            \"injected report durability failure\",\n            \"final report parent sync failed\",\n        ));\n    }\n",
+    )
+}
+
 fn remove_one_m0_01b_owner_coverage_target(root: &Path) -> TestResult {
     let path = root.join("tools/xtask/src/quality.rs");
     replace_once(
@@ -3184,6 +3486,85 @@ fn extract_json_string_after<'content>(
         .ok_or_else(|| {
             std::io::Error::other(format!("fixture value after `{marker}` is malformed")).into()
         })
+}
+
+fn extract_unsigned_after<'content>(
+    content: &'content str,
+    marker: &str,
+) -> TestResult<&'content str> {
+    let (_, suffix) = content
+        .split_once(marker)
+        .ok_or_else(|| std::io::Error::other(format!("fixture omitted marker `{marker}`")))?;
+    let length = suffix.bytes().take_while(u8::is_ascii_digit).count();
+    suffix
+        .get(..length)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::other(format!("fixture value after `{marker}` is malformed")).into()
+        })
+}
+
+fn empty_json_arrays_after(
+    mut content: String,
+    start_marker: &str,
+    field: &str,
+    count: usize,
+) -> TestResult<String> {
+    let mut search_from = content
+        .find(start_marker)
+        .map(|index| index + start_marker.len())
+        .ok_or_else(|| std::io::Error::other(format!("fixture omitted `{start_marker}`")))?;
+    for _ in 0..count {
+        let field_start = content
+            .get(search_from..)
+            .and_then(|suffix| suffix.find(field))
+            .map(|index| search_from + index)
+            .ok_or_else(|| std::io::Error::other(format!("fixture omitted `{field}`")))?;
+        let array_start = content
+            .get(field_start + field.len()..)
+            .and_then(|suffix| suffix.find('['))
+            .map(|index| field_start + field.len() + index)
+            .ok_or_else(|| std::io::Error::other(format!("fixture `{field}` is not an array")))?;
+        let mut depth = 0_usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut array_end = None;
+        let array_bytes = content
+            .as_bytes()
+            .get(array_start..)
+            .ok_or_else(|| std::io::Error::other(format!("fixture `{field}` array is invalid")))?;
+        for (offset, byte) in array_bytes.iter().copied().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        std::io::Error::other(format!("fixture `{field}` array is unbalanced"))
+                    })?;
+                    if depth == 0 {
+                        array_end = Some(array_start + offset);
+                        break;
+                    }
+                },
+                _ => {},
+            }
+        }
+        let array_end = array_end
+            .ok_or_else(|| std::io::Error::other(format!("fixture `{field}` array is unclosed")))?;
+        content.replace_range(array_start..=array_end, "[]");
+        search_from = array_start + 2;
+    }
+    Ok(content)
 }
 
 fn replace_all(path: &Path, before: &str, after: &str) -> TestResult {
