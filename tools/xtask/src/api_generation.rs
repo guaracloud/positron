@@ -1376,11 +1376,14 @@ fn decode_varint(
     Err(ApiError::malformed(source))
 }}
 
+fn trim_json_whitespace(value: &str) -> &str {{
+    value.trim_matches(&[' ', '\t', '\r', '\n'][..])
+}}
+
 fn decode_http(body: &[u8]) -> Result<{request}, ApiError> {{
     let source = ApiFailureSource::{source_http};
-    let text = core::str::from_utf8(body)
-        .map_err(|_| ApiError::malformed(source))?
-        .trim();
+    let text =
+        trim_json_whitespace(core::str::from_utf8(body).map_err(|_| ApiError::malformed(source))?);
     let Some(object) = text
         .strip_prefix('{{')
         .and_then(|value| value.strip_suffix('}}'))
@@ -1393,7 +1396,8 @@ fn decode_http(body: &[u8]) -> Result<{request}, ApiError> {{
         let Some((key, value)) = member.split_once(':') else {{
             return Err(ApiError::malformed(source));
         }};
-        match key.trim() {{
+        let key = trim_json_whitespace(key);
+        match key {{
             "\"{api_major_name}\"" if api_major.is_none() => {{
                 api_major = Some(parse_json_u32(value, source)?);
             }},
@@ -1406,7 +1410,10 @@ fn decode_http(body: &[u8]) -> Result<{request}, ApiError> {{
             "\"{api_major_name}\"" | "\"{capability_name}\"" => {{
                 return Err(ApiError::malformed(source));
             }},
-            _ => return Err(ApiError::unknown_field(source)),
+            _ if key.starts_with('"') && key.ends_with('"') => {{
+                return Err(ApiError::unknown_field(source));
+            }},
+            _ => return Err(ApiError::malformed(source)),
         }}
     }}
     let Some(api_major) = api_major else {{
@@ -1422,7 +1429,7 @@ fn decode_http(body: &[u8]) -> Result<{request}, ApiError> {{
 }}
 
 fn parse_json_u32(value: &str, source: ApiFailureSource) -> Result<u32, ApiError> {{
-    let value = value.trim_matches(&[' ', '\t', '\r', '\n'][..]);
+    let value = trim_json_whitespace(value);
     let bytes = value.as_bytes();
     let canonical = match bytes {{
         [b'0'] => true,

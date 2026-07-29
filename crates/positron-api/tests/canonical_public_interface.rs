@@ -452,6 +452,37 @@ fn http_u32_values_require_canonical_integer_grammar() {
 }
 
 #[test]
+fn http_json_rejects_non_rfc_whitespace_outside_strings() {
+    for bytes in [
+        "\u{00a0}{\"api_major\":1}".as_bytes(),
+        "{\"api_major\":1}\u{2003}".as_bytes(),
+        "{\u{00a0}\"api_major\":1}".as_bytes(),
+        "{\"api_major\"\u{2003}:1}".as_bytes(),
+        "{\"api_major\":\u{00a0}1}".as_bytes(),
+        "{\"api_major\":1\u{2003}}".as_bytes(),
+        "{\"api_major\":1,\u{00a0}\"capability\":0}".as_bytes(),
+    ] {
+        let result = CapabilityService::decode_and_negotiate(Transport::HttpJson, bytes);
+        assert_eq!(
+            result.map_err(|error| (
+                error.code(),
+                error.retry_class(),
+                error.completion_state(),
+                error.source(),
+                error.safe_detail(),
+            )),
+            Err((
+                ApiErrorCode::MalformedRequest,
+                RetryClass::AfterInputCorrection,
+                CompletionState::Rejected,
+                ApiFailureSource::HttpDecode,
+                SafeDetail::RequestMalformed,
+            ))
+        );
+    }
+}
+
+#[test]
 fn malformed_oversized_and_unknown_wire_inputs_fail_closed() {
     let oversized = vec![0_u8; MAX_PUBLIC_REQUEST_BYTES + 1];
     let cases = [

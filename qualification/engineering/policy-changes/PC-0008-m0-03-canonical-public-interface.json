@@ -123,7 +123,7 @@
       "status": "failed-local-diagnostic",
       "source_dirty": true,
       "command": "cargo test -p positron-api --test canonical_public_interface http_u32_values_require_canonical_integer_grammar",
-      "result": "The HTTP decoder accepted noncanonical signed, zero-padded, or whitespace-padded u32 text before negotiation."
+      "result": "The HTTP decoder accepted noncanonical signed, zero-padded, or internal-whitespace u32 text before negotiation; RFC JSON whitespace at token boundaries is accepted."
     },
     {
       "id": "mutation-selector-owner-red-final-review-remediation",
@@ -184,7 +184,7 @@
     "the bounded canonical model covers required request, response, PublicError, Capability, supporting-enum, field-number, enum-number, and supported deprecation semantics while rejecting ambiguity and unsupported constructs",
     "the HTTP client publishes and tests an exact one-buffer allocation contract with no intermediate heap body and no completed-body copy",
     "public decoding rejects overflowing terminal u32 varints before shifting or capability negotiation",
-    "HTTP u32 decoding accepts only canonical unsigned decimal grammar and rejects signed, padded, fractional, exponent, and whitespace forms",
+    "HTTP u32 decoding accepts canonical unsigned decimal grammar with RFC JSON boundary whitespace and rejects signed, zero-padded, fractional, exponent, internal-whitespace, and non-RFC-whitespace forms",
     "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail",
     "the public contract proves implemented, unavailable, unsupported, and version-incompatible capability outcomes with safe typed errors and no wire or domain leakage",
     "the canonical artifact scope cannot return to scaffold, accept unknown fields, exceed its 64-byte request bound, or drift from deterministic generation",
