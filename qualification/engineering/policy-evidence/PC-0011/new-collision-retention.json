@@ -3,8 +3,8 @@
   "policy_change": "PC-0011-m0-06-evidence-attempt-integrity",
   "implementation": "new-dirty-remediation",
   "source_revision": "pending-commit-self-reference-boundary",
-  "fixture": "The same canonical attempt path contains the exact arbitrary bytes {\"tampered\":true}\\n before cargo xtask quality tries to retain its verdict.",
+  "fixture": "The same canonical attempt path contains the exact arbitrary bytes {\"tampered\":true}\\n and the bounded extension preoccupies every collision-00 through collision-15 path with the same distinct arbitrary slot bytes.",
   "verdict": "passed-focused-local-diagnostic",
-  "result": "The original bytes remain unchanged. The runner atomically claims the first free slot from 16 deterministic collision paths and retains schema-v2 failed evidence bound to the attempted identity; EG-00 fails and every sibling is not-selected.",
+  "result": "Every original byte remains unchanged. The runner create-news the reserved collision-exhausted schema-v3 failure bound to the canonical attempt and exact occupied-slot set; a repeated invocation preserves that reserved record. Every selected gate also retains an attempt-owned bounded JSON report with exact path, SHA-256, length, content type, verdict, safe stdout/stderr, and a canonical structured invocation digest validated by EG-EVIDENCE.",
   "qualification_claim": "none"
 }

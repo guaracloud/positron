@@ -8,6 +8,7 @@
     "schema_version",
     "attempt_id",
     "collision_of",
+    "collision_slots",
     "profile",
     "result",
     "merge_eligible",
@@ -20,9 +21,10 @@
     "gates"
   ],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "const": 3 },
     "attempt_id": { "type": "string", "minLength": 1, "maxLength": 256 },
     "collision_of": { "$ref": "#/$defs/identityBinding" },
+    "collision_slots": { "$ref": "#/$defs/identityBinding" },
     "profile": { "enum": ["pre-commit", "pr", "ext", "qual"] },
     "result": { "enum": ["passed", "failed"] },
     "merge_eligible": { "type": "boolean" },
@@ -86,7 +88,7 @@
           "result",
           "duration_ms",
           "budget_seconds",
-          "command",
+          "invocation",
           "command_digest",
           "owner",
           "raw_report",
@@ -97,10 +99,10 @@
           "result": { "enum": ["passed", "failed", "not-selected"] },
           "duration_ms": { "type": "integer", "minimum": 0 },
           "budget_seconds": { "type": "integer", "minimum": 1 },
-          "command": { "type": "string", "minLength": 1, "maxLength": 16384 },
+          "invocation": { "$ref": "#/$defs/gateInvocation" },
           "command_digest": { "$ref": "#/$defs/sha256Digest" },
           "owner": { "$ref": "#/$defs/identityBinding" },
-          "raw_report": { "$ref": "#/$defs/identityBinding" },
+          "raw_report": { "$ref": "#/$defs/rawReportBinding" },
           "detail": { "type": "string", "minLength": 1, "maxLength": 16384 }
         }
       }
@@ -114,6 +116,115 @@
     "sha256Digest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "gateInvocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "arguments",
+        "working_directory",
+        "environment_digest",
+        "timeout_seconds",
+        "memory_mib",
+        "activation",
+        "exception_class",
+        "controlled_steps"
+      ],
+      "properties": {
+        "program": { "const": "cargo-xtask-quality/internal" },
+        "arguments": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 16,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "working_directory": { "const": "engineering-workspace" },
+        "environment_digest": { "$ref": "#/$defs/sha256Digest" },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "memory_mib": { "type": "integer", "minimum": 1 },
+        "activation": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "exception_class": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "controlled_steps": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/controlledInvocation" }
+        }
+      }
+    },
+    "controlledInvocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "resolved_program",
+        "arguments",
+        "working_directory",
+        "environment_digest",
+        "timeout_ms",
+        "input_kind",
+        "input_bytes",
+        "input_sha256"
+      ],
+      "properties": {
+        "program": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "resolved_program": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "arguments": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "working_directory": { "const": "engineering-workspace" },
+        "environment_digest": { "$ref": "#/$defs/sha256Digest" },
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "input_kind": { "enum": ["null", "bytes"] },
+        "input_bytes": { "type": "integer", "minimum": 0, "maximum": 8388608 },
+        "input_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "const": "-" }
+          ]
+        }
+      }
+    },
+    "rawReportBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicability",
+        "path",
+        "sha256",
+        "bytes",
+        "content_type",
+        "reason"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "applicability": { "const": "exact" },
+            "path": {
+              "type": "string",
+              "pattern": "^target/quality/evidence-reports/[A-Za-z0-9._-]{1,256}/EG-(00|[A-Z]+)\\.json$"
+            },
+            "sha256": { "$ref": "#/$defs/sha256Digest" },
+            "bytes": { "type": "integer", "minimum": 1, "maximum": 8388608 },
+            "content_type": {
+              "const": "application/vnd.positron.quality-gate-report+json;version=1"
+            },
+            "reason": { "const": "-" }
+          }
+        },
+        {
+          "properties": {
+            "applicability": { "const": "not-applicable" },
+            "path": { "const": "-" },
+            "sha256": { "const": "-" },
+            "bytes": { "const": 0 },
+            "content_type": { "const": "-" },
+            "reason": { "const": "gate-not-selected" }
+          }
+        }
+      ]
     },
     "identityBinding": {
       "type": "object",
@@ -148,7 +259,6 @@
                 "no-approval-claimed",
                 "no-exception-applied",
                 "gate-not-selected",
-                "diagnostic-output-not-retained",
                 "unavailable-before-registry-validation"
               ]
             }

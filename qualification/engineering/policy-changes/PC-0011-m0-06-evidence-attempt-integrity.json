@@ -17,9 +17,11 @@
     "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
     "runner_changes": [
       "A target/quality/evidence attempt path is created exclusively. If it exists, its bytes remain unchanged and the colliding invocation retains a schema-valid failed verdict in the first free slot from 16 deterministic create-new collision paths bound to the attempted identity.",
+      "If all 16 deterministic collision slots are occupied, the invocation retains one reserved create-new collision-exhausted failure bound to the canonical attempt and exact occupied-slot set. An existing reserved record is treated as the already retained exhaustion state and is never overwritten.",
       "Trusted CI rejects a GITHUB_SHA that differs from the controlled git revision before gate selection.",
       "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a missing or retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass.",
-      "Engineering evidence schema version 2 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact command digests."
+      "Engineering evidence schema version 3 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact structured-invocation digests.",
+      "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. The canonical structured invocation binds the internal runner and every controlled child program/tool, ordered arguments, workspace root, environment digest, timeout, memory, activation, exception, and input identity. Streams are bounded at 131072 bytes and a gate report at 8388608 bytes; not-selected gates remain explicit not-applicable."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
@@ -29,9 +31,11 @@
   },
   "detection_gained": [
     "A same-attempt evidence collision cannot replace a retained result.",
+    "A collision whose 16 ordinary retention slots are already occupied cannot disappear without a reserved immutable exhaustion record.",
     "A trusted CI result cannot be accepted for a source revision other than the controlled git revision.",
     "A missing trusted-CI attempt identity or retry cannot turn an earlier failing run into a fresh green attempt.",
-    "Every current runner attempt exposes exact or explicitly non-applicable evidence identities with validated command and registry digests."
+    "Every current runner attempt exposes exact or explicitly non-applicable evidence identities with validated structured invocation and registry digests.",
+    "Missing, tampered, oversized, or command-mismatched selected-gate raw reports fail the public EG-EVIDENCE validator."
   ],
   "detection_lost": [],
   "representative_old_new_evidence": {
@@ -44,23 +48,28 @@
       "status": "passed-focused-local-diagnostic",
       "commands": [
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_overwritten_engineering_evidence_attempt -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_collision_exhaustion_without_changing_any_occupied_bytes -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_publishes_the_complete_exact_identity_evidence_contract -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_missing_retained_raw_report_evidence -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_tampered_retained_raw_report_evidence -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_oversized_retained_raw_report_binding -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_raw_report_command_digest_mismatch -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_incomplete_evidence_identity_schema -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_stale_trusted_ci_source_identity -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retried_trusted_ci_attempt -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_trusted_ci_without_a_run_attempt_identity -- --exact"
       ],
-      "result": "The public runner now preserves arbitrary colliding bytes, retains a distinct schema-v2 failed collision verdict, publishes the complete exact-identity contract on success, rejects incomplete schema, and retains schema-valid failed verdicts for stale, retried, and missing trusted-CI identities. These local results are diagnostic only."
+      "result": "The public runner now preserves arbitrary canonical and slot bytes, retains schema-v3 collision or reserved exhaustion failures, publishes exact selected-gate report and structured-invocation bindings, rejects missing, tampered, oversized, and command-mismatched reports, rejects incomplete schema, and retains schema-valid failed verdicts for stale, retried, and missing trusted-CI identities. These local results are diagnostic only."
     },
     "dual_run_artifacts": {
       "old": "qualification/engineering/policy-evidence/PC-0011/old-collision-overwrite.json",
       "new": "qualification/engineering/policy-evidence/PC-0011/new-collision-retention.json"
     },
-    "dual_run_conclusion": "The same arbitrary-byte collision fixture distinguishes the old missing-failure-record behavior from the new bounded retained-failure behavior. No prior failed attempt is removed, reclassified, or converted into a qualification claim."
+    "dual_run_conclusion": "The same arbitrary-byte collision fixture, extended by occupying all 16 bounded slots, distinguishes the old missing-failure-record behavior from the new ordinary and exhaustion retained-failure behavior. No prior failed attempt is removed, reclassified, or converted into a qualification claim."
   },
   "compatibility_and_recovery": {
-    "compatibility": "The cargo xtask quality command is unchanged. Engineering evidence advances from schema version 1 to version 2; consumers must require the new identity object and per-gate command_digest, owner, and raw_report fields. This diagnostic schema is not product or qualification evidence.",
-    "recovery": "Create a new run with its own fresh attempt identity after correcting the underlying failure. Preserve the canonical collision bytes and every occupied collision slot; do not delete, rename, or overwrite an existing evidence attempt."
+    "compatibility": "The cargo xtask quality command is unchanged. Engineering evidence advances to schema version 3; consumers must require the identity object, structured per-gate invocation and digest, owner, exact selected-gate raw_report binding, and explicit not-selected applicability. This diagnostic schema is not product or qualification evidence.",
+    "recovery": "Create a new run with its own fresh attempt identity after correcting the underlying failure. Preserve the canonical collision bytes, every occupied collision slot, the reserved exhaustion record, and every attempt-owned raw report; do not delete, rename, or overwrite retained evidence."
   },
   "approvals_required": [
     "Architecture",

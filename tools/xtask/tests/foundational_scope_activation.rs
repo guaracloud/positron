@@ -420,6 +420,26 @@ fn quality_records_dirty_local_success_as_non_merge_eligible_evidence() -> TestR
                 .into());
             }
         }
+        let report = exact_raw_report_path(&fixture.root, &evidence, "EG-00")?;
+        let report = fs::read_to_string(report)?;
+        for expected in [
+            "\"schema_version\": 1",
+            "\"content_type\": \"application/vnd.positron.quality-gate-report+json;version=1\"",
+            "\"gate_id\": \"EG-00\"",
+            "\"verdict\": \"passed\"",
+            "\"invocation_digest\": \"sha256:",
+            "\"controlled_steps\": [",
+            "\"verdict\":\"exit-status:",
+            "\"stdout\":",
+            "\"stderr\":",
+        ] {
+            if !report.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "EG-00 raw report omitted exact retained field `{expected}`"
+                ))
+                .into());
+            }
+        }
         Ok(())
     })();
     let cleanup = fixture.remove();
@@ -557,6 +577,81 @@ fn quality_rejects_an_overwritten_engineering_evidence_attempt() -> TestResult {
 }
 
 #[test]
+fn quality_retains_collision_exhaustion_without_changing_any_occupied_bytes() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        pin_fixture_attempt_identity(&fixture.root)?;
+        let evidence_directory = fixture.root.join("target/quality/evidence");
+        fs::create_dir_all(&evidence_directory)?;
+        let canonical = evidence_directory.join("1700000000000-111111111111-1.json");
+        let canonical_bytes = b"{\"canonical\":\"occupied\"}\n";
+        fs::write(&canonical, canonical_bytes)?;
+        let mut occupied = Vec::new();
+        for slot in 0..16 {
+            let path = evidence_directory.join(format!(
+                "1700000000000-111111111111-1-collision-{slot:02}.json"
+            ));
+            let bytes = format!("{{\"slot\":{slot},\"occupied\":true}}\n").into_bytes();
+            fs::write(&path, &bytes)?;
+            occupied.push((path, bytes));
+        }
+
+        let output = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&output, "engineering evidence attempt collision")?;
+        if fs::read(&canonical)? != canonical_bytes {
+            return Err(std::io::Error::other(
+                "collision exhaustion changed the canonical evidence bytes",
+            )
+            .into());
+        }
+        for (path, bytes) in &occupied {
+            if fs::read(path)? != *bytes {
+                return Err(std::io::Error::other(format!(
+                    "collision exhaustion changed occupied slot {}",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+
+        let exhausted =
+            evidence_directory.join("1700000000000-111111111111-1-collision-exhausted.json");
+        let retained = fs::read_to_string(&exhausted)?;
+        assert_complete_evidence_contract(&retained)?;
+        for expected in [
+            "\"result\": \"failed\"",
+            "\"merge_eligible\": false",
+            "\"gate_id\": \"EG-00\"",
+            "\"value\": \"1700000000000-111111111111-1\"",
+            "\"collision_slots\": {",
+            "\"value\": \"collision-00,collision-01,collision-02,collision-03,collision-04,collision-05,collision-06,collision-07,collision-08,collision-09,collision-10,collision-11,collision-12,collision-13,collision-14,collision-15\"",
+            "all 16 deterministic collision slots were already occupied",
+        ] {
+            if !retained.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "collision-exhaustion evidence omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+
+        let exhausted_bytes = fs::read(&exhausted)?;
+        let second = fixture.quality_output_from_fixture_source("pre-commit")?;
+        assert_rejected_output(&second, "engineering evidence attempt collision")?;
+        if fs::read(&exhausted)? != exhausted_bytes {
+            return Err(std::io::Error::other(
+                "a repeated exhausted collision changed the reserved evidence bytes",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_publishes_the_complete_exact_identity_evidence_contract() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -581,6 +676,19 @@ fn quality_publishes_the_complete_exact_identity_evidence_contract() -> TestResu
             "\"command_digest\": \"sha256:",
             "\"owner\": {",
             "\"raw_report\": {",
+            "\"applicability\": \"exact\"",
+            "\"path\": \"target/quality/evidence-reports/",
+            "\"content_type\": \"application/vnd.positron.quality-gate-report+json;version=1\"",
+            "\"invocation\": {",
+            "\"program\":\"cargo-xtask-quality/internal\"",
+            "\"arguments\":[",
+            "\"working_directory\":\"engineering-workspace\"",
+            "\"environment_digest\":\"sha256:",
+            "\"timeout_seconds\":",
+            "\"memory_mib\":",
+            "\"activation\":",
+            "\"exception_class\":",
+            "\"controlled_steps\":[",
         ] {
             if !evidence.contains(expected) {
                 return Err(std::io::Error::other(format!(
@@ -594,6 +702,68 @@ fn quality_publishes_the_complete_exact_identity_evidence_contract() -> TestResu
     let cleanup = fixture.remove();
     cleanup?;
     result
+}
+
+#[test]
+fn quality_rejects_missing_retained_raw_report_evidence() -> TestResult {
+    assert_invalid_retained_raw_report(
+        |fixture, _evidence_path, evidence| {
+            let report = exact_raw_report_path(&fixture.root, evidence, "EG-00")?;
+            fs::remove_file(report)?;
+            Ok(())
+        },
+        "retained raw report is missing",
+    )
+}
+
+#[test]
+fn quality_rejects_tampered_retained_raw_report_evidence() -> TestResult {
+    assert_invalid_retained_raw_report(
+        |fixture, _, evidence| {
+            let report = exact_raw_report_path(&fixture.root, evidence, "EG-00")?;
+            let mut bytes = fs::read(&report)?;
+            let original = b"\"schema_version\": 1";
+            let offset = bytes
+                .windows(original.len())
+                .position(|window| window == original)
+                .ok_or_else(|| {
+                    std::io::Error::other("raw report omitted schema_version fixture")
+                })?;
+            let version = bytes
+                .get_mut(offset + original.len() - 1)
+                .ok_or_else(|| std::io::Error::other("raw report version byte is unavailable"))?;
+            *version = b'2';
+            fs::write(report, bytes)?;
+            Ok(())
+        },
+        "retained raw report digest does not match its evidence binding",
+    )
+}
+
+#[test]
+fn quality_rejects_an_oversized_retained_raw_report_binding() -> TestResult {
+    assert_invalid_retained_raw_report(
+        |_, evidence_path, evidence| {
+            rewrite_gate_field(evidence_path, evidence, "EG-00", "\"bytes\": ", "8388609")
+        },
+        "retained raw report exceeds 8388608 bytes",
+    )
+}
+
+#[test]
+fn quality_rejects_a_raw_report_command_digest_mismatch() -> TestResult {
+    assert_invalid_retained_raw_report(
+        |_, evidence_path, evidence| {
+            rewrite_gate_field(
+                evidence_path,
+                evidence,
+                "EG-00",
+                "\"command_digest\": \"",
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            )
+        },
+        "raw report invocation digest does not match its evidence command digest",
+    )
 }
 
 #[test]
@@ -638,6 +808,8 @@ fn quality_pre_commit_evidence_keeps_every_deferred_gate_explicit() -> TestResul
             "\"profile\": \"pre-commit\"",
             "\"gate_id\": \"EG-COVERAGE\"",
             "\"result\": \"not-selected\"",
+            "\"applicability\": \"not-applicable\"",
+            "\"reason\": \"gate-not-selected\"",
             "Not in the bounded local-feedback profile; the complete PR profile in trusted CI remains authoritative.",
         ] {
             if !evidence.contains(expected) {
@@ -1261,6 +1433,10 @@ impl Fixture {
     }
 
     fn latest_evidence(&self) -> TestResult<String> {
+        Ok(fs::read_to_string(self.latest_evidence_path()?)?)
+    }
+
+    fn latest_evidence_path(&self) -> TestResult<PathBuf> {
         let evidence_directory = self.root.join("target/quality/evidence");
         let mut evidence = fs::read_dir(&evidence_directory)?
             .map(|entry| entry.map(|entry| entry.path()))
@@ -1269,7 +1445,7 @@ impl Fixture {
         let path = evidence.last().ok_or_else(|| {
             std::io::Error::other("quality did not retain an engineering evidence artifact")
         })?;
-        Ok(fs::read_to_string(path)?)
+        Ok(path.clone())
     }
 
     #[cfg(unix)]
@@ -1590,6 +1766,74 @@ fn assert_rejected_output(output: &std::process::Output, expected_failure: &str)
     Ok(())
 }
 
+fn assert_invalid_retained_raw_report(
+    mutate: impl FnOnce(&Fixture, &Path, &str) -> TestResult,
+    expected_failure: &str,
+) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        let evidence = fs::read_to_string(&evidence_path)?;
+        mutate(&fixture, &evidence_path, &evidence)?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, expected_failure)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn exact_raw_report_path(root: &Path, evidence: &str, gate: &str) -> TestResult<PathBuf> {
+    let record = gate_record(evidence, gate)?;
+    let marker = "\"raw_report\": {";
+    let (_, raw_report) = record
+        .split_once(marker)
+        .ok_or_else(|| std::io::Error::other(format!("gate `{gate}` omitted raw_report")))?;
+    let path_marker = "\"path\": \"";
+    let (_, path) = raw_report.split_once(path_marker).ok_or_else(|| {
+        std::io::Error::other(format!("gate `{gate}` raw_report omitted exact path"))
+    })?;
+    let (path, _) = path.split_once('"').ok_or_else(|| {
+        std::io::Error::other(format!("gate `{gate}` raw_report path is malformed"))
+    })?;
+    Ok(root.join(path))
+}
+
+fn rewrite_gate_field(
+    evidence_path: &Path,
+    evidence: &str,
+    gate: &str,
+    marker: &str,
+    replacement: &str,
+) -> TestResult {
+    let record = gate_record(evidence, gate)?;
+    let (_, value_and_suffix) = record.split_once(marker).ok_or_else(|| {
+        std::io::Error::other(format!("gate `{gate}` omitted field marker `{marker}`"))
+    })?;
+    let old_value = if marker.ends_with('"') {
+        value_and_suffix.split_once('"').map(|(value, _)| value)
+    } else {
+        value_and_suffix
+            .find(|character: char| !character.is_ascii_digit())
+            .and_then(|end| value_and_suffix.get(..end))
+    }
+    .ok_or_else(|| std::io::Error::other(format!("gate `{gate}` field is malformed")))?;
+    let old = format!("{marker}{old_value}");
+    let new = format!("{marker}{replacement}");
+    replace_once(evidence_path, &old, &new)
+}
+
+fn gate_record<'evidence>(evidence: &'evidence str, gate: &str) -> TestResult<&'evidence str> {
+    let marker = format!("\"gate_id\": \"{gate}\"");
+    let (_, tail) = evidence
+        .split_once(&marker)
+        .ok_or_else(|| std::io::Error::other(format!("evidence omitted gate `{gate}`")))?;
+    Ok(tail
+        .split_once("\"gate_id\":")
+        .map_or(tail, |(record, _)| record))
+}
+
 fn assert_failed_aggregator_evidence(
     fixture: &Fixture,
     source_revision: &str,
@@ -1602,7 +1846,9 @@ fn assert_failed_aggregator_evidence(
         "\"merge_eligible\": false",
         "\"gate_id\": \"EG-00\"",
         "\"result\": \"failed\"",
-        "\"command_digest\": \"sha256:ab3b0d0ae02a33f3f385a1c33bb993a729aba5f09a604c25bc5d001dc7dde0a2\"",
+        "\"command_digest\": \"sha256:",
+        "\"--aggregator-failure\"",
+        "\"applicability\": \"exact\"",
         source_revision,
         reason,
     ] {
@@ -1618,8 +1864,9 @@ fn assert_failed_aggregator_evidence(
 
 fn assert_complete_evidence_contract(evidence: &str) -> TestResult {
     for required in [
-        "\"schema_version\": 2",
+        "\"schema_version\": 3",
         "\"collision_of\"",
+        "\"collision_slots\"",
         "\"release_manifest\"",
         "\"artifact\"",
         "\"target\"",
