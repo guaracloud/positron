@@ -73,15 +73,17 @@
       "result": "The public runner now preserves arbitrary canonical and slot bytes, retains schema-v3 collision or reserved exhaustion failures, publishes exact selected-gate report and structured-invocation bindings, rejects missing, tampered, oversized, and command-mismatched reports, rejects incomplete schema, and retains schema-valid failed verdicts for stale, retried, and missing trusted-CI identities. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "10bbd12ce9cbd5faa58a2539cd3faf851c7efad9",
-      "source_tree": "b9f5e80af231255299bb0b986ef27b1e696e1dd0",
+      "source_revision": "97cd11a304a0ffb4228c771b77bfcd62fdd859d9",
+      "source_tree": "f636bb2796c86faa7e9b47e6c0cb279d337d1b9d",
       "fixture_sha256": "37931f5c70117541ba24ad3a54a153e884a21edcab05a49a761431ea58127e2d",
       "schema_sha256": "83605fea70fc599a609a3f04bc2ffacb73972facad948363f88c50371d6311f7",
-      "runner_sha256": "f56737ff3b859c55e8dd1e5f219d6b56a19462a592eddc2309e44e14a63474be",
+      "runner_sha256": "29dc954e2097de6e4617f86fd8fe193813b5e8159f3d797f294cb40ba3d00e45",
       "parser_sha256": "84f149f0478df4e7f13f99d674fa367c23196721bcdcade583a899fcbfa7032b",
       "exact_fixture_results": [
         "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
-        "quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied: passed"
+        "quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied: passed",
+        "quality_ext_executes_the_foundational_coverage_harness: passed",
+        "quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suite: passed"
       ]
     },
     "dual_run_artifacts": {
