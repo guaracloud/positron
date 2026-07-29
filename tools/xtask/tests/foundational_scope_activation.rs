@@ -5769,6 +5769,11 @@ case "$command" in
   nextest)
     if [ "${2:-}" = "--version" ]; then
       printf 'cargo-nextest 0.9.138\n'
+    elif [ "$*" = "nextest run --locked --workspace --all-targets --all-features --profile ci --status-level fail --final-status-level fail" ]; then
+      printf '     Summary [   0.001s] 1 tests run: 1 passed, 0 skipped\n' >&2
+    else
+      printf '%s\n' 'fixture received a noncanonical Nextest invocation' >&2
+      exit 78
     fi
     ;;
   deny)

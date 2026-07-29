@@ -1509,8 +1509,7 @@ fn run_writer_process(
         std::process::id(),
         publication_point.as_str()
     );
-    write_process_record(&ready, content.as_bytes())?;
-    sync_directory(case_root)?;
+    write_atomic_process_record(&ready, content.as_bytes())?;
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -1624,6 +1623,31 @@ fn write_process_record(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
         .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
+}
+
+fn write_atomic_process_record(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| XtaskError::invalid_path(path, "process record path is not valid UTF-8"))?;
+    let staged = path.with_file_name(format!("{file_name}.staged"));
+    write_process_record(&staged, bytes)?;
+    fs::hard_link(&staged, path).map_err(|source| {
+        XtaskError::io(
+            format!(
+                "publish process record {} as {}",
+                staged.display(),
+                path.display()
+            ),
+            source,
+        )
+    })?;
+    fs::remove_file(&staged)
+        .map_err(|source| XtaskError::io(format!("remove {}", staged.display()), source))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| XtaskError::invalid_path(path, "process record has no parent"))?;
+    sync_directory(parent)
 }
 
 fn write_fault_bytes(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {

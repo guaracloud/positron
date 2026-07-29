@@ -18,14 +18,16 @@
     "runner_changes": [
       "The active xtask tooling scope participates in risk-gate selection only through its own registered risk_gates set; no application, artifact, or deferred gate is inferred.",
       "One immutable execution context captures bounded adversarial-manifest, quality-registry, integrity-registry, and fixture-harness bytes once; it parses the typed registries once and derives fixture, seed, and schedule identity from those exact bytes. Evidence identity and all three runners receive that same context and never reread the registered inputs.",
-      "EG-CORRECT launches the explicitly registered current-xtask Quality Engineering writer process with a cleared environment, waits within the registered deadline for an exact PID and publication-point acknowledgement, force-kills and reaps the writer, launches a distinct recovery process, and accepts only its externally readable predecessor-or-successor state and recovery digest.",
+      "EG-CORRECT launches the explicitly registered current-xtask Quality Engineering writer process with a cleared environment, waits within the registered deadline for an atomically published exact PID and publication-point acknowledgement, force-kills and reaps the writer, launches a distinct recovery process, and accepts only its externally readable predecessor-or-successor state and recovery digest.",
       "EG-FAULT maps nine typed publication points one-to-one to the required partial-write, crash, restart, corruption, full-disk, clock, cancellation, network, and provider schedules. Every writer is force-killed and reaped at its acknowledged point and every verdict comes from a fresh recovery process over durable state.",
       "EG-INTEGRITY persists identity-bound fixture objects, reopens the golden object, corrupts and deletes attempt-owned copies, requires digest-mismatch and missing-object failures, and proves the untouched prior object remains readable after each adversarial case.",
       "Each gate claims one must-create no-follow fixture root directly beneath the canonical attempt TMPDIR. Occupied, symbolic-link, non-directory, escaped, and identity-changed paths fail before child launch or filesystem mutation.",
-      "An RAII owner reconciles the exact attempt-owned gate tree on success, detector failure, forced writer termination, recovery failure, and timeout; it synchronizes the attempt parent after removal, converts cleanup failure into a failed gate, and retains only immutable process observations and recovery digests in raw evidence."
+      "An RAII owner reconciles the exact attempt-owned gate tree on success, detector failure, forced writer termination, recovery failure, and timeout; it synchronizes the attempt parent after removal, converts cleanup failure into a failed gate, and retains only immutable process observations and recovery digests in raw evidence.",
+      "EG-TEST retains its exact locked workspace, all-targets, all-features, no-retry CI selection and the existing 131072-byte per-stream ceiling. Its Nextest invocation overrides only live and final status verbosity to failure level, preserves immediate-final failure output from the registered CI profile, parses the canonical final summary, rejects missing counts or any skipped test, and retains the completed-test count in the gate detail."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, coordinators, timeouts, memory declarations, exception classes, targets, thresholds, and application activation ledgers.",
+      "The EG-TEST suite selection, failure exit semantics, failure output, retry policy, timeout policy, and controlled stream ceiling.",
       "Developer evidence remains diagnostic and non-merge-eligible.",
       "Release Qualification Cells remain Specified; an engineering runner implementation does not qualify a product artifact."
     ]
@@ -36,6 +38,7 @@
     "Corrupt fixture bytes are classified as a digest mismatch, deleted fixture objects are classified as missing, and neither adversarial case can mutate or replace its prior persisted object.",
     "The retained report records exact fixture IDs, seeds, fault schedules, writer and recovery process identities, forced termination and reap, externally observed states, recovery digests, identity-field coverage, and the frozen fixture-registry binding rather than a synthesized cargo self-test verdict.",
     "Mutation after fixture capture cannot alter execution or evidence, a symlink claim race cannot write outside the attempt root, repeated runs do not accumulate fixture trees, timed-out writers are killed and reaped, and cleanup failure fails the named gate.",
+    "The expanded first-class regression inventory cannot exhaust EG-TEST evidence capture through successful per-test status repetition; failures remain visible, and successful evidence carries the exact completed-test count with zero skips.",
     "The active tooling selection regression test proves EG-CONCURRENCY, EG-CRYPTO, EG-RESOURCE, and EG-SOAK remain explicitly not selected when xtask selects only its registered gates."
   ],
   "detection_lost": [],
@@ -66,9 +69,10 @@
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_fixture_root_symlink_race_without_touching_the_target -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_cleans_attempt_owned_fixture_trees_after_repeated_successes -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_kills_reaps_and_cleans_a_timed_out_fixture_writer -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_fails_when_attempt_owned_fixture_cleanup_fails -- --exact"
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_fails_when_attempt_owned_fixture_cleanup_fails -- --exact",
+        "cargo test --locked --package xtask --bin xtask quality::tests::test_runner_preserves_full_selection_failure_visibility_and_bounded_summary -- --exact"
       ],
-      "result": "The named process-backed state-transition, nine-class one-to-one fault schedule, frozen-input, no-follow ownership, bounded cleanup, and identity-bound corruption/deletion fixtures passed through their registry-selected public seams locally. These local results are diagnostic only."
+      "result": "The named process-backed state-transition, nine-class one-to-one fault schedule, frozen-input, no-follow ownership, bounded cleanup, identity-bound corruption/deletion, and bounded full-selection EG-TEST command-contract fixtures passed through their registry-selected public seams locally. These local results are diagnostic only."
     }
   },
   "compatibility_and_recovery": {

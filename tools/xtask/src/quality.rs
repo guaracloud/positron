@@ -68,6 +68,20 @@ const MAXIMUM_CONTROLLED_PROGRAM_CHARACTERS: usize = 256;
 const MAXIMUM_RESOLVED_PROGRAM_CHARACTERS: usize = 4_096;
 const MAXIMUM_CONTROLLED_ARGUMENTS: usize = 256;
 const MAXIMUM_CONTROLLED_ARGUMENT_CHARACTERS: usize = 4_096;
+const NEXTEST_PR_ARGUMENTS: [&str; 12] = [
+    "nextest",
+    "run",
+    "--locked",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--profile",
+    "ci",
+    "--status-level",
+    "fail",
+    "--final-status-level",
+    "fail",
+];
 const EVIDENCE_V3_CONSTRAINT_OWNER: &str =
     "Constraint owner: tools/xtask/src/quality.rs EVIDENCE_V3_CONSTRAINTS_V1";
 const EVIDENCE_V3_SCHEMA_SHA256: &str =
@@ -626,6 +640,7 @@ struct Evidence {
 struct CommandOutcome {
     display: String,
     stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug)]
@@ -3128,20 +3143,7 @@ fn registered_runner_command_matches(
             _ => false,
         },
         "test" => match index {
-            0 => {
-                program == "cargo"
-                    && args
-                        == [
-                            "nextest",
-                            "run",
-                            "--locked",
-                            "--workspace",
-                            "--all-targets",
-                            "--all-features",
-                            "--profile",
-                            "ci",
-                        ]
-            },
+            0 => program == "cargo" && args == NEXTEST_PR_ARGUMENTS,
             1 => {
                 program == "cargo"
                     && args == ["test", "--locked", "--workspace", "--doc", "--all-features"]
@@ -4746,19 +4748,11 @@ fn run_test_gate(
         root,
         environment,
         "cargo",
-        [
-            "nextest",
-            "run",
-            "--locked",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--profile",
-            "ci",
-        ],
+        NEXTEST_PR_ARGUMENTS,
         remaining(deadline)?,
         capture,
     )?;
+    let completed_test_count = nextest_completed_test_count(&nextest.stderr)?;
     let doctest = run_status(
         root,
         environment,
@@ -4767,7 +4761,47 @@ fn run_test_gate(
         remaining(deadline)?,
         capture,
     )?;
-    Ok(format!("{} | {}", nextest.display, doctest.display))
+    Ok(format!(
+        "{}; completed-tests={completed_test_count} | {}",
+        nextest.display, doctest.display
+    ))
+}
+
+fn nextest_completed_test_count(stderr: &str) -> Result<usize, XtaskError> {
+    let summary = stderr
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("Summary ["))
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "nextest result summary",
+                "missing final completed-test count",
+            )
+        })?;
+    let (_, counts) = summary.split_once("] ").ok_or_else(|| {
+        XtaskError::invalid(
+            "nextest result summary",
+            "final summary duration delimiter is malformed",
+        )
+    })?;
+    let (completed, outcomes) = counts.split_once(" tests run: ").ok_or_else(|| {
+        XtaskError::invalid(
+            "nextest result summary",
+            "final completed-test count delimiter is malformed",
+        )
+    })?;
+    let completed = completed.parse::<usize>().map_err(|error| {
+        XtaskError::invalid(
+            "nextest result summary",
+            format!("final completed-test count is invalid: {error}"),
+        )
+    })?;
+    if completed == 0 || outcomes != format!("{completed} passed, 0 skipped") {
+        return Err(XtaskError::invalid(
+            "nextest result summary",
+            format!("expected every completed test to pass without skips, observed `{outcomes}`"),
+        ));
+    }
+    Ok(completed)
 }
 
 fn scan_active_application_sources(
@@ -5148,6 +5182,7 @@ fn run_status_with_options<'argument>(
         return Ok(CommandOutcome {
             display,
             stdout: verdict.output.stdout,
+            stderr: verdict.output.stderr,
         });
     }
     Err(XtaskError::command(
@@ -5256,6 +5291,7 @@ fn run_capture_with_input<'argument>(
     Ok(CommandOutcome {
         display,
         stdout: verdict.output.stdout,
+        stderr: verdict.output.stderr,
     })
 }
 
@@ -7680,13 +7716,14 @@ mod tests {
         Evidence, ExecutionTools, GateAttemptDefinition, GateAttemptOutcome, GateInvocation,
         GateStatus, IdentityBinding, M0_02_MUTATION_SELECTOR, M0_03_MUTATION_SELECTOR,
         M0_04_MUTATION_SELECTOR, MAXIMUM_ACTIVATION_CHARACTERS, MAXIMUM_ATTEMPT_ID_CHARACTERS,
-        MAXIMUM_CONTROLLED_ARGUMENT_CHARACTERS, MAXIMUM_CONTROLLED_PROGRAM_CHARACTERS,
-        MAXIMUM_EXCEPTION_CLASS_CHARACTERS, MAXIMUM_GATE_ARGUMENT_CHARACTERS,
-        MAXIMUM_GATE_DETAIL_CHARACTERS, MAXIMUM_IDENTITY_VALUE_CHARACTERS,
-        MAXIMUM_RESOLVED_PROGRAM_CHARACTERS, NotApplicableReason, Options, Profile,
-        RawReportBinding, RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
+        MAXIMUM_CAPTURED_REPORT_STREAM_BYTES, MAXIMUM_CONTROLLED_ARGUMENT_CHARACTERS,
+        MAXIMUM_CONTROLLED_PROGRAM_CHARACTERS, MAXIMUM_EXCEPTION_CLASS_CHARACTERS,
+        MAXIMUM_GATE_ARGUMENT_CHARACTERS, MAXIMUM_GATE_DETAIL_CHARACTERS,
+        MAXIMUM_IDENTITY_VALUE_CHARACTERS, MAXIMUM_RESOLVED_PROGRAM_CHARACTERS,
+        NEXTEST_PR_ARGUMENTS, NotApplicableReason, Options, Profile, RawReportBinding,
+        RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
         character_count_in_range, evidence_json, gate_invocation_json, json_string,
-        parse_gate_invocation_value, raw_report_json_with_limit,
+        nextest_completed_test_count, parse_gate_invocation_value, raw_report_json_with_limit,
         registered_dependency_command_matches, run_generation_matrix_gate, sha256_digest,
         unavailable_evidence_identity, valid_hex_identity, valid_raw_report_schema_path,
         valid_sha256_digest, validate_configuration_parser_threat_model_text,
@@ -8146,6 +8183,57 @@ mod tests {
             "cargo-machete",
             &["--with-metadata", "--skip-target-dir", "."]
         ));
+    }
+
+    #[test]
+    fn test_runner_preserves_full_selection_failure_visibility_and_bounded_summary() -> TestResult {
+        assert_eq!(
+            NEXTEST_PR_ARGUMENTS,
+            [
+                "nextest",
+                "run",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--profile",
+                "ci",
+                "--status-level",
+                "fail",
+                "--final-status-level",
+                "fail",
+            ],
+            "the bounded reporter must not alter the full locked PR test selection"
+        );
+        assert!(
+            !NEXTEST_PR_ARGUMENTS
+                .iter()
+                .any(|argument| matches!(*argument, "-E" | "--filterset" | "--skip")),
+            "the bounded reporter must not filter or skip tests"
+        );
+        assert_eq!(
+            MAXIMUM_CAPTURED_REPORT_STREAM_BYTES, 131_072,
+            "the reporter change must not raise the controlled stream ceiling"
+        );
+        assert_eq!(
+            nextest_completed_test_count(
+                "Summary [ 113.160s] 317 tests run: 317 passed, 0 skipped\n"
+            )?,
+            317,
+            "the retained human summary must expose the exact completed-test count"
+        );
+        assert!(
+            nextest_completed_test_count(
+                "Summary [ 1.000s] 317 tests run: 316 passed, 1 skipped\n"
+            )
+            .is_err(),
+            "an ignored or skipped test must fail the summary contract"
+        );
+        assert!(
+            nextest_completed_test_count("317 tests passed without a canonical summary").is_err(),
+            "missing final count evidence must fail closed"
+        );
+        Ok(())
     }
 
     #[test]
