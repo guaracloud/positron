@@ -66,7 +66,17 @@
   },
   "compatibility_and_recovery": {
     "compatibility": "The cargo xtask quality command and evidence schema remain unchanged. New reports use the existing selected-gate immutable raw-report contract.",
-    "recovery": "Correct the registered scenario, semantic spawn marker, resource measurement, or lifecycle operation; retain the failed attempt and create a new attempt without overwriting prior evidence."
+    "recovery": "Correct the registered scenario, semantic spawn marker, resource measurement, or lifecycle operation; retain the failed attempt and create a new attempt without overwriting prior evidence.",
+    "incomplete_publication_attempts": [
+      {
+        "revision": "03a7eab0fddaf376deaf4ee2be1797c8739ec5f0",
+        "worktree": "/private/tmp/positron-m0-08-publish-clean.icRou9",
+        "cargo_target_dir": "/private/tmp/positron-m0-08-target.gdwmGh",
+        "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-target.gdwmGh git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
+        "observed_state": "The detached worktree was clean and the hook started with dirty=false, but no target/quality/evidence or evidence-reports file was published and refs/heads/codex/m0-08-concurrency-resource-runners remained absent from origin after the interrupted invocation.",
+        "recovery": "Preserve the worktree and external target directory as diagnostic material. Run one fresh isolated exact-head publication attempt; do not infer a passed quality verdict or a successful push."
+      }
+    ]
   },
   "approvals_required": ["Architecture", "Quality Engineering"],
   "approval": {
