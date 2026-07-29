@@ -406,6 +406,192 @@ fn quality_records_explicit_not_selected_scheduled_gates_for_the_pr_profile() ->
 }
 
 #[test]
+fn quality_runs_correctness_through_the_registered_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "registered correctness runner did not complete successfully: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = "EG-CORRECT";
+        let record = gate_record(&evidence, gate)?;
+        if !record.contains("\"result\": \"passed\"") {
+            return Err(std::io::Error::other(
+                "registered correctness runner did not retain a passing public outcome",
+            )
+            .into());
+        }
+        let report = fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, gate)?)?;
+        for expected in [
+            "\"schema_version\": 1",
+            "\"gate_id\": \"EG-CORRECT\"",
+            "\"verdict\": \"passed\"",
+            "\"controlled_steps\": [",
+        ] {
+            if !report.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "correctness immutable raw report omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+        for deferred_gate in ["EG-CONCURRENCY", "EG-CRYPTO", "EG-RESOURCE", "EG-SOAK"] {
+            let deferred = gate_record(&evidence, deferred_gate)?;
+            if !deferred.contains("\"result\": \"not-selected\"") {
+                return Err(std::io::Error::other(format!(
+                    "including active tooling selected unrelated deferred gate {deferred_gate}"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_correctness_self_test_without_a_terminal_test_verdict() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/malformed-correctness-self-test-output"),
+            "",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "invalid correctness self-test: did not report exactly one passing test",
+        )?;
+        let evidence = fixture.latest_evidence()?;
+        let record = gate_record(&evidence, "EG-CORRECT")?;
+        if !record.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(
+                "malformed correctness output did not retain a failed gate outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_runs_fault_through_the_registered_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "registered fault runner did not complete successfully: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = "EG-FAULT";
+        let record = gate_record(&evidence, gate)?;
+        if !record.contains("\"result\": \"passed\"") {
+            return Err(std::io::Error::other(
+                "registered fault runner did not retain a passing public outcome",
+            )
+            .into());
+        }
+        let report = fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, gate)?)?;
+        for expected in [
+            "\"schema_version\": 1",
+            "\"gate_id\": \"EG-FAULT\"",
+            "\"verdict\": \"passed\"",
+            "\"controlled_steps\": [",
+        ] {
+            if !report.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "fault immutable raw report omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_runs_integrity_through_the_registered_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-INTEGRITY|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "registered integrity runner did not complete successfully: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = "EG-INTEGRITY";
+        let record = gate_record(&evidence, gate)?;
+        if !record.contains("\"result\": \"passed\"") {
+            return Err(std::io::Error::other(
+                "registered integrity runner did not retain a passing public outcome",
+            )
+            .into());
+        }
+        let report = fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, gate)?)?;
+        for expected in [
+            "\"schema_version\": 1",
+            "\"gate_id\": \"EG-INTEGRITY\"",
+            "\"verdict\": \"passed\"",
+            "\"controlled_steps\": [",
+        ] {
+            if !report.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "integrity immutable raw report omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_records_dirty_local_success_as_non_merge_eligible_evidence() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -4962,6 +5148,13 @@ case "$command" in
     if [ "$package" = "positron-domain" ] && [ -f target/quality-tools/reject-m0-02-dynamic-execution ]; then
       printf '%s\n' 'fixture rejects M0-02 dynamic execution' >&2
       exit 75
+    fi
+    if [ "$package" = "xtask" ]; then
+      if [ -f target/quality-tools/malformed-correctness-self-test-output ]; then
+        printf '%s\n' 'malformed fixture self-test output'
+      else
+        printf '%s\n' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+      fi
     fi
     ;;
   tree)

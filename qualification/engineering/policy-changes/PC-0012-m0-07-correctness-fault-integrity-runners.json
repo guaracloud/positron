@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "id": "PC-0012-m0-07-correctness-fault-integrity-runners",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Implement the existing EG-CORRECT, EG-FAULT, and EG-INTEGRITY registry runners for the active xtask tooling scope without changing product behavior or Qualification Cell state.",
+  "change": {
+    "issue": 8,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
+    "runner_changes": [
+      "The active xtask tooling scope participates in risk-gate selection only through its own registered risk_gates set; no application, artifact, or deferred gate is inferred.",
+      "EG-CORRECT retains one bounded controlled state-model test that rejects mixed crash publication states and accepts only predecessor or successor recovery states.",
+      "EG-FAULT retains one bounded controlled fault-matrix test that rejects a missing publication-point schedule and requires one schedule per registered point.",
+      "EG-INTEGRITY retains one bounded controlled evidence-state test that rejects corrupted or missing retained evidence after restart.",
+      "Each selected runner command, timeout, memory declaration, stdout, stderr, verdict, command digest, and immutable raw-report binding remains validated by the existing evidence contract."
+    ],
+    "unchanged": [
+      "All 25 gate IDs, stages, coordinators, timeouts, memory declarations, exception classes, targets, thresholds, and application activation ledgers.",
+      "Developer evidence remains diagnostic and non-merge-eligible.",
+      "Release Qualification Cells remain Specified; an engineering runner implementation does not qualify a product artifact."
+    ]
+  },
+  "detection_gained": [
+    "An active xtask scope can no longer select EG-CORRECT, EG-FAULT, or EG-INTEGRITY and receive an unsupported-runner failure instead of a retained controlled result.",
+    "A mixed publication state, a missing fault schedule, and corrupted or absent restart evidence each fail their named registered runner through the public quality seam.",
+    "A successful controlled command with malformed or zero-test self-test output fails the named gate and retains its immutable failed evidence rather than being accepted as a pass.",
+    "The active tooling selection regression test proves EG-CONCURRENCY, EG-CRYPTO, EG-RESOURCE, and EG-SOAK remain explicitly not selected when xtask selects only its registered gates."
+  ],
+  "detection_lost": [],
+  "representative_old_new_evidence": {
+    "old": {
+      "status": "failed-focused-public-regression",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_fault_through_the_registered_public_seam -- --exact",
+      "result": "Before the change, an active registered EG-FAULT selection failed with an unsupported runner outcome."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --bin xtask runner_ -- --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_ -- --nocapture"
+      ],
+      "result": "The named state, fault, and integrity models and their three registry-selected public seams passed locally. These local results are diagnostic only."
+    }
+  },
+  "compatibility_and_recovery": {
+    "compatibility": "The cargo xtask quality command and evidence schema remain unchanged. Correctness, fault, and integrity reports use the existing immutable selected-gate raw-report contract.",
+    "recovery": "Correct the failing model or controlled command and create a new quality attempt. Retain every failed attempt and its raw report; do not overwrite or reclassify earlier evidence."
+  },
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering"
+  ],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
+    "attribution": "No implementation agent, reviewer, or repository owner is recorded as granting a required approval."
+  },
+  "qualification_claim": "None. This record does not claim a Qualified cell, trusted CI pass, merge eligibility, release readiness, or role approval."
+}

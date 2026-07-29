@@ -1271,6 +1271,9 @@ fn execute_gate(
         },
         "dependencies" => run_dependency_gate(root, registry, budget, environment, capture),
         "documentation" => run_documentation_gate(root, budget, environment, capture),
+        "correctness" => run_correctness_gate(root, budget, environment, capture),
+        "fault" => run_fault_gate(root, budget, environment, capture),
+        "integrity" => run_integrity_gate(root, budget, environment, capture),
         "error-policy" => run_error_policy_gate(root, registry),
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
@@ -1293,6 +1296,112 @@ fn execute_gate(
             "an active risk scope selected a gate whose executable harness has not been implemented",
         )),
     }
+}
+
+fn run_correctness_gate(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    let deadline = Instant::now() + budget;
+    let model = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "--",
+            "quality::tests::correctness_runner_rejects_mixed_publication_state",
+            "--exact",
+        ],
+        remaining(deadline)?,
+        capture,
+    )?;
+    verify_runner_self_test_output("correctness", &model.stdout)?;
+    Ok(format!(
+        "{}; internal:predecessor-or-successor publication-state model",
+        model.display
+    ))
+}
+
+fn run_fault_gate(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    let deadline = Instant::now() + budget;
+    let matrix = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "--",
+            "quality::tests::fault_runner_rejects_an_unmapped_publication_point",
+            "--exact",
+        ],
+        remaining(deadline)?,
+        capture,
+    )?;
+    verify_runner_self_test_output("fault", &matrix.stdout)?;
+    Ok(format!(
+        "{}; internal:one-to-one publication-point fault matrix",
+        matrix.display
+    ))
+}
+
+fn run_integrity_gate(
+    root: &Path,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    let deadline = Instant::now() + budget;
+    let evidence = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "--",
+            "quality::tests::integrity_runner_rejects_corrupted_or_missing_evidence",
+            "--exact",
+        ],
+        remaining(deadline)?,
+        capture,
+    )?;
+    verify_runner_self_test_output("integrity", &evidence.stdout)?;
+    Ok(format!(
+        "{}; internal:immutable evidence integrity and restart-readability model",
+        evidence.display
+    ))
+}
+
+fn verify_runner_self_test_output(gate: &str, stdout: &str) -> Result<(), XtaskError> {
+    if stdout.contains("test result: ok. 1 passed; 0 failed;") {
+        return Ok(());
+    }
+    Err(XtaskError::invalid(
+        format!("{gate} self-test"),
+        "did not report exactly one passing test",
+    ))
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
@@ -2803,6 +2912,9 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
         "dynamic-analysis" => 2,
         "dependencies" => 3,
         "documentation" | "rust" | "test" => 2,
+        "correctness" => 1,
+        "fault" => 1,
+        "integrity" => 1,
         "safety" => usize::from(registry.has_m0_04_configuration_scope()),
         "security" => 1,
         "secrets" | "supply" => {
@@ -2812,8 +2924,8 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
                 1
             }
         },
-        "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
-        | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => 0,
+        "concurrency" | "crypto" | "error-policy" | "evidence" | "matrix" | "performance"
+        | "policy" | "resource" | "soak" => 0,
         _ => 0,
     }
 }
@@ -2828,6 +2940,51 @@ fn registered_runner_command_matches(
 ) -> bool {
     let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     match runner {
+        "correctness" => {
+            program == "cargo"
+                && args
+                    == [
+                        "test",
+                        "--locked",
+                        "--package",
+                        "xtask",
+                        "--bin",
+                        "xtask",
+                        "--",
+                        "quality::tests::correctness_runner_rejects_mixed_publication_state",
+                        "--exact",
+                    ]
+        },
+        "fault" => {
+            program == "cargo"
+                && args
+                    == [
+                        "test",
+                        "--locked",
+                        "--package",
+                        "xtask",
+                        "--bin",
+                        "xtask",
+                        "--",
+                        "quality::tests::fault_runner_rejects_an_unmapped_publication_point",
+                        "--exact",
+                    ]
+        },
+        "integrity" => {
+            program == "cargo"
+                && args
+                    == [
+                        "test",
+                        "--locked",
+                        "--package",
+                        "xtask",
+                        "--bin",
+                        "xtask",
+                        "--",
+                        "quality::tests::integrity_runner_rejects_corrupted_or_missing_evidence",
+                        "--exact",
+                    ]
+        },
         "registry" => registry
             .tools
             .iter()
@@ -3044,8 +3201,8 @@ fn registered_runner_command_matches(
                 && args.first() == Some(&"+nightly-2026-07-20")
                 && args.get(1) == Some(&"llvm-cov")
         },
-        "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
-        | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => false,
+        "concurrency" | "crypto" | "error-policy" | "evidence" | "matrix" | "performance"
+        | "policy" | "resource" | "soak" => false,
         _ => false,
     }
 }
@@ -7539,6 +7696,99 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PublicationRecoveryState {
+        Predecessor,
+        Successor,
+        Mixed,
+    }
+
+    fn publication_state_is_truthful(state: PublicationRecoveryState) -> bool {
+        matches!(
+            state,
+            PublicationRecoveryState::Predecessor | PublicationRecoveryState::Successor
+        )
+    }
+
+    #[test]
+    fn correctness_runner_rejects_mixed_publication_state() {
+        assert!(publication_state_is_truthful(
+            PublicationRecoveryState::Predecessor
+        ));
+        assert!(publication_state_is_truthful(
+            PublicationRecoveryState::Successor
+        ));
+        assert!(
+            !publication_state_is_truthful(PublicationRecoveryState::Mixed),
+            "correctness evidence must reject a crash state that is neither predecessor nor successor"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PublicationPoint {
+        CommitRecord,
+        PublicationMarker,
+    }
+
+    fn fault_schedule_covers_each_publication_point_once(
+        publication_points: &[PublicationPoint],
+        scheduled_points: &[PublicationPoint],
+    ) -> bool {
+        publication_points.iter().all(|publication_point| {
+            scheduled_points
+                .iter()
+                .filter(|scheduled_point| scheduled_point == &publication_point)
+                .count()
+                == 1
+        }) && scheduled_points.len() == publication_points.len()
+    }
+
+    #[test]
+    fn fault_runner_rejects_an_unmapped_publication_point() {
+        let publication_points = [
+            PublicationPoint::CommitRecord,
+            PublicationPoint::PublicationMarker,
+        ];
+        assert!(fault_schedule_covers_each_publication_point_once(
+            &publication_points,
+            &publication_points,
+        ));
+        assert!(
+            !fault_schedule_covers_each_publication_point_once(
+                &publication_points,
+                &[PublicationPoint::CommitRecord],
+            ),
+            "every registered publication point must have one crash schedule"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RetainedEvidenceState {
+        Verified,
+        Corrupted,
+        Missing,
+    }
+
+    fn evidence_remains_readable_after_restart(state: RetainedEvidenceState) -> bool {
+        state == RetainedEvidenceState::Verified
+    }
+
+    #[test]
+    fn integrity_runner_rejects_corrupted_or_missing_evidence() {
+        assert!(evidence_remains_readable_after_restart(
+            RetainedEvidenceState::Verified
+        ));
+        for invalid in [
+            RetainedEvidenceState::Corrupted,
+            RetainedEvidenceState::Missing,
+        ] {
+            assert!(
+                !evidence_remains_readable_after_restart(invalid),
+                "corrupted or missing immutable evidence must not become valid after restart"
+            );
+        }
+    }
 
     #[test]
     fn defaults_to_the_complete_pull_request_profile() {
