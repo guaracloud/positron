@@ -6225,7 +6225,7 @@ impl OwnedDirectoryChain {
     }
 
     fn cleanup_empty(&self) -> Result<(), XtaskError> {
-        for directory in self.created.iter().rev() {
+        for (depth, directory) in self.created.iter().rev().enumerate() {
             match fs::remove_dir(directory) {
                 Ok(()) => {
                     let parent = directory.parent().ok_or_else(|| {
@@ -6237,6 +6237,9 @@ impl OwnedDirectoryChain {
                     sync_directory(parent)?;
                 },
                 Err(source) if source.kind() == ErrorKind::NotFound => {},
+                Err(source) if source.kind() == ErrorKind::DirectoryNotEmpty && depth > 0 => {
+                    break;
+                },
                 Err(source) if source.kind() == ErrorKind::DirectoryNotEmpty => {
                     return Err(XtaskError::io(
                         format!(
