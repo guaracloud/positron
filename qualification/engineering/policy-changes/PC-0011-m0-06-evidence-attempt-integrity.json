@@ -23,7 +23,7 @@
       "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a missing or retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass.",
       "Engineering evidence schema version 3 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact structured-invocation digests.",
       "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. A bounded typed JSON parser rejects malformed, duplicate, missing, unknown, oversized, or cross-reference-inconsistent evidence and reports. Controlled steps are charged before stream copies, with 128 steps, 131072 bytes per stream, and 8388608 encoded bytes per report; the serializer reserves each exact escaped JSON field before copying and retains a schema-valid failed attempt if encoding reaches the limit.",
-      "Retained evidence files and raw-report directories are enumerated independently under bounded counts. Current schema-v3 evidence requires every exact report even when its report directory is absent, orphan report files and attempt directories fail closed, attempt-owned filenames are constrained, and bounded schema-v1/v2 records remain explicit legacy inputs without schema-v3 report requirements."
+      "Retained evidence files and raw-report directories are enumerated independently under bounded counts. Current schema-v3 evidence requires every exact report even when its report directory is absent, orphan report files and attempt directories fail closed, schema-v3 attempt-owned filenames are constrained, and bounded schema-v1/v2 records remain explicit legacy inputs with their historical filename labels and without schema-v3 report requirements."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
@@ -84,11 +84,11 @@
       "result": "The public runner now preserves arbitrary canonical and slot bytes, retains schema-v3 collision or reserved exhaustion failures, publishes exact selected-gate report and structured-invocation bindings, independently rejects missing report directories and orphan report paths, preserves bounded legacy inputs, bounds exact encoded JSON bytes before copying, rejects missing, tampered, oversized, and command-mismatched reports, rejects incomplete schema, and retains schema-valid failed verdicts for encoding limits and stale, retried, or missing trusted-CI identities. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "db9307afd74a655f2ceb26099d91ffbe1b57536b",
-      "source_tree": "7b14645ed0ba659282787371d10b0dc61c1cc237",
-      "fixture_sha256": "b791b2a9159491c438796fac285b952198ac580871e4382dc0cd81d522e7c5d5",
+      "source_revision": "d3a8804f24b7a162c972e8b0098958ec7f0ade2f",
+      "source_tree": "bde584fc0c73e3e15fa7fee0c74cc06dcfd99faa",
+      "fixture_sha256": "7c0cf63189e50acfaa1f972481c19bcfeac02c5024f091a10faa2d4b92e67857",
       "schema_sha256": "f75900ffcd94a33b23d68bd4cd974f8994670b5593d060a18084f192ac2a69b1",
-      "runner_sha256": "75f94981b311e17c9e041c6add75d30896b90ac3ed91f498e8886b30aaf0c9e0",
+      "runner_sha256": "d88ae87a39fbf3e087bea31aa0fb0b9ff27e48ce9c79444d6e16e1538ac76640",
       "parser_sha256": "84f149f0478df4e7f13f99d674fa367c23196721bcdcade583a899fcbfa7032b",
       "exact_fixture_results": [
         "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
