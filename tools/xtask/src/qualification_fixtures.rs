@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
 use crate::error::XtaskError;
@@ -20,12 +22,28 @@ const HARNESS_REGISTRY_HEADER: &str = "interface_id\texecutable\twriter_operatio
 const MAXIMUM_REGISTRY_BYTES: usize = 16_384;
 const MAXIMUM_IDENTITY_REGISTRY_BYTES: usize = 65_536;
 const MAXIMUM_FIXTURES: usize = 32;
+const MAXIMUM_OWNED_DIRECTORY_ENTRIES: usize = 64;
 const MAXIMUM_FIELD_BYTES: usize = 96;
 const MAXIMUM_STATE_BYTES: usize = 1_024;
 const MAXIMUM_INTEGRITY_OBJECT_BYTES: usize = 8_192;
 const MAXIMUM_PROCESS_RECORD_BYTES: usize = 1_024;
+const MAXIMUM_PROCESS_ARGUMENTS: usize = 9;
 const CORRECTNESS_GATE: &str = "EG-CORRECT";
 const FAULT_GATE: &str = "EG-FAULT";
+
+#[cfg(not(any(
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+compile_error!(
+    "the fixture directory-capability boundary supports only registered macOS and Linux x86_64/aarch64 hosts"
+);
 
 const CORRECTNESS_PUBLICATION_POINTS: [PublicationPoint; 2] = [
     PublicationPoint::BeforePublication,
@@ -249,14 +267,395 @@ struct HarnessInterface {
 
 #[derive(Debug)]
 struct OwnedFixtureRoot {
+    parent: DirectoryCapability,
+    directory: DirectoryCapability,
+    name: String,
     path: PathBuf,
     active: bool,
+}
+
+#[derive(Debug)]
+struct DirectoryCapability {
+    file: fs::File,
+    diagnostic_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Debug)]
 struct ChildReconciliation {
     status: std::process::ExitStatus,
     kill_sent: bool,
+}
+
+struct ProcessRootClaim<'a> {
+    owned_root: &'a Path,
+    case_root: &'a Path,
+    owned_identity: &'a str,
+    case_identity: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl OpenedFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn token(self) -> String {
+        format!("{}-{}", self.device, self.inode)
+    }
+
+    fn parse(path: &Path, value: &str) -> Result<Self, XtaskError> {
+        let Some((device, inode)) = value.split_once('-') else {
+            return Err(XtaskError::invalid_path(
+                path,
+                "fixture directory identity token is malformed",
+            ));
+        };
+        let device = device.parse::<u64>().map_err(|_| {
+            XtaskError::invalid_path(path, "fixture directory device identity is invalid")
+        })?;
+        let inode = inode.parse::<u64>().map_err(|_| {
+            XtaskError::invalid_path(path, "fixture directory inode identity is invalid")
+        })?;
+        Ok(Self { device, inode })
+    }
+}
+
+impl DirectoryCapability {
+    fn open(path: &Path, label: &str) -> Result<Self, XtaskError> {
+        let file = rustix::fs::openat(
+            rustix::fs::CWD,
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(|source| {
+            XtaskError::io(
+                format!("open {label} {}", path.display()),
+                rustix_io(source),
+            )
+        })?;
+        let metadata = file.metadata().map_err(|source| {
+            XtaskError::io(format!("inspect opened {label} {}", path.display()), source)
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(XtaskError::invalid_path(
+                path,
+                format!("{label} is not a directory"),
+            ));
+        }
+        let capability = Self {
+            file,
+            diagnostic_path: path.to_path_buf(),
+        };
+        capability.entry_names(label)?;
+        Ok(capability)
+    }
+
+    fn open_child_directory(&self, name: &str, label: &str) -> Result<Self, XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let diagnostic_path = self.diagnostic_path.join(name);
+        let file = rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(|source| {
+            XtaskError::io(
+                format!("open {label} {}", diagnostic_path.display()),
+                rustix_io(source),
+            )
+        })?;
+        Ok(Self {
+            file,
+            diagnostic_path,
+        })
+    }
+
+    fn create_child_directory(&self, name: &str, label: &str) -> Result<Self, XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        rustix::fs::mkdirat(&self.file, name, Mode::RWXU).map_err(|source| {
+            XtaskError::io(
+                format!("create {label} {}", path.display()),
+                rustix_io(source),
+            )
+        })?;
+        self.sync()?;
+        self.open_child_directory(name, label)
+    }
+
+    fn entry_names(&self, label: &str) -> Result<Vec<String>, XtaskError> {
+        let directory = Dir::read_from(&self.file).map_err(|source| {
+            XtaskError::io(
+                format!("enumerate {label} {}", self.diagnostic_path.display()),
+                rustix_io(source),
+            )
+        })?;
+        let mut names = Vec::new();
+        for entry in directory {
+            let entry = entry.map_err(|source| {
+                XtaskError::io(format!("read {label} directory entry"), rustix_io(source))
+            })?;
+            let name = entry.file_name().to_str().map_err(|_| {
+                XtaskError::invalid_path(
+                    &self.diagnostic_path,
+                    format!("{label} entry name is not UTF-8"),
+                )
+            })?;
+            if !matches!(name, "." | "..") {
+                if names.len() >= MAXIMUM_OWNED_DIRECTORY_ENTRIES {
+                    return Err(XtaskError::invalid_path(
+                        &self.diagnostic_path,
+                        format!("{label} exceeds {MAXIMUM_OWNED_DIRECTORY_ENTRIES} entries"),
+                    ));
+                }
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
+    }
+
+    fn identity(&self) -> Result<DirectoryIdentity, XtaskError> {
+        self.file
+            .metadata()
+            .map(|metadata| DirectoryIdentity::from_metadata(&metadata))
+            .map_err(|source| {
+                XtaskError::io(
+                    format!(
+                        "inspect fixture directory capability {}",
+                        self.diagnostic_path.display()
+                    ),
+                    source,
+                )
+            })
+    }
+
+    fn require_identity(&self, expected: DirectoryIdentity) -> Result<(), XtaskError> {
+        if self.identity()? != expected {
+            return Err(XtaskError::invalid_path(
+                &self.diagnostic_path,
+                "fixture directory identity does not match the parent claim",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<(), XtaskError> {
+        self.file.sync_all().map_err(|source| {
+            XtaskError::io(
+                format!(
+                    "synchronize fixture directory {}",
+                    self.diagnostic_path.display()
+                ),
+                source,
+            )
+        })
+    }
+
+    fn read_bounded(
+        &self,
+        name: &str,
+        maximum_bytes: usize,
+        limit_label: &str,
+    ) -> Result<Vec<u8>, XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        let file = rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(|source| {
+            if source == rustix::io::Errno::LOOP {
+                XtaskError::invalid_path(&path, format!("{limit_label} is a symbolic link"))
+            } else {
+                XtaskError::io(
+                    format!("open {limit_label} {}", path.display()),
+                    rustix_io(source),
+                )
+            }
+        })?;
+        read_bounded_opened_file(file, &path, maximum_bytes, limit_label)
+    }
+
+    fn read_bounded_optional(
+        &self,
+        name: &str,
+        maximum_bytes: usize,
+        limit_label: &str,
+    ) -> Result<Option<Vec<u8>>, XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        match rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(file) => {
+                read_bounded_opened_file(fs::File::from(file), &path, maximum_bytes, limit_label)
+                    .map(Some)
+            },
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(rustix::io::Errno::LOOP) => Err(XtaskError::invalid_path(
+                &path,
+                format!("{limit_label} is a symbolic link"),
+            )),
+            Err(source) => Err(XtaskError::io(
+                format!("open {limit_label} {}", path.display()),
+                rustix_io(source),
+            )),
+        }
+    }
+
+    fn create_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        maximum_bytes: usize,
+    ) -> Result<(), XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        if bytes.len() > maximum_bytes {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("fixture object exceeds {maximum_bytes} bytes"),
+            ));
+        }
+        let mut file = rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(fs::File::from)
+        .map_err(|source| {
+            XtaskError::io(format!("create {}", path.display()), rustix_io(source))
+        })?;
+        file.write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
+    }
+
+    fn replace_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        maximum_bytes: usize,
+    ) -> Result<(), XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        if bytes.len() > maximum_bytes {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("fixture object exceeds {maximum_bytes} bytes"),
+            ));
+        }
+        let mut file = rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::WRONLY | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(|source| XtaskError::io(format!("open {}", path.display()), rustix_io(source)))?;
+        file.write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
+    }
+
+    fn remove_file(&self, name: &str) -> Result<(), XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        rustix::fs::unlinkat(&self.file, name, AtFlags::empty()).map_err(|source| {
+            XtaskError::io(format!("remove {}", path.display()), rustix_io(source))
+        })
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, from)?;
+        validate_leaf_name(&self.diagnostic_path, to)?;
+        rustix::fs::renameat(&self.file, from, &self.file, to).map_err(|source| {
+            XtaskError::io(
+                format!(
+                    "rename fixture object {} as {}",
+                    self.diagnostic_path.join(from).display(),
+                    self.diagnostic_path.join(to).display()
+                ),
+                rustix_io(source),
+            )
+        })
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> Result<(), XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, from)?;
+        validate_leaf_name(&self.diagnostic_path, to)?;
+        rustix::fs::linkat(&self.file, from, &self.file, to, AtFlags::empty()).map_err(|source| {
+            XtaskError::io(
+                format!(
+                    "link fixture object {} as {}",
+                    self.diagnostic_path.join(from).display(),
+                    self.diagnostic_path.join(to).display()
+                ),
+                rustix_io(source),
+            )
+        })
+    }
+}
+
+fn rustix_io(source: rustix::io::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(source.raw_os_error())
+}
+
+fn validate_leaf_name(path: &Path, name: &str) -> Result<(), XtaskError> {
+    let mut components = Path::new(name).components();
+    if matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none() {
+        return Ok(());
+    }
+    Err(XtaskError::invalid_path(
+        path,
+        "fixture capability leaf name is not one normal path component",
+    ))
 }
 
 #[derive(Debug)]
@@ -365,6 +764,12 @@ impl FixtureRegistry {
             ] {
                 validate_field(path, offset + 2, field_name, value)?;
             }
+            if !matches!(*gate_id, CORRECTNESS_GATE | FAULT_GATE) {
+                return Err(XtaskError::invalid_path(
+                    path,
+                    format!("fixture gate `{gate_id}` is not an exact consumed gate"),
+                ));
+            }
             if !fixture_ids.insert((*fixture_id).to_owned()) {
                 return Err(XtaskError::invalid_path(
                     path,
@@ -388,7 +793,9 @@ impl FixtureRegistry {
                 "fixture registry contains no cases",
             ));
         }
-        Ok(Self { cases })
+        let registry = Self { cases };
+        registry.validate_complete_consumption(path)?;
+        Ok(registry)
     }
 
     fn cases_for(&self, gate_id: &str) -> Vec<&FixtureCase> {
@@ -396,6 +803,24 @@ impl FixtureRegistry {
             .iter()
             .filter(|case| case.gate_id == gate_id)
             .collect()
+    }
+
+    fn validate_complete_consumption(&self, path: &Path) -> Result<(), XtaskError> {
+        let correctness = self.cases_for(CORRECTNESS_GATE);
+        let fault = self.cases_for(FAULT_GATE);
+        let consumed = correctness.len().checked_add(fault.len()).ok_or_else(|| {
+            XtaskError::invalid_path(path, "fixture gate consumption count overflowed")
+        })?;
+        if consumed != self.cases.len() {
+            return Err(XtaskError::invalid_path(
+                path,
+                format!(
+                    "fixture registry contains {} rows but exactly {consumed} rows are consumed",
+                    self.cases.len()
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -572,8 +997,8 @@ impl HarnessInterface {
             "publication-point-ready-v1",
             "force-kill-and-reap",
             "recovery-v1",
-            "owned-root-case-root-publication-point-fault-schedule-predecessor-successor",
-            "owned-root-case-root-result-path-recovery-protocol",
+            "owned-root-case-root-owned-id-case-id-publication-point-fault-schedule-predecessor-successor",
+            "owned-root-case-root-owned-id-case-id-result-name-recovery-protocol",
         ) {
             return Err(XtaskError::invalid_path(
                 path,
@@ -783,13 +1208,87 @@ fn read_frozen_input(
     relative: &str,
     maximum_bytes: usize,
 ) -> Result<Vec<u8>, XtaskError> {
-    let path = root.join(relative);
-    let bytes = fs::read(&path)
-        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    let mut directory = DirectoryCapability::open(root, "frozen fixture root")?;
+    let mut components = Path::new(relative).components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(component) = component else {
+            return Err(XtaskError::invalid_path(
+                &root.join(relative),
+                "frozen fixture path is not strictly relative",
+            ));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            XtaskError::invalid_path(&root.join(relative), "frozen fixture path is not UTF-8")
+        })?;
+        if components.peek().is_some() {
+            directory =
+                directory.open_child_directory(component, "frozen fixture directory component")?;
+        } else {
+            return directory.read_bounded(component, maximum_bytes, "fixture identity input");
+        }
+    }
+    Err(XtaskError::invalid_path(
+        &root.join(relative),
+        "frozen fixture path is empty",
+    ))
+}
+
+fn read_bounded_opened_file(
+    mut file: fs::File,
+    diagnostic_path: &Path,
+    maximum_bytes: usize,
+    limit_label: &str,
+) -> Result<Vec<u8>, XtaskError> {
+    let before = file.metadata().map_err(|source| {
+        XtaskError::io(format!("inspect {}", diagnostic_path.display()), source)
+    })?;
+    if !before.file_type().is_file() {
+        return Err(XtaskError::invalid_path(
+            diagnostic_path,
+            format!("{limit_label} is not a regular file"),
+        ));
+    }
+    if before.len() > maximum_bytes as u64 {
+        return Err(XtaskError::invalid_path(
+            diagnostic_path,
+            format!("{limit_label} exceeds {maximum_bytes} bytes"),
+        ));
+    }
+    let bounded_capacity = maximum_bytes.checked_add(1).ok_or_else(|| {
+        XtaskError::invalid_path(diagnostic_path, format!("{limit_label} bound overflowed"))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(bounded_capacity).map_err(|error| {
+        XtaskError::invalid_path(
+            diagnostic_path,
+            format!("reserve bounded {limit_label} buffer failed: {error}"),
+        )
+    })?;
+    let read_limit = u64::try_from(bounded_capacity).map_err(|_| {
+        XtaskError::invalid_path(
+            diagnostic_path,
+            format!("{limit_label} bound does not fit u64"),
+        )
+    })?;
+    Read::by_ref(&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| XtaskError::io(format!("read {}", diagnostic_path.display()), source))?;
     if bytes.len() > maximum_bytes {
         return Err(XtaskError::invalid_path(
-            &path,
-            format!("fixture identity input exceeds {maximum_bytes} bytes"),
+            diagnostic_path,
+            format!("{limit_label} exceeds {maximum_bytes} bytes"),
+        ));
+    }
+    let after = file.metadata().map_err(|source| {
+        XtaskError::io(format!("reinspect {}", diagnostic_path.display()), source)
+    })?;
+    if OpenedFileIdentity::from_metadata(&before) != OpenedFileIdentity::from_metadata(&after)
+        || after.len() != bytes.len() as u64
+    {
+        return Err(XtaskError::invalid_path(
+            diagnostic_path,
+            format!("{limit_label} changed while it was read"),
         ));
     }
     Ok(bytes)
@@ -801,38 +1300,25 @@ fn execute_integrity_case(
     identity: &IntegrityIdentity,
 ) -> Result<String, XtaskError> {
     let case_root = fixture_root.create_case(&case.fixture_id)?;
-    let original = case_root.join("prior-attempt.evidence");
-    write_integrity_object(&original, identity, case)?;
-    sync_directory(&case_root)?;
-    let reopened = case_root.join("reopen.evidence");
-    fs::copy(&original, &reopened).map_err(|source| {
-        XtaskError::io(
-            format!(
-                "copy integrity fixture {} to {}",
-                original.display(),
-                reopened.display()
-            ),
-            source,
-        )
-    })?;
-    sync_file(&reopened)?;
-    sync_directory(&case_root)?;
+    let original = "prior-attempt.evidence";
+    write_integrity_object(&case_root, original, identity, case)?;
+    case_root.sync()?;
+    let reopened = "reopen.evidence";
+    let original_bytes =
+        case_root.read_bounded(original, MAXIMUM_INTEGRITY_OBJECT_BYTES, "integrity object")?;
+    case_root.create_file(reopened, &original_bytes, MAXIMUM_INTEGRITY_OBJECT_BYTES)?;
+    case_root.sync()?;
 
     match case.mutation {
         IntegrityMutation::None => {},
-        IntegrityMutation::CorruptPayload => corrupt_integrity_payload(&reopened)?,
+        IntegrityMutation::CorruptPayload => corrupt_integrity_payload(&case_root, reopened)?,
         IntegrityMutation::DeleteObject => {
-            fs::remove_file(&reopened).map_err(|source| {
-                XtaskError::io(
-                    format!("delete integrity fixture {}", reopened.display()),
-                    source,
-                )
-            })?;
-            sync_directory(&case_root)?;
+            case_root.remove_file(reopened)?;
+            case_root.sync()?;
         },
     }
 
-    let outcome = match read_integrity_object(&reopened, identity, case) {
+    let outcome = match read_integrity_object(&case_root, reopened, identity, case) {
         Ok(()) => IntegrityExpectedReopen::Verified,
         Err(IntegrityReadFailure::DigestMismatch) => IntegrityExpectedReopen::DigestMismatch,
         Err(IntegrityReadFailure::MissingObject) => IntegrityExpectedReopen::MissingObject,
@@ -857,7 +1343,7 @@ fn execute_integrity_case(
             ),
         ));
     }
-    read_integrity_object(&original, identity, case).map_err(|failure| {
+    read_integrity_object(&case_root, original, identity, case).map_err(|failure| {
         XtaskError::invalid(
             format!("integrity fixture `{}`", case.fixture_id),
             format!("prior attempt was not preserved: {failure:?}"),
@@ -873,7 +1359,8 @@ fn execute_integrity_case(
 }
 
 fn write_integrity_object(
-    path: &Path,
+    directory: &DirectoryCapability,
+    name: &str,
     identity: &IntegrityIdentity,
     case: &IntegrityCase,
 ) -> Result<(), XtaskError> {
@@ -893,31 +1380,26 @@ fn write_integrity_object(
     );
     if content.len() > MAXIMUM_INTEGRITY_OBJECT_BYTES {
         return Err(XtaskError::invalid_path(
-            path,
+            &directory.diagnostic_path.join(name),
             format!("integrity object exceeds {MAXIMUM_INTEGRITY_OBJECT_BYTES} bytes"),
         ));
     }
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|source| XtaskError::io(format!("create {}", path.display()), source))?;
-    file.write_all(content.as_bytes())
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
-        .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
+    directory.create_file(name, content.as_bytes(), MAXIMUM_INTEGRITY_OBJECT_BYTES)
 }
 
 fn read_integrity_object(
-    path: &Path,
+    directory: &DirectoryCapability,
+    name: &str,
     identity: &IntegrityIdentity,
     case: &IntegrityCase,
 ) -> Result<(), IntegrityReadFailure> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(IntegrityReadFailure::MissingObject);
-        },
+    let bytes = match directory.read_bounded_optional(
+        name,
+        MAXIMUM_INTEGRITY_OBJECT_BYTES,
+        "integrity object",
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(IntegrityReadFailure::MissingObject),
         Err(_) => return Err(IntegrityReadFailure::Io),
     };
     if bytes.len() > MAXIMUM_INTEGRITY_OBJECT_BYTES {
@@ -988,38 +1470,26 @@ fn read_integrity_object(
     Ok(())
 }
 
-fn corrupt_integrity_payload(path: &Path) -> Result<(), XtaskError> {
-    let mut bytes = fs::read(path)
-        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+fn corrupt_integrity_payload(
+    directory: &DirectoryCapability,
+    name: &str,
+) -> Result<(), XtaskError> {
+    let path = directory.diagnostic_path.join(name);
+    let mut bytes =
+        directory.read_bounded(name, MAXIMUM_INTEGRITY_OBJECT_BYTES, "integrity object")?;
     let marker = b"payload=fixture-payload-";
     let start = bytes
         .windows(marker.len())
         .position(|window| window == marker)
         .and_then(|offset| offset.checked_add(marker.len()))
         .ok_or_else(|| {
-            XtaskError::invalid_path(path, "integrity fixture payload marker is missing")
+            XtaskError::invalid_path(&path, "integrity fixture payload marker is missing")
         })?;
     let byte = bytes.get_mut(start).ok_or_else(|| {
-        XtaskError::invalid_path(path, "integrity fixture payload is unexpectedly empty")
+        XtaskError::invalid_path(&path, "integrity fixture payload is unexpectedly empty")
     })?;
     *byte = if *byte == b'x' { b'y' } else { b'x' };
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
-        .map_err(|source| XtaskError::io(format!("corrupt {}", path.display()), source))
-}
-
-fn sync_file(path: &Path) -> Result<(), XtaskError> {
-    fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| XtaskError::io(format!("synchronize {}", path.display()), source))
+    directory.replace_file(name, &bytes, MAXIMUM_INTEGRITY_OBJECT_BYTES)
 }
 
 fn integrity_payload_digest(payload: &[u8]) -> String {
@@ -1069,21 +1539,26 @@ fn execute_state_transition(
 ) -> Result<String, XtaskError> {
     validate_schedule_mapping(case)?;
     let case_root = fixture_root.create_case(&case.fixture_id)?;
-    let ready = case_root.join("writer.ready");
+    let owned_identity = fixture_root.directory.identity()?.token();
+    let case_identity = case_root.identity()?.token();
     let executable = std::env::current_exe()
         .map_err(|source| XtaskError::io("resolve current xtask executable", source))?;
     let mut writer = Command::new(&executable)
         .env_clear()
-        .current_dir(&case_root)
         .args([
             "quality-fixture",
             harness.writer_operation.as_str(),
             fixture_root.path.to_str().ok_or_else(|| {
                 XtaskError::invalid_path(&fixture_root.path, "fixture root is not valid UTF-8")
             })?,
-            case_root.to_str().ok_or_else(|| {
-                XtaskError::invalid_path(&case_root, "fixture path is not valid UTF-8")
+            case_root.diagnostic_path.to_str().ok_or_else(|| {
+                XtaskError::invalid_path(
+                    &case_root.diagnostic_path,
+                    "fixture path is not valid UTF-8",
+                )
             })?,
+            owned_identity.as_str(),
+            case_identity.as_str(),
             case.publication_point.as_str(),
             case.fault_schedule.as_str(),
             case.predecessor.as_str(),
@@ -1097,7 +1572,7 @@ fn execute_state_transition(
     let writer_pid = writer.id();
     if let Err(error) = wait_for_ready_acknowledgement(
         &mut writer,
-        &ready,
+        &case_root,
         harness,
         case.publication_point,
         writer_pid,
@@ -1121,22 +1596,23 @@ fn execute_state_transition(
         ));
     }
 
-    let recovery_result = case_root.join("recovery.result");
     let mut recovery = Command::new(&executable)
         .env_clear()
-        .current_dir(&case_root)
         .args([
             "quality-fixture",
             harness.recovery_operation.as_str(),
             fixture_root.path.to_str().ok_or_else(|| {
                 XtaskError::invalid_path(&fixture_root.path, "fixture root is not valid UTF-8")
             })?,
-            case_root.to_str().ok_or_else(|| {
-                XtaskError::invalid_path(&case_root, "fixture path is not valid UTF-8")
+            case_root.diagnostic_path.to_str().ok_or_else(|| {
+                XtaskError::invalid_path(
+                    &case_root.diagnostic_path,
+                    "fixture path is not valid UTF-8",
+                )
             })?,
-            recovery_result.to_str().ok_or_else(|| {
-                XtaskError::invalid_path(&recovery_result, "recovery path is not valid UTF-8")
-            })?,
+            owned_identity.as_str(),
+            case_identity.as_str(),
+            "recovery.result",
             harness.recovery_protocol.as_str(),
         ])
         .stdin(Stdio::null())
@@ -1165,7 +1641,7 @@ fn execute_state_transition(
         ));
     }
     let (reopened, recovery_digest) =
-        read_recovery_result(&recovery_result, harness, recovery_pid)?;
+        read_recovery_result(&case_root, "recovery.result", harness, recovery_pid)?;
     let predecessor_or_successor = reopened == case.predecessor || reopened == case.successor;
     if !predecessor_or_successor || reopened != case.expected_reopen {
         return Err(XtaskError::invalid(
@@ -1246,42 +1722,41 @@ fn validate_schedule_mapping(case: &FixtureCase) -> Result<(), XtaskError> {
 
 fn wait_for_ready_acknowledgement(
     writer: &mut std::process::Child,
-    ready: &Path,
+    case_root: &DirectoryCapability,
     harness: &HarnessInterface,
     publication_point: PublicationPoint,
     expected_pid: u32,
 ) -> Result<(), XtaskError> {
     let deadline = Instant::now() + harness.maximum_wait;
     loop {
-        if ready.try_exists().map_err(|source| {
-            XtaskError::io(
-                format!("inspect fixture acknowledgement {}", ready.display()),
-                source,
-            )
-        })? {
-            let bytes = read_bounded_file(ready, MAXIMUM_PROCESS_RECORD_BYTES)?;
+        if let Some(bytes) = case_root.read_bounded_optional(
+            "writer.ready",
+            MAXIMUM_PROCESS_RECORD_BYTES,
+            "fixture acknowledgement",
+        )? {
+            let ready = case_root.diagnostic_path.join("writer.ready");
             let content = std::str::from_utf8(&bytes).map_err(|_| {
-                XtaskError::invalid_path(ready, "fixture acknowledgement is not UTF-8")
+                XtaskError::invalid_path(&ready, "fixture acknowledgement is not UTF-8")
             })?;
             let fields = content.trim_end().split('\t').collect::<Vec<_>>();
             let [protocol, pid, point] = fields.as_slice() else {
                 return Err(XtaskError::invalid_path(
-                    ready,
+                    &ready,
                     "fixture acknowledgement does not contain exactly three fields",
                 ));
             };
             if *protocol != harness.ready_protocol || *point != publication_point.as_str() {
                 return Err(XtaskError::invalid_path(
-                    ready,
+                    &ready,
                     "fixture acknowledgement does not match the registered interface",
                 ));
             }
             let pid = pid.parse::<u32>().map_err(|_| {
-                XtaskError::invalid_path(ready, "fixture acknowledgement PID is invalid")
+                XtaskError::invalid_path(&ready, "fixture acknowledgement PID is invalid")
             })?;
             if pid != expected_pid {
                 return Err(XtaskError::invalid_path(
-                    ready,
+                    &ready,
                     "fixture acknowledgement PID does not match the owned writer",
                 ));
             }
@@ -1367,71 +1842,74 @@ fn force_terminate_and_reap(
 }
 
 fn read_recovery_result(
-    path: &Path,
+    case_root: &DirectoryCapability,
+    name: &str,
     harness: &HarnessInterface,
     expected_pid: u32,
 ) -> Result<(String, String), XtaskError> {
-    let bytes = read_bounded_file(path, MAXIMUM_PROCESS_RECORD_BYTES)?;
+    let path = case_root.diagnostic_path.join(name);
+    let bytes = case_root.read_bounded(name, MAXIMUM_PROCESS_RECORD_BYTES, "recovery result")?;
     let content = std::str::from_utf8(&bytes)
-        .map_err(|_| XtaskError::invalid_path(path, "recovery result is not UTF-8"))?;
+        .map_err(|_| XtaskError::invalid_path(&path, "recovery result is not UTF-8"))?;
     let fields = content.trim_end().split('\t').collect::<Vec<_>>();
     let [protocol, pid, state, digest] = fields.as_slice() else {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             "recovery result does not contain exactly four fields",
         ));
     };
     if *protocol != harness.recovery_protocol {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             "recovery result protocol is not registered",
         ));
     }
     let pid = pid
         .parse::<u32>()
-        .map_err(|_| XtaskError::invalid_path(path, "recovery result PID is invalid"))?;
+        .map_err(|_| XtaskError::invalid_path(&path, "recovery result PID is invalid"))?;
     if pid != expected_pid {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             "recovery result PID does not match the fresh child",
         ));
     }
     let expected_digest = recovered_state_digest(state);
     if *digest != expected_digest {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             "recovery result digest does not bind the observed durable state",
         ));
     }
     Ok(((*state).to_owned(), (*digest).to_owned()))
 }
 
-fn read_bounded_file(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, XtaskError> {
-    let bytes = fs::read(path)
-        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-    if bytes.len() > maximum_bytes {
-        return Err(XtaskError::invalid_path(
-            path,
-            format!("process record exceeds {maximum_bytes} bytes"),
-        ));
-    }
-    Ok(bytes)
-}
-
 pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(), XtaskError> {
-    let arguments = arguments.take(8).collect::<Vec<_>>();
+    let arguments = arguments
+        .take(MAXIMUM_PROCESS_ARGUMENTS + 1)
+        .collect::<Vec<_>>();
+    if arguments.len() > MAXIMUM_PROCESS_ARGUMENTS {
+        return Err(XtaskError::usage(format!(
+            "quality-fixture argument count exceeds the exact maximum of {MAXIMUM_PROCESS_ARGUMENTS}"
+        )));
+    }
     match arguments.as_slice() {
         [
             operation,
             owned_root,
             case_root,
+            owned_identity,
+            case_identity,
             publication_point,
             fault_schedule,
             predecessor,
             successor,
         ] if operation == "writer" => run_writer_process(
-            Path::new(owned_root),
-            Path::new(case_root),
+            &ProcessRootClaim {
+                owned_root: Path::new(owned_root),
+                case_root: Path::new(case_root),
+                owned_identity,
+                case_identity,
+            },
             PublicationPoint::parse(publication_point)?,
             CrashSchedule::parse(fault_schedule)?,
             predecessor,
@@ -1441,12 +1919,18 @@ pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(),
             operation,
             owned_root,
             case_root,
-            result_path,
+            owned_identity,
+            case_identity,
+            result_name,
             recovery_protocol,
         ] if operation == "recover" => run_recovery_process(
-            Path::new(owned_root),
-            Path::new(case_root),
-            Path::new(result_path),
+            &ProcessRootClaim {
+                owned_root: Path::new(owned_root),
+                case_root: Path::new(case_root),
+                owned_identity,
+                case_identity,
+            },
+            result_name,
             recovery_protocol,
         ),
         _ => Err(XtaskError::usage(
@@ -1456,60 +1940,49 @@ pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(),
 }
 
 fn run_writer_process(
-    owned_root: &Path,
-    case_root: &Path,
+    claim: &ProcessRootClaim<'_>,
     publication_point: PublicationPoint,
     fault_schedule: CrashSchedule,
     predecessor: &str,
     successor: &str,
 ) -> Result<(), XtaskError> {
-    validate_process_root(owned_root, case_root)?;
-    validate_field(case_root, 0, "predecessor", predecessor)?;
-    validate_field(case_root, 0, "successor", successor)?;
-    let published = case_root.join("published.state");
-    let candidate = case_root.join("candidate.state");
-    write_state(&published, predecessor)?;
-    sync_directory(case_root)?;
+    let case_root = claim_process_root(claim)?;
+    validate_field(&case_root.diagnostic_path, 0, "predecessor", predecessor)?;
+    validate_field(&case_root.diagnostic_path, 0, "successor", successor)?;
+    let published = "published.state";
+    let candidate = "candidate.state";
+    write_state(&case_root, published, predecessor)?;
+    case_root.sync()?;
     match fault_schedule {
         CrashSchedule::PartialWrite => {
-            write_fault_bytes(&candidate, b"partial-state")?;
+            write_fault_bytes(&case_root, candidate, b"partial-state")?;
         },
         CrashSchedule::FullDisk
         | CrashSchedule::Clock
         | CrashSchedule::Network
         | CrashSchedule::Provider => {
-            let marker = case_root.join(format!("{}.fault", fault_schedule.as_str()));
-            write_fault_bytes(&marker, fault_schedule.as_str().as_bytes())?;
+            let marker = format!("{}.fault", fault_schedule.as_str());
+            write_fault_bytes(&case_root, &marker, fault_schedule.as_str().as_bytes())?;
         },
         CrashSchedule::AfterCandidateSync | CrashSchedule::Crash | CrashSchedule::Cancellation => {
-            write_state(&candidate, successor)?;
+            write_state(&case_root, candidate, successor)?;
         },
         CrashSchedule::Corruption => {
-            write_state(&candidate, successor)?;
-            corrupt_state_file(&candidate)?;
+            write_state(&case_root, candidate, successor)?;
+            corrupt_state_file(&case_root, candidate)?;
         },
         CrashSchedule::AfterPublicationSync | CrashSchedule::Restart => {
-            write_state(&candidate, successor)?;
-            fs::rename(&candidate, &published).map_err(|source| {
-                XtaskError::io(
-                    format!(
-                        "publish state-transition fixture {} as {}",
-                        candidate.display(),
-                        published.display()
-                    ),
-                    source,
-                )
-            })?;
-            sync_directory(case_root)?;
+            write_state(&case_root, candidate, successor)?;
+            case_root.rename(candidate, published)?;
+            case_root.sync()?;
         },
     }
-    let ready = case_root.join("writer.ready");
     let content = format!(
         "publication-point-ready-v1\t{}\t{}\n",
         std::process::id(),
         publication_point.as_str()
     );
-    write_atomic_process_record(&ready, content.as_bytes())?;
+    write_atomic_process_record(&case_root, "writer.ready", content.as_bytes())?;
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -1521,197 +1994,145 @@ fn run_writer_process(
 }
 
 fn run_recovery_process(
-    owned_root: &Path,
-    case_root: &Path,
-    result_path: &Path,
+    claim: &ProcessRootClaim<'_>,
+    result_name: &str,
     recovery_protocol: &str,
 ) -> Result<(), XtaskError> {
-    validate_process_root(owned_root, case_root)?;
+    let case_root = claim_process_root(claim)?;
     if recovery_protocol != "recovery-v1" {
         return Err(XtaskError::invalid(
             "fixture recovery process",
             "recovery protocol is not registered",
         ));
     }
-    if result_path.parent() != Some(case_root) {
-        return Err(XtaskError::invalid_path(
-            result_path,
-            "recovery result must remain directly beneath the case root",
-        ));
-    }
-    let state = read_state(&case_root.join("published.state"))?;
+    validate_leaf_name(&case_root.diagnostic_path, result_name)?;
+    let state = read_state(&case_root, "published.state")?;
     let digest = recovered_state_digest(&state);
     let content = format!(
         "{recovery_protocol}\t{}\t{state}\t{digest}\n",
         std::process::id()
     );
-    write_process_record(result_path, content.as_bytes())?;
-    sync_directory(case_root)
+    write_process_record(&case_root, result_name, content.as_bytes())?;
+    case_root.sync()
 }
 
-fn validate_process_root(owned_root: &Path, case_root: &Path) -> Result<(), XtaskError> {
+fn claim_process_root(claim: &ProcessRootClaim<'_>) -> Result<DirectoryCapability, XtaskError> {
+    let ProcessRootClaim {
+        owned_root,
+        case_root,
+        owned_identity,
+        case_identity,
+    } = claim;
     if !owned_root.is_absolute() || !case_root.is_absolute() {
         return Err(XtaskError::invalid_path(
             case_root,
             "fixture process owned root and case root must be absolute",
         ));
     }
-    let owned_metadata = fs::symlink_metadata(owned_root).map_err(|source| {
-        XtaskError::io(
-            format!("inspect fixture process root {}", owned_root.display()),
-            source,
-        )
-    })?;
-    if !owned_metadata.file_type().is_dir() {
-        return Err(XtaskError::invalid_path(
-            owned_root,
-            "fixture process owned root is not a directory",
-        ));
-    }
-    let canonical_owned_root = fs::canonicalize(owned_root).map_err(|source| {
-        XtaskError::io(
-            format!("canonicalize fixture process root {}", owned_root.display()),
-            source,
-        )
-    })?;
-    if canonical_owned_root != owned_root || case_root.parent() != Some(owned_root) {
+    if case_root.parent() != Some(owned_root) {
         return Err(XtaskError::invalid_path(
             case_root,
             "fixture process case root is not a direct child of the exact owned root",
         ));
     }
-    let case_metadata = fs::symlink_metadata(case_root).map_err(|source| {
-        XtaskError::io(
-            format!("inspect fixture process case {}", case_root.display()),
-            source,
-        )
-    })?;
-    if !case_metadata.file_type().is_dir() {
-        return Err(XtaskError::invalid_path(
-            case_root,
-            "fixture process case root is not a directory",
-        ));
+    let expected_owned = DirectoryIdentity::parse(owned_root, owned_identity)?;
+    let expected_case = DirectoryIdentity::parse(case_root, case_identity)?;
+    let owned = DirectoryCapability::open(owned_root, "fixture process owned root")?;
+    owned.require_identity(expected_owned)?;
+    let case_name = case_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| XtaskError::invalid_path(case_root, "fixture case name is not UTF-8"))?;
+    if let Ok(case) = owned.open_child_directory(case_name, "fixture process case root")
+        && case.identity()? == expected_case
+    {
+        return Ok(case);
     }
-    let canonical = fs::canonicalize(case_root).map_err(|source| {
-        XtaskError::io(
-            format!("canonicalize fixture case root {}", case_root.display()),
-            source,
-        )
-    })?;
-    if canonical != case_root || !canonical.is_dir() || !canonical.starts_with(owned_root) {
-        return Err(XtaskError::invalid_path(
-            case_root,
-            "fixture process case root must be a canonical directory",
-        ));
+    for name in owned.entry_names("fixture process owned root")? {
+        let Ok(case) = owned.open_child_directory(&name, "fixture process case candidate") else {
+            continue;
+        };
+        if case.identity()? == expected_case {
+            return Ok(case);
+        }
     }
-    Ok(())
+    Err(XtaskError::invalid_path(
+        case_root,
+        "fixture process case identity is no longer present beneath the owned root",
+    ))
 }
 
-fn write_process_record(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+fn write_process_record(
+    directory: &DirectoryCapability,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), XtaskError> {
+    let path = directory.diagnostic_path.join(name);
     if bytes.len() > MAXIMUM_PROCESS_RECORD_BYTES {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             format!("process record exceeds {MAXIMUM_PROCESS_RECORD_BYTES} bytes"),
         ));
     }
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|source| XtaskError::io(format!("create {}", path.display()), source))?;
-    file.write_all(bytes)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
-        .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
+    directory.create_file(name, bytes, MAXIMUM_PROCESS_RECORD_BYTES)
 }
 
-fn write_atomic_process_record(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| XtaskError::invalid_path(path, "process record path is not valid UTF-8"))?;
-    let staged = path.with_file_name(format!("{file_name}.staged"));
-    write_process_record(&staged, bytes)?;
-    fs::hard_link(&staged, path).map_err(|source| {
-        XtaskError::io(
-            format!(
-                "publish process record {} as {}",
-                staged.display(),
-                path.display()
-            ),
-            source,
-        )
-    })?;
-    fs::remove_file(&staged)
-        .map_err(|source| XtaskError::io(format!("remove {}", staged.display()), source))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| XtaskError::invalid_path(path, "process record has no parent"))?;
-    sync_directory(parent)
+fn write_atomic_process_record(
+    directory: &DirectoryCapability,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), XtaskError> {
+    validate_leaf_name(&directory.diagnostic_path, name)?;
+    let staged = format!("{name}.staged");
+    write_process_record(directory, &staged, bytes)?;
+    directory.hard_link(&staged, name)?;
+    directory.remove_file(&staged)?;
+    directory.sync()
 }
 
-fn write_fault_bytes(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
-    write_process_record(path, bytes)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| XtaskError::invalid_path(path, "fault artifact has no parent"))?;
-    sync_directory(parent)
+fn write_fault_bytes(
+    directory: &DirectoryCapability,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), XtaskError> {
+    write_process_record(directory, name, bytes)?;
+    directory.sync()
 }
 
-fn corrupt_state_file(path: &Path) -> Result<(), XtaskError> {
-    let mut bytes = read_bounded_file(path, MAXIMUM_STATE_BYTES)?;
+fn corrupt_state_file(directory: &DirectoryCapability, name: &str) -> Result<(), XtaskError> {
+    let path = directory.diagnostic_path.join(name);
+    let mut bytes = directory.read_bounded(name, MAXIMUM_STATE_BYTES, "fixture state")?;
     let byte = bytes
         .first_mut()
-        .ok_or_else(|| XtaskError::invalid_path(path, "state candidate is unexpectedly empty"))?;
+        .ok_or_else(|| XtaskError::invalid_path(&path, "state candidate is unexpectedly empty"))?;
     *byte = if *byte == b'x' { b'y' } else { b'x' };
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
-        .map_err(|source| XtaskError::io(format!("corrupt {}", path.display()), source))
+    directory.replace_file(name, &bytes, MAXIMUM_STATE_BYTES)
 }
 
-fn write_state(path: &Path, state: &str) -> Result<(), XtaskError> {
+fn write_state(directory: &DirectoryCapability, name: &str, state: &str) -> Result<(), XtaskError> {
+    let path = directory.diagnostic_path.join(name);
     let catalog = format!("catalog-{state}");
     let audit = format!("audit-{state}");
     let digest = state_digest(state, &catalog, &audit);
     let content = format!("{state}\n{catalog}\n{audit}\n{digest}\n");
     if content.len() > MAXIMUM_STATE_BYTES {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             format!("fixture state exceeds {MAXIMUM_STATE_BYTES} bytes"),
         ));
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| XtaskError::io(format!("create {}", path.display()), source))?;
-    file.write_all(content.as_bytes())
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
-        .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
+    directory.create_file(name, content.as_bytes(), MAXIMUM_STATE_BYTES)
 }
 
-fn read_state(path: &Path) -> Result<String, XtaskError> {
-    let bytes = fs::read(path)
-        .map_err(|source| XtaskError::io(format!("reopen {}", path.display()), source))?;
-    if bytes.len() > MAXIMUM_STATE_BYTES {
-        return Err(XtaskError::invalid_path(
-            path,
-            format!("reopened fixture state exceeds {MAXIMUM_STATE_BYTES} bytes"),
-        ));
-    }
+fn read_state(directory: &DirectoryCapability, name: &str) -> Result<String, XtaskError> {
+    let path = directory.diagnostic_path.join(name);
+    let bytes = directory.read_bounded(name, MAXIMUM_STATE_BYTES, "reopened fixture state")?;
     let content = std::str::from_utf8(&bytes)
-        .map_err(|_| XtaskError::invalid_path(path, "reopened fixture state is not UTF-8"))?;
+        .map_err(|_| XtaskError::invalid_path(&path, "reopened fixture state is not UTF-8"))?;
     let fields = content.lines().collect::<Vec<_>>();
     let [state, catalog, audit, digest] = fields.as_slice() else {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             "reopened fixture state does not contain exactly four fields",
         ));
     };
@@ -1720,7 +2141,7 @@ fn read_state(path: &Path) -> Result<String, XtaskError> {
         || *digest != state_digest(state, catalog, audit)
     {
         return Err(XtaskError::invalid_path(
-            path,
+            &path,
             "reopened fixture state is mixed or corrupted",
         ));
     }
@@ -1751,22 +2172,25 @@ fn recovered_state_digest(state: &str) -> String {
 
 impl OwnedFixtureRoot {
     fn create(temporary_root: &Path, name: &str) -> Result<Self, XtaskError> {
-        validate_owned_directory(temporary_root, temporary_root, "attempt temporary root")?;
         validate_field(temporary_root, 0, "fixture_root_name", name)?;
-        let path = temporary_root.join(format!("qualification-fixtures-{name}"));
-        match fs::create_dir(&path) {
+        let parent = DirectoryCapability::open(temporary_root, "attempt temporary root")?;
+        let name = format!("qualification-fixtures-{name}");
+        let path = temporary_root.join(&name);
+        let directory = match rustix::fs::mkdirat(&parent.file, name.as_str(), Mode::RWXU) {
             Ok(()) => {
-                sync_directory(&path)?;
-                sync_directory(temporary_root)?;
+                parent.sync()?;
+                parent.open_child_directory(&name, "owned fixture root")?
             },
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(&path).map_err(|inspect| {
-                    XtaskError::io(
-                        format!("inspect occupied fixture root {}", path.display()),
-                        inspect,
-                    )
-                })?;
-                if !metadata.file_type().is_dir() {
+            Err(rustix::io::Errno::EXIST) => {
+                let stat =
+                    rustix::fs::statat(&parent.file, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|source| {
+                            XtaskError::io(
+                                format!("inspect occupied fixture root {}", path.display()),
+                                rustix_io(source),
+                            )
+                        })?;
+                if !FileType::from_raw_mode(stat.st_mode).is_dir() {
                     return Err(XtaskError::invalid_path(
                         &path,
                         "owned fixture directory component is not a directory",
@@ -1780,34 +2204,23 @@ impl OwnedFixtureRoot {
             Err(source) => {
                 return Err(XtaskError::io(
                     format!("create owned fixture root {}", path.display()),
-                    source,
+                    rustix_io(source),
                 ));
             },
-        }
-        validate_owned_directory(temporary_root, &path, "owned fixture root")?;
-        Ok(Self { path, active: true })
+        };
+        Ok(Self {
+            parent,
+            directory,
+            name,
+            path,
+            active: true,
+        })
     }
 
-    fn create_case(&self, fixture_id: &str) -> Result<PathBuf, XtaskError> {
-        validate_owned_directory(
-            self.path.parent().ok_or_else(|| {
-                XtaskError::invalid_path(&self.path, "owned fixture root has no parent")
-            })?,
-            &self.path,
-            "owned fixture root",
-        )?;
+    fn create_case(&self, fixture_id: &str) -> Result<DirectoryCapability, XtaskError> {
         validate_field(&self.path, 0, "fixture_id", fixture_id)?;
-        let case = self.path.join(fixture_id);
-        fs::create_dir(&case).map_err(|source| {
-            XtaskError::io(
-                format!("create owned fixture case {}", case.display()),
-                source,
-            )
-        })?;
-        sync_directory(&case)?;
-        sync_directory(&self.path)?;
-        validate_owned_directory(&self.path, &case, "owned fixture case")?;
-        Ok(case)
+        self.directory
+            .create_child_directory(fixture_id, "owned fixture case")
     }
 
     fn finish<T>(mut self, outcome: Result<T, XtaskError>) -> Result<T, XtaskError> {
@@ -1827,17 +2240,18 @@ impl OwnedFixtureRoot {
         if !self.active {
             return Ok(());
         }
-        let parent = self.path.parent().ok_or_else(|| {
-            XtaskError::invalid_path(&self.path, "owned fixture root has no parent")
-        })?;
-        validate_owned_directory(parent, &self.path, "owned fixture root during cleanup")?;
-        fs::remove_dir_all(&self.path).map_err(|source| {
-            XtaskError::io(
-                format!("remove owned fixture tree {}", self.path.display()),
-                source,
-            )
-        })?;
-        sync_directory(parent).map_err(|error| {
+        remove_directory_contents(&self.directory)?;
+        let identity = self.directory.identity()?;
+        remove_child_directory_by_identity(&self.parent, identity)?;
+        if let Ok(stat) = rustix::fs::statat(
+            &self.parent.file,
+            self.name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) && FileType::from_raw_mode(stat.st_mode).is_symlink()
+        {
+            self.parent.remove_file(&self.name)?;
+        }
+        self.parent.sync().map_err(|error| {
             XtaskError::invalid(
                 "qualification fixture cleanup",
                 format!(
@@ -1859,30 +2273,57 @@ impl Drop for OwnedFixtureRoot {
     }
 }
 
-fn validate_owned_directory(root: &Path, path: &Path, label: &str) -> Result<(), XtaskError> {
-    if !path.starts_with(root) {
-        return Err(XtaskError::invalid_path(
-            path,
-            format!("{label} escaped its owned root"),
-        ));
+fn remove_directory_contents(directory: &DirectoryCapability) -> Result<(), XtaskError> {
+    for name in directory.entry_names("owned fixture directory")? {
+        let stat = rustix::fs::statat(&directory.file, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|source| XtaskError::io("inspect owned fixture entry", rustix_io(source)))?;
+        if FileType::from_raw_mode(stat.st_mode).is_dir() {
+            let child = directory.open_child_directory(&name, "owned fixture cleanup directory")?;
+            remove_directory_contents(&child)?;
+            rustix::fs::unlinkat(&directory.file, name.as_str(), AtFlags::REMOVEDIR).map_err(
+                |source| {
+                    XtaskError::io(
+                        format!(
+                            "remove owned fixture directory {}",
+                            directory.diagnostic_path.join(&name).display()
+                        ),
+                        rustix_io(source),
+                    )
+                },
+            )?;
+        } else {
+            directory.remove_file(&name)?;
+        }
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| XtaskError::io(format!("inspect {label} {}", path.display()), source))?;
-    if !metadata.file_type().is_dir() {
-        return Err(XtaskError::invalid_path(
-            path,
-            "owned fixture directory component is not a directory",
-        ));
+    directory.sync()
+}
+
+fn remove_child_directory_by_identity(
+    parent: &DirectoryCapability,
+    expected: DirectoryIdentity,
+) -> Result<(), XtaskError> {
+    for name in parent.entry_names("fixture parent during cleanup")? {
+        let Ok(child) = parent.open_child_directory(&name, "fixture cleanup candidate") else {
+            continue;
+        };
+        if child.identity()? == expected {
+            return rustix::fs::unlinkat(&parent.file, name.as_str(), AtFlags::REMOVEDIR).map_err(
+                |source| {
+                    XtaskError::io(
+                        format!(
+                            "remove owned fixture root {}",
+                            parent.diagnostic_path.join(&name).display()
+                        ),
+                        rustix_io(source),
+                    )
+                },
+            );
+        }
     }
-    let canonical = fs::canonicalize(path)
-        .map_err(|source| XtaskError::io(format!("canonicalize {label}"), source))?;
-    if canonical != path || !canonical.starts_with(root) {
-        return Err(XtaskError::invalid_path(
-            path,
-            format!("{label} changed identity or escaped its owned root"),
-        ));
-    }
-    Ok(())
+    Err(XtaskError::invalid_path(
+        &parent.diagnostic_path,
+        "owned fixture root identity disappeared before cleanup",
+    ))
 }
 
 fn validate_field(path: &Path, line: usize, field: &str, value: &str) -> Result<(), XtaskError> {
@@ -1900,15 +2341,4 @@ fn validate_field(path: &Path, line: usize, field: &str, value: &str) -> Result<
             "fixture row {line} field `{field}` must be 1..={MAXIMUM_FIELD_BYTES} ASCII alphanumeric or hyphen bytes"
         ),
     ))
-}
-
-fn sync_directory(path: &Path) -> Result<(), XtaskError> {
-    fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| {
-            XtaskError::io(
-                format!("synchronize fixture directory {}", path.display()),
-                source,
-            )
-        })
 }

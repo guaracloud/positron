@@ -4768,15 +4768,21 @@ fn run_test_gate(
 }
 
 fn nextest_completed_test_count(stderr: &str) -> Result<usize, XtaskError> {
-    let summary = stderr
+    let mut summaries = stderr
         .lines()
-        .find_map(|line| line.trim_start().strip_prefix("Summary ["))
-        .ok_or_else(|| {
-            XtaskError::invalid(
-                "nextest result summary",
-                "missing final completed-test count",
-            )
-        })?;
+        .filter_map(|line| line.trim_start().strip_prefix("Summary ["));
+    let summary = summaries.next().ok_or_else(|| {
+        XtaskError::invalid(
+            "nextest result summary",
+            "missing final completed-test count",
+        )
+    })?;
+    if summaries.next().is_some() {
+        return Err(XtaskError::invalid(
+            "nextest result summary",
+            "multiple final completed-test summaries are ambiguous",
+        ));
+    }
     let (_, counts) = summary.split_once("] ").ok_or_else(|| {
         XtaskError::invalid(
             "nextest result summary",
@@ -8232,6 +8238,14 @@ mod tests {
         assert!(
             nextest_completed_test_count("317 tests passed without a canonical summary").is_err(),
             "missing final count evidence must fail closed"
+        );
+        assert!(
+            nextest_completed_test_count(
+                "Summary [ 1.000s] 317 tests run: 317 passed, 0 skipped\n\
+                 Summary [ 1.001s] 317 tests run: 316 passed, 1 skipped\n"
+            )
+            .is_err(),
+            "an early passing summary must not hide a later non-canonical terminal summary"
         );
         Ok(())
     }

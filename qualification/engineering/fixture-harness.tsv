@@ -1,2 +1,2 @@
 interface_id	executable	writer_operation	recovery_operation	ready_protocol	maximum_wait_ms	termination	recovery_protocol	writer_arguments	recovery_arguments
-quality-engineering-state-v1	current-xtask	writer	recover	publication-point-ready-v1	5000	force-kill-and-reap	recovery-v1	owned-root-case-root-publication-point-fault-schedule-predecessor-successor	owned-root-case-root-result-path-recovery-protocol
+quality-engineering-state-v1	current-xtask	writer	recover	publication-point-ready-v1	5000	force-kill-and-reap	recovery-v1	owned-root-case-root-owned-id-case-id-publication-point-fault-schedule-predecessor-successor	owned-root-case-root-owned-id-case-id-result-name-recovery-protocol

@@ -607,6 +607,30 @@ fn quality_proves_forced_writer_termination_and_fresh_process_recovery() -> Test
     result
 }
 
+#[test]
+fn quality_fixture_rejects_trailing_arguments_before_child_dispatch() -> TestResult {
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args([
+            "quality-fixture",
+            "writer",
+            "/owned",
+            "/owned/case",
+            "before-publication",
+            "crash-after-candidate-sync",
+            "state-v1",
+            "state-v2",
+            "unexpected-trailing",
+            "another-trailing",
+            "third-trailing",
+            "fourth-trailing",
+        ])
+        .output()?;
+    assert_rejected_output(
+        &output,
+        "quality-fixture argument count exceeds the exact maximum of 9",
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn quality_rejects_a_fixture_root_symlink_race_without_touching_the_target() -> TestResult {
@@ -671,6 +695,198 @@ fn quality_rejects_a_fixture_root_symlink_race_without_touching_the_target() -> 
             .into());
         }
         Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_keeps_writer_acknowledgement_bound_after_a_post_claim_case_swap() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_fixture_writer_claim_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let tools = fixture.root.join("target/quality-tools");
+        wait_for_path(
+            &tools.join("fixture-writer-claim-ready"),
+            Duration::from_secs(30),
+        )?;
+        let case_root = PathBuf::from(
+            fs::read_to_string(tools.join("fixture-writer-claim-path"))?
+                .trim()
+                .to_owned(),
+        );
+        let claimed = case_root.with_file_name(format!(
+            "{}-claimed",
+            case_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| std::io::Error::other("fixture case name was not UTF-8"))?
+        ));
+        let external = tools.join("fixture-writer-swap-external");
+        fs::create_dir(&external)?;
+        let canary = external.join("canary");
+        fs::write(&canary, b"untouched\n")?;
+        fs::rename(&case_root, &claimed)?;
+        std::os::unix::fs::symlink(&external, &case_root)?;
+        fs::write(tools.join("fixture-writer-claim-release"), b"release\n")?;
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "post-claim writer swap escaped the held case capability: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        assert_external_canary_untouched(&external, &canary)?;
+        assert_no_fixture_trees(&fixture.root)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_symbolic_link_process_acknowledgement_after_claim() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_fixture_writer_claim_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let tools = fixture.root.join("target/quality-tools");
+        wait_for_path(
+            &tools.join("fixture-writer-claim-ready"),
+            Duration::from_secs(30),
+        )?;
+        let case_root = PathBuf::from(
+            fs::read_to_string(tools.join("fixture-writer-claim-path"))?
+                .trim()
+                .to_owned(),
+        );
+        let canary = tools.join("fixture-ack-symlink-canary");
+        fs::write(&canary, b"untouched\n")?;
+        std::os::unix::fs::symlink(&canary, case_root.join("writer.ready"))?;
+        fs::write(tools.join("fixture-writer-claim-release"), b"release\n")?;
+
+        let output = child.wait_with_output()?;
+        assert_rejected_output(&output, "fixture acknowledgement is a symbolic link")?;
+        if fs::read(&canary)? != b"untouched\n" {
+            return Err(std::io::Error::other(
+                "symbolic-link acknowledgement changed its external target",
+            )
+            .into());
+        }
+        assert_no_fixture_trees(&fixture.root)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_an_oversized_process_acknowledgement_before_allocation() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_fixture_writer_claim_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let tools = fixture.root.join("target/quality-tools");
+        wait_for_path(
+            &tools.join("fixture-writer-claim-ready"),
+            Duration::from_secs(30),
+        )?;
+        let case_root = PathBuf::from(
+            fs::read_to_string(tools.join("fixture-writer-claim-path"))?
+                .trim()
+                .to_owned(),
+        );
+        fs::write(case_root.join("writer.ready"), vec![b'x'; 1_025])?;
+        fs::write(tools.join("fixture-writer-claim-release"), b"release\n")?;
+
+        let output = child.wait_with_output()?;
+        assert_rejected_output(&output, "fixture acknowledgement exceeds 1024 bytes")?;
+        assert_no_fixture_trees(&fixture.root)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_keeps_integrity_mutations_bound_after_a_post_claim_case_swap() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-INTEGRITY|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_fixture_integrity_claim_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let tools = fixture.root.join("target/quality-tools");
+        wait_for_path(
+            &tools.join("fixture-integrity-claim-ready"),
+            Duration::from_secs(30),
+        )?;
+        let case_root = PathBuf::from(
+            fs::read_to_string(tools.join("fixture-integrity-claim-path"))?
+                .trim()
+                .to_owned(),
+        );
+        let claimed = case_root.with_file_name(format!(
+            "{}-claimed",
+            case_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| std::io::Error::other("integrity case name was not UTF-8"))?
+        ));
+        let external = tools.join("fixture-integrity-swap-external");
+        fs::create_dir(&external)?;
+        let canary = external.join("canary");
+        fs::write(&canary, b"untouched\n")?;
+        fs::rename(&case_root, &claimed)?;
+        std::os::unix::fs::symlink(&external, &case_root)?;
+        fs::write(tools.join("fixture-integrity-claim-release"), b"release\n")?;
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "post-claim integrity swap escaped the held case capability: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .into());
+        }
+        assert_external_canary_untouched(&external, &canary)?;
+        assert_no_fixture_trees(&fixture.root)
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -835,6 +1051,116 @@ fn quality_rejects_a_malformed_correctness_fixture_registry() -> TestResult {
             .into());
         }
         Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_unconsumed_fixture_gate_row() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let registry = fixture
+            .root
+            .join("qualification/engineering/quality-fixtures.tsv");
+        let mut content = fs::read_to_string(&registry)?;
+        content.push_str(
+            "unconsumed-typo\tEG-CORREXT\tbefore-publication\tcrash-after-candidate-sync\tseed-unconsumed-v1\tstate-v1\tstate-v2\tstate-v1\n",
+        );
+        fs::write(&registry, content)?;
+
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "fixture gate `EG-CORREXT` is not an exact consumed gate",
+        )?;
+        let evidence = fixture.latest_evidence()?;
+        for gate in ["EG-CORRECT", "EG-FAULT"] {
+            if !gate_record(&evidence, gate)?.contains("\"result\": \"failed\"") {
+                return Err(std::io::Error::other(format!(
+                    "unconsumed fixture row did not fail `{gate}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_symbolic_link_frozen_fixture_input() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        let registry = fixture
+            .root
+            .join("qualification/engineering/quality-fixtures.tsv");
+        let external = fixture
+            .root
+            .join("target/quality-tools/external-quality-fixtures.tsv");
+        fs::write(&external, fs::read(&registry)?)?;
+        fs::remove_file(&registry)?;
+        std::os::unix::fs::symlink(&external, &registry)?;
+
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "registry symlinks are forbidden")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_symbolic_link_during_frozen_fixture_capture() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let manifest = fixture
+            .root
+            .join("qualification/fixtures/adversarial/manifest.json");
+        let external = fixture
+            .root
+            .join("target/quality-tools/external-adversarial-manifest.json");
+        fs::write(&external, fs::read(&manifest)?)?;
+        fs::remove_file(&manifest)?;
+        std::os::unix::fs::symlink(&external, &manifest)?;
+
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "fixture identity input is a symbolic link")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_oversized_frozen_fixture_before_allocating_its_contents() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("qualification/fixtures/adversarial/manifest.json"),
+            vec![b'x'; 65_537],
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "fixture identity input exceeds 65536 bytes")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -3962,6 +4288,24 @@ fn assert_no_fixture_trees(root: &Path) -> TestResult {
 }
 
 #[cfg(unix)]
+fn assert_external_canary_untouched(external: &Path, canary: &Path) -> TestResult {
+    if fs::read(canary)? != b"untouched\n" {
+        return Err(std::io::Error::other("fixture swap changed the external canary").into());
+    }
+    let mut entries = fs::read_dir(external)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    if entries != [std::ffi::OsString::from("canary")] {
+        return Err(std::io::Error::other(
+            "fixture swap created or removed content outside the owned root",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn run_parallel_reservation_racers(
     fixture: &Fixture,
     barrier_candidate: &str,
@@ -4781,8 +5125,8 @@ fn inject_fixture_root_claim_barrier(root: &Path) -> TestResult {
     let source = root.join("tools/xtask/src/qualification_fixtures.rs");
     replace_once(
         &source,
-        "    fn create(temporary_root: &Path, name: &str) -> Result<Self, XtaskError> {\n        validate_owned_directory(temporary_root, temporary_root, \"attempt temporary root\")?;\n",
-        "    fn create(temporary_root: &Path, name: &str) -> Result<Self, XtaskError> {\n        fixture_root_claim_barrier(temporary_root)?;\n        validate_owned_directory(temporary_root, temporary_root, \"attempt temporary root\")?;\n",
+        "        let parent = DirectoryCapability::open(temporary_root, \"attempt temporary root\")?;\n        let name = format!(\"qualification-fixtures-{name}\");\n",
+        "        let parent = DirectoryCapability::open(temporary_root, \"attempt temporary root\")?;\n        fixture_root_claim_barrier(temporary_root)?;\n        let name = format!(\"qualification-fixtures-{name}\");\n",
     )?;
     replace_once(
         &source,
@@ -4824,12 +5168,75 @@ impl OwnedFixtureRoot {
 }
 
 #[cfg(unix)]
+fn inject_fixture_writer_claim_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    replace_once(
+        &source,
+        "    let case_root = claim_process_root(claim)?;\n    validate_field(&case_root.diagnostic_path, 0, \"predecessor\", predecessor)?;\n",
+        "    let case_root = claim_process_root(claim)?;\n    fixture_case_claim_barrier(&case_root.diagnostic_path, \"writer\")?;\n    validate_field(&case_root.diagnostic_path, 0, \"predecessor\", predecessor)?;\n",
+    )?;
+    inject_fixture_case_claim_barrier(&source)
+}
+
+#[cfg(unix)]
+fn inject_fixture_integrity_claim_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    replace_once(
+        &source,
+        "    let case_root = fixture_root.create_case(&case.fixture_id)?;\n    let original = \"prior-attempt.evidence\";\n",
+        "    let case_root = fixture_root.create_case(&case.fixture_id)?;\n    fixture_case_claim_barrier(&case_root.diagnostic_path, \"integrity\")?;\n    let original = \"prior-attempt.evidence\";\n",
+    )?;
+    inject_fixture_case_claim_barrier(&source)
+}
+
+#[cfg(unix)]
+fn inject_fixture_case_claim_barrier(source: &Path) -> TestResult {
+    replace_once(
+        source,
+        "fn execute_integrity_case(\n",
+        r#"fn fixture_case_claim_barrier(case_root: &Path, kind: &str) -> Result<(), XtaskError> {
+    let workspace = case_root
+        .ancestors()
+        .find(|candidate| candidate.join("project-positron.md").is_file())
+        .ok_or_else(|| XtaskError::invalid_path(case_root, "fixture case has no workspace ancestor"))?;
+    let tools = workspace.join("target/quality-tools");
+    let path = tools.join(format!("fixture-{kind}-claim-path"));
+    let ready = tools.join(format!("fixture-{kind}-claim-ready"));
+    let release = tools.join(format!("fixture-{kind}-claim-release"));
+    fs::write(&path, case_root.as_os_str().as_encoded_bytes())
+        .map_err(|source| XtaskError::io("publish fixture case claim path", source))?;
+    fs::write(&ready, b"ready\n")
+        .map_err(|source| XtaskError::io("publish fixture case claim readiness", source))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if release
+            .try_exists()
+            .map_err(|source| XtaskError::io("inspect fixture case claim barrier", source))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(XtaskError::invalid(
+                "fixture case claim barrier",
+                "case swapper did not release the barrier",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn execute_integrity_case(
+"#,
+    )
+}
+
+#[cfg(unix)]
 fn inject_fixture_writer_timeout(root: &Path) -> TestResult {
     let source = root.join("tools/xtask/src/qualification_fixtures.rs");
     replace_once(
         &source,
-        "    validate_process_root(owned_root, case_root)?;\n    validate_field(case_root, 0, \"predecessor\", predecessor)?;\n",
-        "    validate_process_root(owned_root, case_root)?;\n    fixture_writer_timeout(case_root)?;\n    validate_field(case_root, 0, \"predecessor\", predecessor)?;\n",
+        "    let case_root = claim_process_root(claim)?;\n    validate_field(&case_root.diagnostic_path, 0, \"predecessor\", predecessor)?;\n",
+        "    let case_root = claim_process_root(claim)?;\n    fixture_writer_timeout(&case_root.diagnostic_path)?;\n    validate_field(&case_root.diagnostic_path, 0, \"predecessor\", predecessor)?;\n",
     )?;
     replace_once(
         &source,

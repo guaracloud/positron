@@ -15,15 +15,93 @@
     "issue": 8,
     "semantic_owner": "Quality Engineering",
     "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
+    "dependency_review": {
+      "necessity": "Rust std does not expose safe descriptor-relative create, open, link, rename, unlink, or directory enumeration APIs on all four registered macOS and Linux hosts. rustix is scoped only to xtask and supplies the safe I/O-owned wrappers needed to close validation/use races without a Positron unsafe boundary.",
+      "direct": {
+        "package": "rustix",
+        "version": "1.1.4",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190",
+        "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+        "features": [
+          "fs",
+          "std"
+        ],
+        "default_features": false,
+        "security": "The boundary uses rustix OwnedFd and safe openat, mkdirat, linkat, renameat, unlinkat, statat, and Dir APIs with O_NOFOLLOW and exact resource bounds. cargo audit reported no vulnerability for the 47-package lock graph; cargo deny accepted advisories, licenses, sources, and exact rustix 1.1.4 bans; Cargo Vet accepted the exact safe-to-deploy entry.",
+        "maintenance": "Bytecode Alliance maintains rustix with a published security-reporting process. Exact 1.1.4 is the current reviewed release, declares rust-version 1.63, and documents the required safe fs APIs for the registered Apple and Linux targets.",
+        "removal": "Remove when Rust std provides portable safe descriptor-relative filesystem operations on every registered host."
+      },
+      "newly_resolved_transitives": [
+        {
+          "package": "bitflags",
+          "version": "2.13.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da",
+          "license": "MIT OR Apache-2.0",
+          "features": "std only through rustix std",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained at github.com/bitflags/bitflags; exact release declares rust-version 1.56.0.",
+          "removal": "Removed transitively when rustix is removed or no longer requires bitflags."
+        },
+        {
+          "package": "errno",
+          "version": "0.3.14",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
+          "license": "MIT OR Apache-2.0",
+          "features": "std on Apple hosts; not selected by the Linux raw backend",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained at github.com/lambda-fairy/rust-errno; exact release declares rust-version 1.56.",
+          "removal": "Removed transitively when rustix is removed or no longer requires the libc errno backend."
+        },
+        {
+          "package": "linux-raw-sys",
+          "version": "0.12.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53",
+          "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+          "features": "auxvec, elf, errno, general, ioctl, no_std on registered Linux hosts only",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained by rustix contributors at github.com/sunfishcode/linux-raw-sys; exact release declares rust-version 1.63.",
+          "removal": "Removed transitively when rustix is removed or switches away from the Linux raw backend."
+        },
+        {
+          "package": "windows-link",
+          "version": "0.2.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+          "license": "MIT OR Apache-2.0",
+          "features": "none; lock-only target dependency, not compiled on the four registered hosts",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained by Microsoft at github.com/microsoft/windows-rs; exact release declares rust-version 1.71.",
+          "removal": "Removed from the lock graph when rustix and its Windows target dependency are removed."
+        },
+        {
+          "package": "windows-sys",
+          "version": "0.61.2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+          "license": "MIT OR Apache-2.0",
+          "features": "lock-only Windows target features; not compiled on the four registered hosts",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained by Microsoft at github.com/microsoft/windows-rs; exact release declares rust-version 1.71.",
+          "removal": "Removed from the lock graph when rustix and errno no longer resolve Windows target support."
+        }
+      ],
+      "resolution": "Cargo.lock intentionally adds only rustix 1.1.4 and the five exact transitives above. No prior dependency or exemption version changed, and no existing exemption criterion was broadened."
+    },
     "runner_changes": [
       "The active xtask tooling scope participates in risk-gate selection only through its own registered risk_gates set; no application, artifact, or deferred gate is inferred.",
       "One immutable execution context captures bounded adversarial-manifest, quality-registry, integrity-registry, and fixture-harness bytes once; it parses the typed registries once and derives fixture, seed, and schedule identity from those exact bytes. Evidence identity and all three runners receive that same context and never reread the registered inputs.",
       "EG-CORRECT launches the explicitly registered current-xtask Quality Engineering writer process with a cleared environment, waits within the registered deadline for an atomically published exact PID and publication-point acknowledgement, force-kills and reaps the writer, launches a distinct recovery process, and accepts only its externally readable predecessor-or-successor state and recovery digest.",
       "EG-FAULT maps nine typed publication points one-to-one to the required partial-write, crash, restart, corruption, full-disk, clock, cancellation, network, and provider schedules. Every writer is force-killed and reaped at its acknowledged point and every verdict comes from a fresh recovery process over durable state.",
       "EG-INTEGRITY persists identity-bound fixture objects, reopens the golden object, corrupts and deletes attempt-owned copies, requires digest-mismatch and missing-object failures, and proves the untouched prior object remains readable after each adversarial case.",
-      "Each gate claims one must-create no-follow fixture root directly beneath the canonical attempt TMPDIR. Occupied, symbolic-link, non-directory, escaped, and identity-changed paths fail before child launch or filesystem mutation.",
+      "Each gate claims one must-create no-follow fixture root directly beneath the canonical attempt TMPDIR, then performs every fixture create, read, write, copy, link, rename, removal, and recursive cleanup relative to held directory descriptors. Writer and recovery children verify exact device/inode identity tokens before mutation; occupied, symbolic-link, non-directory, escaped, swapped, and identity-changed paths fail closed.",
       "An RAII owner reconciles the exact attempt-owned gate tree on success, detector failure, forced writer termination, recovery failure, and timeout; it synchronizes the attempt parent after removal, converts cleanup failure into a failed gate, and retains only immutable process observations and recovery digests in raw evidence.",
-      "EG-TEST retains its exact locked workspace, all-targets, all-features, no-retry CI selection and the existing 131072-byte per-stream ceiling. Its Nextest invocation overrides only live and final status verbosity to failure level, preserves immediate-final failure output from the registered CI profile, parses the canonical final summary, rejects missing counts or any skipped test, and retains the completed-test count in the gate detail."
+      "All frozen fixture inputs and process records are opened no-follow through their held parent descriptors, checked against their byte ceiling before allocation, read through a maximum-plus-one stream bound into a pre-reserved buffer, and rejected if their opened identity or metadata drifts during the read.",
+      "The internal quality-fixture child interface accepts only its exact registered writer or recovery arity, including parent-claimed directory identities, and rejects any trailing argument before dispatch.",
+      "EG-TEST retains its exact locked workspace, all-targets, all-features, no-retry CI selection and the existing 131072-byte per-stream ceiling. Its Nextest invocation overrides only live and final status verbosity to failure level, preserves immediate-final failure output from the registered CI profile, requires exactly one terminal canonical summary, rejects missing or ambiguous counts and any skipped test, and retains the completed-test count in the gate detail."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, coordinators, timeouts, memory declarations, exception classes, targets, thresholds, and application activation ledgers.",
