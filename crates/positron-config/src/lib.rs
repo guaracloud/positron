@@ -895,29 +895,46 @@ fn preflight_toml(file: &str) -> Result<(), ConfigurationFailure> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum QuoteState {
+    Unquoted,
+    Basic,
+    BasicEscape,
+    Literal,
+}
+
 fn content_before_comment(line: &str) -> Result<&str, ConfigurationFailure> {
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if character == '\\' => escaped = true,
-            Some('"') if character == '"' => quote = None,
-            Some('\'') if character == '\'' => quote = None,
-            Some(_) => {},
-            None if character == '"' || character == '\'' => quote = Some(character),
-            None if character == '#' => {
-                return line
-                    .get(..index)
-                    .ok_or_else(|| document_failure(ConfigurationFailureCode::Malformed));
+    let mut state = QuoteState::Unquoted;
+    for (index, byte) in line.bytes().enumerate() {
+        state = match state {
+            QuoteState::BasicEscape => QuoteState::Basic,
+            QuoteState::Basic => match byte {
+                b'\\' => QuoteState::BasicEscape,
+                b'"' => QuoteState::Unquoted,
+                _ => QuoteState::Basic,
             },
-            None => {},
-        }
+            QuoteState::Literal => match byte {
+                b'\'' => QuoteState::Unquoted,
+                _ => QuoteState::Literal,
+            },
+            QuoteState::Unquoted => match byte {
+                b'"' => QuoteState::Basic,
+                b'\'' => QuoteState::Literal,
+                b'#' => {
+                    return line
+                        .get(..index)
+                        .ok_or_else(|| document_failure(ConfigurationFailureCode::Malformed));
+                },
+                _ => QuoteState::Unquoted,
+            },
+        };
     }
-    if quote.is_some() {
-        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    match state {
+        QuoteState::Unquoted => Ok(line),
+        QuoteState::Basic | QuoteState::BasicEscape | QuoteState::Literal => {
+            Err(document_failure(ConfigurationFailureCode::Malformed))
+        },
     }
-    Ok(line)
 }
 
 fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
@@ -945,24 +962,33 @@ fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
 }
 
 fn unquoted_equals(line: &str) -> Result<Option<usize>, ConfigurationFailure> {
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if character == '\\' => escaped = true,
-            Some('"') if character == '"' => quote = None,
-            Some('\'') if character == '\'' => quote = None,
-            Some(_) => {},
-            None if character == '"' || character == '\'' => quote = Some(character),
-            None if character == '=' => return Ok(Some(index)),
-            None => {},
-        }
+    let mut state = QuoteState::Unquoted;
+    for (index, byte) in line.bytes().enumerate() {
+        state = match state {
+            QuoteState::BasicEscape => QuoteState::Basic,
+            QuoteState::Basic => match byte {
+                b'\\' => QuoteState::BasicEscape,
+                b'"' => QuoteState::Unquoted,
+                _ => QuoteState::Basic,
+            },
+            QuoteState::Literal => match byte {
+                b'\'' => QuoteState::Unquoted,
+                _ => QuoteState::Literal,
+            },
+            QuoteState::Unquoted => match byte {
+                b'"' => QuoteState::Basic,
+                b'\'' => QuoteState::Literal,
+                b'=' => return Ok(Some(index)),
+                _ => QuoteState::Unquoted,
+            },
+        };
     }
-    if quote.is_some() {
-        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    match state {
+        QuoteState::Unquoted => Ok(None),
+        QuoteState::Basic | QuoteState::BasicEscape | QuoteState::Literal => {
+            Err(document_failure(ConfigurationFailureCode::Malformed))
+        },
     }
-    Ok(None)
 }
 
 fn preflight_key(key: &str) -> Result<(), ConfigurationFailure> {

@@ -1441,6 +1441,122 @@ fn quoted_key_separator_scanning_preserves_syntax_and_resource_precedence() {
 }
 
 #[test]
+fn basic_string_escape_state_preserves_complete_values_and_failure_precedence()
+-> Result<(), ConfigurationFailure> {
+    let escaped_backslash = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = \"/keys/root\\\\branch#=tail\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    let literal_backslash = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = '/keys/root\\branch#=tail'\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    assert!(escaped_backslash.local_key_file() == literal_backslash.local_key_file());
+
+    let escaped_quote = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = \"/keys/root\\\"quote#=tail\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    let literal_quote = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = '/keys/root\"quote#=tail'\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    assert!(escaped_quote.local_key_file() == literal_quote.local_key_file());
+
+    let oversized_after_escaped_quote = format!(
+        "schema_version = 1\n[security]\nlocal_key_file = \"/keys/root\\\"#={}\"\n",
+        "x".repeat(250)
+    );
+    assert_document_rejection(
+        inputs(Some(&oversized_after_escaped_quote), [], []).and_then(resolve),
+        ConfigurationFailureCode::ResourceLimit,
+    );
+    Ok(())
+}
+
+#[test]
+fn quoted_key_quote_state_preserves_complete_token_boundaries() {
+    for quoted_key in [
+        "\"unknown\\\\key#=tail\"",
+        "\"unknown\\\"quote#=tail\"",
+        "'unknown=key#tail'",
+        "''",
+    ] {
+        let document = format!("schema_version = 1\n{quoted_key} = 1\n");
+        assert_document_rejection(
+            inputs(Some(&document), [], []).and_then(resolve),
+            ConfigurationFailureCode::Malformed,
+        );
+    }
+
+    let exact_basic_key = format!("\"{}\\\"=#\"", "b".repeat(58));
+    assert_eq!(exact_basic_key.len(), 64);
+    let exact_basic_document = format!("schema_version = 1\n{exact_basic_key} = 1\n");
+    assert_document_rejection(
+        inputs(Some(&exact_basic_document), [], []).and_then(resolve),
+        ConfigurationFailureCode::Malformed,
+    );
+
+    let oversized_basic_key = format!("\"{}\\\"=#\"", "b".repeat(59));
+    assert_eq!(oversized_basic_key.len(), 65);
+    let oversized_basic_document = format!("schema_version = 1\n{oversized_basic_key} = 1\n");
+    assert_document_rejection(
+        inputs(Some(&oversized_basic_document), [], []).and_then(resolve),
+        ConfigurationFailureCode::ResourceLimit,
+    );
+
+    let exact_literal_key = format!("'{}=#'", "l".repeat(60));
+    assert_eq!(exact_literal_key.len(), 64);
+    let exact_literal_document = format!("schema_version = 1\n{exact_literal_key} = 1\n");
+    assert_document_rejection(
+        inputs(Some(&exact_literal_document), [], []).and_then(resolve),
+        ConfigurationFailureCode::Malformed,
+    );
+
+    let oversized_literal_key = format!("'{}=#'", "l".repeat(61));
+    assert_eq!(oversized_literal_key.len(), 65);
+    let oversized_literal_document = format!("schema_version = 1\n{oversized_literal_key} = 1\n");
+    assert_document_rejection(
+        inputs(Some(&oversized_literal_document), [], []).and_then(resolve),
+        ConfigurationFailureCode::ResourceLimit,
+    );
+
+    for unmatched in [
+        "schema_version = 1\n'unterminated=# = 1\n",
+        "schema_version = 1\n[security]\nlocal_key_file = '/keys/root=#tail\n",
+    ] {
+        assert_document_rejection(
+            inputs(Some(unmatched), [], []).and_then(resolve),
+            ConfigurationFailureCode::Malformed,
+        );
+    }
+}
+
+#[test]
 fn array_table_syntax_precedes_ordinary_table_name_resource_classification() {
     let long_array_name = "a".repeat(63);
     let incomplete_long_array_name = "a".repeat(65);

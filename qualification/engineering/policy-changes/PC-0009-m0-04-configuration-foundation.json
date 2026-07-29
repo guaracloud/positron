@@ -296,6 +296,47 @@
       }
     ]
   },
+  "followup_quote_state_mutation_miss_to_remediation_map": {
+    "trusted_source_revision": "17e91fb90df607e9a46972e350d08cb8bf51c78b",
+    "trusted_run_id": 30424056990,
+    "trusted_artifact_id": 8713174775,
+    "classification_counts": {
+      "real": 5,
+      "semantic_equivalent_or_impossible": 0,
+      "total": 5
+    },
+    "groups": [
+      {
+        "owner": "content_before_comment",
+        "classification": "real",
+        "misses": [
+          "1: replace double-quote backslash guard with false at lib.rs:904:26"
+        ],
+        "public_invariant": "A basic-string escaped quote keeps following comment and separator markers inside the complete scalar token. If that complete token exceeds 256 bytes, preflight returns ResourceLimit from ConfigurationDocument before setting-specific path validation.",
+        "remediation": "basic_string_escape_state_preserves_complete_values_and_failure_precedence resolves escaped-backslash and escaped-quote values containing hash and equals bytes, then asserts the exact document-level ResourceLimit precedence for an oversized token. The owner now models escaped basic-string input as an explicit BasicEscape state instead of a mutable boolean guard."
+      },
+      {
+        "owner": "unquoted_equals",
+        "classification": "real",
+        "misses": [
+          "2: replace double-quote backslash guard with false at lib.rs:953:26"
+        ],
+        "public_invariant": "An escaped quote inside a standards-compliant basic quoted key does not close the key or expose its embedded equals sign as the assignment separator; the complete 64/65-byte key token is measured first.",
+        "remediation": "quoted_key_quote_state_preserves_complete_token_boundaries covers escaped backslash and escaped quote key forms with hash and equals bytes and the exact 64-byte Malformed versus 65-byte ResourceLimit boundary. The owner retains the bounded scan through an explicit BasicEscape state."
+      },
+      {
+        "owner": "unquoted_equals",
+        "classification": "real",
+        "misses": [
+          "3: replace single-quote close guard with true at lib.rs:955:27",
+          "4: replace single-quote close guard with false at lib.rs:955:27",
+          "5: replace single-quote close == with != at lib.rs:955:37"
+        ],
+        "public_invariant": "A standards-compliant literal quoted key closes only on its next single quote. Embedded equals and hash bytes remain key bytes, complete 64/65-byte tokens preserve Malformed versus ResourceLimit precedence, and unmatched literal keys or values return Malformed.",
+        "remediation": "quoted_key_quote_state_preserves_complete_token_boundaries covers supported literal values, complete and empty quoted keys, exact 64/65-byte literal key tokens, and unmatched key/value forms. The owner now uses explicit Literal and Unquoted state transitions rather than mutable single-quote guards."
+      }
+    ]
+  },
   "attempts": [
     {
       "id": "m0-01-activation-only-ledger",
@@ -683,6 +724,60 @@
         "cargo clippy --locked --package positron-config --all-targets --all-features -- -D warnings"
       ],
       "result": "The focused array-table test and all 33 public configuration tests passed with exact typed source/code/outcome assertions. Formatting and focused positron-config Clippy passed with warnings denied. No local coverage, mutation, or extended profile ran, and no trusted mutation outcome is predicted."
+    },
+    {
+      "id": "trusted-exact-head-five-quote-state-survivors",
+      "status": "failed-trusted-ci",
+      "command": "cargo xtask quality --profile ext --retain-m0-04-mutation",
+      "source_revision": "17e91fb90df607e9a46972e350d08cb8bf51c78b",
+      "source_dirty": false,
+      "trusted_ci": true,
+      "run_id": 30424056990,
+      "artifact_id": 8713174775,
+      "artifact_name": "extended-evidence-30424056990-1-17e91fb90df607e9a46972e350d08cb8bf51c78b",
+      "artifact_digest": "sha256:487d496eb79714a699d480726acaddd9a85ad3eb30768af6ae47b74f6b5269e9",
+      "evidence_attempt": "1785302319784-17e91fb90df6-29039",
+      "coverage": {
+        "line": "735/777 (94.5945945945946 percent)",
+        "region": "1019/1066 (95.59099437148218 percent)",
+        "branch": "153/164 (93.29268292682929 percent)"
+      },
+      "mutation": {
+        "total": 173,
+        "caught": 117,
+        "unviable": 51,
+        "missed": 5,
+        "timeouts": 0
+      },
+      "result": "The unchanged line and region floors passed, but EG-COVERAGE failed closed because the retained focused mutation command exited with five quote-state survivors. EG-SAFETY, EG-SECURITY, and every other selected gate passed. The exact attempt and artifact remain immutable and not merge-eligible."
+    },
+    {
+      "id": "quote-state-public-test-construction-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation",
+      "result": "The first public test construction did not compile because assert_eq required Debug from the intentionally opaque ProtectedFileReference. The assertions were corrected to use public equality without adding or exposing secret-bearing Debug output."
+    },
+    {
+      "id": "quote-state-public-tests-before-scanner-refactor",
+      "status": "passed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation",
+      "result": "All 35 public configuration tests passed on the canonical implementation before scanner refactoring. The new tests distinguish the five retained mutants through resolved values and exact typed syntax/resource/source precedence; no local mutation command was run."
+    },
+    {
+      "id": "quote-state-scanner-format-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo fmt --all -- --check",
+      "result": "Rustfmt reported one test-only assertion layout difference. cargo fmt --all applied only that mechanical formatting."
+    },
+    {
+      "id": "quote-state-scanner-focused-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package positron-config --test configuration_foundation",
+        "cargo fmt --all -- --check",
+        "cargo clippy --locked --package positron-config --all-targets --all-features -- -D warnings"
+      ],
+      "result": "All 35 public configuration tests passed after replacing mutable quote guards with explicit bounded Unquoted, Basic, BasicEscape, and Literal states in both registered owners. Formatting and focused positron-config Clippy passed with warnings denied. No local coverage, mutation, or extended profile ran."
     }
   ],
   "detection_gained": [
