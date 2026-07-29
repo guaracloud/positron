@@ -1493,7 +1493,7 @@ fn run_bounded_runner_gate(
             verdict
         },
         Err(error) => {
-            let lifecycle = match error.shutdown {
+            let lifecycle = match error.shutdown.as_deref() {
                 Some(observed) => format!(
                     "process-lifecycle-v1;phase={};termination-requested={};process-reaped={};live={};shutdown-ms={};process-shutdown-elapsed-ms={};resource-shutdown-elapsed-ms={};shutdown-elapsed-ms={}",
                     error.phase.as_str(),
@@ -1511,20 +1511,32 @@ fn run_bounded_runner_gate(
                     shutdown.as_millis(),
                 ),
             };
+            let reconciliation =
+                error
+                    .reconciliation
+                    .as_deref()
+                    .map_or_else(String::new, |observed| {
+                        format!(
+                            "; reconciliation-phase={}; reconciliation-detail={}",
+                            observed.phase.as_str(),
+                            observed.detail,
+                        )
+                    });
             let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
             capture.record(
                 invocation,
                 &step_verdict,
                 "",
-                &format!("{}; {lifecycle}", error.detail),
+                &format!("{}{}; {lifecycle}", error.detail, reconciliation),
             )?;
             remove_optional_bounded_runner_outcome(&outcome_path)?;
             return Err(XtaskError::invalid(
                 "bounded runner process lifecycle",
                 format!(
-                    "controlled runner failed during {}: {}; {}",
+                    "controlled runner failed during {}: {}{}; {}",
                     error.phase.as_str(),
                     error.detail,
+                    reconciliation,
                     lifecycle,
                 ),
             ));

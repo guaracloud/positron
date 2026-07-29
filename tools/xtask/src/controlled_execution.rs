@@ -228,6 +228,8 @@ pub(crate) struct ExecutionFailure {
     pub(crate) detail: String,
     /// Honest reconciliation observations when a launched process was shut down.
     pub(crate) shutdown: Option<Box<ShutdownEvidence>>,
+    /// A cleanup failure observed while preserving the originating failure.
+    pub(crate) reconciliation: Option<Box<ReconciliationFailure>>,
 }
 
 impl ExecutionFailure {
@@ -237,8 +239,44 @@ impl ExecutionFailure {
             phase,
             detail: detail.into(),
             shutdown: None,
+            reconciliation: None,
         }
     }
+
+    fn with_reconciliation(mut self, failure: Self) -> Self {
+        let nested = failure.reconciliation;
+        let observed = ReconciliationFailure {
+            phase: failure.phase,
+            detail: failure.detail,
+        };
+        match self.reconciliation.as_mut() {
+            Some(existing) => {
+                existing.detail.push_str("; additional ");
+                existing.detail.push_str(observed.phase.as_str());
+                existing.detail.push_str(" reconciliation failure: ");
+                existing.detail.push_str(&observed.detail);
+            },
+            None => self.reconciliation = Some(Box::new(observed)),
+        }
+        if let Some(nested) = nested
+            && let Some(existing) = self.reconciliation.as_mut()
+        {
+            existing.detail.push_str("; additional ");
+            existing.detail.push_str(nested.phase.as_str());
+            existing.detail.push_str(" reconciliation failure: ");
+            existing.detail.push_str(&nested.detail);
+        }
+        self
+    }
+}
+
+/// Typed secondary context from cleanup after an originating failure.
+#[derive(Debug)]
+pub(crate) struct ReconciliationFailure {
+    /// The phase reported by the failed cleanup operation.
+    pub(crate) phase: FailurePhase,
+    /// Bounded diagnostic context for that cleanup operation.
+    pub(crate) detail: String,
 }
 
 /// Observed shutdown behavior for a failed controlled invocation.
@@ -326,7 +364,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
             ));
         },
     };
-    let group = ProcessGroup::new(child.id(), specification.tools.process_control.clone());
+    let group = ProcessGroup::new(child.id());
     let mut workers = match OwnedWorkers::start(
         &mut child,
         OwnedWorkersRequest {
@@ -462,11 +500,12 @@ fn finish_after_setup_failure(
 ) -> ExecutionOutcome {
     let shutdown_started = Instant::now();
     let Some(shutdown_deadline) = shutdown_started.checked_add(shutdown_timeout) else {
-        return ExecutionOutcome::Failed(ExecutionFailure::new(
-            failure.command,
+        let cleanup = ExecutionFailure::new(
+            failure.command.clone(),
             FailurePhase::Cleanup,
             "the setup-failure shutdown deadline cannot be represented",
-        ));
+        );
+        return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
     };
     let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
     let process_elapsed = shutdown_started.elapsed();
@@ -481,22 +520,22 @@ fn finish_after_setup_failure(
         elapsed: process_elapsed,
     };
     if process_elapsed > shutdown_timeout {
-        let mut cleanup = ExecutionFailure::new(
-            failure.command,
+        let cleanup = ExecutionFailure::new(
+            failure.command.clone(),
             FailurePhase::Cleanup,
             "controlled setup reconciliation exceeded the registered shutdown deadline",
         );
-        cleanup.shutdown = Some(Box::new(evidence));
-        return ExecutionOutcome::Failed(cleanup);
+        failure.shutdown = Some(Box::new(evidence));
+        return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
     }
     match cleanup {
         Ok(()) => {
             failure.shutdown = Some(Box::new(evidence));
             ExecutionOutcome::Failed(failure)
         },
-        Err(mut cleanup) => {
-            cleanup.shutdown = Some(Box::new(evidence));
-            ExecutionOutcome::Failed(cleanup)
+        Err(cleanup) => {
+            failure.shutdown = Some(Box::new(evidence));
+            ExecutionOutcome::Failed(failure.with_reconciliation(cleanup))
         },
     }
 }
@@ -513,11 +552,12 @@ fn finish_after_execution_failure(
     let shutdown_deadline = match shutdown_started.checked_add(shutdown_timeout) {
         Some(deadline) => deadline,
         None => {
-            return ExecutionOutcome::Failed(ExecutionFailure::new(
-                failure.command,
+            let cleanup = ExecutionFailure::new(
+                failure.command.clone(),
                 FailurePhase::Cleanup,
                 "the registered shutdown deadline cannot be represented",
-            ));
+            );
+            return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
         },
     };
     let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
@@ -536,29 +576,32 @@ fn finish_after_execution_failure(
         resource_elapsed,
         elapsed,
     };
-    if elapsed > shutdown_timeout {
-        let mut cleanup = ExecutionFailure::new(
-            failure.command,
+    let mut reconciliation = if elapsed > shutdown_timeout {
+        Some(ExecutionFailure::new(
+            failure.command.clone(),
             FailurePhase::Cleanup,
             "controlled reconciliation exceeded the registered shutdown deadline",
-        );
-        cleanup.shutdown = Some(Box::new(evidence));
-        return ExecutionOutcome::Failed(cleanup);
+        ))
+    } else {
+        None
+    };
+    if let Err(cleanup) = cleanup {
+        reconciliation = Some(match reconciliation {
+            Some(existing) => existing.with_reconciliation(cleanup),
+            None => cleanup,
+        });
     }
-    match (cleanup, workers_result) {
-        (Ok(()), Ok(())) => {
-            failure.shutdown = Some(Box::new(evidence));
-            ExecutionOutcome::Failed(failure)
-        },
-        (Err(mut cleanup), _) => {
-            cleanup.shutdown = Some(Box::new(evidence));
-            ExecutionOutcome::Failed(cleanup)
-        },
-        (Ok(()), Err(mut worker)) => {
-            worker.shutdown = Some(Box::new(evidence));
-            ExecutionOutcome::Failed(worker)
-        },
+    if let Err(worker) = workers_result {
+        reconciliation = Some(match reconciliation {
+            Some(existing) => existing.with_reconciliation(worker),
+            None => worker,
+        });
     }
+    failure.shutdown = Some(Box::new(evidence));
+    if let Some(reconciliation) = reconciliation {
+        failure = failure.with_reconciliation(reconciliation);
+    }
+    ExecutionOutcome::Failed(failure)
 }
 
 #[cfg(unix)]
@@ -682,31 +725,27 @@ fn wait_for_progress(deadline: Instant) {
 #[cfg(unix)]
 struct ProcessGroup {
     identifier: u32,
-    process_control: PathBuf,
 }
 
 #[cfg(unix)]
 impl ProcessGroup {
-    fn new(identifier: u32, process_control: PathBuf) -> Self {
-        Self {
-            identifier,
-            process_control,
-        }
+    fn new(identifier: u32) -> Self {
+        Self { identifier }
     }
 
     fn exists(&self, command: &str, deadline: Instant) -> Result<bool, ExecutionFailure> {
-        let target = format!("-{}", self.identifier);
-        let status = run_platform_kill(
-            &[
-                OsString::from("-0"),
-                OsString::from("--"),
-                OsString::from(target),
-            ],
-            command,
-            &self.process_control,
-            deadline,
-        )?;
-        Ok(status.success())
+        require_shutdown_time(command, deadline, "process-group probe")?;
+        let identifier = self.identifier(command)?;
+        match rustix::process::test_kill_process_group(identifier) {
+            Ok(()) => Ok(true),
+            Err(rustix::io::Errno::SRCH) => Ok(false),
+            Err(source) => Err(process_control_failure(
+                command,
+                "probe",
+                self.identifier,
+                source,
+            )),
+        }
     }
 
     fn signal(
@@ -715,32 +754,37 @@ impl ProcessGroup {
         command: &str,
         deadline: Instant,
     ) -> Result<(), ExecutionFailure> {
-        if !self.exists(command, deadline)? {
-            return Ok(());
-        }
-        let target = format!("-{}", self.identifier);
-        let status = run_platform_kill(
-            &[
-                OsString::from(signal.flag()),
-                OsString::from("--"),
-                OsString::from(target),
-            ],
-            command,
-            &self.process_control,
-            deadline,
-        )?;
-        if status.success() || !self.exists(command, deadline)? {
-            return Ok(());
-        }
-        Err(ExecutionFailure::new(
-            command.to_owned(),
-            FailurePhase::Cleanup,
-            format!(
-                "{} did not terminate controlled process group {}",
+        require_shutdown_time(command, deadline, signal.operation())?;
+        let identifier = self.identifier(command)?;
+        match rustix::process::kill_process_group(identifier, signal.as_rustix()) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(source) => Err(process_control_failure(
+                command,
                 signal.name(),
-                self.identifier
-            ),
-        ))
+                self.identifier,
+                source,
+            )),
+        }
+    }
+
+    fn identifier(&self, command: &str) -> Result<rustix::process::Pid, ExecutionFailure> {
+        let raw = i32::try_from(self.identifier).map_err(|_| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                format!(
+                    "controlled process group identifier {} exceeded the platform range",
+                    self.identifier
+                ),
+            )
+        })?;
+        rustix::process::Pid::from_raw(raw).ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                "controlled process group identifier was zero",
+            )
+        })
     }
 
     fn not_empty_failure(&self, command: &str) -> ExecutionFailure {
@@ -764,10 +808,10 @@ enum Signal {
 
 #[cfg(unix)]
 impl Signal {
-    fn flag(self) -> &'static str {
+    fn as_rustix(self) -> rustix::process::Signal {
         match self {
-            Self::Terminate => "-TERM",
-            Self::Kill => "-KILL",
+            Self::Terminate => rustix::process::Signal::TERM,
+            Self::Kill => rustix::process::Signal::KILL,
         }
     }
 
@@ -777,59 +821,30 @@ impl Signal {
             Self::Kill => "forced termination signal",
         }
     }
+
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Terminate => "process-group termination signal",
+            Self::Kill => "process-group forced termination signal",
+        }
+    }
 }
 
 #[cfg(unix)]
-fn run_platform_kill(
-    arguments: &[OsString],
+fn process_control_failure(
     command: &str,
-    process_control: &std::path::Path,
-    deadline: Instant,
-) -> Result<ExitStatus, ExecutionFailure> {
-    require_shutdown_time(command, deadline, "platform process-control launch")?;
-    let mut child = std::process::Command::new(process_control)
-        .env_clear()
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        // positron-concurrency-spawn: run_platform_kill\tcontrolled-platform-kill-v1
-        .spawn()
-        .map_err(|source| {
-            ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Cleanup,
-                source.to_string(),
-            )
-        })?;
-    match wait_for_direct_child(&mut child, command, deadline, None, None) {
-        Ok(status) => Ok(status),
-        Err(failure) if failure.phase == FailurePhase::Deadline => {
-            child.kill().map_err(|source| {
-                ExecutionFailure::new(
-                    command.to_owned(),
-                    FailurePhase::Cleanup,
-                    source.to_string(),
-                )
-            })?;
-            if let Err(reap) = wait_for_direct_child(&mut child, command, deadline, None, None) {
-                return Err(ExecutionFailure::new(
-                    command.to_owned(),
-                    FailurePhase::Cleanup,
-                    format!(
-                        "platform process-control command could not be reaped before the registered shutdown deadline: {}",
-                        reap.detail
-                    ),
-                ));
-            }
-            Err(ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Cleanup,
-                "platform process-control command exceeded its bounded deadline",
-            ))
-        },
-        Err(failure) => Err(failure),
-    }
+    operation: &str,
+    identifier: u32,
+    source: rustix::io::Errno,
+) -> ExecutionFailure {
+    ExecutionFailure::new(
+        command.to_owned(),
+        FailurePhase::Cleanup,
+        format!(
+            "{operation} controlled process group {identifier}: {}",
+            std::io::Error::from_raw_os_error(source.raw_os_error())
+        ),
+    )
 }
 
 #[cfg(unix)]
@@ -997,7 +1012,7 @@ impl OwnedWorkers {
             };
             return match cleanup {
                 Ok(()) => Err(failure),
-                Err(cleanup) => Err(cleanup),
+                Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
             };
         }
         match self.capture.take() {
@@ -1146,7 +1161,7 @@ impl InputBroker {
                 let failure = cancellation_failure(command);
                 return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             match self.poll(command) {
@@ -1155,7 +1170,7 @@ impl InputBroker {
                 Err(failure) => {
                     return match self.abort(command, deadline) {
                         Ok(()) => Err(failure),
-                        Err(cleanup) => Err(cleanup),
+                        Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                     };
                 },
             }
@@ -1167,7 +1182,7 @@ impl InputBroker {
                 );
                 return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             wait_for_progress(deadline);
@@ -1592,7 +1607,7 @@ impl CaptureBroker {
                 let failure = cancellation_failure(command);
                 return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             let stdout_complete = match self.stdout.poll(command) {
@@ -1600,7 +1615,7 @@ impl CaptureBroker {
                 Err(failure) => {
                     return match self.abort(command, deadline) {
                         Ok(()) => Err(failure),
-                        Err(cleanup) => Err(cleanup),
+                        Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                     };
                 },
             };
@@ -1609,7 +1624,7 @@ impl CaptureBroker {
                 Err(failure) => {
                     return match self.abort(command, deadline) {
                         Ok(()) => Err(failure),
-                        Err(cleanup) => Err(cleanup),
+                        Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                     };
                 },
             };
@@ -1624,7 +1639,7 @@ impl CaptureBroker {
                 );
                 return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             wait_for_progress(deadline);
@@ -2259,7 +2274,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shutdown_deadline_bounds_slow_process_control_without_starting_capture_brokers()
+    fn unix_repeated_signal_and_probe_phases_share_one_deadline_without_platform_helpers()
     -> TestResult {
         let protocol = CancellationProtocol::create()?;
         let helpers = SlowExecutionTools::create(Duration::from_millis(40))?;
@@ -2272,7 +2287,9 @@ mod tests {
             program: OsString::from("/bin/sh"),
             arguments: vec![
                 OsString::from("-c"),
-                OsString::from(": > \"$POSITRON_CONTROLLED_READY\"; exec /bin/sleep 60"),
+                OsString::from(
+                    ": > \"$POSITRON_CONTROLLED_READY\"; trap '' TERM; while :; do /bin/sleep 60; done",
+                ),
             ],
             current_dir: std::env::current_dir()?,
             environment: protocol.environment(),
@@ -2289,6 +2306,7 @@ mod tests {
         protocol.wait_until_ready(Duration::from_secs(1))?;
         cancellation.store(true, Ordering::Release);
         let outcome = joined_outcome(worker, "slow process-control cancellation")?;
+        let process_control_started = helpers.process_control_started();
         let capture_started = helpers.capture_started();
         let helper_cleanup = helpers.remove();
         let protocol_cleanup = protocol.remove();
@@ -2297,6 +2315,12 @@ mod tests {
         if capture_started? {
             return Err(io::Error::other(
                 "discard output mode started a capture broker during bounded shutdown",
+            )
+            .into());
+        }
+        if process_control_started? {
+            return Err(io::Error::other(
+                "Unix bounded shutdown launched the configured platform process-control helper",
             )
             .into());
         }
@@ -2310,14 +2334,18 @@ mod tests {
             io::Error::other("slow process-control failure omitted shutdown evidence")
         })?;
         if observed.bound != Duration::from_millis(100)
-            || observed.elapsed >= Duration::from_millis(150)
-            || failure.phase != FailurePhase::Cleanup
+            || observed.elapsed > Duration::from_millis(100)
+            || !observed.process_reaped
+            || observed.live != 0
+            || failure.phase != FailurePhase::Cancellation
         {
             return Err(io::Error::other(format!(
-                "slow process-control helper escaped one shutdown deadline: phase={}, bound={}ms, elapsed={}ms",
+                "Unix cancellation did not reap inside one shutdown deadline: phase={}, bound={}ms, elapsed={}ms, process-reaped={}, live={}",
                 failure.phase.as_str(),
                 observed.bound.as_millis(),
                 observed.elapsed.as_millis(),
+                observed.process_reaped,
+                observed.live,
             ))
             .into());
         }
@@ -2381,9 +2409,23 @@ done
     -> TestResult {
         let outcome = execute_escaped_descriptor_fixture_with_deadline(Duration::from_millis(100))?;
         match outcome {
-            ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => Ok(()),
+            ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => {
+                let reconciliation = failure.reconciliation.ok_or_else(|| {
+                    io::Error::other(
+                        "escaped capture deadline omitted secondary cleanup failure context",
+                    )
+                })?;
+                if reconciliation.detail.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "escaped capture deadline retained empty {} cleanup context",
+                        reconciliation.phase.as_str(),
+                    ))
+                    .into());
+                }
+                Ok(())
+            },
             ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
-                "escaped capture descriptors returned {} instead of deadline: {}",
+                "escaped capture descriptors returned {} without secondary cleanup context: {}",
                 failure.phase.as_str(),
                 failure.detail
             ))
@@ -2893,6 +2935,7 @@ os._exit(0)
         directory: PathBuf,
         process_control: PathBuf,
         capture_broker: PathBuf,
+        process_control_marker: PathBuf,
         capture_marker: PathBuf,
     }
 
@@ -2907,11 +2950,15 @@ os._exit(0)
             fs::create_dir_all(&directory)?;
             let process_control = directory.join("process-control");
             let capture_broker = directory.join("capture-broker");
+            let process_control_marker = directory.join("process-control-started");
             let capture_marker = directory.join("capture-started");
             let delay_seconds = format!("{:.3}", delay.as_secs_f64());
             fs::write(
                 &process_control,
-                format!("#!/bin/sh\n/bin/sleep {delay_seconds}\nexec /bin/kill \"$@\"\n"),
+                format!(
+                    "#!/bin/sh\n: > '{}'\n/bin/sleep {delay_seconds}\nexec /bin/kill \"$@\"\n",
+                    process_control_marker.display()
+                ),
             )?;
             fs::write(
                 &capture_broker,
@@ -2929,6 +2976,7 @@ os._exit(0)
                 directory,
                 process_control,
                 capture_broker,
+                process_control_marker,
                 capture_marker,
             })
         }
@@ -2942,6 +2990,10 @@ os._exit(0)
 
         fn capture_started(&self) -> TestResult<bool> {
             Ok(self.capture_marker.try_exists()?)
+        }
+
+        fn process_control_started(&self) -> TestResult<bool> {
+            Ok(self.process_control_marker.try_exists()?)
         }
 
         fn remove(self) -> TestResult {

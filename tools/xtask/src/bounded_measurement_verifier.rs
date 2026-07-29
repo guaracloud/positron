@@ -337,12 +337,6 @@ fn validate_spawn_registry(bytes: &[u8], scenario: &Scenario) -> Result<(), Xtas
             "process",
         ),
         (
-            "controlled-platform-kill-v1",
-            "tools/xtask/src/controlled_execution.rs",
-            "run_platform_kill",
-            "process",
-        ),
-        (
             "controlled-input-broker-v1",
             "tools/xtask/src/controlled_execution.rs",
             "InputBroker::start",

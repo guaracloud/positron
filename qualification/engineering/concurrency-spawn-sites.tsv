@@ -1,7 +1,6 @@
 path	symbol	kind	id
 tools/xtask/src/registered_task_lifecycle.rs	RegisteredTasks::spawn	thread	quality-bounded-worker-v1
 tools/xtask/src/controlled_execution.rs	execute_unix	process	controlled-command-v1
-tools/xtask/src/controlled_execution.rs	run_platform_kill	process	controlled-platform-kill-v1
 tools/xtask/src/controlled_execution.rs	InputBroker::start	process	controlled-input-broker-v1
 tools/xtask/src/controlled_execution.rs	CaptureReader::start	process	controlled-capture-broker-v1
 tools/xtask/src/qualification_fixtures.rs	execute_state_transition	process	fixture-writer-v1
