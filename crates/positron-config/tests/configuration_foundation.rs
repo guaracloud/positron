@@ -405,6 +405,49 @@ fn rejects_bounded_conflicting_unknown_and_forbidden_overrides() {
 }
 
 #[test]
+fn accepts_exact_source_bounds_and_rejects_only_the_first_excess_byte() {
+    let mut exact_document = String::from("schema_version = 1\n#");
+    exact_document.push_str(&"x".repeat((16 * 1024) - exact_document.len()));
+    let exact_document_result = inputs(Some(&exact_document), [], []).and_then(resolve);
+    assert!(exact_document_result.is_ok());
+
+    let oversized_document = format!("{exact_document}x");
+    let oversized_document_result = inputs(Some(&oversized_document), [], []);
+    assert!(matches!(
+        oversized_document_result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::ResourceLimit
+                && error.source() == FailureSource::ConfigurationDocument
+    ));
+
+    let exact_key = "K".repeat(64);
+    assert!(EnvironmentOverrides::try_from_pairs([(exact_key.as_str(), "value")]).is_ok());
+    let oversized_key = format!("{exact_key}K");
+    assert!(matches!(
+        EnvironmentOverrides::try_from_pairs([(oversized_key.as_str(), "value")]),
+        Err(error)
+            if error.code() == ConfigurationFailureCode::ResourceLimit
+                && error.source() == FailureSource::EnvironmentOverride
+    ));
+
+    let exact_value = "v".repeat(256);
+    assert!(
+        CommandLineOverrides::try_from_pairs([("diagnostics.log_level", exact_value.as_str())])
+            .is_ok()
+    );
+    let oversized_value = format!("{exact_value}v");
+    assert!(matches!(
+        CommandLineOverrides::try_from_pairs([(
+            "diagnostics.log_level",
+            oversized_value.as_str()
+        )]),
+        Err(error)
+            if error.code() == ConfigurationFailureCode::ResourceLimit
+                && error.source() == FailureSource::CommandLineOverride
+    ));
+}
+
+#[test]
 fn rejects_secret_and_unsafe_configuration_without_echoing_values() {
     let secret_override = inputs(
         None,
@@ -1241,6 +1284,37 @@ fn preflight_rejects_adversarial_toml_before_unbounded_parse_allocation() {
 }
 
 #[test]
+fn exact_preflight_entry_ceiling_is_not_reclassified_as_a_resource_failure() {
+    let mut header_is_sixteenth = String::from("schema_version = 1\n");
+    for index in 0..14 {
+        header_is_sixteenth.push_str(&format!("unknown_{index} = 1\n"));
+    }
+    header_is_sixteenth.push_str("[diagnostics]\n");
+    let header_result = inputs(Some(&header_is_sixteenth), [], []).and_then(resolve);
+    assert!(matches!(
+        header_result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ConfigurationDocument
+    ));
+
+    let mut scalar_is_sixteenth = String::from("schema_version = 1\n[diagnostics]\n");
+    for index in 0..14 {
+        scalar_is_sixteenth.push_str(&format!("unknown_{index} = 1\n"));
+    }
+    let scalar_result = inputs(Some(&scalar_is_sixteenth), [], []).and_then(resolve);
+    assert!(matches!(
+        scalar_result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ConfigurationDocument
+    ));
+
+    scalar_is_sixteenth.push_str("first_excess_entry = 1\n");
+    assert_resource_limit(&scalar_is_sixteenth);
+}
+
+#[test]
 fn preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax() {
     let accepted = inputs(
         Some(
@@ -1266,6 +1340,55 @@ fn preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax()
             Err(error) if error.code() == ConfigurationFailureCode::Malformed
         ));
     }
+}
+
+#[test]
+fn comment_markers_inside_supported_string_forms_preserve_the_complete_value()
+-> Result<(), ConfigurationFailure> {
+    let escaped_double = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = \"/keys/root\\\"key#tail=value\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    let equivalent_single = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = '/keys/root\"key#tail=value'\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    assert!(escaped_double.local_key_file() == equivalent_single.local_key_file());
+
+    let single_quoted = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = '/keys/root#tail=value'\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    let equivalent_double = inputs(
+        Some(
+            "schema_version = 1\n\
+             [security]\n\
+             local_key_file = \"/keys/root#tail=value\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    assert!(single_quoted.local_key_file() == equivalent_double.local_key_file());
+    Ok(())
 }
 
 #[test]
@@ -1299,6 +1422,95 @@ fn preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape() {
 
     let oversized_bare_scalar = format!("schema_version = {}\n", "1".repeat(257));
     assert_resource_limit(&oversized_bare_scalar);
+}
+
+#[test]
+fn preflight_name_boundaries_preserve_unknown_and_malformed_classification() {
+    for document in [
+        "schema_version = 1\n[unknown_section]\n",
+        "schema_version = 1\n[unknown-section]\n",
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnknownSetting
+                    && error.source() == FailureSource::ConfigurationDocument
+        ));
+    }
+
+    for document in [
+        "schema_version = 1\n[\"diagnostics\"]\n",
+        "\"schema_version\" = 1\n",
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::Malformed
+                    && error.source() == FailureSource::ConfigurationDocument
+        ));
+    }
+
+    let exact_header = format!("schema_version = 1\n[{}]\n", "h".repeat(64));
+    let exact_header_result = inputs(Some(&exact_header), [], []).and_then(resolve);
+    assert!(matches!(
+        exact_header_result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ConfigurationDocument
+    ));
+    let oversized_header = format!("schema_version = 1\n[{}]\n", "h".repeat(65));
+    assert_resource_limit(&oversized_header);
+
+    let exact_key = format!("schema_version = 1\n{} = 1\n", "k".repeat(64));
+    let exact_key_result = inputs(Some(&exact_key), [], []).and_then(resolve);
+    assert!(matches!(
+        exact_key_result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ConfigurationDocument
+    ));
+    let oversized_key = format!("schema_version = 1\n{} = 1\n", "k".repeat(65));
+    assert_resource_limit(&oversized_key);
+}
+
+#[test]
+fn listener_byte_ceiling_precedes_address_parsing_only_after_the_ceiling() {
+    let exact_value = "x".repeat(256);
+    let exact_command_line = CommandLineOverrides::try_from_pairs([(
+        "listener.control_bind_address",
+        exact_value.as_str(),
+    )]);
+    assert!(exact_command_line.is_ok());
+    let exact_result = exact_command_line.and_then(|command_line| {
+        EnvironmentOverrides::try_from_pairs(std::iter::empty::<(&str, &str)>())
+            .and_then(|environment| ConfigurationInputs::try_new(None, environment, command_line))
+    });
+    let exact_result = exact_result.and_then(resolve);
+    assert!(matches!(
+        exact_result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::Malformed
+                && error.source() == FailureSource::ListenerControlBindAddress
+    ));
+
+    let oversized_value = "x".repeat(257);
+    let oversized_result = CommandLineOverrides::try_from_pairs([(
+        "listener.control_bind_address",
+        oversized_value.as_str(),
+    )])
+    .and_then(|command_line| {
+        EnvironmentOverrides::try_from_pairs(std::iter::empty::<(&str, &str)>())
+            .and_then(|environment| ConfigurationInputs::try_new(None, environment, command_line))
+    })
+    .and_then(resolve);
+    assert!(matches!(
+        oversized_result,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::ResourceLimit
+                && error.source() == FailureSource::CommandLineOverride
+    ));
 }
 
 #[test]

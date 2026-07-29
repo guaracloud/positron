@@ -872,7 +872,7 @@ fn preflight_toml(file: &str) -> Result<(), ConfigurationFailure> {
             }
             continue;
         }
-        let Some(separator) = unquoted_equals(line)? else {
+        let Some(separator) = unquoted_equals(line) else {
             return Err(document_failure(ConfigurationFailureCode::Malformed));
         };
         let key = line
@@ -914,14 +914,11 @@ fn content_before_comment(line: &str) -> Result<&str, ConfigurationFailure> {
             None => {},
         }
     }
-    if quote.is_some() || escaped {
-        return Err(document_failure(ConfigurationFailureCode::Malformed));
-    }
     Ok(line)
 }
 
 fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
-    if line.starts_with("[[") || !line.ends_with(']') {
+    if !line.ends_with(']') {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }
     let name = line
@@ -932,47 +929,26 @@ fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
     if name.len() > MAX_KEY_BYTES {
         return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
     }
-    if name.is_empty()
-        || name.contains('.')
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }
     Ok(())
 }
 
-fn unquoted_equals(line: &str) -> Result<Option<usize>, ConfigurationFailure> {
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if character == '\\' => escaped = true,
-            Some('"') if character == '"' => quote = None,
-            Some('\'') if character == '\'' => quote = None,
-            Some(_) => {},
-            None if character == '"' || character == '\'' => quote = Some(character),
-            None if character == '=' => return Ok(Some(index)),
-            None => {},
-        }
-    }
-    if quote.is_some() || escaped {
-        return Err(document_failure(ConfigurationFailureCode::Malformed));
-    }
-    Ok(None)
+fn unquoted_equals(line: &str) -> Option<usize> {
+    line.find('=')
 }
 
 fn preflight_key(key: &str) -> Result<(), ConfigurationFailure> {
     if key.len() > MAX_KEY_BYTES {
         return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
     }
-    if key.is_empty()
-        || key.contains('.')
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    if !key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }
@@ -983,7 +959,7 @@ fn preflight_scalar(value: &str) -> Result<(), ConfigurationFailure> {
     if value.is_empty() {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }
-    if value.starts_with('[') || value.starts_with('{') {
+    if matches!(value.as_bytes().first(), Some(b'[' | b'{')) {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }
     let scalar_bytes = if let Some(inner) = value
@@ -1203,7 +1179,7 @@ fn parse_canonical_u16(value: &str, source: FailureSource) -> Result<u16, Config
 }
 
 fn parse_loopback_address(value: &str) -> Result<SocketAddr, ConfigurationFailure> {
-    let ValueDomain::LoopbackSocketAddress(maximum_bytes) =
+    let ValueDomain::LoopbackSocketAddress(_) =
         setting_definition(Setting::ListenerControlBindAddress).domain()
     else {
         return Err(ConfigurationFailure::new(
@@ -1211,12 +1187,6 @@ fn parse_loopback_address(value: &str) -> Result<SocketAddr, ConfigurationFailur
             FailureSource::ListenerControlBindAddress,
         ));
     };
-    if value.len() > maximum_bytes {
-        return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::ResourceLimit,
-            FailureSource::ListenerControlBindAddress,
-        ));
-    }
     let address = value.parse::<SocketAddr>().map_err(|_| {
         ConfigurationFailure::new(
             ConfigurationFailureCode::Malformed,
