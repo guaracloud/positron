@@ -125,7 +125,7 @@
     "value_domain_positive_and_exact_boundaries": "accepts_each_closed_value_and_exact_numeric_and_address_boundaries",
     "value_domain_invalid_types_values_and_paths": "rejects_invalid_shapes_and_values_from_each_closed_value_domain",
     "schema_and_root_table_variants": "requires_an_explicit_supported_schema_version_for_file_configuration; rejects_empty_unknown_root_table_before_iterating_children; rejects_nonempty_unknown_root_table; rejects_unknown_or_non_table_root_sections_before_setting_application; accepts_known_empty_root_tables_without_changing_default_values",
-    "preflight_resource_malformed_comment_string_and_escape_paths": "preflight_rejects_adversarial_toml_before_unbounded_parse_allocation; preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape; preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax; preflight_preserves_blank_lines_single_quoted_literals_and_escaped_quotes; malformed_quote_state_precedes_scalar_resource_classification; quoted_key_separator_scanning_preserves_syntax_and_resource_precedence",
+    "preflight_resource_malformed_comment_string_and_escape_paths": "preflight_rejects_adversarial_toml_before_unbounded_parse_allocation; preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape; preflight_tracks_comments_strings_and_escapes_without_replacing_toml_syntax; preflight_preserves_blank_lines_single_quoted_literals_and_escaped_quotes; malformed_quote_state_precedes_scalar_resource_classification; quoted_key_separator_scanning_preserves_syntax_and_resource_precedence; array_table_syntax_precedes_ordinary_table_name_resource_classification",
     "redaction_and_opaque_protected_references": "raw_configuration_inputs_and_failures_never_format_secret_canaries; rejects_each_reachable_immutable_change_with_its_semantic_source",
     "mutability_classes_combinations_and_priority": "returns_only_checked_mutability_plans_and_rejects_immutable_changes; plans_no_change_and_mixed_mutability_with_closed_priority; rejects_each_reachable_immutable_change_with_its_semantic_source",
     "generated_metadata_schema_and_reference": "exposes_the_complete_canonical_setting_contract_and_compiled_defaults; generated_schema_and_reference_are_deterministic_and_secret_safe; rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity",
@@ -136,8 +136,8 @@
     "trusted_run_id": 30422346238,
     "trusted_artifact_id": 8712581081,
     "classification_counts": {
-      "real": 31,
-      "semantic_equivalent_or_impossible": 10,
+      "real": 32,
+      "semantic_equivalent_or_impossible": 9,
       "total": 41
     },
     "groups": [
@@ -198,12 +198,20 @@
         "owner": "preflight_table_header",
         "classification": "semantic-equivalent",
         "misses": [
-          "14: replace array-table-or-missing-close || with && at lib.rs:924:31",
           "16: replace empty-or-dotted-name || with && at lib.rs:937:9",
           "17: replace empty-name-or-dotted-name || with && at lib.rs:936:9"
         ],
-        "public_invariant": "Unsupported table syntax retains the same closed Malformed outcome through bounded byte grammar and the maintained parser.",
-        "remediation": "Removed redundant array, empty-name, and dotted-name clauses while retaining the byte ceiling and supported bare-name grammar."
+        "public_invariant": "Empty and dotted unsupported table names retain the same closed Malformed outcome through bounded byte grammar and the maintained parser.",
+        "remediation": "Removed only redundant empty-name and dotted-name clauses while retaining the byte ceiling and supported bare-name grammar."
+      },
+      {
+        "owner": "preflight_table_header",
+        "classification": "real",
+        "misses": [
+          "14: replace array-table-or-missing-close || with && at lib.rs:924:31"
+        ],
+        "public_invariant": "Array-table syntax, including long or incomplete double-bracket forms, returns Malformed before ordinary single-table name length accounting; ordinary single-table names retain their exact 64-byte UnknownSetting and 65-byte ResourceLimit boundary.",
+        "remediation": "Separated the early array-table and missing-close checks so their precedence is explicit and no mutable disjunction remains. array_table_syntax_precedes_ordinary_table_name_resource_classification covers short, over-limit, incomplete, and ordinary 64/65-byte table headers."
       },
       {
         "owner": "preflight_table_header",
@@ -642,6 +650,39 @@
         "cargo clippy --locked --package positron-config --all-targets --all-features -- -D warnings"
       ],
       "result": "All 32 public configuration tests passed after restoring only the bounded terminal quote-state and quote-aware separator owners. Formatting and focused positron-config Clippy passed with warnings denied. No local coverage, mutation, or extended profile ran, and no trusted mutation outcome is predicted."
+    },
+    {
+      "id": "mutation-remediation-second-independent-review",
+      "status": "failed-independent-review",
+      "source_revision": "b442c062e6ae06cf0e9bfc6dc355da4d0e2eac2e",
+      "review_axes": {
+        "standards": "passed with no hard violations",
+        "spec": "failed with one P1 array-table syntax/resource-precedence finding"
+      },
+      "result": "The fresh read-only Spec review confirmed the prior scalar and quoted-key findings closed, then found that removing the explicit array-table guard changed a long complete double-bracket header from Malformed to ResourceLimit. The review result is retained; no code was changed during review."
+    },
+    {
+      "id": "array-table-classification-public-regression-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation array_table_syntax_precedes_ordinary_table_name_resource_classification -- --exact",
+      "result": "The public test failed against the pushed refactor because a complete array-table header whose stripped name crossed 64 bytes returned ResourceLimit instead of the established Malformed outcome."
+    },
+    {
+      "id": "array-table-boundary-fixture-red",
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package positron-config --test configuration_foundation array_table_syntax_precedes_ordinary_table_name_resource_classification -- --exact",
+      "result": "After restoring early array-table rejection, the combined test still failed because its ordinary single-table fixtures omitted the independently required schema_version and therefore correctly returned MissingSchemaVersion. The fixtures were corrected to include schema_version = 1; no production behavior changed for this diagnostic."
+    },
+    {
+      "id": "array-table-classification-focused-green",
+      "status": "passed-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package positron-config --test configuration_foundation array_table_syntax_precedes_ordinary_table_name_resource_classification -- --exact",
+        "cargo test --locked --package positron-config --test configuration_foundation",
+        "cargo fmt --all -- --check",
+        "cargo clippy --locked --package positron-config --all-targets --all-features -- -D warnings"
+      ],
+      "result": "The focused array-table test and all 33 public configuration tests passed with exact typed source/code/outcome assertions. Formatting and focused positron-config Clippy passed with warnings denied. No local coverage, mutation, or extended profile ran, and no trusted mutation outcome is predicted."
     }
   ],
   "detection_gained": [

@@ -921,6 +921,9 @@ fn content_before_comment(line: &str) -> Result<&str, ConfigurationFailure> {
 }
 
 fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
+    if line.starts_with("[[") {
+        return Err(document_failure(ConfigurationFailureCode::Malformed));
+    }
     if !line.ends_with(']') {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }

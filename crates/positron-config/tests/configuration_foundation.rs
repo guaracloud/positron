@@ -1441,6 +1441,36 @@ fn quoted_key_separator_scanning_preserves_syntax_and_resource_precedence() {
 }
 
 #[test]
+fn array_table_syntax_precedes_ordinary_table_name_resource_classification() {
+    let long_array_name = "a".repeat(63);
+    let incomplete_long_array_name = "a".repeat(65);
+    for document in [
+        String::from("[[diagnostics]]\n"),
+        format!("[[{long_array_name}]]\n"),
+        String::from("[[diagnostics]\n"),
+        String::from("[[diagnostics\n"),
+        format!("[[{incomplete_long_array_name}\n"),
+    ] {
+        assert_document_rejection(
+            inputs(Some(&document), [], []).and_then(resolve),
+            ConfigurationFailureCode::Malformed,
+        );
+    }
+
+    let exact_single_table = format!("schema_version = 1\n[{}]\n", "t".repeat(64));
+    assert_document_rejection(
+        inputs(Some(&exact_single_table), [], []).and_then(resolve),
+        ConfigurationFailureCode::UnknownSetting,
+    );
+
+    let oversized_single_table = format!("schema_version = 1\n[{}]\n", "t".repeat(65));
+    assert_document_rejection(
+        inputs(Some(&oversized_single_table), [], []).and_then(resolve),
+        ConfigurationFailureCode::ResourceLimit,
+    );
+}
+
+#[test]
 fn preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape() {
     for document in [
         "schema_version 1\n",
