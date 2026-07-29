@@ -89,6 +89,8 @@ pub(crate) enum InvocationInput {
 /// The externally visible output ownership mode.
 #[derive(Debug)]
 pub(crate) enum OutputMode {
+    /// Close both child output streams without capture workers.
+    Discard,
     /// Capture independently bounded standard output and standard error.
     Capture { maximum_bytes_per_stream: usize },
     /// Stream stdout into one create-new bounded artifact while capturing stderr.
@@ -394,9 +396,13 @@ fn configure_standard_descriptors(
         },
     }
     match output {
-        OutputMode::Capture { .. } | OutputMode::CaptureWithStdoutArtifact { .. } => {},
+        OutputMode::Discard => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        },
+        OutputMode::Capture { .. } | OutputMode::CaptureWithStdoutArtifact { .. } => {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        },
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 }
 
 #[cfg(unix)]
@@ -679,6 +685,19 @@ impl OwnedWorkers {
                 Some((stdin, bytes))
             },
         };
+        if matches!(output, OutputMode::Discard) {
+            if input_pipe.is_some() {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "discarded output mode requires closed standard input",
+                ));
+            }
+            return Ok(Self {
+                capture: None,
+                input: None,
+            });
+        }
         let stdout = child.stdout.take().ok_or_else(|| {
             ExecutionFailure::new(
                 command.to_owned(),
@@ -694,6 +713,13 @@ impl OwnedWorkers {
             )
         })?;
         let request = match output {
+            OutputMode::Discard => {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "discarded output mode reached capture setup",
+                ));
+            },
             OutputMode::Capture {
                 maximum_bytes_per_stream,
             } => CaptureBrokerRequest {

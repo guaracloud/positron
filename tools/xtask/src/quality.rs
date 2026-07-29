@@ -15,7 +15,7 @@ use crate::controlled_execution::{
 use crate::error::XtaskError;
 use crate::evidence_json as bounded_json;
 use crate::hooks;
-use crate::qualification_fixtures::{DirectoryCapability, DirectoryIdentity, FileCapability};
+use crate::qualification_fixtures::{DirectoryCapability, FileCapability};
 use crate::registry::{self, Gate, Registry};
 
 const CANONICAL_GATE_IDS: [&str; 25] = [
@@ -1370,9 +1370,13 @@ fn execute_gate(
             run_dependency_gate(attempt_id, root, registry, budget, environment, capture)
         },
         "documentation" => run_documentation_gate(root, budget, environment, capture),
-        "concurrency" => {
-            crate::bounded_runners::run_concurrency(qualification_fixtures.bounded_runners(), root)
-        },
+        "concurrency" => run_bounded_runner_gate(
+            qualification_fixtures.bounded_runners(),
+            root,
+            "EG-CONCURRENCY",
+            environment,
+            capture,
+        ),
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
         "fault" => run_fault_gate(qualification_fixtures, environment),
         "integrity" => run_integrity_gate(
@@ -1400,12 +1404,172 @@ fn execute_gate(
         ),
         "test" => run_test_gate(root, budget, environment, capture),
         "matrix" => run_generation_matrix_gate(root),
-        "resource" => {
-            crate::bounded_runners::run_resource(qualification_fixtures.bounded_runners(), root)
-        },
+        "resource" => run_bounded_runner_gate(
+            qualification_fixtures.bounded_runners(),
+            root,
+            "EG-RESOURCE",
+            environment,
+            capture,
+        ),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
             "an active risk scope selected a gate whose executable harness has not been implemented",
+        )),
+    }
+}
+
+fn run_bounded_runner_gate(
+    registry: &crate::bounded_runners::FrozenBoundedRunnerRegistry,
+    root: &Path,
+    gate: &str,
+    environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    crate::bounded_runners::validate_source_policy(registry, root)?;
+    let shutdown = registry.shutdown_bound(gate)?;
+    let work_budget = registry.process_work_budget(gate)?;
+    let started = Instant::now();
+    let program = env::current_exe()
+        .map_err(|source| XtaskError::io("resolve bounded runner executable", source))?;
+    if !program.is_absolute() || !program.is_file() {
+        return Err(XtaskError::invalid_path(
+            &program,
+            "bounded runner executable is not an absolute file",
+        ));
+    }
+    let nonce = unix_time_ms()?;
+    let outcome_path = environment.temporary_root().join(format!(
+        "bounded-runner-{}-{}-{nonce}.out",
+        std::process::id(),
+        gate.to_ascii_lowercase(),
+    ));
+    let arguments = registry.child_arguments(gate, &outcome_path)?;
+    let invocation_environment = environment.invocation_environment(&[])?;
+    let input = InvocationInput::Null;
+    let invocation = controlled_invocation(
+        "cargo-xtask-quality/bounded-runner",
+        program.as_os_str(),
+        &arguments,
+        &invocation_environment,
+        work_budget,
+        &input,
+    );
+    let outcome = controlled_execution::execute(InvocationSpec {
+        program: program.as_os_str().to_owned(),
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: invocation_environment,
+        tools: environment.execution_tools(),
+        input,
+        output: OutputMode::Discard,
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(work_budget)?,
+    })
+    .into_result();
+    let elapsed = started.elapsed();
+    let lifecycle = |phase: &str| {
+        format!(
+            "process-lifecycle-v1;phase={phase};termination-requested={};process-reaped=true;live=0;deadline-ms={};deadline-elapsed-ms={}",
+            phase == "deadline" || phase == "cancellation",
+            shutdown.as_millis(),
+            elapsed.as_millis(),
+        )
+    };
+    let verdict = match outcome {
+        Ok(verdict) => {
+            let step_verdict = format!("exit-status:{}", verdict.status);
+            capture.record(invocation, &step_verdict, "", "")?;
+            verdict
+        },
+        Err(error) => {
+            let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
+            capture.record(invocation, &step_verdict, "", &error.detail)?;
+            remove_optional_bounded_runner_outcome(&outcome_path)?;
+            return Err(XtaskError::invalid(
+                "bounded runner process lifecycle",
+                format!(
+                    "controlled runner failed during {}: {}; {}",
+                    error.phase.as_str(),
+                    error.detail,
+                    lifecycle(error.phase.as_str()),
+                ),
+            ));
+        },
+    };
+    let outcome = take_bounded_runner_outcome(&outcome_path)?;
+    if !verdict.status.success() {
+        return Err(XtaskError::invalid(
+            "bounded runner process lifecycle",
+            format!(
+                "child returned {}: {}; {}",
+                verdict.status,
+                outcome.trim().replace('\n', " | "),
+                lifecycle("child-error"),
+            ),
+        ));
+    }
+    if elapsed > shutdown {
+        return Err(XtaskError::invalid(
+            "bounded runner process lifecycle",
+            format!(
+                "runner returned after the registered shutdown bound; {}",
+                lifecycle("late-success"),
+            ),
+        ));
+    }
+    let Some(record) = outcome.strip_prefix("ok\n") else {
+        return Err(XtaskError::invalid(
+            "bounded runner process lifecycle",
+            format!(
+                "child outcome omitted its success discriminator: {}; {}",
+                one_line(&outcome),
+                lifecycle("malformed-output"),
+            ),
+        ));
+    };
+    let record = record.trim_end_matches('\n');
+    if record.is_empty() || record.lines().count() != 1 {
+        return Err(XtaskError::invalid(
+            "bounded runner process lifecycle",
+            format!(
+                "child omitted its exact one-line measurement; {}",
+                lifecycle("malformed-output"),
+            ),
+        ));
+    }
+    Ok(record.to_owned())
+}
+
+fn take_bounded_runner_outcome(path: &Path) -> Result<String, XtaskError> {
+    let bytes =
+        fs::read(path).map_err(|source| XtaskError::io("read bounded runner outcome", source))?;
+    remove_optional_bounded_runner_outcome(path)?;
+    if bytes.len() > 8_192 {
+        return Err(XtaskError::invalid_path(
+            path,
+            "bounded runner outcome exceeds its exact maximum",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| XtaskError::invalid_path(path, "bounded runner outcome is not valid UTF-8"))
+}
+
+fn remove_optional_bounded_runner_outcome(path: &Path) -> Result<(), XtaskError> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            let parent = path.parent().ok_or_else(|| {
+                XtaskError::invalid_path(path, "bounded runner outcome has no parent")
+            })?;
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| {
+                    XtaskError::io("synchronize bounded runner outcome cleanup", source)
+                })
+        },
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(XtaskError::io(
+            "remove bounded runner outcome after process failure",
+            source,
         )),
     }
 }
@@ -6244,7 +6408,8 @@ fn unix_time_ms() -> Result<u128, XtaskError> {
 
 fn write_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, XtaskError> {
     let directory = root.join("target/quality/evidence");
-    let owned_directories = OwnedDirectoryChain::create(root, &directory)?;
+    let owned_directories =
+        OwnedDirectoryChain::create(root, &directory, OwnedLeaf::ExistingAllowed)?;
     let reservation = match AttemptReservation::reserve(root, &directory, evidence) {
         Ok(ReservationOutcome::Claimed(reservation)) => *reservation,
         Ok(ReservationOutcome::RetainedCollision { path }) => {
@@ -6266,107 +6431,13 @@ struct AttemptReservation {
     recovery_path: PathBuf,
     recovery_bytes: String,
     report_staging_path: PathBuf,
-    report_staging_area: Option<OwnedStagingReportArea>,
     report_final_path: PathBuf,
     report_staging_files: Vec<PathBuf>,
     report_final_files: Vec<PathBuf>,
+    report_staging_directories: OwnedDirectoryChain,
     report_final_directories: OwnedDirectoryChain,
     evidence: Evidence,
     collided: bool,
-}
-
-/// A publisher owns only its attempt-named staging leaf. The shared staging
-/// ancestor is a stable capability-managed infrastructure directory: a racer
-/// must never remove it while another publisher may still synchronize it.
-struct OwnedStagingReportArea {
-    root: DirectoryCapability,
-    target: DirectoryCapability,
-    quality: DirectoryCapability,
-    parent: DirectoryCapability,
-    leaf: DirectoryCapability,
-    root_identity: DirectoryIdentity,
-    target_identity: DirectoryIdentity,
-    quality_identity: DirectoryIdentity,
-    parent_identity: DirectoryIdentity,
-    leaf_identity: DirectoryIdentity,
-    leaf_name: String,
-}
-
-impl OwnedStagingReportArea {
-    fn create(root: &Path, attempt_id: &str) -> Result<Self, XtaskError> {
-        let root = DirectoryCapability::open(root, "engineering evidence workspace root")?;
-        let target =
-            root.open_or_create_child_directory("target", "engineering evidence target")?;
-        let quality =
-            target.open_or_create_child_directory("quality", "engineering evidence quality")?;
-        let parent = quality.open_or_create_child_directory(
-            "evidence-report-staging",
-            "engineering evidence staging infrastructure",
-        )?;
-        let leaf =
-            parent.create_child_directory(attempt_id, "attempt-owned evidence staging leaf")?;
-        Ok(Self {
-            root_identity: root.identity()?,
-            target_identity: target.identity()?,
-            quality_identity: quality.identity()?,
-            parent_identity: parent.identity()?,
-            leaf_identity: leaf.identity()?,
-            root,
-            target,
-            quality,
-            parent,
-            leaf,
-            leaf_name: attempt_id.to_owned(),
-        })
-    }
-
-    fn path(&self) -> &Path {
-        self.leaf.diagnostic_path()
-    }
-
-    fn require_identity(&self) -> Result<(), XtaskError> {
-        if self.root.identity()? != self.root_identity {
-            return Err(XtaskError::invalid_path(
-                self.root.diagnostic_path(),
-                "engineering evidence workspace root identity changed",
-            ));
-        }
-        self.root.require_child_directory_identity(
-            "target",
-            self.target_identity,
-            "engineering evidence target",
-        )?;
-        self.target.require_child_directory_identity(
-            "quality",
-            self.quality_identity,
-            "engineering evidence quality",
-        )?;
-        self.quality.require_child_directory_identity(
-            "evidence-report-staging",
-            self.parent_identity,
-            "engineering evidence staging infrastructure",
-        )?;
-        self.parent.require_child_directory_identity(
-            &self.leaf_name,
-            self.leaf_identity,
-            "attempt-owned evidence staging leaf",
-        )
-    }
-
-    fn sync(&self) -> Result<(), XtaskError> {
-        self.require_identity()?;
-        self.leaf.sync()?;
-        self.parent.sync()
-    }
-
-    fn cleanup_leaf(&self) -> Result<(), XtaskError> {
-        self.require_identity()?;
-        self.parent.remove_child_directory_by_identity(
-            &self.leaf_name,
-            self.leaf_identity,
-            "attempt-owned evidence staging leaf",
-        )
-    }
 }
 
 enum ReservationOutcome {
@@ -6526,12 +6597,12 @@ impl AttemptReservation {
             report_staging_path: root
                 .join("target/quality/evidence-report-staging")
                 .join(&evidence.attempt_id),
-            report_staging_area: None,
             report_final_path: root
                 .join("target/quality/evidence-reports")
                 .join(&evidence.attempt_id),
             report_staging_files: Vec::new(),
             report_final_files: Vec::new(),
+            report_staging_directories: OwnedDirectoryChain::default(),
             report_final_directories: OwnedDirectoryChain::default(),
             evidence,
             collided,
@@ -6552,27 +6623,16 @@ impl AttemptReservation {
         let final_parent = self.report_final_path.parent().ok_or_else(|| {
             XtaskError::invalid_path(&self.report_final_path, "report path has no parent")
         })?;
-        self.report_final_directories = OwnedDirectoryChain::create(root, final_parent)?;
-        let staging_area = OwnedStagingReportArea::create(root, &self.evidence.attempt_id)?;
-        if staging_area.path() != self.report_staging_path {
-            return Err(XtaskError::invalid_path(
-                staging_area.path(),
-                "descriptor-created evidence staging leaf does not match the reserved attempt path",
-            ));
-        }
-        self.report_staging_area = Some(staging_area);
-        let staging_area = self.report_staging_area.as_ref().ok_or_else(|| {
-            XtaskError::invalid(
-                "engineering evidence staging",
-                "staging area was not retained",
-            )
-        })?;
+        self.report_final_directories =
+            OwnedDirectoryChain::create(root, final_parent, OwnedLeaf::ExistingAllowed)?;
+        self.report_staging_directories =
+            OwnedDirectoryChain::create(root, &self.report_staging_path, OwnedLeaf::MustCreate)?;
         stage_raw_reports(
             &self.report_staging_path,
             &self.evidence,
             &mut self.report_staging_files,
         )?;
-        staging_area.sync()?;
+        sync_directory(&self.report_staging_path)?;
         claim_final_report_directory(
             &self.report_final_path,
             final_parent,
@@ -6586,7 +6646,7 @@ impl AttemptReservation {
         sync_directory(&self.report_final_path)?;
         sync_directory(final_parent)?;
         cleanup_owned_report_files(&self.report_staging_files)?;
-        staging_area.cleanup_leaf()?;
+        self.report_staging_directories.cleanup_empty()?;
         self.file
             .write_all(serialized.as_bytes())
             .and_then(|()| self.file.flush())
@@ -6621,9 +6681,7 @@ impl AttemptReservation {
             cleanup_owned_report_files(&self.report_staging_files),
             cleanup_owned_report_files(&self.report_final_files),
             cleanup_primary_evidence(&self.path),
-            self.report_staging_area
-                .as_ref()
-                .map_or(Ok(()), OwnedStagingReportArea::cleanup_leaf),
+            self.report_staging_directories.cleanup_empty(),
             self.report_final_directories.cleanup_empty(),
         ] {
             if let Err(cleanup_error) = cleanup {
@@ -6668,8 +6726,14 @@ struct OwnedDirectoryChain {
     created: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+enum OwnedLeaf {
+    ExistingAllowed,
+    MustCreate,
+}
+
 impl OwnedDirectoryChain {
-    fn create(root: &Path, target: &Path) -> Result<Self, XtaskError> {
+    fn create(root: &Path, target: &Path, leaf: OwnedLeaf) -> Result<Self, XtaskError> {
         let relative = target.strip_prefix(root).map_err(|source| {
             XtaskError::invalid_path(
                 target,
@@ -6678,14 +6742,15 @@ impl OwnedDirectoryChain {
         })?;
         let mut chain = Self::default();
         let mut current = root.to_path_buf();
-        if relative.as_os_str().is_empty() {
+        let component_count = relative.components().count();
+        if component_count == 0 {
             return Err(XtaskError::invalid_path(
                 target,
                 "owned directory target must be below its evidence root",
             ));
         }
 
-        for component in relative.components() {
+        for (index, component) in relative.components().enumerate() {
             let Component::Normal(name) = component else {
                 return Err(chain.reconcile_failure(XtaskError::invalid_path(
                     target,
@@ -6694,6 +6759,7 @@ impl OwnedDirectoryChain {
             };
             let parent = current.clone();
             current.push(name);
+            let is_leaf = index + 1 == component_count;
             match fs::create_dir(&current) {
                 Ok(()) => {
                     chain.created.push(current.clone());
@@ -6702,6 +6768,12 @@ impl OwnedDirectoryChain {
                     }
                 },
                 Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+                    if is_leaf && matches!(leaf, OwnedLeaf::MustCreate) {
+                        return Err(chain.reconcile_failure(XtaskError::invalid_path(
+                            &current,
+                            "owned evidence directory is already occupied",
+                        )));
+                    }
                     if !current.is_dir() {
                         return Err(chain.reconcile_failure(XtaskError::invalid_path(
                             &current,

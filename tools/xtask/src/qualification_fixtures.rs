@@ -738,10 +738,6 @@ impl DirectoryCapability {
             })
     }
 
-    pub(crate) fn diagnostic_path(&self) -> &Path {
-        &self.diagnostic_path
-    }
-
     fn require_identity(&self, expected: DirectoryIdentity) -> Result<(), XtaskError> {
         if self.identity()? != expected {
             return Err(XtaskError::invalid_path(
@@ -977,36 +973,6 @@ impl DirectoryCapability {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) fn remove_child_directory_by_identity(
-        &self,
-        name: &str,
-        expected: DirectoryIdentity,
-        label: &str,
-    ) -> Result<(), XtaskError> {
-        let child = self.open_child_directory(name, label).map_err(|_| {
-            XtaskError::invalid_path(
-                &self.diagnostic_path.join(name),
-                format!("{label} canonical name was replaced"),
-            )
-        })?;
-        if child.identity()? != expected {
-            return Err(XtaskError::invalid_path(
-                &self.diagnostic_path.join(name),
-                format!("{label} canonical name was replaced"),
-            ));
-        }
-        rustix::fs::unlinkat(&self.file, name, AtFlags::REMOVEDIR).map_err(|source| {
-            XtaskError::io(
-                format!(
-                    "remove owned {label} {}",
-                    self.diagnostic_path.join(name).display()
-                ),
-                rustix_io(source),
-            )
-        })?;
-        self.sync()
     }
 
     pub(crate) fn require_child_file_identity(

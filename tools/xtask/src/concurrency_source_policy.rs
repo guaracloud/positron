@@ -4,7 +4,7 @@
 //! sites with their registry and resolves Rust `use` trees before checking for
 //! forbidden spawn and unbounded-resource invocations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -31,25 +31,18 @@ pub(crate) fn validate_registered_spawn_sites(
         let source_text = fs::read_to_string(&source)
             .map_err(|error| XtaskError::io(format!("read {}", source.display()), error))?;
         let tokenized = tokenized_source(&source_text);
-        let test_start = ["\n#[cfg(test)]", "\n#[cfg(all(test,"]
-            .into_iter()
-            .filter_map(|marker| tokenized.find(marker))
-            .min();
-        let production = test_start
-            .and_then(|index| tokenized.get(..index))
-            .unwrap_or(&tokenized);
+        let (production, excluded_test_lines) = mask_cfg_test_items(&tokenized)?;
         let compact = production
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
 
-        reject_forbidden_invocations(&source, production, &compact)?;
+        reject_forbidden_invocations(&source, &production, &compact)?;
 
-        let production_line_count = production.lines().count();
         let markers = source_text
             .lines()
-            .take(production_line_count)
             .enumerate()
+            .filter(|(offset, _)| !excluded_test_lines.contains(&(offset + 1)))
             .filter_map(|(offset, raw_line)| {
                 raw_line
                     .trim_start()
@@ -115,6 +108,164 @@ pub(crate) fn validate_registered_spawn_sites(
     Ok(())
 }
 
+fn mask_cfg_test_items(source: &str) -> Result<(String, BTreeSet<usize>), XtaskError> {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut excluded = vec![false; characters.len()];
+    let mut cursor = 0;
+    while cursor < characters.len() {
+        if characters.get(cursor) != Some(&'#') || characters.get(cursor + 1) != Some(&'[') {
+            cursor += 1;
+            continue;
+        }
+        let attribute_end = balanced_end(&characters, cursor + 1, '[', ']')?;
+        let attribute = characters
+            .get(cursor..attribute_end)
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "concurrency source policy",
+                    "test-only attribute escaped its tokenized source boundary",
+                )
+            })?
+            .iter()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if !is_test_only_cfg_attribute(&attribute) {
+            cursor = attribute_end;
+            continue;
+        }
+        let item_start = cursor;
+        cursor = attribute_end;
+        loop {
+            while characters
+                .get(cursor)
+                .is_some_and(|character| character.is_whitespace())
+            {
+                cursor += 1;
+            }
+            if characters.get(cursor) != Some(&'#') || characters.get(cursor + 1) != Some(&'[') {
+                break;
+            }
+            cursor = balanced_end(&characters, cursor + 1, '[', ']')?;
+        }
+        let item_end = rust_item_end(&characters, cursor)?;
+        excluded
+            .get_mut(item_start..item_end)
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "concurrency source policy",
+                    "test-only item escaped its tokenized source boundary",
+                )
+            })?
+            .fill(true);
+        cursor = item_end;
+    }
+    let mut line = 1_usize;
+    let mut excluded_lines = BTreeSet::new();
+    let production = characters
+        .iter()
+        .zip(excluded)
+        .map(|(character, excluded)| {
+            let current_line = line;
+            if *character == '\n' {
+                line += 1;
+            }
+            if excluded {
+                excluded_lines.insert(current_line);
+                if *character == '\n' { '\n' } else { ' ' }
+            } else {
+                *character
+            }
+        })
+        .collect();
+    Ok((production, excluded_lines))
+}
+
+fn is_test_only_cfg_attribute(attribute: &str) -> bool {
+    attribute == "#[cfg(test)]"
+        || (attribute.starts_with("#[cfg(all(")
+            && attribute.ends_with("))]")
+            && attribute
+                .trim_start_matches("#[cfg(all(")
+                .trim_end_matches("))]")
+                .split(',')
+                .any(|predicate| predicate == "test"))
+}
+
+fn balanced_end(
+    characters: &[char],
+    open_at: usize,
+    open: char,
+    close: char,
+) -> Result<usize, XtaskError> {
+    if characters.get(open_at) != Some(&open) {
+        return Err(XtaskError::invalid(
+            "concurrency source policy",
+            "annotated Rust boundary omitted its opening delimiter",
+        ));
+    }
+    let mut depth = 0_usize;
+    for (offset, character) in characters.iter().enumerate().skip(open_at) {
+        if *character == open {
+            depth = depth.checked_add(1).ok_or_else(|| {
+                XtaskError::invalid(
+                    "concurrency source policy",
+                    "annotated Rust boundary nesting overflowed",
+                )
+            })?;
+        } else if *character == close {
+            depth = depth.checked_sub(1).ok_or_else(|| {
+                XtaskError::invalid(
+                    "concurrency source policy",
+                    "annotated Rust boundary closed before it opened",
+                )
+            })?;
+            if depth == 0 {
+                return Ok(offset + 1);
+            }
+        }
+    }
+    Err(XtaskError::invalid(
+        "concurrency source policy",
+        "annotated Rust boundary was not closed",
+    ))
+}
+
+fn rust_item_end(characters: &[char], start: usize) -> Result<usize, XtaskError> {
+    let mut parenthesis_depth = 0_usize;
+    let mut bracket_depth = 0_usize;
+    for (offset, character) in characters.iter().enumerate().skip(start) {
+        match *character {
+            '(' => parenthesis_depth += 1,
+            ')' => {
+                parenthesis_depth = parenthesis_depth.checked_sub(1).ok_or_else(|| {
+                    XtaskError::invalid(
+                        "concurrency source policy",
+                        "test-only Rust item has an unmatched parenthesis",
+                    )
+                })?;
+            },
+            '[' => bracket_depth += 1,
+            ']' => {
+                bracket_depth = bracket_depth.checked_sub(1).ok_or_else(|| {
+                    XtaskError::invalid(
+                        "concurrency source policy",
+                        "test-only Rust item has an unmatched bracket",
+                    )
+                })?;
+            },
+            '{' if parenthesis_depth == 0 && bracket_depth == 0 => {
+                return balanced_end(characters, offset, '{', '}');
+            },
+            ';' if parenthesis_depth == 0 && bracket_depth == 0 => return Ok(offset + 1),
+            _ => {},
+        }
+    }
+    Err(XtaskError::invalid(
+        "concurrency source policy",
+        "test-only Rust attribute omitted its item boundary",
+    ))
+}
+
 fn reject_forbidden_invocations(
     source: &Path,
     production: &str,
@@ -153,7 +304,7 @@ fn reject_forbidden_invocations(
             "unregistered imported concurrency primitive alias in activated tooling source",
         ));
     }
-    for invocation in resolved_forbidden_import_invocations(production)? {
+    for invocation in resolved_forbidden_binding_invocations(production)? {
         if invocation_exists(compact, &invocation) {
             return Err(XtaskError::invalid_path(
                 source,
@@ -176,10 +327,11 @@ enum UseToken {
     CloseGroup,
     Comma,
     Semicolon,
+    Equals,
     Glob,
 }
 
-fn resolved_forbidden_import_invocations(source: &str) -> Result<Vec<String>, XtaskError> {
+fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, XtaskError> {
     let tokens = use_tokens(source);
     let mut bindings = Vec::new();
     let mut cursor = 0;
@@ -214,6 +366,58 @@ fn resolved_forbidden_import_invocations(source: &str) -> Result<Vec<String>, Xt
             _ => &[],
         };
         invocations.extend(suffixes.iter().map(|suffix| format!("{local}{suffix}")));
+    }
+    let mut paths = invocations
+        .iter()
+        .map(|invocation| invocation.split("::").map(str::to_owned).collect())
+        .collect::<Vec<Vec<String>>>();
+    loop {
+        let mut changed = false;
+        let mut cursor = 0;
+        while cursor < tokens.len() {
+            if identifier_at(&tokens, cursor) != Some("let") {
+                cursor += 1;
+                continue;
+            }
+            cursor += 1;
+            if identifier_at(&tokens, cursor) == Some("mut") {
+                cursor += 1;
+            }
+            let Some(local) = identifier_at(&tokens, cursor) else {
+                continue;
+            };
+            cursor += 1;
+            if tokens.get(cursor) != Some(&UseToken::Equals) {
+                continue;
+            }
+            cursor += 1;
+            let Some(first) = identifier_at(&tokens, cursor) else {
+                continue;
+            };
+            let mut right_hand_side = vec![first.to_owned()];
+            cursor += 1;
+            while tokens.get(cursor) == Some(&UseToken::PathSeparator) {
+                cursor += 1;
+                let Some(segment) = identifier_at(&tokens, cursor) else {
+                    break;
+                };
+                right_hand_side.push(segment.to_owned());
+                cursor += 1;
+            }
+            if tokens.get(cursor) != Some(&UseToken::Semicolon) || !paths.contains(&right_hand_side)
+            {
+                continue;
+            }
+            let rebound = vec![local.to_owned()];
+            if !paths.contains(&rebound) {
+                invocations.push(local.to_owned());
+                paths.push(rebound);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
     Ok(invocations)
 }
@@ -340,6 +544,7 @@ fn use_tokens(source: &str) -> Vec<UseToken> {
                 '}' => Some(UseToken::CloseGroup),
                 ',' => Some(UseToken::Comma),
                 ';' => Some(UseToken::Semicolon),
+                '=' => Some(UseToken::Equals),
                 '*' => Some(UseToken::Glob),
                 _ => None,
             };

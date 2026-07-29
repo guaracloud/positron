@@ -75,6 +75,7 @@ fn run() -> Result<(), XtaskError> {
             quality::run(&options)
         },
         "quality-fixture" => qualification_fixtures::run_process(arguments),
+        "quality-bounded-runner" => bounded_runners::run_process(arguments),
         "setup" => {
             ensure_no_more_arguments(arguments)?;
             hooks::install()

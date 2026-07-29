@@ -9,7 +9,10 @@
 //! than a runner verdict.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::concurrency_source_policy::SpawnSiteRegistry;
@@ -28,6 +31,9 @@ const MAXIMUM_FIELD_BYTES: usize = 96;
 const REGISTERED_SPAWN_SITE: &str = "quality-bounded-worker-v1";
 const CONCURRENCY_GATE: &str = "EG-CONCURRENCY";
 const RESOURCE_GATE: &str = "EG-RESOURCE";
+const CHILD_PROCESS_RECONCILIATION_RESERVE: Duration = Duration::from_millis(25);
+const MAXIMUM_CHILD_ARGUMENT_BYTES: usize = 32_768;
+const MAXIMUM_CHILD_OUTCOME_BYTES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScenarioGate {
@@ -241,6 +247,173 @@ impl FrozenBoundedRunnerRegistry {
                 XtaskError::invalid("bounded runner registry", "registered scenario is missing")
             })
     }
+
+    pub(crate) fn child_arguments(
+        &self,
+        gate: &str,
+        outcome: &Path,
+    ) -> Result<Vec<OsString>, XtaskError> {
+        let registry = hex_encode(&self.bytes)?;
+        let spawn_sites = hex_encode(&self.spawn_site_bytes)?;
+        Ok(vec![
+            OsString::from("quality-bounded-runner"),
+            OsString::from(gate),
+            OsString::from(registry),
+            OsString::from(spawn_sites),
+            outcome.as_os_str().to_owned(),
+        ])
+    }
+
+    pub(crate) fn process_work_budget(&self, gate: &str) -> Result<Duration, XtaskError> {
+        let scenario = self.scenario(ScenarioGate::parse(gate)?)?;
+        scenario
+            .shutdown
+            .checked_sub(CHILD_PROCESS_RECONCILIATION_RESERVE)
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "bounded runner process lifecycle",
+                    "registered shutdown bound does not reserve process reconciliation time",
+                )
+            })
+    }
+
+    pub(crate) fn shutdown_bound(&self, gate: &str) -> Result<Duration, XtaskError> {
+        Ok(self.scenario(ScenarioGate::parse(gate)?)?.shutdown)
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> Result<String, XtaskError> {
+    let capacity = bytes.len().checked_mul(2).ok_or_else(|| {
+        XtaskError::invalid(
+            "bounded runner child arguments",
+            "hex-encoded field length cannot be represented",
+        )
+    })?;
+    if capacity > MAXIMUM_CHILD_ARGUMENT_BYTES {
+        return Err(XtaskError::invalid(
+            "bounded runner child arguments",
+            "hex-encoded field exceeds its exact maximum",
+        ));
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(capacity);
+    for byte in bytes {
+        encoded.push(char::from(hex_digit(HEX, byte >> 4)?));
+        encoded.push(char::from(hex_digit(HEX, byte & 0x0f)?));
+    }
+    Ok(encoded)
+}
+
+fn hex_digit(digits: &[u8; 16], index: u8) -> Result<u8, XtaskError> {
+    digits.get(usize::from(index)).copied().ok_or_else(|| {
+        XtaskError::invalid(
+            "bounded runner child arguments",
+            "hex digit index escaped its canonical alphabet",
+        )
+    })
+}
+
+pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(), XtaskError> {
+    let arguments = arguments.take(5).collect::<Vec<_>>();
+    let [gate, registry, spawn_sites, outcome] = arguments.as_slice() else {
+        return Err(XtaskError::usage(
+            "quality-bounded-runner requires one gate, two frozen registries, and one outcome path",
+        ));
+    };
+    let outcome = PathBuf::from(outcome);
+    let result = (|| {
+        let registry =
+            FrozenBoundedRunnerRegistry::capture(hex_decode(registry)?, hex_decode(spawn_sites)?)?;
+        let record = match ScenarioGate::parse(gate)? {
+            ScenarioGate::Concurrency => run_concurrency_scenario(&registry)?,
+            ScenarioGate::Resource => run_resource_scenario(&registry)?,
+        };
+        Ok(record)
+    })();
+    write_child_outcome(&outcome, &result)?;
+    result.map(|_| ())
+}
+
+fn hex_decode(encoded: &str) -> Result<Vec<u8>, XtaskError> {
+    if encoded.len() > MAXIMUM_CHILD_ARGUMENT_BYTES || !encoded.len().is_multiple_of(2) {
+        return Err(XtaskError::invalid(
+            "bounded runner child arguments",
+            "hex-encoded field has an invalid bounded length",
+        ));
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let [high, low] = pair else {
+                return Err(XtaskError::invalid(
+                    "bounded runner child arguments",
+                    "hex-encoded field contains an incomplete byte",
+                ));
+            };
+            let high = hex_nibble(*high)?;
+            let low = hex_nibble(*low)?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, XtaskError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(XtaskError::invalid(
+            "bounded runner child arguments",
+            "hex-encoded field contains a non-canonical digit",
+        )),
+    }
+}
+
+fn write_child_outcome(path: &Path, result: &Result<String, XtaskError>) -> Result<(), XtaskError> {
+    let root = std::env::current_dir()
+        .map_err(|source| XtaskError::io("resolve bounded runner workspace", source))?;
+    let parent = path.parent().ok_or_else(|| {
+        XtaskError::invalid_path(path, "bounded runner outcome path has no parent")
+    })?;
+    if !path.is_absolute() || !parent.starts_with(root.join("target/quality/tmp")) {
+        return Err(XtaskError::invalid_path(
+            path,
+            "bounded runner outcome path escaped the owned quality temporary root",
+        ));
+    }
+    let content = match result {
+        Ok(record) => format!("ok\n{record}\n"),
+        Err(error) => format!("error\n{error}\n"),
+    };
+    if content.len() > MAXIMUM_CHILD_OUTCOME_BYTES {
+        return Err(XtaskError::invalid_path(
+            path,
+            "bounded runner outcome exceeds its exact maximum",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| XtaskError::io("create bounded runner outcome", source))?;
+    file.write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|source| XtaskError::io("write bounded runner outcome", source))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| XtaskError::io("synchronize bounded runner outcome parent", source))
+}
+
+pub(crate) fn validate_source_policy(
+    registry: &FrozenBoundedRunnerRegistry,
+    root: &Path,
+) -> Result<(), XtaskError> {
+    crate::concurrency_source_policy::validate_registered_spawn_sites(
+        root,
+        Path::new(SPAWN_SITE_REGISTRY_PATH),
+        registry.spawn_sites(),
+        REGISTERED_SPAWN_SITE,
+    )
 }
 
 fn parse_positive(path: &Path, value: &str, field: &str) -> Result<usize, XtaskError> {
@@ -394,16 +567,7 @@ impl BoundedWorkQueue {
     }
 }
 
-pub(crate) fn run_concurrency(
-    registry: &FrozenBoundedRunnerRegistry,
-    root: &Path,
-) -> Result<String, XtaskError> {
-    crate::concurrency_source_policy::validate_registered_spawn_sites(
-        root,
-        Path::new(SPAWN_SITE_REGISTRY_PATH),
-        registry.spawn_sites(),
-        REGISTERED_SPAWN_SITE,
-    )?;
+fn run_concurrency_scenario(registry: &FrozenBoundedRunnerRegistry) -> Result<String, XtaskError> {
     let scenario = registry.scenario(ScenarioGate::Concurrency)?;
     validate_concurrency_scenario(scenario)?;
     let LifecycleResult {
@@ -427,16 +591,7 @@ pub(crate) fn run_concurrency(
     Ok(record)
 }
 
-pub(crate) fn run_resource(
-    registry: &FrozenBoundedRunnerRegistry,
-    root: &Path,
-) -> Result<String, XtaskError> {
-    crate::concurrency_source_policy::validate_registered_spawn_sites(
-        root,
-        Path::new(SPAWN_SITE_REGISTRY_PATH),
-        registry.spawn_sites(),
-        REGISTERED_SPAWN_SITE,
-    )?;
+fn run_resource_scenario(registry: &FrozenBoundedRunnerRegistry) -> Result<String, XtaskError> {
     let scenario = registry.scenario(ScenarioGate::Resource)?;
     validate_resource_scenario(scenario)?;
     let LifecycleResult {
@@ -631,6 +786,27 @@ fn verify_measurement_record(
         return Err(XtaskError::invalid(
             "independent bounded measurement verifier",
             "worker measurement count does not match the retained registration",
+        ));
+    }
+    let expected_identity = (0..scenario.max_tasks).collect::<BTreeSet<_>>();
+    let worker_ids = parsed
+        .iter()
+        .map(|measurement| measurement.id)
+        .collect::<BTreeSet<_>>();
+    if worker_ids != expected_identity || worker_ids.len() != parsed.len() {
+        return Err(XtaskError::invalid(
+            "independent bounded measurement verifier",
+            "worker identifiers do not exactly match the registered workers",
+        ));
+    }
+    let schedule_slots = parsed
+        .iter()
+        .map(|measurement| measurement.schedule_slot)
+        .collect::<BTreeSet<_>>();
+    if schedule_slots != expected_identity || schedule_slots.len() != parsed.len() {
+        return Err(XtaskError::invalid(
+            "independent bounded measurement verifier",
+            "worker schedule slots are not unique and contiguous",
         ));
     }
     let joined_ids = fields
