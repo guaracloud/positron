@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "id": "PC-0011-m0-06-evidence-attempt-integrity",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Close the M0-06 engineering-evidence attempt-integrity gaps in the authoritative cargo xtask quality runner without changing product behavior or qualification state.",
+  "change": {
+    "issue": 7,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
+    "runner_changes": [
+      "A target/quality/evidence attempt path or deterministic collision identity is create-new reserved before any attempt-owned raw report is created. If the canonical path exists, its bytes remain unchanged and the colliding invocation reserves a schema-valid failed verdict in the first free slot from 16 deterministic collision paths bound to the attempted identity.",
+      "Reservation is a bounded atomic create-new state machine: each candidate first reserves and durably writes its recovery verdict, then atomically reserves its primary path. A recovery collision advances to the next deterministic candidate, while a primary collision retains the already reserved recovery verdict without overwriting either path.",
+      "If all 16 deterministic collision slots are occupied, the invocation retains one reserved create-new collision-exhausted failure bound to the canonical attempt and exact occupied-slot set. An existing reserved record is treated as the already retained exhaustion state and is never overwritten.",
+      "If any raw-report path is already occupied or report retention otherwise fails after reservation, the occupied bytes remain unchanged and the claimed evidence handle receives a schema-valid failed attempt with an explicit report-retention-failed reason.",
+      "Trusted CI rejects a GITHUB_SHA that differs from the controlled git revision before gate selection.",
+      "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a missing or retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass.",
+      "Engineering evidence schema version 3 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact structured-invocation digests.",
+      "Every selected gate create-news an attempt-owned JSON raw report with exact relative path, SHA-256, byte length, content type, verdict, diagnostic detail, and bounded stdout/stderr. Typed retained-document parsing enforces the evidence schema's 2097152-byte limit and the raw-report schema's independent 8388608-byte limit, with filesystem metadata rejected before either file is read. Controlled steps are charged before stream copies, with 128 steps, 131072 bytes per stream, and 8388608 encoded bytes per report; the serializer reserves each exact escaped JSON field before copying and retains a schema-valid failed attempt if encoding reaches the limit.",
+      "Retained evidence files and raw-report directories are enumerated independently under bounded counts. Current schema-v3 evidence requires every exact report even when its report directory is absent, orphan report files and attempt directories fail closed, schema-v3 attempt-owned filenames are constrained, and bounded schema-v1/v2 records remain explicit legacy inputs with their historical filename labels and without schema-v3 report requirements.",
+      "Every retained-evidence directory entry is charged against the canonical count before classification. Only regular files with exact JSON extensions are accepted, so non-JSON files, directories, symlinks, and mixed-entry over-count roots fail closed before content parsing.",
+      "Before the primary evidence path is touched or any report is published, the attempt create-news, flushes, synchronizes, and directory-synchronizes one schema-valid recovery record bound to the canonical attempt. A pre-existing recovery record prevents primary creation, and a primary collision after recovery reservation preserves both the recovery verdict and occupied primary bytes.",
+      "Every evidence and report directory component is created individually, child- and parent-synchronized before use, and recorded as attempt-owned only after successful creation. Every selected report is create-new written, flushed, file-synchronized, and read back in one bounded staging directory. The staging directory is synchronized before rename; after rename, the final directory and report parent are synchronized before primary evidence is written, flushed, and synchronized. Recovery deletion is followed by evidence-parent synchronization, and any durability or reconciliation failure removes only attempt-owned partial state as far as safe while retaining or restoring the recovery verdict.",
+      "Report reconciliation records each exact create-new report file and each directory component owned by the attempt. Failure cleanup removes only those files and then only empty owned directories; it never recursively removes a staging or final bundle, injected non-owned files, directories, or symlinks are preserved while publication remains failed, and concurrently shared nonempty ancestor directories are preserved without reclassifying a successfully removed attempt leaf as cleanup failure.",
+      "Final raw-report publication atomically create-dir claims the attempt directory before any entry is published. Each already synchronized staging file is create-new hard-linked to its absent final path and synchronized; only after the complete exact set, final directory, and report parent are durable is staging reconciled non-recursively and primary evidence eligible for acknowledgement.",
+      "Removing an incomplete owned primary evidence file is followed by evidence-parent synchronization before recovery is reported. Retained validation rejects any attempt whose primary evidence and candidate-specific authoritative recovery marker coexist, so a crash-resurrected primary cannot be accepted beside the failed verdict.",
+      "The bounded retained-JSON parser grows decoded string storage geometrically up to the canonical 131072-byte limit rather than reserving once per decoded character; allocation failure, arithmetic overflow, and the existing decoded-length boundary remain explicit failures.",
+      "EVIDENCE_V3_CONSTRAINTS_V1 is the canonical runtime constraint owner for string, digest, path, count, and size boundaries. The checked schema names this owner and is verified by its exact SHA-256 after structural checks, so enum, pattern, length, range, required-field, or additional-properties drift fails closed. Runtime parsing enforces lowercase 40/64-character source and registry identities, lowercase SHA-256, and every declared maximum.",
+      "Retained structured invocations are parsed into typed ordered fields, including repeated arguments, canonicalized with the writer's positron-quality-command-v2 NUL-domain-separated JSON algorithm, and SHA-256 recomputed independently for both evidence and raw reports before their stored digests are cross-compared. Current-schema gate identity, owner, budget, selection, program, ordered arguments, working directory, environment, timeout, activation, exception, and ordered commands are then compared with the canonical gate, toolchain, profile, stage, and scope registries rather than accepted from the retained record itself. Passed selected gates require their complete canonical controlled-step sequence; failed selected gates require the non-empty canonical prefix ending at the executed failure; only a canonically zero-step internal gate may retain an empty executed sequence.",
+      "Exceptional retained attempts use an explicit typed mode derived from their collision bindings. Collision records canonically retain collision-retention and blocked-by-collision invocations; publication-recovery records retain report-retention-failure and blocked-by-EG-00 invocations. The public EG-EVIDENCE validator applies the matching closed semantics on the next run."
+    ],
+    "unchanged": [
+      "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
+      "Developer evidence remains diagnostic and non-merge-eligible.",
+      "Release Qualification Cells remain Specified; this engineering runner does not qualify a product artifact."
+    ]
+  },
+  "detection_gained": [
+    "A same-attempt evidence collision cannot replace a retained result.",
+    "Parallel canonical and collision-slot racers cannot both claim or overwrite one candidate; each invocation retains exactly one schema-valid verdict through atomic create-new reservation.",
+    "A collision whose 16 ordinary retention slots are already occupied cannot disappear without a reserved immutable exhaustion record.",
+    "A trusted CI result cannot be accepted for a source revision other than the controlled git revision.",
+    "A missing trusted-CI attempt identity or retry cannot turn an earlier failing run into a fresh green attempt.",
+    "Every current runner attempt exposes exact or explicitly non-applicable evidence identities with validated structured invocation and registry digests.",
+    "Missing, tampered, oversized, malformed, duplicate-field, or command-mismatched selected-gate raw reports fail the public EG-EVIDENCE validator.",
+    "Retained evidence with missing, duplicate, or extra canonical gates, aggregate-result overwrite, or schema-version removal fails closed.",
+    "A raw-report collision, encoded-size rejection, evidence write failure, or evidence flush failure cannot consume the attempt without a pre-reserved schema-valid failed recovery record.",
+    "Deleting an entire schema-v3 report directory, adding an orphan report file or attempt directory, or presenting an adversarial retained-evidence filename fails the public validator.",
+    "A non-JSON file, directory, symlink, or 4097th mixed retained-evidence entry fails the public validator before any entry is accepted outside the bounded root contract.",
+    "Bounded legacy schema-v1/v2 evidence is explicitly preserved without being reinterpreted as schema-v3 report evidence.",
+    "A report failure at any position cannot expose a partial final report directory; reconciliation removes only attempt-owned publication and cannot erase the retained failed verdict or overwrite a pre-existing report directory.",
+    "Non-owned content injected into either an attempt staging bundle or renamed final bundle survives reconciliation byte-for-byte while the attempt remains failed and its schema-valid recovery verdict is retained.",
+    "A concurrent final report-directory claimant between staging completion and publication cannot be replaced or populated; the claimed directory remains byte-for-byte owned by the racer and the quality invocation retains one schema-valid failed recovery verdict.",
+    "A pre-existing recovery record cannot cause an empty primary file, and a primary reservation collision after recovery creation cannot overwrite either authoritative record.",
+    "An incomplete primary unlink whose evidence-parent synchronization fails remains a typed publication-recovery failure, and a later primary/recovery dual state fails the public EG-EVIDENCE validator.",
+    "An evidence-directory parent-sync, report-directory component-sync, staging-child parent-sync, staged report file-sync, staging-directory-sync, final-directory-sync, or report-parent-sync failure cannot acknowledge primary evidence; reconciliation removes only directories created by that attempt and retains a schema-valid recovery verdict when one exists.",
+    "Plain and escaped retained-JSON strings at the 131072-byte decoded limit require only logarithmically many allocation growth requests while over-limit strings still fail closed.",
+    "Uppercase hashes, overlong constrained identities, and any checked-schema constraint drift fail EG-EVIDENCE.",
+    "Retained reports one byte below and exactly at the 8388608-byte raw-report limit are accepted, while a report one byte over the limit is rejected from metadata before parsing.",
+    "Coordinated edits to an invocation plus independently valid recomputed command digests are rejected against the canonical registries while ordered repeated arguments and dynamic resolved tool identities remain lossless.",
+    "Deleting every controlled step from a selected external gate and recomputing valid evidence and report digests fails registry-derived cardinality. A passed selected gate requires the complete canonical sequence, a failed selected gate requires its non-empty canonical prefix, and a registered internal runner whose canonical sequence is empty remains valid.",
+    "Retained collision and publication-recovery records remain valid under their distinct typed invocation modes during the next EG-EVIDENCE pass."
+  ],
+  "detection_lost": [],
+  "representative_old_new_evidence": {
+    "old": {
+      "status": "failed-focused-public-regression",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_overwritten_engineering_evidence_attempt -- --exact",
+      "result": "Before the change, a pre-created target/quality/evidence attempt path was silently replaced and the public runner returned success."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_never_replaces_a_concurrently_claimed_final_report_directory -- --exact --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_synchronizes_the_evidence_parent_after_removing_an_incomplete_primary -- --exact --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_primary_resurrected_next_to_its_authoritative_recovery -- --exact --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_preserves_injected_non_owned_content -- --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_failed_attempt_without_final_reports -- --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_evidence_when -- --nocapture",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_recovery_when -- --nocapture",
+        "cargo clippy --locked --package xtask --all-targets -- -D warnings"
+      ],
+      "result": "All 28 distinct focused tests passed, including the deterministic final-directory claim racer, primary-unlink synchronization failure, primary/recovery dual-state rejection, exact publication, collision compatibility, non-owned-content preservation, and adjacent durability and recovery paths. Targeted xtask Clippy also passed with warnings denied. These local results are diagnostic only."
+    },
+    "behavior_provenance": {
+      "source_revision": "127bf6dac37f91fed4f813c8d600797af6b51a9d",
+      "source_tree": "74aa62484f45b3810863d8b0264066dc690b7b0f",
+      "fixture_sha256": "8a02e22af8189144ea3cf3ea425f23c683c44b29c12ab1dbd805b337221e0940",
+      "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
+      "runner_sha256": "50be4e5390c4c32eabb2519936cb61b2087ba22fc126a4f8c313db58b1169380",
+      "parser_sha256": "1d7d55c06319acb06fbabe74df0f875c86f0081eec672958d44f6d74fcb7e3f6",
+      "exact_fixture_results": [
+        "quality_never_replaces_a_concurrently_claimed_final_report_directory: passed",
+        "quality_synchronizes_the_evidence_parent_after_removing_an_incomplete_primary: passed",
+        "quality_rejects_a_primary_resurrected_next_to_its_authoritative_recovery: passed",
+        "quality_publishes_the_complete_exact_identity_evidence_contract: passed",
+        "quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied: passed",
+        "quality_preserves_injected_non_owned_content_in_the_staging_bundle: passed",
+        "quality_preserves_injected_non_owned_content_in_the_final_bundle: passed",
+        "quality_rejects_an_overwritten_engineering_evidence_attempt: passed",
+        "quality_validates_a_retained_collision_on_the_next_evidence_pass: passed",
+        "quality_retains_collision_exhaustion_without_changing_any_occupied_bytes: passed",
+        "quality_does_not_touch_primary_evidence_when_recovery_is_preexisting: passed",
+        "quality_preserves_recovery_when_primary_reservation_collides_afterward: passed",
+        "quality_retains_failed_attempt_without_final_reports_when_staging_cleanup_fails: passed",
+        "cargo clippy --locked --package xtask --all-targets -- -D warnings: passed"
+      ]
+    },
+    "dual_run_artifacts": {
+      "old": "qualification/engineering/policy-evidence/PC-0011/old-collision-overwrite.json",
+      "new": "qualification/engineering/policy-evidence/PC-0011/new-collision-retention.json"
+    },
+    "dual_run_conclusion": "The same arbitrary-byte collision fixture, extended by occupying all 16 bounded slots, distinguishes the old missing-failure-record behavior from the new ordinary and exhaustion retained-failure behavior. No prior failed attempt is removed, reclassified, or converted into a qualification claim."
+  },
+  "compatibility_and_recovery": {
+    "compatibility": "The cargo xtask quality command is unchanged. Engineering evidence advances to schema version 3; consumers must require the identity object, structured per-gate invocation and digest, owner, exact selected-gate raw_report binding, and explicit not-selected applicability. This diagnostic schema is not product or qualification evidence.",
+    "recovery": "Create a new run with its own fresh attempt identity after correcting the underlying failure. Preserve the canonical collision bytes, every occupied collision slot, the reserved exhaustion record, and every attempt-owned raw report; do not delete, rename, or overwrite retained evidence."
+  },
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering"
+  ],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
+    "attribution": "No implementation agent, reviewer, or repository owner is recorded as granting a required approval."
+  },
+  "qualification_claim": "None. This record does not claim a qualified cell, trusted CI pass, merge eligibility, release readiness, or role approval."
+}

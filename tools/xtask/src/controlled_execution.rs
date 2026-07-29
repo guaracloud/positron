@@ -89,8 +89,6 @@ pub(crate) enum InvocationInput {
 /// The externally visible output ownership mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutputMode {
-    /// Forward output to the invoking terminal without buffering it.
-    Inherit,
     /// Capture independently bounded standard output and standard error.
     Capture { maximum_bytes_per_stream: usize },
 }
@@ -358,14 +356,8 @@ fn configure_standard_descriptors(
             command.stdin(Stdio::piped());
         },
     }
-    match output {
-        OutputMode::Inherit => {
-            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        },
-        OutputMode::Capture { .. } => {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        },
-    }
+    let OutputMode::Capture { .. } = output;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 }
 
 #[cfg(unix)]
@@ -647,42 +639,34 @@ impl OwnedWorkers {
                 Some((stdin, bytes))
             },
         };
-        let capture_pipes = match output {
-            OutputMode::Inherit => None,
-            OutputMode::Capture {
-                maximum_bytes_per_stream,
-            } => {
-                let stdout = child.stdout.take().ok_or_else(|| {
-                    ExecutionFailure::new(
-                        command.to_owned(),
-                        FailurePhase::Descriptor,
-                        "owned stdout capture pipe was unavailable",
-                    )
-                })?;
-                let stderr = child.stderr.take().ok_or_else(|| {
-                    ExecutionFailure::new(
-                        command.to_owned(),
-                        FailurePhase::Descriptor,
-                        "owned stderr capture pipe was unavailable",
-                    )
-                })?;
-                Some((stdout, stderr, maximum_bytes_per_stream))
+        let OutputMode::Capture {
+            maximum_bytes_per_stream,
+        } = output;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                "owned stdout capture pipe was unavailable",
+            )
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                "owned stderr capture pipe was unavailable",
+            )
+        })?;
+        let mut capture = Some(CaptureBroker::start(
+            stdout,
+            stderr,
+            CaptureBrokerRequest {
+                maximum_bytes: maximum_bytes_per_stream,
+                current_dir,
+                invocation_id: child.id(),
+                command,
+                capture_broker: &tools.capture_broker,
             },
-        };
-        let mut capture = match capture_pipes {
-            Some((stdout, stderr, maximum_bytes_per_stream)) => Some(CaptureBroker::start(
-                stdout,
-                stderr,
-                CaptureBrokerRequest {
-                    maximum_bytes: maximum_bytes_per_stream,
-                    current_dir,
-                    invocation_id: child.id(),
-                    command,
-                    capture_broker: &tools.capture_broker,
-                },
-            )?),
-            None => None,
-        };
+        )?);
         let input = match input_pipe {
             Some((stdin, bytes)) => match InputBroker::start(
                 stdin,
