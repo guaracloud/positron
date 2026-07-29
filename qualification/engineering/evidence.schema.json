@@ -7,6 +7,7 @@
   "required": [
     "schema_version",
     "attempt_id",
+    "collision_of",
     "profile",
     "result",
     "merge_eligible",
@@ -15,11 +16,13 @@
     "ended_unix_ms",
     "registry_digest",
     "environment_digest",
+    "identity",
     "gates"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
-    "attempt_id": { "type": "string", "minLength": 1 },
+    "schema_version": { "const": 2 },
+    "attempt_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "collision_of": { "$ref": "#/$defs/identityBinding" },
     "profile": { "enum": ["pre-commit", "pr", "ext", "qual"] },
     "result": { "enum": ["passed", "failed"] },
     "merge_eligible": { "type": "boolean" },
@@ -35,13 +38,41 @@
     },
     "started_unix_ms": { "type": "integer", "minimum": 0 },
     "ended_unix_ms": { "type": "integer", "minimum": 0 },
-    "registry_digest": {
-      "type": "string",
-      "pattern": "^(git-object:[0-9a-f]{40,64}|invalid-registry|unavailable-registry-digest)$"
-    },
-    "environment_digest": {
-      "type": "string",
-      "pattern": "^git-object:[0-9a-f]{40,64}$"
+    "registry_digest": { "$ref": "#/$defs/registryDigest" },
+    "environment_digest": { "$ref": "#/$defs/registryDigest" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "release_manifest",
+        "artifact",
+        "target",
+        "target_registry_digest",
+        "toolchain_digest",
+        "effective_configuration",
+        "fixture_registry_digest",
+        "corpus",
+        "seed",
+        "fault_schedule",
+        "verifier",
+        "approval",
+        "exception"
+      ],
+      "properties": {
+        "release_manifest": { "$ref": "#/$defs/identityBinding" },
+        "artifact": { "$ref": "#/$defs/identityBinding" },
+        "target": { "$ref": "#/$defs/identityBinding" },
+        "target_registry_digest": { "$ref": "#/$defs/registryDigest" },
+        "toolchain_digest": { "$ref": "#/$defs/registryDigest" },
+        "effective_configuration": { "$ref": "#/$defs/identityBinding" },
+        "fixture_registry_digest": { "$ref": "#/$defs/registryDigest" },
+        "corpus": { "$ref": "#/$defs/identityBinding" },
+        "seed": { "$ref": "#/$defs/identityBinding" },
+        "fault_schedule": { "$ref": "#/$defs/identityBinding" },
+        "verifier": { "$ref": "#/$defs/identityBinding" },
+        "approval": { "$ref": "#/$defs/identityBinding" },
+        "exception": { "$ref": "#/$defs/identityBinding" }
+      }
     },
     "gates": {
       "type": "array",
@@ -56,6 +87,9 @@
           "duration_ms",
           "budget_seconds",
           "command",
+          "command_digest",
+          "owner",
+          "raw_report",
           "detail"
         ],
         "properties": {
@@ -63,10 +97,64 @@
           "result": { "enum": ["passed", "failed", "not-selected"] },
           "duration_ms": { "type": "integer", "minimum": 0 },
           "budget_seconds": { "type": "integer", "minimum": 1 },
-          "command": { "type": "string", "minLength": 1 },
-          "detail": { "type": "string", "minLength": 1 }
+          "command": { "type": "string", "minLength": 1, "maxLength": 16384 },
+          "command_digest": { "$ref": "#/$defs/sha256Digest" },
+          "owner": { "$ref": "#/$defs/identityBinding" },
+          "raw_report": { "$ref": "#/$defs/identityBinding" },
+          "detail": { "type": "string", "minLength": 1, "maxLength": 16384 }
         }
       }
+    }
+  },
+  "$defs": {
+    "registryDigest": {
+      "type": "string",
+      "pattern": "^(git-object:[0-9a-f]{40,64}|invalid-registry|unavailable-registry-digest)$"
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identityBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicability", "value", "reason"],
+      "oneOf": [
+        {
+          "properties": {
+            "applicability": { "const": "exact" },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "not": { "const": "-" }
+            },
+            "reason": { "const": "-" }
+          }
+        },
+        {
+          "properties": {
+            "applicability": { "const": "not-applicable" },
+            "value": { "const": "-" },
+            "reason": {
+              "enum": [
+                "no-collision",
+                "no-release-manifest-for-engineering-attempt",
+                "no-candidate-artifact-for-engineering-attempt",
+                "no-effective-configuration-for-engineering-attempt",
+                "no-corpus-selected",
+                "no-seed-selected",
+                "no-fault-schedule-selected",
+                "no-approval-claimed",
+                "no-exception-applied",
+                "gate-not-selected",
+                "diagnostic-output-not-retained",
+                "unavailable-before-registry-validation"
+              ]
+            }
+          }
+        }
+      ]
     }
   }
 }

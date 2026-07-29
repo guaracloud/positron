@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "policy_change": "PC-0011-m0-06-evidence-attempt-integrity",
+  "implementation": "old",
+  "source_revision": "0482d77d9e421b093e1ac02d34bf343fb316330d",
+  "fixture": "A canonical attempt path contained the exact arbitrary bytes {\"tampered\":true}\\n before cargo xtask quality tried to retain its verdict.",
+  "verdict": "failed-public-regression",
+  "result": "The runner returned an EEXIST error. The original bytes remained, but no distinct schema-valid failed record existed for the colliding invocation.",
+  "qualification_claim": "none"
+}

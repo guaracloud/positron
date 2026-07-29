@@ -16,9 +16,10 @@
     "semantic_owner": "Quality Engineering",
     "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
     "runner_changes": [
-      "A target/quality/evidence attempt path is created exclusively and an existing path is a fail-closed error; evidence is never overwritten.",
+      "A target/quality/evidence attempt path is created exclusively. If it exists, its bytes remain unchanged and the colliding invocation retains a schema-valid failed verdict in the first free slot from 16 deterministic create-new collision paths bound to the attempted identity.",
       "Trusted CI rejects a GITHUB_SHA that differs from the controlled git revision before gate selection.",
-      "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass."
+      "Trusted CI accepts only GITHUB_RUN_ATTEMPT=1; a missing or retried workflow attempt is retained as failed aggregator evidence rather than accepted as a fresh pass.",
+      "Engineering evidence schema version 2 requires explicit typed applicability for Release Manifest, artifact, target, configuration, corpus, seed, fault schedule, verifier, approval, exception, owner, and raw-report identities; it also binds target, toolchain, fixture-registry, environment, registry, and exact command digests."
     ],
     "unchanged": [
       "All 25 gate IDs, stages, owners, timeouts, memory declarations, activation, exception classes, thresholds, targets, commands, and selection rules.",
@@ -29,7 +30,8 @@
   "detection_gained": [
     "A same-attempt evidence collision cannot replace a retained result.",
     "A trusted CI result cannot be accepted for a source revision other than the controlled git revision.",
-    "A trusted CI retry cannot turn an earlier failing run into a fresh green attempt."
+    "A missing trusted-CI attempt identity or retry cannot turn an earlier failing run into a fresh green attempt.",
+    "Every current runner attempt exposes exact or explicitly non-applicable evidence identities with validated command and registry digests."
   ],
   "detection_lost": [],
   "representative_old_new_evidence": {
@@ -42,16 +44,23 @@
       "status": "passed-focused-local-diagnostic",
       "commands": [
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_overwritten_engineering_evidence_attempt -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_publishes_the_complete_exact_identity_evidence_contract -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_an_incomplete_evidence_identity_schema -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_stale_trusted_ci_source_identity -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retried_trusted_ci_attempt -- --exact"
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_retried_trusted_ci_attempt -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_trusted_ci_without_a_run_attempt_identity -- --exact"
       ],
-      "result": "The public runner now returns a retained failed verdict for overwrite, stale source, and retry inputs. These local results are diagnostic only."
+      "result": "The public runner now preserves arbitrary colliding bytes, retains a distinct schema-v2 failed collision verdict, publishes the complete exact-identity contract on success, rejects incomplete schema, and retains schema-valid failed verdicts for stale, retried, and missing trusted-CI identities. These local results are diagnostic only."
     },
-    "dual_run_conclusion": "The failing overwrite reproducer remains represented by the retained regression test. No prior failed attempt is removed, reclassified, or converted into a qualification claim."
+    "dual_run_artifacts": {
+      "old": "qualification/engineering/policy-evidence/PC-0011/old-collision-overwrite.json",
+      "new": "qualification/engineering/policy-evidence/PC-0011/new-collision-retention.json"
+    },
+    "dual_run_conclusion": "The same arbitrary-byte collision fixture distinguishes the old missing-failure-record behavior from the new bounded retained-failure behavior. No prior failed attempt is removed, reclassified, or converted into a qualification claim."
   },
   "compatibility_and_recovery": {
-    "compatibility": "The cargo xtask quality command and JSON evidence schema remain compatible. A duplicate attempt identity now fails instead of replacing prior evidence.",
-    "recovery": "Create a new run with its own fresh attempt identity after correcting the underlying failure. Do not delete, rename, or overwrite an existing evidence attempt."
+    "compatibility": "The cargo xtask quality command is unchanged. Engineering evidence advances from schema version 1 to version 2; consumers must require the new identity object and per-gate command_digest, owner, and raw_report fields. This diagnostic schema is not product or qualification evidence.",
+    "recovery": "Create a new run with its own fresh attempt identity after correcting the underlying failure. Preserve the canonical collision bytes and every occupied collision slot; do not delete, rename, or overwrite an existing evidence attempt."
   },
   "approvals_required": [
     "Architecture",

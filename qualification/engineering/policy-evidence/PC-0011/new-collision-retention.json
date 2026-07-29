@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "policy_change": "PC-0011-m0-06-evidence-attempt-integrity",
+  "implementation": "new-dirty-remediation",
+  "source_revision": "pending-commit-self-reference-boundary",
+  "fixture": "The same canonical attempt path contains the exact arbitrary bytes {\"tampered\":true}\\n before cargo xtask quality tries to retain its verdict.",
+  "verdict": "passed-focused-local-diagnostic",
+  "result": "The original bytes remain unchanged. The runner atomically claims the first free slot from 16 deterministic collision paths and retains schema-v2 failed evidence bound to the attempted identity; EG-00 fails and every sibling is not-selected.",
+  "qualification_claim": "none"
+}

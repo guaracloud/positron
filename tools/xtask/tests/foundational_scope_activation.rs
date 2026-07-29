@@ -365,6 +365,35 @@ fn quality_records_explicit_not_selected_scheduled_gates_for_the_pr_profile() ->
                 .into());
             }
         }
+        for (gate, owner) in [
+            ("EG-00", "Quality Engineering"),
+            ("EG-ARCH", "Architecture"),
+            ("EG-BUILD", "Rust and Toolchain"),
+            ("EG-CONCURRENCY", "Application Runtime"),
+            ("EG-CORRECT", "Architecture"),
+            ("EG-COVERAGE", "Quality Engineering"),
+            ("EG-CRYPTO", "Security and Key Management"),
+            ("EG-DEPS", "Rust and Toolchain"),
+            ("EG-DOCS", "Public API and SDK"),
+            ("EG-DYNAMIC", "Quality Engineering"),
+            ("EG-ERROR", "Public API and SDK"),
+            ("EG-EVIDENCE", "Release Engineering"),
+            ("EG-FAULT", "Quality Engineering"),
+            ("EG-INTEGRITY", "Security and Key Management"),
+            ("EG-MATRIX", "Quality Engineering"),
+            ("EG-PERF", "Performance Qualification"),
+            ("EG-POLICY", "Architecture"),
+            ("EG-RESOURCE", "Storage Kernel"),
+            ("EG-RUST", "Rust and Toolchain"),
+            ("EG-SAFETY", "Security and Key Management"),
+            ("EG-SECRETS", "Security and Key Management"),
+            ("EG-SECURITY", "Security and Key Management"),
+            ("EG-SOAK", "Performance Qualification"),
+            ("EG-SUPPLY", "Release Engineering"),
+            ("EG-TEST", "Quality Engineering"),
+        ] {
+            assert_gate_owner_binding(&evidence, gate, owner)?;
+        }
         Ok(())
     })();
     let cleanup = fixture.remove();
@@ -413,6 +442,11 @@ fn quality_rejects_stale_trusted_ci_source_identity() -> TestResult {
         assert_rejected_output(
             &output,
             "trusted CI revision does not match the executing source",
+        )?;
+        assert_failed_aggregator_evidence(
+            &fixture,
+            "0000000000000000000000000000000000000000",
+            "trusted CI revision does not match the executing source",
         )
     })();
     let cleanup = fixture.remove();
@@ -435,6 +469,37 @@ fn quality_rejects_a_retried_trusted_ci_attempt() -> TestResult {
         assert_rejected_output(
             &output,
             "trusted CI retry attempts are not accepted as fresh evidence",
+        )?;
+        assert_failed_aggregator_evidence(
+            &fixture,
+            "0000000000000000000000000000000000000000",
+            "trusted CI retry attempts are not accepted as fresh evidence",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_trusted_ci_without_a_run_attempt_identity() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        let output = fixture.quality_output_for_with_environment(
+            "pre-commit",
+            [
+                ("GITHUB_ACTIONS", "true"),
+                ("GITHUB_SHA", "0000000000000000000000000000000000000000"),
+            ],
+        )?;
+        assert_rejected_output(
+            &output,
+            "trusted CI evidence is missing its run-attempt identity",
+        )?;
+        assert_failed_aggregator_evidence(
+            &fixture,
+            "0000000000000000000000000000000000000000",
+            "trusted CI evidence is missing its run-attempt identity",
         )
     })();
     let cleanup = fixture.remove();
@@ -454,13 +519,96 @@ fn quality_rejects_an_overwritten_engineering_evidence_attempt() -> TestResult {
             std::io::Error::other("fixture evidence path has no parent directory")
         })?;
         fs::create_dir_all(parent)?;
-        fs::write(&evidence, "{\"tampered\":true}\n")?;
+        let original = b"{\"tampered\":true}\n";
+        fs::write(&evidence, original)?;
         let output = fixture.quality_output_from_fixture_source("pre-commit")?;
-        assert_rejected_output(&output, "create new engineering evidence")
+        assert_rejected_output(&output, "engineering evidence attempt collision")?;
+        if fs::read(&evidence)? != original {
+            return Err(std::io::Error::other(
+                "the colliding attempt changed the pre-existing evidence bytes",
+            )
+            .into());
+        }
+        let collision = fixture
+            .root
+            .join("target/quality/evidence/1700000000000-111111111111-1-collision-00.json");
+        let retained = fs::read_to_string(&collision)?;
+        assert_complete_evidence_contract(&retained)?;
+        for expected in [
+            "\"result\": \"failed\"",
+            "\"merge_eligible\": false",
+            "\"gate_id\": \"EG-00\"",
+            "engineering evidence attempt collision",
+            "\"collision_of\": {",
+            "\"value\": \"1700000000000-111111111111-1\"",
+        ] {
+            if !retained.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "collision evidence omitted `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
     })();
     let cleanup = fixture.remove();
     cleanup?;
     result
+}
+
+#[test]
+fn quality_publishes_the_complete_exact_identity_evidence_contract() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        fixture.quality()?;
+        let evidence = fixture.latest_evidence()?;
+        assert_complete_evidence_contract(&evidence)?;
+        for expected in [
+            "\"release_manifest\": {",
+            "\"reason\": \"no-release-manifest-for-engineering-attempt\"",
+            "\"artifact\": {",
+            "\"reason\": \"no-candidate-artifact-for-engineering-attempt\"",
+            "\"target\": {",
+            "\"value\": \"engineering-workspace\"",
+            "\"toolchain_digest\": \"git-object:",
+            "\"fixture_registry_digest\": \"git-object:",
+            "\"verifier\": {",
+            "\"value\": \"cargo-xtask-quality/local-diagnostic\"",
+            "\"approval\": {",
+            "\"reason\": \"no-approval-claimed\"",
+            "\"exception\": {",
+            "\"reason\": \"no-exception-applied\"",
+            "\"command_digest\": \"sha256:",
+            "\"owner\": {",
+            "\"raw_report\": {",
+        ] {
+            if !evidence.contains(expected) {
+                return Err(std::io::Error::other(format!(
+                    "engineering evidence omitted exact identity contract `{expected}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_incomplete_evidence_identity_schema() -> TestResult {
+    assert_fixture_rejected_profile(
+        "pr",
+        |root| {
+            replace_all(
+                &root.join("qualification/engineering/evidence.schema.json"),
+                "\"command_digest\"",
+                "\"removed_command_digest\"",
+            )
+        },
+        "evidence schema is missing `\"command_digest\"`",
+    )
 }
 
 #[test]
@@ -1442,6 +1590,81 @@ fn assert_rejected_output(output: &std::process::Output, expected_failure: &str)
     Ok(())
 }
 
+fn assert_failed_aggregator_evidence(
+    fixture: &Fixture,
+    source_revision: &str,
+    reason: &str,
+) -> TestResult {
+    let evidence = fixture.latest_evidence()?;
+    assert_complete_evidence_contract(&evidence)?;
+    for expected in [
+        "\"result\": \"failed\"",
+        "\"merge_eligible\": false",
+        "\"gate_id\": \"EG-00\"",
+        "\"result\": \"failed\"",
+        "\"command_digest\": \"sha256:ab3b0d0ae02a33f3f385a1c33bb993a729aba5f09a604c25bc5d001dc7dde0a2\"",
+        source_revision,
+        reason,
+    ] {
+        if !evidence.contains(expected) {
+            return Err(std::io::Error::other(format!(
+                "failed aggregator evidence omitted `{expected}`"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn assert_complete_evidence_contract(evidence: &str) -> TestResult {
+    for required in [
+        "\"schema_version\": 2",
+        "\"collision_of\"",
+        "\"release_manifest\"",
+        "\"artifact\"",
+        "\"target\"",
+        "\"environment_digest\"",
+        "\"toolchain_digest\"",
+        "\"effective_configuration\"",
+        "\"fixture_registry_digest\"",
+        "\"corpus\"",
+        "\"seed\"",
+        "\"fault_schedule\"",
+        "\"verifier\"",
+        "\"approval\"",
+        "\"exception\"",
+        "\"command_digest\"",
+        "\"owner\"",
+        "\"raw_report\"",
+    ] {
+        if !evidence.contains(required) {
+            return Err(std::io::Error::other(format!(
+                "evidence is missing required schema field `{required}`"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn assert_gate_owner_binding(evidence: &str, gate: &str, owner: &str) -> TestResult {
+    let marker = format!("\"gate_id\": \"{gate}\"");
+    let (_, tail) = evidence
+        .split_once(&marker)
+        .ok_or_else(|| std::io::Error::other(format!("evidence omitted gate `{gate}`")))?;
+    let gate_record = tail
+        .split_once("\"gate_id\":")
+        .map_or(tail, |(record, _)| record);
+    let expected = format!("\"value\": \"{owner}\"");
+    if !gate_record.contains(&expected) {
+        return Err(std::io::Error::other(format!(
+            "gate `{gate}` is not bound one-to-one to owner `{owner}`"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 fn assert_fixture_accepted(mutate: impl FnOnce(&Path) -> TestResult) -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -2052,6 +2275,19 @@ fn replace_once(path: &Path, before: &str, after: &str) -> TestResult {
         .into());
     };
     fs::write(path, format!("{prefix}{after}{suffix}"))?;
+    Ok(())
+}
+
+fn replace_all(path: &Path, before: &str, after: &str) -> TestResult {
+    let content = fs::read_to_string(path)?;
+    if !content.contains(before) {
+        return Err(std::io::Error::other(format!(
+            "fixture source {} does not contain `{before}`",
+            path.display()
+        ))
+        .into());
+    }
+    fs::write(path, content.replace(before, after))?;
     Ok(())
 }
 

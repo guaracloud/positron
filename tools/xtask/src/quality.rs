@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use crate::controlled_execution::{
     self, ExecutionTools, InvocationInput, InvocationSpec, OutputMode,
@@ -293,13 +295,16 @@ impl Options {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GateAttempt {
     gate_id: String,
     result: GateStatus,
     duration_ms: u128,
     budget_seconds: u64,
     command: String,
+    command_digest: String,
+    owner: IdentityBinding,
+    raw_report: IdentityBinding,
     detail: String,
 }
 
@@ -320,7 +325,7 @@ impl GateStatus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SourceIdentity {
     revision: String,
     dirty: bool,
@@ -328,9 +333,84 @@ struct SourceIdentity {
     revision_matches_ci: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NotApplicableReason {
+    NoCollision,
+    NoReleaseManifestForEngineeringAttempt,
+    NoCandidateArtifactForEngineeringAttempt,
+    NoEffectiveConfigurationForEngineeringAttempt,
+    NoCorpusSelected,
+    NoSeedSelected,
+    NoFaultScheduleSelected,
+    NoApprovalClaimed,
+    NoExceptionApplied,
+    GateNotSelected,
+    DiagnosticOutputNotRetained,
+    UnavailableBeforeRegistryValidation,
+}
+
+impl NotApplicableReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCollision => "no-collision",
+            Self::NoReleaseManifestForEngineeringAttempt => {
+                "no-release-manifest-for-engineering-attempt"
+            },
+            Self::NoCandidateArtifactForEngineeringAttempt => {
+                "no-candidate-artifact-for-engineering-attempt"
+            },
+            Self::NoEffectiveConfigurationForEngineeringAttempt => {
+                "no-effective-configuration-for-engineering-attempt"
+            },
+            Self::NoCorpusSelected => "no-corpus-selected",
+            Self::NoSeedSelected => "no-seed-selected",
+            Self::NoFaultScheduleSelected => "no-fault-schedule-selected",
+            Self::NoApprovalClaimed => "no-approval-claimed",
+            Self::NoExceptionApplied => "no-exception-applied",
+            Self::GateNotSelected => "gate-not-selected",
+            Self::DiagnosticOutputNotRetained => "diagnostic-output-not-retained",
+            Self::UnavailableBeforeRegistryValidation => "unavailable-before-registry-validation",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum IdentityBinding {
+    Exact(String),
+    NotApplicable(NotApplicableReason),
+}
+
+impl IdentityBinding {
+    fn exact(value: impl Into<String>) -> Self {
+        Self::Exact(value.into())
+    }
+
+    fn not_applicable(reason: NotApplicableReason) -> Self {
+        Self::NotApplicable(reason)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EvidenceIdentity {
+    release_manifest: IdentityBinding,
+    artifact: IdentityBinding,
+    target: IdentityBinding,
+    target_registry_digest: String,
+    toolchain_digest: String,
+    effective_configuration: IdentityBinding,
+    fixture_registry_digest: String,
+    corpus: IdentityBinding,
+    seed: IdentityBinding,
+    fault_schedule: IdentityBinding,
+    verifier: IdentityBinding,
+    approval: IdentityBinding,
+    exception: IdentityBinding,
+}
+
+#[derive(Clone, Debug)]
 struct Evidence {
     attempt_id: String,
+    collision_of: IdentityBinding,
     profile: Profile,
     result: GateStatus,
     merge_eligible: bool,
@@ -339,6 +419,7 @@ struct Evidence {
     ended_unix_ms: u128,
     registry_digest: String,
     environment_digest: String,
+    identity: EvidenceIdentity,
     gates: Vec<GateAttempt>,
 }
 
@@ -362,6 +443,80 @@ struct AggregatorFailure<'failure> {
     environment_digest: &'failure str,
     registry_digest: &'failure str,
     error: &'failure XtaskError,
+}
+
+fn unavailable_evidence_identity(source: &SourceIdentity) -> EvidenceIdentity {
+    EvidenceIdentity {
+        release_manifest: IdentityBinding::not_applicable(
+            NotApplicableReason::NoReleaseManifestForEngineeringAttempt,
+        ),
+        artifact: IdentityBinding::not_applicable(
+            NotApplicableReason::NoCandidateArtifactForEngineeringAttempt,
+        ),
+        target: IdentityBinding::exact("engineering-workspace"),
+        target_registry_digest: "unavailable-registry-digest".to_owned(),
+        toolchain_digest: "unavailable-registry-digest".to_owned(),
+        effective_configuration: IdentityBinding::not_applicable(
+            NotApplicableReason::NoEffectiveConfigurationForEngineeringAttempt,
+        ),
+        fixture_registry_digest: "unavailable-registry-digest".to_owned(),
+        corpus: IdentityBinding::not_applicable(NotApplicableReason::NoCorpusSelected),
+        seed: IdentityBinding::not_applicable(NotApplicableReason::NoSeedSelected),
+        fault_schedule: IdentityBinding::not_applicable(
+            NotApplicableReason::NoFaultScheduleSelected,
+        ),
+        verifier: verifier_identity(source),
+        approval: IdentityBinding::not_applicable(NotApplicableReason::NoApprovalClaimed),
+        exception: IdentityBinding::not_applicable(NotApplicableReason::NoExceptionApplied),
+    }
+}
+
+fn verifier_identity(source: &SourceIdentity) -> IdentityBinding {
+    if source.trusted_ci {
+        IdentityBinding::exact("cargo-xtask-quality/github-actions")
+    } else {
+        IdentityBinding::exact("cargo-xtask-quality/local-diagnostic")
+    }
+}
+
+fn engineering_evidence_identity(
+    root: &Path,
+    source: &SourceIdentity,
+    environment: &EnvironmentSnapshot,
+) -> Result<EvidenceIdentity, XtaskError> {
+    let target_registry_digest =
+        digest_relative_files(root, environment, &["qualification/targets/registry.json"])?;
+    let toolchain_digest = digest_relative_files(
+        root,
+        environment,
+        &[
+            "qualification/engineering/toolchains.tsv",
+            "rust-toolchain.toml",
+        ],
+    )?;
+    let fixture_registry_digest = digest_relative_files(
+        root,
+        environment,
+        &["qualification/fixtures/adversarial/manifest.json"],
+    )?;
+    Ok(EvidenceIdentity {
+        target_registry_digest,
+        toolchain_digest,
+        fixture_registry_digest,
+        ..unavailable_evidence_identity(source)
+    })
+}
+
+fn digest_relative_files(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    relatives: &[&str],
+) -> Result<String, XtaskError> {
+    let files = relatives
+        .iter()
+        .map(|relative| root.join(relative))
+        .collect::<Vec<_>>();
+    digest_files(root, &files, environment)
 }
 
 pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
@@ -442,6 +597,23 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             );
         },
     };
+    let identity = match engineering_evidence_identity(&root, &source, &environment) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return retain_aggregator_failure(
+                &root,
+                options.profile,
+                AggregatorFailure {
+                    source,
+                    started_unix_ms,
+                    attempt_id,
+                    environment_digest: environment.digest(),
+                    registry_digest: &registry_digest,
+                    error: &error,
+                },
+            );
+        },
+    };
     let activated_risk_gates = registry.activated_risk_gates();
 
     println!(
@@ -454,14 +626,13 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let mut attempts = Vec::with_capacity(registry.gates.len());
     for gate in &registry.gates {
         if !gate_selected(gate, options.profile, &activated_risk_gates) {
-            attempts.push(GateAttempt {
-                gate_id: gate.id.clone(),
-                result: GateStatus::NotSelected,
-                duration_ms: 0,
-                budget_seconds: gate.timeout_seconds,
-                command: format!("internal:{}", gate.runner),
-                detail: not_selected_reason(gate, options.profile),
-            });
+            attempts.push(gate_attempt(
+                gate,
+                GateStatus::NotSelected,
+                0,
+                format!("internal:{}", gate.runner),
+                not_selected_reason(gate, options.profile),
+            ));
             continue;
         }
 
@@ -475,28 +646,26 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         match execution {
             Ok(command) => {
                 println!("[{}] passed", gate.id);
-                attempts.push(GateAttempt {
-                    gate_id: gate.id.clone(),
-                    result: GateStatus::Passed,
+                attempts.push(gate_attempt(
+                    gate,
+                    GateStatus::Passed,
                     duration_ms,
-                    budget_seconds: gate.timeout_seconds,
                     command,
-                    detail: format!(
+                    format!(
                         "Coordinator: {}; exception class: {}",
                         gate.coordinator, gate.exception_class
                     ),
-                });
+                ));
             },
             Err(error) => {
                 eprintln!("[{}] failed: {error}", gate.id);
-                attempts.push(GateAttempt {
-                    gate_id: gate.id.clone(),
-                    result: GateStatus::Failed,
+                attempts.push(gate_attempt(
+                    gate,
+                    GateStatus::Failed,
                     duration_ms,
-                    budget_seconds: gate.timeout_seconds,
-                    command: format!("internal:{}", gate.runner),
-                    detail: error.to_string(),
-                });
+                    format!("internal:{}", gate.runner),
+                    error.to_string(),
+                ));
             },
         }
     }
@@ -520,6 +689,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         );
     let evidence = Evidence {
         attempt_id,
+        collision_of: IdentityBinding::not_applicable(NotApplicableReason::NoCollision),
         profile: options.profile,
         result,
         merge_eligible,
@@ -528,6 +698,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         ended_unix_ms,
         registry_digest,
         environment_digest: environment.digest().to_owned(),
+        identity,
         gates: attempts,
     };
     let evidence_path = write_evidence(&root, &evidence)?;
@@ -568,6 +739,23 @@ fn retain_aggregator_failure(
             } else {
                 "blocked-by:EG-00".to_owned()
             },
+            command_digest: command_digest(if is_aggregator {
+                "internal:registry"
+            } else {
+                "blocked-by:EG-00"
+            }),
+            owner: if is_aggregator {
+                IdentityBinding::exact("Quality Engineering")
+            } else {
+                IdentityBinding::not_applicable(
+                    NotApplicableReason::UnavailableBeforeRegistryValidation,
+                )
+            },
+            raw_report: IdentityBinding::not_applicable(if is_aggregator {
+                NotApplicableReason::DiagnosticOutputNotRetained
+            } else {
+                NotApplicableReason::GateNotSelected
+            }),
             detail: if is_aggregator {
                 failure.error.to_string()
             } else {
@@ -578,9 +766,11 @@ fn retain_aggregator_failure(
     }
     let evidence = Evidence {
         attempt_id: failure.attempt_id,
+        collision_of: IdentityBinding::not_applicable(NotApplicableReason::NoCollision),
         profile,
         result: GateStatus::Failed,
         merge_eligible: false,
+        identity: unavailable_evidence_identity(&failure.source),
         source: failure.source,
         started_unix_ms: failure.started_unix_ms,
         ended_unix_ms: unix_time_ms()?,
@@ -594,6 +784,38 @@ fn retain_aggregator_failure(
         "engineering quality aggregator",
         failure.error.to_string(),
     ))
+}
+
+fn gate_attempt(
+    gate: &Gate,
+    result: GateStatus,
+    duration_ms: u128,
+    command: String,
+    detail: String,
+) -> GateAttempt {
+    let raw_report = if result == GateStatus::NotSelected {
+        IdentityBinding::not_applicable(NotApplicableReason::GateNotSelected)
+    } else {
+        IdentityBinding::not_applicable(NotApplicableReason::DiagnosticOutputNotRetained)
+    };
+    GateAttempt {
+        gate_id: gate.id.clone(),
+        result,
+        duration_ms,
+        budget_seconds: gate.timeout_seconds,
+        command_digest: command_digest(&command),
+        command,
+        owner: IdentityBinding::exact(gate.coordinator.clone()),
+        raw_report,
+        detail,
+    }
+}
+
+fn command_digest(command: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"positron-quality-command-v1\0");
+    hasher.update(command.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn gate_selected(gate: &Gate, profile: Profile, activated_risk_gates: &BTreeSet<String>) -> bool {
@@ -1767,10 +1989,29 @@ fn run_evidence_gate(root: &Path, registry: &Registry) -> Result<String, XtaskEr
     let schema = fs::read_to_string(&path)
         .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
     for field in [
+        "\"schema_version\": { \"const\": 2 }",
         "\"additionalProperties\": false",
         "\"attempt_id\"",
+        "\"collision_of\"",
         "\"merge_eligible\"",
         "\"registry_digest\"",
+        "\"release_manifest\"",
+        "\"artifact\"",
+        "\"target\"",
+        "\"target_registry_digest\"",
+        "\"environment_digest\"",
+        "\"toolchain_digest\"",
+        "\"effective_configuration\"",
+        "\"fixture_registry_digest\"",
+        "\"corpus\"",
+        "\"seed\"",
+        "\"fault_schedule\"",
+        "\"verifier\"",
+        "\"approval\"",
+        "\"exception\"",
+        "\"command_digest\"",
+        "\"owner\"",
+        "\"raw_report\"",
         "\"not-selected\"",
     ] {
         if !schema.contains(field) {
@@ -3314,19 +3555,117 @@ fn write_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, XtaskErro
     let path = directory.join(format!("{}.json", evidence.attempt_id));
     let serialized = evidence_json(evidence);
     validate_serialized_evidence(evidence, &serialized)?;
-    let mut file = fs::OpenOptions::new()
+    let opened = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
-        .map_err(|source| {
-            XtaskError::io(
+        .open(&path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+            let retained = retain_collision_evidence(&directory, evidence)?;
+            return Err(XtaskError::invalid(
+                "engineering evidence attempt collision",
+                format!(
+                    "attempt `{}` already exists; original bytes were preserved and the failed collision verdict was retained at {}",
+                    evidence.attempt_id,
+                    retained.display()
+                ),
+            ));
+        },
+        Err(source) => {
+            return Err(XtaskError::io(
                 format!("create new engineering evidence {}", path.display()),
                 source,
-            )
-        })?;
+            ));
+        },
+    };
     file.write_all(serialized.as_bytes())
         .map_err(|source| XtaskError::io(format!("write {}", path.display()), source))?;
     Ok(path)
+}
+
+fn retain_collision_evidence(
+    directory: &Path,
+    attempted: &Evidence,
+) -> Result<PathBuf, XtaskError> {
+    const MAXIMUM_COLLISION_SLOTS: usize = 16;
+    for slot in 0..MAXIMUM_COLLISION_SLOTS {
+        let collision_id = format!("{}-collision-{slot:02}", attempted.attempt_id);
+        let path = directory.join(format!("{collision_id}.json"));
+        let mut collision = attempted.clone();
+        collision.attempt_id = collision_id;
+        collision.collision_of = IdentityBinding::exact(attempted.attempt_id.clone());
+        collision.result = GateStatus::Failed;
+        collision.merge_eligible = false;
+        collision.ended_unix_ms = unix_time_ms()?;
+        collision.gates = collision_gate_attempts(&attempted.gates);
+        let serialized = evidence_json(&collision);
+        validate_serialized_evidence(&collision, &serialized)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(serialized.as_bytes()).map_err(|source| {
+                    XtaskError::io(
+                        format!("write collision evidence {}", path.display()),
+                        source,
+                    )
+                })?;
+                return Ok(path);
+            },
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!("create collision evidence {}", path.display()),
+                    source,
+                ));
+            },
+        }
+    }
+    Err(XtaskError::invalid(
+        "engineering evidence collision slots",
+        "all 16 deterministic collision-retention slots are occupied",
+    ))
+}
+
+fn collision_gate_attempts(attempts: &[GateAttempt]) -> Vec<GateAttempt> {
+    attempts
+        .iter()
+        .map(|attempt| {
+            let is_aggregator = attempt.gate_id == "EG-00";
+            let command = if is_aggregator {
+                "internal:evidence-retention"
+            } else {
+                "blocked-by:EG-00"
+            };
+            GateAttempt {
+                gate_id: attempt.gate_id.clone(),
+                result: if is_aggregator {
+                    GateStatus::Failed
+                } else {
+                    GateStatus::NotSelected
+                },
+                duration_ms: 0,
+                budget_seconds: attempt.budget_seconds,
+                command: command.to_owned(),
+                command_digest: command_digest(command),
+                owner: attempt.owner.clone(),
+                raw_report: IdentityBinding::not_applicable(if is_aggregator {
+                    NotApplicableReason::DiagnosticOutputNotRetained
+                } else {
+                    NotApplicableReason::GateNotSelected
+                }),
+                detail: if is_aggregator {
+                    "engineering evidence attempt collision; original bytes preserved".to_owned()
+                } else {
+                    "EG-00 failed closed during collision retention; gate was not selected"
+                        .to_owned()
+                },
+            }
+        })
+        .collect()
 }
 
 fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result<(), XtaskError> {
@@ -3344,16 +3683,19 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
         .iter()
         .map(|gate| gate.gate_id.clone())
         .collect::<BTreeSet<_>>();
-    if gate_ids.len() != evidence.gates.len() {
+    if gate_ids != CANONICAL_GATE_IDS.into_iter().map(str::to_owned).collect() {
         return Err(XtaskError::invalid(
             "engineering evidence",
-            "attempt contains duplicate gate identities",
+            "attempt gate identities do not match the complete canonical gate set",
         ));
     }
     if evidence.attempt_id.is_empty()
         || !valid_hex_identity(&evidence.source.revision)
         || !valid_registry_digest(&evidence.registry_digest)
         || !valid_registry_digest(&evidence.environment_digest)
+        || !valid_registry_digest(&evidence.identity.target_registry_digest)
+        || !valid_registry_digest(&evidence.identity.toolchain_digest)
+        || !valid_registry_digest(&evidence.identity.fixture_registry_digest)
         || evidence.ended_unix_ms < evidence.started_unix_ms
     {
         return Err(XtaskError::invalid(
@@ -3361,10 +3703,25 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
             "attempt identity, source, digest, and time ordering must be complete",
         ));
     }
+    validate_evidence_identity(evidence)?;
+    let any_failed = evidence
+        .gates
+        .iter()
+        .any(|gate| gate.result == GateStatus::Failed);
+    if (evidence.result == GateStatus::Failed) != any_failed
+        || evidence.result == GateStatus::NotSelected
+        || (evidence.merge_eligible && evidence.result != GateStatus::Passed)
+    {
+        return Err(XtaskError::invalid(
+            "engineering evidence",
+            "aggregate result does not match the independent gate verdicts",
+        ));
+    }
     for gate in &evidence.gates {
         if gate.gate_id.is_empty()
             || gate.budget_seconds == 0
             || gate.command.is_empty()
+            || gate.command_digest != command_digest(&gate.command)
             || gate.detail.is_empty()
         {
             return Err(XtaskError::invalid(
@@ -3381,13 +3738,50 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
                 ),
             ));
         }
+        match (&gate.owner, gate.result) {
+            (IdentityBinding::Exact(owner), _) if !owner.is_empty() => {},
+            (
+                IdentityBinding::NotApplicable(
+                    NotApplicableReason::UnavailableBeforeRegistryValidation,
+                ),
+                GateStatus::NotSelected,
+            ) => {},
+            _ => {
+                return Err(XtaskError::invalid(
+                    "engineering evidence",
+                    format!(
+                        "gate `{}` has no applicable accountable owner",
+                        gate.gate_id
+                    ),
+                ));
+            },
+        }
+        let expected_report_reason = if gate.result == GateStatus::NotSelected {
+            NotApplicableReason::GateNotSelected
+        } else {
+            NotApplicableReason::DiagnosticOutputNotRetained
+        };
+        if gate.raw_report != IdentityBinding::not_applicable(expected_report_reason) {
+            return Err(XtaskError::invalid(
+                "engineering evidence",
+                format!(
+                    "gate `{}` has inconsistent raw-report applicability",
+                    gate.gate_id
+                ),
+            ));
+        }
     }
     for required in [
-        "\"schema_version\": 1",
+        "\"schema_version\": 2",
         "\"attempt_id\"",
+        "\"collision_of\"",
         "\"merge_eligible\"",
         "\"registry_digest\"",
         "\"environment_digest\"",
+        "\"identity\"",
+        "\"command_digest\"",
+        "\"owner\"",
+        "\"raw_report\"",
         "\"gates\"",
     ] {
         if !serialized.contains(required) {
@@ -3396,6 +3790,83 @@ fn validate_serialized_evidence(evidence: &Evidence, serialized: &str) -> Result
                 format!("required field `{required}` is missing"),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_evidence_identity(evidence: &Evidence) -> Result<(), XtaskError> {
+    for (field, binding, expected) in [
+        (
+            "release_manifest",
+            &evidence.identity.release_manifest,
+            NotApplicableReason::NoReleaseManifestForEngineeringAttempt,
+        ),
+        (
+            "artifact",
+            &evidence.identity.artifact,
+            NotApplicableReason::NoCandidateArtifactForEngineeringAttempt,
+        ),
+        (
+            "effective_configuration",
+            &evidence.identity.effective_configuration,
+            NotApplicableReason::NoEffectiveConfigurationForEngineeringAttempt,
+        ),
+        (
+            "corpus",
+            &evidence.identity.corpus,
+            NotApplicableReason::NoCorpusSelected,
+        ),
+        (
+            "seed",
+            &evidence.identity.seed,
+            NotApplicableReason::NoSeedSelected,
+        ),
+        (
+            "fault_schedule",
+            &evidence.identity.fault_schedule,
+            NotApplicableReason::NoFaultScheduleSelected,
+        ),
+        (
+            "approval",
+            &evidence.identity.approval,
+            NotApplicableReason::NoApprovalClaimed,
+        ),
+        (
+            "exception",
+            &evidence.identity.exception,
+            NotApplicableReason::NoExceptionApplied,
+        ),
+    ] {
+        if binding != &IdentityBinding::not_applicable(expected) {
+            return Err(XtaskError::invalid(
+                "engineering evidence",
+                format!("`{field}` must use its exact not-applicable reason"),
+            ));
+        }
+    }
+    if evidence.identity.target != IdentityBinding::exact("engineering-workspace")
+        || evidence.identity.verifier != verifier_identity(&evidence.source)
+    {
+        return Err(XtaskError::invalid(
+            "engineering evidence",
+            "target or verifier identity does not match the engineering invocation",
+        ));
+    }
+    match &evidence.collision_of {
+        IdentityBinding::NotApplicable(NotApplicableReason::NoCollision) => {},
+        IdentityBinding::Exact(original)
+            if !original.is_empty()
+                && evidence
+                    .attempt_id
+                    .strip_prefix(original)
+                    .is_some_and(|suffix| suffix.starts_with("-collision-"))
+                && evidence.result == GateStatus::Failed => {},
+        _ => {
+            return Err(XtaskError::invalid(
+                "engineering evidence",
+                "collision identity is malformed or inconsistent with the failed verdict",
+            ));
+        },
     }
     Ok(())
 }
@@ -3414,11 +3885,12 @@ fn valid_registry_digest(value: &str) -> bool {
 fn evidence_json(evidence: &Evidence) -> String {
     let mut output = String::new();
     output.push_str("{\n");
-    output.push_str("  \"schema_version\": 1,\n");
+    output.push_str("  \"schema_version\": 2,\n");
     output.push_str(&format!(
         "  \"attempt_id\": {},\n",
         json_string(&evidence.attempt_id)
     ));
+    push_identity_binding(&mut output, 2, "collision_of", &evidence.collision_of, true);
     output.push_str(&format!(
         "  \"profile\": {},\n",
         json_string(evidence.profile.as_str())
@@ -3458,6 +3930,72 @@ fn evidence_json(evidence: &Evidence) -> String {
         "  \"environment_digest\": {},\n",
         json_string(&evidence.environment_digest)
     ));
+    output.push_str("  \"identity\": {\n");
+    push_identity_binding(
+        &mut output,
+        4,
+        "release_manifest",
+        &evidence.identity.release_manifest,
+        true,
+    );
+    push_identity_binding(
+        &mut output,
+        4,
+        "artifact",
+        &evidence.identity.artifact,
+        true,
+    );
+    push_identity_binding(&mut output, 4, "target", &evidence.identity.target, true);
+    output.push_str(&format!(
+        "    \"target_registry_digest\": {},\n",
+        json_string(&evidence.identity.target_registry_digest)
+    ));
+    output.push_str(&format!(
+        "    \"toolchain_digest\": {},\n",
+        json_string(&evidence.identity.toolchain_digest)
+    ));
+    push_identity_binding(
+        &mut output,
+        4,
+        "effective_configuration",
+        &evidence.identity.effective_configuration,
+        true,
+    );
+    output.push_str(&format!(
+        "    \"fixture_registry_digest\": {},\n",
+        json_string(&evidence.identity.fixture_registry_digest)
+    ));
+    push_identity_binding(&mut output, 4, "corpus", &evidence.identity.corpus, true);
+    push_identity_binding(&mut output, 4, "seed", &evidence.identity.seed, true);
+    push_identity_binding(
+        &mut output,
+        4,
+        "fault_schedule",
+        &evidence.identity.fault_schedule,
+        true,
+    );
+    push_identity_binding(
+        &mut output,
+        4,
+        "verifier",
+        &evidence.identity.verifier,
+        true,
+    );
+    push_identity_binding(
+        &mut output,
+        4,
+        "approval",
+        &evidence.identity.approval,
+        true,
+    );
+    push_identity_binding(
+        &mut output,
+        4,
+        "exception",
+        &evidence.identity.exception,
+        false,
+    );
+    output.push_str("  },\n");
     output.push_str("  \"gates\": [\n");
     let mut first = true;
     for gate in &evidence.gates {
@@ -3484,6 +4022,12 @@ fn evidence_json(evidence: &Evidence) -> String {
             json_string(&gate.command)
         ));
         output.push_str(&format!(
+            "      \"command_digest\": {},\n",
+            json_string(&gate.command_digest)
+        ));
+        push_identity_binding(&mut output, 6, "owner", &gate.owner, true);
+        push_identity_binding(&mut output, 6, "raw_report", &gate.raw_report, true);
+        output.push_str(&format!(
             "      \"detail\": {}\n",
             json_string(&gate.detail)
         ));
@@ -3492,6 +4036,28 @@ fn evidence_json(evidence: &Evidence) -> String {
     output.push_str("\n  ]\n");
     output.push_str("}\n");
     output
+}
+
+fn push_identity_binding(
+    output: &mut String,
+    indentation: usize,
+    field: &str,
+    binding: &IdentityBinding,
+    trailing_comma: bool,
+) {
+    let spaces = " ".repeat(indentation);
+    let (applicability, value, reason) = match binding {
+        IdentityBinding::Exact(value) => ("exact", value.as_str(), "-"),
+        IdentityBinding::NotApplicable(reason) => ("not-applicable", "-", reason.as_str()),
+    };
+    output.push_str(&format!(
+        "{spaces}{}: {{\"applicability\": {}, \"value\": {}, \"reason\": {}}}{}\n",
+        json_string(field),
+        json_string(applicability),
+        json_string(value),
+        json_string(reason),
+        if trailing_comma { "," } else { "" }
+    ));
 }
 
 fn json_string(value: &str) -> String {
