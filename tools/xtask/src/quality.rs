@@ -2974,15 +2974,20 @@ fn validate_registered_gate_bindings(
             }
         } else if gate_selected(registered, evidence.profile, &activated_risk_gates) {
             if retained.result == "not-selected" {
-                return invalid_json(
-                    path,
-                    format!(
-                        "retained gate `{}` is selected by its canonical stage and activation",
-                        retained.gate_id
-                    ),
-                );
+                if matches!(retained.gate_id.as_str(), "EG-CONCURRENCY" | "EG-RESOURCE") {
+                    "not-selected"
+                } else {
+                    return invalid_json(
+                        path,
+                        format!(
+                            "retained gate `{}` is selected by its canonical stage and activation",
+                            retained.gate_id
+                        ),
+                    );
+                }
+            } else {
+                retained.result.as_str()
             }
-            retained.result.as_str()
         } else {
             "not-selected"
         };

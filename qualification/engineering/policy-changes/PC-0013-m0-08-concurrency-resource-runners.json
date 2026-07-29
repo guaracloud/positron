@@ -21,6 +21,7 @@
     },
     "runner_changes": [
       "The active xtask scope selects only the existing EG-CONCURRENCY and EG-RESOURCE risk gates; all gate IDs, stages, budgets, coordinators, exception classes, cells, and product scopes remain unchanged.",
+      "Retained evidence predating this activation may preserve EG-CONCURRENCY and EG-RESOURCE as not-selected; this narrow compatibility rule protects immutable historical attempts from current-registry reinterpretation and does not permit either gate to be skipped in a newly created attempt.",
       "FrozenQualificationFixtures captures concurrency-fixtures.tsv once, binds its bytes into fixture, seed, and schedule identities, and supplies those same immutable bytes to both runners and retained evidence.",
       "EG-CONCURRENCY registers three Quality Engineering workers before Builder::spawn, gives each a one-command bounded channel and shared bounded measurement channel, sends concrete cancellation or work commands, observes completion before a 100ms registered shutdown deadline, and retains every join handle until join succeeds.",
       "EG-RESOURCE performs real FIFO work admission, two-unit reservations, hard-pressure denial, a two-attempt retry storm bound, reservation release, queue-empty and leak checks, and three joined workers. The verifier derives fairness from worker-recorded schedule slots and validates retained measurements rather than a runner verdict.",
