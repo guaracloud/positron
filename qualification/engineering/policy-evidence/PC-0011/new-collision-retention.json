@@ -2,11 +2,11 @@
   "schema_version": 1,
   "policy_change": "PC-0011-m0-06-evidence-attempt-integrity",
   "implementation": "new-clean-behavior-commit",
-  "source_revision": "0c856e4a41abaf8afe372817d41c616797acc2cc",
-  "source_tree": "8797c81f86a0658777260303fa39846104740955",
+  "source_revision": "127bf6dac37f91fed4f813c8d600797af6b51a9d",
+  "source_tree": "74aa62484f45b3810863d8b0264066dc690b7b0f",
   "fixture_sha256": "8a02e22af8189144ea3cf3ea425f23c683c44b29c12ab1dbd805b337221e0940",
   "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
-  "runner_sha256": "52a4360efac6eb525d0104aedb11bad72f13e0aa3ab6cd5086759979be22fce9",
+  "runner_sha256": "50be4e5390c4c32eabb2519936cb61b2087ba22fc126a4f8c313db58b1169380",
   "parser_sha256": "1d7d55c06319acb06fbabe74df0f875c86f0081eec672958d44f6d74fcb7e3f6",
   "fixture": "Focused public fixtures deterministically claim a concurrent final report directory after staging but before publication, inject an evidence-parent synchronization failure after incomplete-primary unlink, simulate a primary resurrected beside its authoritative recovery, and preserve adjacent collision, non-owned-content, and publication-recovery compatibility.",
   "commands": [
@@ -20,6 +20,6 @@
     "cargo clippy --locked --package xtask --all-targets -- -D warnings"
   ],
   "verdict": "passed-focused-local-diagnostic",
-  "result": "All 28 distinct remediation-focused tests passed at the bound behavior revision, and targeted xtask Clippy passed with warnings denied. Final report publication atomically claims its directory and never replaces a concurrent path, incomplete-primary unlink synchronizes its parent, and retained primary/recovery dual state fails closed.",
+  "result": "All 28 distinct remediation-focused tests passed at the bound behavior revision, the parallel canonical racer passed twice after its shared-parent cleanup regression was corrected, and targeted xtask Clippy passed with warnings denied. Final report publication atomically claims its directory and never replaces a concurrent path, incomplete-primary unlink synchronizes its parent, retained primary/recovery dual state fails closed, and concurrent sibling attempts do not turn preserved shared ancestors into cleanup failures.",
   "qualification_claim": "none"
 }

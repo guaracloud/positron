@@ -28,7 +28,7 @@
       "Every retained-evidence directory entry is charged against the canonical count before classification. Only regular files with exact JSON extensions are accepted, so non-JSON files, directories, symlinks, and mixed-entry over-count roots fail closed before content parsing.",
       "Before the primary evidence path is touched or any report is published, the attempt create-news, flushes, synchronizes, and directory-synchronizes one schema-valid recovery record bound to the canonical attempt. A pre-existing recovery record prevents primary creation, and a primary collision after recovery reservation preserves both the recovery verdict and occupied primary bytes.",
       "Every evidence and report directory component is created individually, child- and parent-synchronized before use, and recorded as attempt-owned only after successful creation. Every selected report is create-new written, flushed, file-synchronized, and read back in one bounded staging directory. The staging directory is synchronized before rename; after rename, the final directory and report parent are synchronized before primary evidence is written, flushed, and synchronized. Recovery deletion is followed by evidence-parent synchronization, and any durability or reconciliation failure removes only attempt-owned partial state as far as safe while retaining or restoring the recovery verdict.",
-      "Report reconciliation records each exact create-new report file and each directory component owned by the attempt. Failure cleanup removes only those files and then only empty owned directories; it never recursively removes a staging or final bundle, and injected non-owned files, directories, or symlinks are preserved while publication remains failed.",
+      "Report reconciliation records each exact create-new report file and each directory component owned by the attempt. Failure cleanup removes only those files and then only empty owned directories; it never recursively removes a staging or final bundle, injected non-owned files, directories, or symlinks are preserved while publication remains failed, and concurrently shared nonempty ancestor directories are preserved without reclassifying a successfully removed attempt leaf as cleanup failure.",
       "Final raw-report publication atomically create-dir claims the attempt directory before any entry is published. Each already synchronized staging file is create-new hard-linked to its absent final path and synchronized; only after the complete exact set, final directory, and report parent are durable is staging reconciled non-recursively and primary evidence eligible for acknowledgement.",
       "Removing an incomplete owned primary evidence file is followed by evidence-parent synchronization before recovery is reported. Retained validation rejects any attempt whose primary evidence and candidate-specific authoritative recovery marker coexist, so a crash-resurrected primary cannot be accepted beside the failed verdict.",
       "The bounded retained-JSON parser grows decoded string storage geometrically up to the canonical 131072-byte limit rather than reserving once per decoded character; allocation failure, arithmetic overflow, and the existing decoded-length boundary remain explicit failures.",
@@ -90,11 +90,11 @@
       "result": "All 28 distinct focused tests passed, including the deterministic final-directory claim racer, primary-unlink synchronization failure, primary/recovery dual-state rejection, exact publication, collision compatibility, non-owned-content preservation, and adjacent durability and recovery paths. Targeted xtask Clippy also passed with warnings denied. These local results are diagnostic only."
     },
     "behavior_provenance": {
-      "source_revision": "0c856e4a41abaf8afe372817d41c616797acc2cc",
-      "source_tree": "8797c81f86a0658777260303fa39846104740955",
+      "source_revision": "127bf6dac37f91fed4f813c8d600797af6b51a9d",
+      "source_tree": "74aa62484f45b3810863d8b0264066dc690b7b0f",
       "fixture_sha256": "8a02e22af8189144ea3cf3ea425f23c683c44b29c12ab1dbd805b337221e0940",
       "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
-      "runner_sha256": "52a4360efac6eb525d0104aedb11bad72f13e0aa3ab6cd5086759979be22fce9",
+      "runner_sha256": "50be4e5390c4c32eabb2519936cb61b2087ba22fc126a4f8c313db58b1169380",
       "parser_sha256": "1d7d55c06319acb06fbabe74df0f875c86f0081eec672958d44f6d74fcb7e3f6",
       "exact_fixture_results": [
         "quality_never_replaces_a_concurrently_claimed_final_report_directory: passed",
