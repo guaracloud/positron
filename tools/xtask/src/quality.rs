@@ -3076,9 +3076,6 @@ fn validate_retained_engineering_evidence(
         let entry = entry
             .map_err(|source| XtaskError::io(format!("read {}", directory.display()), source))?;
         let path = entry.path();
-        if path.extension().and_then(OsStr::to_str) != Some("json") {
-            continue;
-        }
         attempt_count = attempt_count.checked_add(1).ok_or_else(|| {
             XtaskError::invalid_path(&directory, "retained attempt count overflowed")
         })?;
@@ -3094,10 +3091,10 @@ fn validate_retained_engineering_evidence(
                 source,
             )
         })?;
-        if !file_type.is_file() {
+        if !file_type.is_file() || path.extension().and_then(OsStr::to_str) != Some("json") {
             return Err(XtaskError::invalid_path(
                 &path,
-                "retained evidence candidate must be a regular JSON file",
+                "retained evidence directory entry must be a regular JSON file",
             ));
         }
         let Some(attempt_id) = path.file_stem().and_then(OsStr::to_str) else {
@@ -5820,7 +5817,10 @@ fn write_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, XtaskErro
     let owned_directories =
         OwnedDirectoryChain::create(root, &directory, OwnedLeaf::ExistingAllowed)?;
     let reservation = match AttemptReservation::reserve(root, &directory, evidence) {
-        Ok(reservation) => reservation,
+        Ok(ReservationOutcome::Claimed(reservation)) => *reservation,
+        Ok(ReservationOutcome::RetainedCollision { path }) => {
+            return Err(collision_error(evidence, &path));
+        },
         Err(error) => return Err(owned_directories.reconcile_failure(error)),
     };
     let collided = reservation.collided;
@@ -5838,54 +5838,93 @@ struct AttemptReservation {
     recovery_bytes: String,
     report_staging_path: PathBuf,
     report_final_path: PathBuf,
+    report_files: Vec<PathBuf>,
     report_staging_directories: OwnedDirectoryChain,
     report_final_directories: OwnedDirectoryChain,
-    reports_published: bool,
     evidence: Evidence,
     collided: bool,
 }
 
-impl AttemptReservation {
-    fn reserve(root: &Path, directory: &Path, attempted: &Evidence) -> Result<Self, XtaskError> {
-        let canonical = directory.join(format!("{}.json", attempted.attempt_id));
-        if !path_exists(&canonical)? {
-            return Self::new(root, canonical, attempted.clone(), false);
-        }
+enum ReservationOutcome {
+    Claimed(Box<AttemptReservation>),
+    RetainedCollision { path: PathBuf },
+}
 
-        for slot in 0..COLLISION_SLOT_COUNT {
-            let collision_id = format!("{}-collision-{slot:02}", attempted.attempt_id);
-            let path = directory.join(format!("{collision_id}.json"));
-            if !path_exists(&path)? {
-                let evidence = collision_evidence(
-                    attempted,
-                    collision_id,
-                    format!("collision-{slot:02}"),
-                    "engineering evidence attempt collision; original bytes preserved",
-                )?;
-                return Self::new(root, path, evidence, true);
+enum CandidateReservation {
+    Claimed(Box<AttemptReservation>),
+    RecoveryOccupied { path: PathBuf },
+    PrimaryOccupied { recovery_path: PathBuf },
+}
+
+impl AttemptReservation {
+    fn reserve(
+        root: &Path,
+        directory: &Path,
+        attempted: &Evidence,
+    ) -> Result<ReservationOutcome, XtaskError> {
+        for candidate in 0..=(COLLISION_SLOT_COUNT + 1) {
+            let (path, evidence, collided, final_candidate) = if candidate == 0 {
+                (
+                    directory.join(format!("{}.json", attempted.attempt_id)),
+                    attempted.clone(),
+                    false,
+                    false,
+                )
+            } else if candidate <= COLLISION_SLOT_COUNT {
+                let slot = candidate - 1;
+                let collision_id = format!("{}-collision-{slot:02}", attempted.attempt_id);
+                (
+                    directory.join(format!("{collision_id}.json")),
+                    collision_evidence(
+                        attempted,
+                        collision_id,
+                        format!("collision-{slot:02}"),
+                        "engineering evidence attempt collision; original bytes preserved",
+                    )?,
+                    true,
+                    false,
+                )
+            } else {
+                let exhaustion_id = format!("{}-collision-exhausted", attempted.attempt_id);
+                (
+                    directory.join(format!("{exhaustion_id}.json")),
+                    collision_evidence(
+                        attempted,
+                        exhaustion_id,
+                        COLLISION_OCCUPIED_SET.to_owned(),
+                        "all 16 deterministic collision slots were already occupied; every existing byte was preserved",
+                    )?,
+                    true,
+                    true,
+                )
+            };
+            match Self::try_new(root, path, evidence, collided)? {
+                CandidateReservation::Claimed(reservation) => {
+                    return Ok(ReservationOutcome::Claimed(reservation));
+                },
+                CandidateReservation::RecoveryOccupied { path } if final_candidate => {
+                    return Ok(ReservationOutcome::RetainedCollision { path });
+                },
+                CandidateReservation::RecoveryOccupied { .. } => {},
+                CandidateReservation::PrimaryOccupied { recovery_path } => {
+                    return Ok(ReservationOutcome::RetainedCollision {
+                        path: recovery_path,
+                    });
+                },
             }
         }
-
-        let exhaustion_id = format!("{}-collision-exhausted", attempted.attempt_id);
-        let path = directory.join(format!("{exhaustion_id}.json"));
-        if path_exists(&path)? {
-            return Err(collision_error(attempted, &path));
-        }
-        let evidence = collision_evidence(
-            attempted,
-            exhaustion_id,
-            COLLISION_OCCUPIED_SET.to_owned(),
-            "all 16 deterministic collision slots were already occupied; every existing byte was preserved",
-        )?;
-        Self::new(root, path, evidence, true)
+        Err(XtaskError::invalid(
+            "engineering evidence attempt reservation",
+            "bounded reservation state machine exhausted without a retained outcome",
+        ))
     }
 
-    fn new(
+    fn try_new(
         root: &Path,
         path: PathBuf,
         evidence: Evidence,
         collided: bool,
-    ) -> Result<Self, XtaskError> {
+    ) -> Result<CandidateReservation, XtaskError> {
         if !valid_owned_evidence_component(&evidence.attempt_id) {
             return Err(XtaskError::invalid(
                 "engineering evidence attempt reservation",
@@ -5914,33 +5953,48 @@ impl AttemptReservation {
         let recovery = report_retention_failure_evidence(&recovery_source, &recovery_error)?;
         let recovery_bytes = evidence_json(&recovery);
         validate_serialized_evidence(&recovery, &recovery_bytes)?;
-        let mut recovery_file = reserve_new_file(&recovery_path).map_err(|source| {
-            XtaskError::io(
-                format!("reserve recovery evidence {}", recovery_path.display()),
-                source,
-            )
-        })?;
-        recovery_file
+        let mut recovery_file = match reserve_new_file(&recovery_path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+                return Ok(CandidateReservation::RecoveryOccupied {
+                    path: recovery_path,
+                });
+            },
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!("reserve recovery evidence {}", recovery_path.display()),
+                    source,
+                ));
+            },
+        };
+        if let Err(source) = recovery_file
             .write_all(recovery_bytes.as_bytes())
             .and_then(|()| recovery_file.flush())
             .and_then(|()| recovery_file.sync_all())
-            .map_err(|source| {
-                XtaskError::io(
-                    format!("write recovery evidence {}", recovery_path.display()),
-                    source,
-                )
-            })?;
+        {
+            let error = XtaskError::io(
+                format!("write recovery evidence {}", recovery_path.display()),
+                source,
+            );
+            return Err(reconcile_owned_file_failure(&recovery_path, error));
+        }
         let evidence_directory = recovery_path.parent().ok_or_else(|| {
             XtaskError::invalid_path(&recovery_path, "recovery evidence path has no parent")
         })?;
         sync_directory(evidence_directory)?;
-        let file = reserve_new_file(&path).map_err(|source| {
-            XtaskError::io(
-                format!("reserve primary engineering evidence {}", path.display()),
-                source,
-            )
-        })?;
-        Ok(Self {
+        let file = match reserve_new_file(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+                return Ok(CandidateReservation::PrimaryOccupied { recovery_path });
+            },
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!("reserve primary engineering evidence {}", path.display()),
+                    source,
+                ));
+            },
+        };
+        Ok(CandidateReservation::Claimed(Box::new(Self {
             path,
             file,
             recovery_path,
@@ -5951,12 +6005,12 @@ impl AttemptReservation {
             report_final_path: root
                 .join("target/quality/evidence-reports")
                 .join(&evidence.attempt_id),
+            report_files: Vec::new(),
             report_staging_directories: OwnedDirectoryChain::default(),
             report_final_directories: OwnedDirectoryChain::default(),
-            reports_published: false,
             evidence,
             collided,
-        })
+        })))
     }
 
     fn commit(mut self, root: &Path) -> Result<PathBuf, XtaskError> {
@@ -5977,10 +6031,21 @@ impl AttemptReservation {
             OwnedDirectoryChain::create(root, final_parent, OwnedLeaf::ExistingAllowed)?;
         self.report_staging_directories =
             OwnedDirectoryChain::create(root, &self.report_staging_path, OwnedLeaf::MustCreate)?;
-        stage_raw_reports(&self.report_staging_path, &self.evidence)?;
+        stage_raw_reports(
+            &self.report_staging_path,
+            &self.evidence,
+            &mut self.report_files,
+        )?;
         sync_directory(&self.report_staging_path)?;
         publish_staged_reports(&self.report_staging_path, &self.report_final_path)?;
-        self.reports_published = true;
+        self.report_final_directories
+            .adopt_renamed_directory(&self.report_final_path);
+        for report in &mut self.report_files {
+            let name = report.file_name().ok_or_else(|| {
+                XtaskError::invalid_path(report, "owned report file has no filename")
+            })?;
+            *report = self.report_final_path.join(name);
+        }
         sync_directory(&self.report_final_path)?;
         sync_directory(final_parent)?;
         self.file
@@ -6013,14 +6078,8 @@ impl AttemptReservation {
 
     fn reconcile_failed_publication(&self, error: XtaskError) -> XtaskError {
         let mut cleanup_errors = Vec::new();
-        let final_cleanup = if self.reports_published {
-            cleanup_report_final(&self.report_final_path)
-        } else {
-            Ok(())
-        };
         for cleanup in [
-            cleanup_report_staging(&self.report_staging_path),
-            final_cleanup,
+            cleanup_owned_report_files(&self.report_files),
             cleanup_primary_evidence(&self.path),
             self.report_staging_directories.cleanup_empty(),
             self.report_final_directories.cleanup_empty(),
@@ -6133,6 +6192,10 @@ impl OwnedDirectoryChain {
         Ok(chain)
     }
 
+    fn adopt_renamed_directory(&mut self, directory: &Path) {
+        self.created.push(directory.to_path_buf());
+    }
+
     fn reconcile_failure(self, error: XtaskError) -> XtaskError {
         match self.cleanup_empty() {
             Ok(()) => error,
@@ -6156,7 +6219,15 @@ impl OwnedDirectoryChain {
                     sync_directory(parent)?;
                 },
                 Err(source) if source.kind() == ErrorKind::NotFound => {},
-                Err(source) if source.kind() == ErrorKind::DirectoryNotEmpty => break,
+                Err(source) if source.kind() == ErrorKind::DirectoryNotEmpty => {
+                    return Err(XtaskError::io(
+                        format!(
+                            "preserve non-owned content in owned directory {}",
+                            directory.display()
+                        ),
+                        source,
+                    ));
+                },
                 Err(source) => {
                     return Err(XtaskError::io(
                         format!("remove owned evidence directory {}", directory.display()),
@@ -6179,6 +6250,27 @@ fn reserve_new_file(path: &Path) -> Result<fs::File, std::io::Error> {
         .write(true)
         .create_new(true)
         .open(path)
+}
+
+fn reconcile_owned_file_failure(path: &Path, error: XtaskError) -> XtaskError {
+    let cleanup = match fs::remove_file(path) {
+        Ok(()) => path
+            .parent()
+            .ok_or_else(|| XtaskError::invalid_path(path, "owned file has no parent"))
+            .and_then(sync_directory),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(XtaskError::io(
+            format!("remove owned file {}", path.display()),
+            source,
+        )),
+    };
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => XtaskError::invalid(
+            "owned evidence file reconciliation",
+            format!("{error}; cleanup also failed: {cleanup_error}"),
+        ),
+    }
 }
 
 fn collision_evidence(
@@ -6244,7 +6336,11 @@ fn collision_error(evidence: &Evidence, retained: &Path) -> XtaskError {
     )
 }
 
-fn stage_raw_reports(staging_path: &Path, evidence: &Evidence) -> Result<(), XtaskError> {
+fn stage_raw_reports(
+    staging_path: &Path,
+    evidence: &Evidence,
+    owned_files: &mut Vec<PathBuf>,
+) -> Result<(), XtaskError> {
     for gate in &evidence.gates {
         let RawReportBinding::Exact { .. } = &gate.raw_report else {
             continue;
@@ -6273,6 +6369,7 @@ fn stage_raw_reports(staging_path: &Path, evidence: &Evidence) -> Result<(), Xta
                     source,
                 )
             })?;
+        owned_files.push(report_path.clone());
         file.write_all(content.as_bytes())
             .and_then(|()| file.flush())
             .and_then(|()| file.sync_all())
@@ -6308,26 +6405,25 @@ fn publish_staged_reports(staging_path: &Path, final_path: &Path) -> Result<(), 
     })
 }
 
-fn cleanup_report_staging(path: &Path) -> Result<(), XtaskError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(XtaskError::io(
-            format!("remove report staging {}", path.display()),
-            source,
-        )),
+fn cleanup_owned_report_files(paths: &[PathBuf]) -> Result<(), XtaskError> {
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                let parent = path.parent().ok_or_else(|| {
+                    XtaskError::invalid_path(path, "owned report file has no parent")
+                })?;
+                sync_directory(parent)?;
+            },
+            Err(source) if source.kind() == ErrorKind::NotFound => {},
+            Err(source) => {
+                return Err(XtaskError::io(
+                    format!("remove owned report file {}", path.display()),
+                    source,
+                ));
+            },
+        }
     }
-}
-
-fn cleanup_report_final(path: &Path) -> Result<(), XtaskError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(XtaskError::io(
-            format!("remove final report bundle {}", path.display()),
-            source,
-        )),
-    }
+    Ok(())
 }
 
 fn cleanup_primary_evidence(path: &Path) -> Result<(), XtaskError> {
