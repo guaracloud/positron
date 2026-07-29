@@ -190,9 +190,98 @@
       "evidence_attempt_id": "1785287818503-5d0fe2a6e4e1-29039",
       "coverage_report": "target/quality/coverage/m0-03-api.json",
       "mutation_report": "target/quality/mutation/m0-03-api-final/mutants.out/outcomes.json",
-      "result": "EG-COVERAGE failed after the canonical API reached 100 percent branch, function, line, and region coverage. The retained mutation campaign selected 88 mutants: 50 caught, 34 unviable, 3 missed, and 1 timed out. Replacing ApiVersion::major with 1 is proven semantic-equivalent because the public type is a closed single-variant v1 enum; the additive public accessor remains, while the focused selector excludes only this equivalent target and retains CapabilityRequest::for_version, CapabilityResponse::api_major, and CapabilityService::negotiate as the observable version invariant owners. The other missed outcomes were an algebraically equivalent encode_varint bitwise-OR replacement and a decode_varint right-shift replacement not distinguished by the public multi-byte cases. Mutating encode_varint termination from equality to inequality timed out. This exact trusted-CI failure remains immutable and is not merge-eligible."
+      "result": "EG-COVERAGE failed after the canonical API reached 100 percent branch, function, line, and region coverage. The retained mutation campaign selected 88 mutants: 50 caught, 34 unviable, 3 missed, and 1 timed out. The missed outcomes were the semantic-equivalent closed-v1 ApiVersion::major return, an algebraically equivalent encode_varint bitwise-OR replacement, and a decode_varint right-shift replacement not distinguished by the public multi-byte cases. Mutating encode_varint termination from equality to inequality timed out. This exact trusted-CI failure remains immutable and is not merge-eligible."
     }
   ],
+  "equivalence_analyses": [
+    {
+      "id": "EA-0001-api-version-major-literal-one",
+      "status": "proved-semantic-equivalence",
+      "recorded_at_utc": "2026-07-29T01:43:58Z",
+      "retained_attempt_id": "trusted-ci-extended-30412989230",
+      "source_revision": "5d0fe2a6e4e195e9105b540498a585c7bb5c9771",
+      "workflow_run_id": 30412989230,
+      "workflow_attempt": 1,
+      "artifact_id": 8709357587,
+      "artifact_digest": "sha256:8892607dd8d10df7c13eeb0502583b3aa8b140767cc9250f33d16aa3bce194b0",
+      "evidence_attempt_id": "1785287818503-5d0fe2a6e4e1-29039",
+      "evidence_json_sha256": "6e233d4a0fc314312da169348be72184838ffea68ee47508475ab58161850cf6",
+      "mutation_outcomes_path": "mutation/m0-03-api-final/mutants.out/outcomes.json",
+      "mutation_outcomes_sha256": "f0da108d4d80fe35883253c645fea3854350f7532905e62dbef622362a9c8fc8",
+      "observed_outcome": "MissedMutant: crates/positron-api/src/generated.rs:20:9: replace ApiVersion::major -> u32 with 1",
+      "proof": [
+        "The generated public ApiVersion type is a closed enum with exactly one constructible variant, declared #[repr(u32)] ApiVersion::V1 = 1.",
+        "ApiVersion::major returns self as u32, so its result is 1 for the complete safe input domain {ApiVersion::V1}. Replacing that expression with the literal 1 is therefore extensionally equal for every valid input.",
+        "Downstream crates cannot add enum variants. Invalid discriminants constructed through unsafe code are outside the safe public contract and cannot create another valid input."
+      ],
+      "observable_invariant_owners": [
+        "CapabilityRequest::for_version",
+        "CapabilityResponse::api_major",
+        "CapabilityService::negotiate"
+      ],
+      "selector_conclusion": "Exclude only the generated ApiVersion::major literal-one equivalent target. Retain the request-construction, response-access, and negotiation owners that expose version behavior to callers.",
+      "limits": "This analysis does not reclassify any viable mutant, change the 100 percent mutation baseline, remove any observable invariant owner, weaken EG-COVERAGE, or alter the immutable failed attempt."
+    }
+  ],
+  "selector_policy_authorization": {
+    "status": "authorized-by-repository-owner-autonomous-delegation",
+    "recorded_at_utc": "2026-07-29T01:43:58Z",
+    "authorized_by": "@vicotrbb",
+    "authorization_capacity": "repository owner delegating Architecture, Public API and SDK, and Quality Engineering approval for autonomous ticket execution",
+    "session_instruction_verbatim": "For all the other tickets, ignore this manual approval gate! Just work autonomously while keeping high quality bar... Never ask this approval to me again, ever",
+    "approved_scope": "Exclude the single generated ApiVersion::major replacement-with-1 target proven equivalent by EA-0001 while retaining every viable mutation target and the observable version owners CapabilityRequest::for_version, CapabilityResponse::api_major, and CapabilityService::negotiate.",
+    "not_approved": [
+      "removal or exclusion of any viable invariant owner",
+      "change to a mutation or coverage threshold",
+      "weakening, skipping, renaming, or reclassification of any gate",
+      "change to public or wire behavior",
+      "qualification or merge-eligibility claim"
+    ],
+    "github_review_claimed": false,
+    "technical_review": {
+      "reviewed_candidate_revision": "47b0b157c558219d357839b277f1e35a5a06aebb",
+      "recorded_after_completion_at_utc": "2026-07-29T01:43:58Z",
+      "review_kind": "fresh independent Terra two-axis code review",
+      "standards": {
+        "reviewer": "Bohr",
+        "task_id": "/root/m0_03_tdd_implementation/review_standards",
+        "result": "Two hard findings: the bounded selector exclusion lacked recorded policy authorization and the retained trusted-CI result had been rewritten. This policy-only remediation records the authorization and restores the immutable result verbatim."
+      },
+      "spec": {
+        "reviewer": "Noether",
+        "task_id": "/root/m0_03_tdd_implementation/review_spec",
+        "result": "Pass with no findings."
+      },
+      "attribution": "This is independent technical review evidence, not a GitHub approval and not a claim that either reviewer held a required human role."
+    }
+  },
+  "representative_old_new_evidence": {
+    "status": "old-completed-new-pending-trusted-ci",
+    "old": {
+      "status": "failed-trusted-ci-retained-immutable",
+      "source_revision": "5d0fe2a6e4e195e9105b540498a585c7bb5c9771",
+      "workflow_run_id": 30412989230,
+      "workflow_attempt": 1,
+      "artifact_id": 8709357587,
+      "artifact_name": "extended-evidence-30412989230-1-5d0fe2a6e4e195e9105b540498a585c7bb5c9771",
+      "artifact_digest": "sha256:8892607dd8d10df7c13eeb0502583b3aa8b140767cc9250f33d16aa3bce194b0",
+      "evidence_attempt_id": "1785287818503-5d0fe2a6e4e1-29039",
+      "evidence_json_sha256": "6e233d4a0fc314312da169348be72184838ffea68ee47508475ab58161850cf6",
+      "mutation_outcomes_sha256": "f0da108d4d80fe35883253c645fea3854350f7532905e62dbef622362a9c8fc8",
+      "result": "Failed with 88 selected mutants: 50 caught, 34 unviable, 3 missed, and 1 timed out. The three missed outcomes include the ApiVersion::major replacement-with-1 equivalent analyzed in EA-0001. No old success or merge-eligibility claim is made."
+    },
+    "new": {
+      "status": "pending-one-future-exact-head-trusted-ci-run",
+      "source_revision": "pending final commit; the workflow binds this field through github.sha",
+      "workflow": ".github/workflows/extended.yml",
+      "dispatch_input": "retain_m0_03_mutation=true",
+      "command": "cargo xtask quality --profile ext --retain-m0-03-mutation",
+      "artifact_name_template": "extended-evidence-<github.run_id>-<github.run_attempt>-<github.sha>",
+      "artifact_contents": "The existing upload-artifact step retains target/quality, including the revision-bound evidence JSON, coverage report, and focused mutation outcomes.",
+      "result": "not run; no pass, mutation score, merge-eligibility, or qualification claim is made before the external exact-head artifact exists."
+    },
+    "comparison_scope": "The representative comparison is limited to the authorized exclusion of one proven-equivalent generated accessor target. The final trusted-CI artifact must demonstrate that all viable observable owners, thresholds, and gates remain selected and passing on the exact final commit."
+  },
   "detection_gained": [
     "one bounded parsed versioned Protobuf source generates the Rust, gRPC and HTTP decode mapping, client contract, OpenAPI, and Schema Digest foundations",
     "the bounded canonical model covers required request, response, PublicError, Capability, supporting-enum, field-number, enum-number, and supported deprecation semantics while rejecting ambiguity and unsupported constructs",
@@ -207,7 +296,15 @@
   "detection_lost": [],
   "migration": "No durable format, SDK publication, listener, provider, query, signal-store, clustering, or Release 1 qualification claim is introduced. The implemented candidate remains unqualified until exact-artifact M6 evidence.",
   "approvals_required": ["Architecture", "Public API and SDK", "Quality Engineering"],
-  "approval_status": "pending-independent-review",
-  "approved_by": [],
+  "approval_status": "approved-by-repository-owner-autonomous-delegation-for-bounded-selector-exclusion",
+  "approved_by": [
+    {
+      "principal": "@vicotrbb",
+      "capacity": "repository owner autonomous delegation",
+      "roles": ["Architecture", "Public API and SDK", "Quality Engineering"],
+      "recorded_at_utc": "2026-07-29T01:43:58Z",
+      "scope": "Only the single proven-equivalent generated ApiVersion::major replacement-with-1 selector exclusion described by EA-0001."
+    }
+  ],
   "immutable_after_acceptance": true
 }
