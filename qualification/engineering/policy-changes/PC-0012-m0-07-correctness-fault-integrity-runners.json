@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "id": "PC-0012-m0-07-correctness-fault-integrity-runners",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Implement the existing EG-CORRECT, EG-FAULT, and EG-INTEGRITY registry runners for the active xtask tooling scope without changing product behavior or Qualification Cell state.",
+  "change": {
+    "issue": 8,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and retained target/quality/evidence attempt",
+    "dependency_review": {
+      "necessity": "Rust std does not expose safe descriptor-relative create, open, link, rename, unlink, directory enumeration, private-process-group creation, or group-wide termination APIs on all four registered macOS and Linux hosts. rustix is scoped only to xtask and supplies the safe I/O-owned and process-group wrappers needed to close validation/use races and terminate fixture descendants without a Positron unsafe boundary.",
+      "direct": {
+        "package": "rustix",
+        "version": "1.1.4",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190",
+        "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+        "features": [
+          "fs",
+          "process",
+          "std"
+        ],
+        "default_features": false,
+        "security": "The boundary uses rustix OwnedFd and safe openat, mkdirat, linkat, renameat, unlinkat, statat, Dir, process_group, and kill_process_group APIs with O_NOFOLLOW and exact resource bounds. Private process groups permit group-wide termination while bounded try_wait observation reaps the owned direct child without an unbounded wait. cargo audit reported no vulnerability for the 47-package lock graph; cargo deny accepted advisories, licenses, sources, and exact rustix 1.1.4 bans; Cargo Vet accepted the exact safe-to-deploy entry.",
+        "maintenance": "Bytecode Alliance maintains rustix with a published security-reporting process. Exact 1.1.4 is the current reviewed release, declares rust-version 1.63, and documents the required safe fs and process APIs for the registered Apple and Linux targets.",
+        "removal": "Remove when Rust std provides portable safe descriptor-relative filesystem operations and private-process-group kill support on every registered host."
+      },
+      "newly_resolved_transitives": [
+        {
+          "package": "bitflags",
+          "version": "2.13.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da",
+          "license": "MIT OR Apache-2.0",
+          "features": "std only through rustix std",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained at github.com/bitflags/bitflags; exact release declares rust-version 1.56.0.",
+          "removal": "Removed transitively when rustix is removed or no longer requires bitflags."
+        },
+        {
+          "package": "errno",
+          "version": "0.3.14",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
+          "license": "MIT OR Apache-2.0",
+          "features": "std on Apple hosts; not selected by the Linux raw backend",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained at github.com/lambda-fairy/rust-errno; exact release declares rust-version 1.56.",
+          "removal": "Removed transitively when rustix is removed or no longer requires the libc errno backend."
+        },
+        {
+          "package": "linux-raw-sys",
+          "version": "0.12.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53",
+          "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+          "features": "auxvec, elf, errno, general, ioctl, no_std on registered Linux hosts only",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained by rustix contributors at github.com/sunfishcode/linux-raw-sys; exact release declares rust-version 1.63.",
+          "removal": "Removed transitively when rustix is removed or switches away from the Linux raw backend."
+        },
+        {
+          "package": "windows-link",
+          "version": "0.2.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+          "license": "MIT OR Apache-2.0",
+          "features": "none; lock-only target dependency, not compiled on the four registered hosts",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained by Microsoft at github.com/microsoft/windows-rs; exact release declares rust-version 1.71.",
+          "removal": "Removed from the lock graph when rustix and its Windows target dependency are removed."
+        },
+        {
+          "package": "windows-sys",
+          "version": "0.61.2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+          "license": "MIT OR Apache-2.0",
+          "features": "lock-only Windows target features; not compiled on the four registered hosts",
+          "security_and_vet": "No cargo-audit advisory; cargo-deny accepted license and source; exact safe-to-deploy Cargo Vet entry.",
+          "maintenance": "Maintained by Microsoft at github.com/microsoft/windows-rs; exact release declares rust-version 1.71.",
+          "removal": "Removed from the lock graph when rustix and errno no longer resolve Windows target support."
+        }
+      ],
+      "resolution": "Cargo.lock intentionally adds only rustix 1.1.4 and the five exact transitives above. No prior dependency or exemption version changed, and no existing exemption criterion was broadened."
+    },
+    "runner_changes": [
+      "The active xtask tooling scope participates in risk-gate selection only through its own registered risk_gates set; no application, artifact, or deferred gate is inferred.",
+      "One immutable execution context captures bounded adversarial-manifest, quality-registry, integrity-registry, and fixture-harness bytes once; it parses the typed registries once and derives fixture, seed, and schedule identity from those exact bytes. Dependency metadata is streamed into a descriptor-relative create-new no-follow artifact under held root, target, quality, metadata, and attempt directory capabilities; validation reads the same opened inode and rejects any canonical directory or file-name replacement before or after parsing.",
+      "EG-CORRECT launches the explicitly registered current-xtask Quality Engineering writer in a private process group with a cleared environment, waits within the registered deadline for an atomically published exact PID and publication-point acknowledgement, sends group-wide termination, reaps the direct child through bounded try_wait observation, launches a distinct recovery process, and accepts only its externally readable predecessor-or-successor state and recovery digest.",
+      "EG-FAULT dispatches a closed exhaustive mapping of nine typed adapters for partial-write, process-crash, restart, corruption, bounded-storage, controlled-clock, cancellation, network-publication, and provider-publication schedules. The last five execute a zero-capacity candidate writer that returns typed exhaustion, a two-tick regressed clock consumed by monotonic publication validation, a requested cancellation token consumed by publication, a send through a closed Unix socket, and a send through a closed current-xtask provider-process pipe. Each actual failure persists and synchronizes its bounded error identity separately from the adapter observation. Fresh recovery checks the registered durable-state oracle and candidate shape, reads the operation result, and independently replays the deterministic boundary before accepting it.",
+      "EG-INTEGRITY persists identity-bound fixture objects, reopens the golden object, corrupts and deletes attempt-owned copies, requires digest-mismatch and missing-object failures, and proves the untouched prior object remains readable after each adversarial case.",
+      "Each gate claims one must-create no-follow fixture root directly beneath the canonical attempt TMPDIR, then performs every fixture create, read, write, copy, link, rename, removal, and recursive cleanup relative to held directory descriptors. Writer and recovery children verify exact device/inode identity tokens before mutation; occupied, symbolic-link, non-directory, escaped, swapped, and identity-changed paths fail closed.",
+      "Descriptor-relative open-or-create directory creation falls back to opening an existing entry only when mkdirat returns EEXIST. Parent synchronization, post-create open, durability, permission, resource, and every other error propagate as typed failures and cannot be reclassified by reopening the newly created directory.",
+      "An RAII owner reconciles the exact attempt-owned gate tree on success, detector failure, forced writer termination, recovery failure, and timeout; it removes only the identity-owned inode, synchronizes the attempt parent, requires the canonical fixture-root name to be absent, leaves any unowned replacement untouched, and converts replacement or cleanup failure into a failed gate.",
+      "All frozen fixture inputs and process records are opened no-follow through their held parent descriptors, checked against their byte ceiling before allocation, read through a maximum-plus-one stream bound into a pre-reserved buffer, and rejected if their opened identity or metadata drifts during the read.",
+      "Published fixture process records retain their staged hard link until the attempt-owned RAII cleanup runs, so the acknowledgement does not mutate its own inode metadata after publication.",
+      "The internal quality-fixture child interface accepts only its exact registered writer or recovery arity, including parent-claimed directory identities, and rejects any trailing argument before dispatch.",
+      "Nextest assigns only copied-workspace tests that source-mutate and rebuild xtask to the source-mutated-fixture-builds resource group with max-threads 2. The rejected 3587d6d PR-profile attempt allowed at least fourteen such builds to overlap: four tests failed after 37-46 seconds and ten reached the unchanged 120-second per-test deadline. Two slots prevented those timeouts while retaining bounded parallelism. Follow-up one-slot and two-slot runs each passed 342 of 343 tests and showed that the remaining bounded-reap assertion was instead counting 20 or more seconds of unrelated pre-seam quality work; that assertion now starts only after an explicit marker from the first injected reap-observer call. Unrelated tests retain normal scheduling and all tests, assertions, retries, status levels, selectors, and deadlines remain unchanged.",
+      "EG-TEST retains its exact locked workspace, all-targets, all-features, no-retry CI selection and the existing 131072-byte per-stream ceiling. Its Nextest invocation overrides only live and final status verbosity to failure level, preserves immediate-final failure output from the registered CI profile, requires exactly one terminal canonical summary, rejects missing or ambiguous counts and any skipped test, and retains the completed-test count in the gate detail.",
+      "EG-DEPS keeps the 131072-byte controlled stderr ceiling and streams cargo metadata stdout directly into one descriptor-relative create-new attempt-owned artifact capped at 8388608 bytes. The runner reads the same held inode, checks length before allocation, hashes while reading, validates required JSON fields, revalidates every canonical directory and file identity, and records only byte count, digest, device-inode identity, and validation summary in gate capture. Failure cleanup unlinks the artifact only when its canonical name still resolves to that held identity."
+    ],
+    "unchanged": [
+      "All 25 gate IDs, stages, coordinators, timeouts, memory declarations, exception classes, targets, thresholds, and application activation ledgers.",
+      "The EG-TEST suite selection, failure exit semantics, failure output, retry policy, timeout policy, and controlled stream ceiling.",
+      "Developer evidence remains diagnostic and non-merge-eligible.",
+      "Release Qualification Cells remain Specified; an engineering runner implementation does not qualify a product artifact."
+    ]
+  },
+  "detection_gained": [
+    "An active xtask scope can no longer select EG-CORRECT, EG-FAULT, or EG-INTEGRITY and receive an unsupported-runner failure instead of a retained fixture result.",
+    "A false predecessor-or-successor oracle, a malformed or oversized fixture registry, and a missing publication-point schedule fail closed through the public quality seam and retain a failed named-gate outcome.",
+    "Corrupt fixture bytes are classified as a digest mismatch, deleted fixture objects are classified as missing, and neither adversarial case can mutate or replace its prior persisted object.",
+    "The retained report records exact fixture IDs, seeds, fault schedules, writer and recovery process identities, forced termination and bounded reap, externally observed states, recovery digests, typed adapter/injection outcomes, identity-field coverage, and the frozen fixture-registry binding rather than a synthesized cargo self-test verdict.",
+    "Mutation after fixture capture cannot alter execution or evidence, dependency metadata directory or file swaps cannot substitute forged bytes, a symlink claim race cannot write outside the attempt root, repeated runs do not accumulate fixture trees, timed-out writer process groups are killed and directly reaped within a fixed bound, and cleanup replacement or failure fails the named gate without deleting an unowned replacement.",
+    "Removing the invocation for any one of the nine typed fault adapters fails EG-FAULT through the public quality seam because recovery independently requires that adapter's exact durable observation and candidate-state consequence.",
+    "Bypassing any bounded-storage, controlled-clock, cancellation, network-publication, or provider-publication operation while forging its expected observation and error token fails EG-FAULT because the fresh recovery process independently replays the boundary and compares its actual result with the synchronized durable receipt.",
+    "A failure synchronizing the parent after descriptor-relative directory creation cannot be reopened and accepted as success; only an exact EEXIST mkdirat result permits the existing-directory path.",
+    "The expanded first-class regression inventory cannot exhaust EG-TEST evidence capture through successful per-test status repetition; failures remain visible, successful evidence carries the exact completed-test count with zero skips, and source-mutated copied-workspace builds receive a bounded two-slot resource group without serializing unrelated tests.",
+    "The active tooling selection regression test proves EG-CONCURRENCY, EG-CRYPTO, EG-RESOURCE, and EG-SOAK remain explicitly not selected when xtask selects only its registered gates."
+  ],
+  "detection_lost": [],
+  "lifecycle_test_map": {
+    "pass": "The three quality_runs_*_through_the_registered_public_seam fixtures execute the durable detectors and inspect named-gate evidence and immutable raw reports; the correctness and fault reports prove acknowledged writer termination plus fresh-process recovery.",
+    "fail": "The false correctness oracle, missing fault schedule, false integrity reopen outcome, symlink race, and injected cleanup failure fixtures each return a failed named-gate outcome through cargo xtask quality.",
+    "timeout_and_cancellation": "quality_kills_reaps_and_cleans_a_timed_out_fixture_writer proves a writer that omits its registered acknowledgement is group-terminated, directly reaped, and cleaned before the deadline failure is retained. quality_fails_with_bounded_evidence_when_writer_reap_observation_stalls replaces the reap observer with a permanently stalled seam and proves a typed failed EG-CORRECT attempt returns within five seconds without a surviving recorded process.",
+    "missing_tool": "The M0-06 environment snapshot and controlled launch-failure tests fail the attempt before an unavailable external detector can run. EG-CORRECT, EG-FAULT, and EG-INTEGRITY themselves use only owned Rust and filesystem operations and make no missing-tool claim.",
+    "malformed": "quality_rejects_a_malformed_correctness_fixture_registry and the existing malformed retained-evidence/raw-report tests reject malformed detector inputs and durable outputs.",
+    "stale": "quality_rejects_stale_trusted_ci_source_identity and the existing registered command, environment, registry, report-digest, and result cross-reference checks remain gate-generic and cover attempts containing these named gates.",
+    "retry": "quality_preserves_a_failed_correctness_attempt_before_a_later_pass proves a later successful detector run cannot erase or rewrite the prior failed attempt; the existing trusted-CI retry rejection remains unchanged.",
+    "resource_ceiling": "quality_rejects_a_correctness_fixture_registry_over_its_resource_ceiling proves the 16384-byte detector registry ceiling; the registered process protocol bounds wait time and record size; existing M0-06 raw-report step, stream, report, path, environment, and retained-attempt ceilings remain shared.",
+    "cleanup": "Repeated successful attempts, false-oracle failure, every normally force-killed writer, an injected writer timeout, and an injected cleanup failure cover cleanup success and failure. quality_rejects_an_ordinary_directory_replacing_the_cleaned_fixture_root proves the canonical replacement is detected and its canary remains untouched. Mutable fixture paths are absent from retained reports, and the attempt parent is synchronized after successful removal."
+  },
+  "representative_old_new_evidence": {
+    "old": {
+      "status": "failed-focused-public-regression",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_fault_through_the_registered_public_seam -- --exact",
+      "result": "Before the change, an active registered EG-FAULT selection failed with an unsupported runner outcome."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_correctness_through_the_registered_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_runs_fault_through_the_registered_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_proves_forced_writer_termination_and_fresh_process_recovery -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_executes_and_binds_the_fixture_registry_bytes_captured_once -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_a_fixture_root_symlink_race_without_touching_the_target -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_cleans_attempt_owned_fixture_trees_after_repeated_successes -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_kills_reaps_and_cleans_a_timed_out_fixture_writer -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation quality_fails_when_attempt_owned_fixture_cleanup_fails -- --exact",
+        "cargo test --locked --package xtask --bin xtask quality::tests::test_runner_preserves_full_selection_failure_visibility_and_bounded_summary -- --exact",
+        "cargo test --locked -p xtask controlled_execution::tests::streams_stdout_above_the_capture_ceiling_without_retaining_it_in_memory -- --exact",
+        "cargo test --locked -p xtask controlled_execution::tests::rejects_and_removes_a_streamed_stdout_artifact_above_eight_mibibytes -- --exact",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_retains_full_dependency_metadata_above_the_stream_capture_ceiling -- --exact",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_rejects_a_replaced_dependency_metadata_artifact_without_reading_the_forgery -- --exact",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_rejects_a_replaced_dependency_metadata_directory_without_touching_its_canary -- --exact",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_rejects_a_removed_",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_rejects_an_ordinary_directory_replacing_the_cleaned_fixture_root -- --exact",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_fails_with_bounded_evidence_when_writer_reap_observation_stalls -- --exact",
+        "cargo nextest run --locked -p xtask --test foundational_scope_activation -P ci -E 'test(/^(quality_rejects_a_bypassed_.*_operation|quality_rejects_a_parent_sync_failure_after_creating_dependency_metadata_directory)$/)'",
+        "cargo nextest run --locked -p xtask --test foundational_scope_activation -P ci -E 'test(/^(quality_rejects_a_removed_.*|quality_rejects_a_replaced_dependency_metadata_.*|quality_fails_with_bounded_evidence_when_writer_reap_observation_stalls|quality_kills_reaps_and_cleans_a_timed_out_fixture_writer)$/)'",
+        "cargo test --locked -p xtask --test foundational_scope_activation quality_accepts_a_valid_retained_raw_report_at_its_limit -- --exact"
+      ],
+      "result": "The named process-backed state-transition, nine concrete typed fault adapters and their per-adapter removal mutations, frozen-input, no-follow metadata inode and canonical-name ownership, replacement-preserving cleanup, bounded group termination and direct-child reap, identity-bound corruption/deletion, bounded full-selection EG-TEST command-contract, and streamed dependency-metadata fixtures passed through their public seams locally. The first clean push attempt for revision ce340f2247883d34b43492ee09e07197522b0476 was rejected; its immutable diagnostic evidence remains at target/quality/evidence/1785338294119-ce340f224788-32584.json. A later isolated push attempt for revision b69a929abae38c293d6004c6f27d8a3b59238e8e passed and retained diagnostic evidence at /private/tmp/positron-m0-07-publish.refIV4/target/quality/evidence/1785339186583-b69a929abae3-91900.json. The isolated push attempt for revision 3587d6dd26164da6918932c0c4237092c3f579bc was rejected after 329 tests passed, four failed after 37-46 seconds, and ten copied-workspace source-build tests reached the unchanged 120-second deadline; its immutable diagnostic evidence remains at /private/tmp/positron-m0-07-publish.CJJaaH/target/quality/evidence/1785341524311-3587d6dd2616-90776.json. After correcting the stale injected metadata capability reference and assigning only that 24-test resource class to two slots, the exact thirteen-test failed-selector set passed under the CI profile in about 75 seconds total, but the isolated push attempt for revision 31bb29be3b3be4337429b28d49e45bfee11393dd was rejected after 342 tests passed and the bounded-reap test counted 25.13 seconds from public quality launch; its immutable diagnostic evidence remains at /private/tmp/positron-m0-07-publish.vQfDOv/target/quality/evidence/1785342186169-31bb29be3b3b-45192.json. A one-slot diagnostic passed the exact thirteen-test selector from fresh copied workspaces in about 64 seconds total, but the isolated push attempt for revision 399e9aeb84f460460dd422fef1c2785adc39f464 was likewise rejected after 342 tests passed because the same assertion counted 25.99 seconds from launch; its immutable diagnostic evidence remains at /private/tmp/positron-m0-07-publish.yJcNqr/target/quality/evidence/1785342688766-399e9aeb84f4-95094.json. Both results disproved source-build concurrency as the remaining cause: the five-second protocol assertion now starts at an explicit first-reap-observer marker while the same public quality child continues. The corrected stalled-reap selector passed individually, and the exact thirteen-test selector passed under the restored two-slot CI profile in about 32 seconds total. These results are diagnostic only and do not erase or reclassify any failed attempt, grant approval, or establish merge eligibility."
+    }
+  },
+  "compatibility_and_recovery": {
+    "compatibility": "The cargo xtask quality command and evidence schema remain unchanged. The quality-fixture command is an internal registered Quality Engineering child-process interface invoked only by cargo xtask quality. Correctness, fault, and integrity reports use the existing immutable selected-gate raw-report contract; exact seed and fault-schedule identity bindings are populated only when these fixture gates are selected.",
+    "recovery": "Correct the failing registered fixture, instrumentation mapping, or persisted-object behavior and create a new quality attempt. Retain every failed attempt and its raw report; do not overwrite or reclassify earlier evidence."
+  },
+  "approvals_required": [
+    "Architecture",
+    "Quality Engineering"
+  ],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
+    "attribution": "No implementation agent, reviewer, or repository owner is recorded as granting a required approval."
+  },
+  "qualification_claim": "None. The fixture process is Quality Engineering harness behavior only and does not activate product storage, durability, provider, network, runtime, or distribution behavior. This record does not claim a Qualified cell, trusted CI pass, merge eligibility, release readiness, or role approval."
+}

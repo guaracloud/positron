@@ -87,10 +87,46 @@ pub(crate) enum InvocationInput {
 }
 
 /// The externally visible output ownership mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum OutputMode {
     /// Capture independently bounded standard output and standard error.
     Capture { maximum_bytes_per_stream: usize },
+    /// Stream stdout into one create-new bounded artifact while capturing stderr.
+    CaptureWithStdoutArtifact {
+        artifact: ArtifactOutput,
+        maximum_artifact_bytes: usize,
+        maximum_stderr_bytes: usize,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct ArtifactOutput {
+    file: std::fs::File,
+    parent: std::fs::File,
+    name: String,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl ArtifactOutput {
+    pub(crate) fn new(
+        file: std::fs::File,
+        parent: std::fs::File,
+        name: String,
+        path: PathBuf,
+        device: u64,
+        inode: u64,
+    ) -> Self {
+        Self {
+            file,
+            parent,
+            name,
+            path,
+            device,
+            inode,
+        }
+    }
 }
 
 /// A fully reconciled execution result.
@@ -255,7 +291,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                 .iter()
                 .map(|(name, value)| (name, value)),
         );
-    configure_standard_descriptors(&mut command, specification.output, &specification.input);
+    configure_standard_descriptors(&mut command, &specification.output, &specification.input);
     configure_isolated_process_group(&mut command);
 
     let mut child = match command.spawn() {
@@ -345,7 +381,7 @@ fn configure_isolated_process_group(command: &mut std::process::Command) {
 #[cfg(unix)]
 fn configure_standard_descriptors(
     command: &mut std::process::Command,
-    output: OutputMode,
+    output: &OutputMode,
     input: &InvocationInput,
 ) {
     match input {
@@ -356,7 +392,9 @@ fn configure_standard_descriptors(
             command.stdin(Stdio::piped());
         },
     }
-    let OutputMode::Capture { .. } = output;
+    match output {
+        OutputMode::Capture { .. } | OutputMode::CaptureWithStdoutArtifact { .. } => {},
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 }
 
@@ -639,9 +677,6 @@ impl OwnedWorkers {
                 Some((stdin, bytes))
             },
         };
-        let OutputMode::Capture {
-            maximum_bytes_per_stream,
-        } = output;
         let stdout = child.stdout.take().ok_or_else(|| {
             ExecutionFailure::new(
                 command.to_owned(),
@@ -656,17 +691,36 @@ impl OwnedWorkers {
                 "owned stderr capture pipe was unavailable",
             )
         })?;
-        let mut capture = Some(CaptureBroker::start(
-            stdout,
-            stderr,
-            CaptureBrokerRequest {
-                maximum_bytes: maximum_bytes_per_stream,
+        let request = match output {
+            OutputMode::Capture {
+                maximum_bytes_per_stream,
+            } => CaptureBrokerRequest {
+                stdout: StdoutTarget::Capture {
+                    maximum_bytes: maximum_bytes_per_stream,
+                },
+                maximum_stderr_bytes: maximum_bytes_per_stream,
                 current_dir,
                 invocation_id: child.id(),
                 command,
                 capture_broker: &tools.capture_broker,
             },
-        )?);
+            OutputMode::CaptureWithStdoutArtifact {
+                artifact,
+                maximum_artifact_bytes,
+                maximum_stderr_bytes,
+            } => CaptureBrokerRequest {
+                stdout: StdoutTarget::Artifact {
+                    artifact,
+                    maximum_bytes: maximum_artifact_bytes,
+                },
+                maximum_stderr_bytes,
+                current_dir,
+                invocation_id: child.id(),
+                command,
+                capture_broker: &tools.capture_broker,
+            },
+        };
+        let mut capture = Some(CaptureBroker::start(stdout, stderr, request)?);
         let input = match input_pipe {
             Some((stdin, bytes)) => match InputBroker::start(
                 stdin,
@@ -997,15 +1051,115 @@ struct CaptureBroker {
     stdout: CaptureReader,
     stderr: CaptureReader,
     directory: PathBuf,
+    artifact_cleanup: Option<ArtifactCleanup>,
 }
 
 #[cfg(unix)]
 struct CaptureBrokerRequest<'a> {
-    maximum_bytes: usize,
+    stdout: StdoutTarget,
+    maximum_stderr_bytes: usize,
     current_dir: &'a std::path::Path,
     invocation_id: u32,
     command: &'a str,
     capture_broker: &'a std::path::Path,
+}
+
+#[cfg(unix)]
+enum StdoutTarget {
+    Capture {
+        maximum_bytes: usize,
+    },
+    Artifact {
+        artifact: ArtifactOutput,
+        maximum_bytes: usize,
+    },
+}
+
+#[cfg(unix)]
+struct ArtifactCleanup {
+    parent: File,
+    name: String,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn normalized_device_identity<T>(device: T) -> Result<u64, T::Error>
+where
+    T: TryInto<u64>,
+{
+    device.try_into()
+}
+
+#[cfg(unix)]
+impl ArtifactCleanup {
+    fn remove_if_owned(self, command: &str) -> Result<(), ExecutionFailure> {
+        let metadata = rustix::fs::statat(
+            &self.parent,
+            &self.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        );
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => return Ok(()),
+            Err(source) => {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Cleanup,
+                    format!(
+                        "inspect stdout artifact {} during cleanup: {}",
+                        self.path.display(),
+                        std::io::Error::from_raw_os_error(source.raw_os_error())
+                    ),
+                ));
+            },
+        };
+        let device = normalized_device_identity(metadata.st_dev).map_err(|_| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                format!(
+                    "stdout artifact device identity is invalid during cleanup: {}",
+                    self.path.display()
+                ),
+            )
+        })?;
+        let inode = metadata.st_ino;
+        if device != self.device || inode != self.inode {
+            return Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                format!(
+                    "stdout artifact canonical name was replaced during cleanup: {}",
+                    self.path.display()
+                ),
+            ));
+        }
+        rustix::fs::unlinkat(&self.parent, &self.name, rustix::fs::AtFlags::empty()).map_err(
+            |source| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Cleanup,
+                    format!(
+                        "remove owned stdout artifact {}: {}",
+                        self.path.display(),
+                        std::io::Error::from_raw_os_error(source.raw_os_error())
+                    ),
+                )
+            },
+        )?;
+        self.parent.sync_all().map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                format!(
+                    "synchronize stdout artifact parent {}: {source}",
+                    self.path.display()
+                ),
+            )
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -1016,13 +1170,14 @@ impl CaptureBroker {
         request: CaptureBrokerRequest<'_>,
     ) -> Result<Self, ExecutionFailure> {
         let CaptureBrokerRequest {
-            maximum_bytes,
+            stdout: stdout_target,
+            maximum_stderr_bytes,
             current_dir,
             invocation_id,
             command,
             capture_broker,
         } = request;
-        let broker_limit = maximum_bytes.checked_add(1).ok_or_else(|| {
+        let stderr_broker_limit = maximum_stderr_bytes.checked_add(1).ok_or_else(|| {
             ExecutionFailure::new(
                 command.to_owned(),
                 FailurePhase::Capture,
@@ -1045,25 +1200,74 @@ impl CaptureBroker {
                 format!("create invocation capture directory: {source}"),
             )
         })?;
-        let stdout_path = directory.join("stdout");
-        let stderr_path = directory.join("stderr");
-        let stdout_file = match create_capture_file(&stdout_path, command) {
-            Ok(file) => file,
-            Err(failure) => {
-                return match fs::remove_dir(&directory) {
+        let (stdout_path, stdout_file, maximum_stdout_bytes, mut artifact_cleanup) =
+            match stdout_target {
+                StdoutTarget::Capture { maximum_bytes } => {
+                    let path = directory.join("stdout");
+                    let file = match create_capture_file(&path, command) {
+                        Ok(file) => file,
+                        Err(failure) => {
+                            return match remove_capture_paths(&directory, &[]) {
+                                Ok(()) => Err(failure),
+                                Err(cleanup) => Err(cleanup),
+                            };
+                        },
+                    };
+                    (path, file, maximum_bytes, None)
+                },
+                StdoutTarget::Artifact {
+                    artifact:
+                        ArtifactOutput {
+                            file,
+                            parent,
+                            name,
+                            path,
+                            device,
+                            inode,
+                        },
+                    maximum_bytes,
+                } => {
+                    let cleanup = ArtifactCleanup {
+                        parent,
+                        name,
+                        path: path.clone(),
+                        device,
+                        inode,
+                    };
+                    (path, file, maximum_bytes, Some(cleanup))
+                },
+            };
+        let stdout_broker_limit = match maximum_stdout_bytes.checked_add(1) {
+            Some(limit) => limit,
+            None => {
+                let failure = ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Capture,
+                    "stdout artifact limit cannot reserve an overflow-detection byte",
+                );
+                let cleanup =
+                    cleanup_capture_start(&directory, &[], artifact_cleanup.take(), command);
+                return match cleanup {
                     Ok(()) => Err(failure),
-                    Err(source) => Err(ExecutionFailure::new(
-                        command.to_owned(),
-                        FailurePhase::Cleanup,
-                        format!("remove incomplete capture directory: {source}"),
-                    )),
+                    Err(cleanup) => Err(cleanup),
                 };
             },
         };
+        let stderr_path = directory.join("stderr");
         let stderr_file = match create_capture_file(&stderr_path, command) {
             Ok(file) => file,
             Err(failure) => {
-                return match remove_capture_paths(&directory, &[&stdout_path]) {
+                let cleanup_paths = if artifact_cleanup.is_some() {
+                    Vec::new()
+                } else {
+                    vec![stdout_path.as_path()]
+                };
+                return match cleanup_capture_start(
+                    &directory,
+                    &cleanup_paths,
+                    artifact_cleanup.take(),
+                    command,
+                ) {
                     Ok(()) => Err(failure),
                     Err(cleanup) => Err(cleanup),
                 };
@@ -1075,15 +1279,25 @@ impl CaptureBroker {
             CaptureReaderRequest {
                 path: stdout_path.clone(),
                 stream: "stdout",
-                maximum_bytes,
-                broker_limit,
+                maximum_bytes: maximum_stdout_bytes,
+                broker_limit: stdout_broker_limit,
                 command,
                 capture_broker,
             },
         ) {
             Ok(reader) => reader,
             Err(failure) => {
-                return match remove_capture_paths(&directory, &[&stdout_path, &stderr_path]) {
+                let cleanup_paths = if artifact_cleanup.is_some() {
+                    vec![stderr_path.as_path()]
+                } else {
+                    vec![stdout_path.as_path(), stderr_path.as_path()]
+                };
+                return match cleanup_capture_start(
+                    &directory,
+                    &cleanup_paths,
+                    artifact_cleanup.take(),
+                    command,
+                ) {
                     Ok(()) => Err(failure),
                     Err(cleanup) => Err(cleanup),
                 };
@@ -1095,8 +1309,8 @@ impl CaptureBroker {
             CaptureReaderRequest {
                 path: stderr_path.clone(),
                 stream: "stderr",
-                maximum_bytes,
-                broker_limit,
+                maximum_bytes: maximum_stderr_bytes,
+                broker_limit: stderr_broker_limit,
                 command,
                 capture_broker,
             },
@@ -1104,10 +1318,20 @@ impl CaptureBroker {
             Ok(reader) => reader,
             Err(failure) => {
                 let broker_cleanup = stdout.abort(command);
-                let file_cleanup = remove_capture_paths(&directory, &[&stdout_path, &stderr_path]);
+                let cleanup_paths = if artifact_cleanup.is_some() {
+                    vec![stderr_path.as_path()]
+                } else {
+                    vec![stdout_path.as_path(), stderr_path.as_path()]
+                };
+                let file_cleanup = cleanup_capture_start(
+                    &directory,
+                    &cleanup_paths,
+                    artifact_cleanup.take(),
+                    command,
+                );
                 return match (broker_cleanup, file_cleanup) {
+                    (_, Err(cleanup)) | (Err(cleanup), Ok(())) => Err(cleanup),
                     (Ok(()), Ok(())) => Err(failure),
-                    (Err(cleanup), _) | (Ok(()), Err(cleanup)) => Err(cleanup),
                 };
             },
         };
@@ -1115,6 +1339,7 @@ impl CaptureBroker {
             stdout,
             stderr,
             directory,
+            artifact_cleanup,
         })
     }
 
@@ -1169,28 +1394,75 @@ impl CaptureBroker {
     }
 
     fn finish(mut self, command: &str) -> Result<CapturedOutput, ExecutionFailure> {
-        let stdout = self.stdout.finish(command);
+        let retains_stdout_artifact = self.artifact_cleanup.is_some();
+        let stdout = if retains_stdout_artifact {
+            self.stdout.finish_artifact(command).map(|()| String::new())
+        } else {
+            self.stdout.finish(command)
+        };
         let stderr = self.stderr.finish(command);
-        let cleanup =
-            remove_capture_paths(&self.directory, &[&self.stdout.path, &self.stderr.path]);
-        match (stdout, stderr, cleanup) {
-            (Ok(stdout), Ok(stderr), Ok(())) => Ok(CapturedOutput { stdout, stderr }),
-            (Err(failure), _, _) | (Ok(_), Err(failure), _) => Err(failure),
-            (Ok(_), Ok(_), Err(cleanup)) => Err(cleanup),
+        let cleanup_paths = if retains_stdout_artifact {
+            vec![self.stderr.path.as_path()]
+        } else {
+            vec![self.stdout.path.as_path(), self.stderr.path.as_path()]
+        };
+        let cleanup = remove_capture_paths(&self.directory, &cleanup_paths);
+        let artifact_cleanup = if stdout.is_ok() && stderr.is_ok() && cleanup.is_ok() {
+            self.artifact_cleanup.take();
+            Ok(())
+        } else {
+            match self.artifact_cleanup.take() {
+                Some(artifact) => artifact.remove_if_owned(command),
+                None => Ok(()),
+            }
+        };
+        match (stdout, stderr, cleanup, artifact_cleanup) {
+            (_, _, _, Err(cleanup)) => Err(cleanup),
+            (Ok(stdout), Ok(stderr), Ok(()), Ok(())) => Ok(CapturedOutput { stdout, stderr }),
+            (Err(failure), _, _, Ok(())) | (Ok(_), Err(failure), _, Ok(())) => Err(failure),
+            (Ok(_), Ok(_), Err(cleanup), Ok(())) => Err(cleanup),
         }
     }
 
-    fn abort(self, command: &str) -> Result<(), ExecutionFailure> {
+    fn abort(mut self, command: &str) -> Result<(), ExecutionFailure> {
         let stdout_path = self.stdout.path.clone();
         let stderr_path = self.stderr.path.clone();
         let stdout = self.stdout.abort(command);
         let stderr = self.stderr.abort(command);
-        let cleanup = remove_capture_paths(&self.directory, &[&stdout_path, &stderr_path]);
-        match (stdout, stderr, cleanup) {
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
-            (Err(failure), _, _) | (Ok(()), Err(failure), _) => Err(failure),
-            (Ok(()), Ok(()), Err(cleanup)) => Err(cleanup),
+        let cleanup_paths = if self.artifact_cleanup.is_some() {
+            vec![stderr_path.as_path()]
+        } else {
+            vec![stdout_path.as_path(), stderr_path.as_path()]
+        };
+        let cleanup = remove_capture_paths(&self.directory, &cleanup_paths);
+        let artifact_cleanup = match self.artifact_cleanup.take() {
+            Some(artifact) => artifact.remove_if_owned(command),
+            None => Ok(()),
+        };
+        match (stdout, stderr, cleanup, artifact_cleanup) {
+            (_, _, _, Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(failure), _, _, Ok(())) | (Ok(()), Err(failure), _, Ok(())) => Err(failure),
+            (Ok(()), Ok(()), Err(cleanup), Ok(())) => Err(cleanup),
         }
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_capture_start(
+    directory: &std::path::Path,
+    paths: &[&std::path::Path],
+    artifact: Option<ArtifactCleanup>,
+    command: &str,
+) -> Result<(), ExecutionFailure> {
+    let capture_cleanup = remove_capture_paths(directory, paths);
+    let artifact_cleanup = match artifact {
+        Some(artifact) => artifact.remove_if_owned(command),
+        None => Ok(()),
+    };
+    match (capture_cleanup, artifact_cleanup) {
+        (_, Err(cleanup)) | (Err(cleanup), Ok(())) => Err(cleanup),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -1277,20 +1549,7 @@ impl CaptureReader {
     }
 
     fn finish(&mut self, command: &str) -> Result<String, ExecutionFailure> {
-        let status = self.status.ok_or_else(|| {
-            ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Capture,
-                format!("{} capture broker has no terminal status", self.stream),
-            )
-        })?;
-        if !status.success() {
-            return Err(ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Capture,
-                format!("{} capture broker exited with {status}", self.stream),
-            ));
-        }
+        self.validate_terminal_status(command)?;
         let output = File::open(&self.path).map_err(|source| {
             ExecutionFailure::new(
                 command.to_owned(),
@@ -1305,6 +1564,62 @@ impl CaptureReader {
                 format!("{} capture failed: {}", self.stream, failure.detail),
             )
         })
+    }
+
+    fn finish_artifact(&mut self, command: &str) -> Result<(), ExecutionFailure> {
+        self.validate_terminal_status(command)?;
+        let artifact = File::open(&self.path).map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("open streamed stdout artifact: {source}"),
+            )
+        })?;
+        let bytes = artifact
+            .metadata()
+            .map_err(|source| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Capture,
+                    format!("inspect streamed stdout artifact: {source}"),
+                )
+            })?
+            .len();
+        if bytes > self.maximum_bytes as u64 {
+            return Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!(
+                    "streamed stdout artifact exceeded the {}-byte limit",
+                    self.maximum_bytes
+                ),
+            ));
+        }
+        artifact.sync_all().map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("sync streamed stdout artifact: {source}"),
+            )
+        })
+    }
+
+    fn validate_terminal_status(&self, command: &str) -> Result<(), ExecutionFailure> {
+        let status = self.status.ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("{} capture broker has no terminal status", self.stream),
+            )
+        })?;
+        if !status.success() {
+            return Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                format!("{} capture broker exited with {status}", self.stream),
+            ));
+        }
+        Ok(())
     }
 
     fn abort(mut self, command: &str) -> Result<(), ExecutionFailure> {
@@ -1449,14 +1764,15 @@ fn command_display(program: &OsStr, arguments: &[OsString]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        CapturedOutput, ExecutionFailure, ExecutionOutcome, ExecutionTools, ExecutionVerdict,
-        FailurePhase, InvocationInput, InvocationSpec, OutputMode, execute,
+        ArtifactOutput, CapturedOutput, ExecutionFailure, ExecutionOutcome, ExecutionTools,
+        ExecutionVerdict, FailurePhase, InvocationInput, InvocationSpec, OutputMode, execute,
     };
     use std::error::Error;
-    use std::ffi::OsString;
-    use std::fs::{self, OpenOptions};
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{self, File, OpenOptions};
     use std::io;
     use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1898,8 +2214,148 @@ done
         }
     }
 
+    #[test]
+    fn streams_stdout_above_the_capture_ceiling_without_retaining_it_in_memory() -> TestResult {
+        let directory = artifact_test_directory("above-capture-ceiling")?;
+        let artifact = directory.join("metadata.json");
+        let outcome = execute(artifact_output_specification(
+            &directory, &artifact, 196_608, 262_144,
+        )?);
+        let result = (|| {
+            let verdict = reconciled(outcome)?;
+            if !verdict.status.success() {
+                return Err(io::Error::other(format!(
+                    "streamed artifact child returned {}",
+                    verdict.status
+                ))
+                .into());
+            }
+            if !verdict.output.stdout.is_empty() {
+                return Err(
+                    io::Error::other("streamed artifact was also retained in memory").into(),
+                );
+            }
+            if fs::metadata(&artifact)?.len() != 196_608 {
+                return Err(io::Error::other(
+                    "streamed artifact did not retain the exact stdout length",
+                )
+                .into());
+            }
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&directory);
+        cleanup?;
+        result
+    }
+
+    #[test]
+    fn rejects_and_removes_a_streamed_stdout_artifact_above_eight_mibibytes() -> TestResult {
+        let directory = artifact_test_directory("above-artifact-limit")?;
+        let artifact = directory.join("metadata.json");
+        let outcome = execute(artifact_output_specification(
+            &directory, &artifact, 9_437_184, 8_388_608,
+        )?);
+        let result = match outcome {
+            ExecutionOutcome::Failed(failure)
+                if failure.phase == FailurePhase::Capture
+                    && failure
+                        .detail
+                        .contains("streamed stdout artifact exceeded the 8388608-byte limit") =>
+            {
+                if artifact.try_exists()? {
+                    Err(
+                        io::Error::other("over-limit streamed stdout artifact was not removed")
+                            .into(),
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+            ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                "over-limit streamed artifact returned {} instead of capture: {}",
+                failure.phase.as_str(),
+                failure.detail
+            ))
+            .into()),
+            ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                "over-limit streamed artifact reconciled with {}",
+                verdict.status
+            ))
+            .into()),
+        };
+        let cleanup = fs::remove_dir_all(&directory);
+        cleanup?;
+        result
+    }
+
     fn captured_shell(script: &str, timeout: Duration) -> TestResult<InvocationSpec> {
         captured_shell_with_limit(script, timeout, 1_024)
+    }
+
+    fn artifact_test_directory(subject: &str) -> TestResult<PathBuf> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sequence = CANCELLATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "positron-controlled-{subject}-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)?;
+        Ok(directory)
+    }
+
+    fn artifact_output_specification(
+        current_dir: &std::path::Path,
+        artifact_path: &std::path::Path,
+        output_bytes: usize,
+        maximum_artifact_bytes: usize,
+    ) -> TestResult<InvocationSpec> {
+        if !output_bytes.is_multiple_of(1_024) {
+            return Err(io::Error::other("artifact test size must be a multiple of 1024").into());
+        }
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .ok_or_else(|| io::Error::other("artifact test deadline cannot be represented"))?;
+        let artifact_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(artifact_path)?;
+        let artifact_metadata = artifact_file.metadata()?;
+        let artifact_parent_path = artifact_path
+            .parent()
+            .ok_or_else(|| io::Error::other("artifact test path has no parent"))?;
+        let artifact_parent = File::open(artifact_parent_path)?;
+        let artifact_name = artifact_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| io::Error::other("artifact test name is not UTF-8"))?
+            .to_owned();
+        Ok(InvocationSpec {
+            program: OsString::from("/bin/dd"),
+            arguments: vec![
+                OsString::from("if=/dev/zero"),
+                OsString::from("bs=1024"),
+                OsString::from(format!("count={}", output_bytes / 1_024)),
+            ],
+            current_dir: current_dir.to_path_buf(),
+            environment: Vec::new(),
+            tools: test_execution_tools()?,
+            input: InvocationInput::Null,
+            output: OutputMode::CaptureWithStdoutArtifact {
+                artifact: ArtifactOutput::new(
+                    artifact_file,
+                    artifact_parent,
+                    artifact_name,
+                    artifact_path.to_path_buf(),
+                    artifact_metadata.dev(),
+                    artifact_metadata.ino(),
+                ),
+                maximum_artifact_bytes,
+                maximum_stderr_bytes: 131_072,
+            },
+            cancellation: Arc::new(AtomicBool::new(false)),
+            deadline,
+        })
     }
 
     fn escaped_descriptor_spec(

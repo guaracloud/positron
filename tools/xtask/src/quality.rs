@@ -15,6 +15,7 @@ use crate::controlled_execution::{
 use crate::error::XtaskError;
 use crate::evidence_json as bounded_json;
 use crate::hooks;
+use crate::qualification_fixtures::{DirectoryCapability, FileCapability};
 use crate::registry::{self, Gate, Registry};
 
 const CANONICAL_GATE_IDS: [&str; 25] = [
@@ -68,6 +69,20 @@ const MAXIMUM_CONTROLLED_PROGRAM_CHARACTERS: usize = 256;
 const MAXIMUM_RESOLVED_PROGRAM_CHARACTERS: usize = 4_096;
 const MAXIMUM_CONTROLLED_ARGUMENTS: usize = 256;
 const MAXIMUM_CONTROLLED_ARGUMENT_CHARACTERS: usize = 4_096;
+const NEXTEST_PR_ARGUMENTS: [&str; 12] = [
+    "nextest",
+    "run",
+    "--locked",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--profile",
+    "ci",
+    "--status-level",
+    "fail",
+    "--final-status-level",
+    "fail",
+];
 const EVIDENCE_V3_CONSTRAINT_OWNER: &str =
     "Constraint owner: tools/xtask/src/quality.rs EVIDENCE_V3_CONSTRAINTS_V1";
 const EVIDENCE_V3_SCHEMA_SHA256: &str =
@@ -406,6 +421,17 @@ struct GateCapture {
     charged_bytes: usize,
 }
 
+struct GateExecutionContext<'context> {
+    attempt_id: &'context str,
+    root: &'context Path,
+    registry: &'context Registry,
+    qualification_fixtures: &'context crate::qualification_fixtures::FrozenQualificationFixtures,
+    options: &'context Options,
+    environment: &'context EnvironmentSnapshot,
+    source: &'context SourceIdentity,
+    identity: &'context EvidenceIdentity,
+}
+
 impl GateCapture {
     fn new() -> Self {
         Self {
@@ -569,6 +595,15 @@ impl IdentityBinding {
     }
 }
 
+fn identity_binding_text(binding: &IdentityBinding) -> String {
+    match binding {
+        IdentityBinding::Exact(value) => format!("exact:{value}"),
+        IdentityBinding::NotApplicable(reason) => {
+            format!("not-applicable:{}", reason.as_str())
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 struct EvidenceIdentity {
     release_manifest: IdentityBinding,
@@ -607,6 +642,7 @@ struct Evidence {
 struct CommandOutcome {
     display: String,
     stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug)]
@@ -663,6 +699,8 @@ fn engineering_evidence_identity(
     root: &Path,
     source: &SourceIdentity,
     environment: &EnvironmentSnapshot,
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
+    qualification_fixture_selected: bool,
 ) -> Result<EvidenceIdentity, XtaskError> {
     let target_registry_digest =
         digest_relative_files(root, environment, &["qualification/targets/registry.json"])?;
@@ -674,17 +712,18 @@ fn engineering_evidence_identity(
             "rust-toolchain.toml",
         ],
     )?;
-    let fixture_registry_digest = digest_relative_files(
-        root,
-        environment,
-        &["qualification/fixtures/adversarial/manifest.json"],
-    )?;
-    Ok(EvidenceIdentity {
+    let fixture_registry_digest = digest_payload(root, environment, fixtures.identity_payload())?;
+    let mut identity = EvidenceIdentity {
         target_registry_digest,
         toolchain_digest,
         fixture_registry_digest,
         ..unavailable_evidence_identity(source)
-    })
+    };
+    if qualification_fixture_selected {
+        identity.seed = IdentityBinding::exact(fixtures.seed_digest());
+        identity.fault_schedule = IdentityBinding::exact(fixtures.fault_schedule_digest());
+    }
+    Ok(identity)
 }
 
 fn digest_relative_files(
@@ -777,7 +816,36 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             );
         },
     };
-    let identity = match engineering_evidence_identity(&root, &source, &environment) {
+    let activated_risk_gates = registry.activated_risk_gates();
+    let qualification_fixture_selected = registry.gates.iter().any(|gate| {
+        matches!(gate.id.as_str(), "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY")
+            && gate_selected(gate, options.profile, &activated_risk_gates)
+    });
+    let qualification_fixtures =
+        match crate::qualification_fixtures::FrozenQualificationFixtures::capture(&root) {
+            Ok(fixtures) => fixtures,
+            Err(error) => {
+                return retain_aggregator_failure(
+                    &root,
+                    options.profile,
+                    AggregatorFailure {
+                        source,
+                        started_unix_ms,
+                        attempt_id,
+                        environment_digest: environment.digest(),
+                        registry_digest: &registry_digest,
+                        error: &error,
+                    },
+                );
+            },
+        };
+    let identity = match engineering_evidence_identity(
+        &root,
+        &source,
+        &environment,
+        &qualification_fixtures,
+        qualification_fixture_selected,
+    ) {
         Ok(identity) => identity,
         Err(error) => {
             return retain_aggregator_failure(
@@ -794,8 +862,6 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             );
         },
     };
-    let activated_risk_gates = registry.activated_risk_gates();
-
     println!(
         "Positron engineering quality: profile={}, revision={}, dirty={}",
         options.profile.as_str(),
@@ -827,7 +893,20 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         );
         let started = Instant::now();
         let mut capture = GateCapture::new();
-        let execution = execute_gate(&root, &registry, gate, options, &environment, &mut capture);
+        let execution = execute_gate(
+            GateExecutionContext {
+                attempt_id: &attempt_id,
+                root: &root,
+                registry: &registry,
+                qualification_fixtures: &qualification_fixtures,
+                options,
+                environment: &environment,
+                source: &source,
+                identity: &identity,
+            },
+            gate,
+            &mut capture,
+        );
         let controlled_steps = capture.finish();
         let duration_ms = started.elapsed().as_millis();
         match execution {
@@ -1000,7 +1079,27 @@ fn gate_attempt(
     environment_digest: &str,
     outcome: GateAttemptOutcome,
 ) -> GateAttempt {
-    let invocation = GateInvocation {
+    let invocation =
+        canonical_gate_invocation(gate, profile, environment_digest, &outcome.controlled_steps);
+    build_gate_attempt(
+        attempt_id,
+        GateAttemptDefinition {
+            gate_id: gate.id.clone(),
+            budget_seconds: gate.timeout_seconds,
+            invocation,
+            owner: IdentityBinding::exact(gate.coordinator.clone()),
+        },
+        outcome,
+    )
+}
+
+fn canonical_gate_invocation(
+    gate: &Gate,
+    profile: Profile,
+    environment_digest: &str,
+    controlled_steps: &[ControlledStepReport],
+) -> GateInvocation {
+    GateInvocation {
         program: "cargo-xtask-quality/internal".to_owned(),
         arguments: vec![
             "quality".to_owned(),
@@ -1017,22 +1116,11 @@ fn gate_attempt(
         memory_mib: gate.memory_mib,
         activation: gate.activation.clone(),
         exception_class: gate.exception_class.clone(),
-        controlled_steps: outcome
-            .controlled_steps
+        controlled_steps: controlled_steps
             .iter()
             .map(|step| step.invocation.clone())
             .collect(),
-    };
-    build_gate_attempt(
-        attempt_id,
-        GateAttemptDefinition {
-            gate_id: gate.id.clone(),
-            budget_seconds: gate.timeout_seconds,
-            invocation,
-            owner: IdentityBinding::exact(gate.coordinator.clone()),
-        },
-        outcome,
-    )
+    }
 }
 
 fn build_gate_attempt(
@@ -1246,13 +1334,20 @@ fn not_selected_reason(gate: &Gate, profile: Profile) -> String {
 }
 
 fn execute_gate(
-    root: &Path,
-    registry: &Registry,
+    context: GateExecutionContext<'_>,
     gate: &Gate,
-    options: &Options,
-    environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let GateExecutionContext {
+        attempt_id,
+        root,
+        registry,
+        qualification_fixtures,
+        options,
+        environment,
+        source,
+        identity,
+    } = context;
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
         "registry" => run_registry_gate(
@@ -1269,8 +1364,20 @@ fn execute_gate(
         "dynamic-analysis" => {
             run_dynamic_analysis_gate(root, registry, budget, environment, capture)
         },
-        "dependencies" => run_dependency_gate(root, registry, budget, environment, capture),
+        "dependencies" => {
+            run_dependency_gate(attempt_id, root, registry, budget, environment, capture)
+        },
         "documentation" => run_documentation_gate(root, budget, environment, capture),
+        "correctness" => run_correctness_gate(qualification_fixtures, environment),
+        "fault" => run_fault_gate(qualification_fixtures, environment),
+        "integrity" => run_integrity_gate(
+            qualification_fixtures,
+            gate,
+            options,
+            environment,
+            source,
+            identity,
+        ),
         "error-policy" => run_error_policy_gate(root, registry),
         "evidence" => run_evidence_gate(root, registry),
         "policy" => run_policy_gate(root, registry),
@@ -1293,6 +1400,45 @@ fn execute_gate(
             "an active risk scope selected a gate whose executable harness has not been implemented",
         )),
     }
+}
+
+fn run_correctness_gate(
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    crate::qualification_fixtures::run_correctness(fixtures, &environment.temporary_root)
+}
+
+fn run_fault_gate(
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
+    environment: &EnvironmentSnapshot,
+) -> Result<String, XtaskError> {
+    crate::qualification_fixtures::run_fault(fixtures, &environment.temporary_root)
+}
+
+fn run_integrity_gate(
+    fixtures: &crate::qualification_fixtures::FrozenQualificationFixtures,
+    gate: &Gate,
+    options: &Options,
+    environment: &EnvironmentSnapshot,
+    source: &SourceIdentity,
+    identity: &EvidenceIdentity,
+) -> Result<String, XtaskError> {
+    let invocation = canonical_gate_invocation(gate, options.profile, environment.digest(), &[]);
+    let integrity_identity = crate::qualification_fixtures::IntegrityIdentity {
+        revision: source.revision.clone(),
+        artifact: identity_binding_text(&identity.artifact),
+        target: identity_binding_text(&identity.target),
+        environment: environment.digest().to_owned(),
+        command: command_digest(&invocation),
+        fixtures: identity.fixture_registry_digest.clone(),
+        result: GateStatus::Passed.as_str().to_owned(),
+    };
+    crate::qualification_fixtures::run_integrity(
+        fixtures,
+        &environment.temporary_root,
+        &integrity_identity,
+    )
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
@@ -2236,6 +2382,7 @@ fn run_build_gate(
 }
 
 fn run_dependency_gate(
+    attempt_id: &str,
     root: &Path,
     registry: &Registry,
     budget: Duration,
@@ -2245,13 +2392,12 @@ fn run_dependency_gate(
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
-        run_capture(
+        run_dependency_metadata_capture(
+            attempt_id,
             root,
             environment,
-            "cargo",
-            ["metadata", "--locked", "--format-version", "1"],
             remaining(deadline)?,
-            Some(&mut *capture),
+            capture,
         )?
         .display,
     );
@@ -2281,6 +2427,232 @@ fn run_dependency_gate(
         commands.push("internal:direct-dependency-review parity".to_owned());
     }
     Ok(commands.join(" | "))
+}
+
+fn run_dependency_metadata_capture(
+    attempt_id: &str,
+    root: &Path,
+    snapshot: &EnvironmentSnapshot,
+    timeout: Duration,
+    capture: &mut GateCapture,
+) -> Result<CommandOutcome, XtaskError> {
+    let artifact = prepare_dependency_metadata_artifact(root, attempt_id)?;
+    let argument_values = ["metadata", "--locked", "--format-version", "1"];
+    let arguments = argument_values.map(OsString::from).to_vec();
+    let resolved_program = snapshot.tool_path("cargo")?;
+    let display = command_display(&resolved_program.to_string_lossy(), &arguments);
+    println!("  $ {display}");
+    let invocation_environment = snapshot.invocation_environment(&[])?;
+    let input = InvocationInput::Null;
+    let invocation = controlled_invocation(
+        "cargo",
+        resolved_program.as_os_str(),
+        &arguments,
+        &invocation_environment,
+        timeout,
+        &input,
+    );
+    let verdict = controlled_execution::execute(InvocationSpec {
+        program: resolved_program,
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: invocation_environment,
+        tools: snapshot.execution_tools(),
+        input,
+        output: OutputMode::CaptureWithStdoutArtifact {
+            artifact: artifact.artifact_output()?,
+            maximum_artifact_bytes: MAXIMUM_RAW_REPORT_BYTES,
+            maximum_stderr_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+        },
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(timeout)?,
+    })
+    .into_result();
+    let verdict = match verdict {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
+            capture.record(invocation, &step_verdict, "", &error.detail)?;
+            return Err(XtaskError::controlled_harness(error));
+        },
+    };
+    if !verdict.status.success() {
+        let step_verdict = format!("exit-status:{}", verdict.status);
+        capture.record(
+            invocation,
+            &step_verdict,
+            "",
+            &bounded_stream_summary(&verdict.output.stderr),
+        )?;
+        return Err(XtaskError::command(
+            display,
+            format!(
+                "exit status {}: stderr={}",
+                verdict.status,
+                one_line(&verdict.output.stderr)
+            ),
+        ));
+    }
+    let summary = validate_dependency_metadata_artifact(root, &artifact)?;
+    capture.record(
+        invocation,
+        &format!("exit-status:{}", verdict.status),
+        &summary,
+        &bounded_stream_summary(&verdict.output.stderr),
+    )?;
+    Ok(CommandOutcome {
+        display,
+        stdout: summary,
+        stderr: bounded_stream_summary(&verdict.output.stderr),
+    })
+}
+
+fn bounded_stream_summary(stream: &str) -> String {
+    let one_line = one_line(stream);
+    one_line
+        .chars()
+        .take(MAXIMUM_GATE_DETAIL_CHARACTERS)
+        .collect()
+}
+
+struct DependencyMetadataArtifact {
+    root: DirectoryCapability,
+    target: DirectoryCapability,
+    quality: DirectoryCapability,
+    metadata: DirectoryCapability,
+    attempt: DirectoryCapability,
+    file: FileCapability,
+    attempt_id: String,
+}
+
+impl DependencyMetadataArtifact {
+    fn diagnostic_path(&self) -> &Path {
+        self.file.diagnostic_path()
+    }
+
+    fn artifact_output(&self) -> Result<crate::controlled_execution::ArtifactOutput, XtaskError> {
+        self.file.artifact_output()
+    }
+
+    fn require_canonical_names(&self) -> Result<(), XtaskError> {
+        self.root.require_child_directory_identity(
+            "target",
+            self.target.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.target.require_child_directory_identity(
+            "quality",
+            self.quality.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.quality.require_child_directory_identity(
+            "dependency-metadata",
+            self.metadata.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.metadata.require_child_directory_identity(
+            &self.attempt_id,
+            self.attempt.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.attempt.require_child_file_identity(
+            "metadata.json",
+            self.file.identity(),
+            "dependency metadata artifact",
+        )
+    }
+}
+
+fn prepare_dependency_metadata_artifact(
+    root: &Path,
+    attempt_id: &str,
+) -> Result<DependencyMetadataArtifact, XtaskError> {
+    let root = DirectoryCapability::open(root, "dependency metadata workspace root")?;
+    let target = root.open_or_create_child_directory("target", "dependency metadata target")?;
+    let quality =
+        target.open_or_create_child_directory("quality", "dependency metadata quality")?;
+    let metadata = quality
+        .open_or_create_child_directory("dependency-metadata", "dependency metadata parent")?;
+    let attempt =
+        metadata.create_child_directory(attempt_id, "attempt-owned dependency metadata")?;
+    let file =
+        attempt.create_file_capability("metadata.json", "attempt-owned dependency metadata")?;
+    attempt.sync()?;
+    Ok(DependencyMetadataArtifact {
+        root,
+        target,
+        quality,
+        metadata,
+        attempt,
+        file,
+        attempt_id: attempt_id.to_owned(),
+    })
+}
+
+fn validate_dependency_metadata_artifact(
+    root: &Path,
+    artifact: &DependencyMetadataArtifact,
+) -> Result<String, XtaskError> {
+    artifact.require_canonical_names()?;
+    let path = artifact.diagnostic_path();
+    let bytes = artifact
+        .file
+        .read_bounded(MAXIMUM_RAW_REPORT_BYTES, "dependency metadata artifact")?;
+    let expected_bytes = bytes.len();
+    if expected_bytes == 0 || expected_bytes > MAXIMUM_RAW_REPORT_BYTES {
+        return Err(XtaskError::invalid(
+            "dependency metadata artifact",
+            format!("cargo metadata output must contain 1..={MAXIMUM_RAW_REPORT_BYTES} bytes"),
+        ));
+    }
+    let mut digest = Sha256::new();
+    for chunk in bytes.chunks(8_192) {
+        digest.update(chunk);
+    }
+    let content = std::str::from_utf8(&bytes).map_err(|_| {
+        XtaskError::invalid(
+            "dependency metadata artifact",
+            "cargo metadata is not UTF-8",
+        )
+    })?;
+    let mut document = bounded_json::parse_with_maximum_bytes(content, MAXIMUM_RAW_REPORT_BYTES)
+        .map_err(|error| XtaskError::invalid("dependency metadata artifact", error.to_string()))?
+        .into_object("cargo metadata")
+        .map_err(|error| XtaskError::invalid("dependency metadata artifact", error.to_string()))?;
+    for (field, expected) in [
+        ("packages", "array"),
+        ("workspace_members", "array"),
+        ("workspace_root", "string"),
+        ("target_directory", "string"),
+        ("resolve", "object"),
+    ] {
+        let value = bounded_json::take_required(&mut document, field).map_err(|error| {
+            XtaskError::invalid("dependency metadata artifact", error.to_string())
+        })?;
+        let valid = matches!(
+            (expected, value),
+            ("array", bounded_json::JsonValue::Array(_))
+                | ("string", bounded_json::JsonValue::String(_))
+                | ("object", bounded_json::JsonValue::Object(_))
+        );
+        if !valid {
+            return Err(XtaskError::invalid(
+                "dependency metadata artifact",
+                format!("cargo metadata field `{field}` is not a {expected}"),
+            ));
+        }
+    }
+    artifact.require_canonical_names()?;
+    artifact.attempt.sync()?;
+    let digest = format!("sha256:{:x}", digest.finalize());
+    Ok(format!(
+        "metadata-artifact={}; identity={}; bytes={}; digest={digest}; packages+workspace+resolve=validated",
+        path.strip_prefix(root)
+            .map_err(|_| XtaskError::invalid_path(path, "metadata artifact escaped workspace"))?
+            .display(),
+        artifact.file.identity().token(),
+        expected_bytes,
+    ))
 }
 
 fn run_documentation_gate(
@@ -2803,6 +3175,9 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
         "dynamic-analysis" => 2,
         "dependencies" => 3,
         "documentation" | "rust" | "test" => 2,
+        "correctness" => 0,
+        "fault" => 0,
+        "integrity" => 0,
         "safety" => usize::from(registry.has_m0_04_configuration_scope()),
         "security" => 1,
         "secrets" | "supply" => {
@@ -2812,8 +3187,8 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
                 1
             }
         },
-        "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
-        | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => 0,
+        "concurrency" | "crypto" | "error-policy" | "evidence" | "matrix" | "performance"
+        | "policy" | "resource" | "soak" => 0,
         _ => 0,
     }
 }
@@ -3000,20 +3375,7 @@ fn registered_runner_command_matches(
             _ => false,
         },
         "test" => match index {
-            0 => {
-                program == "cargo"
-                    && args
-                        == [
-                            "nextest",
-                            "run",
-                            "--locked",
-                            "--workspace",
-                            "--all-targets",
-                            "--all-features",
-                            "--profile",
-                            "ci",
-                        ]
-            },
+            0 => program == "cargo" && args == NEXTEST_PR_ARGUMENTS,
             1 => {
                 program == "cargo"
                     && args == ["test", "--locked", "--workspace", "--doc", "--all-features"]
@@ -4618,19 +4980,11 @@ fn run_test_gate(
         root,
         environment,
         "cargo",
-        [
-            "nextest",
-            "run",
-            "--locked",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--profile",
-            "ci",
-        ],
+        NEXTEST_PR_ARGUMENTS,
         remaining(deadline)?,
         capture,
     )?;
+    let completed_test_count = nextest_completed_test_count(&nextest.stderr)?;
     let doctest = run_status(
         root,
         environment,
@@ -4639,7 +4993,53 @@ fn run_test_gate(
         remaining(deadline)?,
         capture,
     )?;
-    Ok(format!("{} | {}", nextest.display, doctest.display))
+    Ok(format!(
+        "{}; completed-tests={completed_test_count} | {}",
+        nextest.display, doctest.display
+    ))
+}
+
+fn nextest_completed_test_count(stderr: &str) -> Result<usize, XtaskError> {
+    let mut summaries = stderr
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("Summary ["));
+    let summary = summaries.next().ok_or_else(|| {
+        XtaskError::invalid(
+            "nextest result summary",
+            "missing final completed-test count",
+        )
+    })?;
+    if summaries.next().is_some() {
+        return Err(XtaskError::invalid(
+            "nextest result summary",
+            "multiple final completed-test summaries are ambiguous",
+        ));
+    }
+    let (_, counts) = summary.split_once("] ").ok_or_else(|| {
+        XtaskError::invalid(
+            "nextest result summary",
+            "final summary duration delimiter is malformed",
+        )
+    })?;
+    let (completed, outcomes) = counts.split_once(" tests run: ").ok_or_else(|| {
+        XtaskError::invalid(
+            "nextest result summary",
+            "final completed-test count delimiter is malformed",
+        )
+    })?;
+    let completed = completed.parse::<usize>().map_err(|error| {
+        XtaskError::invalid(
+            "nextest result summary",
+            format!("final completed-test count is invalid: {error}"),
+        )
+    })?;
+    if completed == 0 || outcomes != format!("{completed} passed, 0 skipped") {
+        return Err(XtaskError::invalid(
+            "nextest result summary",
+            format!("expected every completed test to pass without skips, observed `{outcomes}`"),
+        ));
+    }
+    Ok(completed)
 }
 
 fn scan_active_application_sources(
@@ -5020,6 +5420,7 @@ fn run_status_with_options<'argument>(
         return Ok(CommandOutcome {
             display,
             stdout: verdict.output.stdout,
+            stderr: verdict.output.stderr,
         });
     }
     Err(XtaskError::command(
@@ -5128,6 +5529,7 @@ fn run_capture_with_input<'argument>(
     Ok(CommandOutcome {
         display,
         stdout: verdict.output.stdout,
+        stderr: verdict.output.stderr,
     })
 }
 
@@ -5784,6 +6186,14 @@ fn digest_files(
         payload.push(0);
     }
 
+    digest_payload(root, environment, payload)
+}
+
+fn digest_payload(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    payload: Vec<u8>,
+) -> Result<String, XtaskError> {
     let output = run_capture_with_input(
         root,
         environment,
@@ -6894,16 +7304,6 @@ fn validate_evidence_identity(evidence: &Evidence) -> Result<(), XtaskError> {
             NotApplicableReason::NoCorpusSelected,
         ),
         (
-            "seed",
-            &evidence.identity.seed,
-            NotApplicableReason::NoSeedSelected,
-        ),
-        (
-            "fault_schedule",
-            &evidence.identity.fault_schedule,
-            NotApplicableReason::NoFaultScheduleSelected,
-        ),
-        (
             "approval",
             &evidence.identity.approval,
             NotApplicableReason::NoApprovalClaimed,
@@ -6920,6 +7320,35 @@ fn validate_evidence_identity(evidence: &Evidence) -> Result<(), XtaskError> {
                 format!("`{field}` must use its exact not-applicable reason"),
             ));
         }
+    }
+    let qualification_fixture_selected = evidence.gates.iter().any(|gate| {
+        matches!(
+            gate.gate_id.as_str(),
+            "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY"
+        ) && gate.result != GateStatus::NotSelected
+    });
+    match (
+        qualification_fixture_selected,
+        &evidence.identity.seed,
+        &evidence.identity.fault_schedule,
+    ) {
+        (_, IdentityBinding::Exact(seed), IdentityBinding::Exact(schedule))
+            if valid_sha256_digest(seed) && valid_sha256_digest(schedule) => {},
+        (
+            false,
+            IdentityBinding::NotApplicable(NotApplicableReason::NoSeedSelected),
+            IdentityBinding::NotApplicable(NotApplicableReason::NoFaultScheduleSelected),
+        ) => {},
+        _ => {
+            return Err(XtaskError::invalid(
+                "engineering evidence",
+                format!(
+                    "fixture-selected attempts and their recovery records require exact seed and fault-schedule digests; selected={qualification_fixture_selected}, seed={}, schedule={}",
+                    identity_binding_text(&evidence.identity.seed),
+                    identity_binding_text(&evidence.identity.fault_schedule),
+                ),
+            ));
+        },
     }
     if evidence.identity.target != IdentityBinding::exact("engineering-workspace")
         || evidence.identity.verifier != verifier_identity(&evidence.source)
@@ -7525,13 +7954,14 @@ mod tests {
         Evidence, ExecutionTools, GateAttemptDefinition, GateAttemptOutcome, GateInvocation,
         GateStatus, IdentityBinding, M0_02_MUTATION_SELECTOR, M0_03_MUTATION_SELECTOR,
         M0_04_MUTATION_SELECTOR, MAXIMUM_ACTIVATION_CHARACTERS, MAXIMUM_ATTEMPT_ID_CHARACTERS,
-        MAXIMUM_CONTROLLED_ARGUMENT_CHARACTERS, MAXIMUM_CONTROLLED_PROGRAM_CHARACTERS,
-        MAXIMUM_EXCEPTION_CLASS_CHARACTERS, MAXIMUM_GATE_ARGUMENT_CHARACTERS,
-        MAXIMUM_GATE_DETAIL_CHARACTERS, MAXIMUM_IDENTITY_VALUE_CHARACTERS,
-        MAXIMUM_RESOLVED_PROGRAM_CHARACTERS, NotApplicableReason, Options, Profile,
-        RawReportBinding, RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
+        MAXIMUM_CAPTURED_REPORT_STREAM_BYTES, MAXIMUM_CONTROLLED_ARGUMENT_CHARACTERS,
+        MAXIMUM_CONTROLLED_PROGRAM_CHARACTERS, MAXIMUM_EXCEPTION_CLASS_CHARACTERS,
+        MAXIMUM_GATE_ARGUMENT_CHARACTERS, MAXIMUM_GATE_DETAIL_CHARACTERS,
+        MAXIMUM_IDENTITY_VALUE_CHARACTERS, MAXIMUM_RESOLVED_PROGRAM_CHARACTERS,
+        NEXTEST_PR_ARGUMENTS, NotApplicableReason, Options, Profile, RawReportBinding,
+        RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
         character_count_in_range, evidence_json, gate_invocation_json, json_string,
-        parse_gate_invocation_value, raw_report_json_with_limit,
+        nextest_completed_test_count, parse_gate_invocation_value, raw_report_json_with_limit,
         registered_dependency_command_matches, run_generation_matrix_gate, sha256_digest,
         unavailable_evidence_identity, valid_hex_identity, valid_raw_report_schema_path,
         valid_sha256_digest, validate_configuration_parser_threat_model_text,
@@ -7991,6 +8421,65 @@ mod tests {
             "cargo-machete",
             &["--with-metadata", "--skip-target-dir", "."]
         ));
+    }
+
+    #[test]
+    fn test_runner_preserves_full_selection_failure_visibility_and_bounded_summary() -> TestResult {
+        assert_eq!(
+            NEXTEST_PR_ARGUMENTS,
+            [
+                "nextest",
+                "run",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--profile",
+                "ci",
+                "--status-level",
+                "fail",
+                "--final-status-level",
+                "fail",
+            ],
+            "the bounded reporter must not alter the full locked PR test selection"
+        );
+        assert!(
+            !NEXTEST_PR_ARGUMENTS
+                .iter()
+                .any(|argument| matches!(*argument, "-E" | "--filterset" | "--skip")),
+            "the bounded reporter must not filter or skip tests"
+        );
+        assert_eq!(
+            MAXIMUM_CAPTURED_REPORT_STREAM_BYTES, 131_072,
+            "the reporter change must not raise the controlled stream ceiling"
+        );
+        assert_eq!(
+            nextest_completed_test_count(
+                "Summary [ 113.160s] 317 tests run: 317 passed, 0 skipped\n"
+            )?,
+            317,
+            "the retained human summary must expose the exact completed-test count"
+        );
+        assert!(
+            nextest_completed_test_count(
+                "Summary [ 1.000s] 317 tests run: 316 passed, 1 skipped\n"
+            )
+            .is_err(),
+            "an ignored or skipped test must fail the summary contract"
+        );
+        assert!(
+            nextest_completed_test_count("317 tests passed without a canonical summary").is_err(),
+            "missing final count evidence must fail closed"
+        );
+        assert!(
+            nextest_completed_test_count(
+                "Summary [ 1.000s] 317 tests run: 317 passed, 0 skipped\n\
+                 Summary [ 1.001s] 317 tests run: 316 passed, 1 skipped\n"
+            )
+            .is_err(),
+            "an early passing summary must not hide a later non-canonical terminal summary"
+        );
+        Ok(())
     }
 
     #[test]

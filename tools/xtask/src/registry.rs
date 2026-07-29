@@ -287,7 +287,7 @@ impl Registry {
         let mut activated = self
             .scopes
             .iter()
-            .filter(|scope| scope.kind == "application" && scope.state == "active")
+            .filter(|scope| scope.state == "active")
             .flat_map(|scope| scope.risk_gates.iter().cloned())
             .collect::<BTreeSet<_>>();
         activated.extend(
