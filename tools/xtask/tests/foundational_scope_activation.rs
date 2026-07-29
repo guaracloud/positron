@@ -597,6 +597,34 @@ fn quality_rejects_an_aliased_thread_spawn_through_the_public_seam() -> TestResu
 }
 
 #[test]
+fn quality_rejects_a_braced_thread_spawn_alias_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::thread::{spawn as launch};\n#[allow(dead_code)] fn braced_spawn_alias() { let _worker = launch(|| {}); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_braced_channel_alias_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::sync::mpsc::{channel as unbounded};\n#[allow(dead_code)] fn braced_channel_alias() { let _queue = unbounded::<()>(); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_multiline_grouped_spawn_alias_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "use std::thread::{\n    spawn as launch,\n};\n#[allow(dead_code)] fn multiline_grouped_alias() { let _worker = launch(|| {}); }\n",
+    )
+}
+
+#[test]
+fn quality_rejects_a_function_pointer_spawn_binding_through_the_public_seam() -> TestResult {
+    assert_imported_concurrency_alias_rejected(
+        "#[allow(dead_code)] fn function_pointer_spawn() { let launch = std::thread::spawn; let _worker = launch(|| {}); }\n",
+    )
+}
+
+#[test]
 fn quality_rejects_a_stale_semantic_spawn_site_through_the_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -910,6 +938,48 @@ fn quality_reconciles_after_worker_error_and_panic_through_the_public_seam() -> 
         let output = fixture.quality_output_from_fixture_source("pr")?;
         assert_rejected_output(&output, "injected worker error")?;
         assert_concurrency_lifecycle_failure(&fixture, "0,1,2")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_records_cancel_delivered_reconciliation_through_the_public_seam() -> TestResult {
+    assert_cancellation_state("", "injected mid-dispatch failure", "cancelled-ids=", "")
+}
+
+#[test]
+fn quality_records_already_queued_reconciliation_through_the_public_seam() -> TestResult {
+    assert_cancellation_state(
+        "        tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;\n",
+        "registered task command queue reached its finite capacity",
+        "already-queued-ids=0",
+        "        tasks.dispatch(0, WorkerCommand::Execute { schedule_slot: 9 })?;\n        tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;\n",
+    )
+}
+
+#[test]
+fn quality_records_disconnected_reconciliation_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            "    let ((), measurements) = RegisteredTasks::execute(scenario, |tasks| {",
+            "    thread::sleep(Duration::from_millis(30));\n    let ((), measurements) = RegisteredTasks::execute(scenario, |tasks| {",
+        )?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            ") -> Result<(), XtaskError> {\n    let command = receiver",
+            ") -> Result<(), XtaskError> {\n    if id == 0 { return Ok(()); }\n    let command = receiver",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "registered task result channel closed before every task reported",
+        )?;
+        assert_lifecycle_state(&fixture, "disconnected-ids=0")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -5306,6 +5376,22 @@ fn enable_concurrency_gate(fixture: &Fixture) -> TestResult {
     )
 }
 
+fn assert_imported_concurrency_alias_rejected(source_append: &str) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(source_append);
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "unregistered imported concurrency primitive alias")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 fn assert_concurrency_lifecycle_failure(fixture: &Fixture, spawned_ids: &str) -> TestResult {
     let evidence = fixture.latest_evidence()?;
     if !gate_record(&evidence, "EG-CONCURRENCY")?.contains("\"result\": \"failed\"") {
@@ -5331,6 +5417,48 @@ fn assert_concurrency_lifecycle_failure(fixture: &Fixture, spawned_ids: &str) ->
         .into());
     }
     Ok(())
+}
+
+fn assert_lifecycle_state(fixture: &Fixture, state: &str) -> TestResult {
+    let evidence = fixture.latest_evidence()?;
+    let report = fs::read_to_string(exact_raw_report_path(
+        &fixture.root,
+        &evidence,
+        "EG-CONCURRENCY",
+    )?)?;
+    if !report.contains(state) || !report.contains("joined-ids=0,1,2;live=0") {
+        return Err(
+            std::io::Error::other(format!("missing truthful lifecycle state `{state}`")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn assert_cancellation_state(
+    original_dispatch: &str,
+    expected_error: &str,
+    state: &str,
+    replacement_dispatch: &str,
+) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        if !original_dispatch.is_empty() {
+            replace_once(&source, original_dispatch, replacement_dispatch)?;
+        }
+        replace_once(
+            &source,
+            "        tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n        tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n        Ok(())",
+            "        Err(XtaskError::invalid(\"test cancellation state\", \"injected mid-dispatch failure\"))",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, expected_error)?;
+        assert_lifecycle_state(&fixture, state)
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
 }
 
 fn assert_rejected_output(output: &std::process::Output, expected_failure: &str) -> TestResult {

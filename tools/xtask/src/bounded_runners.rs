@@ -344,6 +344,13 @@ struct RegisteredTask {
     handle: Option<thread::JoinHandle<Result<(), XtaskError>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancellationState {
+    CancelDelivered,
+    AlreadyQueued,
+    Disconnected,
+}
+
 struct RegisteredTasks {
     tasks: Vec<RegisteredTask>,
     results: Receiver<WorkerMeasurement>,
@@ -496,13 +503,17 @@ impl RegisteredTasks {
             .filter(|task| task.handle.is_some())
             .map(|task| task.id)
             .collect::<Vec<_>>();
-        let mut cancelled_ids = Vec::new();
+        let mut cancellation = Vec::new();
         for task in &mut self.tasks {
             if let Some(sender) = task.sender.as_ref() {
-                let _ = sender.try_send(WorkerCommand::Cancel {
+                let state = match sender.try_send(WorkerCommand::Cancel {
                     schedule_slot: usize::MAX,
-                });
-                cancelled_ids.push(task.id);
+                }) {
+                    Ok(()) => CancellationState::CancelDelivered,
+                    Err(TrySendError::Full(_)) => CancellationState::AlreadyQueued,
+                    Err(TrySendError::Disconnected(_)) => CancellationState::Disconnected,
+                };
+                cancellation.push((task.id, state));
             }
             task.sender = None;
         }
@@ -533,8 +544,22 @@ impl RegisteredTasks {
             reported_ids.push(measurement.id);
         }
         let mut completed_ids = joined_ids.clone();
+        let mut cancelled_ids = cancellation
+            .iter()
+            .filter_map(|(id, state)| (*state == CancellationState::CancelDelivered).then_some(*id))
+            .collect::<Vec<_>>();
+        let mut already_queued_ids = cancellation
+            .iter()
+            .filter_map(|(id, state)| (*state == CancellationState::AlreadyQueued).then_some(*id))
+            .collect::<Vec<_>>();
+        let mut disconnected_ids = cancellation
+            .iter()
+            .filter_map(|(id, state)| (*state == CancellationState::Disconnected).then_some(*id))
+            .collect::<Vec<_>>();
         for ids in [
             &mut cancelled_ids,
+            &mut already_queued_ids,
+            &mut disconnected_ids,
             &mut reported_ids,
             &mut completed_ids,
             &mut joined_ids,
@@ -543,9 +568,11 @@ impl RegisteredTasks {
             ids.dedup();
         }
         let lifecycle = format!(
-            "lifecycle-v1;spawned-ids={};cancelled-ids={};reported-ids={};completed-ids={};joined-ids={};live=0",
+            "lifecycle-v1;spawned-ids={};cancelled-ids={};already-queued-ids={};disconnected-ids={};reported-ids={};completed-ids={};joined-ids={};live=0",
             format_ids(&spawned_ids),
             format_ids(&cancelled_ids),
+            format_ids(&already_queued_ids),
+            format_ids(&disconnected_ids),
             format_ids(&reported_ids),
             format_ids(&completed_ids),
             format_ids(&joined_ids),
@@ -1066,11 +1093,16 @@ fn validate_registered_spawn_sites(
                 "direct unregistered thread spawn in activated tooling source",
             ));
         }
-        for alias in imported_spawn_aliases(&compact_production) {
-            if compact_production.contains(&alias) {
+        for alias in imported_forbidden_alias_invocations(&compact_production) {
+            let generic_alias = alias.strip_suffix('(').map(|name| format!("{name}::<"));
+            if compact_production.contains(&alias)
+                || generic_alias
+                    .as_deref()
+                    .is_some_and(|generic_alias| compact_production.contains(generic_alias))
+            {
                 return Err(XtaskError::invalid_path(
                     &source,
-                    "direct unregistered thread spawn through an imported alias",
+                    "unregistered imported concurrency primitive alias in activated tooling source",
                 ));
             }
         }
@@ -1159,7 +1191,7 @@ fn validate_registered_spawn_sites(
     Ok(())
 }
 
-fn imported_spawn_aliases(compact: &str) -> Vec<String> {
+fn imported_forbidden_alias_invocations(compact: &str) -> Vec<String> {
     let mut aliases = Vec::new();
     for import in compact.split("use").skip(1) {
         let Some(import) = import.split(';').next() else {
@@ -1183,6 +1215,29 @@ fn imported_spawn_aliases(compact: &str) -> Vec<String> {
             if is_identifier(alias) {
                 aliases.push(format!("{alias}("));
             }
+        }
+        for (needle, invocation) in [
+            ("std::thread::{spawnas", "("),
+            ("std::sync::mpsc::{channelas", "("),
+            ("std::sync::mpsc::{sync_channelas", "("),
+        ] {
+            let mut remaining = import;
+            while let Some((_, tail)) = remaining.split_once(needle) {
+                let alias = tail.split([',', '}', ';']).next().unwrap_or_default();
+                if is_identifier(alias) {
+                    aliases.push(format!("{alias}{invocation}"));
+                }
+                remaining = tail;
+            }
+        }
+    }
+    for primitive in ["std::thread::spawn", "std::sync::mpsc::channel"] {
+        let mut remaining = compact;
+        while let Some((before, after)) = remaining.rsplit_once(primitive) {
+            if before.ends_with('=') && after.starts_with(';') {
+                return vec![primitive.to_owned()];
+            }
+            remaining = before;
         }
     }
     aliases
