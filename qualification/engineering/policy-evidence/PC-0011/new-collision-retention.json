@@ -2,11 +2,11 @@
   "schema_version": 1,
   "policy_change": "PC-0011-m0-06-evidence-attempt-integrity",
   "implementation": "new-clean-behavior-commit",
-  "source_revision": "b677e86e8d145619847f20b039836401a2464087",
-  "source_tree": "00f69a21923f410910bd5524cbb9769d6409d114",
+  "source_revision": "c92f6e5115548a6d1b0e4a4ff60f427d2c5625c1",
+  "source_tree": "271093af7c8ad7086793cab6b18b27281bc9e0e2",
   "fixture_sha256": "fe21171c04a5a6b3bf24721d2aebbefd192994f15b2e155ebb6381e517d25b73",
   "schema_sha256": "84d605906a62be0fbaf4cf166f34e9660206ff9a72b56cd90ed38acd2a7bae30",
-  "runner_sha256": "dd347a089f99d5df711c4886a1fe92c34ca1c6eecdee39816cc1e89b68f58545",
+  "runner_sha256": "d9ffdef0d7856a941f0a81638dc7fde2edc7b731ef6395cb68f5d6c2fda5e8b5",
   "parser_sha256": "3406b96639f8c8ed7e7bfcd7f6676404502f027cad942e65dad12878d8ab7972",
   "fixture": "Focused public fixtures exercise raw reports one byte below, exactly at, and one byte above the schema limit; inject primary evidence write, flush, and reconciliation failures; inject first, middle, last, and cleanup failures into report staging; coordinate invocation tampering with independently recomputed valid command digests; preserve occupied report bytes; and exhaust all collision slots.",
   "commands": [
@@ -17,9 +17,10 @@
     "cargo test --locked --package xtask --test foundational_scope_activation quality_rejects_coordinated_invocation_and_stored_digest_tampering -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_a_failed_evidence_reservation_when_a_raw_report_path_is_occupied -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation quality_retains_collision_exhaustion_without_changing_any_occupied_bytes -- --exact",
-    "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact"
+    "cargo test --locked --package xtask --bin xtask quality::tests::retained_invocation_digest_parser_preserves_ordered_repeated_arguments -- --exact",
+    "cargo test --locked --package xtask --bin xtask quality::tests::dependency_runner_matches_each_registered_controlled_step_in_order -- --exact"
   ],
   "verdict": "passed-focused-local-diagnostic",
-  "result": "All 14 focused tests passed at the bound clean behavior commit. Typed parsing honors the independent 2097152-byte evidence and 8388608-byte raw-report budgets with metadata-first rejection. A synchronized recovery verdict exists before report publication and survives primary write, flush, and reconciliation failures while attempt-owned incomplete reports are removed and occupied bytes remain unchanged. Evidence and raw-report invocations are typed, ordered, canonically rehashed, and compared against canonical gate and toolchain registries, so coordinated tampering with valid recomputed digests fails while repeated arguments remain lossless.",
+  "result": "All 15 focused tests passed at the bound behavior revision. Typed parsing honors the independent 2097152-byte evidence and 8388608-byte raw-report budgets with metadata-first rejection. A synchronized recovery verdict exists before report publication and survives primary write, flush, and reconciliation failures while attempt-owned incomplete reports are removed and occupied bytes remain unchanged. Evidence and raw-report invocations are typed, ordered, canonically rehashed, and compared against canonical gate and toolchain registries, so coordinated tampering with valid recomputed digests fails while repeated arguments and the exact three-step dependency command sequence remain lossless.",
   "qualification_claim": "none"
 }
