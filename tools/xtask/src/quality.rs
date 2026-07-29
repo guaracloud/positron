@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +15,7 @@ use crate::controlled_execution::{
 use crate::error::XtaskError;
 use crate::evidence_json as bounded_json;
 use crate::hooks;
+use crate::qualification_fixtures::{DirectoryCapability, FileCapability};
 use crate::registry::{self, Gate, Registry};
 
 const CANONICAL_GATE_IDS: [&str; 25] = [
@@ -2435,7 +2436,7 @@ fn run_dependency_metadata_capture(
     timeout: Duration,
     capture: &mut GateCapture,
 ) -> Result<CommandOutcome, XtaskError> {
-    let artifact_path = prepare_dependency_metadata_artifact_path(root, attempt_id)?;
+    let artifact = prepare_dependency_metadata_artifact(root, attempt_id)?;
     let argument_values = ["metadata", "--locked", "--format-version", "1"];
     let arguments = argument_values.map(OsString::from).to_vec();
     let resolved_program = snapshot.tool_path("cargo")?;
@@ -2459,7 +2460,7 @@ fn run_dependency_metadata_capture(
         tools: snapshot.execution_tools(),
         input,
         output: OutputMode::CaptureWithStdoutArtifact {
-            artifact_path: artifact_path.clone(),
+            artifact: artifact.artifact_output()?,
             maximum_artifact_bytes: MAXIMUM_RAW_REPORT_BYTES,
             maximum_stderr_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
         },
@@ -2492,7 +2493,7 @@ fn run_dependency_metadata_capture(
             ),
         ));
     }
-    let summary = validate_dependency_metadata_artifact(root, &artifact_path)?;
+    let summary = validate_dependency_metadata_artifact(root, &artifact)?;
     capture.record(
         invocation,
         &format!("exit-status:{}", verdict.status),
@@ -2514,65 +2515,99 @@ fn bounded_stream_summary(stream: &str) -> String {
         .collect()
 }
 
-fn prepare_dependency_metadata_artifact_path(
-    root: &Path,
-    attempt_id: &str,
-) -> Result<PathBuf, XtaskError> {
-    let directory = root.join("target/quality/dependency-metadata");
-    fs::create_dir_all(&directory)
-        .map_err(|source| XtaskError::io(format!("create {}", directory.display()), source))?;
-    sync_directory(&directory)?;
-    Ok(directory.join(format!("{attempt_id}.json")))
+struct DependencyMetadataArtifact {
+    root: DirectoryCapability,
+    target: DirectoryCapability,
+    quality: DirectoryCapability,
+    metadata: DirectoryCapability,
+    attempt: DirectoryCapability,
+    file: FileCapability,
+    attempt_id: String,
 }
 
-fn validate_dependency_metadata_artifact(root: &Path, path: &Path) -> Result<String, XtaskError> {
-    let mut file = fs::File::open(path)
-        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| XtaskError::io(format!("inspect {}", path.display()), source))?;
-    let expected_bytes = usize::try_from(metadata.len()).map_err(|_| {
-        XtaskError::invalid(
+impl DependencyMetadataArtifact {
+    fn diagnostic_path(&self) -> &Path {
+        self.file.diagnostic_path()
+    }
+
+    fn artifact_output(&self) -> Result<crate::controlled_execution::ArtifactOutput, XtaskError> {
+        self.file.artifact_output()
+    }
+
+    fn require_canonical_names(&self) -> Result<(), XtaskError> {
+        self.root.require_child_directory_identity(
+            "target",
+            self.target.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.target.require_child_directory_identity(
+            "quality",
+            self.quality.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.quality.require_child_directory_identity(
+            "dependency-metadata",
+            self.metadata.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.metadata.require_child_directory_identity(
+            &self.attempt_id,
+            self.attempt.identity()?,
+            "dependency metadata directory",
+        )?;
+        self.attempt.require_child_file_identity(
+            "metadata.json",
+            self.file.identity(),
             "dependency metadata artifact",
-            "cargo metadata length does not fit the host address space",
         )
-    })?;
+    }
+}
+
+fn prepare_dependency_metadata_artifact(
+    root: &Path,
+    attempt_id: &str,
+) -> Result<DependencyMetadataArtifact, XtaskError> {
+    let root = DirectoryCapability::open(root, "dependency metadata workspace root")?;
+    let target = root.open_or_create_child_directory("target", "dependency metadata target")?;
+    let quality =
+        target.open_or_create_child_directory("quality", "dependency metadata quality")?;
+    let metadata = quality
+        .open_or_create_child_directory("dependency-metadata", "dependency metadata parent")?;
+    let attempt =
+        metadata.create_child_directory(attempt_id, "attempt-owned dependency metadata")?;
+    let file =
+        attempt.create_file_capability("metadata.json", "attempt-owned dependency metadata")?;
+    attempt.sync()?;
+    Ok(DependencyMetadataArtifact {
+        root,
+        target,
+        quality,
+        metadata,
+        attempt,
+        file,
+        attempt_id: attempt_id.to_owned(),
+    })
+}
+
+fn validate_dependency_metadata_artifact(
+    root: &Path,
+    artifact: &DependencyMetadataArtifact,
+) -> Result<String, XtaskError> {
+    artifact.require_canonical_names()?;
+    let path = artifact.diagnostic_path();
+    let bytes = artifact
+        .file
+        .read_bounded(MAXIMUM_RAW_REPORT_BYTES, "dependency metadata artifact")?;
+    let expected_bytes = bytes.len();
     if expected_bytes == 0 || expected_bytes > MAXIMUM_RAW_REPORT_BYTES {
         return Err(XtaskError::invalid(
             "dependency metadata artifact",
             format!("cargo metadata output must contain 1..={MAXIMUM_RAW_REPORT_BYTES} bytes"),
         ));
     }
-    let mut bytes = Vec::with_capacity(expected_bytes);
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 8_192];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-        if read == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(read) > MAXIMUM_RAW_REPORT_BYTES {
-            return Err(XtaskError::invalid(
-                "dependency metadata artifact",
-                format!("cargo metadata output exceeds {MAXIMUM_RAW_REPORT_BYTES} bytes"),
-            ));
-        }
-        let chunk = buffer.get(..read).ok_or_else(|| {
-            XtaskError::invalid(
-                "dependency metadata artifact",
-                "cargo metadata read exceeded the fixed buffer",
-            )
-        })?;
+    for chunk in bytes.chunks(8_192) {
         digest.update(chunk);
-        bytes.extend_from_slice(chunk);
-    }
-    if bytes.len() != expected_bytes {
-        return Err(XtaskError::invalid(
-            "dependency metadata artifact",
-            "cargo metadata length changed while it was being validated",
-        ));
     }
     let content = std::str::from_utf8(&bytes).map_err(|_| {
         XtaskError::invalid(
@@ -2607,16 +2642,15 @@ fn validate_dependency_metadata_artifact(root: &Path, path: &Path) -> Result<Str
             ));
         }
     }
-    let parent = path.parent().ok_or_else(|| {
-        XtaskError::invalid_path(path, "metadata artifact has no parent directory")
-    })?;
-    sync_directory(parent)?;
+    artifact.require_canonical_names()?;
+    artifact.attempt.sync()?;
     let digest = format!("sha256:{:x}", digest.finalize());
     Ok(format!(
-        "metadata-artifact={}; bytes={}; digest={digest}; packages+workspace+resolve=validated",
+        "metadata-artifact={}; identity={}; bytes={}; digest={digest}; packages+workspace+resolve=validated",
         path.strip_prefix(root)
             .map_err(|_| XtaskError::invalid_path(path, "metadata artifact escaped workspace"))?
             .display(),
+        artifact.file.identity().token(),
         expected_bytes,
     ))
 }

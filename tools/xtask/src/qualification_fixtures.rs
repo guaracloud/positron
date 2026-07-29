@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -167,6 +168,94 @@ impl CrashSchedule {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QualityFixtureAdapter {
+    CandidatePersistence,
+    PublicationPersistence,
+    PartialWrite,
+    ProcessCrash,
+    Restart,
+    Corruption,
+    BoundedStorage,
+    ControlledClock,
+    Cancellation,
+    NetworkPublication,
+    ProviderPublication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdapterObservation {
+    adapter: &'static str,
+    injection: &'static str,
+}
+
+impl QualityFixtureAdapter {
+    fn for_schedule(schedule: CrashSchedule) -> Self {
+        match schedule {
+            CrashSchedule::AfterCandidateSync => Self::CandidatePersistence,
+            CrashSchedule::AfterPublicationSync => Self::PublicationPersistence,
+            CrashSchedule::PartialWrite => Self::PartialWrite,
+            CrashSchedule::Crash => Self::ProcessCrash,
+            CrashSchedule::Restart => Self::Restart,
+            CrashSchedule::Corruption => Self::Corruption,
+            CrashSchedule::FullDisk => Self::BoundedStorage,
+            CrashSchedule::Clock => Self::ControlledClock,
+            CrashSchedule::Cancellation => Self::Cancellation,
+            CrashSchedule::Network => Self::NetworkPublication,
+            CrashSchedule::Provider => Self::ProviderPublication,
+        }
+    }
+
+    fn expected_observation(self) -> AdapterObservation {
+        match self {
+            Self::CandidatePersistence => AdapterObservation {
+                adapter: "candidate-persistence-adapter",
+                injection: "candidate-synced",
+            },
+            Self::PublicationPersistence => AdapterObservation {
+                adapter: "publication-persistence-adapter",
+                injection: "successor-published",
+            },
+            Self::PartialWrite => AdapterObservation {
+                adapter: "partial-write-adapter",
+                injection: "partial-write-injected",
+            },
+            Self::ProcessCrash => AdapterObservation {
+                adapter: "process-crash-adapter",
+                injection: "crash-window-open",
+            },
+            Self::Restart => AdapterObservation {
+                adapter: "restart-adapter",
+                injection: "successor-published",
+            },
+            Self::Corruption => AdapterObservation {
+                adapter: "corruption-adapter",
+                injection: "candidate-corrupted",
+            },
+            Self::BoundedStorage => AdapterObservation {
+                adapter: "bounded-storage-adapter",
+                injection: "capacity-exhausted",
+            },
+            Self::ControlledClock => AdapterObservation {
+                adapter: "controlled-clock-adapter",
+                injection: "clock-regressed",
+            },
+            Self::Cancellation => AdapterObservation {
+                adapter: "cancellation-adapter",
+                injection: "cancelled-before-publication",
+            },
+            Self::NetworkPublication => AdapterObservation {
+                adapter: "network-publication-adapter",
+                injection: "network-unavailable",
+            },
+            Self::ProviderPublication => AdapterObservation {
+                adapter: "provider-publication-adapter",
+                injection: "provider-unavailable",
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FixtureCase {
     fixture_id: String,
@@ -275,13 +364,28 @@ struct OwnedFixtureRoot {
 }
 
 #[derive(Debug)]
-struct DirectoryCapability {
+pub(crate) struct DirectoryCapability {
     file: fs::File,
     diagnostic_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DirectoryIdentity {
+pub(crate) struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct FileCapability {
+    file: fs::File,
+    parent: fs::File,
+    name: String,
+    diagnostic_path: PathBuf,
+    identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
 }
@@ -332,7 +436,7 @@ impl DirectoryIdentity {
         }
     }
 
-    fn token(self) -> String {
+    pub(crate) fn token(self) -> String {
         format!("{}-{}", self.device, self.inode)
     }
 
@@ -354,7 +458,7 @@ impl DirectoryIdentity {
 }
 
 impl DirectoryCapability {
-    fn open(path: &Path, label: &str) -> Result<Self, XtaskError> {
+    pub(crate) fn open(path: &Path, label: &str) -> Result<Self, XtaskError> {
         let file = rustix::fs::openat(
             rustix::fs::CWD,
             path,
@@ -385,7 +489,7 @@ impl DirectoryCapability {
         Ok(capability)
     }
 
-    fn open_child_directory(&self, name: &str, label: &str) -> Result<Self, XtaskError> {
+    pub(crate) fn open_child_directory(&self, name: &str, label: &str) -> Result<Self, XtaskError> {
         validate_leaf_name(&self.diagnostic_path, name)?;
         let diagnostic_path = self.diagnostic_path.join(name);
         let file = rustix::fs::openat(
@@ -407,7 +511,11 @@ impl DirectoryCapability {
         })
     }
 
-    fn create_child_directory(&self, name: &str, label: &str) -> Result<Self, XtaskError> {
+    pub(crate) fn create_child_directory(
+        &self,
+        name: &str,
+        label: &str,
+    ) -> Result<Self, XtaskError> {
         validate_leaf_name(&self.diagnostic_path, name)?;
         let path = self.diagnostic_path.join(name);
         rustix::fs::mkdirat(&self.file, name, Mode::RWXU).map_err(|source| {
@@ -418,6 +526,17 @@ impl DirectoryCapability {
         })?;
         self.sync()?;
         self.open_child_directory(name, label)
+    }
+
+    pub(crate) fn open_or_create_child_directory(
+        &self,
+        name: &str,
+        label: &str,
+    ) -> Result<Self, XtaskError> {
+        match self.create_child_directory(name, label) {
+            Ok(directory) => Ok(directory),
+            Err(_) => self.open_child_directory(name, label),
+        }
     }
 
     fn entry_names(&self, label: &str) -> Result<Vec<String>, XtaskError> {
@@ -451,7 +570,7 @@ impl DirectoryCapability {
         Ok(names)
     }
 
-    fn identity(&self) -> Result<DirectoryIdentity, XtaskError> {
+    pub(crate) fn identity(&self) -> Result<DirectoryIdentity, XtaskError> {
         self.file
             .metadata()
             .map(|metadata| DirectoryIdentity::from_metadata(&metadata))
@@ -476,7 +595,7 @@ impl DirectoryCapability {
         Ok(())
     }
 
-    fn sync(&self) -> Result<(), XtaskError> {
+    pub(crate) fn sync(&self) -> Result<(), XtaskError> {
         self.file.sync_all().map_err(|source| {
             XtaskError::io(
                 format!(
@@ -576,6 +695,109 @@ impl DirectoryCapability {
             .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
     }
 
+    pub(crate) fn create_file_capability(
+        &self,
+        name: &str,
+        label: &str,
+    ) -> Result<FileCapability, XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let diagnostic_path = self.diagnostic_path.join(name);
+        let file = rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(fs::File::from)
+        .map_err(|source| {
+            XtaskError::io(
+                format!("create {label} {}", diagnostic_path.display()),
+                rustix_io(source),
+            )
+        })?;
+        let metadata = file.metadata().map_err(|source| {
+            XtaskError::io(
+                format!("inspect created {label} {}", diagnostic_path.display()),
+                source,
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(XtaskError::invalid_path(
+                &diagnostic_path,
+                format!("{label} is not a regular file"),
+            ));
+        }
+        Ok(FileCapability {
+            file,
+            parent: self.file.try_clone().map_err(|source| {
+                XtaskError::io(
+                    format!(
+                        "duplicate parent capability for {label} {}",
+                        diagnostic_path.display()
+                    ),
+                    source,
+                )
+            })?,
+            name: name.to_owned(),
+            diagnostic_path,
+            identity: FileIdentity::from_metadata(&metadata),
+        })
+    }
+
+    pub(crate) fn require_child_directory_identity(
+        &self,
+        name: &str,
+        expected: DirectoryIdentity,
+        label: &str,
+    ) -> Result<(), XtaskError> {
+        let child = self.open_child_directory(name, label).map_err(|_| {
+            XtaskError::invalid_path(
+                &self.diagnostic_path.join(name),
+                format!("{label} canonical name was replaced"),
+            )
+        })?;
+        if child.identity()? != expected {
+            return Err(XtaskError::invalid_path(
+                &self.diagnostic_path.join(name),
+                format!("{label} canonical name was replaced"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_child_file_identity(
+        &self,
+        name: &str,
+        expected: FileIdentity,
+        label: &str,
+    ) -> Result<(), XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        let file = rustix::fs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(|_| {
+            XtaskError::invalid_path(&path, format!("{label} canonical name was replaced"))
+        })?;
+        let metadata = file.metadata().map_err(|source| {
+            XtaskError::io(
+                format!("inspect canonical {label} {}", path.display()),
+                source,
+            )
+        })?;
+        if FileIdentity::from_metadata(&metadata) != expected {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("{label} canonical name was replaced"),
+            ));
+        }
+        Ok(())
+    }
+
     fn replace_file(
         &self,
         name: &str,
@@ -640,6 +862,83 @@ impl DirectoryCapability {
                 rustix_io(source),
             )
         })
+    }
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    pub(crate) fn token(self) -> String {
+        format!("{}-{}", self.device, self.inode)
+    }
+}
+
+impl FileCapability {
+    pub(crate) fn artifact_output(
+        &self,
+    ) -> Result<crate::controlled_execution::ArtifactOutput, XtaskError> {
+        let file = self.file.try_clone().map_err(|source| {
+            XtaskError::io(
+                format!(
+                    "duplicate artifact capability {}",
+                    self.diagnostic_path.display()
+                ),
+                source,
+            )
+        })?;
+        let parent = self.parent.try_clone().map_err(|source| {
+            XtaskError::io(
+                format!(
+                    "duplicate artifact parent capability {}",
+                    self.diagnostic_path.display()
+                ),
+                source,
+            )
+        })?;
+        Ok(crate::controlled_execution::ArtifactOutput::new(
+            file,
+            parent,
+            self.name.clone(),
+            self.diagnostic_path.clone(),
+            self.identity.device,
+            self.identity.inode,
+        ))
+    }
+
+    pub(crate) fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    pub(crate) fn diagnostic_path(&self) -> &Path {
+        &self.diagnostic_path
+    }
+
+    pub(crate) fn read_bounded(
+        &self,
+        maximum_bytes: usize,
+        label: &str,
+    ) -> Result<Vec<u8>, XtaskError> {
+        let mut file = self.file.try_clone().map_err(|source| {
+            XtaskError::io(
+                format!(
+                    "duplicate artifact capability {}",
+                    self.diagnostic_path.display()
+                ),
+                source,
+            )
+        })?;
+        file.seek(SeekFrom::Start(0)).map_err(|source| {
+            XtaskError::io(
+                format!("seek {label} {}", self.diagnostic_path.display()),
+                source,
+            )
+        })?;
+        read_bounded_opened_file(file, &self.diagnostic_path, maximum_bytes, label)
     }
 }
 
@@ -998,7 +1297,7 @@ impl HarnessInterface {
             "force-kill-and-reap",
             "recovery-v1",
             "owned-root-case-root-owned-id-case-id-publication-point-fault-schedule-predecessor-successor",
-            "owned-root-case-root-owned-id-case-id-result-name-recovery-protocol",
+            "owned-root-case-root-directory-ids-result-name-recovery-protocol-schedule-oracle",
         ) {
             return Err(XtaskError::invalid_path(
                 path,
@@ -1564,6 +1863,7 @@ fn execute_state_transition(
             case.predecessor.as_str(),
             case.successor.as_str(),
         ])
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1577,7 +1877,11 @@ fn execute_state_transition(
         case.publication_point,
         writer_pid,
     ) {
-        return match force_terminate_and_reap(&mut writer, "fixture writer process") {
+        return match force_terminate_and_reap(
+            &mut writer,
+            "fixture writer process",
+            harness.maximum_wait,
+        ) {
             Ok(_) => Err(error),
             Err(reconciliation) => Err(XtaskError::invalid(
                 "fixture writer process",
@@ -1585,7 +1889,8 @@ fn execute_state_transition(
             )),
         };
     }
-    let writer_reconciliation = force_terminate_and_reap(&mut writer, "fixture writer process")?;
+    let writer_reconciliation =
+        force_terminate_and_reap(&mut writer, "fixture writer process", harness.maximum_wait)?;
     if !writer_reconciliation.kill_sent || writer_reconciliation.status.success() {
         return Err(XtaskError::invalid(
             format!("fixture writer `{}`", case.fixture_id),
@@ -1614,7 +1919,10 @@ fn execute_state_transition(
             case_identity.as_str(),
             "recovery.result",
             harness.recovery_protocol.as_str(),
+            case.fault_schedule.as_str(),
+            case.expected_reopen.as_str(),
         ])
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1626,7 +1934,11 @@ fn execute_state_transition(
         harness.maximum_wait,
         "fixture recovery process",
     ) {
-        return match force_terminate_and_reap(&mut recovery, "fixture recovery process") {
+        return match force_terminate_and_reap(
+            &mut recovery,
+            "fixture recovery process",
+            harness.maximum_wait,
+        ) {
             Ok(_) => Err(error),
             Err(reconciliation) => Err(XtaskError::invalid(
                 "fixture recovery process",
@@ -1640,7 +1952,7 @@ fn execute_state_transition(
             "fresh recovery process reused the writer process identity",
         ));
     }
-    let (reopened, recovery_digest) =
+    let (reopened, recovery_digest, observation) =
         read_recovery_result(&case_root, "recovery.result", harness, recovery_pid)?;
     let predecessor_or_successor = reopened == case.predecessor || reopened == case.successor;
     if !predecessor_or_successor || reopened != case.expected_reopen {
@@ -1653,10 +1965,12 @@ fn execute_state_transition(
         ));
     }
     Ok(format!(
-        "{}:{}:{}:seed={}:ack={}:writer=forcibly-terminated-and-reaped:writer-pid={writer_pid}:recovery-pid={recovery_pid}:recovery=fresh-process:recovery-digest={recovery_digest}",
+        "{}:{}:{}:adapter={}:injection={}:seed={}:ack={}:writer=forcibly-terminated-and-reaped:writer-pid={writer_pid}:recovery-pid={recovery_pid}:recovery=fresh-process:recovery-digest={recovery_digest}",
         case.fixture_id,
         case.fault_schedule.as_str(),
         reopened,
+        observation.adapter,
+        observation.injection,
         case.seed,
         harness.ready_protocol,
     ))
@@ -1815,7 +2129,20 @@ fn wait_for_successful_child(
 fn force_terminate_and_reap(
     child: &mut std::process::Child,
     label: &str,
+    maximum_wait: Duration,
 ) -> Result<ChildReconciliation, XtaskError> {
+    let raw_pid = i32::try_from(child.id()).map_err(|_| {
+        XtaskError::invalid(
+            format!("{label} termination"),
+            "child PID does not fit the registered process-group identity",
+        )
+    })?;
+    let process_group = rustix::process::Pid::from_raw(raw_pid).ok_or_else(|| {
+        XtaskError::invalid(
+            format!("{label} termination"),
+            "child PID is not a nonzero process-group identity",
+        )
+    })?;
     if let Some(status) = child
         .try_wait()
         .map_err(|source| XtaskError::io(format!("observe {label} before termination"), source))?
@@ -1825,20 +2152,56 @@ fn force_terminate_and_reap(
             kill_sent: false,
         });
     }
-    let kill = child.kill();
-    let status = child
-        .wait()
-        .map_err(|source| XtaskError::io(format!("reap {label}"), source))?;
+    let kill = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
     if let Err(source) = kill {
         return Err(XtaskError::invalid(
             format!("{label} termination"),
-            format!("kill failed with `{source}`; child was still reaped with {status}"),
+            format!(
+                "process-group kill failed with `{source}`; pid={}; kill-sent=false",
+                child.id()
+            ),
         ));
     }
-    Ok(ChildReconciliation {
-        status,
-        kill_sent: true,
-    })
+    let deadline = Instant::now().checked_add(maximum_wait).ok_or_else(|| {
+        XtaskError::invalid(
+            format!("{label} reap"),
+            "registered reap deadline cannot be represented",
+        )
+    })?;
+    let mut terminal_status = None;
+    loop {
+        if terminal_status.is_none() {
+            terminal_status = observe_child_reap(child, label)?;
+        }
+        if let Some(status) = terminal_status {
+            return Ok(ChildReconciliation {
+                status,
+                kill_sent: true,
+            });
+        }
+        if Instant::now() >= deadline {
+            let status = terminal_status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "not-reaped".to_owned());
+            return Err(XtaskError::invalid(
+                format!("{label} reap"),
+                format!(
+                    "{label} reap deadline elapsed; pid={}; kill-sent=true; process-group-kill-sent=true; direct-status={status}",
+                    child.id()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn observe_child_reap(
+    child: &mut std::process::Child,
+    label: &str,
+) -> Result<Option<std::process::ExitStatus>, XtaskError> {
+    child
+        .try_wait()
+        .map_err(|source| XtaskError::io(format!("observe {label} reap"), source))
 }
 
 fn read_recovery_result(
@@ -1846,16 +2209,16 @@ fn read_recovery_result(
     name: &str,
     harness: &HarnessInterface,
     expected_pid: u32,
-) -> Result<(String, String), XtaskError> {
+) -> Result<(String, String, AdapterObservation), XtaskError> {
     let path = case_root.diagnostic_path.join(name);
     let bytes = case_root.read_bounded(name, MAXIMUM_PROCESS_RECORD_BYTES, "recovery result")?;
     let content = std::str::from_utf8(&bytes)
         .map_err(|_| XtaskError::invalid_path(&path, "recovery result is not UTF-8"))?;
     let fields = content.trim_end().split('\t').collect::<Vec<_>>();
-    let [protocol, pid, state, digest] = fields.as_slice() else {
+    let [protocol, pid, state, digest, adapter, injection] = fields.as_slice() else {
         return Err(XtaskError::invalid_path(
             &path,
-            "recovery result does not contain exactly four fields",
+            "recovery result does not contain exactly six fields",
         ));
     };
     if *protocol != harness.recovery_protocol {
@@ -1880,7 +2243,30 @@ fn read_recovery_result(
             "recovery result digest does not bind the observed durable state",
         ));
     }
-    Ok(((*state).to_owned(), (*digest).to_owned()))
+    let observation = [
+        CrashSchedule::AfterCandidateSync,
+        CrashSchedule::AfterPublicationSync,
+        CrashSchedule::PartialWrite,
+        CrashSchedule::Crash,
+        CrashSchedule::Restart,
+        CrashSchedule::Corruption,
+        CrashSchedule::FullDisk,
+        CrashSchedule::Clock,
+        CrashSchedule::Cancellation,
+        CrashSchedule::Network,
+        CrashSchedule::Provider,
+    ]
+    .into_iter()
+    .map(QualityFixtureAdapter::for_schedule)
+    .map(QualityFixtureAdapter::expected_observation)
+    .find(|observation| observation.adapter == *adapter && observation.injection == *injection)
+    .ok_or_else(|| {
+        XtaskError::invalid_path(
+            &path,
+            "recovery result does not name a registered adapter observation",
+        )
+    })?;
+    Ok(((*state).to_owned(), (*digest).to_owned(), observation))
 }
 
 pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(), XtaskError> {
@@ -1923,6 +2309,8 @@ pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(),
             case_identity,
             result_name,
             recovery_protocol,
+            fault_schedule,
+            expected_reopen,
         ] if operation == "recover" => run_recovery_process(
             &ProcessRootClaim {
                 owned_root: Path::new(owned_root),
@@ -1932,6 +2320,8 @@ pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(),
             },
             result_name,
             recovery_protocol,
+            CrashSchedule::parse(fault_schedule)?,
+            expected_reopen,
         ),
         _ => Err(XtaskError::usage(
             "quality-fixture requires an exact registered writer or recover invocation",
@@ -1953,30 +2343,8 @@ fn run_writer_process(
     let candidate = "candidate.state";
     write_state(&case_root, published, predecessor)?;
     case_root.sync()?;
-    match fault_schedule {
-        CrashSchedule::PartialWrite => {
-            write_fault_bytes(&case_root, candidate, b"partial-state")?;
-        },
-        CrashSchedule::FullDisk
-        | CrashSchedule::Clock
-        | CrashSchedule::Network
-        | CrashSchedule::Provider => {
-            let marker = format!("{}.fault", fault_schedule.as_str());
-            write_fault_bytes(&case_root, &marker, fault_schedule.as_str().as_bytes())?;
-        },
-        CrashSchedule::AfterCandidateSync | CrashSchedule::Crash | CrashSchedule::Cancellation => {
-            write_state(&case_root, candidate, successor)?;
-        },
-        CrashSchedule::Corruption => {
-            write_state(&case_root, candidate, successor)?;
-            corrupt_state_file(&case_root, candidate)?;
-        },
-        CrashSchedule::AfterPublicationSync | CrashSchedule::Restart => {
-            write_state(&case_root, candidate, successor)?;
-            case_root.rename(candidate, published)?;
-            case_root.sync()?;
-        },
-    }
+    let adapter = QualityFixtureAdapter::for_schedule(fault_schedule);
+    execute_fixture_adapter(&case_root, adapter, candidate, published, successor)?;
     let content = format!(
         "publication-point-ready-v1\t{}\t{}\n",
         std::process::id(),
@@ -1993,10 +2361,103 @@ fn run_writer_process(
     ))
 }
 
+fn execute_fixture_adapter(
+    case_root: &DirectoryCapability,
+    adapter: QualityFixtureAdapter,
+    candidate: &str,
+    published: &str,
+    successor: &str,
+) -> Result<AdapterObservation, XtaskError> {
+    match adapter {
+        QualityFixtureAdapter::CandidatePersistence => {
+            write_state(case_root, candidate, successor)?;
+        },
+        QualityFixtureAdapter::PublicationPersistence | QualityFixtureAdapter::Restart => {
+            write_state(case_root, candidate, successor)?;
+            case_root.rename(candidate, published)?;
+            case_root.sync()?;
+        },
+        QualityFixtureAdapter::PartialWrite => {
+            write_fault_bytes(case_root, candidate, b"partial-state")?;
+        },
+        QualityFixtureAdapter::ProcessCrash => {
+            write_state(case_root, candidate, successor)?;
+        },
+        QualityFixtureAdapter::Corruption => {
+            write_state(case_root, candidate, successor)?;
+            corrupt_state_file(case_root, candidate)?;
+        },
+        QualityFixtureAdapter::BoundedStorage => {
+            let attempted = encoded_state(successor)?;
+            let remaining_bytes = 0_usize;
+            if attempted.len() <= remaining_bytes {
+                return Err(XtaskError::invalid(
+                    "bounded storage fixture adapter",
+                    "full-disk injection did not exhaust the candidate persistence budget",
+                ));
+            }
+        },
+        QualityFixtureAdapter::ControlledClock => {
+            let last_observed_tick = 2_u64;
+            let publication_tick = 1_u64;
+            if publication_tick >= last_observed_tick {
+                return Err(XtaskError::invalid(
+                    "controlled clock fixture adapter",
+                    "clock injection did not regress before publication",
+                ));
+            }
+        },
+        QualityFixtureAdapter::Cancellation => {
+            let cancellation_requested = true;
+            if !cancellation_requested {
+                return Err(XtaskError::invalid(
+                    "cancellation fixture adapter",
+                    "cancellation injection was not observed before publication",
+                ));
+            }
+        },
+        QualityFixtureAdapter::NetworkPublication => {
+            let network_available = false;
+            if network_available {
+                return Err(XtaskError::invalid(
+                    "network publication fixture adapter",
+                    "network injection remained available",
+                ));
+            }
+        },
+        QualityFixtureAdapter::ProviderPublication => {
+            let provider_available = false;
+            if provider_available {
+                return Err(XtaskError::invalid(
+                    "provider publication fixture adapter",
+                    "provider injection remained available",
+                ));
+            }
+        },
+    }
+    let observation = adapter.expected_observation();
+    write_adapter_observation(case_root, observation)?;
+    Ok(observation)
+}
+
+fn write_adapter_observation(
+    case_root: &DirectoryCapability,
+    observation: AdapterObservation,
+) -> Result<(), XtaskError> {
+    let content = format!(
+        "fixture-adapter-v1\t{}\t{}\n",
+        observation.adapter, observation.injection
+    );
+    write_process_record(case_root, "adapter.observation", content.as_bytes())?;
+    case_root.sync()
+}
+
 fn run_recovery_process(
     claim: &ProcessRootClaim<'_>,
     result_name: &str,
     recovery_protocol: &str,
+    fault_schedule: CrashSchedule,
+    expected_reopen: &str,
 ) -> Result<(), XtaskError> {
     let case_root = claim_process_root(claim)?;
     if recovery_protocol != "recovery-v1" {
@@ -2007,13 +2468,146 @@ fn run_recovery_process(
     }
     validate_leaf_name(&case_root.diagnostic_path, result_name)?;
     let state = read_state(&case_root, "published.state")?;
+    let observation =
+        validate_recovered_adapter_effect(&case_root, fault_schedule, expected_reopen, &state)?;
     let digest = recovered_state_digest(&state);
     let content = format!(
-        "{recovery_protocol}\t{}\t{state}\t{digest}\n",
-        std::process::id()
+        "{recovery_protocol}\t{}\t{state}\t{digest}\t{}\t{}\n",
+        std::process::id(),
+        observation.adapter,
+        observation.injection,
     );
     write_process_record(&case_root, result_name, content.as_bytes())?;
     case_root.sync()
+}
+
+fn validate_recovered_adapter_effect(
+    case_root: &DirectoryCapability,
+    fault_schedule: CrashSchedule,
+    expected_reopen: &str,
+    reopened: &str,
+) -> Result<AdapterObservation, XtaskError> {
+    validate_field(
+        &case_root.diagnostic_path,
+        0,
+        "expected_reopen",
+        expected_reopen,
+    )?;
+    if reopened != expected_reopen {
+        return Err(XtaskError::invalid(
+            "fixture recovery adapter oracle",
+            format!(
+                "reopened durable state `{reopened}` does not match registered oracle `{expected_reopen}`"
+            ),
+        ));
+    }
+    let adapter = QualityFixtureAdapter::for_schedule(fault_schedule);
+    let expected = adapter.expected_observation();
+    let observed = read_adapter_observation(case_root)?;
+    if observed != expected {
+        return Err(XtaskError::invalid(
+            "fixture recovery adapter oracle",
+            format!(
+                "adapter observation `{}/{}` does not match registered `{}/{}`",
+                observed.adapter, observed.injection, expected.adapter, expected.injection
+            ),
+        ));
+    }
+
+    let candidate_bytes = case_root.read_bounded_optional(
+        "candidate.state",
+        MAXIMUM_STATE_BYTES,
+        "fixture candidate state",
+    )?;
+    let candidate_state = if candidate_bytes.is_some() {
+        read_state(case_root, "candidate.state").ok()
+    } else {
+        None
+    };
+    let actual_effect_matches = match adapter {
+        QualityFixtureAdapter::CandidatePersistence | QualityFixtureAdapter::ProcessCrash => {
+            candidate_state
+                .as_deref()
+                .is_some_and(|candidate| candidate != reopened)
+        },
+        QualityFixtureAdapter::PublicationPersistence | QualityFixtureAdapter::Restart => {
+            candidate_bytes.is_none()
+        },
+        QualityFixtureAdapter::PartialWrite | QualityFixtureAdapter::Corruption => {
+            candidate_bytes.is_some() && candidate_state.is_none()
+        },
+        QualityFixtureAdapter::BoundedStorage
+        | QualityFixtureAdapter::ControlledClock
+        | QualityFixtureAdapter::Cancellation
+        | QualityFixtureAdapter::NetworkPublication
+        | QualityFixtureAdapter::ProviderPublication => candidate_bytes.is_none(),
+    };
+    if !actual_effect_matches {
+        return Err(XtaskError::invalid(
+            "fixture recovery adapter oracle",
+            format!(
+                "actual durable candidate state does not match adapter `{}`",
+                expected.adapter
+            ),
+        ));
+    }
+    Ok(expected)
+}
+
+fn read_adapter_observation(
+    case_root: &DirectoryCapability,
+) -> Result<AdapterObservation, XtaskError> {
+    let path = case_root.diagnostic_path.join("adapter.observation");
+    let bytes = case_root.read_bounded(
+        "adapter.observation",
+        MAXIMUM_PROCESS_RECORD_BYTES,
+        "fixture adapter observation",
+    )?;
+    let content = std::str::from_utf8(&bytes)
+        .map_err(|_| XtaskError::invalid_path(&path, "fixture adapter observation is not UTF-8"))?;
+    let fields = content.trim_end().split('\t').collect::<Vec<_>>();
+    let [protocol, adapter, injection] = fields.as_slice() else {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "fixture adapter observation does not contain exactly three fields",
+        ));
+    };
+    if *protocol != "fixture-adapter-v1" {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "fixture adapter observation protocol is not registered",
+        ));
+    }
+    let schedule_adapter = [
+        CrashSchedule::AfterCandidateSync,
+        CrashSchedule::AfterPublicationSync,
+        CrashSchedule::PartialWrite,
+        CrashSchedule::Crash,
+        CrashSchedule::Restart,
+        CrashSchedule::Corruption,
+        CrashSchedule::FullDisk,
+        CrashSchedule::Clock,
+        CrashSchedule::Cancellation,
+        CrashSchedule::Network,
+        CrashSchedule::Provider,
+    ]
+    .into_iter()
+    .map(QualityFixtureAdapter::for_schedule)
+    .find(|candidate| candidate.expected_observation().adapter == *adapter)
+    .ok_or_else(|| {
+        XtaskError::invalid_path(
+            &path,
+            "fixture adapter observation names an unknown adapter",
+        )
+    })?;
+    let observation = schedule_adapter.expected_observation();
+    if observation.injection != *injection {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "fixture adapter observation names an unknown injection",
+        ));
+    }
+    Ok(observation)
 }
 
 fn claim_process_root(claim: &ProcessRootClaim<'_>) -> Result<DirectoryCapability, XtaskError> {
@@ -2110,17 +2704,28 @@ fn corrupt_state_file(directory: &DirectoryCapability, name: &str) -> Result<(),
 
 fn write_state(directory: &DirectoryCapability, name: &str, state: &str) -> Result<(), XtaskError> {
     let path = directory.diagnostic_path.join(name);
-    let catalog = format!("catalog-{state}");
-    let audit = format!("audit-{state}");
-    let digest = state_digest(state, &catalog, &audit);
-    let content = format!("{state}\n{catalog}\n{audit}\n{digest}\n");
+    let content = encoded_state(state)?;
     if content.len() > MAXIMUM_STATE_BYTES {
         return Err(XtaskError::invalid_path(
             &path,
             format!("fixture state exceeds {MAXIMUM_STATE_BYTES} bytes"),
         ));
     }
-    directory.create_file(name, content.as_bytes(), MAXIMUM_STATE_BYTES)
+    directory.create_file(name, &content, MAXIMUM_STATE_BYTES)
+}
+
+fn encoded_state(state: &str) -> Result<Vec<u8>, XtaskError> {
+    let catalog = format!("catalog-{state}");
+    let audit = format!("audit-{state}");
+    let digest = state_digest(state, &catalog, &audit);
+    let content = format!("{state}\n{catalog}\n{audit}\n{digest}\n").into_bytes();
+    if content.len() > MAXIMUM_STATE_BYTES {
+        return Err(XtaskError::invalid(
+            "fixture state",
+            format!("fixture state exceeds {MAXIMUM_STATE_BYTES} bytes"),
+        ));
+    }
+    Ok(content)
 }
 
 fn read_state(directory: &DirectoryCapability, name: &str) -> Result<String, XtaskError> {
@@ -2242,14 +2847,7 @@ impl OwnedFixtureRoot {
         remove_directory_contents(&self.directory)?;
         let identity = self.directory.identity()?;
         remove_child_directory_by_identity(&self.parent, identity)?;
-        if let Ok(stat) = rustix::fs::statat(
-            &self.parent.file,
-            self.name.as_str(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        ) && FileType::from_raw_mode(stat.st_mode).is_symlink()
-        {
-            self.parent.remove_file(&self.name)?;
-        }
+        self.active = false;
         self.parent.sync().map_err(|error| {
             XtaskError::invalid(
                 "qualification fixture cleanup",
@@ -2259,8 +2857,24 @@ impl OwnedFixtureRoot {
                 ),
             )
         })?;
-        self.active = false;
-        Ok(())
+        match rustix::fs::statat(
+            &self.parent.file,
+            self.name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            Ok(_) => Err(XtaskError::invalid_path(
+                &self.path,
+                "canonical fixture root name was replaced during cleanup",
+            )),
+            Err(source) => Err(XtaskError::io(
+                format!(
+                    "inspect canonical fixture root after cleanup {}",
+                    self.path.display()
+                ),
+                rustix_io(source),
+            )),
+        }
     }
 }
 

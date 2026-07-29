@@ -994,6 +994,77 @@ fn quality_kills_reaps_and_cleans_a_timed_out_fixture_writer() -> TestResult {
 
 #[cfg(unix)]
 #[test]
+fn quality_fails_with_bounded_evidence_when_writer_reap_observation_stalls() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("qualification/engineering/fixture-harness.tsv"),
+            "\t5000\tforce-kill-and-reap\t",
+            "\t50\tforce-kill-and-reap\t",
+        )?;
+        inject_stalled_writer_reap_observation(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let started = Instant::now();
+        let output = fixture
+            .quality_child_from_built_fixture_for("pr")?
+            .wait_with_output()?;
+        if started.elapsed() >= Duration::from_secs(5) {
+            return Err(std::io::Error::other(
+                "stalled writer reap exceeded its bounded public failure deadline",
+            )
+            .into());
+        }
+        for expected in [
+            "fixture writer process reap deadline elapsed",
+            "kill-sent=true",
+            "pid=",
+        ] {
+            assert_rejected_output(&output, expected)?;
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-CORRECT")?;
+        if !gate.contains("\"result\": \"failed\"")
+            || !gate.contains("fixture writer process reap deadline elapsed")
+        {
+            return Err(std::io::Error::other(
+                "stalled writer reap did not retain its typed PID/state failure",
+            )
+            .into());
+        }
+        let pid = fs::read_to_string(
+            fixture
+                .root
+                .join("target/quality-tools/fixture-writer-reap-stall-pid"),
+        )?;
+        let status = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            return Err(std::io::Error::other(
+                "stalled-reap fixture writer remained detached after the runner exited",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
 fn quality_fails_when_attempt_owned_fixture_cleanup_fails() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -1013,6 +1084,66 @@ fn quality_fails_when_attempt_owned_fixture_cleanup_fails() -> TestResult {
         if !gate_record(&evidence, "EG-CORRECT")?.contains("\"result\": \"failed\"") {
             return Err(std::io::Error::other(
                 "fixture cleanup failure was not retained as a failed gate",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_an_ordinary_directory_replacing_the_cleaned_fixture_root() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        inject_fixture_cleanup_replacement_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let tools = fixture.root.join("target/quality-tools");
+        wait_for_path(
+            &tools.join("fixture-cleanup-replacement-ready"),
+            Duration::from_secs(30),
+        )?;
+        let canonical = PathBuf::from(
+            fs::read_to_string(tools.join("fixture-cleanup-replacement-path"))?
+                .trim()
+                .to_owned(),
+        );
+        fs::create_dir(&canonical)?;
+        let canary = canonical.join("canary");
+        fs::write(&canary, b"untouched\n")?;
+        fs::write(
+            tools.join("fixture-cleanup-replacement-release"),
+            b"release\n",
+        )?;
+
+        let output = child.wait_with_output()?;
+        assert_rejected_output(
+            &output,
+            "canonical fixture root name was replaced during cleanup",
+        )?;
+        if fs::read(&canary)? != b"untouched\n" {
+            return Err(std::io::Error::other(
+                "fixture cleanup changed the unowned replacement canary",
+            )
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-CORRECT")?;
+        if !gate.contains("\"result\": \"failed\"")
+            || !gate.contains("canonical fixture root name was replaced during cleanup")
+        {
+            return Err(std::io::Error::other(
+                "fixture replacement cleanup failure was not retained with bounded detail",
             )
             .into());
         }
@@ -1270,15 +1401,15 @@ fn quality_runs_fault_through_the_registered_public_seam() -> TestResult {
             "\"gate_id\": \"EG-FAULT\"",
             "\"verdict\": \"passed\"",
             "exact-fault-classes=partial-write+crash+restart+corruption+full-disk+clock+cancellation+network+provider",
-            "fault-partial-write:inject-partial-write:state-v1",
-            "fault-crash:inject-crash:state-v1",
-            "fault-restart:inject-restart:state-v2",
-            "fault-corruption:inject-corruption:state-v1",
-            "fault-full-disk:inject-full-disk:state-v1",
-            "fault-clock:inject-clock:state-v1",
-            "fault-cancellation:inject-cancellation:state-v1",
-            "fault-network:inject-network:state-v1",
-            "fault-provider:inject-provider:state-v1",
+            "fault-partial-write:inject-partial-write:state-v1:adapter=partial-write-adapter:injection=partial-write-injected",
+            "fault-crash:inject-crash:state-v1:adapter=process-crash-adapter:injection=crash-window-open",
+            "fault-restart:inject-restart:state-v2:adapter=restart-adapter:injection=successor-published",
+            "fault-corruption:inject-corruption:state-v1:adapter=corruption-adapter:injection=candidate-corrupted",
+            "fault-full-disk:inject-full-disk:state-v1:adapter=bounded-storage-adapter:injection=capacity-exhausted",
+            "fault-clock:inject-clock:state-v1:adapter=controlled-clock-adapter:injection=clock-regressed",
+            "fault-cancellation:inject-cancellation:state-v1:adapter=cancellation-adapter:injection=cancelled-before-publication",
+            "fault-network:inject-network:state-v1:adapter=network-publication-adapter:injection=network-unavailable",
+            "fault-provider:inject-provider:state-v1:adapter=provider-publication-adapter:injection=provider-unavailable",
             "one-to-one-publication-points=9",
         ] {
             if !report.contains(expected) {
@@ -1287,6 +1418,69 @@ fn quality_runs_fault_through_the_registered_public_seam() -> TestResult {
                 ))
                 .into());
             }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+macro_rules! removed_fault_adapter_regression {
+    ($name:ident, $variant:literal) => {
+        #[test]
+        fn $name() -> TestResult {
+            assert_removed_fault_adapter_is_rejected($variant)
+        }
+    };
+}
+
+removed_fault_adapter_regression!(
+    quality_rejects_a_removed_partial_write_adapter,
+    "PartialWrite"
+);
+removed_fault_adapter_regression!(quality_rejects_a_removed_crash_adapter, "Crash");
+removed_fault_adapter_regression!(quality_rejects_a_removed_restart_adapter, "Restart");
+removed_fault_adapter_regression!(quality_rejects_a_removed_corruption_adapter, "Corruption");
+removed_fault_adapter_regression!(
+    quality_rejects_a_removed_bounded_storage_adapter,
+    "FullDisk"
+);
+removed_fault_adapter_regression!(quality_rejects_a_removed_controlled_clock_adapter, "Clock");
+removed_fault_adapter_regression!(
+    quality_rejects_a_removed_cancellation_adapter,
+    "Cancellation"
+);
+removed_fault_adapter_regression!(
+    quality_rejects_a_removed_network_publication_adapter,
+    "Network"
+);
+removed_fault_adapter_regression!(
+    quality_rejects_a_removed_provider_publication_adapter,
+    "Provider"
+);
+
+fn assert_removed_fault_adapter_is_rejected(variant: &str) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        set_scope_field(
+            &fixture.root,
+            "xtask",
+            "risk_gates",
+            "EG-00|EG-ARCH|EG-BUILD|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
+        )?;
+        remove_fault_adapter_invocation(&fixture.root, variant)?;
+        fixture.build_fixture_xtask()?;
+        let output = fixture
+            .quality_child_from_built_fixture_for("pr")?
+            .wait_with_output()?;
+        assert_rejected_output(&output, "fixture recovery process")?;
+        let evidence = fixture.latest_evidence()?;
+        if !gate_record(&evidence, "EG-FAULT")?.contains("\"result\": \"failed\"") {
+            return Err(std::io::Error::other(format!(
+                "removing the {variant} adapter did not retain a failed EG-FAULT verdict"
+            ))
+            .into());
         }
         Ok(())
     })();
@@ -3641,6 +3835,7 @@ fn quality_retains_full_dependency_metadata_above_the_stream_capture_ceiling() -
             fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, "EG-DEPS")?)?;
         for expected in [
             "metadata-artifact=target/quality/dependency-metadata/",
+            "identity=",
             "packages+workspace+resolve=validated",
             "digest=sha256:",
         ] {
@@ -3653,15 +3848,120 @@ fn quality_retains_full_dependency_metadata_above_the_stream_capture_ceiling() -
         }
         let metadata_directory = fixture.root.join("target/quality/dependency-metadata");
         let artifacts = fs::read_dir(&metadata_directory)?.collect::<Result<Vec<_>, _>>()?;
-        let [artifact] = artifacts.as_slice() else {
+        let [attempt] = artifacts.as_slice() else {
             return Err(std::io::Error::other(
                 "dependency metadata did not retain exactly one attempt-owned artifact",
             )
             .into());
         };
-        if fs::metadata(artifact.path())?.len() <= 131_072 {
+        let artifact = attempt.path().join("metadata.json");
+        if fs::metadata(&artifact)?.len() <= 131_072 {
             return Err(std::io::Error::other(
                 "dependency metadata regression did not exceed the stream capture ceiling",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_replaced_dependency_metadata_artifact_without_reading_the_forgery()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        inject_dependency_metadata_artifact_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let tools = fixture.root.join("target/quality-tools");
+        wait_for_path(
+            &tools.join("dependency-metadata-artifact-ready"),
+            Duration::from_secs(30),
+        )?;
+        let artifact = PathBuf::from(
+            fs::read_to_string(tools.join("dependency-metadata-artifact-path"))?
+                .trim()
+                .to_owned(),
+        );
+        let owned = artifact.with_extension("owned");
+        fs::rename(&artifact, &owned)?;
+        let forged = b"{\"packages\":[],\"workspace_members\":[],\"workspace_root\":\"/forged\",\"target_directory\":\"/forged/target\",\"resolve\":{}}\n";
+        fs::write(&artifact, forged)?;
+        fs::write(
+            tools.join("dependency-metadata-artifact-release"),
+            b"release\n",
+        )?;
+
+        let output = child.wait_with_output()?;
+        assert_rejected_output(
+            &output,
+            "dependency metadata artifact canonical name was replaced",
+        )?;
+        if fs::read(&artifact)? != forged {
+            return Err(std::io::Error::other(
+                "dependency metadata rejection changed the forged replacement",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_replaced_dependency_metadata_directory_without_touching_its_canary()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        inject_dependency_metadata_artifact_barrier(&fixture.root)?;
+        fixture.build_fixture_xtask()?;
+        let child = fixture.quality_child_from_built_fixture_for("pr")?;
+        let tools = fixture.root.join("target/quality-tools");
+        wait_for_path(
+            &tools.join("dependency-metadata-artifact-ready"),
+            Duration::from_secs(30),
+        )?;
+        let artifact = PathBuf::from(
+            fs::read_to_string(tools.join("dependency-metadata-artifact-path"))?
+                .trim()
+                .to_owned(),
+        );
+        let directory = artifact
+            .parent()
+            .ok_or_else(|| std::io::Error::other("metadata artifact had no parent"))?;
+        let owned = directory.with_extension("owned");
+        fs::rename(directory, &owned)?;
+        fs::create_dir(directory)?;
+        let canary = directory.join("canary");
+        fs::write(&canary, b"untouched\n")?;
+        fs::write(
+            directory.join(
+                artifact
+                    .file_name()
+                    .ok_or_else(|| std::io::Error::other("metadata artifact had no file name"))?,
+            ),
+            b"{\"packages\":[],\"workspace_members\":[],\"workspace_root\":\"/forged\",\"target_directory\":\"/forged/target\",\"resolve\":{}}\n",
+        )?;
+        fs::write(
+            tools.join("dependency-metadata-artifact-release"),
+            b"release\n",
+        )?;
+
+        let output = child.wait_with_output()?;
+        assert_rejected_output(
+            &output,
+            "dependency metadata directory canonical name was replaced",
+        )?;
+        if fs::read(&canary)? != b"untouched\n" {
+            return Err(std::io::Error::other(
+                "dependency metadata directory rejection changed its canary",
             )
             .into());
         }
@@ -5167,6 +5467,65 @@ fn digest_relative_files(
     )
 }
 
+fn remove_fault_adapter_invocation(root: &Path, variant: &str) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    let original = "    let adapter = QualityFixtureAdapter::for_schedule(fault_schedule);\n    execute_fixture_adapter(&case_root, adapter, candidate, published, successor)?;\n";
+    let replacement = format!(
+        "    let adapter = QualityFixtureAdapter::for_schedule(fault_schedule);\n    if fault_schedule != CrashSchedule::{variant} {{\n        execute_fixture_adapter(&case_root, adapter, candidate, published, successor)?;\n    }}\n"
+    );
+    replace_once(&source, original, &replacement)
+}
+
+#[cfg(unix)]
+fn inject_dependency_metadata_artifact_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/quality.rs");
+    replace_once(
+        &source,
+        "    let summary = validate_dependency_metadata_artifact(root, &artifact)?;\n",
+        "    dependency_metadata_artifact_barrier(root, &artifact_path)?;\n    let summary = validate_dependency_metadata_artifact(root, &artifact)?;\n",
+    )?;
+    replace_once(
+        &source,
+        "fn bounded_stream_summary(stream: &str) -> String {\n",
+        r#"fn dependency_metadata_artifact_barrier(
+    root: &Path,
+    artifact_path: &Path,
+) -> Result<(), XtaskError> {
+    let tools = root.join("target/quality-tools");
+    fs::write(
+        tools.join("dependency-metadata-artifact-path"),
+        artifact_path.as_os_str().as_encoded_bytes(),
+    )
+    .map_err(|source| XtaskError::io("publish dependency metadata artifact path", source))?;
+    fs::write(
+        tools.join("dependency-metadata-artifact-ready"),
+        b"ready\n",
+    )
+    .map_err(|source| XtaskError::io("publish dependency metadata barrier", source))?;
+    let release = tools.join("dependency-metadata-artifact-release");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if release
+            .try_exists()
+            .map_err(|source| XtaskError::io("inspect dependency metadata barrier", source))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(XtaskError::invalid(
+                "dependency metadata artifact barrier",
+                "artifact swapper did not release the barrier",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn bounded_stream_summary(stream: &str) -> String {
+"#,
+    )
+}
+
 #[cfg(unix)]
 fn inject_fixture_root_claim_barrier(root: &Path) -> TestResult {
     let source = root.join("tools/xtask/src/qualification_fixtures.rs");
@@ -5314,11 +5673,71 @@ fn run_writer_process(
 }
 
 #[cfg(unix)]
+fn inject_stalled_writer_reap_observation(root: &Path) -> TestResult {
+    replace_once(
+        &root.join("tools/xtask/src/qualification_fixtures.rs"),
+        "    child\n        .try_wait()\n        .map_err(|source| XtaskError::io(format!(\"observe {label} reap\"), source))\n",
+        "    fs::write(\n        \"target/quality-tools/fixture-writer-reap-stall-pid\",\n        child.id().to_string(),\n    )\n    .map_err(|source| XtaskError::io(\"publish stalled writer PID\", source))?;\n    let _label = label;\n    Ok(None)\n",
+    )
+}
+
+#[cfg(unix)]
 fn inject_fixture_cleanup_failure(root: &Path) -> TestResult {
     replace_once(
         &root.join("tools/xtask/src/qualification_fixtures.rs"),
         "    fn cleanup(&mut self) -> Result<(), XtaskError> {\n        if !self.active {\n",
         "    fn cleanup(&mut self) -> Result<(), XtaskError> {\n        if self.active {\n            return Err(XtaskError::invalid(\n                \"injected qualification fixture cleanup failure\",\n                \"owned tree could not be reconciled\",\n            ));\n        }\n        if !self.active {\n",
+    )
+}
+
+#[cfg(unix)]
+fn inject_fixture_cleanup_replacement_barrier(root: &Path) -> TestResult {
+    let source = root.join("tools/xtask/src/qualification_fixtures.rs");
+    replace_once(
+        &source,
+        "        remove_child_directory_by_identity(&self.parent, identity)?;\n",
+        "        remove_child_directory_by_identity(&self.parent, identity)?;\n        fixture_cleanup_replacement_barrier(&self.path)?;\n",
+    )?;
+    replace_once(
+        &source,
+        "impl OwnedFixtureRoot {\n",
+        r#"fn fixture_cleanup_replacement_barrier(canonical: &Path) -> Result<(), XtaskError> {
+    let workspace = canonical
+        .ancestors()
+        .find(|candidate| candidate.join("project-positron.md").is_file())
+        .ok_or_else(|| XtaskError::invalid_path(canonical, "fixture root has no workspace ancestor"))?;
+    let tools = workspace.join("target/quality-tools");
+    fs::write(
+        tools.join("fixture-cleanup-replacement-path"),
+        canonical.as_os_str().as_encoded_bytes(),
+    )
+    .map_err(|source| XtaskError::io("publish cleanup replacement path", source))?;
+    fs::write(
+        tools.join("fixture-cleanup-replacement-ready"),
+        b"ready\n",
+    )
+    .map_err(|source| XtaskError::io("publish cleanup replacement barrier", source))?;
+    let release = tools.join("fixture-cleanup-replacement-release");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if release
+            .try_exists()
+            .map_err(|source| XtaskError::io("inspect cleanup replacement barrier", source))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(XtaskError::invalid(
+                "fixture cleanup replacement barrier",
+                "replacement racer did not release the barrier",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+impl OwnedFixtureRoot {
+"#,
     )
 }
 
