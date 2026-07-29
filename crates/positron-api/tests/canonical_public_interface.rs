@@ -3,15 +3,20 @@
 use positron_api::generated::{
     ApiErrorCode, ApiFailureSource, ApiVersion, Capability, CapabilityAvailability,
     CapabilityClient, CapabilityRequest, CapabilityService, CompletionState, DeprecationState,
-    EncodedRequest, MAX_PUBLIC_REQUEST_BYTES, RetryClass, SafeDetail, SchemaDigest, Transport,
+    EncodedRequest, MAX_PUBLIC_REQUEST_BYTES, RequestedApiMajor, RetryClass, SafeDetail,
+    SchemaDigest, Transport,
 };
 use std::hint::black_box;
 
 #[test]
 fn v1_capability_statement_is_typed_and_bound_to_the_canonical_schema() {
-    let response = CapabilityService::negotiate(CapabilityRequest::for_version(ApiVersion::V1));
+    let version = ApiVersion::V1;
+    let major = match version {
+        ApiVersion::V1 => version.major(),
+    };
+    let response = CapabilityService::negotiate(CapabilityRequest::for_version(version));
 
-    assert_eq!(ApiVersion::V1.major(), 1);
+    assert_eq!(major, 1);
     assert_eq!(response.availability(), CapabilityAvailability::Implemented);
     assert_eq!(response.api_major(), ApiVersion::V1);
     assert_eq!(response.schema_digest(), SchemaDigest::canonical());
@@ -31,15 +36,18 @@ fn v1_capability_statement_is_typed_and_bound_to_the_canonical_schema() {
 
 #[test]
 fn another_nonzero_api_major_is_typed_and_refused_consistently() -> Result<(), std::io::Error> {
-    let version =
-        ApiVersion::from_major(2).map_err(|error| std::io::Error::other(format!("{error:?}")))?;
-    let request = CapabilityRequest::for_capability(version, Capability::CanonicalPublicInterface);
+    let requested_major = RequestedApiMajor::from_major(2)
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    let request = CapabilityRequest::for_requested_major(
+        requested_major,
+        Capability::CanonicalPublicInterface,
+    );
     let encoded = CapabilityClient::encode(request, Transport::GrpcProtobuf);
     let response =
         CapabilityService::decode_and_negotiate(Transport::GrpcProtobuf, encoded.as_bytes())
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
 
-    assert_eq!(version.major(), 2);
+    assert_eq!(requested_major.major(), 2);
     assert_eq!(encoded.as_bytes(), &[0x08, 0x02, 0x10, 0x01]);
     assert_eq!(
         response.availability(),
@@ -55,7 +63,7 @@ fn another_nonzero_api_major_is_typed_and_refused_consistently() -> Result<(), s
 
 #[test]
 fn zero_api_major_fails_closed_with_the_existing_typed_error() -> Result<(), std::io::Error> {
-    let error = match ApiVersion::from_major(0) {
+    let error = match RequestedApiMajor::from_major(0) {
         Ok(_) => return Err(std::io::Error::other("zero API major was accepted")),
         Err(error) => error,
     };

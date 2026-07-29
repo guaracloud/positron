@@ -235,6 +235,18 @@
       "selector_correction": "ApiVersion::from_major and ApiVersion::major are both selected mutation owners alongside CapabilityRequest::for_version, CapabilityResponse::api_major, and CapabilityService::negotiate. No selector exception remains.",
       "implementation_revision": "pending final commit; the committed-candidate PR profile and future trusted-CI artifact bind the exact revision",
       "qualification_claim": "none"
+    },
+    {
+      "id": "EA-0001-CORRECTION-0002",
+      "status": "supersedes-incompatible-newtype-design-without-rewriting-history",
+      "recorded_at_utc": "2026-07-29T02:01:01Z",
+      "corrects": "EA-0001-CORRECTION-0001",
+      "compatibility_correction": "The invariant-bearing ApiVersion newtype introduced after EA-0001-CORRECTION-0001 broke the closed enum's exhaustive-match source compatibility. The generated canonical ApiVersion is restored exactly to the closed V1 enum with its exhaustive major match.",
+      "checked_request_owner": "RequestedApiMajor is the separate invariant-bearing NonZeroU32 type for caller and transport majors. Its checked from_major rejects zero with the existing typed error, and its major accessor preserves other nonzero requested values such as 2.",
+      "equivalence_scope": "Replacing closed ApiVersion::major with 1 remains semantic-equivalent for the complete canonical input domain {ApiVersion::V1}. Replacing RequestedApiMajor::major with 1 is observably wrong for requested major 2.",
+      "selector_correction": "The focused selector excludes only closed ApiVersion::major and selects RequestedApiMajor::from_major, RequestedApiMajor::major, CapabilityRequest::for_version, CapabilityRequest::for_requested_major, CapabilityResponse::api_major, CapabilityService::negotiate, and the other retained real owners.",
+      "implementation_revision": "pending final commit; the committed-candidate PR profile and future trusted-CI artifact bind the exact revision",
+      "qualification_claim": "none"
     }
   ],
   "technical_review_history": [
@@ -269,6 +281,22 @@
         "result": "One P1 finding: required approval criteria were incorrectly recorded as roles performed by the repository owner."
       },
       "attribution": "Independent technical review evidence only; the findings remain visible and no reviewer role approval is claimed."
+    },
+    {
+      "reviewed_candidate_revision": "f12bd6d0317a9edd9f7147520e2627a3e019cee0",
+      "recorded_after_completion_at_utc": "2026-07-29T02:01:01Z",
+      "review_kind": "fresh independent Terra two-axis code review",
+      "standards": {
+        "reviewer": "Bohr",
+        "task_id": "/root/m0_03_tdd_implementation/review_standards",
+        "result": "One hard finding and one judgement call: the ApiVersion NonZeroU32 newtype broke the closed enum's exhaustive-match source compatibility and admitted speculative canonical versions. The review recommended a separate checked requested-major type."
+      },
+      "spec": {
+        "reviewer": "Noether",
+        "task_id": "/root/m0_03_tdd_implementation/review_spec",
+        "result": "Pass with no findings."
+      },
+      "attribution": "Independent technical review evidence only; the findings remain visible and no reviewer role approval is claimed."
     }
   ],
   "representative_old_new_evidence": {
@@ -296,7 +324,7 @@
       "artifact_contents": "The existing upload-artifact step retains target/quality, including the revision-bound evidence JSON, coverage report, and focused mutation outcomes.",
       "result": "not run; no pass, mutation score, merge-eligibility, or qualification claim is made before the external exact-head artifact exists."
     },
-    "comparison_scope": "The implementation removes the prior equivalence instead of excluding a target. The final trusted-CI artifact must demonstrate that ApiVersion::from_major, ApiVersion::major, all other viable observable owners, thresholds, and gates remain selected and passing on the exact final commit."
+    "comparison_scope": "The implementation preserves the closed ApiVersion::major equivalence while moving requested-major variability into selected RequestedApiMajor::from_major and RequestedApiMajor::major owners. The final trusted-CI artifact must demonstrate that all viable observable owners, thresholds, and gates remain selected and passing on the exact final commit."
   },
   "detection_gained": [
     "one bounded parsed versioned Protobuf source generates the Rust, gRPC and HTTP decode mapping, client contract, OpenAPI, and Schema Digest foundations",
@@ -304,7 +332,7 @@
     "the HTTP client publishes and tests an exact one-buffer allocation contract with no intermediate heap body and no completed-body copy",
     "public decoding rejects overflowing terminal u32 varints before shifting or capability negotiation",
     "HTTP u32 decoding accepts canonical unsigned decimal grammar with RFC JSON boundary whitespace and rejects signed, zero-padded, fractional, exponent, internal-whitespace, and non-RFC-whitespace forms",
-    "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail; it selects ApiVersion::from_major, ApiVersion::major, and the observable request, response, and negotiation owners with no target exception",
+    "the M0-03 mutation selector is checked against exact generated Rust owners so stale or nonexistent names fail; it excludes only the documented equivalent closed ApiVersion::major accessor and selects RequestedApiMajor construction/access plus the observable request, response, and negotiation owners",
     "the public contract proves implemented, unavailable, unsupported, and version-incompatible capability outcomes with safe typed errors and no wire or domain leakage",
     "the canonical artifact scope cannot return to scaffold, accept unknown fields, exceed its 64-byte request bound, or drift from deterministic generation",
     "the authoritative EXT runner owns M0-03 coverage and the explicit exact-selector mutation campaign without changing routine PR selection"
