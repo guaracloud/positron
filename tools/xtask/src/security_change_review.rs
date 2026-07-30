@@ -96,8 +96,12 @@ struct Contract {
 
 fn load_contract(root: &Path) -> Result<Contract, XtaskError> {
     let path = root.join(POLICY_PATH);
-    let content =
-        crate::bounded_input::read_utf8(&path, MAXIMUM_POLICY_BYTES, "PC-0015 policy record")?;
+    let content = String::from_utf8(crate::bounded_input::read(
+        &path,
+        MAXIMUM_POLICY_BYTES,
+        "PC-0015 policy record",
+    )?)
+    .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     let value = crate::evidence_json::parse(&content)
         .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     let mut document = value

@@ -56,7 +56,10 @@
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions -- --exact",
-    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::every_m0_10_external_input_accepts_its_boundary_and_rejects_oversize -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::canary_fixture_inputs_enforce_exact_bounds -- --exact",
     "cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact",
     "cargo test --locked --package xtask --bin xtask security_harness::canary_tests:: -- --nocapture",
     "cargo test --locked --package xtask --bin xtask crypto_targets:: -- --nocapture"
@@ -91,6 +94,15 @@
       "result": "These exact targets exist and were run during the focused M0-10 cycles. The new runner retains owned threat/surface identities, the typed security probe, the parent-owned nine-category candidate artifact scan, and the controlled crypto command. This diagnostic does not qualify a product target."
     }
   },
+  "publication_attempts": [
+    {
+      "revision": "bbc3c7d841aedafe940c0b8de830189f3be15879",
+      "worktree": "/private/tmp/positron-m0-10-final-push.AvIOAV",
+      "evidence": "/private/tmp/positron-m0-10-final-push.AvIOAV/target/quality/evidence/1785412656008-bbc3c7d841ae-84772.json",
+      "observed_state": "The clean exact-head pre-push PR profile retained a failed attempt. EG-DOCS reported one redacted square-access-token finding in the generated combined-workspace Rust search index. EG-TEST ran 523 tests: 522 passed and the single 20-run M0-10 external-input boundary matrix timed out at 120.007 seconds under full-suite contention. EG-SECURITY and every other selected gate passed. Origin remained at 18bcbac0c8c0291d725451a9c13d50662d2ef903.",
+      "recovery": "Preserve the exact failed evidence. Keep the unchanged generated-document secret detector and split the same public-seam boundary matrix into independently bounded table partitions. Reduce the shared bounded-input module to its one byte-reading primitive so the combined rustdoc projection contains no false-positive token, then rerun focused rustdoc scanning and one fresh isolated exact-head publication attempt."
+    }
+  ],
   "qualification_claim": "None. Harness implementation and local evidence are diagnostic only; no exact target is Qualified or merge-eligible.",
   "approvals_required": ["Architecture", "Quality Engineering", "Security and Key Management"],
   "approval": {

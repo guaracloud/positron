@@ -31,13 +31,3 @@ pub(crate) fn read(
     }
     Ok(bytes)
 }
-
-pub(crate) fn read_utf8(
-    path: &Path,
-    maximum_bytes: usize,
-    subject: &str,
-) -> Result<String, XtaskError> {
-    String::from_utf8(read(path, maximum_bytes, subject)?).map_err(|source| {
-        XtaskError::invalid_path(path, format!("{subject} is not UTF-8: {source}"))
-    })
-}

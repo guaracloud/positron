@@ -5318,8 +5318,12 @@ fn run_security_gate(
         ));
     }
     let path = root.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json");
-    let threat_model =
-        crate::bounded_input::read_utf8(&path, 8_192, "M0-04 parser threat-model record")?;
+    let threat_model = String::from_utf8(crate::bounded_input::read(
+        &path,
+        8_192,
+        "M0-04 parser threat-model record",
+    )?)
+    .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
     let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
     let descriptor = catalog.descriptor_for("EG-SECURITY")?;

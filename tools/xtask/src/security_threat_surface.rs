@@ -304,8 +304,12 @@ fn validate_policy_commands(root: &Path) -> Result<(), XtaskError> {
     let path = root.join(
         "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
     );
-    let content =
-        crate::bounded_input::read_utf8(&path, MAXIMUM_POLICY_BYTES, "PC-0015 policy record")?;
+    let content = String::from_utf8(crate::bounded_input::read(
+        &path,
+        MAXIMUM_POLICY_BYTES,
+        "PC-0015 policy record",
+    )?)
+    .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     let public_targets = [
         "m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam",
         "m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor",
@@ -325,7 +329,10 @@ fn validate_policy_commands(root: &Path) -> Result<(), XtaskError> {
         "m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification",
         "m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification",
         "m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions",
-        "m0_10_final_blockers::every_m0_10_external_input_accepts_its_boundary_and_rejects_oversize",
+        "m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds",
+        "m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds",
+        "m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds",
+        "m0_10_final_blockers::canary_fixture_inputs_enforce_exact_bounds",
     ];
     for target in final_blocker_targets {
         if !content.contains(target) {

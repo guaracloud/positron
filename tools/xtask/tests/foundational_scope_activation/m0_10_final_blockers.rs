@@ -108,13 +108,29 @@ fn quality_rejects_stale_conflicting_or_unowned_path_dispositions() -> TestResul
 }
 
 #[test]
-fn every_m0_10_external_input_accepts_its_boundary_and_rejects_oversize() -> TestResult {
-    let inputs = [
+fn policy_and_catalog_inputs_enforce_exact_bounds() -> TestResult {
+    assert_external_input_bounds(&[
         (
             "qualification/engineering/security-threat-surfaces.tsv",
             16_384,
             "security threat-surface registry",
         ),
+        (
+            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
+            32_768,
+            "PC-0015 policy record",
+        ),
+        (
+            "qualification/engineering/security-runners.tsv",
+            16_384,
+            "security runner catalog",
+        ),
+    ])
+}
+
+#[test]
+fn threat_model_inputs_enforce_exact_bounds() -> TestResult {
+    assert_external_input_bounds(&[
         (
             "qualification/engineering/security/TM-0010-m0-10-runner-crypto.json",
             8_192,
@@ -126,25 +142,32 @@ fn every_m0_10_external_input_accepts_its_boundary_and_rejects_oversize() -> Tes
             "versioned threat-model record",
         ),
         (
-            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
-            32_768,
-            "PC-0015 policy record",
+            "qualification/engineering/security/TM-0001-m0-04-toml-parser.json",
+            8_192,
+            "M0-04 parser threat-model record",
         ),
+    ])
+}
+
+#[test]
+fn target_registry_inputs_enforce_exact_bounds() -> TestResult {
+    assert_external_input_bounds(&[
         (
             "qualification/engineering/security-crypto-targets.tsv",
             4_096,
             "profile-aware crypto target registry",
         ),
         (
-            "qualification/engineering/security-runners.tsv",
-            16_384,
-            "security runner catalog",
-        ),
-        (
             "qualification/engineering/security-canary-targets.tsv",
             4_096,
             "committed security fixture",
         ),
+    ])
+}
+
+#[test]
+fn canary_fixture_inputs_enforce_exact_bounds() -> TestResult {
+    assert_external_input_bounds(&[
         (
             "qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv",
             4_096,
@@ -155,13 +178,11 @@ fn every_m0_10_external_input_accepts_its_boundary_and_rejects_oversize() -> Tes
             4_096,
             "committed security fixture",
         ),
-        (
-            "qualification/engineering/security/TM-0001-m0-04-toml-parser.json",
-            8_192,
-            "M0-04 parser threat-model record",
-        ),
-    ];
-    for (relative, maximum, subject) in inputs {
+    ])
+}
+
+fn assert_external_input_bounds(inputs: &[(&str, usize, &str)]) -> TestResult {
+    for &(relative, maximum, subject) in inputs {
         let boundary_output = quality_with_resized_input(relative, maximum)?;
         let exceeds = format!("{subject} exceeds {maximum} bytes");
         let boundary_detail = combined_output(&boundary_output);
