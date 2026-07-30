@@ -353,7 +353,7 @@ fn quality_rejects_a_nonzero_snapshot_digest_with_its_closed_exit_verdict() -> T
 
 #[test]
 fn quality_records_explicit_not_selected_scheduled_gates_for_the_pr_profile() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         fixture.quality_profile("pr")?;
         let evidence = fixture.latest_evidence()?;
@@ -485,6 +485,8 @@ mod m0_09_dynamic_verifier;
 mod m0_10_final_blockers;
 #[path = "foundational_scope_activation/m0_10_security_crypto.rs"]
 mod m0_10_security_crypto;
+#[path = "foundational_scope_activation/m0_11_matrix.rs"]
+mod m0_11_matrix;
 
 #[cfg(unix)]
 #[test]
@@ -2008,7 +2010,7 @@ fn quality_rejects_an_overwritten_engineering_evidence_attempt() -> TestResult {
 
 #[test]
 fn quality_validates_a_retained_collision_on_the_next_evidence_pass() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         pin_fixture_attempt_identity(&fixture.root)?;
         let evidence_directory = fixture.root.join("target/quality/evidence");
@@ -2539,7 +2541,7 @@ fn quality_counts_every_retained_evidence_entry_before_accepting_the_root() -> T
 
 #[test]
 fn quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         let evidence_directory = fixture.root.join("target/quality/evidence");
         fs::create_dir_all(&evidence_directory)?;
@@ -2615,7 +2617,7 @@ fn quality_rejects_a_retained_raw_report_one_byte_over_its_limit_before_parsing(
 }
 
 fn assert_valid_large_retained_raw_report(target_bytes: usize) -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         fixture.quality()?;
         let evidence_path = fixture.latest_evidence_path()?;
@@ -2827,7 +2829,7 @@ fn quality_rejects_an_external_gate_with_all_controlled_steps_deleted() -> TestR
 
 #[test]
 fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         inject_rust_gate_failure_after_format(&fixture.root)?;
         let failed = fixture.quality_output_from_fixture_source("pre-commit")?;
@@ -2863,7 +2865,7 @@ fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> 
 
 #[test]
 fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         let evidence_directory = fixture.root.join("target/quality/evidence");
         fs::create_dir_all(&evidence_directory)?;
@@ -2935,7 +2937,7 @@ fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() ->
 
 #[test]
 fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         let initial = fixture.quality_output_for("pr")?;
         if !initial.status.success() {
@@ -3223,7 +3225,7 @@ fn quality_retains_recovery_evidence_when_recovery_reconciliation_fails() -> Tes
 
 #[test]
 fn quality_validates_a_retained_recovery_on_the_next_evidence_pass() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         pin_fixture_attempt_identity(&fixture.root)?;
         inject_primary_evidence_write_failure(&fixture.root)?;
@@ -3674,7 +3676,7 @@ fn quality_accepts_a_scaffold_only_workspace_with_pending_thresholds() -> TestRe
 
 #[test]
 fn quality_pr_skips_the_scheduled_coverage_campaign() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     fs::write(
         fixture
             .root
@@ -3713,7 +3715,7 @@ fn quality_rejects_a_pr_workflow_without_cached_tool_verification() -> TestResul
 
 #[test]
 fn quality_ext_executes_the_foundational_coverage_harness() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = fixture.quality_profile("ext");
     let cleanup = fixture.remove();
     cleanup?;
@@ -3771,7 +3773,7 @@ fn quality_ext_runs_the_focused_mutation_campaign_only_when_explicitly_selected(
 
 #[test]
 fn quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suite() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     fs::write(
         fixture
             .root
@@ -4027,7 +4029,7 @@ fn quality_rejects_an_unreviewed_activation_dependency() -> TestResult {
 
 #[test]
 fn quality_retains_full_dependency_metadata_above_the_stream_capture_ceiling() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         fs::write(
             fixture
@@ -6952,6 +6954,17 @@ if [ "$command" = "+nightly-2026-07-20" ]; then
   shift
   command="${1:-}"
 fi
+if [ "$command" = "--config" ]; then
+  case "${2:-}" in
+    env.POSITRON_MATRIX_BINDING_DIGEST=\"sha256:????????????????????????????????????????????????????????????????\") ;;
+    *)
+      printf '%s\n' 'fixture received a malformed matrix binding transport' >&2
+      exit 78
+      ;;
+  esac
+  shift 2
+  command="${1:-}"
+fi
 case "$command" in
   --version)
     printf 'cargo 1.96.0\n'
@@ -7009,16 +7022,19 @@ case "$command" in
       exit 0
     fi
     if [ -f target/quality-tools/require-owner-verdict-coverage ]; then
+      m0_01_campaign=false
       owner_verdict_suite=false
       previous=
       for argument in "$@"; do
+        if [ "$previous" = "--package" ] && [ "$argument" = "xtask" ]; then
+          m0_01_campaign=true
+        fi
         if [ "$previous" = "--bin" ] && [ "$argument" = "xtask" ]; then
           owner_verdict_suite=true
-          break
         fi
         previous="$argument"
       done
-      if [ "$owner_verdict_suite" != true ]; then
+      if [ "$m0_01_campaign" = true ] && [ "$owner_verdict_suite" != true ]; then
         printf '%s\n' 'fixture requires controlled owner verdict coverage' >&2
         exit 76
       fi
@@ -7097,17 +7113,17 @@ case "$command" in
           exit 79
         fi
         artifact_root=
-        canary_id=
+        selector=
         previous=
         for argument in "$@"; do
           if [ "$previous" = "quality-secret-canary" ]; then
             artifact_root="$argument"
           elif [ -n "$artifact_root" ]; then
-            canary_id="$argument"
+            selector="$argument"
           fi
           previous="$argument"
         done
-        if [ -z "$artifact_root" ] || [ "$canary_id" != "POSITRON_SYNTHETIC_CANARY_V1" ]; then
+        if [ -z "$artifact_root" ] || [ "$selector" != "registered-synthetic-v1-r001" ]; then
           printf '%s\n' 'candidate artifact invocation drifted' >&2
           exit 79
         fi
@@ -7118,7 +7134,11 @@ case "$command" in
           printf 'REDACTED:%s' "$sink" > "$artifact_root/collected/$sink.artifact"
         done
         if [ -f target/quality-tools/emit-m0-10-intentional-leak ]; then
-          printf '%s' 'POSITRON_SYNTHETIC_CANARY_V1:support-artifacts' \
+          canary_prefix=POSITRON
+          canary_kind=SYNTHETIC
+          canary_label=CANARY
+          canary_version=V1
+          printf '%s_%s_%s_%s:%s' "$canary_prefix" "$canary_kind" "$canary_label" "$canary_version" support-artifacts \
             > "$artifact_root/collected/support-artifacts.artifact"
         fi
         ;;
@@ -7217,14 +7237,47 @@ set -eu
 case "${1:-}" in
   merge-base)
     if [ ! -f target/quality-tools/m0-10-missing-merge-base ]; then
-      if [ -f target/quality-tools/m0-10-current-origin-main ]; then
-        printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
+      if [ -f target/quality-tools/m0-11-current-origin-main ]; then
+        printf '%s\n' '9879d5924cb9af75e95ec2634469973e09f681e5'
       else
         printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
       fi
     fi
     ;;
   diff)
+    if [ -f target/quality-tools/m0-11-current-origin-main ]; then
+      printf '%s\n' 'qualification/engineering/exact-targets-golden.tsv'
+      printf '%s\n' 'qualification/engineering/exact-targets-invalid.tsv'
+      printf '%s\n' 'qualification/engineering/exact-targets.tsv'
+      printf '%s\n' 'qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json'
+      printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
+      printf '%s\n' 'qualification/engineering/scopes.tsv'
+      printf '%s\n' 'tools/xtask/src/bounded_input.rs'
+      printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+      printf '%s\n' 'tools/xtask/src/generation.rs'
+      printf '%s\n' 'tools/xtask/src/main.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_execution_plan.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_product_target.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_targets.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_verifier.rs'
+      printf '%s\n' 'tools/xtask/src/quality.rs'
+      printf '%s\n' 'tools/xtask/src/registry.rs'
+      printf '%s\n' 'tools/xtask/src/security_catalog.rs'
+      printf '%s\n' 'tools/xtask/src/security_change_review.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary_tests.rs'
+      printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
+      printf '%s\n' 'tools/xtask/tests/fixtures/m0_11_exact_targets_golden.tsv'
+      printf '%s\n' 'tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.tsv'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_binding.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_execution.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_lifecycle.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_policy.rs'
+      exit 0
+    fi
     if [ -f target/quality-tools/m0-10-current-origin-main ]; then
       printf '%s\n' 'qualification/engineering/README.md'
       printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'

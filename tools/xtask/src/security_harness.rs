@@ -30,9 +30,10 @@ pub(crate) fn emit_secret_candidate(
 pub(crate) fn scan_secret_candidate(
     root: &Path,
     artifact_root: &Path,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    selector: &str,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
-    canary::scan_candidate(root, artifact_root, budget)
+    canary::scan_candidate(root, artifact_root, selector, budget)
 }
 
 pub(crate) fn security_probe_result() -> Result<&'static str, XtaskError> {

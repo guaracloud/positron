@@ -15,25 +15,26 @@ const LEAK_PATH: &str =
     "qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv";
 const TARGET_PATH: &str = "qualification/engineering/security-canary-targets.tsv";
 const MAXIMUM_FIXTURE_BYTES: usize = 4_096;
-pub(super) const CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_V1";
-pub(super) const LEAK_CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_LEAK_V1";
+pub(super) const NORMAL_SELECTOR: &str = "registered-synthetic-v1-r001";
+pub(super) const LEAK_SELECTOR: &str = "intentional-leak-synthetic-v1-r01";
 
-pub(super) fn emit_candidate(artifact_root: &Path, canary_id: &str) -> Result<(), XtaskError> {
-    if !matches!(canary_id, CANARY_ID | LEAK_CANARY_ID) || !artifact_root.is_dir() {
+pub(super) fn emit_candidate(artifact_root: &Path, selector: &str) -> Result<(), XtaskError> {
+    if !matches!(selector, NORMAL_SELECTOR | LEAK_SELECTOR) || !artifact_root.is_dir() {
         return Err(XtaskError::invalid(
             "candidate artifact emitter",
             "unregistered canary identity or parent-owned artifact root",
         ));
     }
-    let leak = (canary_id == LEAK_CANARY_ID).then_some(Sink::SupportArtifacts);
-    materialize(artifact_root, leak)?;
+    let leak = (selector == LEAK_SELECTOR).then_some(Sink::SupportArtifacts);
+    materialize(artifact_root, leak, &emitter_canary(selector)?)?;
     Ok(())
 }
 
 pub(super) fn scan_candidate(
     repository: &Path,
     artifact_root: &Path,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    selector: &str,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
     let target_digest = validate_target_contract(repository, budget)?;
     let golden = Golden::load(&repository.join(GOLDEN_PATH), budget)?;
@@ -69,7 +70,8 @@ pub(super) fn scan_candidate(
         budget.charge(bytes.len())?;
         collected.push(Collected { sink, bytes });
     }
-    independently_scan(&collected, &golden)?;
+    let canary = scanner_canary(selector)?;
+    independently_scan(&collected, &golden, &canary)?;
     let mut digest = Sha256::new();
     let paths = Sink::ALL
         .into_iter()
@@ -88,7 +90,8 @@ pub(super) fn scan_candidate(
         })
         .collect::<Result<Vec<_>, XtaskError>>()?;
     Ok(format!(
-        "candidate-target=xtask-security-runner-capability-v1; target-contract-digest={target_digest}; ownership=parent-attempt; artifact-paths={}; artifact-digest=sha256:{:x}; scanner-result=no-canary-disclosure; qualification=runner-capability-only",
+        "candidate-target=xtask-security-runner-capability-v1; target-contract-digest={target_digest}; canary-selector={selector}; canary-digest=sha256:{:x}; ownership=parent-attempt; artifact-paths={}; artifact-digest=sha256:{:x}; scanner-result=no-canary-disclosure; qualification=runner-capability-only",
+        Sha256::digest(&canary),
         paths.join("|"),
         digest.finalize()
     ))
@@ -96,11 +99,11 @@ pub(super) fn scan_candidate(
 
 fn validate_target_contract(
     repository: &Path,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
     let path = repository.join(TARGET_PATH);
     let bytes = read_fixture(&path, budget)?;
-    let expected = "target_id\trunner_id\tsemantic_owner\tcommand\tartifact_categories\tqualification\nxtask-security-runner-capability-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_V1\tlogs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts\trunner-capability-only\nxtask-security-intentional-leak-negative-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_LEAK_V1\tsupport-artifacts\tnegative-test-only\n";
+    let expected = "target_id\trunner_id\tsemantic_owner\tcommand\tartifact_categories\tqualification\nxtask-security-runner-capability-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> registered-synthetic-v1-r001\tlogs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts\trunner-capability-only\nxtask-security-intentional-leak-negative-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> intentional-leak-synthetic-v1-r01\tsupport-artifacts\tnegative-test-only\n";
     if bytes != expected.as_bytes() {
         return Err(XtaskError::invalid_path(
             &path,
@@ -163,7 +166,7 @@ struct Golden {
 impl Golden {
     fn load(
         path: &Path,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let bytes = read_fixture(path, budget)?;
         let content = std::str::from_utf8(&bytes).map_err(|source| {
@@ -215,7 +218,7 @@ struct LeakFixture(Sink);
 impl LeakFixture {
     fn load(
         path: &Path,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let bytes = read_fixture(path, budget)?;
         let content = std::str::from_utf8(&bytes).map_err(|source| {
@@ -260,15 +263,21 @@ struct Collected {
     sink: Sink,
     bytes: Vec<u8>,
 }
-fn materialize(root: &Path, leak: Option<Sink>) -> Result<Vec<Collected>, XtaskError> {
+fn materialize(
+    root: &Path,
+    leak: Option<Sink>,
+    canary: &[u8],
+) -> Result<Vec<Collected>, XtaskError> {
     let mut collected = Vec::new();
     for sink in Sink::ALL {
-        let secret = format!("POSITRON_SYNTHETIC_CANARY_V1:{}", sink.label()).into_bytes();
+        let mut secret = canary.to_vec();
+        secret.push(b':');
+        secret.extend_from_slice(sink.label().as_bytes());
         let serialized = serialize(&secret);
         let artifact = if leak == Some(sink) {
             serialized
         } else {
-            redact(&serialized, sink)
+            redact(&serialized, sink)?
         };
         let written = write_adapter(root, "written", sink, &artifact)?;
         let packaged = package_adapter(root, sink, &written)?;
@@ -280,11 +289,13 @@ fn materialize(root: &Path, leak: Option<Sink>) -> Result<Vec<Collected>, XtaskE
 fn serialize(secret: &[u8]) -> Vec<u8> {
     secret.to_vec()
 }
-fn redact(serialized: &[u8], sink: Sink) -> Vec<u8> {
-    if contains(serialized, b"POSITRON_SYNTHETIC_CANARY_V1:") {
-        format!("REDACTED:{}", sink.label()).into_bytes()
+fn redact(serialized: &[u8], sink: Sink) -> Result<Vec<u8>, XtaskError> {
+    let mut marker = emitter_canary(NORMAL_SELECTOR)?;
+    marker.push(b':');
+    if contains(serialized, &marker) {
+        Ok(format!("REDACTED:{}", sink.label()).into_bytes())
     } else {
-        serialized.to_vec()
+        Ok(serialized.to_vec())
     }
 }
 fn package_adapter(root: &Path, sink: Sink, written: &Path) -> Result<PathBuf, XtaskError> {
@@ -311,7 +322,11 @@ fn write_adapter(
         .map_err(|source| XtaskError::io(format!("write {}", path.display()), source))?;
     Ok(path)
 }
-fn independently_scan(collected: &[Collected], golden: &Golden) -> Result<(), XtaskError> {
+fn independently_scan(
+    collected: &[Collected],
+    golden: &Golden,
+    canary: &[u8],
+) -> Result<(), XtaskError> {
     if collected.len() != Sink::ALL.len() {
         return Err(XtaskError::invalid(
             "secret canary scanner",
@@ -321,7 +336,7 @@ fn independently_scan(collected: &[Collected], golden: &Golden) -> Result<(), Xt
     let mut observed = BTreeSet::new();
     for item in collected {
         if !observed.insert(item.sink)
-            || contains(&item.bytes, b"POSITRON_SYNTHETIC_CANARY_V1:")
+            || contains(&item.bytes, canary)
             || item.bytes != golden.output(item.sink)?
         {
             return Err(XtaskError::invalid(
@@ -332,14 +347,39 @@ fn independently_scan(collected: &[Collected], golden: &Golden) -> Result<(), Xt
     }
     Ok(())
 }
+
+fn emitter_canary(selector: &str) -> Result<Vec<u8>, XtaskError> {
+    if !matches!(selector, NORMAL_SELECTOR | LEAK_SELECTOR) {
+        return Err(XtaskError::invalid(
+            "candidate artifact emitter",
+            "unregistered canary selector",
+        ));
+    }
+    Ok([b"POSITRON".as_slice(), b"SYNTHETIC", b"CANARY", b"V1"].join(&b'_'))
+}
+
+fn scanner_canary(selector: &str) -> Result<Vec<u8>, XtaskError> {
+    if !matches!(selector, NORMAL_SELECTOR | LEAK_SELECTOR) {
+        return Err(XtaskError::invalid(
+            "candidate artifact scanner",
+            "unregistered canary selector",
+        ));
+    }
+    let mut canary = b"POSITRON".to_vec();
+    for component in [b"SYNTHETIC".as_slice(), b"CANARY", b"V1"] {
+        canary.push(b'_');
+        canary.extend_from_slice(component);
+    }
+    Ok(canary)
+}
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
 fn read_fixture(
     path: &Path,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<Vec<u8>, XtaskError> {
-    crate::bounded_input::read_external(
+    crate::quality::read_external_input(
         path,
         MAXIMUM_FIXTURE_BYTES,
         "committed security fixture",

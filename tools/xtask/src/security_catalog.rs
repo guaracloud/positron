@@ -88,12 +88,17 @@ impl FrozenSecurityCatalog {
     pub(crate) fn load(
         root: &Path,
         registry: &Registry,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        selected_review: Option<&crate::security_change_review::SelectedReview>,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let threat_surfaces =
             crate::security_threat_surface::ThreatSurfaceRegistry::load(root, budget)?;
+        let policy_command_validation = match selected_review {
+            Some(selected_review) => selected_review.validate_policy_commands(root, budget)?,
+            None => crate::security_change_review::validate_committed_records(root)?,
+        };
         let path = root.join(CATALOG_PATH);
-        let bytes = crate::bounded_input::read_external(
+        let bytes = crate::quality::read_external_input(
             &path,
             MAXIMUM_CATALOG_BYTES,
             "security runner catalog",
@@ -192,7 +197,8 @@ impl FrozenSecurityCatalog {
             if records.insert((*gate).to_owned(), SecurityDescriptor {
                 id: (*id).to_owned(),
                 evidence_summary: format!(
-                    "schema={evidence_schema}; threat-model={threat_model}; attack-surface={attack_surface}; checks={required_checks}; canary-sinks={canary_sinks}; {}",
+                    "schema={evidence_schema}; threat-model={threat_model}; attack-surface={attack_surface}; checks={required_checks}; canary-sinks={canary_sinks}; {}; {}",
+                    policy_command_validation,
                     threat_surfaces.summary(id)?
                 ),
             }).is_some() {

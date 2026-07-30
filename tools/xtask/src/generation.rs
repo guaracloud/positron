@@ -92,6 +92,11 @@ pub(crate) struct VerificationReport {
 }
 
 impl VerificationReport {
+    /// Returns the digest of the verified byte-identical artifact set.
+    pub(crate) fn artifact_digest(&self) -> &str {
+        &self.first_digest
+    }
+
     /// Returns the bounded human-readable parity evidence.
     pub(crate) fn display(&self) -> String {
         format!(

@@ -6,110 +6,36 @@ use std::path::Path;
 
 use crate::error::XtaskError;
 
-const MAXIMUM_EXTERNAL_INPUT_COUNT: usize = 64;
-const MAXIMUM_EXTERNAL_INPUT_BYTES: usize = 262_144;
-
-pub(crate) struct ExternalInputBudget {
-    count: usize,
-    bytes: usize,
-    declared: Option<(usize, usize)>,
-}
-
-impl ExternalInputBudget {
-    pub(crate) const fn new() -> Self {
-        Self {
-            count: 0,
-            bytes: 0,
-            declared: None,
-        }
-    }
-
-    pub(crate) fn apply_declared_limits(
-        &mut self,
-        maximum_count: usize,
-        maximum_bytes: usize,
-    ) -> Result<(), XtaskError> {
-        if maximum_count == 0
-            || maximum_count > MAXIMUM_EXTERNAL_INPUT_COUNT
-            || maximum_bytes == 0
-            || maximum_bytes > MAXIMUM_EXTERNAL_INPUT_BYTES
-        {
-            return Err(XtaskError::invalid(
-                "M0-10 external input budget",
-                "declared external input limits are zero or exceed the hard safety ceiling",
-            ));
-        }
-        if self
-            .declared
-            .is_some_and(|declared| declared != (maximum_count, maximum_bytes))
-        {
-            return Err(XtaskError::invalid(
-                "M0-10 external input budget",
-                "declared external input limits changed during one quality attempt",
-            ));
-        }
-        self.declared = Some((maximum_count, maximum_bytes));
-        self.enforce()
-    }
-
-    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), XtaskError> {
-        self.count = self.count.checked_add(1).ok_or_else(|| {
-            XtaskError::invalid("M0-10 external input budget", "input count overflowed")
-        })?;
-        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
-            XtaskError::invalid(
-                "M0-10 external input budget",
-                "aggregate input bytes overflowed",
-            )
-        })?;
-        self.enforce()
-    }
-
-    pub(crate) fn summary(&self) -> Result<String, XtaskError> {
-        let Some((maximum_count, maximum_bytes)) = self.declared else {
-            return Err(XtaskError::invalid(
-                "M0-10 external input budget",
-                "PC-0015 did not declare attempt-wide external input limits",
-            ));
-        };
-        Ok(format!(
-            "external-input-count={}; external-input-aggregate-bytes={}; external-input-maximum-count={maximum_count}; external-input-maximum-aggregate-bytes={maximum_bytes}",
-            self.count, self.bytes,
-        ))
-    }
-
-    fn enforce(&self) -> Result<(), XtaskError> {
-        let (maximum_count, maximum_bytes) = self
-            .declared
-            .unwrap_or((MAXIMUM_EXTERNAL_INPUT_COUNT, MAXIMUM_EXTERNAL_INPUT_BYTES));
-        if self.count > maximum_count {
-            return Err(XtaskError::invalid(
-                "M0-10 external input budget",
-                format!("external input count exceeds {maximum_count}"),
-            ));
-        }
-        if self.bytes > maximum_bytes {
-            return Err(XtaskError::invalid(
-                "M0-10 external input budget",
-                format!("external input aggregate exceeds {maximum_bytes} bytes"),
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn read_external(
+pub(crate) fn read(
     path: &Path,
     maximum_bytes: usize,
     subject: &str,
-    budget: &mut ExternalInputBudget,
 ) -> Result<Vec<u8>, XtaskError> {
-    let bytes = read(path, maximum_bytes, subject)?;
-    budget.charge(bytes.len())?;
-    Ok(bytes)
+    let file = File::open(path)
+        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
+    read_opened(file, path, maximum_bytes, subject)
 }
 
-pub(crate) fn read(
+pub(crate) fn read_optional(
+    path: &Path,
+    maximum_bytes: usize,
+    subject: &str,
+) -> Result<Option<Vec<u8>>, XtaskError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(XtaskError::io(
+                format!("open optional {}", path.display()),
+                source,
+            ));
+        },
+    };
+    read_opened(file, path, maximum_bytes, subject).map(Some)
+}
+
+fn read_opened(
+    mut file: File,
     path: &Path,
     maximum_bytes: usize,
     subject: &str,
@@ -119,8 +45,6 @@ pub(crate) fn read(
         .ok_or_else(|| XtaskError::invalid_path(path, "bounded input limit overflows usize"))?;
     let read_limit = u64::try_from(read_capacity)
         .map_err(|_| XtaskError::invalid_path(path, "bounded input limit exceeds u64"))?;
-    let mut file = File::open(path)
-        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
     let mut bytes = Vec::with_capacity(read_capacity);
     file.by_ref()
         .take(read_limit)
@@ -133,4 +57,77 @@ pub(crate) fn read(
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{read, read_optional};
+
+    #[test]
+    fn required_and_optional_reads_enforce_the_exact_source_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "positron-bounded-input-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir(&root)?;
+        let required = root.join("required.tsv");
+        let optional = root.join("optional.tsv");
+        let result = (|| {
+            fs::write(&required, [b'x'; 16])?;
+            if read(&required, 16, "required registry")?.len() != 16 {
+                return Err(std::io::Error::other(
+                    "required exact-boundary read changed byte length",
+                )
+                .into());
+            }
+            fs::write(&required, [b'x'; 17])?;
+            if !read(&required, 16, "required registry")
+                .is_err_and(|error| error.to_string().contains("exceeds 16 bytes"))
+            {
+                return Err(std::io::Error::other(
+                    "required max+1 registry did not fail at the source boundary",
+                )
+                .into());
+            }
+            if read_optional(&optional, 16, "optional registry")?.is_some() {
+                return Err(
+                    std::io::Error::other("missing optional registry was not absent").into(),
+                );
+            }
+            fs::write(&optional, [b'x'; 16])?;
+            if read_optional(&optional, 16, "optional registry")?
+                .is_none_or(|bytes| bytes.len() != 16)
+            {
+                return Err(std::io::Error::other(
+                    "optional exact-boundary read changed byte length",
+                )
+                .into());
+            }
+            fs::write(&optional, [b'x'; 17])?;
+            if !read_optional(&optional, 16, "optional registry")
+                .is_err_and(|error| error.to_string().contains("exceeds 16 bytes"))
+            {
+                return Err(std::io::Error::other(
+                    "optional max+1 registry did not fail at the source boundary",
+                )
+                .into());
+            }
+            fs::remove_file(&optional)?;
+            fs::create_dir(&optional)?;
+            if read_optional(&optional, 16, "optional registry").is_ok() {
+                return Err(std::io::Error::other(
+                    "optional registry converted a non-NotFound I/O error into absence",
+                )
+                .into());
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(root)?;
+        result
+    }
 }

@@ -25,6 +25,10 @@ mod evidence_json;
 mod framed_stdout_reader;
 mod generation;
 mod hooks;
+mod matrix_execution_plan;
+mod matrix_product_target;
+mod matrix_targets;
+mod matrix_verifier;
 mod qualification_fixtures;
 mod quality;
 mod registered_task_lifecycle;
@@ -96,14 +100,11 @@ fn run() -> Result<(), XtaskError> {
             let artifact_root = arguments
                 .next()
                 .ok_or_else(|| XtaskError::usage("quality-secret-canary requires artifact root"))?;
-            let canary_id = arguments.next().ok_or_else(|| {
-                XtaskError::usage("quality-secret-canary requires canary identity")
+            let selector = arguments.next().ok_or_else(|| {
+                XtaskError::usage("quality-secret-canary requires a registered selector")
             })?;
             ensure_no_more_arguments(arguments)?;
-            security_harness::emit_secret_candidate(
-                std::path::Path::new(&artifact_root),
-                &canary_id,
-            )
+            security_harness::emit_secret_candidate(std::path::Path::new(&artifact_root), &selector)
         },
         "quality-internal-cancel-dynamic" => dynamic_cancellation::run(arguments),
         "quality-fixture" => qualification_fixtures::run_process(arguments),

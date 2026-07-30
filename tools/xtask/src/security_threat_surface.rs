@@ -45,11 +45,17 @@ pub(crate) struct ThreatSurfaceRegistry {
 impl ThreatSurfaceRegistry {
     pub(crate) fn load(
         root: &Path,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
-        crate::security_change_review::validate_policy_commands(root, budget)?;
+        Self::load_with_model_records(root, budget)
+    }
+
+    fn load_with_model_records(
+        root: &Path,
+        budget: &mut crate::quality::SecurityInputBudget,
+    ) -> Result<Self, XtaskError> {
         let path = root.join(PATH);
-        let bytes = crate::bounded_input::read_external(
+        let bytes = crate::quality::read_external_input(
             &path,
             MAXIMUM_REGISTRY_BYTES,
             "security threat-surface registry",
@@ -236,12 +242,20 @@ impl ThreatSurfaceRegistry {
             })
     }
 
+    /// Return the immutable classification sources used by historical review
+    /// records. This deliberately exposes no live changed-path information.
+    pub(crate) fn classification_maps(
+        &self,
+    ) -> (&BTreeMap<String, String>, &BTreeMap<String, String>) {
+        (&self.model_coverage, &self.reviewed_non_trust)
+    }
+
     pub(crate) fn validate_changed_paths(
         &self,
         root: &Path,
         merge_base: &str,
         changed_paths: &str,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<String, XtaskError> {
         crate::security_change_review::validate(
             root,
@@ -260,10 +274,10 @@ fn validate_model_record(
     owner: &str,
     boundary: &str,
     surfaces: &str,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
     let path = root.join(format!("qualification/engineering/security/{model}.json"));
-    let bytes = crate::bounded_input::read_external(
+    let bytes = crate::quality::read_external_input(
         &path,
         MAXIMUM_MODEL_BYTES,
         "versioned threat-model record",
