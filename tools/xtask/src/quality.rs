@@ -56,6 +56,11 @@ const SNAPSHOT_DIGEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAXIMUM_CAPTURED_REPORT_STREAM_BYTES: usize = 131_072;
 const MAXIMUM_MATRIX_CAPTURED_REPORT_STREAM_BYTES: usize = MAXIMUM_CAPTURED_REPORT_STREAM_BYTES;
 const LEGACY_MATRIX_BINDING_REVISION: &str = "bd5386209359d8395b90e18a16fa20a6962c935b";
+const PRE_GENERATION_MATRIX_SUMMARY_REVISIONS: [&str; 3] = [
+    "f0f127dee2fecf8526c0d4365eb52fd7ce4bb084",
+    "ca9c6b4b12f67ba5155d8403c7986a6018f24452",
+    "2dc957a6d3c9fa2ff90cff2b8037fa024cde0163",
+];
 const MAXIMUM_RAW_REPORT_BYTES: usize = 8_388_608;
 const MAXIMUM_RETAINED_EVIDENCE_BYTES: usize = 2_097_152;
 const MAXIMUM_CONTROLLED_REPORT_STEPS: usize = 128;
@@ -2131,8 +2136,26 @@ fn legacy_matrix_public_gate_detail(
     )
 }
 
+fn pre_generation_matrix_public_gate_detail(
+    gate: &Gate,
+    executed_targets: usize,
+    binding_root: &str,
+    product_outcome: crate::matrix_product_target::MatrixProductOutcome,
+) -> String {
+    format!(
+        "exact-targets={executed_targets}; binding-root={binding_root}; product-outcome={}; qualification=no-product-qualification; coordinator: {}; exception class: {}",
+        product_outcome.label(),
+        gate.coordinator,
+        gate.exception_class,
+    )
+}
+
 fn uses_legacy_matrix_binding_contract(profile: Profile, revision: &str) -> bool {
     profile == Profile::Pr && revision == LEGACY_MATRIX_BINDING_REVISION
+}
+
+fn uses_pre_generation_matrix_summary(profile: Profile, revision: &str) -> bool {
+    profile == Profile::Pr && PRE_GENERATION_MATRIX_SUMMARY_REVISIONS.contains(&revision)
 }
 
 fn matrix_binding_root(manifests: &[Vec<u8>]) -> String {
@@ -4052,6 +4075,13 @@ fn validate_matrix_controlled_steps(
     }
     let expected_detail = if legacy_binding_contract {
         legacy_matrix_public_gate_detail(gate, expected_steps.len(), expected.product_outcome())
+    } else if uses_pre_generation_matrix_summary(context.profile, context.revision) {
+        pre_generation_matrix_public_gate_detail(
+            gate,
+            expected_steps.len(),
+            expected.binding_root(),
+            expected.product_outcome(),
+        )
     } else {
         matrix_public_gate_detail(
             gate,
@@ -9356,10 +9386,11 @@ mod tests {
         RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
         character_count_in_range, evidence_json, gate_invocation_json, json_string,
         legacy_matrix_public_gate_detail, nextest_completed_test_count,
-        parse_gate_invocation_value, raw_report_json_with_limit,
-        registered_dependency_command_matches, registered_runner_command_matches,
-        run_generation_matrix_gate, sha256_digest, unavailable_evidence_identity,
-        uses_legacy_matrix_binding_contract, valid_hex_identity, valid_raw_report_schema_path,
+        parse_gate_invocation_value, pre_generation_matrix_public_gate_detail,
+        raw_report_json_with_limit, registered_dependency_command_matches,
+        registered_runner_command_matches, run_generation_matrix_gate, sha256_digest,
+        unavailable_evidence_identity, uses_legacy_matrix_binding_contract,
+        uses_pre_generation_matrix_summary, valid_hex_identity, valid_raw_report_schema_path,
         valid_sha256_digest, validate_configuration_parser_threat_model_text,
         validate_serialized_evidence,
     };
@@ -9393,6 +9424,30 @@ mod tests {
             "exact-targets=14; product-outcome=missing; qualification=no-product-qualification"
         ));
         assert!(detail.len() <= 512);
+
+        let pre_generation = pre_generation_matrix_public_gate_detail(
+            &gate,
+            14,
+            "sha256:binding",
+            MatrixProductOutcome::Missing,
+        );
+        for revision in [
+            "f0f127dee2fecf8526c0d4365eb52fd7ce4bb084",
+            "ca9c6b4b12f67ba5155d8403c7986a6018f24452",
+            "2dc957a6d3c9fa2ff90cff2b8037fa024cde0163",
+        ] {
+            assert!(uses_pre_generation_matrix_summary(Profile::Pr, revision));
+            assert!(!uses_pre_generation_matrix_summary(Profile::Ext, revision));
+        }
+        assert!(!uses_pre_generation_matrix_summary(
+            Profile::Pr,
+            "2dc957a6d3c9fa2ff90cff2b8037fa024cde0164"
+        ));
+        assert_eq!(
+            pre_generation,
+            "exact-targets=14; binding-root=sha256:binding; product-outcome=missing; qualification=no-product-qualification; coordinator: Quality Engineering; exception class: temporary"
+        );
+        assert!(pre_generation.len() <= 512);
     }
 
     #[test]
