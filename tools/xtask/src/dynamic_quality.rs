@@ -11,89 +11,24 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::dynamic_catalog::{
+    DynamicCapability, DynamicKind, DynamicOutputProtocol, FrozenDynamicCatalog, catalog_digest,
+};
 use crate::error::XtaskError;
 use crate::quality::Profile;
 
 const REGISTRY_PATH: &str = "qualification/engineering/dynamic-targets.tsv";
-const REGISTRY_HEADER: &str = "target_id\tgate_id\tkind\tstages\ttool\targuments\tcorpus\tseed\tschedule\tminimized_failure\toutput_protocol\ttimeout_seconds";
+const REGISTRY_HEADER: &str = "target_id\tgate_id\tcapability_id\tstages\targuments\tcorpus\tseed\tschedule\tminimized_failure\toutput_protocol\ttimeout_seconds";
 const MAXIMUM_REGISTRY_BYTES: usize = 16_384;
 const MAXIMUM_TARGETS: usize = 32;
 const MAXIMUM_FIELD_BYTES: usize = 256;
 const DYNAMIC_GATE: &str = "EG-DYNAMIC";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DynamicKind {
-    Property,
-    StateModel,
-    Fuzz,
-    Corpus,
-    Miri,
-    Sanitizer,
-    Loom,
-}
-
-impl DynamicKind {
-    fn parse(value: &str) -> Result<Self, XtaskError> {
-        match value {
-            "property" => Ok(Self::Property),
-            "state-model" => Ok(Self::StateModel),
-            "fuzz" => Ok(Self::Fuzz),
-            "corpus" => Ok(Self::Corpus),
-            "miri" => Ok(Self::Miri),
-            "sanitizer" => Ok(Self::Sanitizer),
-            "loom" => Ok(Self::Loom),
-            _ => Err(XtaskError::invalid(
-                "dynamic target registry",
-                format!("unknown dynamic detector kind `{value}`"),
-            )),
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Property => "property",
-            Self::StateModel => "state-model",
-            Self::Fuzz => "fuzz",
-            Self::Corpus => "corpus",
-            Self::Miri => "miri",
-            Self::Sanitizer => "sanitizer",
-            Self::Loom => "loom",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DynamicOutputProtocol {
-    ExitStatusV1,
-    ExactLineV1,
-}
-
-impl DynamicOutputProtocol {
-    fn parse(value: &str) -> Result<Self, XtaskError> {
-        match value {
-            "exit-status-v1" => Ok(Self::ExitStatusV1),
-            "exact-line-v1" => Ok(Self::ExactLineV1),
-            _ => Err(XtaskError::invalid(
-                "dynamic target registry",
-                format!("unknown dynamic target output protocol `{value}`"),
-            )),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::ExitStatusV1 => "exit-status-v1",
-            Self::ExactLineV1 => "exact-line-v1",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct DynamicTarget {
     id: String,
-    kind: DynamicKind,
+    capability: DynamicCapability,
     stages: BTreeSet<String>,
-    tool: String,
     arguments: Vec<String>,
     corpus: String,
     seed: String,
@@ -101,6 +36,8 @@ pub(crate) struct DynamicTarget {
     minimized_failure: String,
     output_protocol: DynamicOutputProtocol,
     timeout: Duration,
+    catalog_digest: String,
+    registry_digest: String,
 }
 
 impl DynamicTarget {
@@ -109,15 +46,31 @@ impl DynamicTarget {
     }
 
     pub(crate) fn kind(&self) -> DynamicKind {
-        self.kind
+        self.capability.kind()
+    }
+
+    pub(crate) fn capability_id(&self) -> &str {
+        self.capability.id()
     }
 
     pub(crate) fn tool_id(&self) -> &str {
-        &self.tool
+        self.capability.tool_id()
+    }
+
+    pub(crate) fn tool_version(&self) -> &str {
+        self.capability.tool_version()
+    }
+
+    pub(crate) fn capability(&self) -> &DynamicCapability {
+        &self.capability
     }
 
     pub(crate) fn arguments_slice(&self) -> &[String] {
         &self.arguments
+    }
+
+    pub(crate) fn stages(&self) -> &BTreeSet<String> {
+        &self.stages
     }
 
     pub(crate) fn corpus(&self) -> &str {
@@ -144,6 +97,14 @@ impl DynamicTarget {
         self.timeout
     }
 
+    pub(crate) fn catalog_digest(&self) -> &str {
+        &self.catalog_digest
+    }
+
+    pub(crate) fn registry_digest(&self) -> &str {
+        &self.registry_digest
+    }
+
     pub(crate) fn validate_output(&self, stdout: &str) -> Result<(), XtaskError> {
         match self.output_protocol {
             DynamicOutputProtocol::ExitStatusV1 => Ok(()),
@@ -161,9 +122,10 @@ impl DynamicTarget {
 
     pub(crate) fn retained_identity(&self) -> String {
         format!(
-            "target={};kind={};corpus={};seed={};schedule={};minimized-failure={};output-protocol={}",
+            "target={};kind={};capability={};corpus={};seed={};schedule={};minimized-failure={};output-protocol={}",
             self.id,
-            self.kind.label(),
+            self.capability.kind().label(),
+            self.capability.id(),
             self.corpus,
             self.seed,
             self.schedule,
@@ -177,11 +139,7 @@ impl DynamicTarget {
             Profile::PreCommit => false,
             Profile::Pr => self.stages.contains("PR"),
             Profile::Ext => self.stages.contains("PR") || self.stages.contains("EXT"),
-            Profile::Qual => {
-                self.stages.contains("PR")
-                    || self.stages.contains("EXT")
-                    || self.stages.contains("QUAL")
-            },
+            Profile::Qual => self.stages.contains("QUAL"),
         }
     }
 }
@@ -195,6 +153,7 @@ impl FrozenDynamicTargets {
     pub(crate) fn load(
         root: &Path,
         owning_gate_stages: &BTreeSet<String>,
+        catalog: &FrozenDynamicCatalog,
     ) -> Result<Self, XtaskError> {
         let path = root.join(REGISTRY_PATH);
         let bytes = fs::read(&path)
@@ -234,9 +193,8 @@ impl FrozenDynamicTargets {
             let [
                 id,
                 gate,
-                kind,
+                capability_id,
                 stages,
-                tool,
                 arguments,
                 corpus,
                 seed,
@@ -257,9 +215,8 @@ impl FrozenDynamicTargets {
             for field in [
                 *id,
                 *gate,
-                *kind,
+                *capability_id,
                 *stages,
-                *tool,
                 *arguments,
                 *corpus,
                 *seed,
@@ -290,6 +247,14 @@ impl FrozenDynamicTargets {
                     format!("dynamic target registry repeats target `{id}`"),
                 ));
             }
+            let capability = catalog.capability(capability_id).ok_or_else(|| {
+                XtaskError::invalid_path(
+                    &path,
+                    format!(
+                        "dynamic target `{id}` references unknown capability `{capability_id}`"
+                    ),
+                )
+            })?;
             for (label, value) in [
                 ("corpus", *corpus),
                 ("seed", *seed),
@@ -310,11 +275,18 @@ impl FrozenDynamicTargets {
             }
             let arguments = parse_arguments(&path, arguments)?;
             let timeout = parse_timeout(&path, timeout_seconds)?;
+            if arguments.len() > capability.maximum_arguments()
+                || timeout > capability.maximum_timeout()
+            {
+                return Err(XtaskError::invalid_path(
+                    &path,
+                    format!("dynamic target `{id}` exceeds its capability bounds"),
+                ));
+            }
             targets.push(DynamicTarget {
                 id: (*id).to_owned(),
-                kind: DynamicKind::parse(kind)?,
+                capability: capability.clone(),
                 stages,
-                tool: (*tool).to_owned(),
                 arguments,
                 corpus: (*corpus).to_owned(),
                 seed: (*seed).to_owned(),
@@ -322,6 +294,8 @@ impl FrozenDynamicTargets {
                 minimized_failure: (*minimized_failure).to_owned(),
                 output_protocol: DynamicOutputProtocol::parse(output_protocol)?,
                 timeout,
+                catalog_digest: catalog.digest().to_owned(),
+                registry_digest: catalog_digest(b"positron-dynamic-target-registry-v1\0", &bytes),
             });
         }
         if targets.is_empty() {
@@ -337,6 +311,10 @@ impl FrozenDynamicTargets {
         self.targets
             .iter()
             .filter(move |target| target.selected_by(profile))
+    }
+
+    pub(crate) fn all(&self) -> &[DynamicTarget] {
+        &self.targets
     }
 }
 
@@ -410,7 +388,7 @@ fn parse_timeout(path: &Path, value: &str) -> Result<Duration, XtaskError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicKind, DynamicOutputProtocol};
+    use crate::dynamic_catalog::{DynamicKind, DynamicOutputProtocol};
 
     #[test]
     fn every_registered_dynamic_detector_kind_has_a_closed_parser_label_pair() {

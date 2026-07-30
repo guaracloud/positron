@@ -44,8 +44,8 @@ fn quality_runs_each_registered_dynamic_target_through_the_public_seam() -> Test
             "EG-DYNAMIC",
         )?)?;
         for required in [
-            "target=domain-value-properties;kind=property;corpus=domain-value-boundaries-v1;seed=seed-domain-properties-v1;schedule=proptest-sequence-v1;minimized-failure=domain-value-minimized-v1;output-protocol=exit-status-v1",
-            "target=domain-lifecycle-state-model;kind=state-model;corpus=domain-lifecycle-transitions-v1;seed=seed-domain-state-model-v1;schedule=transition-schedule-v1;minimized-failure=domain-lifecycle-minimized-v1;output-protocol=exit-status-v1",
+            "target=domain-value-properties;kind=property;capability=property;corpus=domain-value-boundaries-v1;seed=seed-domain-properties-v1;schedule=proptest-sequence-v1;minimized-failure=domain-value-minimized-v1;output-protocol=exit-status-v1",
+            "target=domain-lifecycle-state-model;kind=state-model;capability=state-model;corpus=domain-lifecycle-transitions-v1;seed=seed-domain-state-model-v1;schedule=transition-schedule-v1;minimized-failure=domain-lifecycle-minimized-v1;output-protocol=exit-status-v1",
             "tenant_lifecycle_makes_purge_one_way",
             "plan=dynamic-execution-plan-v1",
             "argv-digest=sha256:",
@@ -101,7 +101,7 @@ fn quality_rejects_a_stale_or_unknown_dynamic_detector_kind_through_the_public_s
             "\tobsolete-property\tPR|EXT\t",
         )?;
         let output = fixture.quality_output_for("pr")?;
-        assert_rejected_output(&output, "unknown dynamic detector kind `obsolete-property`")?;
+        assert_rejected_output(&output, "references unknown capability `obsolete-property`")?;
         assert_failed_dynamic_evidence(&fixture)
     })();
     let cleanup = fixture.remove();
@@ -137,12 +137,14 @@ fn quality_retains_a_missing_dynamic_tool_without_fallback() -> TestResult {
     let result = (|| {
         enable_dynamic_gate(&fixture)?;
         replace_once(
-            &fixture.root.join(DYNAMIC_TARGETS),
-            "\tcargo\ttest|--locked|--package|positron-domain|--test|dynamic_domain_properties\t",
-            "\tdefinitively-absent-dynamic-tool\ttest|--locked|--package|positron-domain|--test|dynamic_domain_properties\t",
+            &fixture
+                .root
+                .join("qualification/engineering/toolchains.tsv"),
+            "cargo\t1.96.0\tcargo\t--version\tpr|ext|qual",
+            "definitively-absent-dynamic-tool\t1.96.0\tcargo\t--version\tpr|ext|qual",
         )?;
         let output = fixture.quality_output_for("pr")?;
-        assert_rejected_output(&output, "definitively-absent-dynamic-tool")?;
+        assert_rejected_output(&output, "references a missing tool")?;
         assert_failed_dynamic_evidence(&fixture)
     })();
     let cleanup = fixture.remove();
@@ -200,7 +202,7 @@ fn quality_uses_dynamic_target_bytes_captured_before_a_post_capture_registry_swa
         replace_once(
             &fixture.root.join("tools/xtask/src/quality.rs"),
             "    let selected = targets.selected(profile).collect::<Vec<_>>();\n",
-            "    std::fs::write(\n        root.join(\"qualification/engineering/dynamic-targets.tsv\"),\n        b\"target_id\\tgate_id\\tkind\\tstages\\ttool\\targuments\\tcorpus\\tseed\\tschedule\\tminimized_failure\\toutput_protocol\\ttimeout_seconds\\nforged\\tEG-DYNAMIC\\tproperty\\tPR\\tcargo\\ttest\\tforged-corpus\\tforged-seed\\tforged-schedule\\tforged-minimized\\texit-status-v1\\t1\\n\",\n    )\n    .map_err(|source| XtaskError::io(\"test dynamic registry post-capture swap\", source))?;\n    let selected = targets.selected(profile).collect::<Vec<_>>();\n",
+            "    std::fs::write(\n        root.join(\"qualification/engineering/dynamic-targets.tsv\"),\n        b\"target_id\\tgate_id\\tcapability_id\\tstages\\targuments\\tcorpus\\tseed\\tschedule\\tminimized_failure\\toutput_protocol\\ttimeout_seconds\\nforged\\tEG-DYNAMIC\\tproperty\\tPR\\ttest\\tforged-corpus\\tforged-seed\\tforged-schedule\\tforged-minimized\\texit-status-v1\\t1\\n\",\n    )\n    .map_err(|source| XtaskError::io(\"test dynamic registry post-capture swap\", source))?;\n    let selected = targets.selected(profile).collect::<Vec<_>>();\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         if !output.status.success() {

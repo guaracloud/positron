@@ -479,6 +479,8 @@ mod m0_09_coverage_audit;
 mod m0_09_dynamic_plans;
 #[path = "foundational_scope_activation/m0_09_dynamic_quality.rs"]
 mod m0_09_dynamic_quality;
+#[path = "foundational_scope_activation/m0_09_dynamic_verifier.rs"]
+mod m0_09_dynamic_verifier;
 
 #[cfg(unix)]
 #[test]

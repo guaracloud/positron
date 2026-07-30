@@ -1255,6 +1255,23 @@ fn invocation_environment_digest(environment: &[(OsString, OsString)]) -> String
     format!("sha256:{:x}", hasher.finalize())
 }
 
+fn dynamic_invocation_environment_digest(
+    snapshot_digest: &str,
+    overrides: &[(String, String)],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"positron-dynamic-invocation-environment-v1\0");
+    hasher.update(snapshot_digest.as_bytes());
+    hasher.update(b"\0");
+    for (name, value) in overrides {
+        hasher.update(name.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 fn invocation_input_identity(input: &InvocationInput) -> (&'static str, usize, String) {
     match input {
         InvocationInput::Null => ("null", 0, "-".to_owned()),
@@ -1325,7 +1342,7 @@ fn gate_selected(gate: &Gate, profile: Profile, activated_risk_gates: &BTreeSet<
     match profile {
         Profile::Pr => gate.stages.contains("PR"),
         Profile::Ext => gate.stages.contains("PR") || gate.stages.contains("EXT"),
-        Profile::Qual => true,
+        Profile::Qual => gate.id != "EG-DYNAMIC",
         Profile::PreCommit => false,
     }
 }
@@ -1338,7 +1355,7 @@ fn not_selected_reason(gate: &Gate, profile: Profile) -> String {
     let stage_applies = match profile {
         Profile::Pr => gate.stages.contains("PR"),
         Profile::Ext => gate.stages.contains("PR") || gate.stages.contains("EXT"),
-        Profile::Qual => true,
+        Profile::Qual => gate.id != "EG-DYNAMIC",
         Profile::PreCommit => false,
     };
     if !stage_applies {
@@ -1715,7 +1732,9 @@ fn run_dynamic_analysis_gate(
                 "EG-DYNAMIC is missing from the captured gate registry",
             )
         })?;
-    let targets = crate::dynamic_quality::FrozenDynamicTargets::load(root, owning_stages)?;
+    let catalog = crate::dynamic_catalog::FrozenDynamicCatalog::load(root, &registry.tools)?;
+    let targets =
+        crate::dynamic_quality::FrozenDynamicTargets::load(root, owning_stages, &catalog)?;
     let selected = targets.selected(profile).collect::<Vec<_>>();
     if selected.is_empty() {
         return Err(XtaskError::invalid(
@@ -1735,6 +1754,8 @@ fn run_dynamic_analysis_gate(
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect::<Vec<_>>();
+        let retained_environment_digest =
+            dynamic_invocation_environment_digest(environment.digest(), plan.environment());
         let outcome = run_status_with_options(
             root,
             environment,
@@ -1743,6 +1764,7 @@ fn run_dynamic_analysis_gate(
             StatusOptions {
                 timeout,
                 environment: &plan_environment,
+                retained_environment_digest: Some(retained_environment_digest),
                 cancellation: Arc::clone(&cancellation),
                 cancellation_marker,
                 maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
@@ -1751,10 +1773,9 @@ fn run_dynamic_analysis_gate(
         )?;
         target.validate_output(&outcome.stdout)?;
         results.push(format!(
-            "{}; {}; {}",
+            "{}; {}",
             target.retained_identity(),
             plan.retained_identity(),
-            outcome.display,
         ));
     }
     Ok(results.join(" | "))
@@ -2956,6 +2977,7 @@ fn run_documentation_gate(
                 ("RUSTDOCFLAGS", "-D warnings"),
                 ("CARGO_TARGET_DIR", target_value),
             ],
+            retained_environment_digest: None,
             cancellation: Arc::new(AtomicBool::new(false)),
             cancellation_marker: None,
             maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
@@ -3105,6 +3127,7 @@ struct ParsedGateRecord {
     controlled_steps: Vec<bounded_json::JsonValue>,
     owner: ParsedIdentityBinding,
     raw_report: ParsedRawReportBinding,
+    detail: String,
 }
 
 #[derive(Debug)]
@@ -3128,6 +3151,14 @@ struct ParsedIdentityBinding {
 struct ParsedGateInvocation {
     typed: GateInvocation,
     controlled_steps: Vec<bounded_json::JsonValue>,
+}
+
+struct RetainedGateValidationContext<'context> {
+    root: &'context Path,
+    profile: Profile,
+    registry: &'context Registry,
+    snapshot_digest: &'context str,
+    path: &'context Path,
 }
 
 #[derive(Clone, Copy)]
@@ -3176,6 +3207,7 @@ impl RetainedDocumentKind {
 }
 
 fn validate_registered_gate_bindings(
+    root: &Path,
     evidence: &ParsedEvidenceRecord,
     registry: &Registry,
     path: &Path,
@@ -3272,13 +3304,18 @@ fn validate_registered_gate_bindings(
                 ),
             );
         }
+        let context = RetainedGateValidationContext {
+            root,
+            profile: evidence.profile,
+            registry,
+            snapshot_digest: &evidence.environment_digest,
+            path,
+        };
         validate_registered_controlled_steps(
             registered,
-            evidence.profile,
             exceptional_mode.is_some() || retained.result == "not-selected",
             retained,
-            registry,
-            path,
+            &context,
         )?;
     }
     Ok(())
@@ -3334,11 +3371,9 @@ fn validate_pre_registry_gate_binding(
 
 fn validate_registered_controlled_steps(
     gate: &Gate,
-    profile: Profile,
     must_be_empty: bool,
     retained: &ParsedGateRecord,
-    registry: &Registry,
-    path: &Path,
+    context: &RetainedGateValidationContext<'_>,
 ) -> Result<(), XtaskError> {
     let retained_result = retained.result.as_str();
     let steps = &retained.typed_invocation.controlled_steps;
@@ -3347,14 +3382,18 @@ fn validate_registered_controlled_steps(
             return Ok(());
         }
         return invalid_json(
-            path,
+            context.path,
             format!(
                 "retained gate `{}` records commands despite not executing",
                 gate.id
             ),
         );
     }
-    let expected_step_count = canonical_controlled_step_count(gate, profile, registry);
+    if gate.runner == "dynamic-analysis" {
+        return validate_dynamic_controlled_steps(gate, retained, context);
+    }
+    let expected_step_count =
+        canonical_controlled_step_count(gate, context.profile, context.registry);
     let cardinality_matches = if expected_step_count == 0 {
         steps.is_empty()
     } else {
@@ -3366,7 +3405,7 @@ fn validate_registered_controlled_steps(
     };
     if !cardinality_matches {
         return invalid_json(
-            path,
+            context.path,
             format!(
                 "retained gate `{}` does not contain its exact canonical controlled steps: result {retained_result}, expected {}, found {}",
                 gate.id,
@@ -3384,14 +3423,18 @@ fn validate_registered_controlled_steps(
     let maximum_timeout_ms = u128::from(gate.timeout_seconds)
         .checked_mul(1_000)
         .ok_or_else(|| {
-            XtaskError::invalid_path(path, "registered gate timeout milliseconds overflow")
+            XtaskError::invalid_path(
+                context.path,
+                "registered gate timeout milliseconds overflow",
+            )
         })?;
     for (index, step) in steps.iter().enumerate() {
         let process_backed_runner = matches!(gate.runner.as_str(), "concurrency" | "resource");
         let registered_program = if process_backed_runner {
             step.program == "cargo-xtask-quality/bounded-runner"
         } else {
-            registry
+            context
+                .registry
                 .tools
                 .iter()
                 .any(|tool| tool.command == step.program)
@@ -3412,17 +3455,85 @@ fn validate_registered_controlled_steps(
             || step.input_sha256 != "-"
             || !registered_runner_command_matches(
                 gate.runner.as_str(),
-                profile,
+                context.profile,
                 index,
                 step,
-                registry,
+                context.registry,
             )
         {
             return invalid_json(
-                path,
+                context.path,
                 format!(
                     "retained gate `{}` controlled step {index} does not match its registered command semantics",
                     gate.id
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_dynamic_controlled_steps(
+    gate: &Gate,
+    retained: &ParsedGateRecord,
+    context: &RetainedGateValidationContext<'_>,
+) -> Result<(), XtaskError> {
+    let expected = crate::dynamic_verifier::ExpectedDynamicGate::capture(
+        context.root,
+        &gate.stages,
+        context.profile,
+        &context.registry.tools,
+    )?;
+    let retained_steps = &retained.typed_invocation.controlled_steps;
+    let expected_steps = expected.steps();
+    let cardinality_matches = match retained.result.as_str() {
+        "passed" => retained_steps.len() == expected_steps.len(),
+        "failed" => (1..=expected_steps.len()).contains(&retained_steps.len()),
+        _ => false,
+    };
+    if !cardinality_matches {
+        return invalid_json(
+            context.path,
+            format!(
+                "retained gate `{}` does not contain the independently derived dynamic step set",
+                gate.id
+            ),
+        );
+    }
+    let expected_detail = format!(
+        "{}; coordinator: {}; exception class: {}",
+        expected.passed_detail(),
+        gate.coordinator,
+        gate.exception_class,
+    );
+    if retained.result == "passed" && retained.detail != expected_detail {
+        return invalid_json(
+            context.path,
+            "retained EG-DYNAMIC detail does not match independently derived target and plan identities",
+        );
+    }
+    for (index, (step, expected_step)) in
+        retained_steps.iter().zip(expected_steps.iter()).enumerate()
+    {
+        let expected_environment_digest =
+            expected_step.invocation_environment_digest(context.snapshot_digest);
+        let resolved = Path::new(&step.resolved_program);
+        let resolved_matches = resolved.is_absolute()
+            && resolved.file_name().and_then(OsStr::to_str) == Some(expected_step.program());
+        if step.program != expected_step.program()
+            || step.arguments != expected_step.arguments()
+            || !resolved_matches
+            || step.timeout_ms > expected_step.maximum_timeout().as_millis()
+            || step.timeout_ms > u128::from(gate.timeout_seconds) * 1_000
+            || step.environment_digest != expected_environment_digest
+            || step.input_kind != "null"
+            || step.input_bytes != 0
+            || step.input_sha256 != "-"
+        {
+            return invalid_json(
+                context.path,
+                format!(
+                    "retained EG-DYNAMIC controlled step {index} does not match its independently derived canonical plan"
                 ),
             );
         }
@@ -3453,7 +3564,6 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
                 + usize::from(registry.has_m0_03_canonical_api_scope())
                 + usize::from(registry.has_m0_04_configuration_scope())
         },
-        "dynamic-analysis" => 2,
         "dependencies" => 3,
         "documentation" | "rust" | "test" => 2,
         "correctness" => 0,
@@ -3667,25 +3777,6 @@ fn registered_runner_command_matches(
             },
             _ => false,
         },
-        "dynamic-analysis" => match index {
-            0 => {
-                program == "cargo"
-                    && args
-                        == [
-                            "test",
-                            "--locked",
-                            "--package",
-                            "positron-domain",
-                            "--test",
-                            "foundational_domain_types",
-                        ]
-            },
-            1 => {
-                program == "cargo"
-                    && args == ["test", "--locked", "--package", "positron-domain", "--doc"]
-            },
-            _ => false,
-        },
         "coverage" => {
             program == "cargo"
                 && args.first() == Some(&"+nightly-2026-07-20")
@@ -3863,7 +3954,7 @@ fn validate_retained_v3_reports(
     evidence: &str,
 ) -> Result<BTreeSet<PathBuf>, XtaskError> {
     let parsed = parse_evidence_record(evidence_path, evidence)?;
-    validate_registered_gate_bindings(&parsed, registry, evidence_path)?;
+    validate_registered_gate_bindings(root, &parsed, registry, evidence_path)?;
     let mut expected_reports = BTreeSet::new();
     for gate in parsed.gates {
         if gate.raw_report.applicability == "not-applicable" {
@@ -3929,12 +4020,25 @@ fn validate_retained_v3_reports(
         if parsed_report.attempt_id != parsed.attempt_id
             || parsed_report.gate_id != gate.gate_id
             || parsed_report.result != gate.result
+            || parsed_report.detail != gate.detail
             || parsed_report.invocation != gate.invocation
             || parsed_report.controlled_steps != gate.controlled_steps
         {
             return Err(XtaskError::invalid_path(
                 &report_path,
                 "raw report fields do not exactly cross-reference their evidence gate",
+            ));
+        }
+        if gate.gate_id == "EG-DYNAMIC"
+            && gate.result == "passed"
+            && parsed_report
+                .controlled_verdicts
+                .iter()
+                .any(|verdict| verdict != "exit-status:exit status: 0")
+        {
+            return Err(XtaskError::invalid_path(
+                &report_path,
+                "passed EG-DYNAMIC raw report contains a non-passing controlled result",
             ));
         }
     }
@@ -4045,9 +4149,11 @@ struct ParsedRawReportRecord {
     attempt_id: String,
     gate_id: String,
     result: String,
+    detail: String,
     invocation_digest: String,
     invocation: bounded_json::JsonValue,
     controlled_steps: Vec<bounded_json::JsonValue>,
+    controlled_verdicts: Vec<String>,
 }
 
 fn parse_evidence_record(path: &Path, content: &str) -> Result<ParsedEvidenceRecord, XtaskError> {
@@ -4208,6 +4314,7 @@ fn parse_gate_record(
         controlled_steps: parsed_invocation.controlled_steps,
         owner,
         raw_report,
+        detail,
     })
 }
 
@@ -4433,7 +4540,8 @@ fn parse_raw_report_record(
             "raw report invocation digest does not match its canonical structured invocation",
         );
     }
-    if require_string(&mut object, "detail", path)?.is_empty() {
+    let detail = require_string(&mut object, "detail", path)?;
+    if detail.is_empty() {
         return invalid_json(path, "raw report detail is empty");
     }
     let controlled_step_values = require_array(&mut object, "controlled_steps", path)?;
@@ -4441,6 +4549,7 @@ fn parse_raw_report_record(
         return invalid_json(path, "raw report contains too many controlled steps");
     }
     let mut controlled_steps = Vec::with_capacity(controlled_step_values.len());
+    let mut controlled_verdicts = Vec::with_capacity(controlled_step_values.len());
     let mut charged_bytes = 0_usize;
     for value in controlled_step_values {
         let mut step = value
@@ -4470,6 +4579,7 @@ fn parse_raw_report_record(
             return invalid_json(path, "controlled report exceeds its total resource bound");
         }
         controlled_steps.push(invocation);
+        controlled_verdicts.push(verdict);
     }
     reject_unknown(object, path, "raw report")?;
     if controlled_steps != parsed_invocation.controlled_steps {
@@ -4482,9 +4592,11 @@ fn parse_raw_report_record(
         attempt_id,
         gate_id,
         result,
+        detail,
         invocation_digest,
         invocation,
         controlled_steps,
+        controlled_verdicts,
     })
 }
 
@@ -5645,6 +5757,7 @@ fn run_status<'argument>(
         StatusOptions {
             timeout,
             environment: &[],
+            retained_environment_digest: None,
             cancellation: Arc::new(AtomicBool::new(false)),
             cancellation_marker: None,
             maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
@@ -5656,6 +5769,7 @@ fn run_status<'argument>(
 struct StatusOptions<'environment, 'capture> {
     timeout: Duration,
     environment: &'environment [(&'environment str, &'environment str)],
+    retained_environment_digest: Option<String>,
     cancellation: Arc<AtomicBool>,
     cancellation_marker: Option<&'environment Path>,
     maximum_capture_bytes: usize,
@@ -5678,7 +5792,7 @@ fn run_status_with_options<'argument>(
     println!("  $ {display}");
     let invocation_environment = snapshot.invocation_environment(options.environment)?;
     let input = InvocationInput::Null;
-    let invocation = controlled_invocation(
+    let mut invocation = controlled_invocation(
         program,
         resolved_program.as_os_str(),
         &arguments,
@@ -5686,6 +5800,9 @@ fn run_status_with_options<'argument>(
         options.timeout,
         &input,
     );
+    if let Some(digest) = options.retained_environment_digest {
+        invocation.environment_digest = digest;
+    }
     let verdict = controlled_execution::execute(InvocationSpec {
         program: resolved_program,
         arguments,

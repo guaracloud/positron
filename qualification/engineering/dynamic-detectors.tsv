@@ -1,0 +1,8 @@
+capability_id	kind	tool_id	version_source	plan_version	argument_grammar	required_inputs	output_protocols	evidence_schema	maximum_arguments	maximum_timeout_seconds
+property	property	cargo	qualification/engineering/toolchains.tsv	dynamic-execution-plan-v1	cargo-test-properties-v1	corpus|seed|schedule|minimized-failure	exit-status-v1|exact-line-v1	dynamic-controlled-step-v1	6	1800
+state-model	state-model	cargo	qualification/engineering/toolchains.tsv	dynamic-execution-plan-v1	cargo-test-state-model-v1	corpus|seed|schedule|minimized-failure	exit-status-v1|exact-line-v1	dynamic-controlled-step-v1	9	1800
+fuzz	fuzz	cargo-fuzz	qualification/engineering/toolchains.tsv	dynamic-execution-plan-v1	cargo-fuzz-run-v1	corpus|seed|schedule|minimized-failure	exit-status-v1|exact-line-v1	dynamic-controlled-step-v1	3	1800
+corpus	corpus	cargo-fuzz	qualification/engineering/toolchains.tsv	dynamic-execution-plan-v1	cargo-fuzz-corpus-v1	corpus|seed|schedule|minimized-failure	exit-status-v1|exact-line-v1	dynamic-controlled-step-v1	4	1800
+miri	miri	miri-nightly	qualification/engineering/toolchains.tsv	dynamic-execution-plan-v1	cargo-miri-test-v1	corpus|seed|schedule|minimized-failure	exit-status-v1|exact-line-v1	dynamic-controlled-step-v1	6	1800
+sanitizer	sanitizer	cargo	qualification/engineering/toolchains.tsv	dynamic-execution-plan-v1	cargo-sanitizer-test-v1	corpus|seed|schedule|minimized-failure	exit-status-v1|exact-line-v1	dynamic-controlled-step-v1	7	1800
+loom	loom	cargo	qualification/engineering/toolchains.tsv	dynamic-execution-plan-v1	cargo-loom-test-v1	corpus|seed|schedule|minimized-failure	exit-status-v1|exact-line-v1	dynamic-controlled-step-v1	8	1800

@@ -6,7 +6,8 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::dynamic_quality::{DynamicKind, DynamicTarget};
+use crate::dynamic_catalog::{ArgumentGrammar, DynamicKind};
+use crate::dynamic_quality::DynamicTarget;
 use crate::error::XtaskError;
 use crate::registry::Tool;
 
@@ -16,43 +17,48 @@ const NIGHTLY: &str = "+nightly-2026-07-20";
 #[derive(Debug)]
 pub(crate) struct DynamicExecutionPlan {
     tool_id: String,
+    tool_version: String,
     program: String,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     argv_digest: String,
+    environment_digest: String,
     input_digest: String,
+    catalog_digest: String,
+    target_registry_digest: String,
     plan_digest: String,
 }
 
 impl DynamicExecutionPlan {
     pub(crate) fn capture(target: &DynamicTarget, tools: &[Tool]) -> Result<Self, XtaskError> {
-        let contract = DetectorContract::for_kind(target.kind());
-        if target.tool_id() != contract.tool_id {
-            return Err(XtaskError::invalid(
-                "dynamic execution plan",
-                format!(
-                    "dynamic kind `{}` requires tool identity `{}`, not `{}`",
-                    target.kind().label(),
-                    contract.tool_id,
-                    target.tool_id(),
-                ),
-            ));
-        }
-        contract.validate_arguments(target.arguments_slice())?;
+        validate_arguments(
+            target.kind(),
+            target.capability().grammar(),
+            target.arguments_slice(),
+            target.corpus(),
+        )?;
         let tool = tools
             .iter()
-            .find(|tool| tool.id == contract.tool_id)
+            .find(|tool| tool.id == target.tool_id())
             .ok_or_else(|| {
                 XtaskError::invalid(
                     "dynamic execution plan",
                     format!(
                         "dynamic kind `{}` requires missing registered tool `{}`",
                         target.kind().label(),
-                        contract.tool_id,
+                        target.tool_id(),
                     ),
                 )
             })?;
-        contract.validate_tool_binding(tool)?;
+        if tool.version != target.tool_version() {
+            return Err(XtaskError::invalid(
+                "dynamic execution plan",
+                format!(
+                    "dynamic capability `{}` tool version drifted after catalog capture",
+                    target.capability_id(),
+                ),
+            ));
+        }
 
         let environment = vec![
             (
@@ -84,27 +90,47 @@ impl DynamicExecutionPlan {
 
         let arguments = target.arguments_slice().to_vec();
         let argv_digest = digest_sequence(b"positron-dynamic-argv-v1\0", &arguments);
-        let input_digest = digest_pairs(b"positron-dynamic-input-v1\0", &environment);
+        let environment_digest = digest_pairs(b"positron-dynamic-environment-v1\0", &environment);
+        let input_digest = digest_pairs(
+            b"positron-dynamic-input-v1\0",
+            &[
+                ("corpus".to_owned(), target.corpus().to_owned()),
+                ("seed".to_owned(), target.seed().to_owned()),
+                ("schedule".to_owned(), target.schedule().to_owned()),
+                (
+                    "minimized-failure".to_owned(),
+                    target.minimized_failure().to_owned(),
+                ),
+            ],
+        );
         let plan_digest = digest_sequence(
             b"positron-dynamic-plan-v1\0",
             &[
                 PLAN_VERSION.to_owned(),
                 target.kind().label().to_owned(),
+                target.capability_id().to_owned(),
                 tool.id.clone(),
                 tool.version.clone(),
                 tool.command.clone(),
                 argv_digest.clone(),
+                environment_digest.clone(),
                 input_digest.clone(),
                 target.output_protocol_label().to_owned(),
+                target.catalog_digest().to_owned(),
+                target.registry_digest().to_owned(),
             ],
         );
         Ok(Self {
             tool_id: tool.id.clone(),
+            tool_version: tool.version.clone(),
             program: tool.command.clone(),
             arguments,
             environment,
             argv_digest,
+            environment_digest,
             input_digest,
+            catalog_digest: target.catalog_digest().to_owned(),
+            target_registry_digest: target.registry_digest().to_owned(),
             plan_digest,
         })
     }
@@ -123,85 +149,47 @@ impl DynamicExecutionPlan {
 
     pub(crate) fn retained_identity(&self) -> String {
         format!(
-            "plan={PLAN_VERSION};tool-id={};program={};argv-digest={};input-digest={};plan-digest={}",
-            self.tool_id, self.program, self.argv_digest, self.input_digest, self.plan_digest,
+            "plan={PLAN_VERSION};tool-id={};tool-version={};program={};argv-digest={};environment-digest={};input-digest={};catalog-digest={};target-registry-digest={};plan-digest={}",
+            self.tool_id,
+            self.tool_version,
+            self.program,
+            self.argv_digest,
+            self.environment_digest,
+            self.input_digest,
+            self.catalog_digest,
+            self.target_registry_digest,
+            self.plan_digest,
         )
     }
 }
 
-struct DetectorContract {
+fn validate_arguments(
     kind: DynamicKind,
-    tool_id: &'static str,
-    version_arguments: &'static [&'static str],
-}
-
-impl DetectorContract {
-    const fn for_kind(kind: DynamicKind) -> Self {
-        match kind {
-            DynamicKind::Property | DynamicKind::StateModel => Self {
-                kind,
-                tool_id: "cargo",
-                version_arguments: &["--version"],
-            },
-            DynamicKind::Fuzz | DynamicKind::Corpus => Self {
-                kind,
-                tool_id: "cargo-fuzz",
-                version_arguments: &["fuzz", "--version"],
-            },
-            DynamicKind::Miri => Self {
-                kind,
-                tool_id: "miri-nightly",
-                version_arguments: &[NIGHTLY, "miri", "--version"],
-            },
-            DynamicKind::Sanitizer | DynamicKind::Loom => Self {
-                kind,
-                tool_id: "cargo",
-                version_arguments: &["--version"],
-            },
-        }
+    grammar: ArgumentGrammar,
+    arguments: &[String],
+    corpus: &str,
+) -> Result<(), XtaskError> {
+    let valid = match grammar {
+        ArgumentGrammar::Property => {
+            cargo_test_target(arguments).is_some_and(|(_, target)| target.ends_with("_properties"))
+        },
+        ArgumentGrammar::StateModel => state_model_target(arguments).is_some(),
+        ArgumentGrammar::Fuzz => fuzz_target(arguments).is_some(),
+        ArgumentGrammar::Corpus => corpus_target(arguments).is_some_and(|value| value == corpus),
+        ArgumentGrammar::Miri => miri_target(arguments).is_some(),
+        ArgumentGrammar::Sanitizer => sanitizer_target(arguments).is_some(),
+        ArgumentGrammar::Loom => loom_target(arguments).is_some(),
+    };
+    if !valid {
+        return Err(XtaskError::invalid(
+            "dynamic execution plan",
+            format!(
+                "arguments do not match the canonical `{}` detector protocol",
+                kind.label(),
+            ),
+        ));
     }
-
-    fn validate_tool_binding(&self, tool: &Tool) -> Result<(), XtaskError> {
-        if tool.command != "cargo"
-            || tool
-                .version_arguments
-                .iter()
-                .map(String::as_str)
-                .ne(self.version_arguments.iter().copied())
-        {
-            return Err(XtaskError::invalid(
-                "dynamic execution plan",
-                format!(
-                    "registered tool `{}` does not match the canonical `{}` detector binding",
-                    tool.id,
-                    self.kind.label(),
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_arguments(&self, arguments: &[String]) -> Result<(), XtaskError> {
-        let valid = match self.kind {
-            DynamicKind::Property => cargo_test_target(arguments)
-                .is_some_and(|(_, target)| target.ends_with("_properties")),
-            DynamicKind::StateModel => state_model_target(arguments).is_some(),
-            DynamicKind::Fuzz | DynamicKind::Corpus => fuzz_target(arguments).is_some(),
-            DynamicKind::Miri => miri_target(arguments).is_some(),
-            DynamicKind::Sanitizer => sanitizer_target(arguments).is_some(),
-            DynamicKind::Loom => loom_target(arguments).is_some(),
-        };
-        if !valid {
-            return Err(XtaskError::invalid(
-                "dynamic execution plan",
-                format!(
-                    "arguments do not match the canonical `{}` detector protocol",
-                    self.kind.label(),
-                ),
-            ));
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 fn cargo_test_target(arguments: &[String]) -> Option<(&str, &str)> {
@@ -249,6 +237,13 @@ fn fuzz_target(arguments: &[String]) -> Option<&str> {
         return None;
     };
     (*fuzz == "fuzz" && *run == "run" && !target.is_empty()).then_some(target)
+}
+
+fn corpus_target(arguments: &[String]) -> Option<&str> {
+    let [fuzz, run, target, corpus] = arguments else {
+        return None;
+    };
+    (*fuzz == "fuzz" && *run == "run" && !target.is_empty() && !corpus.is_empty()).then_some(corpus)
 }
 
 fn miri_target(arguments: &[String]) -> Option<&str> {

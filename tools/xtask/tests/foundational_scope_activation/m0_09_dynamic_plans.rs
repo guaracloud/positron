@@ -4,58 +4,57 @@ const DYNAMIC_TARGETS: &str = "qualification/engineering/dynamic-targets.tsv";
 
 #[test]
 fn quality_executes_every_closed_dynamic_kind_through_the_public_descriptor_seam() -> TestResult {
-    let fixture = Fixture::create()?;
-    let result = (|| {
-        enable_dynamic_gate(&fixture)?;
-        install_dynamic_plan_probe(&fixture)?;
-        fs::write(
-            fixture.root.join(DYNAMIC_TARGETS),
-            all_dynamic_kinds_registry(),
-        )?;
-        let output = fixture.quality_output_for("pr")?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "the complete dynamic-kind descriptor fixture failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            ))
-            .into());
-        }
-        let evidence = fixture.latest_evidence()?;
-        let report = fs::read_to_string(exact_raw_report_path(
-            &fixture.root,
-            &evidence,
-            "EG-DYNAMIC",
-        )?)?;
-        for kind in [
-            "property",
-            "state-model",
-            "fuzz",
-            "corpus",
-            "miri",
-            "sanitizer",
-            "loom",
-        ] {
+    for capability in capability_fixtures() {
+        let fixture = Fixture::create()?;
+        let result: TestResult = (|| {
+            enable_dynamic_gate(&fixture)?;
+            install_dynamic_plan_probe(&fixture, &capability)?;
+            fs::write(
+                fixture.root.join(DYNAMIC_TARGETS),
+                dynamic_target_registry(&capability),
+            )?;
+            let output = fixture.quality_output_for("pr")?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "the `{}` capability fixture failed: {}\n{}",
+                    capability.kind,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ))
+                .into());
+            }
+            let evidence = fixture.latest_evidence()?;
+            let report = fs::read_to_string(exact_raw_report_path(
+                &fixture.root,
+                &evidence,
+                "EG-DYNAMIC",
+            )?)?;
             for required in [
-                format!("kind={kind}"),
+                format!("kind={}", capability.kind),
+                format!("capability={}", capability.kind),
                 "plan=dynamic-execution-plan-v1".to_owned(),
                 "argv-digest=sha256:".to_owned(),
+                "environment-digest=sha256:".to_owned(),
                 "input-digest=sha256:".to_owned(),
+                "catalog-digest=sha256:".to_owned(),
+                "target-registry-digest=sha256:".to_owned(),
                 "plan-digest=sha256:".to_owned(),
             ] {
                 if !report.contains(&required) {
                     return Err(std::io::Error::other(format!(
-                        "the complete descriptor fixture omitted `{required}` for `{kind}`"
+                        "the capability fixture omitted `{required}` for `{}`",
+                        capability.kind
                     ))
                     .into());
                 }
             }
-        }
-        Ok(())
-    })();
-    let cleanup = fixture.remove();
-    cleanup?;
-    result
+            Ok(())
+        })();
+        let cleanup = fixture.remove();
+        cleanup?;
+        result?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -83,15 +82,15 @@ fn quality_rejects_a_cross_kind_dynamic_detector_masquerade_before_execution() -
             ),
             (
                 "fuzz",
-                "dynamic kind `fuzz` requires tool identity `cargo-fuzz`, not `cargo`",
+                "dynamic target `domain-value-properties` exceeds its capability bounds",
             ),
             (
                 "corpus",
-                "dynamic kind `corpus` requires tool identity `cargo-fuzz`, not `cargo`",
+                "dynamic target `domain-value-properties` exceeds its capability bounds",
             ),
             (
                 "miri",
-                "dynamic kind `miri` requires tool identity `miri-nightly`, not `cargo`",
+                "arguments do not match the canonical `miri` detector protocol",
             ),
             (
                 "sanitizer",
@@ -227,7 +226,7 @@ fn quality_uses_captured_tool_binding_before_a_post_capture_tool_registry_tamper
             &evidence,
             "EG-DYNAMIC",
         )?)?;
-        if !report.contains("tool-id=cargo;program=cargo")
+        if !report.contains("tool-id=cargo;tool-version=1.96.0;program=cargo")
             || report.contains("post-capture-tool-registry-tamper")
         {
             return Err(std::io::Error::other(
@@ -263,74 +262,82 @@ fn enable_dynamic_gate(fixture: &Fixture) -> TestResult {
     )
 }
 
-fn all_dynamic_kinds_registry() -> String {
-    let mut registry = String::from(
-        "target_id\tgate_id\tkind\tstages\ttool\targuments\tcorpus\tseed\tschedule\tminimized_failure\toutput_protocol\ttimeout_seconds\n",
-    );
-    for (kind, tool, arguments) in [
-        (
-            "property",
-            "cargo",
-            "test|--locked|--package|positron-domain|--test|dynamic_domain_properties",
-        ),
-        (
-            "state-model",
-            "cargo",
-            "test|--locked|--package|positron-domain|--test|foundational_domain_types|tenant_lifecycle_makes_purge_one_way|--|--exact",
-        ),
-        ("fuzz", "cargo-fuzz", "fuzz|run|fixture-fuzz-target"),
-        ("corpus", "cargo-fuzz", "fuzz|run|fixture-corpus-target"),
-        (
-            "miri",
-            "miri-nightly",
-            "+nightly-2026-07-20|miri|test|--locked|--package|positron-domain",
-        ),
-        (
-            "sanitizer",
-            "cargo",
-            "+nightly-2026-07-20|test|--locked|--package|positron-domain|--test|foundational_domain_types",
-        ),
-        (
-            "loom",
-            "cargo",
-            "test|--locked|--package|positron-domain|--features|loom|--test|foundational_domain_types",
-        ),
-    ] {
-        registry.push_str(&format!(
-            "fixture-{kind}\tEG-DYNAMIC\t{kind}\tPR\t{tool}\t{arguments}\tfixture-corpus-{kind}-v1\tfixture-seed-{kind}-v1\tfixture-schedule-{kind}-v1\tfixture-minimized-{kind}-v1\texact-line-v1\t30\n"
-        ));
-    }
-    registry
+struct CapabilityFixture {
+    kind: &'static str,
+    arguments: &'static str,
+    executed_arguments: &'static str,
 }
 
-fn install_dynamic_plan_probe(fixture: &Fixture) -> TestResult {
+fn capability_fixtures() -> [CapabilityFixture; 7] {
+    [
+        CapabilityFixture {
+            kind: "property",
+            arguments: "test|--locked|--package|positron-domain|--test|dynamic_domain_properties",
+            executed_arguments: "test --locked --package positron-domain --test dynamic_domain_properties",
+        },
+        CapabilityFixture {
+            kind: "state-model",
+            arguments: "test|--locked|--package|positron-domain|--test|foundational_domain_types|tenant_lifecycle_makes_purge_one_way|--|--exact",
+            executed_arguments: "test --locked --package positron-domain --test foundational_domain_types tenant_lifecycle_makes_purge_one_way -- --exact",
+        },
+        CapabilityFixture {
+            kind: "fuzz",
+            arguments: "fuzz|run|fixture-fuzz-target",
+            executed_arguments: "fuzz run fixture-fuzz-target",
+        },
+        CapabilityFixture {
+            kind: "corpus",
+            arguments: "fuzz|run|fixture-corpus-target|fixture-corpus-corpus-v1",
+            executed_arguments: "fuzz run fixture-corpus-target fixture-corpus-corpus-v1",
+        },
+        CapabilityFixture {
+            kind: "miri",
+            arguments: "+nightly-2026-07-20|miri|test|--locked|--package|positron-domain",
+            executed_arguments: "miri test --locked --package positron-domain",
+        },
+        CapabilityFixture {
+            kind: "sanitizer",
+            arguments: "+nightly-2026-07-20|test|--locked|--package|positron-domain|--test|foundational_domain_types",
+            executed_arguments: "test --locked --package positron-domain --test foundational_domain_types",
+        },
+        CapabilityFixture {
+            kind: "loom",
+            arguments: "test|--locked|--package|positron-domain|--features|loom|--test|foundational_domain_types",
+            executed_arguments: "test --locked --package positron-domain --features loom --test foundational_domain_types",
+        },
+    ]
+}
+
+fn dynamic_target_registry(capability: &CapabilityFixture) -> String {
+    format!(
+        "target_id\tgate_id\tcapability_id\tstages\targuments\tcorpus\tseed\tschedule\tminimized_failure\toutput_protocol\ttimeout_seconds\nfixture-{kind}\tEG-DYNAMIC\t{kind}\tPR\t{arguments}\tfixture-corpus-{kind}-v1\tfixture-seed-{kind}-v1\tfixture-schedule-{kind}-v1\tfixture-minimized-{kind}-v1\texact-line-v1\t30\n",
+        kind = capability.kind,
+        arguments = capability.arguments,
+    )
+}
+
+fn install_dynamic_plan_probe(fixture: &Fixture, capability: &CapabilityFixture) -> TestResult {
     let cargo = fixture.root.join("target/quality-tools/bin/cargo");
-    let injected = r#"if [ -n "${POSITRON_DYNAMIC_KIND:-}" ]; then
-  kind="$POSITRON_DYNAMIC_KIND"
-  case "$kind" in
-    property) expected='test --locked --package positron-domain --test dynamic_domain_properties' ;;
-    state-model) expected='test --locked --package positron-domain --test foundational_domain_types tenant_lifecycle_makes_purge_one_way -- --exact' ;;
-    fuzz) expected='fuzz run fixture-fuzz-target' ;;
-    corpus) expected='fuzz run fixture-corpus-target' ;;
-    miri) expected='miri test --locked --package positron-domain' ;;
-    sanitizer) expected='test --locked --package positron-domain --test foundational_domain_types' ;;
-    loom) expected='test --locked --package positron-domain --features loom --test foundational_domain_types' ;;
-    *) printf '%s\n' 'unknown dynamic kind' >&2; exit 71 ;;
-  esac
-  if [ "$*" != "$expected" ] ||
-     [ "${POSITRON_DYNAMIC_TARGET_ID:-}" != "fixture-$kind" ] ||
-     [ "${POSITRON_DYNAMIC_CORPUS_ID:-}" != "fixture-corpus-$kind-v1" ] ||
-     [ "${POSITRON_DYNAMIC_SEED:-}" != "fixture-seed-$kind-v1" ] ||
-     [ "${POSITRON_DYNAMIC_SCHEDULE:-}" != "fixture-schedule-$kind-v1" ] ||
-     [ "${POSITRON_DYNAMIC_MINIMIZED_FAILURE_ID:-}" != "fixture-minimized-$kind-v1" ]; then
+    let injected = format!(
+        r#"if [ -n "${{POSITRON_DYNAMIC_TARGET_ID:-}}" ]; then
+  if [ "$*" != '{arguments}' ] ||
+     [ "${{POSITRON_DYNAMIC_KIND:-}}" != "{kind}" ] ||
+     [ "${{POSITRON_DYNAMIC_TARGET_ID:-}}" != "fixture-{kind}" ] ||
+     [ "${{POSITRON_DYNAMIC_CORPUS_ID:-}}" != "fixture-corpus-{kind}-v1" ] ||
+     [ "${{POSITRON_DYNAMIC_SEED:-}}" != "fixture-seed-{kind}-v1" ] ||
+     [ "${{POSITRON_DYNAMIC_SCHEDULE:-}}" != "fixture-schedule-{kind}-v1" ] ||
+     [ "${{POSITRON_DYNAMIC_MINIMIZED_FAILURE_ID:-}}" != "fixture-minimized-{kind}-v1" ]; then
     printf '%s\n' 'dynamic plan or bound input mismatch' >&2
     exit 72
   fi
   printf '%s\n' 'dynamic-target-result-v1;status=passed'
   exit 0
 fi
-case "$command" in"#;
-    replace_once(&cargo, "case \"$command\" in", injected)
+case "$command" in"#,
+        arguments = capability.executed_arguments,
+        kind = capability.kind,
+    );
+    replace_once(&cargo, "case \"$command\" in", &injected)
 }
 
 fn install_dynamic_cargo_fault(fixture: &Fixture, marker: &str, action: &str) -> TestResult {
