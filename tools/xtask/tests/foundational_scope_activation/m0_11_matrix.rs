@@ -342,7 +342,25 @@ fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> 
             ))
             .into());
         }
+        let matrix_console_bytes = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .chain(String::from_utf8_lossy(&output.stderr).lines())
+            .filter(|line| line.contains("EG-MATRIX"))
+            .map(str::len)
+            .sum::<usize>();
+        if matrix_console_bytes > MAXIMUM_MATRIX_CONSOLE_BYTES {
+            return Err(std::io::Error::other(format!(
+                "matrix-attributable console output exceeds the {MAXIMUM_MATRIX_CONSOLE_BYTES}-byte limit"
+            ))
+            .into());
+        }
         let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-MATRIX")?;
+        if !gate.contains("exact-targets=14") || gate.contains("target=rust-host-1") {
+            return Err(
+                std::io::Error::other("EG-MATRIX evidence summary is not constant-sized").into(),
+            );
+        }
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
             &evidence,
@@ -350,7 +368,11 @@ fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> 
         )?)?;
         let controlled_steps = report.contains("\"controlled_steps\"");
         let resolved_programs = report.matches("\"resolved_program\"").count();
-        if !controlled_steps || resolved_programs != 28 {
+        if !controlled_steps
+            || resolved_programs != 28
+            || !report.contains("target=rust-host-1")
+            || !report.contains("plan-digest=sha256:")
+        {
             return Err(std::io::Error::other(format!(
                 "nested matrix runner did not retain structured controlled evidence: steps={controlled_steps}; resolved-programs={resolved_programs}"
             ))
@@ -474,41 +496,45 @@ fn matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_d
 {
     let fixture = create_matrix_fixture()?;
     let result = (|| {
-        let target = fixture.root.join("target/m0-11-rustdoc");
-        let documentation = Command::new(env!("CARGO"))
-            .current_dir(&fixture.root)
-            .env("CARGO_TARGET_DIR", &target)
-            .args([
-                "doc",
-                "--locked",
-                "--workspace",
-                "--all-features",
-                "--no-deps",
-                "--document-private-items",
-            ])
-            .output()?;
-        if !documentation.status.success() {
-            return Err(std::io::Error::other(
-                "complete private-item rustdoc generation failed for the matrix internal-input owner",
-            )
-            .into());
-        }
-        let generated = target.join("doc");
-        let scan = Command::new("gitleaks")
-            .args([
-                "dir",
-                "--no-banner",
-                "--no-color",
-                "--redact=100",
-                "--max-target-megabytes=20",
-            ])
-            .arg(&generated)
-            .output()?;
-        if !scan.status.success() {
-            return Err(std::io::Error::other(
-                "unchanged generated-doc gitleaks command rejected complete matrix rustdoc",
-            )
-            .into());
+        for target_name in ["first", "second"] {
+            let target = fixture
+                .root
+                .join(format!("target/m0-11-rustdoc-{target_name}"));
+            let documentation = Command::new(env!("CARGO"))
+                .current_dir(&fixture.root)
+                .env("CARGO_TARGET_DIR", &target)
+                .args([
+                    "doc",
+                    "--locked",
+                    "--workspace",
+                    "--all-features",
+                    "--no-deps",
+                    "--document-private-items",
+                ])
+                .output()?;
+            if !documentation.status.success() {
+                return Err(std::io::Error::other(
+                    "complete private-item rustdoc generation failed for the matrix internal-input owner",
+                )
+                .into());
+            }
+            let generated = target.join("doc");
+            let scan = Command::new("gitleaks")
+                .args([
+                    "dir",
+                    "--no-banner",
+                    "--no-color",
+                    "--redact=100",
+                    "--max-target-megabytes=20",
+                ])
+                .arg(&generated)
+                .output()?;
+            if !scan.status.success() {
+                return Err(std::io::Error::other(
+                    "unchanged generated-doc gitleaks command rejected complete matrix rustdoc",
+                )
+                .into());
+            }
         }
         Ok(())
     })();
@@ -518,6 +544,7 @@ fn matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_d
 }
 
 const MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES: usize = 8_192;
+const MAXIMUM_MATRIX_CONSOLE_BYTES: usize = 512;
 const MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES: usize = 131_072;
 const EXACT_M0_11_TEST_COHORT: [&str; 13] = [
     "m0_11_matrix::quality_executes_every_exact_diagnostic_target_with_independent_retained_identity",

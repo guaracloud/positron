@@ -456,6 +456,7 @@ struct GateAttemptOutcome {
     result: GateStatus,
     duration_ms: u128,
     detail: String,
+    raw_detail: Option<String>,
     controlled_steps: Vec<ControlledStepReport>,
 }
 
@@ -1016,6 +1017,7 @@ pub(crate) fn run_with_dynamic_cancellation(
                     result: GateStatus::NotSelected,
                     duration_ms: 0,
                     detail: not_selected_reason(gate, options.profile),
+                    raw_detail: None,
                     controlled_steps: Vec::new(),
                 },
             ));
@@ -1050,6 +1052,18 @@ pub(crate) fn run_with_dynamic_cancellation(
         match execution {
             Ok(detail) => {
                 println!("[{}] passed", gate.id);
+                let retained_detail = format!(
+                    "{detail}; coordinator: {}; exception class: {}",
+                    gate.coordinator, gate.exception_class,
+                );
+                let (detail, raw_detail) = if gate.runner == "matrix" {
+                    (
+                        matrix_public_gate_detail(gate, controlled_steps.len()),
+                        Some(retained_detail),
+                    )
+                } else {
+                    (retained_detail, None)
+                };
                 attempts.push(gate_attempt(
                     &attempt_id,
                     gate,
@@ -1058,10 +1072,8 @@ pub(crate) fn run_with_dynamic_cancellation(
                     GateAttemptOutcome {
                         result: GateStatus::Passed,
                         duration_ms,
-                        detail: format!(
-                            "{detail}; coordinator: {}; exception class: {}",
-                            gate.coordinator, gate.exception_class,
-                        ),
+                        detail,
+                        raw_detail,
                         controlled_steps,
                     },
                 ));
@@ -1077,6 +1089,7 @@ pub(crate) fn run_with_dynamic_cancellation(
                         result: GateStatus::Failed,
                         duration_ms,
                         detail: error.to_string(),
+                        raw_detail: None,
                         controlled_steps,
                     },
                 ));
@@ -1183,6 +1196,7 @@ fn retain_aggregator_failure(
                     "EG-00 failed closed before gate selection; this omission is retained and cannot be interpreted as a pass."
                         .to_owned()
                 },
+                raw_detail: None,
                 controlled_steps: Vec::new(),
             },
         ));
@@ -1276,6 +1290,7 @@ fn build_gate_attempt_with_report_limit(
     maximum_report_bytes: usize,
 ) -> GateAttempt {
     let command_digest = command_digest(&definition.invocation);
+    let raw_detail = outcome.raw_detail.as_deref().unwrap_or(&outcome.detail);
     let (raw_report, raw_report_content, encoding_failure) =
         if outcome.result == GateStatus::NotSelected {
             (
@@ -1292,7 +1307,7 @@ fn build_gate_attempt_with_report_limit(
                     duration_ms: outcome.duration_ms,
                     invocation_digest: &command_digest,
                     invocation: &definition.invocation,
-                    detail: &outcome.detail,
+                    detail: raw_detail,
                     controlled_steps: &outcome.controlled_steps,
                 },
                 maximum_report_bytes,
@@ -1922,6 +1937,13 @@ fn run_exact_target_matrix_gate(
         results.join(" | ")
     };
     Ok(format!("{target_detail}; {generation}"))
+}
+
+fn matrix_public_gate_detail(gate: &Gate, executed_targets: usize) -> String {
+    format!(
+        "exact-targets={executed_targets}; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
+        gate.coordinator, gate.exception_class,
+    )
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
@@ -3802,19 +3824,11 @@ fn validate_matrix_controlled_steps(
             "retained EG-MATRIX does not contain the independently derived exact target step set",
         );
     }
-    let generation_suffix = "canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, Schema Digest, and validation fixtures";
-    let expected_prefix = if expected_steps.is_empty() {
-        "exact-targets=none-for-qual-diagnostic-boundary".to_owned()
-    } else {
-        expected.passed_detail().to_owned()
-    };
-    if retained.result == "passed"
-        && (!retained.detail.starts_with(&expected_prefix)
-            || !retained.detail.contains(generation_suffix))
-    {
+    let expected_detail = matrix_public_gate_detail(gate, expected_steps.len());
+    if retained.result == "passed" && retained.detail != expected_detail {
         return invalid_json(
             context.path,
-            "retained EG-MATRIX detail does not match independently derived target and plan identities",
+            "retained EG-MATRIX summary does not match its bounded public contract",
         );
     }
     for (index, (step, expected_step)) in steps.iter().zip(expected_steps.iter()).enumerate() {
@@ -6386,6 +6400,8 @@ struct StatusOptions<'environment, 'capture> {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+/// Internal matrix-runner console routing; this is not an xtask public interface.
+#[doc(hidden)]
 enum ConsoleOutput {
     Forward,
     Suppress,
@@ -8079,6 +8095,7 @@ fn exceptional_gate_attempts(
                         }
                         .to_owned()
                     },
+                    raw_detail: None,
                     controlled_steps: Vec::new(),
                 },
             )
@@ -9659,6 +9676,7 @@ mod tests {
                     } else {
                         "blocked before registry validation".to_owned()
                     },
+                    raw_detail: None,
                     controlled_steps: if selected {
                         vec![oversized_step.clone()]
                     } else {
