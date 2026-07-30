@@ -353,7 +353,7 @@ fn quality_rejects_a_nonzero_snapshot_digest_with_its_closed_exit_verdict() -> T
 
 #[test]
 fn quality_records_explicit_not_selected_scheduled_gates_for_the_pr_profile() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         fixture.quality_profile("pr")?;
         let evidence = fixture.latest_evidence()?;
@@ -2010,7 +2010,7 @@ fn quality_rejects_an_overwritten_engineering_evidence_attempt() -> TestResult {
 
 #[test]
 fn quality_validates_a_retained_collision_on_the_next_evidence_pass() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         pin_fixture_attempt_identity(&fixture.root)?;
         let evidence_directory = fixture.root.join("target/quality/evidence");
@@ -2541,7 +2541,7 @@ fn quality_counts_every_retained_evidence_entry_before_accepting_the_root() -> T
 
 #[test]
 fn quality_preserves_bounded_legacy_evidence_without_requiring_v3_reports() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         let evidence_directory = fixture.root.join("target/quality/evidence");
         fs::create_dir_all(&evidence_directory)?;
@@ -2617,7 +2617,7 @@ fn quality_rejects_a_retained_raw_report_one_byte_over_its_limit_before_parsing(
 }
 
 fn assert_valid_large_retained_raw_report(target_bytes: usize) -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         fixture.quality()?;
         let evidence_path = fixture.latest_evidence_path()?;
@@ -2829,7 +2829,7 @@ fn quality_rejects_an_external_gate_with_all_controlled_steps_deleted() -> TestR
 
 #[test]
 fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         inject_rust_gate_failure_after_format(&fixture.root)?;
         let failed = fixture.quality_output_from_fixture_source("pre-commit")?;
@@ -2865,7 +2865,7 @@ fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> 
 
 #[test]
 fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         let evidence_directory = fixture.root.join("target/quality/evidence");
         fs::create_dir_all(&evidence_directory)?;
@@ -2937,7 +2937,7 @@ fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() ->
 
 #[test]
 fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         let initial = fixture.quality_output_for("pr")?;
         if !initial.status.success() {
@@ -3225,7 +3225,7 @@ fn quality_retains_recovery_evidence_when_recovery_reconciliation_fails() -> Tes
 
 #[test]
 fn quality_validates_a_retained_recovery_on_the_next_evidence_pass() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         pin_fixture_attempt_identity(&fixture.root)?;
         inject_primary_evidence_write_failure(&fixture.root)?;
@@ -3676,7 +3676,7 @@ fn quality_accepts_a_scaffold_only_workspace_with_pending_thresholds() -> TestRe
 
 #[test]
 fn quality_pr_skips_the_scheduled_coverage_campaign() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     fs::write(
         fixture
             .root
@@ -3715,7 +3715,7 @@ fn quality_rejects_a_pr_workflow_without_cached_tool_verification() -> TestResul
 
 #[test]
 fn quality_ext_executes_the_foundational_coverage_harness() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = fixture.quality_profile("ext");
     let cleanup = fixture.remove();
     cleanup?;
@@ -3773,7 +3773,7 @@ fn quality_ext_runs_the_focused_mutation_campaign_only_when_explicitly_selected(
 
 #[test]
 fn quality_ext_executes_the_controlled_owner_verdict_suite_with_the_fixture_suite() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     fs::write(
         fixture
             .root
@@ -4029,7 +4029,7 @@ fn quality_rejects_an_unreviewed_activation_dependency() -> TestResult {
 
 #[test]
 fn quality_retains_full_dependency_metadata_above_the_stream_capture_ceiling() -> TestResult {
-    let fixture = Fixture::create()?;
+    let fixture = Fixture::create_current_registry()?;
     let result = (|| {
         fs::write(
             fixture
@@ -7022,16 +7022,19 @@ case "$command" in
       exit 0
     fi
     if [ -f target/quality-tools/require-owner-verdict-coverage ]; then
+      m0_01_campaign=false
       owner_verdict_suite=false
       previous=
       for argument in "$@"; do
+        if [ "$previous" = "--package" ] && [ "$argument" = "xtask" ]; then
+          m0_01_campaign=true
+        fi
         if [ "$previous" = "--bin" ] && [ "$argument" = "xtask" ]; then
           owner_verdict_suite=true
-          break
         fi
         previous="$argument"
       done
-      if [ "$owner_verdict_suite" != true ]; then
+      if [ "$m0_01_campaign" = true ] && [ "$owner_verdict_suite" != true ]; then
         printf '%s\n' 'fixture requires controlled owner verdict coverage' >&2
         exit 76
       fi
