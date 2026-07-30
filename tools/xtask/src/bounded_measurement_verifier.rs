@@ -350,7 +350,7 @@ fn validate_spawn_registry(bytes: &[u8], scenario: &Scenario) -> Result<(), Xtas
         ),
         (
             "controlled-framed-stdout-broker-v1",
-            "tools/xtask/src/controlled_execution.rs",
+            "tools/xtask/src/framed_stdout_broker.rs",
             "FramedStdoutBroker::start",
             "thread",
         ),

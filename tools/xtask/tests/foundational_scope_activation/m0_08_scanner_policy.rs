@@ -2,6 +2,65 @@ use super::m0_08_support::*;
 use super::*;
 
 #[test]
+fn quality_rejects_raw_direct_thread_spawn_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn raw_direct_spawn() {\n    let _worker = std::thread::r#spawn(|| {});\n}\n",
+        "direct unregistered thread spawn",
+    )
+}
+
+#[test]
+fn quality_rejects_raw_spawn_methods_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn raw_spawn_methods(builder: std::thread::Builder, scope: &std::thread::Scope<'_, '_>) {\n    let _worker = builder.r#spawn(|| {});\n    let _scoped = builder.r#spawn_scoped(scope, || {});\n}\n",
+        "unregistered process or task spawn",
+    )
+}
+
+#[test]
+fn quality_rejects_raw_unbounded_channel_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn raw_channel() {\n    let _channel = std::sync::mpsc::r#channel::<usize>();\n}\n",
+        "unbounded concurrency primitive",
+    )
+}
+
+#[test]
+fn quality_rejects_raw_module_and_import_aliases_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod raw_aliases {\n    use std::thread as r#worker;\n    use r#worker::r#spawn as r#launch;\n    const SPAWN: usize = r#launch;\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_accepts_unrelated_raw_identifiers_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n#[allow(dead_code)]\nfn r#future() {\n    let r#spawnling = 1_usize;\n    let r#channel_capacity = r#spawnling;\n    let _ = r#channel_capacity;\n}\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "safe unrelated raw identifiers were rejected: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_chained_thread_module_aliases_through_the_public_seam() -> TestResult {
     assert_concurrency_source_rejected(
         "\n#[cfg(any())]\nmod chained_thread_alias {\n    use std::thread as a;\n    use a as b;\n    const SPAWN: usize = (b::spawn);\n}\n",

@@ -15,6 +15,7 @@ mod config_generation;
 mod controlled_execution;
 mod error;
 mod evidence_json;
+mod framed_stdout_broker;
 mod generation;
 mod hooks;
 mod qualification_fixtures;

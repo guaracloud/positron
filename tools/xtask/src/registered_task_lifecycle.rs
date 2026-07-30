@@ -61,6 +61,12 @@ enum CancellationState {
     Disconnected,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum StalledControlState {
+    Delivered,
+    ControlDeliveryFailed(String),
+}
+
 pub(crate) struct RegisteredTasks {
     tasks: Vec<RegisteredTask>,
     results: Receiver<WorkerMeasurement>,
@@ -373,10 +379,16 @@ impl RegisteredTasks {
     }
 
     fn park_with_live_ownership(&mut self) -> ! {
-        drop(crate::bounded_runner_frames::emit_control(
+        let control_delivery = match crate::bounded_runner_frames::emit_control(
             crate::bounded_runner_frames::ControlFrame::LifecycleStalled,
-        ));
+        ) {
+            Ok(()) => StalledControlState::Delivered,
+            Err(error) => StalledControlState::ControlDeliveryFailed(error.to_string()),
+        };
         loop {
+            if let StalledControlState::ControlDeliveryFailed(detail) = &control_delivery {
+                std::hint::black_box(detail);
+            }
             thread::park_timeout(Duration::from_millis(5));
         }
     }

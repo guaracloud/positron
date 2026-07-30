@@ -87,7 +87,7 @@ pub(crate) fn validate_registered_spawn_sites(
                 ));
             };
             let controlled_framed_stdout_thread = key.0
-                == "tools/xtask/src/controlled_execution.rs"
+                == "tools/xtask/src/framed_stdout_broker.rs"
                 && key.1 == "FramedStdoutBroker::start"
                 && key.2 == "controlled-framed-stdout-broker-v1";
             let actual = if key.2 == registered_thread_site || controlled_framed_stdout_thread {
@@ -669,7 +669,32 @@ fn source_tokens(source: &str) -> Vec<SourceToken> {
             line += 1;
             continue;
         }
-        if character.is_ascii_alphabetic() || character == '_' {
+        let raw_identifier_start = if character == 'r' && characters.peek() == Some(&'#') {
+            let mut lookahead = characters.clone();
+            let _hash = lookahead.next();
+            lookahead
+                .next()
+                .filter(|next| next.is_ascii_alphabetic() || *next == '_')
+        } else {
+            None
+        };
+        if let Some(first) = raw_identifier_start {
+            let _hash = characters.next();
+            let _first = characters.next();
+            let mut identifier = String::from(first);
+            while characters
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
+            {
+                if let Some(next) = characters.next() {
+                    identifier.push(next);
+                }
+            }
+            tokens.push(SourceToken {
+                kind: UseToken::Identifier(identifier),
+                line,
+            });
+        } else if character.is_ascii_alphabetic() || character == '_' {
             let mut identifier = String::from(character);
             while characters
                 .peek()
