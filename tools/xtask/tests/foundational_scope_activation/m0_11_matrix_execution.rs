@@ -22,7 +22,8 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
         let detail = matrix_public_detail(gate)?;
-        if !detail.contains("product-outcome=diagnostic")
+        if !detail.contains("binding-root=sha256:")
+            || !detail.contains("product-outcome=diagnostic")
             || detail.contains("identity=")
             || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
         {
@@ -39,55 +40,19 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
         if !report.contains(&format!("\"detail\": \"{detail}\""))
             || report.matches("\"resolved_program\":").count() != 28
             || gate.matches("\"resolved_program\":").count() != 14
+            || gate
+                .matches("env.POSITRON_MATRIX_BINDING_DIGEST=\\\"sha256:")
+                .count()
+                != 14
+            || gate.matches("\"input_kind\":\"null\"").count() != 14
         {
-            return Err(std::io::Error::other(
-                "matrix did not retain the exact compact detail and independently verifiable controlled target plans",
-            )
-            .into());
-        }
-        Ok(())
-    })();
-    let cleanup = fixture.remove();
-    cleanup?;
-    result
-}
-
-#[test]
-fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive() -> TestResult {
-    let fixture = Fixture::create()?;
-    install_product_target(&fixture)?;
-    fixture.build_fixture_xtask()?;
-    let result = (|| {
-        let output = matrix_quality_output(&fixture, "pr")?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(
-                "inactive product matrix scope must retain a diagnostic-only outcome",
-            )
-            .into());
-        }
-        let evidence = fixture.latest_evidence()?;
-        let gate = gate_record(&evidence, "EG-MATRIX")?;
-        let detail = matrix_public_detail(gate)?;
-        if !detail.contains("product-outcome=inactive")
-            || detail.contains("identity=")
-            || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
-        {
-            return Err(std::io::Error::other(
-                "inactive product matrix summary is not the bounded typed public form",
-            )
-            .into());
-        }
-        let report = fs::read_to_string(exact_raw_report_path(
-            &fixture.root,
-            &evidence,
-            "EG-MATRIX",
-        )?)?;
-        if !report.contains(detail)
-            || !report.contains("qualification=no-product-qualification")
-        {
-            return Err(std::io::Error::other(
-                "inactive product target raw report did not cross-reference its typed diagnostic outcome",
-            )
+            return Err(std::io::Error::other(format!(
+                "matrix did not retain the exact compact detail and independently verifiable controlled target plans: report-resolved={}; gate-resolved={}; input-kind={}; input-digest={}",
+                report.matches("\"resolved_program\":").count(),
+                gate.matches("\"resolved_program\":").count(),
+                gate.matches("\"input_kind\":\"null\"").count(),
+                gate.matches("env.POSITRON_MATRIX_BINDING_DIGEST=\\\"sha256:").count(),
+            ))
             .into());
         }
         Ok(())

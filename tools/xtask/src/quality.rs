@@ -537,6 +537,7 @@ struct ControlledStepReport {
 struct GateCapture {
     steps: Vec<ControlledStepReport>,
     charged_bytes: usize,
+    matrix_binding_root: Option<String>,
 }
 
 struct GateExecutionContext<'context> {
@@ -580,6 +581,7 @@ impl GateCapture {
         Self {
             steps: Vec::new(),
             charged_bytes: 0,
+            matrix_binding_root: None,
         }
     }
 
@@ -640,6 +642,20 @@ impl GateCapture {
 
     fn finish(self) -> Vec<ControlledStepReport> {
         self.steps
+    }
+
+    fn set_matrix_binding_root(&mut self, digest: String) -> Result<(), XtaskError> {
+        if self.matrix_binding_root.replace(digest).is_some() {
+            return Err(XtaskError::invalid(
+                "exact target matrix",
+                "matrix binding root was assigned more than once",
+            ));
+        }
+        Ok(())
+    }
+
+    fn matrix_binding_root(&self) -> Option<&str> {
+        self.matrix_binding_root.as_deref()
     }
 }
 
@@ -1100,6 +1116,7 @@ pub(crate) fn run_with_dynamic_cancellation(
             gate,
             &mut capture,
         );
+        let matrix_binding_root = capture.matrix_binding_root().map(str::to_owned);
         let controlled_steps = capture.finish();
         let duration_ms = started.elapsed().as_millis();
         match execution {
@@ -1112,8 +1129,19 @@ pub(crate) fn run_with_dynamic_cancellation(
                 let (detail, raw_detail) = if gate.runner == "matrix" {
                     let product_outcome =
                         matrix_public_product_outcome(&root, &registry, options.profile)?;
+                    let binding_root = matrix_binding_root.as_deref().ok_or_else(|| {
+                        XtaskError::invalid(
+                            "exact target matrix",
+                            "selected EG-MATRIX omitted its aggregate binding root",
+                        )
+                    })?;
                     (
-                        matrix_public_gate_detail(gate, controlled_steps.len(), product_outcome)?,
+                        matrix_public_gate_detail(
+                            gate,
+                            controlled_steps.len(),
+                            binding_root,
+                            product_outcome,
+                        )?,
                         None,
                     )
                 } else {
@@ -1959,6 +1987,7 @@ fn run_exact_target_matrix_gate(
     let targets = crate::matrix_targets::FrozenMatrixTargets::load(root, gate)?;
     let deadline = Instant::now() + budget;
     let mut results = Vec::new();
+    let mut binding_manifests = Vec::new();
     for target in targets.selected(profile) {
         let plan =
             crate::matrix_execution_plan::MatrixExecutionPlan::capture(target, &registry.tools)?;
@@ -1987,8 +2016,10 @@ fn run_exact_target_matrix_gate(
             },
         )?;
         target.validate_output(&outcome.stdout)?;
+        binding_manifests.push(plan.binding_manifest().to_vec());
         results.push(plan.retained_identity().to_owned());
     }
+    capture.set_matrix_binding_root(matrix_binding_root(&binding_manifests))?;
     let generation = matrix_product_outcome(root, registry, profile)?;
     let target_detail = if results.is_empty() {
         "exact-targets=none-for-qual-diagnostic-boundary".to_owned()
@@ -2026,10 +2057,11 @@ fn matrix_product_outcome(
 fn matrix_public_gate_detail(
     gate: &Gate,
     executed_targets: usize,
+    binding_root: &str,
     product_outcome: crate::matrix_product_target::MatrixProductOutcome,
 ) -> Result<String, XtaskError> {
     let detail = format!(
-        "exact-targets={executed_targets}; product-outcome={}; qualification=no-product-qualification; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
+        "exact-targets={executed_targets}; binding-root={binding_root}; product-outcome={}; qualification=no-product-qualification; coordinator: {}; exception class: {}",
         product_outcome.label(),
         gate.coordinator,
         gate.exception_class,
@@ -2041,6 +2073,32 @@ fn matrix_public_gate_detail(
         ));
     }
     Ok(detail)
+}
+
+fn legacy_matrix_public_gate_detail(
+    gate: &Gate,
+    executed_targets: usize,
+    product_outcome: crate::matrix_product_target::MatrixProductOutcome,
+) -> String {
+    format!(
+        "exact-targets={executed_targets}; product-outcome={}; qualification=no-product-qualification; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
+        product_outcome.label(),
+        gate.coordinator,
+        gate.exception_class,
+    )
+}
+
+fn matrix_binding_root(manifests: &[Vec<u8>]) -> String {
+    if manifests.is_empty() {
+        return "not-applicable".to_owned();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"positron-matrix-binding-root-v1\0");
+    for manifest in manifests {
+        hasher.update(manifest);
+        hasher.update(b"\0");
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn matrix_public_product_outcome(
@@ -3501,6 +3559,7 @@ struct ParsedGateRecord {
 #[derive(Debug)]
 struct ParsedEvidenceRecord {
     attempt_id: String,
+    revision: String,
     collision_of: ParsedIdentityBinding,
     collision_slots: ParsedIdentityBinding,
     profile: Profile,
@@ -3523,6 +3582,7 @@ struct ParsedGateInvocation {
 
 struct RetainedGateValidationContext<'context> {
     root: &'context Path,
+    revision: &'context str,
     profile: Profile,
     registry: &'context Registry,
     snapshot_digest: &'context str,
@@ -3674,6 +3734,7 @@ fn validate_registered_gate_bindings(
         }
         let context = RetainedGateValidationContext {
             root,
+            revision: &evidence.revision,
             profile: evidence.profile,
             registry,
             snapshot_digest: &evidence.environment_digest,
@@ -3926,6 +3987,8 @@ fn validate_matrix_controlled_steps(
     )?;
     let steps = &retained.typed_invocation.controlled_steps;
     let expected_steps = expected.steps();
+    let legacy_binding_contract = context.profile == Profile::Pr
+        && context.revision == "bd5386209359d8395b90e18a16fa20a6962c935b";
     let cardinality_matches = match retained.result.as_str() {
         "passed" => steps.len() == expected_steps.len(),
         "failed" => expected_steps.is_empty() || (1..=expected_steps.len()).contains(&steps.len()),
@@ -3937,8 +4000,16 @@ fn validate_matrix_controlled_steps(
             "retained EG-MATRIX does not contain the independently derived exact target step set",
         );
     }
-    let expected_detail =
-        matrix_public_gate_detail(gate, expected_steps.len(), expected.product_outcome())?;
+    let expected_detail = if legacy_binding_contract {
+        legacy_matrix_public_gate_detail(gate, expected_steps.len(), expected.product_outcome())
+    } else {
+        matrix_public_gate_detail(
+            gate,
+            expected_steps.len(),
+            expected.binding_root(),
+            expected.product_outcome(),
+        )?
+    };
     if retained.result == "passed" && retained.detail != expected_detail {
         return invalid_json(
             context.path,
@@ -3946,11 +4017,16 @@ fn validate_matrix_controlled_steps(
         );
     }
     for (index, (step, expected_step)) in steps.iter().zip(expected_steps.iter()).enumerate() {
+        let arguments_match = if legacy_binding_contract {
+            step.arguments.iter().map(String::as_str).eq(["--version"])
+        } else {
+            step.arguments == expected_step.arguments()
+        };
         let resolved = Path::new(&step.resolved_program);
         let resolved_matches = resolved.is_absolute()
             && resolved.file_name().and_then(OsStr::to_str) == Some(expected_step.program());
         if step.program != expected_step.program()
-            || step.arguments != expected_step.arguments()
+            || !arguments_match
             || !resolved_matches
             || step.timeout_ms > expected_step.maximum_timeout().as_millis()
             || step.timeout_ms > u128::from(gate.timeout_seconds) * 1_000
@@ -4751,6 +4827,7 @@ fn parse_evidence_record(path: &Path, content: &str) -> Result<ParsedEvidenceRec
     }
     Ok(ParsedEvidenceRecord {
         attempt_id,
+        revision,
         collision_of,
         collision_slots,
         profile,

@@ -1,2 +1,2 @@
 target_id	kind	mode	gate_id	stages	owner	identity	diagnostic	timeout_seconds
-rust-host-1	compile	runner-capability	EG-MATRIX	PR	Quality Engineering	rust-2024-host-v1	diagnostic-only	30
+rust-host-1	compile	runner-capability	EG-MATRIX	PR|EXT	Quality Engineering	rust-2024-host-v1	diagnostic-only	30

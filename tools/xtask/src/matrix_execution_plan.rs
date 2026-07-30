@@ -20,6 +20,7 @@ pub(crate) struct MatrixExecutionPlan {
     environment: Vec<(String, String)>,
     timeout: std::time::Duration,
     retained_identity: String,
+    binding_manifest: Vec<u8>,
 }
 
 impl MatrixExecutionPlan {
@@ -46,7 +47,7 @@ impl MatrixExecutionPlan {
                 "exact target cargo tool binding drifted from the frozen contract",
             ));
         }
-        let arguments = vec!["--version".to_owned()];
+        let base_arguments = vec!["--version".to_owned()];
         let environment = vec![
             (
                 "POSITRON_MATRIX_TARGET_ID".to_owned(),
@@ -69,7 +70,7 @@ impl MatrixExecutionPlan {
                 "diagnostic-only".to_owned(),
             ),
         ];
-        let argv_digest = digest_sequence(b"positron-matrix-argv-v1\0", &arguments);
+        let argv_digest = digest_sequence(b"positron-matrix-argv-v1\0", &base_arguments);
         let environment_digest = digest_pairs(b"positron-matrix-environment-v1\0", &environment);
         let input_digest = digest_sequence(
             b"positron-matrix-input-v1\0",
@@ -97,12 +98,30 @@ impl MatrixExecutionPlan {
             tool.command,
             target.registry_digest(),
         );
+        let binding_manifest = format!(
+            "binding=matrix-target-binding-v1;target-id={};descriptor-identity={};stages={};mode={};tool-id={TOOL_ID};tool-version={TOOL_VERSION};program={};argv-digest={argv_digest};environment-digest={environment_digest};input-identity={};input-digest={input_digest};registry-digest={};plan-digest={plan_digest}",
+            target.id(),
+            target.identity(),
+            target.stages(),
+            target.mode().label(),
+            tool.command,
+            target.identity(),
+            target.registry_digest(),
+        )
+        .into_bytes();
+        let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_manifest));
+        let arguments = vec![
+            "--config".to_owned(),
+            format!("env.POSITRON_MATRIX_BINDING_DIGEST=\"{binding_digest}\""),
+            "--version".to_owned(),
+        ];
         Ok(Self {
             program: tool.command.clone(),
             arguments,
             environment,
             timeout: target.timeout(),
             retained_identity,
+            binding_manifest,
         })
     }
 
@@ -120,6 +139,9 @@ impl MatrixExecutionPlan {
     }
     pub(crate) fn retained_identity(&self) -> &str {
         &self.retained_identity
+    }
+    pub(crate) fn binding_manifest(&self) -> &[u8] {
+        &self.binding_manifest
     }
 }
 

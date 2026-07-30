@@ -18,9 +18,9 @@
     "changed_path_contract": {
       "merge_base": "9879d5924cb9af75e95ec2634469973e09f681e5",
       "implementation_revision": "2e738ea10aac13fa34d45e77582b7910467c0b83",
-      "path_count": 28,
-      "path_set_digest": "sha256:5cf166b8ab9f9d3e85419fba854c97bdaa84c395f616c4b6030f8813e7717bbb",
-      "classification_digest": "sha256:05904f4e91e8ebcc041e3904d97a2ce625cd365d348183103aacf029c817da22",
+      "path_count": 29,
+      "path_set_digest": "sha256:f4faef67c2999b6340ec6c95bd8e69f0d3054893f8898c65a6fc5d38f5a91924",
+      "classification_digest": "sha256:689e246ec6dd7b4e1bef6559069eabeafb9814ba2c979e820c9ed581096425ad",
       "classification_record": "qualification/engineering/security-threat-surfaces.tsv",
       "classifications": [
         {"path": "qualification/engineering/exact-targets-golden.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 canonical frozen descriptor fixture"},
@@ -48,6 +48,7 @@
         {"path": "tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 negative diagnostic fixture"},
         {"path": "tools/xtask/tests/foundational_scope_activation.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "public fixture harness"},
         {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "public M0-11 runner regressions"},
+        {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix_binding.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 binding-integrity and cardinality tamper regressions"},
         {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix_execution.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 execution regressions"},
         {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix_lifecycle.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 lifecycle regressions"},
         {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix_policy.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 policy regressions"}
@@ -57,9 +58,9 @@
     "dependency_review": {"new_dependencies": "none", "rationale": "Uses the Rust standard library, existing sha2 dependency, and existing controlled-execution owner."},
     "runner_contract": [
       "exact-targets.tsv is a bounded frozen ordered registry containing exactly compile, contract, protocol, producer, provider, platform, architecture, filesystem, StorageClass, registry, distribution, SDK, compatibility, and evidence targets once each.",
-      "Every target binds EG-MATRIX, Quality Engineering ownership, PR|EXT stage, diagnostic-only classification, concrete canonical identity, timeout, cargo tool identity/version, canonical argv, explicit environment, input digest, registry digest, plan digest, result, and controlled execution lifecycle evidence.",
+      "Every target binds EG-MATRIX, Quality Engineering ownership, PR|EXT stage, diagnostic-only classification, concrete canonical identity, timeout, cargo tool identity/version, canonical base argv, explicit environment, input digest, registry digest, execution-plan digest, binding-manifest digest, result, and controlled execution lifecycle evidence. The binding digest uses Cargo's canonical global --config env transport while target stdin remains closed.",
       "The runner reuses controlled_execution for launch, bounded capture, process-group reconciliation, deadline, cancellation marker, missing-tool, and first-failure retention; it does not duplicate lifecycle ownership.",
-      "matrix_verifier independently re-loads descriptors and derives plan, tool, argv, environment, input, timeout, ordering, and detail expectations without calling the runner execution-plan builder.",
+      "matrix_verifier independently re-loads descriptors and derives PR and EXT selection, base plan, binding manifest, Cargo transport argv, tool, environment, input, timeout, ordering, aggregate binding root, and detail expectations without calling the runner selector or execution-plan builder.",
       "The attempt-wide security input budget is an internal quality-orchestration implementation detail, not a public interface. Its hidden rustdoc entry does not suppress private-item documentation generation: the unchanged complete rustdoc and generated-document secret scan remain an explicit public regression.",
       "QUAL executes no M0 diagnostic target and remains rejected by the existing exact-artifact qualification boundary; no matrix target, emulator, fixture, or local run becomes Qualified."
     ]
@@ -83,7 +84,7 @@
     "missing_tool": "quality_rejects_a_missing_matrix_tool_without_an_ambient_fallback",
     "cancellation": "quality_routes_matrix_cancellation_through_the_shared_control_marker",
     "golden_negative": "quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution",
-    "retained_tamper": "parent_rejects_coupled_matrix_command_environment_and_result_tampering",
+    "retained_tamper": "parent_rejects_coupled_matrix_command_environment_and_result_tampering; parent_rejects_matrix_binding_field_root_order_and_cardinality_tampering",
     "fixture_output_and_docs": "matrix_fixture_suppresses_nested_output_and_retains_structured_evidence; matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_docs",
       "security_change_review": "security_review_rejects_a_corrupt_unselected_pc_0015_before_pc_0016_selection; security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head",
     "qualification_boundary": "quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualification"

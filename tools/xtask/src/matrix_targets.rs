@@ -20,7 +20,7 @@ const HEADER: &str =
     "target_id\tkind\tmode\tgate_id\tstages\towner\tidentity\tdiagnostic\ttimeout_seconds";
 const OWNER: &str = "Quality Engineering";
 const GATE: &str = "EG-MATRIX";
-const STAGES: &str = "PR";
+const STAGES: &str = "PR|EXT";
 const DIAGNOSTIC: &str = "diagnostic-only";
 const RUNNER_CAPABILITY: &str = "runner-capability";
 const MAXIMUM_BYTES: usize = 16_384;
@@ -157,6 +157,9 @@ impl MatrixTarget {
     }
     pub(crate) fn registry_digest(&self) -> &str {
         &self.registry_digest
+    }
+    pub(crate) const fn stages(&self) -> &'static str {
+        STAGES
     }
 
     pub(crate) fn validate_output(&self, stdout: &str) -> Result<(), XtaskError> {
@@ -318,7 +321,11 @@ impl FrozenMatrixTargets {
     pub(crate) fn selected(&self, profile: Profile) -> impl Iterator<Item = &MatrixTarget> {
         self.targets
             .iter()
-            .filter(move |_| matches!(profile, Profile::Pr))
+            .filter(move |_| matches!(profile, Profile::Pr | Profile::Ext))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &MatrixTarget> {
+        self.targets.iter()
     }
 }
 

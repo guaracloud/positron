@@ -6954,6 +6954,17 @@ if [ "$command" = "+nightly-2026-07-20" ]; then
   shift
   command="${1:-}"
 fi
+if [ "$command" = "--config" ]; then
+  case "${2:-}" in
+    env.POSITRON_MATRIX_BINDING_DIGEST=\"sha256:????????????????????????????????????????????????????????????????\") ;;
+    *)
+      printf '%s\n' 'fixture received a malformed matrix binding transport' >&2
+      exit 78
+      ;;
+  esac
+  shift 2
+  command="${1:-}"
+fi
 case "$command" in
   --version)
     printf 'cargo 1.96.0\n'
@@ -7257,6 +7268,7 @@ case "${1:-}" in
       printf '%s\n' 'tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.tsv'
       printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
       printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_binding.rs'
       printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_execution.rs'
       printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_lifecycle.rs'
       printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_policy.rs'

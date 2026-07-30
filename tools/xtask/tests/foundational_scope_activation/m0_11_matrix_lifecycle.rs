@@ -25,7 +25,9 @@ fn quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualificatio
         }
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
-        if !gate.contains("exact-targets=0; product-outcome=missing")
+        if !gate.contains(
+            "exact-targets=0; binding-root=not-applicable; product-outcome=missing",
+        )
             || !gate.contains("\"controlled_steps\":[]")
         {
             return Err(std::io::Error::other(
@@ -114,6 +116,96 @@ fn matrix_failure_console_is_bounded_and_points_to_retained_evidence() -> TestRe
         {
             return Err(std::io::Error::other(
                 "bounded matrix failure console output did not point to retained evidence",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_ext_executes_all_diagnostic_targets_without_reusing_product_qualification() -> TestResult {
+    let fixture = create_matrix_fixture()?;
+    let result = (|| {
+        install_product_target(&fixture)?;
+        let output = matrix_quality_output(&fixture, "ext")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "EXT must execute the registered diagnostic runner-capability targets",
+            )
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-MATRIX")?;
+        let detail = matrix_public_detail(gate)?;
+        if !detail.contains("exact-targets=14")
+            || !detail.contains("product-outcome=inactive")
+            || !detail.contains("qualification=no-product-qualification")
+        {
+            return Err(std::io::Error::other(
+                "EXT matrix evidence reused a product target or qualification outcome",
+            )
+            .into());
+        }
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-MATRIX",
+        )?)?;
+        if gate.matches("\"resolved_program\":").count() != 14
+            || report.matches("\"resolved_program\":").count() != 28
+            || report.contains("ProductTargetDiagnostic")
+        {
+            return Err(std::io::Error::other(
+                "EXT did not retain exactly fourteen independent diagnostic target steps",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive() -> TestResult {
+    let fixture = Fixture::create()?;
+    install_product_target(&fixture)?;
+    fixture.build_fixture_xtask()?;
+    let result = (|| {
+        let output = matrix_quality_output(&fixture, "pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "inactive product matrix scope must retain a diagnostic-only outcome",
+            )
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-MATRIX")?;
+        let detail = matrix_public_detail(gate)?;
+        if !detail.contains("product-outcome=inactive")
+            || detail.contains("identity=")
+            || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
+        {
+            return Err(std::io::Error::other(
+                "inactive product matrix summary is not the bounded typed public form",
+            )
+            .into());
+        }
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-MATRIX",
+        )?)?;
+        if !report.contains(detail)
+            || !report.contains("qualification=no-product-qualification")
+        {
+            return Err(std::io::Error::other(
+                "inactive product target raw report did not cross-reference its typed diagnostic outcome",
             )
             .into());
         }

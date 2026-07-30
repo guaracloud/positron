@@ -1,6 +1,7 @@
 use super::*;
 
 include!("m0_11_matrix_execution.rs");
+include!("m0_11_matrix_binding.rs");
 include!("m0_11_matrix_lifecycle.rs");
 include!("m0_11_matrix_policy.rs");
 
