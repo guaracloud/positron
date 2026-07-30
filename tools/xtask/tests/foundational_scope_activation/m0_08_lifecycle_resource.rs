@@ -2,6 +2,41 @@ use super::m0_08_support::*;
 use super::*;
 
 #[test]
+fn bounded_runner_child_rejects_an_extra_argument_through_the_public_seam() -> TestResult {
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args([
+            "quality-bounded-runner",
+            "EG-CONCURRENCY",
+            "00",
+            "00",
+            "1",
+            "unexpected",
+        ])
+        .output()?;
+    assert_rejected_output(
+        &output,
+        "quality-bounded-runner requires one gate, two frozen registries, and one execution timeout",
+    )
+}
+
+#[test]
+fn bounded_runner_child_rejects_a_noncanonical_timeout_through_the_public_seam() -> TestResult {
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args([
+            "quality-bounded-runner",
+            "EG-CONCURRENCY",
+            "00",
+            "00",
+            "001",
+        ])
+        .output()?;
+    assert_rejected_output(
+        &output,
+        "execution timeout is not a canonical positive unsigned millisecond value",
+    )
+}
+
+#[test]
 fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {

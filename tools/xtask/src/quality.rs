@@ -8223,7 +8223,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         CANONICAL_GATE_IDS, ControlledInvocation, ControlledStepReport, EnvironmentSnapshot,
@@ -8238,11 +8238,12 @@ mod tests {
         RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
         character_count_in_range, evidence_json, gate_invocation_json, json_string,
         nextest_completed_test_count, parse_gate_invocation_value, raw_report_json_with_limit,
-        registered_dependency_command_matches, run_generation_matrix_gate, sha256_digest,
-        unavailable_evidence_identity, valid_hex_identity, valid_raw_report_schema_path,
-        valid_sha256_digest, validate_configuration_parser_threat_model_text,
-        validate_serialized_evidence,
+        registered_dependency_command_matches, registered_runner_command_matches,
+        run_generation_matrix_gate, sha256_digest, unavailable_evidence_identity,
+        valid_hex_identity, valid_raw_report_schema_path, valid_sha256_digest,
+        validate_configuration_parser_threat_model_text, validate_serialized_evidence,
     };
+    use crate::registry::Registry;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -8672,6 +8673,63 @@ mod tests {
         let parsed =
             parse_gate_invocation_value(value, std::path::Path::new("retained-invocation.json"))?;
         assert_eq!(parsed.typed.arguments, invocation.arguments);
+        Ok(())
+    }
+
+    #[test]
+    fn parent_runner_verifier_requires_exact_canonical_child_arguments() -> TestResult {
+        let registry = crate::bounded_runners::FrozenBoundedRunnerRegistry::capture(
+            include_bytes!("../../../qualification/engineering/concurrency-fixtures.tsv").to_vec(),
+            include_bytes!("../../../qualification/engineering/concurrency-spawn-sites.tsv")
+                .to_vec(),
+        )?;
+        let mut step = report_test_step(String::new()).invocation;
+        step.program = "cargo-xtask-quality/bounded-runner".to_owned();
+        step.timeout_ms = 900_000;
+        step.arguments = registry
+            .child_arguments("EG-CONCURRENCY", Duration::from_millis(900_000))?
+            .into_iter()
+            .map(|argument| argument.into_string())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| std::io::Error::other("test child argument was not UTF-8"))?;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| std::io::Error::other("test repository root is unavailable"))?;
+        let quality_registry = Registry::load(root)?;
+        assert!(registered_runner_command_matches(
+            "concurrency",
+            Profile::Pr,
+            0,
+            &step,
+            &quality_registry,
+        ));
+
+        let timeout_argument = step
+            .arguments
+            .get_mut(4)
+            .ok_or_else(|| std::io::Error::other("test timeout argument is unavailable"))?;
+        *timeout_argument = "0900000".to_owned();
+        assert!(!registered_runner_command_matches(
+            "concurrency",
+            Profile::Pr,
+            0,
+            &step,
+            &quality_registry,
+        ));
+        let timeout_argument = step
+            .arguments
+            .get_mut(4)
+            .ok_or_else(|| std::io::Error::other("test timeout argument is unavailable"))?;
+        *timeout_argument = "900000".to_owned();
+        step.arguments.push("unexpected".to_owned());
+        assert!(!registered_runner_command_matches(
+            "concurrency",
+            Profile::Pr,
+            0,
+            &step,
+            &quality_registry,
+        ));
         Ok(())
     }
 

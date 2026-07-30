@@ -56,7 +56,8 @@ impl FrozenBoundedRunnerRegistry {
         };
         if *command != "quality-bounded-runner"
             || *recorded_gate != gate
-            || recorded_timeout.parse::<u128>().ok() != Some(timeout_ms)
+            || timeout_ms == 0
+            || *recorded_timeout != timeout_ms.to_string()
         {
             return Err(XtaskError::invalid(
                 "bounded runner child invocation",
@@ -71,35 +72,66 @@ impl FrozenBoundedRunnerRegistry {
 }
 
 pub(crate) fn run_process(arguments: impl Iterator<Item = String>) -> Result<(), XtaskError> {
-    let arguments = arguments.take(5).collect::<Vec<_>>();
-    let [gate, registry, spawn_sites, execution_timeout_ms] = arguments.as_slice() else {
-        return Err(XtaskError::usage(
-            "quality-bounded-runner requires one gate, two frozen registries, and one execution timeout",
-        ));
-    };
+    let [gate, registry, spawn_sites, execution_timeout_ms] = process_arguments(arguments)?;
     let result = (|| {
-        let execution_timeout_ms = execution_timeout_ms.parse::<u64>().map_err(|_| {
-            XtaskError::invalid(
-                "bounded runner child arguments",
-                "execution timeout is not a canonical unsigned millisecond value",
-            )
-        })?;
-        let execution_timeout = Duration::from_millis(execution_timeout_ms);
-        if execution_timeout.is_zero() {
-            return Err(XtaskError::invalid(
-                "bounded runner child arguments",
-                "execution timeout must be positive",
-            ));
-        }
-        let registry =
-            FrozenBoundedRunnerRegistry::capture(hex_decode(registry)?, hex_decode(spawn_sites)?)?;
-        match ScenarioGate::parse(gate)? {
+        let execution_timeout = parse_execution_timeout(&execution_timeout_ms)?;
+        let registry = FrozenBoundedRunnerRegistry::capture(
+            hex_decode(&registry)?,
+            hex_decode(&spawn_sites)?,
+        )?;
+        match ScenarioGate::parse(&gate)? {
             ScenarioGate::Concurrency => run_concurrency_scenario(&registry, execution_timeout),
             ScenarioGate::Resource => run_resource_scenario(&registry, execution_timeout),
         }
     })();
     bounded_runner_frames::emit_result(&result)?;
     result.map(|_| ())
+}
+
+fn process_arguments(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<[String; 4], XtaskError> {
+    let exact = [
+        arguments.next(),
+        arguments.next(),
+        arguments.next(),
+        arguments.next(),
+    ];
+    let [
+        Some(gate),
+        Some(registry),
+        Some(spawn_sites),
+        Some(execution_timeout),
+    ] = exact
+    else {
+        return Err(child_argument_count_failure());
+    };
+    if arguments.next().is_some() {
+        return Err(child_argument_count_failure());
+    }
+    Ok([gate, registry, spawn_sites, execution_timeout])
+}
+
+fn child_argument_count_failure() -> XtaskError {
+    XtaskError::usage(
+        "quality-bounded-runner requires one gate, two frozen registries, and one execution timeout",
+    )
+}
+
+fn parse_execution_timeout(value: &str) -> Result<Duration, XtaskError> {
+    let milliseconds = value.parse::<u64>().map_err(|_| {
+        XtaskError::invalid(
+            "bounded runner child arguments",
+            "execution timeout is not a canonical positive unsigned millisecond value",
+        )
+    })?;
+    if milliseconds == 0 || value != milliseconds.to_string() {
+        return Err(XtaskError::invalid(
+            "bounded runner child arguments",
+            "execution timeout is not a canonical positive unsigned millisecond value",
+        ));
+    }
+    Ok(Duration::from_millis(milliseconds))
 }
 
 pub(super) fn hex_decode(encoded: &str) -> Result<Vec<u8>, XtaskError> {
@@ -134,5 +166,33 @@ fn hex_nibble(byte: u8) -> Result<u8, XtaskError> {
             "bounded runner child arguments",
             "hex-encoded field contains a non-canonical digit",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_execution_timeout, process_arguments};
+
+    #[test]
+    fn child_protocol_requires_exact_arguments_and_a_canonical_positive_timeout() {
+        let arguments = ["EG-CONCURRENCY", "00", "00", "1"]
+            .into_iter()
+            .map(str::to_owned);
+        assert!(process_arguments(arguments).is_ok());
+        assert!(matches!(
+            parse_execution_timeout("1"),
+            Ok(timeout) if timeout.as_millis() == 1
+        ));
+
+        let extra = ["EG-CONCURRENCY", "00", "00", "1", "unexpected"]
+            .into_iter()
+            .map(str::to_owned);
+        assert!(process_arguments(extra).is_err());
+        for invalid in ["001", "+1", "-1", " 1", "1 ", "0", "18446744073709551616"] {
+            assert!(
+                parse_execution_timeout(invalid).is_err(),
+                "noncanonical timeout `{invalid}` was accepted"
+            );
+        }
     }
 }
