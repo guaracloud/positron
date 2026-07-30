@@ -331,6 +331,17 @@ fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> 
             )
             .into());
         }
+        let console_bytes = output
+            .stdout
+            .len()
+            .checked_add(output.stderr.len())
+            .ok_or_else(|| std::io::Error::other("matrix console byte count overflowed"))?;
+        if console_bytes > MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES {
+            return Err(std::io::Error::other(format!(
+                "successful 14-target matrix console output exceeds the {MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES}-byte limit"
+            ))
+            .into());
+        }
         let evidence = fixture.latest_evidence()?;
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
@@ -343,6 +354,34 @@ fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> 
             return Err(std::io::Error::other(format!(
                 "nested matrix runner did not retain structured controlled evidence: steps={controlled_steps}; resolved-programs={resolved_programs}"
             ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn matrix_failure_console_is_bounded_and_points_to_retained_evidence() -> TestResult {
+    let fixture = create_matrix_fixture()?;
+    let result: TestResult = (|| {
+        install_matrix_cargo_fault(
+            &fixture,
+            "console-failure",
+            "printf '%s\\n' 'matrix fixture failure' >&2\n    exit 73",
+        )?;
+        let output = matrix_quality_output(&fixture, "pr")?;
+        assert_rejected_output(&output, "[EG-MATRIX] failed")?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.contains("Evidence:")
+            || !stdout.contains(evidence_path.to_string_lossy().as_ref())
+        {
+            return Err(std::io::Error::other(
+                "bounded matrix failure console output did not point to retained evidence",
+            )
             .into());
         }
         Ok(())
@@ -478,9 +517,9 @@ fn matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_d
     result
 }
 
-const MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES: usize = 16_384;
+const MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES: usize = 8_192;
 const MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES: usize = 131_072;
-const EXACT_M0_11_TEST_COHORT: [&str; 12] = [
+const EXACT_M0_11_TEST_COHORT: [&str; 13] = [
     "m0_11_matrix::quality_executes_every_exact_diagnostic_target_with_independent_retained_identity",
     "m0_11_matrix::quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution",
     "m0_11_matrix::quality_rejects_matrix_lifecycle_failures_without_retry_or_fallback",
@@ -490,6 +529,7 @@ const EXACT_M0_11_TEST_COHORT: [&str; 12] = [
     "m0_11_matrix::parent_rejects_coupled_matrix_command_environment_and_result_tampering",
     "m0_11_matrix::quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualification",
     "m0_11_matrix::matrix_fixture_suppresses_nested_output_and_retains_structured_evidence",
+    "m0_11_matrix::matrix_failure_console_is_bounded_and_points_to_retained_evidence",
     "m0_11_matrix::security_review_selects_pc_0016_for_the_m0_11_merge_base_not_pc_0015",
     "m0_11_matrix::security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head",
     "m0_11_matrix::matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_docs",

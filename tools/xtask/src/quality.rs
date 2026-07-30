@@ -1908,6 +1908,7 @@ fn run_exact_target_matrix_gate(
                 cancellation: Arc::clone(&cancellation),
                 cancellation_marker,
                 maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+                console: ConsoleOutput::Suppress,
                 capture,
             },
         )?;
@@ -1998,6 +1999,7 @@ fn run_dynamic_analysis_gate(
                 cancellation: Arc::clone(&cancellation),
                 cancellation_marker,
                 maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+                console: ConsoleOutput::Forward,
                 capture,
             },
         )?;
@@ -3211,6 +3213,7 @@ fn run_documentation_gate(
             cancellation: Arc::new(AtomicBool::new(false)),
             cancellation_marker: None,
             maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+            console: ConsoleOutput::Forward,
             capture,
         },
     )
@@ -6365,6 +6368,7 @@ fn run_status<'argument>(
             cancellation: Arc::new(AtomicBool::new(false)),
             cancellation_marker: None,
             maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+            console: ConsoleOutput::Forward,
             capture,
         },
     )
@@ -6377,7 +6381,14 @@ struct StatusOptions<'environment, 'capture> {
     cancellation: Arc<AtomicBool>,
     cancellation_marker: Option<&'environment Path>,
     maximum_capture_bytes: usize,
+    console: ConsoleOutput,
     capture: &'capture mut GateCapture,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConsoleOutput {
+    Forward,
+    Suppress,
 }
 
 fn run_status_with_options<'argument>(
@@ -6393,7 +6404,9 @@ fn run_status_with_options<'argument>(
         .collect::<Vec<_>>();
     let resolved_program = snapshot.tool_path(program)?;
     let display = command_display(&resolved_program.to_string_lossy(), &arguments);
-    println!("  $ {display}");
+    if options.console == ConsoleOutput::Forward {
+        println!("  $ {display}");
+    }
     let invocation_environment = snapshot.invocation_environment(options.environment)?;
     let input = InvocationInput::Null;
     let mut invocation = controlled_invocation(
@@ -6425,8 +6438,10 @@ fn run_status_with_options<'argument>(
     .into_result();
     let verdict = match verdict {
         Ok(verdict) => {
-            print!("{}", verdict.output.stdout);
-            eprint!("{}", verdict.output.stderr);
+            if options.console == ConsoleOutput::Forward {
+                print!("{}", verdict.output.stdout);
+                eprint!("{}", verdict.output.stderr);
+            }
             let step_verdict = format!("exit-status:{}", verdict.status);
             options.capture.record(
                 invocation,
