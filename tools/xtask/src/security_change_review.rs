@@ -94,18 +94,39 @@ pub(crate) fn validate(
 }
 
 /// Validate every committed review record before the exact merge-base selector
-/// chooses the one that governs this attempt. A historical record therefore
-/// cannot silently stop enforcing its schema, command, immutable model
-/// references, classifications, or budget. This does not inspect a live diff.
+/// chooses the one that governs this attempt. It deliberately validates only
+/// record-owned structure, so mutable external classifications cannot preempt
+/// the selected record's live changed-path verdict.
 pub(crate) fn validate_committed_records(root: &Path) -> Result<String, XtaskError> {
     let mut summaries = Vec::with_capacity(REVIEW_LOCATORS.len());
     for locator in REVIEW_LOCATORS {
         let mut budget = crate::quality::SecurityInputBudget::new();
+        let contract = ReviewContract::load(root, locator, &mut budget, true)?;
+        summaries.push(format!(
+            "static-policy={}; {}",
+            contract.id,
+            budget.declared_summary()?
+        ));
+    }
+    Ok(summaries.join(" | "))
+}
+
+/// Check unselected records' immutable external references only after the
+/// selected record has completed its live changed-path validation. The local
+/// budget keeps this integrity check outside the selected record's frozen
+/// shared-input accounting contract.
+pub(crate) fn validate_unselected_external_references(
+    root: &Path,
+    selected: SelectedReview,
+) -> Result<String, XtaskError> {
+    let mut summaries = Vec::new();
+    for locator in REVIEW_LOCATORS {
+        if locator.id == selected.locator.id {
+            continue;
+        }
+        let mut budget = crate::quality::SecurityInputBudget::new();
         let surfaces =
-            crate::security_threat_surface::ThreatSurfaceRegistry::load_static_classifications(
-                root,
-                &mut budget,
-            )?;
+            crate::security_threat_surface::ThreatSurfaceRegistry::load(root, &mut budget)?;
         let (model_coverage, reviewed_non_trust) = surfaces.classification_maps();
         let contract = ReviewContract::load(root, locator, &mut budget, true)?;
         let classifications = contract.classifications(model_coverage, reviewed_non_trust)?;
@@ -114,7 +135,7 @@ pub(crate) fn validate_committed_records(root: &Path) -> Result<String, XtaskErr
             &contract,
         )?);
         summaries.push(format!(
-            "static-policy={}; {}",
+            "unselected-policy={}; {}",
             contract.id,
             budget.declared_summary()?
         ));
@@ -182,6 +203,12 @@ impl ReviewContract {
         let path_count = take_usize(&mut contract, "path_count", &path)?;
         let path_set_digest = take_string(&mut contract, "path_set_digest", &path)?;
         let classification_digest = take_string(&mut contract, "classification_digest", &path)?;
+        if !valid_sha256_digest(&path_set_digest) || !valid_sha256_digest(&classification_digest) {
+            return Err(XtaskError::invalid_path(
+                &path,
+                "changed-path contract has an invalid SHA-256 digest",
+            ));
+        }
         let record = take_string(&mut contract, "classification_record", &path)?;
         if record != CLASSIFICATION_RECORD {
             return Err(XtaskError::invalid_path(
@@ -576,6 +603,12 @@ fn take_usize(object: &mut JsonObject, field: &str, path: &Path) -> Result<usize
 
 fn valid_hex_identity(value: &str) -> bool {
     (40..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 fn sha256(bytes: &[u8]) -> String {

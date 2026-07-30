@@ -47,23 +47,12 @@ impl ThreatSurfaceRegistry {
         root: &Path,
         budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
-        Self::load_with_model_records(root, budget, true)
-    }
-
-    /// Load only the immutable registry bindings needed to validate a
-    /// committed policy record. Dynamic model-record contents stay owned by
-    /// the consuming security gate.
-    pub(crate) fn load_static_classifications(
-        root: &Path,
-        budget: &mut crate::quality::SecurityInputBudget,
-    ) -> Result<Self, XtaskError> {
-        Self::load_with_model_records(root, budget, false)
+        Self::load_with_model_records(root, budget)
     }
 
     fn load_with_model_records(
         root: &Path,
         budget: &mut crate::quality::SecurityInputBudget,
-        validate_model_records: bool,
     ) -> Result<Self, XtaskError> {
         let path = root.join(PATH);
         let bytes = crate::quality::read_external_input(
@@ -148,11 +137,8 @@ impl ThreatSurfaceRegistry {
                             ),
                         ));
                     }
-                    let model_digest = if validate_model_records {
-                        validate_model_record(root, model, owner, boundary, paths, budget)?
-                    } else {
-                        "static-binding".to_owned()
-                    };
+                    let model_digest =
+                        validate_model_record(root, model, owner, boundary, paths, budget)?;
                     let registered_surface_digest =
                         format!("sha256:{:x}", Sha256::digest(paths.as_bytes()));
                     let full_surfaces = paths.split('|').collect::<BTreeSet<_>>();

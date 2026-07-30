@@ -5793,10 +5793,13 @@ fn run_security_gate(
         crate::security_threat_surface::ThreatSurfaceRegistry::load(root, external_inputs)?;
     let changed_path_policy_validation =
         selected_security_review.validate_policy_commands(root, external_inputs)?;
-    let committed_policy_validation =
-        crate::security_change_review::validate_committed_records(root)?;
     let changed_path_review =
         threat_surfaces.validate_changed_paths(root, base, &changed.stdout, external_inputs)?;
+    let unselected_policy_validation =
+        crate::security_change_review::validate_unselected_external_references(
+            root,
+            selected_security_review,
+        )?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
     let probes = run_status(
@@ -5824,7 +5827,7 @@ fn run_security_gate(
         ));
     }
     Ok(format!(
-        "internal:{} | {} | {changed_path_policy_validation} | committed-policy-validation={committed_policy_validation} | merge-base={base}; {changed_path_review} | {} | {} | {}",
+        "internal:{} | {} | {changed_path_policy_validation} | unselected-policy-validation={unselected_policy_validation} | merge-base={base}; {changed_path_review} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,

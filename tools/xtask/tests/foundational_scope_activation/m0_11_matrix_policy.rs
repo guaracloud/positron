@@ -45,6 +45,32 @@ fn static_policy_validation_rejects_unselected_pc_0016_schema_drift() -> TestRes
 }
 
 #[test]
+fn selected_pc_0015_review_precedes_unselected_pc_0016_external_validation() -> TestResult {
+    let fixture = create_matrix_fixture()?;
+    let result = (|| {
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json",
+        );
+        replace_once(
+            &policy,
+            "qualification/engineering/security-canary-targets.tsv",
+            "qualification/engineering/security-canary-targets.zz",
+        )?;
+        // This fixture selects PC-0015. Its live changed-path review must run
+        // before the distinct PC-0016 record is checked against external
+        // immutable references.
+        let output = matrix_quality_output(&fixture, "pr")?;
+        assert_rejected_output(
+            &output,
+            "PC-0016-m0-11-compatibility-exact-target-matrix",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn retained_evidence_never_discloses_the_synthetic_canary() -> TestResult {
     let fixture = create_matrix_fixture()?;
     let result = (|| {
