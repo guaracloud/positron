@@ -103,10 +103,12 @@ impl ProcessGroup {
         command: &str,
         deadline: Instant,
     ) -> Result<bool, ExecutionFailure> {
-        require_shutdown_time(command, deadline, "process-group probe")?;
         let identifier = self.identifier(command)?;
         match rustix::process::test_kill_process_group(identifier) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                require_shutdown_time(command, deadline, "process-group probe")?;
+                Ok(true)
+            },
             Err(rustix::io::Errno::SRCH) => Ok(false),
             Err(source) => Err(process_control_failure(
                 command,
@@ -253,6 +255,25 @@ mod tests {
         if outcome != TerminationOutcome::AlreadyExited {
             return Err(std::io::Error::other(
                 "already exited child requested process-group termination",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn already_exited_child_is_closed_when_the_group_probe_reaches_the_shutdown_deadline()
+    -> Result<(), std::io::Error> {
+        let mut command = Command::new("/usr/bin/true");
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let group = ProcessGroup::new(child.id());
+        child.wait()?;
+
+        let outcome = terminate_and_reap(&mut child, &group, "true", Instant::now())
+            .map_err(|failure| std::io::Error::other(failure.detail))?;
+        if outcome != TerminationOutcome::AlreadyExited {
+            return Err(std::io::Error::other(
+                "already exited child at the shutdown boundary requested termination",
             ));
         }
         Ok(())
