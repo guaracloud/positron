@@ -18,37 +18,32 @@ const MAXIMUM_FIXTURE_BYTES: usize = 4_096;
 pub(super) const CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_V1";
 pub(super) const LEAK_CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_LEAK_V1";
 
-pub(super) fn emit_candidate(
-    repository: &Path,
-    artifact_root: &Path,
-    canary_id: &str,
-) -> Result<(), XtaskError> {
+pub(super) fn emit_candidate(artifact_root: &Path, canary_id: &str) -> Result<(), XtaskError> {
     if !matches!(canary_id, CANARY_ID | LEAK_CANARY_ID) || !artifact_root.is_dir() {
         return Err(XtaskError::invalid(
             "candidate artifact emitter",
             "unregistered canary identity or parent-owned artifact root",
         ));
     }
-    let golden = Golden::load(&repository.join(GOLDEN_PATH))?;
-    let intentional_leak = LeakFixture::load(&repository.join(LEAK_PATH))?;
-    if intentional_leak.0 != Sink::SupportArtifacts {
-        return Err(XtaskError::invalid(
-            "candidate artifact emitter",
-            "intentional leak fixture does not select the registered support artifact",
-        ));
-    }
-    let leak = (canary_id == LEAK_CANARY_ID).then_some(intentional_leak.0);
-    materialize(artifact_root, &golden, leak)?;
+    let leak = (canary_id == LEAK_CANARY_ID).then_some(Sink::SupportArtifacts);
+    materialize(artifact_root, leak)?;
     Ok(())
 }
 
 pub(super) fn scan_candidate(
     repository: &Path,
     artifact_root: &Path,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
 ) -> Result<String, XtaskError> {
-    let target_digest = validate_target_contract(repository)?;
-    let golden = Golden::load(&repository.join(GOLDEN_PATH))?;
-    let _intentional_leak = LeakFixture::load(&repository.join(LEAK_PATH))?;
+    let target_digest = validate_target_contract(repository, budget)?;
+    let golden = Golden::load(&repository.join(GOLDEN_PATH), budget)?;
+    let intentional_leak = LeakFixture::load(&repository.join(LEAK_PATH), budget)?;
+    if intentional_leak.0 != Sink::SupportArtifacts {
+        return Err(XtaskError::invalid(
+            "candidate artifact scanner",
+            "intentional leak fixture does not select the registered support artifact",
+        ));
+    }
     let collected_root = artifact_root.join("collected");
     let mut collected = Vec::new();
     let mut budget = ArtifactBudget::candidate();
@@ -99,9 +94,12 @@ pub(super) fn scan_candidate(
     ))
 }
 
-fn validate_target_contract(repository: &Path) -> Result<String, XtaskError> {
+fn validate_target_contract(
+    repository: &Path,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
+) -> Result<String, XtaskError> {
     let path = repository.join(TARGET_PATH);
-    let bytes = read_fixture(&path)?;
+    let bytes = read_fixture(&path, budget)?;
     let expected = "target_id\trunner_id\tsemantic_owner\tcommand\tartifact_categories\tqualification\nxtask-security-runner-capability-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_V1\tlogs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts\trunner-capability-only\nxtask-security-intentional-leak-negative-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_LEAK_V1\tsupport-artifacts\tnegative-test-only\n";
     if bytes != expected.as_bytes() {
         return Err(XtaskError::invalid_path(
@@ -163,8 +161,11 @@ struct Golden {
     outputs: Vec<(Sink, Vec<u8>)>,
 }
 impl Golden {
-    fn load(path: &Path) -> Result<Self, XtaskError> {
-        let bytes = read_fixture(path)?;
+    fn load(
+        path: &Path,
+        budget: &mut crate::bounded_input::ExternalInputBudget,
+    ) -> Result<Self, XtaskError> {
+        let bytes = read_fixture(path, budget)?;
         let content = std::str::from_utf8(&bytes).map_err(|source| {
             XtaskError::invalid(path.display().to_string(), source.to_string())
         })?;
@@ -212,8 +213,11 @@ impl Golden {
 
 struct LeakFixture(Sink);
 impl LeakFixture {
-    fn load(path: &Path) -> Result<Self, XtaskError> {
-        let bytes = read_fixture(path)?;
+    fn load(
+        path: &Path,
+        budget: &mut crate::bounded_input::ExternalInputBudget,
+    ) -> Result<Self, XtaskError> {
+        let bytes = read_fixture(path, budget)?;
         let content = std::str::from_utf8(&bytes).map_err(|source| {
             XtaskError::invalid(path.display().to_string(), source.to_string())
         })?;
@@ -256,11 +260,7 @@ struct Collected {
     sink: Sink,
     bytes: Vec<u8>,
 }
-fn materialize(
-    root: &Path,
-    golden: &Golden,
-    leak: Option<Sink>,
-) -> Result<Vec<Collected>, XtaskError> {
+fn materialize(root: &Path, leak: Option<Sink>) -> Result<Vec<Collected>, XtaskError> {
     let mut collected = Vec::new();
     for sink in Sink::ALL {
         let secret = format!("POSITRON_SYNTHETIC_CANARY_V1:{}", sink.label()).into_bytes();
@@ -273,12 +273,6 @@ fn materialize(
         let written = write_adapter(root, "written", sink, &artifact)?;
         let packaged = package_adapter(root, sink, &written)?;
         let item = collect_adapter(root, sink, &packaged)?;
-        if leak != Some(sink) && item.bytes != golden.output(sink)? {
-            return Err(XtaskError::invalid(
-                "secret canary harness",
-                "adapter output drifted from committed golden input",
-            ));
-        }
         collected.push(item);
     }
     Ok(collected)
@@ -341,8 +335,16 @@ fn independently_scan(collected: &[Collected], golden: &Golden) -> Result<(), Xt
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
-fn read_fixture(path: &Path) -> Result<Vec<u8>, XtaskError> {
-    read_bounded(path, MAXIMUM_FIXTURE_BYTES, "committed security fixture")
+fn read_fixture(
+    path: &Path,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
+) -> Result<Vec<u8>, XtaskError> {
+    crate::bounded_input::read_external(
+        path,
+        MAXIMUM_FIXTURE_BYTES,
+        "committed security fixture",
+        budget,
+    )
 }
 
 pub(super) fn read_bounded(

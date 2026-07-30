@@ -13,14 +13,95 @@ const POLICY_PATH: &str =
 const CLASSIFICATION_RECORD: &str = "qualification/engineering/security-threat-surfaces.tsv";
 const MAXIMUM_POLICY_BYTES: usize = 32_768;
 
+pub(crate) fn validate_policy_commands(
+    root: &Path,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
+) -> Result<(), XtaskError> {
+    let path = root.join(POLICY_PATH);
+    let content = String::from_utf8(crate::bounded_input::read_external(
+        &path,
+        MAXIMUM_POLICY_BYTES,
+        "PC-0015 policy record",
+        budget,
+    )?)
+    .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
+    apply_input_budget_contract(&content, &path, budget)?;
+    let public_targets = [
+        "m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam",
+        "m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor",
+        "m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence",
+        "m0_10_security_crypto::quality_rejects_executable_intentional_leak_with_retained_failed_evidence",
+        "m0_10_security_crypto::quality_rejects_missing_merge_base_and_uncovered_security_changes",
+    ];
+    for target in public_targets {
+        if !content.contains(target) {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("PC-0015 validation command target `{target}` does not resolve"),
+            ));
+        }
+    }
+    let final_blocker_targets = [
+        "m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification",
+        "m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification",
+        "m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions",
+        "m0_10_final_blockers::quality_rejects_an_extra_stale_model_classification",
+        "m0_10_final_blockers::quality_enforces_the_shared_external_input_count_boundary",
+        "m0_10_final_blockers::quality_enforces_the_shared_external_input_aggregate_boundary",
+        "m0_10_final_blockers::quality_uses_the_actual_m0_09_merge_base_and_rejects_the_old_base_pin",
+        "m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds",
+        "m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds",
+        "m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds",
+        "m0_10_final_blockers::canary_fixture_inputs_enforce_exact_bounds",
+    ];
+    for target in final_blocker_targets {
+        if !content.contains(target) {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("PC-0015 validation command target `{target}` does not resolve"),
+            ));
+        }
+    }
+    let target_prefix = "m0_10_security_crypto::";
+    for remainder in content.split(target_prefix).skip(1) {
+        let name = remainder
+            .split(|character: char| character == '"' || character.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        let target = format!("{target_prefix}{name}");
+        if !public_targets.contains(&target.as_str()) {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("PC-0015 validation command target `{target}` does not resolve"),
+            ));
+        }
+    }
+    let crypto_target =
+        "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations";
+    if !content.contains(crypto_target) {
+        return Err(XtaskError::invalid_path(
+            &path,
+            format!("PC-0015 validation command target `{crypto_target}` does not resolve"),
+        ));
+    }
+    if content.contains("security_probe_and_canary_harnesses_fail_closed") {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "PC-0015 validation command references a removed test target",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate(
     root: &Path,
     merge_base: &str,
     changed_paths: &str,
     model_coverage: &BTreeMap<String, String>,
     reviewed_non_trust: &BTreeMap<String, String>,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
 ) -> Result<String, XtaskError> {
-    let contract = load_contract(root)?;
+    let contract = load_contract(root, budget)?;
     if merge_base != contract.merge_base {
         return invalid("merge base drifted from the reviewed changed-path contract");
     }
@@ -50,6 +131,11 @@ pub(crate) fn validate(
     {
         return invalid(format!(
             "reviewed non-trust path `{path}` is extra or stale for the actual changed set"
+        ));
+    }
+    if let Some(path) = model_coverage.keys().find(|path| !actual.contains(*path)) {
+        return invalid(format!(
+            "model-classified path `{path}` is extra or stale for the actual changed set"
         ));
     }
     let mut classifications = Vec::with_capacity(actual.len());
@@ -94,14 +180,19 @@ struct Contract {
     classification_digest: String,
 }
 
-fn load_contract(root: &Path) -> Result<Contract, XtaskError> {
+fn load_contract(
+    root: &Path,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
+) -> Result<Contract, XtaskError> {
     let path = root.join(POLICY_PATH);
-    let content = String::from_utf8(crate::bounded_input::read(
+    let content = String::from_utf8(crate::bounded_input::read_external(
         &path,
         MAXIMUM_POLICY_BYTES,
         "PC-0015 policy record",
+        budget,
     )?)
     .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
+    apply_input_budget_contract(&content, &path, budget)?;
     let value = crate::evidence_json::parse(&content)
         .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     let mut document = value
@@ -126,6 +217,23 @@ fn load_contract(root: &Path) -> Result<Contract, XtaskError> {
         path_set_digest,
         classification_digest,
     })
+}
+
+fn apply_input_budget_contract(
+    content: &str,
+    path: &Path,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
+) -> Result<(), XtaskError> {
+    let value = crate::evidence_json::parse(content)
+        .map_err(|source| XtaskError::invalid_path(path, source.to_string()))?;
+    let mut document = value
+        .into_object("PC-0015")
+        .map_err(|source| XtaskError::invalid_path(path, source.to_string()))?;
+    let mut change = take_object(&mut document, "change", path)?;
+    let mut limits = take_object(&mut change, "external_input_budget", path)?;
+    let maximum_count = take_usize(&mut limits, "maximum_count", path)?;
+    let maximum_bytes = take_usize(&mut limits, "maximum_aggregate_bytes", path)?;
+    budget.apply_declared_limits(maximum_count, maximum_bytes)
 }
 
 fn take_object(

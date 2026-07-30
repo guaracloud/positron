@@ -1,8 +1,47 @@
 use super::*;
 
-const PATH_COUNT: &str = "changed-path-count=40";
-const PATH_SET_DIGEST: &str = "changed-path-set-digest=sha256:9d8305d05177e1cb55da64f80cf46ebef16878c57f0d696f5c1b0bc0162d2c03";
-const CLASSIFICATION_DIGEST: &str = "changed-path-classification-digest=sha256:e2127d638ed7714fec26221c48408761bbfdf395f7e6c055d9cfaa5fd8f2e58a";
+const PATH_COUNT: &str = "changed-path-count=26";
+const PATH_SET_DIGEST: &str = "changed-path-set-digest=sha256:6105ea257f79be4fed8d4e5a3c31879ac4c5fbfb590c7f2f3d2e4ac67374e224";
+const CLASSIFICATION_DIGEST: &str = "changed-path-classification-digest=sha256:d523f4485cd2991864ee96c3edf26c44c88696dd83b49dfc9761942a4f13130a";
+
+#[test]
+fn quality_uses_the_actual_m0_09_merge_base_and_rejects_the_old_base_pin() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/m0-10-current-origin-main"),
+            b"armed\n",
+        )?;
+        let current = fixture.quality_output_for("pr")?;
+        if !current.status.success() {
+            return Err(std::io::Error::other(format!(
+                "current registry rejected the actual M0-09 merge base: {}",
+                combined_output(&current),
+            ))
+            .into());
+        }
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
+        );
+        let original = fs::read_to_string(&policy)?;
+        fs::write(
+            &policy,
+            original.replacen(
+                "542f3835dc67f819e566e017c04e165b15416861",
+                "76d784d5cfe8bcd85267a21b906d12d02af5afce",
+                1,
+            ),
+        )?;
+        let stale = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&stale, "merge base drifted")?;
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
 
 #[test]
 fn quality_rejects_an_actual_changed_path_without_owned_classification() -> TestResult {
@@ -46,7 +85,7 @@ fn quality_retains_the_complete_sorted_changed_path_classification() -> TestResu
         )?)?;
         for expected in [
             PATH_COUNT,
-            "changed-paths=crates/positron-domain/tests/dynamic_domain_properties.rs|qualification/engineering/README.md",
+            "changed-paths=qualification/engineering/README.md|qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
             "|tools/xtask/tests/foundational_scope_activation/m0_10_security_crypto.rs;",
             PATH_SET_DIGEST,
             CLASSIFICATION_DIGEST,
@@ -77,7 +116,7 @@ fn quality_rejects_stale_conflicting_or_unowned_path_dispositions() -> TestResul
             (
                 original.replacen(
                     "tools/xtask/src/security_catalog.rs",
-                    "tools/xtask/src/stale-security-catalog.rs",
+                    "tools/xtask/src/security_catalog.zz",
                     1,
                 ),
                 "extra or stale",
@@ -100,6 +139,129 @@ fn quality_rejects_stale_conflicting_or_unowned_path_dispositions() -> TestResul
             assert_rejected_output(&output, expected)?;
         }
         fs::write(path, original)?;
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_an_extra_stale_model_classification() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let path = fixture
+            .root
+            .join("qualification/engineering/security-threat-surfaces.tsv");
+        let original = fs::read_to_string(&path)?;
+        fs::write(
+            &path,
+            original.replacen(
+                "crates/positron-config/src/lib.rs|qualification/engineering/security/TM-0001-m0-04-toml-parser.json\t-",
+                "crates/positron-config/src/lib.rs|qualification/engineering/security/TM-0001-m0-04-toml-parser.json\tcrates/positron-config/src/lib.rs",
+                1,
+            ),
+        )?;
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
+        );
+        let original_policy = fs::read_to_string(&policy)?;
+        fs::write(
+            policy,
+            original_policy.replacen(
+                "\"maximum_aggregate_bytes\": 108614",
+                "\"maximum_aggregate_bytes\": 108742",
+                1,
+            ),
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "model-classified path")?;
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_enforces_the_shared_external_input_count_boundary() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let current = fixture.quality_output_for("pr")?;
+        if !current.status.success() {
+            return Err(std::io::Error::other(format!(
+                "the exact external input count boundary failed: {}",
+                combined_output(&current),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-SECURITY",
+        )?)?;
+        if !report.contains("external-input-count=29") {
+            return Err(std::io::Error::other(
+                "EG-SECURITY omitted the exact shared external input count",
+            )
+            .into());
+        }
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
+        );
+        let original = fs::read_to_string(&policy)?;
+        fs::write(
+            policy,
+            original.replacen("\"maximum_count\": 29", "\"maximum_count\": 28", 1),
+        )?;
+        let oversized = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&oversized, "external input count exceeds 28")?;
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_enforces_the_shared_external_input_aggregate_boundary() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let current = fixture.quality_output_for("pr")?;
+        if !current.status.success() {
+            return Err(std::io::Error::other(format!(
+                "the exact external input aggregate boundary failed: {}",
+                combined_output(&current),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-SECURITY",
+        )?)?;
+        if !report.contains("external-input-aggregate-bytes=108614") {
+            return Err(std::io::Error::other(
+                "EG-SECURITY omitted the exact shared external input aggregate",
+            )
+            .into());
+        }
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
+        );
+        let original = fs::read_to_string(&policy)?;
+        fs::write(
+            policy,
+            original.replacen(
+                "\"maximum_aggregate_bytes\": 108614",
+                "\"maximum_aggregate_bytes\": 108613",
+                1,
+            ),
+        )?;
+        let oversized = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&oversized, "external input aggregate exceeds 108613 bytes")?;
         Ok(())
     })();
     let cleanup = fixture.remove();

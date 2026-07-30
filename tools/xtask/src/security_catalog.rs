@@ -85,11 +85,20 @@ pub(crate) struct FrozenSecurityCatalog {
 }
 
 impl FrozenSecurityCatalog {
-    pub(crate) fn load(root: &Path, registry: &Registry) -> Result<Self, XtaskError> {
-        let threat_surfaces = crate::security_threat_surface::ThreatSurfaceRegistry::load(root)?;
+    pub(crate) fn load(
+        root: &Path,
+        registry: &Registry,
+        budget: &mut crate::bounded_input::ExternalInputBudget,
+    ) -> Result<Self, XtaskError> {
+        let threat_surfaces =
+            crate::security_threat_surface::ThreatSurfaceRegistry::load(root, budget)?;
         let path = root.join(CATALOG_PATH);
-        let bytes =
-            crate::bounded_input::read(&path, MAXIMUM_CATALOG_BYTES, "security runner catalog")?;
+        let bytes = crate::bounded_input::read_external(
+            &path,
+            MAXIMUM_CATALOG_BYTES,
+            "security runner catalog",
+            budget,
+        )?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| XtaskError::invalid_path(&path, "security runner catalog is not UTF-8"))?;
         let mut lines = text.lines();

@@ -432,6 +432,14 @@ struct GateExecutionContext<'context> {
     identity: &'context EvidenceIdentity,
     dynamic_cancellation: &'context Arc<AtomicBool>,
     dynamic_cancellation_marker: Option<&'context Path>,
+    external_inputs: &'context mut crate::bounded_input::ExternalInputBudget,
+}
+
+struct M010GateContext<'context> {
+    root: &'context Path,
+    registry: &'context Registry,
+    profile: Profile,
+    external_inputs: &'context mut crate::bounded_input::ExternalInputBudget,
 }
 
 struct DynamicAnalysisContext<'context> {
@@ -892,6 +900,7 @@ pub(crate) fn run_with_dynamic_cancellation(
     );
 
     let mut attempts = Vec::with_capacity(registry.gates.len());
+    let mut external_inputs = crate::bounded_input::ExternalInputBudget::new();
     for gate in &registry.gates {
         if !gate_selected(gate, options.profile, &activated_risk_gates) {
             attempts.push(gate_attempt(
@@ -927,6 +936,7 @@ pub(crate) fn run_with_dynamic_cancellation(
                 identity: &identity,
                 dynamic_cancellation: &dynamic_cancellation,
                 dynamic_cancellation_marker: dynamic_cancellation_marker.as_deref(),
+                external_inputs: &mut external_inputs,
             },
             gate,
             &mut capture,
@@ -1390,6 +1400,7 @@ fn execute_gate(
         identity,
         dynamic_cancellation,
         dynamic_cancellation_marker,
+        external_inputs,
     } = context;
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
@@ -1429,9 +1440,12 @@ fn execute_gate(
         ),
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
         "crypto" => run_crypto_gate(
-            root,
-            registry,
-            options.profile,
+            M010GateContext {
+                root,
+                registry,
+                profile: options.profile,
+                external_inputs,
+            },
             budget,
             environment,
             capture,
@@ -1450,11 +1464,24 @@ fn execute_gate(
         "policy" => run_policy_gate(root, registry),
         "rust" => run_rust_gate(root, budget, environment, capture),
         "safety" => run_safety_gate(root, registry, budget, environment, capture),
-        "security" => run_security_gate(root, registry, budget, environment, capture),
+        "security" => run_security_gate(
+            M010GateContext {
+                root,
+                registry,
+                profile: options.profile,
+                external_inputs,
+            },
+            budget,
+            environment,
+            capture,
+        ),
         "secrets" => run_secret_gate(
-            root,
-            registry,
-            options.profile,
+            M010GateContext {
+                root,
+                registry,
+                profile: options.profile,
+                external_inputs,
+            },
             budget,
             environment,
             capture,
@@ -5305,12 +5332,17 @@ fn run_safety_gate(
 }
 
 fn run_security_gate(
-    root: &Path,
-    registry: &Registry,
+    context: M010GateContext<'_>,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let M010GateContext {
+        root,
+        registry,
+        external_inputs,
+        ..
+    } = context;
     if !registry.has_m0_04_configuration_scope() {
         return Err(XtaskError::invalid(
             "security gate",
@@ -5318,14 +5350,16 @@ fn run_security_gate(
         ));
     }
     let path = root.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json");
-    let threat_model = String::from_utf8(crate::bounded_input::read(
+    let threat_model = String::from_utf8(crate::bounded_input::read_external(
         &path,
         8_192,
         "M0-04 parser threat-model record",
+        external_inputs,
     )?)
     .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
-    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
+    let catalog =
+        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
     let descriptor = catalog.descriptor_for("EG-SECURITY")?;
     let merge_base = run_capture(
         root,
@@ -5350,8 +5384,9 @@ fn run_security_gate(
         budget,
         Some(capture),
     )?;
-    let changed_path_review = crate::security_threat_surface::ThreatSurfaceRegistry::load(root)?
-        .validate_changed_paths(root, base, &changed.stdout)?;
+    let changed_path_review =
+        crate::security_threat_surface::ThreatSurfaceRegistry::load(root, external_inputs)?
+            .validate_changed_paths(root, base, &changed.stdout, external_inputs)?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
     let probes = run_status(
@@ -5379,25 +5414,31 @@ fn run_security_gate(
         ));
     }
     Ok(format!(
-        "internal:{} | {} | merge-base={base}; {changed_path_review} | {} | {}",
+        "internal:{} | {} | merge-base={base}; {changed_path_review} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,
         expected_probe,
+        external_inputs.summary()?,
     ))
 }
 
 fn run_crypto_gate(
-    root: &Path,
-    registry: &Registry,
-    profile: Profile,
+    context: M010GateContext<'_>,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
-    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
+    let M010GateContext {
+        root,
+        registry,
+        profile,
+        external_inputs,
+    } = context;
+    let catalog =
+        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
     let descriptor = catalog.descriptor_for("EG-CRYPTO")?;
-    let target_digest = match crate::crypto_targets::select(root, profile)? {
+    let target_digest = match crate::crypto_targets::select(root, profile, external_inputs)? {
         crate::crypto_targets::Selection::RunnerCapability(digest) => digest,
         crate::crypto_targets::Selection::NoActiveProductTarget(digest) => {
             return Ok(format!(
@@ -5497,14 +5538,19 @@ fn validate_configuration_parser_threat_model_text(content: &str) -> Result<(), 
 }
 
 fn run_secret_gate(
-    root: &Path,
-    registry: &Registry,
-    profile: Profile,
+    context: M010GateContext<'_>,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
-    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
+    let M010GateContext {
+        root,
+        registry,
+        profile,
+        external_inputs,
+    } = context;
+    let catalog =
+        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
     let descriptor = catalog.descriptor_for("EG-SECRETS")?;
     let artifact_root = environment
         .temporary_root()
@@ -5538,7 +5584,7 @@ fn run_secret_gate(
             budget,
             capture,
         )?;
-        crate::security_harness::scan_secret_candidate(root, &artifact_root)
+        crate::security_harness::scan_secret_candidate(root, &artifact_root, external_inputs)
     })();
     let cleanup = fs::remove_dir_all(&artifact_root).map_err(|source| {
         XtaskError::io(

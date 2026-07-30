@@ -8,14 +8,13 @@ use sha2::{Digest, Sha256};
 use crate::error::XtaskError;
 
 const PATH: &str = "qualification/engineering/security-threat-surfaces.tsv";
-const HEADER: &str = "record_id\trecord_kind\tmodel_id\tsemantic_owner\ttrust_boundary\tsurface_paths\tchange_set\treview_disposition\trationale";
+const HEADER: &str = "record_id\trecord_kind\tmodel_id\tsemantic_owner\ttrust_boundary\tsurface_paths\tchanged_model_paths\tchange_set\treview_disposition\trationale";
 const OWNER: &str = "Security and Key Management";
-const CHANGE_SET: &str = "m0-10-pr-166@76d784d5cfe8bcd85267a21b906d12d02af5afce";
+const CHANGE_SET: &str = "m0-10-pr-166@542f3835dc67f819e566e017c04e165b15416861";
 const DISPOSITION: &str = "reviewed-m0-10";
 const MODEL_RATIONALE: &str = "owned versioned threat model";
 const MAXIMUM_REGISTRY_BYTES: usize = 16_384;
 const MAXIMUM_MODEL_BYTES: usize = 8_192;
-const MAXIMUM_POLICY_BYTES: usize = 32_768;
 const CONTRACTS: [(&str, &str, &str, &str); 3] = [
     (
         "security-runner-v1",
@@ -44,13 +43,17 @@ pub(crate) struct ThreatSurfaceRegistry {
 }
 
 impl ThreatSurfaceRegistry {
-    pub(crate) fn load(root: &Path) -> Result<Self, XtaskError> {
-        validate_policy_commands(root)?;
+    pub(crate) fn load(
+        root: &Path,
+        budget: &mut crate::bounded_input::ExternalInputBudget,
+    ) -> Result<Self, XtaskError> {
+        crate::security_change_review::validate_policy_commands(root, budget)?;
         let path = root.join(PATH);
-        let bytes = crate::bounded_input::read(
+        let bytes = crate::bounded_input::read_external(
             &path,
             MAXIMUM_REGISTRY_BYTES,
             "security threat-surface registry",
+            budget,
         )?;
         let text = std::str::from_utf8(&bytes).map_err(|source| {
             XtaskError::invalid_path(&path, format!("registry is not UTF-8: {source}"))
@@ -75,6 +78,7 @@ impl ThreatSurfaceRegistry {
                 owner,
                 boundary,
                 paths,
+                changed_model_paths,
                 change_set,
                 disposition,
                 rationale,
@@ -127,10 +131,28 @@ impl ThreatSurfaceRegistry {
                             ),
                         ));
                     }
-                    let model_digest = validate_model_record(root, model, owner, boundary, paths)?;
+                    let model_digest =
+                        validate_model_record(root, model, owner, boundary, paths, budget)?;
                     let registered_surface_digest =
                         format!("sha256:{:x}", Sha256::digest(paths.as_bytes()));
-                    for surface in paths.split('|') {
+                    let full_surfaces = paths.split('|').collect::<BTreeSet<_>>();
+                    let changed_surfaces = if *changed_model_paths == "-" {
+                        Vec::new()
+                    } else {
+                        changed_model_paths.split('|').collect::<Vec<_>>()
+                    };
+                    if changed_surfaces
+                        .iter()
+                        .any(|surface| !full_surfaces.contains(surface))
+                    {
+                        return Err(XtaskError::invalid_path(
+                            &path,
+                            format!(
+                                "changed model coverage escapes full surfaces for `{record_id}`"
+                            ),
+                        ));
+                    }
+                    for surface in changed_surfaces {
                         if model_coverage
                             .insert(surface.to_owned(), format!("{owner}\t{model}"))
                             .is_some()
@@ -144,13 +166,14 @@ impl ThreatSurfaceRegistry {
                     summaries.insert(
                         (*record_id).to_owned(),
                         format!(
-                            "model={model}; model-record-digest={model_digest}; owner={owner}; trust-boundary={boundary}; registered-surfaces={paths}; registered-surface-set-digest={registered_surface_digest}; change-set={change_set}; disposition={disposition}"
+                            "model={model}; model-record-digest={model_digest}; owner={owner}; trust-boundary={boundary}; registered-surfaces={paths}; changed-model-surfaces={changed_model_paths}; registered-surface-set-digest={registered_surface_digest}; change-set={change_set}; disposition={disposition}"
                         ),
                     );
                 },
                 "reviewed-non-trust" => {
                     if *model != "-"
                         || *boundary != "-"
+                        || *changed_model_paths != "-"
                         || owner.is_empty()
                         || *owner == "-"
                         || rationale.is_empty()
@@ -218,6 +241,7 @@ impl ThreatSurfaceRegistry {
         root: &Path,
         merge_base: &str,
         changed_paths: &str,
+        budget: &mut crate::bounded_input::ExternalInputBudget,
     ) -> Result<String, XtaskError> {
         crate::security_change_review::validate(
             root,
@@ -225,6 +249,7 @@ impl ThreatSurfaceRegistry {
             changed_paths,
             &self.model_coverage,
             &self.reviewed_non_trust,
+            budget,
         )
     }
 }
@@ -235,10 +260,15 @@ fn validate_model_record(
     owner: &str,
     boundary: &str,
     surfaces: &str,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
 ) -> Result<String, XtaskError> {
     let path = root.join(format!("qualification/engineering/security/{model}.json"));
-    let bytes =
-        crate::bounded_input::read(&path, MAXIMUM_MODEL_BYTES, "versioned threat-model record")?;
+    let bytes = crate::bounded_input::read_external(
+        &path,
+        MAXIMUM_MODEL_BYTES,
+        "versioned threat-model record",
+        budget,
+    )?;
     if model == "TM-0001-m0-04-toml-parser" {
         return Ok(format!("sha256:{:x}", Sha256::digest(&bytes)));
     }
@@ -251,7 +281,7 @@ fn validate_model_record(
         &format!("\"semantic_owner\": \"{owner}\""),
         &format!("\"trust_boundaries\": [\"{boundary}\"]"),
         "\"review_disposition\": \"reviewed-m0-10\"",
-        "\"review_revision\": \"76d784d5cfe8bcd85267a21b906d12d02af5afce\"",
+        "\"review_revision\": \"542f3835dc67f819e566e017c04e165b15416861\"",
     ] {
         if !content.contains(required) {
             return Err(XtaskError::invalid_path(
@@ -271,11 +301,11 @@ fn validate_model_record(
     let (declared_digest, expected_record_digest) = match model {
         "TM-0010-m0-10-runner-crypto" => (
             "sha256:13fc0dabcc5a71015de407eda2dd2cf36904bb1bd0b50eb1f02e17bdabe1108a",
-            "sha256:89ee6d8ee1f9bf173dad9adcb2bd1303b92ad7a0d65e6767d0f34cf86831fbac",
+            "sha256:56cd9ecd8f0216fb8eac4cc77e39ffd9a57bef9547a172b4ff1b600c5e6ac6bf",
         ),
         "TM-0011-m0-10-runner-artifacts" => (
             "sha256:4dd3266ba77cc7185f72d0ef2af77fc75fe032e9b14cdeaf8b82d9afa335523b",
-            "sha256:70834a596ddb215c47429d2c8423d307d2b3f4f85f7bfb5ee609e3022fe3bc6c",
+            "sha256:d1071c8c2762b3e27e897f182e60c118179eeaceda11f5d8c64f0d8439e5e258",
         ),
         _ => {
             return Err(XtaskError::invalid_path(
@@ -298,77 +328,4 @@ fn validate_model_record(
         ));
     }
     Ok(actual_record_digest)
-}
-
-fn validate_policy_commands(root: &Path) -> Result<(), XtaskError> {
-    let path = root.join(
-        "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
-    );
-    let content = String::from_utf8(crate::bounded_input::read(
-        &path,
-        MAXIMUM_POLICY_BYTES,
-        "PC-0015 policy record",
-    )?)
-    .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
-    let public_targets = [
-        "m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam",
-        "m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor",
-        "m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence",
-        "m0_10_security_crypto::quality_rejects_executable_intentional_leak_with_retained_failed_evidence",
-        "m0_10_security_crypto::quality_rejects_missing_merge_base_and_uncovered_security_changes",
-    ];
-    for target in public_targets {
-        if !content.contains(target) {
-            return Err(XtaskError::invalid_path(
-                &path,
-                format!("PC-0015 validation command target `{target}` does not resolve"),
-            ));
-        }
-    }
-    let final_blocker_targets = [
-        "m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification",
-        "m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification",
-        "m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions",
-        "m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds",
-        "m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds",
-        "m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds",
-        "m0_10_final_blockers::canary_fixture_inputs_enforce_exact_bounds",
-    ];
-    for target in final_blocker_targets {
-        if !content.contains(target) {
-            return Err(XtaskError::invalid_path(
-                &path,
-                format!("PC-0015 validation command target `{target}` does not resolve"),
-            ));
-        }
-    }
-    let target_prefix = "m0_10_security_crypto::";
-    for remainder in content.split(target_prefix).skip(1) {
-        let name = remainder
-            .split(|character: char| character == '"' || character.is_whitespace())
-            .next()
-            .unwrap_or_default();
-        let target = format!("{target_prefix}{name}");
-        if !public_targets.contains(&target.as_str()) {
-            return Err(XtaskError::invalid_path(
-                &path,
-                format!("PC-0015 validation command target `{target}` does not resolve"),
-            ));
-        }
-    }
-    let crypto_target =
-        "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations";
-    if !content.contains(crypto_target) {
-        return Err(XtaskError::invalid_path(
-            &path,
-            format!("PC-0015 validation command target `{crypto_target}` does not resolve"),
-        ));
-    }
-    if content.contains("security_probe_and_canary_harnesses_fail_closed") {
-        return Err(XtaskError::invalid_path(
-            &path,
-            "PC-0015 validation command references a removed test target",
-        ));
-    }
-    Ok(())
 }

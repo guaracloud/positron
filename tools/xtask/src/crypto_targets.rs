@@ -16,12 +16,17 @@ pub(crate) enum Selection {
     NoActiveProductTarget(String),
 }
 
-pub(crate) fn select(root: &Path, profile: Profile) -> Result<Selection, XtaskError> {
+pub(crate) fn select(
+    root: &Path,
+    profile: Profile,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
+) -> Result<Selection, XtaskError> {
     let path = root.join(PATH);
-    let bytes = crate::bounded_input::read(
+    let bytes = crate::bounded_input::read_external(
         &path,
         MAXIMUM_REGISTRY_BYTES,
         "profile-aware crypto target registry",
+        budget,
     )?;
     if bytes != EXPECTED.as_bytes() {
         return Err(XtaskError::invalid_path(
@@ -44,12 +49,13 @@ mod tests {
     #[test]
     fn extended_and_qualification_profiles_never_reuse_pr_runner_capability() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut budget = crate::bounded_input::ExternalInputBudget::new();
         assert!(matches!(
-            select(&root, Profile::Ext),
+            select(&root, Profile::Ext, &mut budget),
             Ok(Selection::NoActiveProductTarget(_))
         ));
         assert!(matches!(
-            select(&root, Profile::Qual),
+            select(&root, Profile::Qual, &mut budget),
             Ok(Selection::NoActiveProductTarget(_))
         ));
     }

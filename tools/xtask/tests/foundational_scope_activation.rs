@@ -4693,14 +4693,10 @@ case ":$PATH:" in
 esac
 case "${1:-}" in
   merge-base)
-    printf '%s\n' '76d784d5cfe8bcd85267a21b906d12d02af5afce'
+    printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
     ;;
   diff)
-    printf '%s\n' 'crates/positron-domain/tests/dynamic_domain_properties.rs'
     printf '%s\n' 'qualification/engineering/README.md'
-    printf '%s\n' 'qualification/engineering/dynamic-detectors.tsv'
-    printf '%s\n' 'qualification/engineering/dynamic-targets.tsv'
-    printf '%s\n' 'qualification/engineering/policy-changes/PC-0014-m0-09-dynamic-test-quality-runners.json'
     printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'
     printf '%s\n' 'qualification/engineering/scopes.tsv'
     printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
@@ -4713,14 +4709,8 @@ case "${1:-}" in
     printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv'
     printf '%s\n' 'tools/xtask/src/bounded_input.rs'
     printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_cancellation.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_catalog.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_execution_plan.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_quality.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_verifier.rs'
     printf '%s\n' 'tools/xtask/src/main.rs'
     printf '%s\n' 'tools/xtask/src/quality.rs'
-    printf '%s\n' 'tools/xtask/src/registry.rs'
     printf '%s\n' 'tools/xtask/src/security_catalog.rs'
     printf '%s\n' 'tools/xtask/src/security_change_review.rs'
     printf '%s\n' 'tools/xtask/src/security_harness.rs'
@@ -4730,10 +4720,6 @@ case "${1:-}" in
     printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
     printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
     printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_coverage_audit.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_dynamic_plans.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_dynamic_quality.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_dynamic_verifier.rs'
     printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_final_blockers.rs'
     printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_security_crypto.rs'
     ;;
@@ -7231,10 +7217,43 @@ set -eu
 case "${1:-}" in
   merge-base)
     if [ ! -f target/quality-tools/m0-10-missing-merge-base ]; then
-      printf '%s\n' '76d784d5cfe8bcd85267a21b906d12d02af5afce'
+      if [ -f target/quality-tools/m0-10-current-origin-main ]; then
+        printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
+      else
+        printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
+      fi
     fi
     ;;
   diff)
+    if [ -f target/quality-tools/m0-10-current-origin-main ]; then
+      printf '%s\n' 'qualification/engineering/README.md'
+      printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'
+      printf '%s\n' 'qualification/engineering/scopes.tsv'
+      printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
+      printf '%s\n' 'qualification/engineering/security-crypto-targets.tsv'
+      printf '%s\n' 'qualification/engineering/security-runners.tsv'
+      printf '%s\n' 'qualification/engineering/security-threat-surfaces.tsv'
+      printf '%s\n' 'qualification/engineering/security/TM-0010-m0-10-runner-crypto.json'
+      printf '%s\n' 'qualification/engineering/security/TM-0011-m0-10-runner-artifacts.json'
+      printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv'
+      printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv'
+      printf '%s\n' 'tools/xtask/src/bounded_input.rs'
+      printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+      printf '%s\n' 'tools/xtask/src/main.rs'
+      printf '%s\n' 'tools/xtask/src/quality.rs'
+      printf '%s\n' 'tools/xtask/src/security_catalog.rs'
+      printf '%s\n' 'tools/xtask/src/security_change_review.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary_budget.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary_tests.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
+      printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_final_blockers.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_security_crypto.rs'
+      exit 0
+    fi
     if [ -f target/quality-tools/m0-10-unclassified-changed-path ]; then
       printf '%s\n' 'tools/xtask/src/security_catalog.rs'
       exit 0
@@ -7243,11 +7262,7 @@ case "${1:-}" in
       printf '%s\n' 'tools/xtask/src/security_harness/uncovered.rs'
       exit 0
     fi
-    printf '%s\n' 'crates/positron-domain/tests/dynamic_domain_properties.rs'
     printf '%s\n' 'qualification/engineering/README.md'
-    printf '%s\n' 'qualification/engineering/dynamic-detectors.tsv'
-    printf '%s\n' 'qualification/engineering/dynamic-targets.tsv'
-    printf '%s\n' 'qualification/engineering/policy-changes/PC-0014-m0-09-dynamic-test-quality-runners.json'
     printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'
     printf '%s\n' 'qualification/engineering/scopes.tsv'
     printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
@@ -7260,14 +7275,8 @@ case "${1:-}" in
     printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv'
     printf '%s\n' 'tools/xtask/src/bounded_input.rs'
     printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_cancellation.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_catalog.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_execution_plan.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_quality.rs'
-    printf '%s\n' 'tools/xtask/src/dynamic_verifier.rs'
     printf '%s\n' 'tools/xtask/src/main.rs'
     printf '%s\n' 'tools/xtask/src/quality.rs'
-    printf '%s\n' 'tools/xtask/src/registry.rs'
     printf '%s\n' 'tools/xtask/src/security_catalog.rs'
     printf '%s\n' 'tools/xtask/src/security_change_review.rs'
     printf '%s\n' 'tools/xtask/src/security_harness.rs'
@@ -7277,10 +7286,6 @@ case "${1:-}" in
     printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
     printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
     printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_coverage_audit.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_dynamic_plans.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_dynamic_quality.rs'
-    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_09_dynamic_verifier.rs'
     printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_final_blockers.rs'
     printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_security_crypto.rs'
     ;;

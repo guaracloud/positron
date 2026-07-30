@@ -17,11 +17,15 @@
     "public_seam": "cargo xtask quality returned verdict and immutable target/quality/evidence report",
     "affected_scopes": ["xtask", "qualification/engineering gate and evidence registries"],
     "changed_path_contract": {
-      "merge_base": "76d784d5cfe8bcd85267a21b906d12d02af5afce",
-      "path_count": 40,
-      "path_set_digest": "sha256:9d8305d05177e1cb55da64f80cf46ebef16878c57f0d696f5c1b0bc0162d2c03",
-      "classification_digest": "sha256:e2127d638ed7714fec26221c48408761bbfdf395f7e6c055d9cfaa5fd8f2e58a",
+      "merge_base": "542f3835dc67f819e566e017c04e165b15416861",
+      "path_count": 26,
+      "path_set_digest": "sha256:6105ea257f79be4fed8d4e5a3c31879ac4c5fbfb590c7f2f3d2e4ac67374e224",
+      "classification_digest": "sha256:d523f4485cd2991864ee96c3edf26c44c88696dd83b49dfc9761942a4f13130a",
       "classification_record": "qualification/engineering/security-threat-surfaces.tsv"
+    },
+    "external_input_budget": {
+      "maximum_count": 29,
+      "maximum_aggregate_bytes": 108614
     },
     "dependency_review": {
       "new_dependencies": "none",
@@ -56,6 +60,10 @@
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_an_extra_stale_model_classification -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_enforces_the_shared_external_input_count_boundary -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_enforces_the_shared_external_input_aggregate_boundary -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_uses_the_actual_m0_09_merge_base_and_rejects_the_old_base_pin -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds -- --exact",

@@ -38,7 +38,7 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
                 .into());
             }
             if gate == "EG-SECURITY"
-                && (!report.contains("merge-base=76d784d5cfe8bcd85267a21b906d12d02af5afce")
+                && (!report.contains("merge-base=542f3835dc67f819e566e017c04e165b15416861")
                     || !report.contains("changed-path-set-digest=sha256:"))
             {
                 return Err(std::io::Error::other(

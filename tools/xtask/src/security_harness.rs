@@ -21,18 +21,18 @@ pub(crate) fn run_security_probe_process() -> Result<(), XtaskError> {
 }
 
 pub(crate) fn emit_secret_candidate(
-    root: &Path,
     artifact_root: &Path,
     canary_id: &str,
 ) -> Result<(), XtaskError> {
-    canary::emit_candidate(root, artifact_root, canary_id)
+    canary::emit_candidate(artifact_root, canary_id)
 }
 
 pub(crate) fn scan_secret_candidate(
     root: &Path,
     artifact_root: &Path,
+    budget: &mut crate::bounded_input::ExternalInputBudget,
 ) -> Result<String, XtaskError> {
-    canary::scan_candidate(root, artifact_root)
+    canary::scan_candidate(root, artifact_root, budget)
 }
 
 pub(crate) fn security_probe_result() -> Result<&'static str, XtaskError> {

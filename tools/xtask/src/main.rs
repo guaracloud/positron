@@ -100,10 +100,7 @@ fn run() -> Result<(), XtaskError> {
                 XtaskError::usage("quality-secret-canary requires canary identity")
             })?;
             ensure_no_more_arguments(arguments)?;
-            let root = env::current_dir()
-                .map_err(|source| XtaskError::io("resolve current directory", source))?;
             security_harness::emit_secret_candidate(
-                &root,
                 std::path::Path::new(&artifact_root),
                 &canary_id,
             )
