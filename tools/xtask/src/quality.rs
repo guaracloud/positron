@@ -5438,19 +5438,58 @@ fn nextest_completed_test_count(stderr: &str) -> Result<usize, XtaskError> {
             "final completed-test count delimiter is malformed",
         )
     })?;
-    let completed = completed.parse::<usize>().map_err(|error| {
-        XtaskError::invalid(
-            "nextest result summary",
-            format!("final completed-test count is invalid: {error}"),
-        )
-    })?;
-    if completed == 0 || outcomes != format!("{completed} passed, 0 skipped") {
+    let completed = parse_nextest_summary_count(completed, "completed-test")?;
+    let exact_passing = format!("{completed} passed, 0 skipped");
+    if completed == 0 {
         return Err(XtaskError::invalid(
             "nextest result summary",
             format!("expected every completed test to pass without skips, observed `{outcomes}`"),
         ));
     }
+    if outcomes != exact_passing {
+        let prefix = format!("{completed} passed (");
+        let slow = outcomes
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(" slow), 0 skipped"))
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "nextest result summary",
+                    format!(
+                        "expected every completed test to pass without skips, observed `{outcomes}`"
+                    ),
+                )
+            })?;
+        let slow = parse_nextest_summary_count(slow, "slow-test")?;
+        if slow == 0 || slow > completed {
+            return Err(XtaskError::invalid(
+                "nextest result summary",
+                "slow-test annotation is outside the completed passing count",
+            ));
+        }
+    }
     Ok(completed)
+}
+
+fn parse_nextest_summary_count(value: &str, field: &str) -> Result<usize, XtaskError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(XtaskError::invalid(
+            "nextest result summary",
+            format!("{field} count is not an unsigned decimal integer"),
+        ));
+    }
+    let count = value.parse::<usize>().map_err(|error| {
+        XtaskError::invalid(
+            "nextest result summary",
+            format!("{field} count is invalid: {error}"),
+        )
+    })?;
+    if count.to_string() != value {
+        return Err(XtaskError::invalid(
+            "nextest result summary",
+            format!("{field} count is not canonical"),
+        ));
+    }
+    Ok(count)
 }
 
 fn scan_active_application_sources(
@@ -8957,6 +8996,24 @@ mod tests {
             317,
             "the retained human summary must expose the exact completed-test count"
         );
+        assert_eq!(
+            nextest_completed_test_count(
+                "Summary [ 376.058s] 501 tests run: 501 passed (2 slow), 0 skipped\n"
+            )?,
+            501,
+            "a canonical informational slow count must preserve the exact passing result"
+        );
+        for malformed in [
+            "Summary [ 1.000s] 317 tests run: 317 passed (0 slow), 0 skipped\n",
+            "Summary [ 1.000s] 317 tests run: 317 passed (318 slow), 0 skipped\n",
+            "Summary [ 1.000s] 317 tests run: 317 passed (02 slow), 0 skipped\n",
+            "Summary [ 1.000s] 317 tests run: 317 passed (2 slow), 0 skipped, 1 failed\n",
+        ] {
+            assert!(
+                nextest_completed_test_count(malformed).is_err(),
+                "noncanonical slow annotations must fail closed"
+            );
+        }
         assert!(
             nextest_completed_test_count(
                 "Summary [ 1.000s] 317 tests run: 316 passed, 1 skipped\n"
