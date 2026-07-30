@@ -29,34 +29,106 @@ pub(super) fn terminate_and_reap(
             source.to_string(),
         )
     })?;
-    if direct_already_exited.is_some() && !group.exists(command, shutdown_deadline)? {
-        return Ok(TerminationOutcome::AlreadyExited);
+    if direct_already_exited.is_some() {
+        let group_exists = match group.exists(command, shutdown_deadline) {
+            Ok(exists) => exists,
+            Err(failure) => {
+                return reconcile_after_process_control_failure(child, group, command, failure);
+            },
+        };
+        if !group_exists {
+            return Ok(TerminationOutcome::AlreadyExited);
+        }
     }
-    group.signal(Signal::Terminate, command, shutdown_deadline)?;
+    if let Err(failure) = group.signal(Signal::Terminate, command, shutdown_deadline) {
+        return reconcile_after_process_control_failure(child, group, command, failure);
+    }
     let grace_deadline = Instant::now()
         .checked_add(TERMINATION_GRACE)
         .unwrap_or(shutdown_deadline)
         .min(shutdown_deadline);
-    if !wait_for_group_while_reaping_direct(
+    let closed_during_grace = match wait_for_group_while_reaping_direct(
         child,
         group,
         command,
         grace_deadline,
         shutdown_deadline,
-    )? {
-        group.signal(Signal::Kill, command, shutdown_deadline)?;
-        if !wait_for_group_while_reaping_direct(
+    ) {
+        Ok(closed) => closed,
+        Err(failure) => {
+            return reconcile_after_process_control_failure(child, group, command, failure);
+        },
+    };
+    if !closed_during_grace {
+        if let Err(failure) = group.signal(Signal::Kill, command, shutdown_deadline) {
+            return reconcile_after_process_control_failure(child, group, command, failure);
+        }
+        let closed_after_kill = match wait_for_group_while_reaping_direct(
             child,
             group,
             command,
             shutdown_deadline,
             shutdown_deadline,
-        )? {
+        ) {
+            Ok(closed) => closed,
+            Err(failure) => {
+                return reconcile_after_process_control_failure(child, group, command, failure);
+            },
+        };
+        if !closed_after_kill {
             return Err(group.not_empty_failure(command));
         }
     }
-    wait_for_direct_child(child, command, shutdown_deadline, None, None, None)
-        .map(|_| TerminationOutcome::TerminationRequested)
+    match wait_for_direct_child(child, command, shutdown_deadline, None, None, None) {
+        Ok(_) => Ok(TerminationOutcome::TerminationRequested),
+        Err(failure) => reconcile_after_process_control_failure(child, group, command, failure),
+    }
+}
+
+fn reconcile_after_process_control_failure(
+    child: &mut Child,
+    group: &ProcessGroup,
+    command: &str,
+    failure: ExecutionFailure,
+) -> Result<TerminationOutcome, ExecutionFailure> {
+    reconcile_after_control_failure(
+        failure,
+        || {
+            child
+                .try_wait()
+                .map(|status| status.is_some())
+                .map_err(|source| {
+                    ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::DirectProcess,
+                        source.to_string(),
+                    )
+                })
+        },
+        || group.probe(command),
+    )
+}
+
+fn reconcile_after_control_failure<TryReap, ProbeGroup>(
+    failure: ExecutionFailure,
+    try_reap: TryReap,
+    probe_group: ProbeGroup,
+) -> Result<TerminationOutcome, ExecutionFailure>
+where
+    TryReap: FnOnce() -> Result<bool, ExecutionFailure>,
+    ProbeGroup: FnOnce() -> Result<bool, ExecutionFailure>,
+{
+    let direct_reaped = try_reap();
+    let group_exists = probe_group();
+    match (direct_reaped, group_exists) {
+        (_, Ok(false)) => Ok(TerminationOutcome::TerminationRequested),
+        (Ok(_), Ok(true)) => Err(failure),
+        (Err(direct), Ok(true)) => Err(failure.with_reconciliation(direct)),
+        (Ok(_), Err(group)) => Err(failure.with_reconciliation(group)),
+        (Err(direct), Err(group)) => Err(failure
+            .with_reconciliation(direct)
+            .with_reconciliation(group)),
+    }
 }
 
 fn wait_for_group_while_reaping_direct(
@@ -103,12 +175,17 @@ impl ProcessGroup {
         command: &str,
         deadline: Instant,
     ) -> Result<bool, ExecutionFailure> {
+        let exists = self.probe(command)?;
+        if exists {
+            require_shutdown_time(command, deadline, "process-group probe")?;
+        }
+        Ok(exists)
+    }
+
+    fn probe(&self, command: &str) -> Result<bool, ExecutionFailure> {
         let identifier = self.identifier(command)?;
         match rustix::process::test_kill_process_group(identifier) {
-            Ok(()) => {
-                require_shutdown_time(command, deadline, "process-group probe")?;
-                Ok(true)
-            },
+            Ok(()) => Ok(true),
             Err(rustix::io::Errno::SRCH) => Ok(false),
             Err(source) => Err(process_control_failure(
                 command,
@@ -233,11 +310,15 @@ fn require_shutdown_time(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::os::unix::process::CommandExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use super::{ProcessGroup, TerminationOutcome, terminate_and_reap};
+    use super::{
+        ProcessGroup, TerminationOutcome, reconcile_after_control_failure, terminate_and_reap,
+    };
+    use crate::controlled_execution::{ExecutionFailure, FailurePhase};
 
     #[test]
     fn already_exited_child_is_reaped_without_a_termination_request() -> Result<(), std::io::Error>
@@ -274,6 +355,40 @@ mod tests {
         if outcome != TerminationOutcome::AlreadyExited {
             return Err(std::io::Error::other(
                 "already exited child at the shutdown boundary requested termination",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reaps_an_exit_between_the_live_probe_and_forced_signal_deadline()
+    -> Result<(), std::io::Error> {
+        let schedule = RefCell::new(Vec::new());
+        let failure = ExecutionFailure::new(
+            "scheduled-child".to_owned(),
+            FailurePhase::Cleanup,
+            "forced termination signal reached the shutdown deadline",
+        );
+        let outcome = reconcile_after_control_failure(
+            failure,
+            || {
+                schedule.borrow_mut().push("try-wait");
+                Ok(true)
+            },
+            || {
+                schedule.borrow_mut().push("group-probe");
+                Ok(false)
+            },
+        )
+        .map_err(|failure| std::io::Error::other(failure.detail))?;
+        if outcome != TerminationOutcome::TerminationRequested {
+            return Err(std::io::Error::other(
+                "the scheduled post-signal exit was not reconciled",
+            ));
+        }
+        if schedule.into_inner() != ["try-wait", "group-probe"] {
+            return Err(std::io::Error::other(
+                "post-signal reconciliation did not try-wait before the final group probe",
             ));
         }
         Ok(())
