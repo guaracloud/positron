@@ -19,6 +19,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 pub(crate) enum FailurePhase {
     Descriptor,
     Capture,
+    ControlDelivery,
     Cancellation,
     Deadline,
     Cleanup,
@@ -49,6 +50,7 @@ impl Failure {
 #[derive(Debug)]
 enum Event {
     Control(ControlFrame),
+    ControlDeliveryFailed(String),
     Failure(String),
 }
 
@@ -62,6 +64,7 @@ pub(crate) struct FramedStdoutBroker {
 impl FramedStdoutBroker {
     pub(crate) fn start(
         mut stdout: std::process::ChildStdout,
+        mut stderr: std::process::ChildStderr,
         maximum_bytes: usize,
     ) -> Result<Self, Failure> {
         if maximum_bytes == 0 {
@@ -70,26 +73,8 @@ impl FramedStdoutBroker {
                 "framed stdout byte bound must be positive",
             ));
         }
-        let flags = rustix::fs::fcntl_getfl(&stdout).map_err(|source| {
-            Failure::new(
-                FailurePhase::Descriptor,
-                format!(
-                    "inspect framed stdout descriptor flags: {}",
-                    std::io::Error::from_raw_os_error(source.raw_os_error())
-                ),
-            )
-        })?;
-        rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK).map_err(
-            |source| {
-                Failure::new(
-                    FailurePhase::Descriptor,
-                    format!(
-                        "make framed stdout descriptor nonblocking: {}",
-                        std::io::Error::from_raw_os_error(source.raw_os_error())
-                    ),
-                )
-            },
-        )?;
+        make_nonblocking(&stdout, "stdout")?;
+        make_nonblocking(&stderr, "stderr")?;
         let (sender, events) = std::sync::mpsc::sync_channel(4);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -99,6 +84,7 @@ impl FramedStdoutBroker {
             .spawn(move || {
                 read_bounded_framed_stdout(
                     &mut stdout,
+                    &mut stderr,
                     maximum_bytes,
                     worker_stop.as_ref(),
                     &sender,
@@ -128,6 +114,9 @@ impl FramedStdoutBroker {
                 FailurePhase::Deadline,
                 "bounded runner reported lifecycle-stalled-v1 and retained live task ownership",
             )),
+            Ok(Event::ControlDeliveryFailed(detail)) => {
+                Err(Failure::new(FailurePhase::ControlDelivery, detail))
+            },
             Ok(Event::Failure(detail)) => Err(Failure::new(FailurePhase::Capture, detail)),
             Err(TryRecvError::Empty) => {
                 self.observe_worker_completion()?;
@@ -274,18 +263,52 @@ impl FramedStdoutBroker {
     }
 }
 
-fn read_bounded_framed_stdout<R: Read>(
+fn make_nonblocking<F: std::os::fd::AsFd>(descriptor: &F, name: &str) -> Result<(), Failure> {
+    let flags = rustix::fs::fcntl_getfl(descriptor).map_err(|source| {
+        Failure::new(
+            FailurePhase::Descriptor,
+            format!(
+                "inspect framed {name} descriptor flags: {}",
+                std::io::Error::from_raw_os_error(source.raw_os_error())
+            ),
+        )
+    })?;
+    rustix::fs::fcntl_setfl(descriptor, flags | rustix::fs::OFlags::NONBLOCK).map_err(|source| {
+        Failure::new(
+            FailurePhase::Descriptor,
+            format!(
+                "make framed {name} descriptor nonblocking: {}",
+                std::io::Error::from_raw_os_error(source.raw_os_error())
+            ),
+        )
+    })
+}
+
+fn read_bounded_framed_stdout<R: Read, E: Read>(
     stdout: &mut R,
+    stderr: &mut E,
     maximum_bytes: usize,
     stop: &AtomicBool,
     events: &SyncSender<Event>,
 ) -> Result<String, String> {
     let mut captured = Vec::with_capacity(maximum_bytes.min(1024));
     let mut inspected = 0;
+    let mut captured_stderr = Vec::with_capacity(maximum_bytes.min(1024));
+    let mut inspected_stderr = 0;
+    let mut stderr_closed = false;
     let mut chunk = [0_u8; 512];
     loop {
         if stop.load(Ordering::Acquire) {
             return Ok(String::new());
+        }
+        if !stderr_closed {
+            stderr_closed = read_control_delivery_failures(
+                stderr,
+                &mut captured_stderr,
+                &mut inspected_stderr,
+                maximum_bytes,
+                events,
+            )?;
         }
         match stdout.read(&mut chunk) {
             Ok(0) => {
@@ -333,6 +356,59 @@ fn read_bounded_framed_stdout<R: Read>(
     }
 }
 
+fn read_control_delivery_failures<R: Read>(
+    stderr: &mut R,
+    captured: &mut Vec<u8>,
+    inspected: &mut usize,
+    maximum_bytes: usize,
+    events: &SyncSender<Event>,
+) -> Result<bool, String> {
+    let mut chunk = [0_u8; 512];
+    match stderr.read(&mut chunk) {
+        Ok(0) => Ok(true),
+        Ok(count) => {
+            let new_length = captured.len().checked_add(count).ok_or_else(|| {
+                report_failure(events, "framed stderr byte count cannot be represented")
+            })?;
+            if new_length > maximum_bytes {
+                return Err(report_failure(
+                    events,
+                    "framed stderr exceeded its exact byte bound",
+                ));
+            }
+            let retained = chunk
+                .get(..count)
+                .ok_or_else(|| "framed stderr read escaped its fixed buffer boundary".to_owned())?;
+            captured.extend_from_slice(retained);
+            while let Some(relative_end) = captured
+                .get(*inspected..)
+                .and_then(|bytes| bytes.iter().position(|byte| *byte == b'\n'))
+            {
+                let end = *inspected + relative_end + 1;
+                let line = captured.get(*inspected..end).ok_or_else(|| {
+                    report_failure(events, "framed stderr line escaped its captured boundary")
+                })?;
+                match bounded_runner_frames::control_delivery_failure(line) {
+                    Ok(Some(detail)) => {
+                        send_event(events, Event::ControlDeliveryFailed(detail))?;
+                    },
+                    Ok(None) => {},
+                    Err(source) => {
+                        return Err(report_failure(events, &source.to_string()));
+                    },
+                }
+                *inspected = end;
+            }
+            Ok(false)
+        },
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(source) => Err(report_failure(
+            events,
+            &format!("read framed stderr: {source}"),
+        )),
+    }
+}
+
 fn report_failure(events: &SyncSender<Event>, detail: &str) -> String {
     match send_event(events, Event::Failure(detail.to_owned())) {
         Ok(()) => detail.to_owned(),
@@ -367,7 +443,14 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Event>(1);
         drop(receiver);
         let mut input = Cursor::new(b"lifecycle-stalled-v1\n");
-        let result = read_bounded_framed_stdout(&mut input, 128, &AtomicBool::new(false), &sender);
+        let mut stderr = Cursor::new([]);
+        let result = read_bounded_framed_stdout(
+            &mut input,
+            &mut stderr,
+            128,
+            &AtomicBool::new(false),
+            &sender,
+        );
         match result {
             Err(failure) => {
                 assert!(failure.contains("parent event receiver disappeared"));

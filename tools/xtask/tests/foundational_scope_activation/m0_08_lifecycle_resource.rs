@@ -263,7 +263,7 @@ fn quality_reaps_a_runner_ready_true_hang_inside_the_registered_bound() -> TestR
                 .root
                 .join("tools/xtask/src/bounded_runners/protocol.rs"),
             "    let result = (|| {\n",
-            "    let result = (|| {\n        if gate == \"EG-CONCURRENCY\" {\n            crate::bounded_runner_frames::emit_control(crate::bounded_runner_frames::ControlFrame::RunnerReady)?;\n            loop {\n                std::thread::park();\n            }\n        }\n",
+            "    let result = (|| {\n        if gate == \"EG-CONCURRENCY\" {\n            crate::bounded_runner_frames::emit_control_with_failure(crate::bounded_runner_frames::ControlFrame::RunnerReady)?;\n            loop {\n                std::thread::park();\n            }\n        }\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         let stderr = String::from_utf8_lossy(&output.stderr);

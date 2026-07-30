@@ -10,6 +10,7 @@ pub(crate) const RUNNER_READY_FRAME: &str = "runner-ready-v1\n";
 pub(crate) const LIFECYCLE_STALLED_FRAME: &str = "lifecycle-stalled-v1\n";
 const OUTCOME_PREFIX: &str = "runner-outcome-v1:";
 const ERROR_PREFIX: &str = "runner-error-v1:";
+const CONTROL_DELIVERY_FAILURE_PREFIX: &str = "control-delivery-failed-v1:";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CapturedFrame {
@@ -23,6 +24,12 @@ pub(crate) enum ControlFrame {
     LifecycleStalled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlDeliveryState {
+    Delivered,
+    ControlDeliveryFailed,
+}
+
 pub(crate) fn emit_result(result: &Result<String, XtaskError>) -> Result<(), XtaskError> {
     match result {
         Ok(record) => emit_encoded(OUTCOME_PREFIX, record),
@@ -30,10 +37,38 @@ pub(crate) fn emit_result(result: &Result<String, XtaskError>) -> Result<(), Xta
     }
 }
 
-pub(crate) fn emit_control(frame: ControlFrame) -> Result<(), XtaskError> {
+pub(crate) fn emit_control_with_failure(
+    frame: ControlFrame,
+) -> Result<ControlDeliveryState, XtaskError> {
     let stdout = std::io::stdout();
-    let mut locked = stdout.lock();
-    emit_control_to(&mut locked, frame)
+    let stderr = std::io::stderr();
+    emit_control_with_failure_to(&mut stdout.lock(), &mut stderr.lock(), frame)
+}
+
+pub(crate) fn emit_control_with_failure_to<W: Write, E: Write>(
+    writer: &mut W,
+    fallback: &mut E,
+    frame: ControlFrame,
+) -> Result<ControlDeliveryState, XtaskError> {
+    match emit_control_to(writer, frame) {
+        Ok(()) => Ok(ControlDeliveryState::Delivered),
+        Err(primary) => {
+            let detail = format!("ControlDeliveryFailed: {primary}");
+            emit_encoded_to(
+                fallback,
+                CONTROL_DELIVERY_FAILURE_PREFIX,
+                &detail,
+                "emit bounded runner control-delivery failure frame",
+            )
+            .map(|()| ControlDeliveryState::ControlDeliveryFailed)
+            .map_err(|secondary| {
+                XtaskError::invalid(
+                    "bounded runner control delivery",
+                    format!("{detail}; fallback delivery failed: {secondary}"),
+                )
+            })
+        },
+    }
 }
 
 fn emit_control_to<W: Write>(writer: &mut W, frame: ControlFrame) -> Result<(), XtaskError> {
@@ -41,7 +76,7 @@ fn emit_control_to<W: Write>(writer: &mut W, frame: ControlFrame) -> Result<(), 
         ControlFrame::RunnerReady => RUNNER_READY_FRAME.as_bytes(),
         ControlFrame::LifecycleStalled => LIFECYCLE_STALLED_FRAME.as_bytes(),
     };
-    write_frame(writer, bytes)
+    write_frame(writer, bytes, "emit bounded runner stdout frame")
 }
 
 pub(crate) fn control_frame(line: &[u8]) -> Option<ControlFrame> {
@@ -52,6 +87,22 @@ pub(crate) fn control_frame(line: &[u8]) -> Option<ControlFrame> {
         },
         _ => None,
     }
+}
+
+pub(crate) fn control_delivery_failure(line: &[u8]) -> Result<Option<String>, XtaskError> {
+    let line = std::str::from_utf8(line).map_err(|_| {
+        XtaskError::invalid(
+            "bounded runner control delivery",
+            "control-delivery failure frame was not valid UTF-8",
+        )
+    })?;
+    let Some(encoded) = line
+        .strip_suffix('\n')
+        .and_then(|frame| frame.strip_prefix(CONTROL_DELIVERY_FAILURE_PREFIX))
+    else {
+        return Ok(None);
+    };
+    decode_payload(encoded).map(Some)
 }
 
 pub(crate) fn parse_captured(stdout: &str) -> Result<CapturedFrame, XtaskError> {
@@ -87,6 +138,21 @@ pub(crate) fn parse_captured(stdout: &str) -> Result<CapturedFrame, XtaskError> 
 }
 
 fn emit_encoded(prefix: &str, payload: &str) -> Result<(), XtaskError> {
+    let stdout = std::io::stdout();
+    emit_encoded_to(
+        &mut stdout.lock(),
+        prefix,
+        payload,
+        "emit bounded runner stdout frame",
+    )
+}
+
+fn emit_encoded_to<W: Write>(
+    writer: &mut W,
+    prefix: &str,
+    payload: &str,
+    action: &str,
+) -> Result<(), XtaskError> {
     if payload.len() > MAXIMUM_RECORD_BYTES {
         return Err(XtaskError::invalid(
             "bounded runner stdout protocol",
@@ -101,20 +167,14 @@ fn emit_encoded(prefix: &str, payload: &str) -> Result<(), XtaskError> {
             "encoded frame exceeds its exact byte bound",
         ));
     }
-    write_stdout(frame.as_bytes())
+    write_frame(writer, frame.as_bytes(), action)
 }
 
-fn write_stdout(bytes: &[u8]) -> Result<(), XtaskError> {
-    let stdout = std::io::stdout();
-    let mut locked = stdout.lock();
-    write_frame(&mut locked, bytes)
-}
-
-fn write_frame<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), XtaskError> {
+fn write_frame<W: Write>(writer: &mut W, bytes: &[u8], action: &str) -> Result<(), XtaskError> {
     writer
         .write_all(bytes)
         .and_then(|()| writer.flush())
-        .map_err(|source| XtaskError::io("emit bounded runner stdout frame", source))
+        .map_err(|source| XtaskError::io(action, source))
 }
 
 fn hex_encode(bytes: &[u8]) -> Result<String, XtaskError> {
@@ -180,77 +240,7 @@ fn hex_nibble(byte: u8) -> Result<u8, XtaskError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
-
-    use super::{
-        CapturedFrame, ControlFrame, MAXIMUM_FRAME_BYTES, MAXIMUM_RECORD_BYTES, emit_control_to,
-        parse_captured,
-    };
-
-    struct WriteFailure;
-
-    impl Write for WriteFailure {
-        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from(io::ErrorKind::BrokenPipe))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct FlushFailure {
-        bytes: Vec<u8>,
-    }
-
-    impl Write for FlushFailure {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::other("deterministic flush failure"))
-        }
-    }
-
-    #[test]
-    fn stalled_control_delivery_reports_a_broken_pipe() -> Result<(), crate::error::XtaskError> {
-        let result = emit_control_to(&mut WriteFailure, ControlFrame::LifecycleStalled);
-
-        match result {
-            Err(failure) => {
-                assert!(
-                    failure
-                        .to_string()
-                        .contains("emit bounded runner stdout frame")
-                );
-                Ok(())
-            },
-            Ok(()) => Err(crate::error::XtaskError::invalid(
-                "bounded runner stalled-control test",
-                "broken pipe reported successful delivery",
-            )),
-        }
-    }
-
-    #[test]
-    fn stalled_control_delivery_reports_a_flush_failure() -> Result<(), crate::error::XtaskError> {
-        let mut writer = FlushFailure::default();
-        let result = emit_control_to(&mut writer, ControlFrame::LifecycleStalled);
-
-        match result {
-            Err(failure) => {
-                assert!(failure.to_string().contains("deterministic flush failure"));
-                Ok(())
-            },
-            Ok(()) => Err(crate::error::XtaskError::invalid(
-                "bounded runner stalled-control test",
-                "failed flush reported successful delivery",
-            )),
-        }
-    }
+    use super::{CapturedFrame, MAXIMUM_FRAME_BYTES, MAXIMUM_RECORD_BYTES, parse_captured};
 
     #[test]
     fn accepts_the_exact_payload_boundary() -> Result<(), crate::error::XtaskError> {

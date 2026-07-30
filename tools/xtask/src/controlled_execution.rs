@@ -205,6 +205,8 @@ pub(crate) enum FailurePhase {
     Descendant,
     /// A captured stream could not be read or decoded.
     Capture,
+    /// A bounded child could not deliver its lifecycle control frame.
+    ControlDelivery,
     /// Controlled termination or cleanup could not complete.
     Cleanup,
     /// This host cannot establish the required process-ownership boundary.
@@ -224,6 +226,7 @@ impl FailurePhase {
             Self::Cancellation => "cancellation",
             Self::Descendant => "descendant",
             Self::Capture => "capture",
+            Self::ControlDelivery => "control-delivery",
             Self::Cleanup => "cleanup",
             #[cfg(not(unix))]
             Self::UnsupportedPlatform => "unsupported-platform",
@@ -322,6 +325,7 @@ fn framed_stdout_failure(command: &str, failure: FramedStdoutFailure) -> Executi
     let phase = match failure.phase {
         FramedStdoutFailurePhase::Descriptor => FailurePhase::Descriptor,
         FramedStdoutFailurePhase::Capture => FailurePhase::Capture,
+        FramedStdoutFailurePhase::ControlDelivery => FailurePhase::ControlDelivery,
         FramedStdoutFailurePhase::Cancellation => FailurePhase::Cancellation,
         FramedStdoutFailurePhase::Deadline => FailurePhase::Deadline,
         FramedStdoutFailurePhase::Cleanup => FailurePhase::Cleanup,
@@ -522,7 +526,7 @@ fn configure_standard_descriptors(
             command.stdout(Stdio::null()).stderr(Stdio::null());
         },
         OutputMode::FramedStdout { .. } => {
-            command.stdout(Stdio::piped()).stderr(Stdio::null());
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
         },
         OutputMode::Capture { .. } | OutputMode::CaptureWithStdoutArtifact { .. } => {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -781,7 +785,14 @@ impl OwnedWorkers {
                     "framed stdout mode requires closed standard input",
                 ));
             }
-            let framed_stdout = FramedStdoutBroker::start(stdout, maximum_bytes)
+            let stderr = child.stderr.take().ok_or_else(|| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "owned framed stderr control-failure pipe was unavailable",
+                )
+            })?;
+            let framed_stdout = FramedStdoutBroker::start(stdout, stderr, maximum_bytes)
                 .map_err(|failure| framed_stdout_failure(command, failure))?;
             return Ok(Self {
                 capture: None,
@@ -1935,8 +1946,7 @@ mod tests {
     use std::error::Error;
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File, OpenOptions};
-    use std::io;
-    use std::io::Write as _;
+    use std::io::{self, Write};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -1948,6 +1958,34 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
     static CANCELLATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct WriteFailure;
+
+    impl Write for WriteFailure {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushFailure {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("deterministic flush failure"))
+        }
+    }
 
     #[test]
     fn reconciles_a_successful_child_with_independent_captured_streams() -> TestResult {
@@ -2013,6 +2051,19 @@ mod tests {
             outcome,
             FailurePhase::Capture,
             "completed before a valid outcome",
+        )
+    }
+
+    #[test]
+    fn stalled_control_delivery_reports_a_broken_pipe() -> TestResult {
+        assert_stalled_control_delivery_is_parent_visible(&mut WriteFailure, "broken pipe")
+    }
+
+    #[test]
+    fn stalled_control_delivery_reports_a_flush_failure() -> TestResult {
+        assert_stalled_control_delivery_is_parent_visible(
+            &mut FlushFailure::default(),
+            "deterministic flush failure",
         )
     }
 
@@ -2974,6 +3025,43 @@ os._exit(0)
             .into());
         }
         Ok(())
+    }
+
+    fn assert_stalled_control_delivery_is_parent_visible<W: Write>(
+        writer: &mut W,
+        expected_detail: &str,
+    ) -> TestResult {
+        let mut fallback = Vec::new();
+        let state = crate::bounded_runner_frames::emit_control_with_failure_to(
+            writer,
+            &mut fallback,
+            crate::bounded_runner_frames::ControlFrame::LifecycleStalled,
+        )?;
+        if state != crate::bounded_runner_frames::ControlDeliveryState::ControlDeliveryFailed {
+            return Err(io::Error::other(
+                "failed stalled control delivery did not return its typed state",
+            )
+            .into());
+        }
+        let frame = std::str::from_utf8(&fallback)?;
+        let detail = crate::bounded_runner_frames::control_delivery_failure(frame.as_bytes())?
+            .ok_or_else(|| io::Error::other("fallback was not a control-delivery failure frame"))?;
+        if !detail.contains(expected_detail) {
+            return Err(io::Error::other(format!(
+                "control-delivery fallback omitted `{expected_detail}`: {detail}"
+            ))
+            .into());
+        }
+        let frame = frame
+            .strip_suffix('\n')
+            .ok_or_else(|| io::Error::other("control-delivery fallback was not newline framed"))?;
+        let script = format!("printf '%s\\n' '{frame}' >&2; exec /bin/sleep 60");
+        let outcome = execute(framed_shell(&script, Duration::from_secs(2))?);
+        assert_framed_control_shutdown(
+            outcome,
+            FailurePhase::ControlDelivery,
+            "ControlDeliveryFailed",
+        )
     }
 
     fn reconciled(outcome: ExecutionOutcome) -> TestResult<ExecutionVerdict> {

@@ -61,12 +61,6 @@ enum CancellationState {
     Disconnected,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum StalledControlState {
-    Delivered,
-    ControlDeliveryFailed(String),
-}
-
 pub(crate) struct RegisteredTasks {
     tasks: Vec<RegisteredTask>,
     results: Receiver<WorkerMeasurement>,
@@ -289,7 +283,7 @@ impl RegisteredTasks {
         drain_measurements(&self.results, &mut reported_ids);
 
         if deadline_expired {
-            self.park_with_live_ownership();
+            return Err(self.park_with_live_ownership());
         }
 
         let mut cancelled_ids = cancellation
@@ -378,18 +372,17 @@ impl RegisteredTasks {
         errors
     }
 
-    fn park_with_live_ownership(&mut self) -> ! {
-        let control_delivery = match crate::bounded_runner_frames::emit_control(
+    fn park_with_live_ownership(&mut self) -> XtaskError {
+        match crate::bounded_runner_frames::emit_control_with_failure(
             crate::bounded_runner_frames::ControlFrame::LifecycleStalled,
         ) {
-            Ok(()) => StalledControlState::Delivered,
-            Err(error) => StalledControlState::ControlDeliveryFailed(error.to_string()),
-        };
-        loop {
-            if let StalledControlState::ControlDeliveryFailed(detail) = &control_delivery {
-                std::hint::black_box(detail);
-            }
-            thread::park_timeout(Duration::from_millis(5));
+            Ok(
+                crate::bounded_runner_frames::ControlDeliveryState::Delivered
+                | crate::bounded_runner_frames::ControlDeliveryState::ControlDeliveryFailed,
+            ) => loop {
+                thread::park_timeout(Duration::from_millis(5));
+            },
+            Err(error) => error,
         }
     }
 
