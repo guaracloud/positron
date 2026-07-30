@@ -65,12 +65,26 @@ pub(crate) fn validate_registered_spawn_sites(
                 Ok((line_number, symbol.to_owned(), id.to_owned()))
             })
             .collect::<Result<Vec<_>, XtaskError>>()?;
-        let spawn_count = compact.match_indices(".spawn(").count();
-        if spawn_count != markers.len() {
+        let spawn_lines = production
+            .lines()
+            .enumerate()
+            .flat_map(|(offset, line)| std::iter::repeat_n(offset + 1, method_spawn_count(line)))
+            .collect::<Vec<_>>();
+        if spawn_lines.len() != markers.len() {
             return Err(XtaskError::invalid_path(
                 &source,
                 "unregistered process or task spawn: every active method spawn must have exactly one registered marker",
             ));
+        }
+        for ((marker_line, _, _), spawn_line) in markers.iter().zip(&spawn_lines) {
+            if spawn_line <= marker_line || spawn_line.saturating_sub(*marker_line) > 3 {
+                return Err(XtaskError::invalid_path(
+                    &source,
+                    format!(
+                        "spawn marker at tooling line {marker_line} is not bound to its exact method spawn"
+                    ),
+                ));
+            }
         }
         for (line_number, symbol, id) in markers {
             let key = (relative.clone(), symbol, id);
@@ -295,22 +309,17 @@ fn reject_forbidden_invocations(
             "unbounded concurrency primitive in activated tooling source",
         ));
     }
-    if ["std::thread::spawn", "std::sync::mpsc::channel"]
-        .into_iter()
-        .any(|primitive| compact.contains(&format!("={primitive};")))
+    let references = resolved_forbidden_value_references(production)?;
+    if references.imported_value_alias
+        || references
+            .paths
+            .iter()
+            .any(|path| token_path_exists(&references.tokens, path))
     {
         return Err(XtaskError::invalid_path(
             source,
             "unregistered imported concurrency primitive alias in activated tooling source",
         ));
-    }
-    for invocation in resolved_forbidden_binding_invocations(production)? {
-        if invocation_exists(compact, &invocation) {
-            return Err(XtaskError::invalid_path(
-                source,
-                "unregistered imported concurrency primitive alias in activated tooling source",
-            ));
-        }
     }
     Ok(())
 }
@@ -331,9 +340,18 @@ enum UseToken {
     Glob,
     OpenParenthesis,
     CloseParenthesis,
+    Dot,
+    Less,
+    Greater,
 }
 
-fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, XtaskError> {
+struct ForbiddenReferences {
+    tokens: Vec<UseToken>,
+    paths: Vec<Vec<String>>,
+    imported_value_alias: bool,
+}
+
+fn resolved_forbidden_value_references(source: &str) -> Result<ForbiddenReferences, XtaskError> {
     let tokens = use_tokens(source);
     let mut bindings = Vec::new();
     let mut cursor = 0;
@@ -352,14 +370,29 @@ fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, X
         }
         cursor += 1;
     }
-    let mut invocations = Vec::new();
+    let mut paths = vec![
+        vec!["std".to_owned(), "thread".to_owned(), "spawn".to_owned()],
+        vec!["thread".to_owned(), "spawn".to_owned()],
+        vec![
+            "std".to_owned(),
+            "sync".to_owned(),
+            "mpsc".to_owned(),
+            "channel".to_owned(),
+        ],
+        vec!["mpsc".to_owned(), "channel".to_owned()],
+    ];
+    let mut imported_value_alias = false;
     for (path, local) in bindings {
         let suffixes: &[&str] = match path.as_slice() {
-            [std, thread, spawn] if std == "std" && thread == "thread" && spawn == "spawn" => &[""],
+            [std, thread, spawn] if std == "std" && thread == "thread" && spawn == "spawn" => {
+                imported_value_alias = true;
+                &[]
+            },
             [std, sync, mpsc, channel]
                 if std == "std" && sync == "sync" && mpsc == "mpsc" && channel == "channel" =>
             {
-                &[""]
+                imported_value_alias = true;
+                &[]
             },
             [std, thread] if std == "std" && thread == "thread" => &["::spawn"],
             [std, sync, mpsc] if std == "std" && sync == "sync" && mpsc == "mpsc" => &["::channel"],
@@ -367,87 +400,66 @@ fn resolved_forbidden_binding_invocations(source: &str) -> Result<Vec<String>, X
             [std] if std == "std" => &["::thread::spawn", "::sync::mpsc::channel"],
             _ => &[],
         };
-        invocations.extend(suffixes.iter().map(|suffix| format!("{local}{suffix}")));
+        paths.extend(suffixes.iter().map(|suffix| {
+            format!("{local}{suffix}")
+                .split("::")
+                .map(str::to_owned)
+                .collect()
+        }));
     }
-    let mut paths = invocations
+    Ok(ForbiddenReferences {
+        tokens,
+        paths,
+        imported_value_alias,
+    })
+}
+
+fn token_path_exists(tokens: &[UseToken], path: &[String]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    tokens.iter().enumerate().any(|(start, _)| {
+        path.iter().enumerate().all(|(offset, expected)| {
+            let token = start + offset.saturating_mul(2);
+            identifier_at(tokens, token) == Some(expected.as_str())
+                && (offset == 0 || tokens.get(token - 1) == Some(&UseToken::PathSeparator))
+        })
+    })
+}
+
+fn method_spawn_count(source: &str) -> usize {
+    let tokens = use_tokens(source);
+    tokens
         .iter()
-        .map(|invocation| invocation.split("::").map(str::to_owned).collect())
-        .collect::<Vec<Vec<String>>>();
-    paths.extend([
-        vec!["std".to_owned(), "thread".to_owned(), "spawn".to_owned()],
-        vec![
-            "std".to_owned(),
-            "sync".to_owned(),
-            "mpsc".to_owned(),
-            "channel".to_owned(),
-        ],
-    ]);
-    loop {
-        let mut changed = false;
-        let mut cursor = 0;
-        while cursor < tokens.len() {
-            if identifier_at(&tokens, cursor) != Some("let") {
-                cursor += 1;
-                continue;
-            }
-            cursor += 1;
-            if identifier_at(&tokens, cursor) == Some("mut") {
-                cursor += 1;
-            }
-            let Some(local) = identifier_at(&tokens, cursor) else {
-                continue;
-            };
-            cursor += 1;
-            while !matches!(
-                tokens.get(cursor),
-                Some(UseToken::Equals | UseToken::Semicolon) | None
-            ) {
-                cursor += 1;
-            }
-            if tokens.get(cursor) != Some(&UseToken::Equals) {
-                continue;
-            }
-            cursor += 1;
-            let mut parenthesis_depth = 0_usize;
-            while tokens.get(cursor) == Some(&UseToken::OpenParenthesis) {
-                parenthesis_depth += 1;
-                cursor += 1;
-            }
-            let Some(first) = identifier_at(&tokens, cursor) else {
-                continue;
-            };
-            let mut right_hand_side = vec![first.to_owned()];
-            cursor += 1;
-            while tokens.get(cursor) == Some(&UseToken::PathSeparator) {
-                cursor += 1;
-                let Some(segment) = identifier_at(&tokens, cursor) else {
-                    break;
-                };
-                right_hand_side.push(segment.to_owned());
-                cursor += 1;
-            }
-            while parenthesis_depth > 0 && tokens.get(cursor) == Some(&UseToken::CloseParenthesis) {
-                parenthesis_depth -= 1;
-                cursor += 1;
-            }
-            if tokens.get(cursor) != Some(&UseToken::Semicolon)
-                || !paths.contains(&right_hand_side)
-                || parenthesis_depth != 0
+        .enumerate()
+        .filter(|(cursor, token)| {
+            if **token != UseToken::Dot
+                || !matches!(
+                    identifier_at(&tokens, cursor + 1),
+                    Some("spawn" | "spawn_scoped")
+                )
             {
-                continue;
+                return false;
             }
-            let rebound = vec![local.to_owned()];
-            if !paths.contains(&rebound) {
-                invocations.push(local.to_owned());
-                paths.push(rebound);
-                changed = true;
+            let mut next = cursor + 2;
+            if tokens.get(next) == Some(&UseToken::PathSeparator)
+                && tokens.get(next + 1) == Some(&UseToken::Less)
+            {
+                next += 2;
+                let mut depth = 1_usize;
+                while depth > 0 {
+                    match tokens.get(next) {
+                        Some(UseToken::Less) => depth += 1,
+                        Some(UseToken::Greater) => depth -= 1,
+                        None => return false,
+                        _ => {},
+                    }
+                    next += 1;
+                }
             }
-        }
-        if !changed {
-            break;
-        }
-    }
-    Ok(invocations)
+            tokens.get(next) == Some(&UseToken::OpenParenthesis)
+        })
+        .count()
 }
 
 fn parse_use_tree(
@@ -576,6 +588,9 @@ fn use_tokens(source: &str) -> Vec<UseToken> {
                 '*' => Some(UseToken::Glob),
                 '(' => Some(UseToken::OpenParenthesis),
                 ')' => Some(UseToken::CloseParenthesis),
+                '.' => Some(UseToken::Dot),
+                '<' => Some(UseToken::Less),
+                '>' => Some(UseToken::Greater),
                 _ => None,
             };
             if let Some(token) = token {

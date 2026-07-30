@@ -2,6 +2,50 @@ use super::m0_08_support::*;
 use super::*;
 
 #[test]
+fn quality_rejects_a_parent_directory_outcome_identity_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/protocol.rs"),
+            "            OsString::from(OUTCOME_NAME),",
+            "            OsString::from(\"owned_dir/../escape\"),",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "outcome identity is not one normal path component")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_rejects_a_symbolic_link_outcome_ticket_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/protocol.rs"),
+            "            ticket.directory.diagnostic_path().as_os_str().to_owned(),",
+            "            {\n                let alias = ticket.directory.diagnostic_path().with_extension(\"alias\");\n                std::os::unix::fs::symlink(ticket.directory.diagnostic_path(), &alias)\n                    .map_err(|source| XtaskError::io(\"create test outcome ticket alias\", source))?;\n                alias.into_os_string()\n            },",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "bounded runner outcome ticket escaped its owned canonical temporary root",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -103,7 +147,9 @@ fn quality_reconciles_after_a_mid_dispatch_failure_through_the_public_seam() -> 
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             "            tasks.dispatch(1, WorkerCommand::Execute { schedule_slot: 1 })?;\n            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            Ok(())",
             "            Err(XtaskError::invalid(\"test lifecycle dispatch\", \"injected mid-dispatch failure\"))",
         )?;
@@ -194,9 +240,11 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
-            "    let result = (|| {\n        let registry =",
-            "    if gate == CONCURRENCY_GATE {\n        readiness.signal()?;\n        loop { std::thread::park(); }\n    }\n    let result = (|| {\n        let registry =",
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/protocol.rs"),
+            "        let readiness =\n            WorkerReadiness::new(owned_directory.diagnostic_path().join(readiness_name))?;\n",
+            "        let readiness =\n            WorkerReadiness::new(owned_directory.diagnostic_path().join(readiness_name))?;\n        if gate == \"EG-CONCURRENCY\" {\n            readiness.signal()?;\n            loop {\n                std::thread::park();\n            }\n        }\n",
         )?;
         fixture.build_fixture_xtask()?;
         let mut quality = fixture.quality_child_from_built_fixture_for("pr")?;
@@ -269,7 +317,9 @@ fn quality_uses_one_registered_deadline_for_work_cancellation_join_and_evidence(
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             "            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            Ok(())",
             "            tasks.dispatch(2, WorkerCommand::Execute { schedule_slot: 2 })?;\n            std::thread::sleep(Duration::from_millis(60));\n            Err(XtaskError::invalid(\"test lifecycle deadline\", \"injected single-deadline failure\"))",
         )?;
@@ -336,7 +386,9 @@ fn quality_records_already_queued_reconciliation_through_the_public_seam() -> Te
         let lifecycle_source = fixture
             .root
             .join("tools/xtask/src/registered_task_lifecycle.rs");
-        let runner_source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let runner_source = fixture
+            .root
+            .join("tools/xtask/src/bounded_runners/scenarios.rs");
         replace_once(
             &lifecycle_source,
             "const CANCELLATION_JOIN_RESERVE: Duration = Duration::from_millis(25);\n",
@@ -409,7 +461,9 @@ fn quality_rejects_an_omitted_serialized_worker_measurement_through_the_public_s
             "EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
         )?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             "    verify_child_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
             "    let record = record.replacen(\"workers=\", \"workers=;omitted-\", 1);\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Concurrency)?;\n",
         )?;
@@ -430,7 +484,9 @@ fn quality_rejects_tampered_serialized_join_observations_through_the_public_seam
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             "    let record = measurement_record(scenario, &measurements, &joined_ids, 0, 0, true);\n",
             "    let record = measurement_record(scenario, &measurements, &joined_ids, 0, 0, true);\n    let record = record.replace(\"joined-ids=0,1,2\", \"joined-ids=0,1,1\");\n",
         )?;
@@ -456,7 +512,9 @@ fn quality_rejects_a_tampered_serialized_resource_schedule_through_the_public_se
             "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
         )?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             "    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
             "    let record = record.replacen(\"workers=\", \"workers=2:0:executed,1:1:executed,0:2:executed;tampered-\", 1);\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
         )?;
@@ -496,7 +554,9 @@ fn quality_rejects_tampered_serialized_resource_pressure_and_leak_state() -> Tes
             "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
         )?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             "    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
             "    let record = record.replace(\"retries=2;reservations=0;queue-empty=true\", \"retries=3;reservations=1;queue-empty=false\");\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
         )?;

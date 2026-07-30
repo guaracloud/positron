@@ -117,8 +117,8 @@ fn quality_rejects_a_post_capture_registry_swap_that_attempts_to_authorize_child
 -> TestResult {
     assert_post_verification_record_rejected(
         "EG-CONCURRENCY",
-        r#"fs::write(
-        REGISTRY_PATH,
+        r#"std::fs::write(
+        "qualification/engineering/concurrency-fixtures.tsv",
         b"scenario_id\tgate_id\tspawn_site\tschedule\tseed\tmax_tasks\tqueue_capacity\treservation_capacity\tretry_limit\tshutdown_ms\texpected\nconcurrency-cancel-join\tEG-CONCURRENCY\tquality-bounded-worker-v1\tforged-schedule-v1\tseed-concurrency-v1\t3\t1\t1\t1\t100\tcancelled-then-joined-v1\nresource-fair-pressure\tEG-RESOURCE\tquality-bounded-worker-v1\tround-robin-pressure-v1\tseed-resource-v1\t3\t3\t2\t2\t100\tfair-pressure-retry-leak-free-v1\n",
     )
     .map_err(|source| XtaskError::io("test post-capture scenario registry swap", source))?;
@@ -167,7 +167,9 @@ fn quality_rejects_parent_captured_capacity_drift_when_child_checks_are_removed(
             "resource-fair-pressure\tEG-RESOURCE\tquality-bounded-worker-v1\tround-robin-pressure-v1\tseed-resource-v1\t3\t3\t2\t2\t100\tfair-pressure-retry-leak-free-v1",
             "resource-fair-pressure\tEG-RESOURCE\tquality-bounded-worker-v1\tround-robin-pressure-v1\tseed-resource-v1\t3\t3\t3\t2\t100\tfair-pressure-retry-leak-free-v1",
         )?;
-        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let source = fixture
+            .root
+            .join("tools/xtask/src/bounded_runners/scenarios.rs");
         replace_once(
             &source,
             "    validate_resource_scenario(scenario)?;\n",
@@ -287,7 +289,9 @@ fn assert_post_verification_record_rejected(
             "    verify_child_measurement_record(scenario, &record, ScenarioGate::{gate_kind})?;\n    {tampered_return}"
         );
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             &verified_return,
             &tampered_return,
         )?;

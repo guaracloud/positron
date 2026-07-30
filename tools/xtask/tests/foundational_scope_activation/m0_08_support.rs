@@ -10,6 +10,16 @@ pub(super) fn enable_concurrency_gate(fixture: &Fixture) -> TestResult {
 }
 
 pub(super) fn assert_imported_concurrency_alias_rejected(source_append: &str) -> TestResult {
+    assert_concurrency_source_rejected(
+        source_append,
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+pub(super) fn assert_concurrency_source_rejected(
+    source_append: &str,
+    expected: &str,
+) -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
@@ -18,7 +28,7 @@ pub(super) fn assert_imported_concurrency_alias_rejected(source_append: &str) ->
         content.push_str(source_append);
         fs::write(&source, content)?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(&output, "unregistered imported concurrency primitive alias")
+        assert_rejected_output(&output, expected)
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -54,7 +64,9 @@ pub(super) fn assert_tampered_resource_slots_rejected(
             "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
         )?;
         replace_once(
-            &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/scenarios.rs"),
             "    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n",
             &format!(
                 "    let record = record.replace(\"{original}\", \"{tampered}\");\n    verify_child_measurement_record(scenario, &record, ScenarioGate::Resource)?;\n"
@@ -189,9 +201,16 @@ pub(super) fn wait_for_bounded_runner_readiness_and_cancel(
                     let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                         continue;
                     };
-                    if !name.starts_with("bounded-runner-")
-                        || !name.contains(&gate_fragment)
-                        || !name.ends_with(".ready")
+                    let Some(ticket_name) = path
+                        .parent()
+                        .and_then(std::path::Path::file_name)
+                        .and_then(std::ffi::OsStr::to_str)
+                    else {
+                        continue;
+                    };
+                    if name != "worker.ready"
+                        || !ticket_name.starts_with("bounded-runner-")
+                        || !ticket_name.contains(&gate_fragment)
                     {
                         continue;
                     }
@@ -201,7 +220,7 @@ pub(super) fn wait_for_bounded_runner_readiness_and_cancel(
                         )
                         .into());
                     }
-                    let cancellation = path.with_extension("cancel");
+                    let cancellation = path.with_file_name("worker.cancel");
                     let mut marker = fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
@@ -236,7 +255,9 @@ pub(super) fn assert_cancellation_state(
     let fixture = Fixture::create()?;
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
-        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let source = fixture
+            .root
+            .join("tools/xtask/src/bounded_runners/scenarios.rs");
         if !original_dispatch.is_empty() {
             replace_once(&source, original_dispatch, replacement_dispatch)?;
         }

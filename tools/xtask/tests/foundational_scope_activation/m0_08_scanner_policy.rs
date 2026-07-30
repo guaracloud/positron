@@ -346,6 +346,51 @@ fn quality_rejects_a_parenthesized_direct_spawn_binding_through_the_public_seam(
 }
 
 #[test]
+fn quality_rejects_const_and_static_forbidden_value_bindings_through_the_public_seam() -> TestResult
+{
+    assert_imported_concurrency_alias_rejected(
+        "#[allow(unused_imports)] use std::thread::spawn as launch_value;\n#[allow(unused_imports)] use std::sync::mpsc::channel as channel_value;\n#[cfg(any())] const SPAWN_VALUE: [usize; 1] = [(launch_value)];\n#[cfg(any())] static CHANNEL_VALUE: (usize,) = (channel_value,);\n",
+    )
+}
+
+#[test]
+fn quality_rejects_builder_spawn_scoped_and_turbofish_sites_through_the_public_seam() -> TestResult
+{
+    assert_concurrency_source_rejected(
+        "#[cfg(any())] fn builder_spawn_shapes() { let _ = std::thread::Builder::new().spawn::<_, ()>(|| ()); let _ = std::thread::Builder::new().spawn_scoped::<_, ()>(scope, || ()); }\n",
+        "unregistered process or task spawn",
+    )
+}
+
+#[test]
+fn quality_accepts_spawn_like_identifiers_comments_and_literals_through_the_public_seam()
+-> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "#[allow(dead_code)] fn safe_spawn_words() { let spawn_factory = \"std::thread::spawn\"; let channel_name = \"mpsc::channel\"; let _ = (spawn_factory, channel_name); /* .spawn_scoped::<T>(...) */ }\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "token-aware source policy rejected safe spawn-like text: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_a_stale_semantic_spawn_site_through_the_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -574,7 +619,7 @@ fn quality_uses_the_frozen_spawn_registry_after_a_post_capture_swap_through_the_
         replace_once(
             &fixture.root.join("tools/xtask/src/bounded_runners.rs"),
             "pub(crate) fn validate_source_policy(\n    registry: &FrozenBoundedRunnerRegistry,\n    root: &Path,\n) -> Result<(), XtaskError> {\n",
-            "pub(crate) fn validate_source_policy(\n    registry: &FrozenBoundedRunnerRegistry,\n    root: &Path,\n) -> Result<(), XtaskError> {\n    std::fs::write(root.join(SPAWN_SITE_REGISTRY_PATH), b\"swapped after frozen capture\").map_err(|error| XtaskError::io(\"test post-capture spawn registry swap\", error))?;\n",
+            "pub(crate) fn validate_source_policy(\n    registry: &FrozenBoundedRunnerRegistry,\n    root: &Path,\n) -> Result<(), XtaskError> {\n    std::fs::write(root.join(registry::SPAWN_SITE_REGISTRY_PATH), b\"swapped after frozen capture\").map_err(|error| XtaskError::io(\"test post-capture spawn registry swap\", error))?;\n",
         )?;
         let output = fixture.quality_output_from_fixture_source("pr")?;
         if !output.status.success() {

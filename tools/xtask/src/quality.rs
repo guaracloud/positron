@@ -1443,17 +1443,28 @@ fn run_bounded_runner_gate(
         std::process::id(),
         gate_id.to_ascii_lowercase(),
     );
-    let outcome_path = environment
-        .temporary_root()
-        .join(format!("{path_stem}.out"));
-    let readiness_path = environment
-        .temporary_root()
-        .join(format!("{path_stem}.ready"));
-    let cancellation_path = environment
-        .temporary_root()
-        .join(format!("{path_stem}.cancel"));
-    let arguments =
-        registry.child_arguments(gate_id, &outcome_path, execution_timeout, &readiness_path)?;
+    let ticket = crate::bounded_runners::OwnedOutcomeTicket::create(
+        environment.temporary_root(),
+        &path_stem,
+    )?;
+    let cancellation_path = ticket.cancellation_path();
+    let arguments = registry.child_arguments(gate_id, &ticket, execution_timeout)?;
+    let retained_arguments = arguments
+        .iter()
+        .map(|argument| {
+            argument.to_str().ok_or_else(|| {
+                XtaskError::invalid(
+                    "bounded runner child invocation",
+                    "child argument is not canonical UTF-8",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::bounded_runners::FrozenBoundedRunnerRegistry::validate_child_invocation(
+        gate_id,
+        execution_timeout.as_millis(),
+        &retained_arguments,
+    )?;
     let invocation_environment = environment.invocation_environment(&[])?;
     let input = InvocationInput::Null;
     let invocation = controlled_invocation(
@@ -1478,8 +1489,7 @@ fn run_bounded_runner_gate(
         cancellation_marker: Some(cancellation_path.clone()),
     })
     .into_result();
-    remove_optional_bounded_runner_outcome(&readiness_path)?;
-    remove_optional_bounded_runner_outcome(&cancellation_path)?;
+    ticket.remove_optional_markers()?;
     let completed_lifecycle = |phase: &str| {
         format!(
             "process-lifecycle-v1;phase={phase};termination-requested=false;process-reaped=true;live=0;shutdown-ms={};process-shutdown-elapsed-ms=0;resource-shutdown-elapsed-ms=0;shutdown-elapsed-ms=0",
@@ -1529,7 +1539,7 @@ fn run_bounded_runner_gate(
                 "",
                 &format!("{}{}; {lifecycle}", error.detail, reconciliation),
             )?;
-            remove_optional_bounded_runner_outcome(&outcome_path)?;
+            ticket.remove_optional_outcome()?;
             return Err(XtaskError::invalid(
                 "bounded runner process lifecycle",
                 format!(
@@ -1542,7 +1552,7 @@ fn run_bounded_runner_gate(
             ));
         },
     };
-    let outcome = take_bounded_runner_outcome(&outcome_path)?;
+    let outcome = ticket.take_outcome()?;
     if !verdict.status.success() {
         return Err(XtaskError::invalid(
             "bounded runner process lifecycle",
@@ -1588,40 +1598,6 @@ fn run_bounded_runner_gate(
         verified.evidence(),
         completed_lifecycle("completed"),
     ))
-}
-
-fn take_bounded_runner_outcome(path: &Path) -> Result<String, XtaskError> {
-    let bytes =
-        fs::read(path).map_err(|source| XtaskError::io("read bounded runner outcome", source))?;
-    remove_optional_bounded_runner_outcome(path)?;
-    if bytes.len() > 8_192 {
-        return Err(XtaskError::invalid_path(
-            path,
-            "bounded runner outcome exceeds its exact maximum",
-        ));
-    }
-    String::from_utf8(bytes)
-        .map_err(|_| XtaskError::invalid_path(path, "bounded runner outcome is not valid UTF-8"))
-}
-
-fn remove_optional_bounded_runner_outcome(path: &Path) -> Result<(), XtaskError> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            let parent = path.parent().ok_or_else(|| {
-                XtaskError::invalid_path(path, "bounded runner outcome has no parent")
-            })?;
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| {
-                    XtaskError::io("synchronize bounded runner outcome cleanup", source)
-                })
-        },
-        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(XtaskError::io(
-            "remove bounded runner outcome after process failure",
-            source,
-        )),
-    }
 }
 
 fn run_correctness_gate(

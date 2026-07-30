@@ -760,7 +760,7 @@ impl DirectoryCapability {
         })
     }
 
-    fn read_bounded(
+    pub(crate) fn read_bounded(
         &self,
         name: &str,
         maximum_bytes: usize,
@@ -818,7 +818,7 @@ impl DirectoryCapability {
         }
     }
 
-    fn create_file(
+    pub(crate) fn create_file(
         &self,
         name: &str,
         bytes: &[u8],
@@ -895,6 +895,10 @@ impl DirectoryCapability {
             diagnostic_path,
             identity: FileIdentity::from_metadata(&metadata),
         })
+    }
+
+    pub(crate) fn diagnostic_path(&self) -> &Path {
+        &self.diagnostic_path
     }
 
     fn open_file_capability_optional(
@@ -1036,12 +1040,24 @@ impl DirectoryCapability {
             .map_err(|source| XtaskError::io(format!("persist {}", path.display()), source))
     }
 
-    fn remove_file(&self, name: &str) -> Result<(), XtaskError> {
+    pub(crate) fn remove_file(&self, name: &str) -> Result<(), XtaskError> {
         validate_leaf_name(&self.diagnostic_path, name)?;
         let path = self.diagnostic_path.join(name);
         rustix::fs::unlinkat(&self.file, name, AtFlags::empty()).map_err(|source| {
             XtaskError::io(format!("remove {}", path.display()), rustix_io(source))
         })
+    }
+
+    pub(crate) fn remove_file_if_exists(&self, name: &str) -> Result<(), XtaskError> {
+        validate_leaf_name(&self.diagnostic_path, name)?;
+        let path = self.diagnostic_path.join(name);
+        match rustix::fs::unlinkat(&self.file, name, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(source) => Err(XtaskError::io(
+                format!("remove {}", path.display()),
+                rustix_io(source),
+            )),
+        }
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), XtaskError> {
