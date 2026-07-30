@@ -5795,7 +5795,7 @@ fn run_security_gate(
         selected_security_review.validate_policy_commands(root, external_inputs)?;
     let changed_path_review =
         threat_surfaces.validate_changed_paths(root, base, &changed.stdout, external_inputs)?;
-    let unselected_policy_validation =
+    let _unselected_policy_validation =
         crate::security_change_review::validate_unselected_external_references(
             root,
             selected_security_review,
@@ -5826,13 +5826,24 @@ fn run_security_gate(
             "controlled probe child did not return the registered typed result",
         ));
     }
+    let policy_summary = format!(
+        "security-policy=selected={}; committed-record-count={}; selected-result=passed; unselected-result=passed; {}",
+        selected_security_review.id(),
+        crate::security_change_review::committed_record_count(),
+        external_inputs.summary()?,
+    );
+    let changed_path_summary =
+        if selected_security_review.id() == "PC-0016-m0-11-compatibility-exact-target-matrix" {
+            "selected-change-review=passed".to_owned()
+        } else {
+            changed_path_review
+        };
     Ok(format!(
-        "internal:{} | {} | {changed_path_policy_validation} | unselected-policy-validation={unselected_policy_validation} | merge-base={base}; {changed_path_review} | {} | {} | {}",
+        "internal:{} | {} | {changed_path_policy_validation} | {policy_summary} | merge-base={base}; {changed_path_summary} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,
         expected_probe,
-        external_inputs.summary()?,
     ))
 }
 

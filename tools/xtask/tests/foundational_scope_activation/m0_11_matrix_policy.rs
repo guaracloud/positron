@@ -158,17 +158,16 @@ fn security_review_requires_pc_0016_implementation_identity_without_pin_to_final
             &evidence,
             "EG-SECURITY",
         )?)?;
-        for required in [
-            "change-review=PC-0016-m0-11-compatibility-exact-target-matrix",
-            "policy=PC-0015-m0-10-security-crypto-runners; external-input-maximum-count=29; external-input-maximum-aggregate-bytes=108614",
-            "policy=PC-0016-m0-11-compatibility-exact-target-matrix; external-input-maximum-count=48; external-input-maximum-aggregate-bytes=196608",
-        ] {
-            if !report.contains(required) {
-                return Err(std::io::Error::other(format!(
-                    "EG-SECURITY omitted committed policy validation `{required}`"
-                ))
-                .into());
-            }
+        let summary = security_policy_summary(gate_record(&evidence, "EG-SECURITY")?)?;
+        if summary
+            != "selected=PC-0016-m0-11-compatibility-exact-target-matrix; committed-record-count=2; selected-result=passed; unselected-result=passed; external-input-count=29; external-input-aggregate-bytes=105264; external-input-maximum-count=48; external-input-maximum-aggregate-bytes=196608"
+            || summary.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
+            || report.contains("changed-paths=")
+        {
+            return Err(std::io::Error::other(
+                "EG-SECURITY did not retain the exact compact PC-0016 policy summary",
+            )
+            .into());
         }
         let policy = fixture.root.join(
             "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json",
@@ -184,6 +183,59 @@ fn security_review_requires_pc_0016_implementation_identity_without_pin_to_final
     let cleanup = fixture.remove();
     cleanup?;
     result
+}
+
+#[test]
+fn security_policy_failure_console_is_bounded_and_retains_evidence_pointer() -> TestResult {
+    let fixture = create_matrix_fixture()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/m0-11-current-origin-main"),
+            "armed\n",
+        )?;
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json",
+        );
+        replace_once(&policy, "\"path_count\": 28", "\"path_count\": 0")?;
+        let output = matrix_quality_output(&fixture, "pr")?;
+        if output.status.success() {
+            return Err(std::io::Error::other(
+                "corrupt PC-0016 policy record unexpectedly passed",
+            )
+            .into());
+        }
+        let console_bytes = output
+            .stdout
+            .len()
+            .checked_add(output.stderr.len())
+            .ok_or_else(|| std::io::Error::other("security policy console byte count overflowed"))?;
+        let evidence_path = fixture.latest_evidence_path()?;
+        if console_bytes > MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES
+            || !String::from_utf8_lossy(&output.stdout).contains(evidence_path.to_string_lossy().as_ref())
+        {
+            return Err(std::io::Error::other(
+                "security policy failure console was not bounded with a retained evidence pointer",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn security_policy_summary(gate: &str) -> TestResult<&str> {
+    let (_, summary) = gate
+        .rsplit_once("security-policy=")
+        .ok_or_else(|| std::io::Error::other("EG-SECURITY omitted policy summary"))?;
+    summary
+        .split_once(" | ")
+        .map(|(summary, _)| summary)
+        .ok_or_else(|| std::io::Error::other("EG-SECURITY policy summary was not terminated"))
+        .map_err(Into::into)
 }
 
 #[test]

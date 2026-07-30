@@ -47,6 +47,10 @@ pub(crate) struct SelectedReview {
 }
 
 impl SelectedReview {
+    pub(crate) fn id(&self) -> &str {
+        self.locator.id
+    }
+
     pub(crate) fn merge_base(&self) -> &str {
         self.locator.merge_base
     }
@@ -62,6 +66,10 @@ impl SelectedReview {
         let contract = ReviewContract::load(root, self.locator, budget, true)?;
         Ok(format!("policy-command-validation={}", contract.id))
     }
+}
+
+pub(crate) const fn committed_record_count() -> usize {
+    REVIEW_LOCATORS.len()
 }
 
 pub(crate) fn select(merge_base: &str) -> Result<SelectedReview, XtaskError> {
