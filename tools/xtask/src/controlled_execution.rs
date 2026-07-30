@@ -15,6 +15,7 @@ use std::process::{Child, ExitStatus, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -93,10 +94,13 @@ pub(crate) enum InvocationInput {
 /// The externally visible output ownership mode.
 #[derive(Debug)]
 pub(crate) enum OutputMode {
-    /// Close both child output streams without capture workers.
+    /// Close both child output streams without capture workers in lifecycle tests.
+    #[cfg(test)]
     Discard,
     /// Capture independently bounded standard output and standard error.
     Capture { maximum_bytes_per_stream: usize },
+    /// Capture one strict bounded stdout frame through an owned pipe broker.
+    FramedStdout { maximum_bytes: usize },
     /// Stream stdout into one create-new bounded artifact while capturing stderr.
     CaptureWithStdoutArtifact {
         artifact: ArtifactOutput,
@@ -393,6 +397,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
         specification.deadline,
         Some(specification.cancellation.as_ref()),
         specification.cancellation_marker.as_deref(),
+        Some(&mut workers),
     ) {
         Ok(status) => status,
         Err(failure) => {
@@ -482,8 +487,12 @@ fn configure_standard_descriptors(
         },
     }
     match output {
+        #[cfg(test)]
         OutputMode::Discard => {
             command.stdout(Stdio::null()).stderr(Stdio::null());
+        },
+        OutputMode::FramedStdout { .. } => {
+            command.stdout(Stdio::piped()).stderr(Stdio::null());
         },
         OutputMode::Capture { .. } | OutputMode::CaptureWithStdoutArtifact { .. } => {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -560,6 +569,7 @@ fn finish_after_execution_failure(
             return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
         },
     };
+    workers.request_abort();
     let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
     let process_elapsed = shutdown_started.elapsed();
     let resource_started = Instant::now();
@@ -611,8 +621,12 @@ fn wait_for_direct_child(
     deadline: Instant,
     cancellation: Option<&AtomicBool>,
     cancellation_marker: Option<&std::path::Path>,
+    mut workers: Option<&mut OwnedWorkers>,
 ) -> Result<ExitStatus, ExecutionFailure> {
     loop {
+        if let Some(workers) = workers.as_deref_mut() {
+            workers.poll_control_frame(command)?;
+        }
         if let Some(cancellation) = cancellation
             && cancellation_requested(cancellation)
         {
@@ -687,7 +701,7 @@ fn terminate_and_reap(
             return Err(group.not_empty_failure(command));
         }
     }
-    wait_for_direct_child(child, command, shutdown_deadline, None, None).map(|_| ())
+    wait_for_direct_child(child, command, shutdown_deadline, None, None, None).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -865,8 +879,312 @@ fn require_shutdown_time(
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+enum FramedStdoutEvent {
+    Control(crate::bounded_runner_frames::ControlFrame),
+    Failure(String),
+}
+
+#[cfg(unix)]
+struct FramedStdoutBroker {
+    handle: Option<thread::JoinHandle<Result<String, String>>>,
+    events: Receiver<FramedStdoutEvent>,
+    stop: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl FramedStdoutBroker {
+    fn start(
+        mut stdout: std::process::ChildStdout,
+        maximum_bytes: usize,
+        command: &str,
+    ) -> Result<Self, ExecutionFailure> {
+        if maximum_bytes == 0 {
+            return Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                "framed stdout byte bound must be positive",
+            ));
+        }
+        let flags = rustix::fs::fcntl_getfl(&stdout).map_err(|source| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                format!(
+                    "inspect framed stdout descriptor flags: {}",
+                    std::io::Error::from_raw_os_error(source.raw_os_error())
+                ),
+            )
+        })?;
+        rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK).map_err(
+            |source| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    format!(
+                        "make framed stdout descriptor nonblocking: {}",
+                        std::io::Error::from_raw_os_error(source.raw_os_error())
+                    ),
+                )
+            },
+        )?;
+        let (sender, events) = std::sync::mpsc::sync_channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("controlled-framed-stdout-broker".to_owned())
+            // positron-concurrency-spawn: FramedStdoutBroker::start\tcontrolled-framed-stdout-broker-v1
+            .spawn(move || {
+                read_bounded_framed_stdout(
+                    &mut stdout,
+                    maximum_bytes,
+                    worker_stop.as_ref(),
+                    &sender,
+                )
+            })
+            .map_err(|source| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Capture,
+                    format!("start framed stdout broker: {source}"),
+                )
+            })?;
+        Ok(Self {
+            handle: Some(handle),
+            events,
+            stop,
+        })
+    }
+
+    fn poll_control_frame(&mut self, command: &str) -> Result<(), ExecutionFailure> {
+        match self.events.try_recv() {
+            Ok(FramedStdoutEvent::Control(
+                crate::bounded_runner_frames::ControlFrame::RunnerReady,
+            )) => Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cancellation,
+                "bounded runner reported runner-ready-v1 and requested controlled shutdown",
+            )),
+            Ok(FramedStdoutEvent::Control(
+                crate::bounded_runner_frames::ControlFrame::LifecycleStalled,
+            )) => Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Deadline,
+                "bounded runner reported lifecycle-stalled-v1 and retained live task ownership",
+            )),
+            Ok(FramedStdoutEvent::Failure(detail)) => Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                detail,
+            )),
+            Err(TryRecvError::Empty) => Ok(()),
+            Err(TryRecvError::Disconnected) => Ok(()),
+        }
+    }
+
+    fn join_until(
+        mut self,
+        command: &str,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> Result<CapturedOutput, ExecutionFailure> {
+        loop {
+            if let Err(failure) = self.poll_control_frame(command) {
+                return match self.abort(command, deadline) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
+                };
+            }
+            if cancellation_requested(cancellation) {
+                let failure = cancellation_failure(command);
+                return match self.abort(command, deadline) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
+                };
+            }
+            let is_finished = self
+                .handle
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished);
+            if is_finished {
+                return self.finish(command);
+            }
+            if Instant::now() >= deadline {
+                let failure = ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Deadline,
+                    "framed stdout descriptor remained open after the invocation deadline",
+                );
+                return match self.abort(command, deadline) {
+                    Ok(()) => Err(failure),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
+                };
+            }
+            wait_for_progress(deadline);
+        }
+    }
+
+    fn finish(mut self, command: &str) -> Result<CapturedOutput, ExecutionFailure> {
+        let pending_failure = self.poll_control_frame(command).err();
+        let handle = self.handle.take().ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                "framed stdout broker lost its registered worker handle",
+            )
+        })?;
+        if !handle.is_finished() {
+            return Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Capture,
+                "framed stdout broker attempted an unobserved blocking join",
+            ));
+        }
+        let stdout = handle
+            .join()
+            .map_err(|_| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Capture,
+                    "framed stdout broker panicked",
+                )
+            })?
+            .map_err(|detail| {
+                ExecutionFailure::new(command.to_owned(), FailurePhase::Capture, detail)
+            })?;
+        if let Some(failure) = pending_failure {
+            return Err(failure);
+        }
+        Ok(CapturedOutput {
+            stdout,
+            stderr: String::new(),
+        })
+    }
+
+    fn abort(mut self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
+        self.request_stop();
+        let handle = self.handle.as_ref().ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                "framed stdout broker lost its registered worker handle",
+            )
+        })?;
+        while !handle.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Cleanup,
+                    "framed stdout broker exceeded the registered shutdown deadline",
+                ));
+            }
+            wait_for_progress(deadline);
+        }
+        let handle = self.handle.take().ok_or_else(|| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                "framed stdout broker lost its finished worker handle",
+            )
+        })?;
+        drop(handle.join().map_err(|_| {
+            ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Cleanup,
+                "framed stdout broker panicked during shutdown",
+            )
+        })?);
+        Ok(())
+    }
+
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.as_ref() {
+            handle.thread().unpark();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_bounded_framed_stdout(
+    stdout: &mut std::process::ChildStdout,
+    maximum_bytes: usize,
+    stop: &AtomicBool,
+    events: &SyncSender<FramedStdoutEvent>,
+) -> Result<String, String> {
+    let mut captured = Vec::with_capacity(maximum_bytes.min(1024));
+    let mut inspected = 0;
+    let mut chunk = [0_u8; 512];
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(String::new());
+        }
+        match stdout.read(&mut chunk) {
+            Ok(0) => {
+                return String::from_utf8(captured)
+                    .map_err(|_| "framed stdout was not valid UTF-8".to_owned());
+            },
+            Ok(count) => {
+                let Some(new_length) = captured.len().checked_add(count) else {
+                    let detail = "framed stdout byte count cannot be represented".to_owned();
+                    report_framed_stdout_failure(events, &detail);
+                    return Err(detail);
+                };
+                if new_length > maximum_bytes {
+                    let detail = "framed stdout exceeded its exact byte bound".to_owned();
+                    report_framed_stdout_failure(events, &detail);
+                    return Err(detail);
+                }
+                let retained = chunk.get(..count).ok_or_else(|| {
+                    "framed stdout read escaped its fixed buffer boundary".to_owned()
+                })?;
+                captured.extend_from_slice(retained);
+                while let Some(relative_end) = captured
+                    .get(inspected..)
+                    .and_then(|bytes| bytes.iter().position(|byte| *byte == b'\n'))
+                {
+                    let end = inspected + relative_end + 1;
+                    let Some(line) = captured.get(inspected..end) else {
+                        let detail = "framed stdout line escaped its captured boundary".to_owned();
+                        report_framed_stdout_failure(events, &detail);
+                        return Err(detail);
+                    };
+                    if let Some(frame) = crate::bounded_runner_frames::control_frame(line) {
+                        match events.try_send(FramedStdoutEvent::Control(frame)) {
+                            Ok(()) => {},
+                            Err(TrySendError::Full(_)) => {
+                                return Err(
+                                    "framed stdout control channel exceeded its exact bound"
+                                        .to_owned(),
+                                );
+                            },
+                            Err(TrySendError::Disconnected(_)) => return Ok(String::new()),
+                        }
+                    }
+                    inspected = end;
+                }
+            },
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::park_timeout(POLL_INTERVAL);
+            },
+            Err(source) => {
+                let detail = format!("read framed stdout: {source}");
+                report_framed_stdout_failure(events, &detail);
+                return Err(detail);
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+fn report_framed_stdout_failure(events: &SyncSender<FramedStdoutEvent>, detail: &str) {
+    drop(events.try_send(FramedStdoutEvent::Failure(detail.to_owned())));
+}
+
+#[cfg(unix)]
 struct OwnedWorkers {
     capture: Option<CaptureBroker>,
+    framed_stdout: Option<FramedStdoutBroker>,
     input: Option<InputBroker>,
 }
 
@@ -907,6 +1225,7 @@ impl OwnedWorkers {
                 Some((stdin, bytes))
             },
         };
+        #[cfg(test)]
         if matches!(output, OutputMode::Discard) {
             if input_pipe.is_some() {
                 return Err(ExecutionFailure::new(
@@ -917,6 +1236,7 @@ impl OwnedWorkers {
             }
             return Ok(Self {
                 capture: None,
+                framed_stdout: None,
                 input: None,
             });
         }
@@ -927,6 +1247,21 @@ impl OwnedWorkers {
                 "owned stdout capture pipe was unavailable",
             )
         })?;
+        if let OutputMode::FramedStdout { maximum_bytes } = output {
+            if input_pipe.is_some() {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "framed stdout mode requires closed standard input",
+                ));
+            }
+            let framed_stdout = FramedStdoutBroker::start(stdout, maximum_bytes, command)?;
+            return Ok(Self {
+                capture: None,
+                framed_stdout: Some(framed_stdout),
+                input: None,
+            });
+        }
         let stderr = child.stderr.take().ok_or_else(|| {
             ExecutionFailure::new(
                 command.to_owned(),
@@ -935,11 +1270,19 @@ impl OwnedWorkers {
             )
         })?;
         let request = match output {
+            #[cfg(test)]
             OutputMode::Discard => {
                 return Err(ExecutionFailure::new(
                     command.to_owned(),
                     FailurePhase::Descriptor,
                     "discarded output mode reached capture setup",
+                ));
+            },
+            OutputMode::FramedStdout { .. } => {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "framed stdout mode reached ordinary capture setup",
                 ));
             },
             OutputMode::Capture {
@@ -994,7 +1337,11 @@ impl OwnedWorkers {
             },
             None => None,
         };
-        Ok(Self { capture, input })
+        Ok(Self {
+            capture,
+            framed_stdout: None,
+            input,
+        })
     }
 
     fn join_until(
@@ -1015,12 +1362,18 @@ impl OwnedWorkers {
                 Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
             };
         }
-        match self.capture.take() {
-            Some(capture) => capture.join_until(command, deadline, cancellation),
-            None => Ok(CapturedOutput {
+        match (self.capture.take(), self.framed_stdout.take()) {
+            (Some(capture), None) => capture.join_until(command, deadline, cancellation),
+            (None, Some(framed)) => framed.join_until(command, deadline, cancellation),
+            (None, None) => Ok(CapturedOutput {
                 stdout: String::new(),
                 stderr: String::new(),
             }),
+            (Some(_), Some(_)) => Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                "controlled invocation retained two stdout owners",
+            )),
         }
     }
 
@@ -1033,9 +1386,28 @@ impl OwnedWorkers {
             Some(input) => input.abort(command, deadline),
             None => Ok(()),
         };
-        match (capture, input) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(failure), _) | (Ok(()), Err(failure)) => Err(failure),
+        let framed = match self.framed_stdout.take() {
+            Some(framed) => framed.abort(command, deadline),
+            None => Ok(()),
+        };
+        match (capture, framed, input) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(failure), _, _) | (Ok(()), Err(failure), _) | (Ok(()), Ok(()), Err(failure)) => {
+                Err(failure)
+            },
+        }
+    }
+
+    fn request_abort(&self) {
+        if let Some(framed) = self.framed_stdout.as_ref() {
+            framed.request_stop();
+        }
+    }
+
+    fn poll_control_frame(&mut self, command: &str) -> Result<(), ExecutionFailure> {
+        match self.framed_stdout.as_mut() {
+            Some(framed) => framed.poll_control_frame(command),
+            None => Ok(()),
         }
     }
 }
@@ -1250,7 +1622,7 @@ impl InputBroker {
                             )),
                         }
                     } else {
-                        wait_for_direct_child(&mut child, command, deadline, None, None).map(
+                        wait_for_direct_child(&mut child, command, deadline, None, None, None).map(
                             |status| {
                                 self.status = Some(status);
                             },
@@ -1899,9 +2271,11 @@ impl CaptureReader {
                         )),
                     };
                 }
-                wait_for_direct_child(&mut child, command, deadline, None, None).map(|status| {
-                    self.status = Some(status);
-                })
+                wait_for_direct_child(&mut child, command, deadline, None, None, None).map(
+                    |status| {
+                        self.status = Some(status);
+                    },
+                )
             },
             Err(source) => Err(ExecutionFailure::new(
                 command.to_owned(),
@@ -2058,6 +2432,65 @@ mod tests {
             "normal-stderr",
             "successful controlled child",
         )
+    }
+
+    #[test]
+    fn reconciles_one_bounded_stdout_frame_without_an_ambient_path() -> TestResult {
+        let verdict = reconciled(execute(framed_shell(
+            "printf '%s\\n' runner-outcome-v1:6f6b",
+            Duration::from_secs(1),
+        )?))?;
+        assert_output(
+            verdict.output,
+            "runner-outcome-v1:6f6b\n",
+            "",
+            "framed stdout child",
+        )
+    }
+
+    #[test]
+    fn runner_ready_frame_triggers_bounded_process_group_shutdown() -> TestResult {
+        let outcome = execute(framed_shell(
+            "printf '%s\\n' runner-ready-v1; exec /bin/sleep 60",
+            Duration::from_secs(2),
+        )?);
+        assert_framed_control_shutdown(outcome, FailurePhase::Cancellation, "runner-ready-v1")
+    }
+
+    #[test]
+    fn lifecycle_stalled_frame_triggers_bounded_process_group_shutdown() -> TestResult {
+        let outcome = execute(framed_shell(
+            "printf '%s\\n' lifecycle-stalled-v1; exec /bin/sleep 60",
+            Duration::from_secs(2),
+        )?);
+        assert_framed_control_shutdown(outcome, FailurePhase::Deadline, "lifecycle-stalled-v1")
+    }
+
+    #[test]
+    fn oversized_framed_stdout_fails_closed_without_waiting_for_eof() -> TestResult {
+        let outcome = execute(framed_shell(
+            "exec /bin/dd if=/dev/zero bs=9000 count=1 2>/dev/null",
+            Duration::from_secs(2),
+        )?);
+        match outcome {
+            ExecutionOutcome::Failed(failure)
+                if failure.phase == FailurePhase::Capture
+                    && failure.detail.contains("exact byte bound") =>
+            {
+                Ok(())
+            },
+            ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                "oversized framed stdout returned {} instead of capture: {}",
+                failure.phase.as_str(),
+                failure.detail,
+            ))
+            .into()),
+            ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                "oversized framed stdout reconciled with {}",
+                verdict.status,
+            ))
+            .into()),
+        }
     }
 
     #[test]
@@ -2938,6 +3371,59 @@ os._exit(0)
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             cancellation_marker: None,
         })
+    }
+
+    fn framed_shell(script: &str, timeout: Duration) -> TestResult<InvocationSpec> {
+        let mut specification = captured_shell_with_limit(
+            script,
+            timeout,
+            crate::bounded_runner_frames::MAXIMUM_FRAME_BYTES,
+        )?;
+        specification.output = OutputMode::FramedStdout {
+            maximum_bytes: crate::bounded_runner_frames::MAXIMUM_FRAME_BYTES,
+        };
+        specification.shutdown_timeout = Duration::from_millis(100);
+        Ok(specification)
+    }
+
+    fn assert_framed_control_shutdown(
+        outcome: ExecutionOutcome,
+        expected_phase: FailurePhase,
+        expected_frame: &str,
+    ) -> TestResult {
+        let ExecutionOutcome::Failed(failure) = outcome else {
+            return Err(io::Error::other(format!(
+                "{expected_frame} did not fail the controlled invocation"
+            ))
+            .into());
+        };
+        if failure.phase != expected_phase || !failure.detail.contains(expected_frame) {
+            return Err(io::Error::other(format!(
+                "{expected_frame} returned {}: {}",
+                failure.phase.as_str(),
+                failure.detail,
+            ))
+            .into());
+        }
+        let observed = failure.shutdown.ok_or_else(|| {
+            io::Error::other(format!("{expected_frame} omitted shutdown evidence"))
+        })?;
+        if !observed.termination_requested
+            || !observed.process_reaped
+            || observed.live != 0
+            || observed.elapsed > observed.bound
+        {
+            return Err(io::Error::other(format!(
+                "{expected_frame} did not reconcile inside its bound: requested={}, reaped={}, live={}, bound={}ms, elapsed={}ms",
+                observed.termination_requested,
+                observed.process_reaped,
+                observed.live,
+                observed.bound.as_millis(),
+                observed.elapsed.as_millis(),
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     fn reconciled(outcome: ExecutionOutcome) -> TestResult<ExecutionVerdict> {

@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::error::XtaskError;
 
-pub(crate) use protocol::{OwnedOutcomeTicket, run_process};
+pub(crate) use protocol::run_process;
 pub(crate) use registry::FrozenBoundedRunnerRegistry;
 
 pub(crate) fn validate_source_policy(

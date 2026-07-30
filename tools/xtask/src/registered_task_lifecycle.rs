@@ -4,9 +4,6 @@
 //! carries one monotonic deadline from registration through reconciliation,
 //! and records completion and join observations only when they actually occur.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -48,52 +45,6 @@ pub(crate) struct RegisteredTaskSpec<'a> {
     pub(crate) shutdown: Duration,
     pub(crate) spawn_site: &'a str,
     pub(crate) registered_spawn_site: &'a str,
-    pub(crate) readiness: WorkerReadiness,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct WorkerReadiness {
-    path: PathBuf,
-}
-
-impl WorkerReadiness {
-    pub(crate) fn new(path: PathBuf) -> Result<Self, XtaskError> {
-        let root = std::env::current_dir()
-            .map_err(|source| XtaskError::io("resolve bounded runner workspace", source))?;
-        let parent = path.parent().ok_or_else(|| {
-            XtaskError::invalid_path(&path, "worker readiness path has no parent")
-        })?;
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-            || !parent.starts_with(root.join("target/quality/tmp"))
-        {
-            return Err(XtaskError::invalid_path(
-                &path,
-                "worker readiness path escaped the owned quality temporary root",
-            ));
-        }
-        Ok(Self { path })
-    }
-
-    pub(crate) fn signal(&self) -> Result<(), XtaskError> {
-        let mut marker = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.path)
-            .map_err(|source| XtaskError::io("create bounded worker readiness marker", source))?;
-        marker
-            .write_all(b"worker-ready-v1\n")
-            .and_then(|()| marker.sync_all())
-            .map_err(|source| XtaskError::io("sync bounded worker readiness marker", source))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            XtaskError::invalid_path(&self.path, "worker readiness path has no parent")
-        })?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| XtaskError::io("sync bounded worker readiness directory", source))
-    }
 }
 
 struct RegisteredTask {
@@ -145,7 +96,6 @@ impl RegisteredTasks {
             shutdown,
             spawn_site,
             registered_spawn_site,
-            readiness,
         } = specification;
         if spawn_site != registered_spawn_site {
             return Err(XtaskError::invalid(
@@ -188,7 +138,6 @@ impl RegisteredTasks {
                 handle: None,
             });
             let worker_results = results_sender.clone();
-            let worker_readiness = readiness.clone();
             let handle = match thread::Builder::new()
                 .name(format!("positron-quality-worker-{id}"))
                 // positron-concurrency-spawn: RegisteredTasks::spawn\tquality-bounded-worker-v1
@@ -199,7 +148,6 @@ impl RegisteredTasks {
                         execution_deadline,
                         receiver,
                         worker_results,
-                        worker_readiness,
                     )
                 }) {
                 Ok(handle) => handle,
@@ -332,16 +280,10 @@ impl RegisteredTasks {
             }
             thread::yield_now();
         }
-        if deadline_expired {
-            cleanup_errors.extend(self.join_structurally_cooperative_tasks());
-        }
         drain_measurements(&self.results, &mut reported_ids);
 
         if deadline_expired {
-            cleanup_errors.push(
-                "cooperative worker completion was not observed before the registered shutdown deadline"
-                    .to_owned(),
-            );
+            self.park_with_live_ownership();
         }
 
         let mut cancelled_ids = cancellation
@@ -430,28 +372,13 @@ impl RegisteredTasks {
         errors
     }
 
-    fn join_structurally_cooperative_tasks(&mut self) -> Vec<String> {
-        let mut errors = Vec::new();
-        for task in &mut self.tasks {
-            let Some(handle) = task.handle.take() else {
-                continue;
-            };
-            match handle.join() {
-                Ok(Ok(())) => {
-                    self.completed_ids.push(task.id);
-                    self.joined_ids.push(task.id);
-                },
-                Ok(Err(error)) => {
-                    self.completed_ids.push(task.id);
-                    errors.push(format!("worker {} returned {error}", task.id));
-                },
-                Err(_) => {
-                    self.completed_ids.push(task.id);
-                    errors.push(format!("worker {} panicked", task.id));
-                },
-            }
+    fn park_with_live_ownership(&mut self) -> ! {
+        drop(crate::bounded_runner_frames::emit_control(
+            crate::bounded_runner_frames::ControlFrame::LifecycleStalled,
+        ));
+        loop {
+            thread::park_timeout(Duration::from_millis(5));
         }
-        errors
     }
 
     fn has_unjoined_handles(&self) -> bool {
@@ -478,7 +405,6 @@ fn worker_loop(
     deadline: Instant,
     receiver: Receiver<WorkerCommand>,
     results: SyncSender<WorkerMeasurement>,
-    readiness: WorkerReadiness,
 ) -> Result<(), XtaskError> {
     let command = loop {
         if cancel.load(Ordering::Acquire) {
@@ -504,9 +430,6 @@ fn worker_loop(
             },
         }
     };
-    if id == 0 {
-        readiness.signal()?;
-    }
     cooperative_pause(&cancel, Duration::ZERO)?;
     let (completion, schedule_slot) = match command {
         WorkerCommand::Execute { schedule_slot } => (WorkerCompletion::Executed, schedule_slot),

@@ -1437,18 +1437,7 @@ fn run_bounded_runner_gate(
             "bounded runner executable is not an absolute file",
         ));
     }
-    let nonce = unix_time_ms()?;
-    let path_stem = format!(
-        "bounded-runner-{}-{}-{nonce}",
-        std::process::id(),
-        gate_id.to_ascii_lowercase(),
-    );
-    let ticket = crate::bounded_runners::OwnedOutcomeTicket::create(
-        environment.temporary_root(),
-        &path_stem,
-    )?;
-    let cancellation_path = ticket.cancellation_path();
-    let arguments = registry.child_arguments(gate_id, &ticket, execution_timeout)?;
+    let arguments = registry.child_arguments(gate_id, execution_timeout)?;
     let retained_arguments = arguments
         .iter()
         .map(|argument| {
@@ -1482,14 +1471,15 @@ fn run_bounded_runner_gate(
         environment: invocation_environment,
         tools: environment.execution_tools(),
         input,
-        output: OutputMode::Discard,
+        output: OutputMode::FramedStdout {
+            maximum_bytes: crate::bounded_runner_frames::MAXIMUM_FRAME_BYTES,
+        },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(execution_timeout)?,
         shutdown_timeout: shutdown,
-        cancellation_marker: Some(cancellation_path.clone()),
+        cancellation_marker: None,
     })
     .into_result();
-    ticket.remove_optional_markers()?;
     let completed_lifecycle = |phase: &str| {
         format!(
             "process-lifecycle-v1;phase={phase};termination-requested=false;process-reaped=true;live=0;shutdown-ms={};process-shutdown-elapsed-ms=0;resource-shutdown-elapsed-ms=0;shutdown-elapsed-ms=0",
@@ -1499,7 +1489,12 @@ fn run_bounded_runner_gate(
     let verdict = match outcome {
         Ok(verdict) => {
             let step_verdict = format!("exit-status:{}", verdict.status);
-            capture.record(invocation, &step_verdict, "", "")?;
+            capture.record(
+                invocation,
+                &step_verdict,
+                &verdict.output.stdout,
+                &verdict.output.stderr,
+            )?;
             verdict
         },
         Err(error) => {
@@ -1539,7 +1534,6 @@ fn run_bounded_runner_gate(
                 "",
                 &format!("{}{}; {lifecycle}", error.detail, reconciliation),
             )?;
-            ticket.remove_optional_outcome()?;
             return Err(XtaskError::invalid(
                 "bounded runner process lifecycle",
                 format!(
@@ -1552,29 +1546,39 @@ fn run_bounded_runner_gate(
             ));
         },
     };
-    let outcome = ticket.take_outcome()?;
-    if !verdict.status.success() {
-        return Err(XtaskError::invalid(
-            "bounded runner process lifecycle",
-            format!(
-                "child returned {}: {}; {}",
-                verdict.status,
-                outcome.trim().replace('\n', " | "),
-                completed_lifecycle("child-error"),
-            ),
-        ));
-    }
-    let Some(record) = outcome.strip_prefix("ok\n") else {
-        return Err(XtaskError::invalid(
-            "bounded runner process lifecycle",
-            format!(
-                "child outcome omitted its success discriminator: {}; {}",
-                one_line(&outcome),
-                completed_lifecycle("malformed-output"),
-            ),
-        ));
+    let frame =
+        crate::bounded_runner_frames::parse_captured(&verdict.output.stdout).map_err(|error| {
+            XtaskError::invalid(
+                "bounded runner process lifecycle",
+                format!("{error}; {}", completed_lifecycle("malformed-output")),
+            )
+        })?;
+    let record = match frame {
+        crate::bounded_runner_frames::CapturedFrame::Outcome(record) => {
+            if !verdict.status.success() {
+                return Err(XtaskError::invalid(
+                    "bounded runner process lifecycle",
+                    format!(
+                        "child returned {} after publishing a success frame; {}",
+                        verdict.status,
+                        completed_lifecycle("child-error"),
+                    ),
+                ));
+            }
+            record
+        },
+        crate::bounded_runner_frames::CapturedFrame::Error(detail) => {
+            return Err(XtaskError::invalid(
+                "bounded runner process lifecycle",
+                format!(
+                    "child returned {}: {}; {}",
+                    verdict.status,
+                    detail.split_whitespace().collect::<Vec<_>>().join(" "),
+                    completed_lifecycle("child-error"),
+                ),
+            ));
+        },
     };
-    let record = record.trim_end_matches('\n');
     if record.is_empty() || record.lines().count() != 1 {
         return Err(XtaskError::invalid(
             "bounded runner process lifecycle",
@@ -1589,7 +1593,7 @@ fn run_bounded_runner_gate(
             gate,
             scenario_registry: registry.bytes(),
             spawn_registry: registry.spawn_site_bytes(),
-            measurement: record,
+            measurement: &record,
             execution: &verdict,
         },
     )?;

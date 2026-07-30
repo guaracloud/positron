@@ -349,6 +349,12 @@ fn validate_spawn_registry(bytes: &[u8], scenario: &Scenario) -> Result<(), Xtas
             "process",
         ),
         (
+            "controlled-framed-stdout-broker-v1",
+            "tools/xtask/src/controlled_execution.rs",
+            "FramedStdoutBroker::start",
+            "thread",
+        ),
+        (
             "fixture-writer-v1",
             "tools/xtask/src/qualification_fixtures.rs",
             "execute_state_transition",

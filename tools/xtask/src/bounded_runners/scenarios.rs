@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::error::XtaskError;
 use crate::registered_task_lifecycle::{
-    LifecycleResult, RegisteredTaskSpec, RegisteredTasks, WorkerCommand, WorkerReadiness,
+    LifecycleResult, RegisteredTaskSpec, RegisteredTasks, WorkerCommand,
 };
 
 use super::measurement::{
@@ -17,7 +17,6 @@ use super::resource::{BoundedWorkQueue, ReservationLedger, ReservationOutcome};
 pub(super) fn run_concurrency_scenario(
     registry: &FrozenBoundedRunnerRegistry,
     execution_timeout: Duration,
-    readiness: WorkerReadiness,
 ) -> Result<String, XtaskError> {
     let scenario = registry.scenario(ScenarioGate::Concurrency)?;
     validate_concurrency_scenario(scenario)?;
@@ -32,7 +31,6 @@ pub(super) fn run_concurrency_scenario(
             shutdown: scenario.shutdown,
             spawn_site: &scenario.spawn_site,
             registered_spawn_site: REGISTERED_SPAWN_SITE,
-            readiness,
         },
         |tasks| {
             tasks.dispatch(0, WorkerCommand::Cancel { schedule_slot: 0 })?;
@@ -49,7 +47,6 @@ pub(super) fn run_concurrency_scenario(
 pub(super) fn run_resource_scenario(
     registry: &FrozenBoundedRunnerRegistry,
     execution_timeout: Duration,
-    readiness: WorkerReadiness,
 ) -> Result<String, XtaskError> {
     let scenario = registry.scenario(ScenarioGate::Resource)?;
     validate_resource_scenario(scenario)?;
@@ -64,7 +61,6 @@ pub(super) fn run_resource_scenario(
             shutdown: scenario.shutdown,
             spawn_site: &scenario.spawn_site,
             registered_spawn_site: REGISTERED_SPAWN_SITE,
-            readiness,
         },
         |tasks| {
             let mut queue = BoundedWorkQueue::new(scenario.queue_capacity);

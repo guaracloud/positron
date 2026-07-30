@@ -2,6 +2,76 @@ use super::m0_08_support::*;
 use super::*;
 
 #[test]
+fn quality_rejects_chained_thread_module_aliases_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod chained_thread_alias {\n    use std::thread as a;\n    use a as b;\n    const SPAWN: usize = (b::spawn);\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_rejects_chained_mpsc_module_aliases_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod chained_mpsc_alias {\n    use std::sync::mpsc as a;\n    use a as b;\n    static CHANNEL: usize = ((b::channel));\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_rejects_builder_and_scope_function_items_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn forbidden_thread_function_items() {\n    let _builder = (((std::thread::Builder::spawn)));\n    let _scope = std::thread::Scope::spawn;\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_rejects_aliased_builder_function_items_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod aliased_builder_function_item {\n    use std::thread::Builder as a;\n    use a as b;\n    const SPAWN: usize = ((b::spawn));\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_rejects_vec_deque_turbofish_new_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn unbounded_queue_function_item() {\n    let _queue = std::collections::VecDeque::<usize>::new;\n}\n",
+        "unbounded concurrency primitive",
+    )
+}
+
+#[test]
+fn quality_rejects_multiline_spawn_scoped_turbofish_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn multiline_scoped_spawn(builder: std::thread::Builder, scope: &std::thread::Scope<'_, '_>) {\n    let _worker = builder\n        .spawn_scoped\n        :: <_, ()>\n        (scope, || Ok(()));\n}\n",
+        "unregistered process or task spawn",
+    )
+}
+
+#[test]
+fn quality_rejects_a_marker_not_immediately_bound_to_its_exact_spawn() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture.root.join("tools/xtask/src/controlled_execution.rs"),
+            "// positron-concurrency-spawn: InputBroker::start\\tcontrolled-input-broker-v1\n            .spawn()",
+            "// positron-concurrency-spawn: InputBroker::start\\tcontrolled-input-broker-v1\n\n            .spawn()",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "spawn marker at tooling line")?;
+        assert_rejected_output(
+            &output,
+            "is not immediately bound to its exact method spawn",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_an_unregistered_tooling_spawn_site_through_the_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {

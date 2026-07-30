@@ -8,6 +8,7 @@
 
 mod api_generation;
 mod bounded_measurement_verifier;
+mod bounded_runner_frames;
 mod bounded_runners;
 mod concurrency_source_policy;
 mod config_generation;

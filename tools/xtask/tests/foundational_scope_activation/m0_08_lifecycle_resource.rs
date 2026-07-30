@@ -2,50 +2,6 @@ use super::m0_08_support::*;
 use super::*;
 
 #[test]
-fn quality_rejects_a_parent_directory_outcome_identity_through_the_public_seam() -> TestResult {
-    let fixture = Fixture::create()?;
-    let result = (|| {
-        enable_concurrency_gate(&fixture)?;
-        replace_once(
-            &fixture
-                .root
-                .join("tools/xtask/src/bounded_runners/protocol.rs"),
-            "            OsString::from(OUTCOME_NAME),",
-            "            OsString::from(\"owned_dir/../escape\"),",
-        )?;
-        let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(&output, "outcome identity is not one normal path component")
-    })();
-    let cleanup = fixture.remove();
-    cleanup?;
-    result
-}
-
-#[cfg(unix)]
-#[test]
-fn quality_rejects_a_symbolic_link_outcome_ticket_through_the_public_seam() -> TestResult {
-    let fixture = Fixture::create()?;
-    let result = (|| {
-        enable_concurrency_gate(&fixture)?;
-        replace_once(
-            &fixture
-                .root
-                .join("tools/xtask/src/bounded_runners/protocol.rs"),
-            "            ticket.directory.diagnostic_path().as_os_str().to_owned(),",
-            "            {\n                let alias = ticket.directory.diagnostic_path().with_extension(\"alias\");\n                std::os::unix::fs::symlink(ticket.directory.diagnostic_path(), &alias)\n                    .map_err(|source| XtaskError::io(\"create test outcome ticket alias\", source))?;\n                alias.into_os_string()\n            },",
-        )?;
-        let output = fixture.quality_output_from_fixture_source("pr")?;
-        assert_rejected_output(
-            &output,
-            "bounded runner outcome ticket escaped its owned canonical temporary root",
-        )
-    })();
-    let cleanup = fixture.remove();
-    cleanup?;
-    result
-}
-
-#[test]
 fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -113,6 +69,69 @@ fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() ->
             }
         }
         Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_a_malformed_bounded_runner_stdout_frame() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/protocol.rs"),
+            "    bounded_runner_frames::emit_result(&result)?;",
+            "    if result.is_err() {\n        bounded_runner_frames::emit_result(&result)?;\n    }\n    println!(\"runner-outcome-v0:00\");",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "captured frame has an unknown or stale version")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_duplicate_bounded_runner_stdout_frames() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/protocol.rs"),
+            "    bounded_runner_frames::emit_result(&result)?;",
+            "    bounded_runner_frames::emit_result(&result)?;\n    bounded_runner_frames::emit_result(&result)?;",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "captured output must contain exactly one complete frame",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_oversized_bounded_runner_stdout_before_eof() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/protocol.rs"),
+            "    bounded_runner_frames::emit_result(&result)?;",
+            "    if result.is_err() {\n        bounded_runner_frames::emit_result(&result)?;\n    }\n    println!(\"{}\", \"x\".repeat(crate::bounded_runner_frames::MAXIMUM_FRAME_BYTES + 1));",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "framed stdout exceeded its exact byte bound")
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -235,7 +254,7 @@ fn quality_bounds_cooperative_worker_join_by_the_registered_shutdown_deadline() 
     result
 }
 #[test]
-fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -> TestResult {
+fn quality_reaps_a_runner_ready_true_hang_inside_the_registered_bound() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
         enable_concurrency_gate(&fixture)?;
@@ -243,30 +262,18 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
             &fixture
                 .root
                 .join("tools/xtask/src/bounded_runners/protocol.rs"),
-            "        let readiness =\n            WorkerReadiness::new(owned_directory.diagnostic_path().join(readiness_name))?;\n",
-            "        let readiness =\n            WorkerReadiness::new(owned_directory.diagnostic_path().join(readiness_name))?;\n        if gate == \"EG-CONCURRENCY\" {\n            readiness.signal()?;\n            loop {\n                std::thread::park();\n            }\n        }\n",
+            "    let result = (|| {\n",
+            "    let result = (|| {\n        if gate == \"EG-CONCURRENCY\" {\n            crate::bounded_runner_frames::emit_control(crate::bounded_runner_frames::ControlFrame::RunnerReady)?;\n            loop {\n                std::thread::park();\n            }\n        }\n",
         )?;
-        fixture.build_fixture_xtask()?;
-        let mut quality = fixture.quality_child_from_built_fixture_for("pr")?;
-        wait_for_bounded_runner_readiness_and_cancel(
-            &fixture,
-            "eg-concurrency",
-            Duration::from_secs(30),
-        )?;
-        // This outer test-infrastructure watchdog includes fixture startup and broad
-        // nextest contention; the product lifecycle bound asserted below remains 100ms.
-        let status = match wait_for_child_exit(&mut quality, Duration::from_secs(30)) {
-            Ok(status) => status,
-            Err(error) => {
-                drop(quality.kill());
-                drop(quality.wait());
-                return Err(error);
-            },
-        };
-        let (stdout, stderr) = read_child_output(&mut quality)?;
-        if status.success() || !stderr.contains("controlled runner failed during cancellation") {
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success()
+            || !stderr.contains("controlled runner failed during cancellation")
+            || !stderr.contains("runner-ready-v1")
+        {
             return Err(std::io::Error::other(format!(
-                "the public quality seam did not return a typed noncooperative-worker cancellation: {stdout}\n{stderr}"
+                "the public quality seam did not return a typed runner-ready cancellation: {}\n{stderr}",
+                String::from_utf8_lossy(&output.stdout),
             ))
             .into());
         }
@@ -285,7 +292,7 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
         ] {
             if !report.contains(required) {
                 return Err(std::io::Error::other(format!(
-                    "noncooperative lifecycle evidence omitted `{required}`"
+                    "runner-ready lifecycle evidence omitted `{required}`"
                 ))
                 .into());
             }
@@ -300,9 +307,68 @@ fn quality_reaps_a_noncooperative_worker_process_inside_the_registered_bound() -
             .parse::<u128>()?;
         if elapsed > 100 {
             return Err(std::io::Error::other(format!(
-                "noncooperative worker kill and reap exceeded the registered 100ms bound: {elapsed}ms"
+                "runner-ready process kill and reap exceeded the registered 100ms bound: {elapsed}ms"
             ))
             .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_reaps_a_lifecycle_stall_while_the_child_retains_task_ownership() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/bounded_runners/protocol.rs"),
+            "            ScenarioGate::Concurrency => run_concurrency_scenario(&registry, execution_timeout),",
+            "            ScenarioGate::Concurrency => run_concurrency_scenario(&registry, Duration::from_millis(20)),",
+        )?;
+        replace_once(
+            &fixture
+                .root
+                .join("tools/xtask/src/registered_task_lifecycle.rs"),
+            "    cooperative_pause(&cancel, Duration::ZERO)?;",
+            "    if id == 0 {\n        loop {\n            std::thread::park_timeout(Duration::from_millis(5));\n        }\n    }\n    cooperative_pause(&cancel, Duration::ZERO)?;",
+        )?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success()
+            || !stderr.contains("controlled runner failed during deadline")
+            || !stderr.contains("lifecycle-stalled-v1")
+        {
+            return Err(std::io::Error::other(format!(
+                "the public quality seam did not return a typed lifecycle stall: {}\n{stderr}",
+                String::from_utf8_lossy(&output.stdout),
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-CONCURRENCY",
+        )?)?;
+        for required in [
+            "process-lifecycle-v1;phase=deadline",
+            "lifecycle-stalled-v1",
+            "termination-requested=true",
+            "process-reaped=true",
+            "live=0",
+            "shutdown-ms=100",
+        ] {
+            if !report.contains(required) {
+                return Err(std::io::Error::other(format!(
+                    "stalled lifecycle evidence omitted `{required}`"
+                ))
+                .into());
+            }
         }
         Ok(())
     })();
