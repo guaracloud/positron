@@ -139,6 +139,31 @@ fn quality_rejects_oversized_bounded_runner_stdout_before_eof() -> TestResult {
 }
 
 #[test]
+fn quality_rejects_the_obsolete_framed_stdout_thread_registration() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let registry = fixture
+            .root
+            .join("qualification/engineering/concurrency-spawn-sites.tsv");
+        let obsolete = "tools/xtask/src/framed_stdout_broker.rs\tFramedStdoutBroker::start\tthread\tcontrolled-framed-stdout-broker-v1\n";
+        let mut content = fs::read_to_string(&registry)?;
+        if !content.contains(obsolete) {
+            content.push_str(obsolete);
+            fs::write(&registry, content)?;
+        }
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(
+            &output,
+            "registered spawn-site set does not exactly match active tooling source",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_reconciles_after_a_partial_registered_spawn_failure_through_the_public_seam()
 -> TestResult {
     let fixture = Fixture::create()?;

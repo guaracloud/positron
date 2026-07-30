@@ -1,7 +1,5 @@
 //! Bounded resource queue, reservation ledger, and pressure model.
 
-use std::collections::VecDeque;
-
 use crate::error::XtaskError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,38 +43,84 @@ impl ReservationLedger {
 
 pub(super) struct BoundedWorkQueue {
     capacity: usize,
-    entries: VecDeque<usize>,
+    entries: Vec<Option<usize>>,
+    head: usize,
+    tail: usize,
+    len: usize,
 }
 
 impl BoundedWorkQueue {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            entries: VecDeque::with_capacity(capacity),
+            entries: vec![None; capacity],
+            head: 0,
+            tail: 0,
+            len: 0,
         }
     }
 
     pub(super) fn enqueue(&mut self, task: usize) -> Result<(), XtaskError> {
-        if self.entries.len() >= self.capacity {
+        if self.len >= self.capacity {
             return Err(XtaskError::invalid(
                 "bounded work queue",
                 "overload was rejected before unreserved queue growth",
             ));
         }
-        self.entries.push_back(task);
+        let slot = self.entries.get_mut(self.tail).ok_or_else(|| {
+            XtaskError::invalid(
+                "bounded work queue",
+                "bounded queue tail escaped its fixed storage",
+            )
+        })?;
+        if slot.replace(task).is_some() {
+            return Err(XtaskError::invalid(
+                "bounded work queue",
+                "bounded queue attempted to overwrite retained work",
+            ));
+        }
+        self.tail = advance(self.tail, self.capacity)?;
+        self.len = self.len.checked_add(1).ok_or_else(|| {
+            XtaskError::invalid(
+                "bounded work queue",
+                "bounded queue length cannot be represented",
+            )
+        })?;
         Ok(())
     }
 
     pub(super) fn dequeue(&mut self) -> Result<usize, XtaskError> {
-        self.entries.pop_front().ok_or_else(|| {
-            XtaskError::invalid(
+        if self.len == 0 {
+            return Err(XtaskError::invalid(
                 "bounded work queue",
                 "deterministic schedule dequeued an empty queue",
-            )
-        })
+            ));
+        }
+        let task = self
+            .entries
+            .get_mut(self.head)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                XtaskError::invalid(
+                    "bounded work queue",
+                    "bounded queue head omitted retained work",
+                )
+            })?;
+        self.head = advance(self.head, self.capacity)?;
+        self.len = self.len.checked_sub(1).ok_or_else(|| {
+            XtaskError::invalid("bounded work queue", "bounded queue length underflowed")
+        })?;
+        Ok(task)
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len == 0
     }
+}
+
+fn advance(index: usize, capacity: usize) -> Result<usize, XtaskError> {
+    let next = index.checked_add(1).ok_or_else(|| {
+        XtaskError::invalid("bounded work queue", "bounded queue index overflowed")
+    })?;
+    Ok(if next == capacity { 0 } else { next })
 }

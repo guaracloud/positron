@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::framed_stdout_broker::{
-    Failure as FramedStdoutFailure, FailurePhase as FramedStdoutFailurePhase, FramedStdoutBroker,
+use crate::framed_stdout_reader::{
+    Failure as FramedStdoutFailure, FailurePhase as FramedStdoutFailurePhase, FramedStdoutReader,
 };
 
 #[cfg(unix)]
@@ -722,7 +722,7 @@ fn wait_for_progress(deadline: Instant) {
 #[cfg(unix)]
 struct OwnedWorkers {
     capture: Option<CaptureBroker>,
-    framed_stdout: Option<FramedStdoutBroker>,
+    framed_stdout: Option<FramedStdoutReader>,
     input: Option<InputBroker>,
 }
 
@@ -800,7 +800,7 @@ impl OwnedWorkers {
                     "owned framed stderr control-failure pipe was unavailable",
                 )
             })?;
-            let framed_stdout = FramedStdoutBroker::start(stdout, stderr, maximum_bytes)
+            let framed_stdout = FramedStdoutReader::start(stdout, stderr, maximum_bytes)
                 .map_err(|failure| framed_stdout_failure(command, failure))?;
             return Ok(Self {
                 capture: None,
@@ -952,9 +952,9 @@ impl OwnedWorkers {
         }
     }
 
-    fn request_abort(&self) {
-        if let Some(framed) = self.framed_stdout.as_ref() {
-            framed.request_stop();
+    fn request_abort(&mut self) {
+        if let Some(framed) = self.framed_stdout.as_mut() {
+            framed.close_descriptors();
         }
     }
 

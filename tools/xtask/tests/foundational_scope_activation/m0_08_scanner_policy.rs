@@ -34,6 +34,49 @@ fn quality_rejects_raw_module_and_import_aliases_through_the_public_seam() -> Te
 }
 
 #[test]
+fn quality_rejects_thread_spawn_through_an_extern_crate_alias() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod extern_thread_alias {\n    extern crate std as runtime;\n    fn invoke() {\n        let _worker = runtime::thread::spawn(|| {});\n    }\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_rejects_unbounded_channel_through_an_extern_crate_alias() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod extern_channel_alias {\n    extern crate std as runtime;\n    fn invoke() {\n        let _channel = runtime::sync::mpsc::channel::<()>;\n    }\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_accepts_an_unrelated_extern_crate_alias() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n#[cfg(any())]\nmod safe_extern_alias {\n    extern crate std as runtime;\n    fn invoke() {\n        let _map = runtime::collections::BTreeMap::<usize, usize>::new();\n    }\n}\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "safe unrelated extern crate alias was rejected: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_rejects_bare_spawn_from_a_transitively_aliased_thread_glob_through_the_public_seam()
 -> TestResult {
     assert_concurrency_source_rejected(
@@ -207,6 +250,65 @@ fn quality_rejects_vec_deque_turbofish_new_through_the_public_seam() -> TestResu
         "\n#[cfg(any())]\nfn unbounded_queue_function_item() {\n    let _queue = std::collections::VecDeque::<usize>::new;\n}\n",
         "unbounded concurrency primitive",
     )
+}
+
+#[test]
+fn quality_rejects_every_resolved_vec_deque_reference_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn unbounded_queue_with_capacity() {\n    let _factory = std::collections::VecDeque::<usize>::with_capacity;\n}\n",
+        "unbounded concurrency primitive",
+    )?;
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn unbounded_queue_default() {\n    let _factory = std::collections::VecDeque::<usize>::default;\n}\n",
+        "unbounded concurrency primitive",
+    )?;
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn unbounded_queue_type_reference() {\n    let _queue: Option<std::collections::VecDeque<usize>> = None;\n}\n",
+        "unbounded concurrency primitive",
+    )
+}
+
+#[test]
+fn quality_rejects_aliased_globbed_and_extern_aliased_vec_deque_references() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod aliased_unbounded_queue {\n    use std::collections::VecDeque as Queue;\n    const FACTORY: usize = Queue::<usize>::default;\n}\n",
+        "concurrency primitive",
+    )?;
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod globbed_unbounded_queue {\n    use std::collections::*;\n    const FACTORY: usize = VecDeque::<usize>::with_capacity;\n}\n",
+        "forbidden concurrency primitive glob import",
+    )?;
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod extern_unbounded_queue {\n    extern crate std as runtime;\n    const FACTORY: usize = runtime::collections::VecDeque::<usize>::default;\n}\n",
+        "concurrency primitive",
+    )
+}
+
+#[test]
+fn quality_accepts_an_unrelated_collection_type_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n#[cfg(any())]\nmod safe_collection {\n    extern crate std as runtime;\n    fn invoke() {\n        let _map = runtime::collections::BTreeMap::<usize, usize>::new();\n        let _vector = std::vec::Vec::<usize>::with_capacity(4);\n    }\n}\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "safe unrelated collection type was rejected: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
 }
 
 #[test]
