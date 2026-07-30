@@ -54,6 +54,7 @@ const MAXIMUM_PATH_ENTRIES: usize = 128;
 const MAXIMUM_SNAPSHOT_DIGEST_INPUT_BYTES: usize = 65_536;
 const SNAPSHOT_DIGEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAXIMUM_CAPTURED_REPORT_STREAM_BYTES: usize = 131_072;
+const MAXIMUM_MATRIX_CAPTURED_REPORT_STREAM_BYTES: usize = MAXIMUM_CAPTURED_REPORT_STREAM_BYTES;
 const MAXIMUM_RAW_REPORT_BYTES: usize = 8_388_608;
 const MAXIMUM_RETAINED_EVIDENCE_BYTES: usize = 2_097_152;
 const MAXIMUM_CONTROLLED_REPORT_STEPS: usize = 128;
@@ -223,6 +224,18 @@ impl SecurityInputBudget {
         Ok(format!(
             "external-input-count={}; external-input-aggregate-bytes={}; external-input-maximum-count={maximum_count}; external-input-maximum-aggregate-bytes={maximum_bytes}",
             self.count, self.bytes,
+        ))
+    }
+
+    pub(crate) fn declared_summary(&self) -> Result<String, XtaskError> {
+        let Some((maximum_count, maximum_bytes)) = self.declared else {
+            return Err(XtaskError::invalid(
+                "external input budget",
+                "security change-review did not declare attempt-wide external input limits",
+            ));
+        };
+        Ok(format!(
+            "external-input-maximum-count={maximum_count}; external-input-maximum-aggregate-bytes={maximum_bytes}"
         ))
     }
 
@@ -538,6 +551,7 @@ struct GateExecutionContext<'context> {
     dynamic_cancellation: &'context Arc<AtomicBool>,
     dynamic_cancellation_marker: Option<&'context Path>,
     external_inputs: &'context mut crate::quality::SecurityInputBudget,
+    selected_security_review: &'context crate::security_change_review::SelectedReview,
 }
 
 struct M010GateContext<'context> {
@@ -545,6 +559,7 @@ struct M010GateContext<'context> {
     registry: &'context Registry,
     profile: Profile,
     external_inputs: &'context mut crate::quality::SecurityInputBudget,
+    selected_security_review: &'context crate::security_change_review::SelectedReview,
 }
 
 struct DynamicAnalysisContext<'context> {
@@ -997,6 +1012,23 @@ pub(crate) fn run_with_dynamic_cancellation(
             );
         },
     };
+    let selected_security_review = match resolve_selected_security_review(&root, &environment) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return retain_aggregator_failure(
+                &root,
+                options.profile,
+                AggregatorFailure {
+                    source,
+                    started_unix_ms,
+                    attempt_id,
+                    environment_digest: environment.digest(),
+                    registry_digest: &registry_digest,
+                    error: &error,
+                },
+            );
+        },
+    };
     println!(
         "Positron engineering quality: profile={}, revision={}, dirty={}",
         options.profile.as_str(),
@@ -1043,6 +1075,7 @@ pub(crate) fn run_with_dynamic_cancellation(
                 dynamic_cancellation: &dynamic_cancellation,
                 dynamic_cancellation_marker: dynamic_cancellation_marker.as_deref(),
                 external_inputs: &mut external_inputs,
+                selected_security_review: &selected_security_review,
             },
             gate,
             &mut capture,
@@ -1058,7 +1091,11 @@ pub(crate) fn run_with_dynamic_cancellation(
                 );
                 let (detail, raw_detail) = if gate.runner == "matrix" {
                     (
-                        matrix_public_gate_detail(gate, controlled_steps.len()),
+                        matrix_public_gate_detail(
+                            gate,
+                            controlled_steps.len(),
+                            matrix_public_product_outcome(&detail)?,
+                        ),
                         Some(retained_detail),
                     )
                 } else {
@@ -1537,6 +1574,7 @@ fn execute_gate(
         dynamic_cancellation,
         dynamic_cancellation_marker,
         external_inputs,
+        selected_security_review,
     } = context;
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
@@ -1581,6 +1619,7 @@ fn execute_gate(
                 registry,
                 profile: options.profile,
                 external_inputs,
+                selected_security_review,
             },
             budget,
             environment,
@@ -1606,6 +1645,7 @@ fn execute_gate(
                 registry,
                 profile: options.profile,
                 external_inputs,
+                selected_security_review,
             },
             budget,
             environment,
@@ -1617,6 +1657,7 @@ fn execute_gate(
                 registry,
                 profile: options.profile,
                 external_inputs,
+                selected_security_review,
             },
             budget,
             environment,
@@ -1922,7 +1963,7 @@ fn run_exact_target_matrix_gate(
                 retained_environment_digest: Some(retained_environment_digest),
                 cancellation: Arc::clone(&cancellation),
                 cancellation_marker,
-                maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+                maximum_capture_bytes: MAXIMUM_MATRIX_CAPTURED_REPORT_STREAM_BYTES,
                 console: ConsoleOutput::Suppress,
                 capture,
             },
@@ -1930,7 +1971,7 @@ fn run_exact_target_matrix_gate(
         target.validate_output(&outcome.stdout)?;
         results.push(plan.retained_identity().to_owned());
     }
-    let generation = run_generation_matrix_gate(root)?;
+    let generation = matrix_product_outcome(root, registry, profile)?;
     let target_detail = if results.is_empty() {
         "exact-targets=none-for-qual-diagnostic-boundary".to_owned()
     } else {
@@ -1939,11 +1980,87 @@ fn run_exact_target_matrix_gate(
     Ok(format!("{target_detail}; {generation}"))
 }
 
-fn matrix_public_gate_detail(gate: &Gate, executed_targets: usize) -> String {
+fn matrix_product_outcome(
+    root: &Path,
+    registry: &Registry,
+    profile: Profile,
+) -> Result<String, XtaskError> {
+    let Some(target) = crate::matrix_product_target::load(root)? else {
+        return Ok("product-target=none; outcome=NoActiveProductTarget; qualification=no-product-qualification".to_owned());
+    };
+    if !matches!(profile, Profile::Pr)
+        || !registry.has_active_artifact_scope(target.artifact_scope())
+    {
+        return Ok(format!(
+            "product-target={}; identity={}; outcome=NoActiveProductTarget; qualification=no-product-qualification",
+            target.id(),
+            target.identity(),
+        ));
+    }
+    let report = run_generation_matrix_gate(root)?;
+    Ok(format!(
+        "product-target={}; identity={}; outcome=ProductTargetDiagnostic; qualification=no-product-qualification; {report}",
+        target.id(),
+        target.identity(),
+    ))
+}
+
+fn matrix_public_gate_detail(
+    gate: &Gate,
+    executed_targets: usize,
+    product_outcome: &str,
+) -> String {
+    format!(
+        "exact-targets={executed_targets}; {product_outcome}; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
+        gate.coordinator, gate.exception_class,
+    )
+}
+
+fn matrix_public_product_outcome(detail: &str) -> Result<&str, XtaskError> {
+    detail
+        .split("; ")
+        .find(|segment| segment.starts_with("product-target="))
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "exact target matrix",
+                "matrix runner omitted its product-target outcome",
+            )
+        })
+}
+
+fn legacy_matrix_public_gate_detail(gate: &Gate, executed_targets: usize) -> String {
     format!(
         "exact-targets={executed_targets}; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
         gate.coordinator, gate.exception_class,
     )
+}
+
+fn matches_legacy_matrix_detail(detail: &str, executed_targets: usize) -> bool {
+    // Exact schema-v3 detail retained by the committed M0-11 runner before
+    // publication compaction. Controlled-step identity is verified separately.
+    let Some(rest) = detail.strip_prefix(&format!(
+        "exact-targets={executed_targets}; target=rust-host-1;kind=compile;mode=runner-capability;"
+    )) else {
+        return false;
+    };
+    [
+        "target=api-contract-1;kind=contract;mode=runner-capability;",
+        "target=otlp-protocol-1;kind=protocol;mode=runner-capability;",
+        "target=producer-fixture-1;kind=producer;mode=runner-capability;",
+        "target=provider-fixture-1;kind=provider;mode=runner-capability;",
+        "target=macos-host-1;kind=platform;mode=runner-capability;",
+        "target=crate-graph-1;kind=architecture;mode=runner-capability;",
+        "target=local-fs-1;kind=filesystem;mode=runner-capability;",
+        "target=storage-class-1;kind=storage-class;mode=runner-capability;",
+        "target=sdk-registry-1;kind=registry;mode=runner-capability;",
+        "target=native-archive-1;kind=distribution;mode=runner-capability;",
+        "target=generated-sdk-1;kind=sdk;mode=runner-capability;",
+        "target=old-new-api-1;kind=compatibility;mode=runner-capability;",
+        "target=evidence-schema-1;kind=evidence;mode=runner-capability;",
+        "product-target=none; outcome=NoActiveProductTarget; qualification=no-product-qualification",
+    ]
+    .iter()
+    .all(|required| rest.contains(required))
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
@@ -3809,7 +3926,7 @@ fn validate_matrix_controlled_steps(
         context.root,
         gate,
         context.profile,
-        &context.registry.tools,
+        context.registry,
     )?;
     let steps = &retained.typed_invocation.controlled_steps;
     let expected_steps = expected.steps();
@@ -3824,8 +3941,19 @@ fn validate_matrix_controlled_steps(
             "retained EG-MATRIX does not contain the independently derived exact target step set",
         );
     }
-    let expected_detail = matrix_public_gate_detail(gate, expected_steps.len());
-    if retained.result == "passed" && retained.detail != expected_detail {
+    let expected_detail =
+        matrix_public_gate_detail(gate, expected_steps.len(), expected.product_outcome());
+    let product_detail_matches = if expected
+        .product_outcome()
+        .contains("ProductTargetDiagnostic")
+    {
+        retained.detail.starts_with(&expected_detail)
+    } else {
+        retained.detail == expected_detail
+            || retained.detail == legacy_matrix_public_gate_detail(gate, expected_steps.len())
+            || matches_legacy_matrix_detail(&retained.detail, expected_steps.len())
+    };
+    if retained.result == "passed" && !product_detail_matches {
         return invalid_json(
             context.path,
             "retained EG-MATRIX summary does not match its bounded public contract",
@@ -5617,6 +5745,7 @@ fn run_security_gate(
         root,
         registry,
         external_inputs,
+        selected_security_review,
         ..
     } = context;
     if !registry.has_m0_04_configuration_scope() {
@@ -5634,8 +5763,12 @@ fn run_security_gate(
     )?)
     .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
-    let catalog =
-        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(
+        root,
+        registry,
+        selected_security_review,
+        external_inputs,
+    )?;
     let descriptor = catalog.descriptor_for("EG-SECURITY")?;
     let merge_base = run_capture(
         root,
@@ -5652,6 +5785,12 @@ fn run_security_gate(
             "merge base could not be resolved to an exact revision",
         ));
     }
+    if base != selected_security_review.merge_base() {
+        return Err(XtaskError::invalid(
+            "security changed-path coverage",
+            "selected policy merge base drifted during the quality attempt",
+        ));
+    }
     let changed = run_capture(
         root,
         environment,
@@ -5660,9 +5799,14 @@ fn run_security_gate(
         budget,
         Some(capture),
     )?;
+    let threat_surfaces =
+        crate::security_threat_surface::ThreatSurfaceRegistry::load(root, external_inputs)?;
+    let changed_path_policy_validation =
+        selected_security_review.validate_policy_commands(root, external_inputs)?;
+    let committed_policy_validation =
+        crate::security_change_review::validate_committed_records(root, &threat_surfaces)?;
     let changed_path_review =
-        crate::security_threat_surface::ThreatSurfaceRegistry::load(root, external_inputs)?
-            .validate_changed_paths(root, base, &changed.stdout, external_inputs)?;
+        threat_surfaces.validate_changed_paths(root, base, &changed.stdout, external_inputs)?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
     let probes = run_status(
@@ -5690,7 +5834,7 @@ fn run_security_gate(
         ));
     }
     Ok(format!(
-        "internal:{} | {} | merge-base={base}; {changed_path_review} | {} | {} | {}",
+        "internal:{} | {} | {changed_path_policy_validation} | committed-policy-validation={committed_policy_validation} | merge-base={base}; {changed_path_review} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,
@@ -5710,9 +5854,14 @@ fn run_crypto_gate(
         registry,
         profile,
         external_inputs,
+        selected_security_review,
     } = context;
-    let catalog =
-        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(
+        root,
+        registry,
+        selected_security_review,
+        external_inputs,
+    )?;
     let descriptor = catalog.descriptor_for("EG-CRYPTO")?;
     let target_digest = match crate::crypto_targets::select(root, profile, external_inputs)? {
         crate::crypto_targets::Selection::RunnerCapability(digest) => digest,
@@ -5824,9 +5973,14 @@ fn run_secret_gate(
         registry,
         profile,
         external_inputs,
+        selected_security_review,
     } = context;
-    let catalog =
-        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(
+        root,
+        registry,
+        selected_security_review,
+        external_inputs,
+    )?;
     let descriptor = catalog.descriptor_for("EG-SECRETS")?;
     let artifact_root = environment
         .temporary_root()
@@ -6709,6 +6863,7 @@ impl EnvironmentSnapshot {
                     | "POSITRON_DYNAMIC_MINIMIZED_FAILURE_ID"
                     | "POSITRON_MATRIX_TARGET_ID"
                     | "POSITRON_MATRIX_KIND"
+                    | "POSITRON_MATRIX_MODE"
                     | "POSITRON_MATRIX_TARGET_IDENTITY"
                     | "POSITRON_MATRIX_DIAGNOSTIC"
             ) {
@@ -7221,6 +7376,28 @@ fn source_identity(
         trusted_ci,
         revision_matches_ci,
     })
+}
+
+fn resolve_selected_security_review(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+) -> Result<crate::security_change_review::SelectedReview, XtaskError> {
+    let merge_base = run_capture(
+        root,
+        environment,
+        "git",
+        ["merge-base", "HEAD", "origin/main"],
+        Duration::from_secs(10),
+        None,
+    )?;
+    let base = merge_base.stdout.trim();
+    if !valid_hex_identity(base) {
+        return Err(XtaskError::invalid(
+            "security changed-path coverage",
+            "merge base could not be resolved to an exact revision",
+        ));
+    }
+    crate::security_change_review::select(base)
 }
 
 fn validate_trusted_ci_attempt(source: &SourceIdentity) -> Result<(), XtaskError> {

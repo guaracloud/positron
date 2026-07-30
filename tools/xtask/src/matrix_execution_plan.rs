@@ -57,6 +57,10 @@ impl MatrixExecutionPlan {
                 target.kind().label().to_owned(),
             ),
             (
+                "POSITRON_MATRIX_MODE".to_owned(),
+                target.mode().label().to_owned(),
+            ),
+            (
                 "POSITRON_MATRIX_TARGET_IDENTITY".to_owned(),
                 target.identity().to_owned(),
             ),
@@ -77,6 +81,7 @@ impl MatrixExecutionPlan {
                 PLAN_VERSION.to_owned(),
                 target.id().to_owned(),
                 target.kind().label().to_owned(),
+                target.mode().label().to_owned(),
                 TOOL_ID.to_owned(),
                 TOOL_VERSION.to_owned(),
                 tool.command.clone(),

@@ -40,6 +40,45 @@ const REVIEW_LOCATORS: [ReviewLocator; 2] = [
     },
 ];
 
+/// The one policy record bound to the exact merge base of this attempt.
+#[derive(Clone, Copy)]
+pub(crate) struct SelectedReview {
+    locator: ReviewLocator,
+}
+
+impl SelectedReview {
+    pub(crate) fn merge_base(&self) -> &str {
+        self.locator.merge_base
+    }
+
+    /// Each M0-10 catalog consumer independently reads and validates the
+    /// selected policy command set. This intentionally preserves the
+    /// three-call accounting contract established by PC-0015.
+    pub(crate) fn validate_policy_commands(
+        &self,
+        root: &Path,
+        budget: &mut crate::quality::SecurityInputBudget,
+    ) -> Result<String, XtaskError> {
+        let contract = ReviewContract::load(root, self.locator, budget, true)?;
+        Ok(format!("policy-command-validation={}", contract.id))
+    }
+}
+
+pub(crate) fn select(merge_base: &str) -> Result<SelectedReview, XtaskError> {
+    let matches = REVIEW_LOCATORS
+        .iter()
+        .filter(|locator| locator.merge_base == merge_base)
+        .collect::<Vec<_>>();
+    let [locator] = matches.as_slice() else {
+        return invalid(if matches.is_empty() {
+            "no security change-review record matches the exact merge base"
+        } else {
+            "multiple security change-review records match the exact merge base"
+        });
+    };
+    Ok(SelectedReview { locator: **locator })
+}
+
 pub(crate) fn validate(
     root: &Path,
     merge_base: &str,
@@ -48,9 +87,38 @@ pub(crate) fn validate(
     reviewed_non_trust: &BTreeMap<String, String>,
     budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
-    let contract = ReviewContract::load(root, merge_base, budget)?;
+    let selection = select(merge_base)?;
+    let contract = ReviewContract::load(root, selection.locator, budget, false)?;
     let classifications = contract.classifications(model_coverage, reviewed_non_trust)?;
     validate_actual_paths(changed_paths, &classifications, &contract)
+}
+
+/// Validate every committed review record before the exact merge-base selector
+/// chooses the one that governs this attempt. A historical record therefore
+/// cannot silently stop enforcing its schema, command, model, or budget.
+pub(crate) fn validate_committed_records(
+    root: &Path,
+    surfaces: &crate::security_threat_surface::ThreatSurfaceRegistry,
+) -> Result<String, XtaskError> {
+    let (model_coverage, reviewed_non_trust) = surfaces.classification_maps();
+    let mut summaries = Vec::with_capacity(REVIEW_LOCATORS.len());
+    for locator in REVIEW_LOCATORS {
+        let mut budget = crate::quality::SecurityInputBudget::new();
+        let contract = ReviewContract::load(root, locator, &mut budget, true)?;
+        let classifications = contract.classifications(model_coverage, reviewed_non_trust)?;
+        let paths = classifications
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        validate_actual_paths(&paths, &classifications, &contract)?;
+        summaries.push(format!(
+            "static-policy={}; {}",
+            contract.id,
+            budget.declared_summary()?
+        ));
+    }
+    Ok(summaries.join(" | "))
 }
 
 struct ReviewContract {
@@ -65,25 +133,20 @@ struct ReviewContract {
 impl ReviewContract {
     fn load(
         root: &Path,
-        merge_base: &str,
+        locator: ReviewLocator,
         budget: &mut crate::quality::SecurityInputBudget,
+        validate_commands: bool,
     ) -> Result<Self, XtaskError> {
-        let matches = REVIEW_LOCATORS
-            .iter()
-            .filter(|locator| locator.merge_base == merge_base)
-            .collect::<Vec<_>>();
-        let [locator] = matches.as_slice() else {
-            return invalid(if matches.is_empty() {
-                "no security change-review record matches the exact merge base"
-            } else {
-                "multiple security change-review records match the exact merge base"
-            });
-        };
         let path = root.join(locator.path);
+        let subject = match locator.id {
+            "PC-0015-m0-10-security-crypto-runners" => "PC-0015 policy record",
+            "PC-0016-m0-11-compatibility-exact-target-matrix" => "PC-0016 policy record",
+            _ => return Err(XtaskError::invalid_path(&path, "unknown policy record")),
+        };
         let content = String::from_utf8(crate::quality::read_external_input(
             &path,
             MAXIMUM_POLICY_BYTES,
-            "security change-review policy record",
+            subject,
             budget,
         )?)
         .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
@@ -101,7 +164,7 @@ impl ReviewContract {
         let mut change = take_object(&mut document, "change", &path)?;
         let mut contract = take_object(&mut change, "changed_path_contract", &path)?;
         let reviewed_base = take_string(&mut contract, "merge_base", &path)?;
-        if reviewed_base != merge_base || reviewed_base != locator.merge_base {
+        if reviewed_base != locator.merge_base {
             return invalid("merge base drifted from the reviewed changed-path contract");
         }
         let revision = take_optional_string(&mut contract, "implementation_revision", &path)?;
@@ -134,15 +197,8 @@ impl ReviewContract {
         crate::evidence_json::reject_unknown_fields(contract, "changed-path contract")
             .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
         apply_input_budget_contract(change, &path, budget)?;
-        if locator.id == "PC-0015-m0-10-security-crypto-runners" {
-            let command_content = String::from_utf8(crate::quality::read_external_input(
-                &path,
-                MAXIMUM_POLICY_BYTES,
-                "PC-0015 policy record",
-                budget,
-            )?)
-            .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
-            validate_m0_10_policy_commands(&command_content, &path)?;
+        if validate_commands {
+            validate_policy_commands(locator, &content, &path)?;
         }
         Ok(Self {
             id: locator.id.to_owned(),
@@ -215,10 +271,27 @@ fn validate_actual_paths(
             return invalid(format!("changed path `{path}` is duplicated"));
         }
     }
-    if let Some(path) = classifications.keys().find(|path| !actual.contains(*path)) {
-        return invalid(format!(
-            "reviewed path `{path}` is extra or stale for the actual changed set"
-        ));
+    if let Some((path, classification)) = classifications
+        .iter()
+        .find(|(path, _)| !actual.contains(*path))
+    {
+        let detail = if contract.id == "PC-0015-m0-10-security-crypto-runners" {
+            match classification {
+                Classification::Model(_) => {
+                    format!(
+                        "model-classified path `{path}` is extra or stale for the actual changed set"
+                    )
+                },
+                Classification::ReviewedNonTrust(_) => {
+                    format!(
+                        "reviewed non-trust path `{path}` is extra or stale for the actual changed set"
+                    )
+                },
+            }
+        } else {
+            format!("reviewed path `{path}` is extra or stale for the actual changed set")
+        };
+        return invalid(detail);
     }
     let mut records = Vec::with_capacity(actual.len());
     for path in &actual {
@@ -236,8 +309,17 @@ fn validate_actual_paths(
         || path_digest != contract.path_set_digest
         || classification_digest != contract.classification_digest
     {
+        let legacy_model_detail = if contract.id == "PC-0015-m0-10-security-crypto-runners"
+            && classifications
+                .values()
+                .any(|classification| matches!(classification, Classification::Model(_)))
+        {
+            "model-classified path contract"
+        } else {
+            "actual changed set"
+        };
         return invalid(format!(
-            "actual changed set or classification digest drifted from {}; implementation-revision={}; actual-paths={}; actual-path-set-digest={path_digest}; actual-classification-digest={classification_digest}",
+            "{legacy_model_detail} or classification digest drifted from {}; implementation-revision={}; actual-paths={}; actual-path-set-digest={path_digest}; actual-classification-digest={classification_digest}",
             contract.id,
             contract.revision.as_deref().unwrap_or("legacy-none"),
             sorted_paths.join("|")
@@ -329,34 +411,35 @@ fn apply_input_budget_contract(
     budget.apply_declared_limits(maximum_count, maximum_bytes)
 }
 
-fn validate_m0_10_policy_commands(content: &str, path: &Path) -> Result<(), XtaskError> {
-    for target in [
-        "m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam",
-        "m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor",
-        "m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence",
-        "m0_10_security_crypto::quality_rejects_executable_intentional_leak_with_retained_failed_evidence",
-        "m0_10_security_crypto::quality_rejects_missing_merge_base_and_uncovered_security_changes",
-        "m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification",
-        "m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification",
-        "m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions",
-        "m0_10_final_blockers::quality_rejects_an_extra_stale_model_classification",
-        "m0_10_final_blockers::quality_enforces_the_shared_external_input_count_boundary",
-        "m0_10_final_blockers::quality_enforces_the_shared_external_input_aggregate_boundary",
-        "m0_10_final_blockers::quality_uses_the_actual_m0_09_merge_base_and_rejects_the_old_base_pin",
-        "m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds",
-        "m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds",
-        "m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds",
-        "m0_10_final_blockers::canary_fixture_inputs_enforce_exact_bounds",
-        "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations",
-    ] {
-        if !content.contains(target) {
+fn validate_policy_commands(
+    locator: ReviewLocator,
+    content: &str,
+    path: &Path,
+) -> Result<(), XtaskError> {
+    let expected = match locator.id {
+        "PC-0015-m0-10-security-crypto-runners" => M0_10_POLICY_COMMANDS.as_slice(),
+        "PC-0016-m0-11-compatibility-exact-target-matrix" => M0_11_POLICY_COMMANDS.as_slice(),
+        _ => {
             return Err(XtaskError::invalid_path(
                 path,
-                format!("PC-0015 validation command target `{target}` does not resolve"),
+                "unknown policy command contract",
+            ));
+        },
+    };
+    for command in expected {
+        if !content.contains(command) {
+            return Err(XtaskError::invalid_path(
+                path,
+                format!(
+                    "{} validation command `{command}` does not resolve",
+                    locator.id
+                ),
             ));
         }
     }
-    if content.contains("security_probe_and_canary_harnesses_fail_closed") {
+    if locator.id == "PC-0015-m0-10-security-crypto-runners"
+        && content.contains("security_probe_and_canary_harnesses_fail_closed")
+    {
         return Err(XtaskError::invalid_path(
             path,
             "PC-0015 validation command references a removed test target",
@@ -364,6 +447,33 @@ fn validate_m0_10_policy_commands(content: &str, path: &Path) -> Result<(), Xtas
     }
     Ok(())
 }
+
+const M0_10_POLICY_COMMANDS: [&str; 17] = [
+    "m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam",
+    "m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor",
+    "m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence",
+    "m0_10_security_crypto::quality_rejects_executable_intentional_leak_with_retained_failed_evidence",
+    "m0_10_security_crypto::quality_rejects_missing_merge_base_and_uncovered_security_changes",
+    "m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification",
+    "m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification",
+    "m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions",
+    "m0_10_final_blockers::quality_rejects_an_extra_stale_model_classification",
+    "m0_10_final_blockers::quality_enforces_the_shared_external_input_count_boundary",
+    "m0_10_final_blockers::quality_enforces_the_shared_external_input_aggregate_boundary",
+    "m0_10_final_blockers::quality_uses_the_actual_m0_09_merge_base_and_rejects_the_old_base_pin",
+    "m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds",
+    "m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds",
+    "m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds",
+    "m0_10_final_blockers::canary_fixture_inputs_enforce_exact_bounds",
+    "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations",
+];
+
+const M0_11_POLICY_COMMANDS: [&str; 4] = [
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_11_matrix::quality_executes_every_exact_diagnostic_target_with_independent_retained_identity -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_11_matrix:: -- --nocapture",
+    "cargo test --locked --package xtask --bin xtask matrix_targets::tests -- --nocapture",
+    "cargo fmt --check",
+];
 
 fn take_object(
     object: &mut JsonObject,

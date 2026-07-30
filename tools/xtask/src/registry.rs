@@ -250,6 +250,12 @@ impl Registry {
             .any(|scope| scope.kind == "application" && scope.state == "active")
     }
 
+    pub(crate) fn has_active_artifact_scope(&self, path: &str) -> bool {
+        self.artifact_scopes
+            .iter()
+            .any(|scope| scope.path == Path::new(path) && scope.state == "active")
+    }
+
     pub(crate) fn has_m0_01_foundational_scope(&self) -> bool {
         self.scopes.iter().any(|scope| {
             scope.kind == "application" && scope.state == "active" && scope.activation_id == "M0-01"

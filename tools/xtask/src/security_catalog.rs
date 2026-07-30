@@ -88,10 +88,12 @@ impl FrozenSecurityCatalog {
     pub(crate) fn load(
         root: &Path,
         registry: &Registry,
+        selected_review: &crate::security_change_review::SelectedReview,
         budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let threat_surfaces =
             crate::security_threat_surface::ThreatSurfaceRegistry::load(root, budget)?;
+        let policy_command_validation = selected_review.validate_policy_commands(root, budget)?;
         let path = root.join(CATALOG_PATH);
         let bytes = crate::quality::read_external_input(
             &path,
@@ -192,7 +194,8 @@ impl FrozenSecurityCatalog {
             if records.insert((*gate).to_owned(), SecurityDescriptor {
                 id: (*id).to_owned(),
                 evidence_summary: format!(
-                    "schema={evidence_schema}; threat-model={threat_model}; attack-surface={attack_surface}; checks={required_checks}; canary-sinks={canary_sinks}; {}",
+                    "schema={evidence_schema}; threat-model={threat_model}; attack-surface={attack_surface}; checks={required_checks}; canary-sinks={canary_sinks}; {}; {}",
+                    policy_command_validation,
                     threat_surfaces.summary(id)?
                 ),
             }).is_some() {

@@ -26,6 +26,7 @@ mod framed_stdout_reader;
 mod generation;
 mod hooks;
 mod matrix_execution_plan;
+mod matrix_product_target;
 mod matrix_targets;
 mod matrix_verifier;
 mod qualification_fixtures;

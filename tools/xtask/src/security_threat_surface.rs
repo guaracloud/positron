@@ -251,6 +251,12 @@ impl ThreatSurfaceRegistry {
             budget,
         )
     }
+
+    pub(crate) fn classification_maps(
+        &self,
+    ) -> (&BTreeMap<String, String>, &BTreeMap<String, String>) {
+        (&self.model_coverage, &self.reviewed_non_trust)
+    }
 }
 
 fn validate_model_record(

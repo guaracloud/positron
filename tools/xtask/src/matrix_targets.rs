@@ -17,11 +17,12 @@ use crate::registry::Gate;
 
 const PATH: &str = "qualification/engineering/exact-targets.tsv";
 const HEADER: &str =
-    "target_id\tkind\tgate_id\tstages\towner\tidentity\tdiagnostic\ttimeout_seconds";
+    "target_id\tkind\tmode\tgate_id\tstages\towner\tidentity\tdiagnostic\ttimeout_seconds";
 const OWNER: &str = "Quality Engineering";
 const GATE: &str = "EG-MATRIX";
-const STAGES: &str = "PR|EXT";
+const STAGES: &str = "PR";
 const DIAGNOSTIC: &str = "diagnostic-only";
+const RUNNER_CAPABILITY: &str = "runner-capability";
 const MAXIMUM_BYTES: usize = 16_384;
 const MAXIMUM_FIELD_BYTES: usize = 256;
 const MAXIMUM_TIMEOUT_SECONDS: u64 = 60;
@@ -42,6 +43,29 @@ pub(crate) enum MatrixKind {
     Sdk,
     Compatibility,
     Evidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MatrixTargetMode {
+    RunnerCapability,
+}
+
+impl MatrixTargetMode {
+    fn parse(value: &str) -> Result<Self, XtaskError> {
+        match value {
+            RUNNER_CAPABILITY => Ok(Self::RunnerCapability),
+            _ => Err(XtaskError::invalid(
+                "exact target registry",
+                format!("unknown matrix target mode `{value}`"),
+            )),
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::RunnerCapability => RUNNER_CAPABILITY,
+        }
+    }
 }
 
 impl MatrixKind {
@@ -109,6 +133,7 @@ impl MatrixKind {
 pub(crate) struct MatrixTarget {
     id: String,
     kind: MatrixKind,
+    mode: MatrixTargetMode,
     identity: String,
     timeout: Duration,
     registry_digest: String,
@@ -120,6 +145,9 @@ impl MatrixTarget {
     }
     pub(crate) fn kind(&self) -> MatrixKind {
         self.kind
+    }
+    pub(crate) fn mode(&self) -> MatrixTargetMode {
+        self.mode
     }
     pub(crate) fn identity(&self) -> &str {
         &self.identity
@@ -150,9 +178,10 @@ impl MatrixTarget {
 
     pub(crate) fn retained_identity(&self) -> String {
         format!(
-            "target={};kind={};identity={};diagnostic=diagnostic-only;timeout-seconds={}",
+            "target={};kind={};mode={};identity={};diagnostic=diagnostic-only;timeout-seconds={}",
             self.id,
             self.kind.label(),
+            self.mode.label(),
             self.identity,
             self.timeout.as_secs()
         )
@@ -204,6 +233,7 @@ impl FrozenMatrixTargets {
             let [
                 id,
                 kind,
+                mode,
                 gate_id,
                 stages,
                 owner,
@@ -233,10 +263,12 @@ impl FrozenMatrixTargets {
                 ));
             }
             let kind = MatrixKind::parse(kind)?;
+            let mode = MatrixTargetMode::parse(mode)?;
             let expected_kind = MatrixKind::ALL.get(offset).copied();
             let expected_descriptor = canonical_descriptor(kind);
             if expected_kind != Some(kind)
                 || expected_descriptor != Some((*id, *identity))
+                || mode != MatrixTargetMode::RunnerCapability
                 || *gate_id != GATE
                 || *stages != STAGES
                 || *owner != OWNER
@@ -268,6 +300,7 @@ impl FrozenMatrixTargets {
             targets.push(MatrixTarget {
                 id: (*id).to_owned(),
                 kind,
+                mode,
                 identity: (*identity).to_owned(),
                 timeout: Duration::from_secs(seconds),
                 registry_digest: digest.clone(),
@@ -285,7 +318,7 @@ impl FrozenMatrixTargets {
     pub(crate) fn selected(&self, profile: Profile) -> impl Iterator<Item = &MatrixTarget> {
         self.targets
             .iter()
-            .filter(move |_| matches!(profile, Profile::Pr | Profile::Ext))
+            .filter(move |_| matches!(profile, Profile::Pr))
     }
 }
 
