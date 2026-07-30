@@ -2159,6 +2159,7 @@ fn validate_m0_02_domain_source_layout(root: &Path, scope: &Scope) -> Result<(),
         "src/routing.rs",
         "src/time.rs",
         "src/value.rs",
+        "tests/dynamic_domain_properties.rs",
         "tests/foundational_domain_types.rs",
     ]
     .into_iter()

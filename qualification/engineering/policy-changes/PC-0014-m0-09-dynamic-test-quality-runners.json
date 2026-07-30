@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "id": "PC-0014-m0-09-dynamic-test-quality-runners",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Implement the existing EG-DYNAMIC target registry and runner for active Quality Engineering harness scope without application behavior or Qualification Cell advancement.",
+  "change": {
+    "issue": 10,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and immutable target/quality/evidence report",
+    "dependency_review": {
+      "new_dependencies": "none",
+      "rationale": "The runner uses the Rust standard library and existing reviewed xtask execution boundaries."
+    },
+    "runner_changes": [
+      "dynamic-detectors.tsv is the frozen capability catalog for exactly seven supported detector kinds, canonical tool and version source, plan version, argument grammar, required inputs, allowed output protocols, evidence schema, argument bound, and timeout bound. Capability support does not activate a product target.",
+      "dynamic-targets.tsv is a separate bounded, exact registry containing only the two currently applicable M0 targets, each referencing one catalog capability and retaining stable target identity, gate, selected stages, controlled arguments, corpus, seed, schedule, minimized-failure identity, closed output protocol, and target timeout.",
+      "EG-DYNAMIC freezes and validates the complete descriptor registry before executing any selected target. Target stages must be a nonempty exact subset of the owning gate's PR and EXT stages. Each target is invoked only through the existing controlled command and capture boundary, with the smaller of its registered timeout and the owning gate's remaining monotonic budget.",
+      "A closed typed execution-plan owner maps property, state-model, fuzz, corpus, Miri, sanitizer, and Loom to their canonical registered tool identity, version probe, argument protocol, and explicit corpus, seed, schedule, and minimized-failure environment. Cross-kind tool or argument masquerades fail before process execution.",
+      "The currently applicable M0 targets execute a bounded generated Domain Types property suite and the existing exact lifecycle transition suite. Later application activation must register the corresponding real detector target before claiming its behavior.",
+      "The runner retains each target's exact descriptor identity and plan version, tool, program, argv digest, input digest, and complete plan digest in its immutable raw gate report. It captures target and tool bytes once before execution, validates its closed output protocol, and applies the existing bounded stdout/stderr capture ceiling. Missing, extra, malformed, stale, duplicate, oversized, noncanonical-timeout, unsupported-stage, or unselected-target descriptors fail closed without a fallback command.",
+      "The retained-evidence parent independently reloads the catalog and target registries, parses every canonical argument grammar, and recomputes target order and count, tool identity and version, argv, environment, inputs, catalog and target-registry digests, plan digest, controlled result, and retained detail without calling the runner's plan builder or serializer. Coupled post-run plan, command, environment, or result tampering and target reorder, addition, or removal fail closed.",
+      "EG-DYNAMIC remains a PR and EXT gate. QUAL neither selects nor executes these targets and retains an empty not-selected invocation; this ticket adds no QUAL stage, target, or Qualification claim.",
+      "The quality orchestration owner passes one explicit cancellation token through EG-DYNAMIC. A typed internal fixture command owns the bounded readiness source used to prove real child cancellation, process-group termination, reap, and failed evidence retention without mutating runner source.",
+      "Existing line, region, branch, changed-code, mutation, ratchet, exclusion, and measured-baseline enforcement stays in the registered EG-COVERAGE owner. The M0-09 audit mapped that unchanged behavior to its existing public tests; this ticket does not alter a threshold, target selection, exception class, stage, or detector command."
+    ],
+    "unchanged": [
+      "No application, runtime, Metrics, Profiles, replication, clustering, distribution, provider, or Qualification Cell behavior is added.",
+      "Developer evidence remains diagnostic and non-merge-eligible. The harness may be Implemented but no target is Qualified.",
+      "No dependency, unsafe boundary, threshold, timeout, memory declaration, selector, test command, or existing gate behavior is weakened."
+    ]
+  },
+  "detection_gained": [
+    "EG-DYNAMIC no longer embeds an ad-hoc Domain Types command pair; every selected dynamic target has a bounded registered identity and a typed canonical execution plan bound to exact tool, argv, corpus, seed, schedule, and minimized-failure evidence.",
+    "Unknown detector kinds, cross-kind masquerades, missing registries or required inputs, extra fields, duplicate target identities, malformed rows, noncanonical timeouts, stages outside the owning PR and EXT gate stages, and oversized target registries fail the public quality seam before a target can run.",
+    "Missing, duplicate, incomplete, or stale seven-kind capability catalogs fail closed while the active target registry remains limited to its two real M0 targets.",
+    "The exact target command is subject to the existing controlled execution timeout, production-owned explicit cancellation token, process-group cleanup and reap, bounded capture, closed output validation, missing-tool, nonzero, and retained failed-attempt semantics. The independent parent rejects coupled retained command, plan, environment, result, order, and cardinality tampering."
+  ],
+  "detection_lost": [],
+  "lifecycle_test_map": {
+    "pass": "quality_runs_each_registered_dynamic_target_through_the_public_seam and quality_executes_every_closed_dynamic_kind_through_the_public_descriptor_seam prove the actual property and exact lifecycle-transition targets plus every closed detector kind execute their canonical tool and argument plan with explicit corpus, seed, schedule, and minimized-failure inputs and immutable target, plan, argv, input, and result evidence.",
+    "fail_timeout_cancellation_and_missing_tool": "quality_does_not_retry_a_failed_dynamic_target_to_green, quality_retains_a_dynamic_target_timeout_through_the_public_seam, quality_retains_dynamic_target_cancellation_through_the_public_seam, and quality_retains_a_missing_dynamic_tool_without_fallback prove first-failure retention, controlled deadline cleanup, explicit cancellation retention, and no missing-tool fallback.",
+    "malformed_and_stale": "quality_rejects_malformed_dynamic_target_output_through_the_public_seam, quality_rejects_a_missing_dynamic_target_registry_without_fallback, quality_rejects_a_stale_or_unknown_dynamic_detector_kind_through_the_public_seam, quality_rejects_a_noncanonical_dynamic_timeout_before_running_the_target, quality_rejects_a_duplicate_dynamic_target_identity_before_running_a_target, quality_rejects_a_cross_kind_dynamic_detector_masquerade_before_execution, quality_rejects_dynamic_profiles_outside_the_owning_gate_before_selection, quality_rejects_each_missing_dynamic_execution_input_before_execution, quality_uses_dynamic_target_bytes_captured_before_a_post_capture_registry_swap, and quality_uses_captured_tool_binding_before_a_post_capture_tool_registry_tamper prove retained public failures, closed output validation, stage ownership, complete bounded inputs, and frozen target and tool bytes.",
+    "retry_and_resource": "Descriptor execution is single-attempt and quality_does_not_retry_a_failed_dynamic_target_to_green proves it. Registry bytes, row count, fields, argument values, and timeouts have fixed caps; quality_rejects_an_oversized_dynamic_registry_before_running_a_target proves the top-level cap, and quality_rejects_dynamic_target_output_that_exceeds_the_bounded_capture_ceiling proves the dynamic invocation cannot exceed its bounded captured stdout/stderr resource ceiling.",
+    "capability_catalog_and_parent_verifier": "dynamic_capability_catalog_fails_closed_when_missing_duplicate_incomplete_or_stale proves the exact seven-kind support catalog is complete and frozen without activating five non-applicable targets. parent_rejects_coupled_post_run_plan_command_environment_and_result_tampering proves an independently derived parent rejects runner plan, command, environment, and result mutations after execution, while parent_rejects_reordered_extra_and_missing_active_targets proves exact target order and cardinality. quality_qual_does_not_select_or_execute_the_pr_ext_dynamic_gate proves QUAL retains an empty not-selected gate and makes no Qualification claim.",
+    "coverage_and_mutation": "M0-09 audit: quality_ext_executes_the_foundational_coverage_harness executes EG-COVERAGE; quality_pr_skips_the_scheduled_coverage_campaign preserves profile selection; quality_ext_rejects_coverage_below_the_frozen_baseline, quality_ext_rejects_an_unpinned_coverage_detector, quality_rejects_a_frozen_m0_01_coverage_baseline_change, quality_rejects_an_activation_without_a_measured_baseline, and quality_ext_rejects_m0_02_domain_coverage_below_its_frozen_baseline cover line/region/branch and measured ratchets; quality_rejects_a_coverage_campaign_without_both_owner_verdict_targets covers total and changed-code owner targets; quality_ext_runs_the_focused_mutation_campaign_only_when_explicitly_selected and extended_workflow_routes_opt_in_mutation_through_the_authoritative_runner cover opt-in mutation; quality_rejects_a_missing_mutation_baseline_reference covers its retained baseline; quality_rejects_missing_disabled_or_quarantined_coverage_detector_descriptors_without_fallback proves a missing detector retains failed EG-COVERAGE evidence and unsupported disabled/quarantined registry states reject before a detector can run; quality_rejects_an_activated_coverage_gate_without_ci_tool_provisioning and quality_rejects_a_coverage_workflow_that_does_not_retain_raw_reports cover retained CI evidence. Exclusions remain in the frozen coverage policy; no coverage policy changed here."
+  },
+  "representative_old_new_evidence": {
+    "old": {
+      "status": "specified-ad-hoc-runner",
+      "command": "cargo xtask quality --profile pr",
+      "result": "EG-DYNAMIC directly encoded two M0-02 commands and did not retain first-class target, corpus, or seed identities."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test foundational_scope_activation -- m0_09_",
+        "cargo test --locked --package positron-domain --test dynamic_domain_properties",
+        "cargo test --locked --package xtask --bin xtask dynamic_quality",
+        "cargo fmt --check"
+      ],
+      "result": "Focused public-seam and parser tests passed locally. This is diagnostic only; the exact committed revision's normal pre-push and trusted CI evidence remain required."
+    }
+  },
+  "approvals_required": ["Architecture", "Quality Engineering"],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
+    "attribution": "No implementation agent, reviewer, or repository owner is recorded as granting a required approval."
+  },
+  "qualification_claim": "None. This is Quality Engineering harness behavior only. It does not claim a Qualified cell, trusted CI pass, merge eligibility, release readiness, or role approval."
+}
