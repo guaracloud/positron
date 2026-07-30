@@ -37,6 +37,81 @@ fn bounded_runner_child_rejects_a_noncanonical_timeout_through_the_public_seam()
 }
 
 #[test]
+fn quality_retains_a_missing_bounded_runner_tool_without_fallback() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let missing_runner = fixture
+            .root
+            .join("target/definitively-absent-quality-bounded-runner");
+        if missing_runner.exists() {
+            return Err(
+                std::io::Error::other("missing-runner fixture path unexpectedly exists").into(),
+            );
+        }
+        replace_once(
+            &fixture.root.join("tools/xtask/src/quality.rs"),
+            "    let arguments = registry.child_arguments(gate_id, execution_timeout)?;\n",
+            "    let program = root.join(\"target/definitively-absent-quality-bounded-runner\");\n    let arguments = registry.child_arguments(gate_id, execution_timeout)?;\n",
+        )?;
+
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        assert_rejected_output(&output, "controlled runner failed during launch")?;
+        assert_rejected_output(&output, "No such file or directory")?;
+
+        let evidence_count = fs::read_dir(fixture.root.join("target/quality/evidence"))?
+            .collect::<Result<Vec<_>, _>>()?
+            .len();
+        if evidence_count != 1 {
+            return Err(std::io::Error::other(format!(
+                "missing-runner failure retained {evidence_count} attempts instead of exactly one"
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-CONCURRENCY")?;
+        if !gate.contains("\"result\": \"failed\"")
+            || gate
+                .matches("\"program\":\"cargo-xtask-quality/bounded-runner\"")
+                .count()
+                != 1
+        {
+            return Err(std::io::Error::other(
+                "missing runner did not retain one exact failed EG-CONCURRENCY invocation",
+            )
+            .into());
+        }
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-CONCURRENCY",
+        )?)?;
+        for required in [
+            "\"verdict\":\"controlled-failure:launch\"",
+            "definitively-absent-quality-bounded-runner",
+            "process-lifecycle-v1;phase=launch",
+        ] {
+            if !report.contains(required) {
+                return Err(std::io::Error::other(format!(
+                    "missing-runner report omitted `{required}`"
+                ))
+                .into());
+            }
+        }
+        if report.contains("\"verdict\":\"exit-status:") {
+            return Err(std::io::Error::other(
+                "missing-runner failure fell back to another executable",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_runs_concurrency_and_resource_through_the_registered_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {

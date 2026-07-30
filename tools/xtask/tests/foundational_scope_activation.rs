@@ -4400,6 +4400,10 @@ impl Fixture {
         profile: &str,
     ) -> TestResult<std::process::Output> {
         self.build_fixture_xtask()?;
+        self.quality_output_from_built_fixture(profile)
+    }
+
+    fn quality_output_from_built_fixture(&self, profile: &str) -> TestResult<std::process::Output> {
         let output = Command::new(self.root.join("target/debug/xtask"))
             .current_dir(&self.root)
             .args(["quality", "--profile", profile])

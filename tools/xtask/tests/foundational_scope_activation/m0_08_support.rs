@@ -35,6 +35,27 @@ pub(super) fn assert_concurrency_source_rejected(
     result
 }
 
+pub(super) fn assert_concurrency_source_cases_rejected(cases: &[(&str, &str)]) -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        fixture.build_fixture_xtask()?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let original = fs::read_to_string(&source)?;
+        for (source_append, expected) in cases {
+            let mut content = original.clone();
+            content.push_str(source_append);
+            fs::write(&source, content)?;
+            let output = fixture.quality_output_from_built_fixture("pr")?;
+            assert_rejected_output(&output, expected)?;
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
 pub(super) fn assert_unbounded_concurrency_primitive_rejected(source_append: &str) -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {

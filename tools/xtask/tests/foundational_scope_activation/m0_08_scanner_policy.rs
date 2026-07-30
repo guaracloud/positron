@@ -254,34 +254,38 @@ fn quality_rejects_vec_deque_turbofish_new_through_the_public_seam() -> TestResu
 
 #[test]
 fn quality_rejects_every_resolved_vec_deque_reference_through_the_public_seam() -> TestResult {
-    assert_concurrency_source_rejected(
-        "\n#[cfg(any())]\nfn unbounded_queue_with_capacity() {\n    let _factory = std::collections::VecDeque::<usize>::with_capacity;\n}\n",
-        "unbounded concurrency primitive",
-    )?;
-    assert_concurrency_source_rejected(
-        "\n#[cfg(any())]\nfn unbounded_queue_default() {\n    let _factory = std::collections::VecDeque::<usize>::default;\n}\n",
-        "unbounded concurrency primitive",
-    )?;
-    assert_concurrency_source_rejected(
-        "\n#[cfg(any())]\nfn unbounded_queue_type_reference() {\n    let _queue: Option<std::collections::VecDeque<usize>> = None;\n}\n",
-        "unbounded concurrency primitive",
-    )
+    assert_concurrency_source_cases_rejected(&[
+        (
+            "\n#[cfg(any())]\nfn unbounded_queue_with_capacity() {\n    let _factory = std::collections::VecDeque::<usize>::with_capacity;\n}\n",
+            "unbounded concurrency primitive",
+        ),
+        (
+            "\n#[cfg(any())]\nfn unbounded_queue_default() {\n    let _factory = std::collections::VecDeque::<usize>::default;\n}\n",
+            "unbounded concurrency primitive",
+        ),
+        (
+            "\n#[cfg(any())]\nfn unbounded_queue_type_reference() {\n    let _queue: Option<std::collections::VecDeque<usize>> = None;\n}\n",
+            "unbounded concurrency primitive",
+        ),
+    ])
 }
 
 #[test]
 fn quality_rejects_aliased_globbed_and_extern_aliased_vec_deque_references() -> TestResult {
-    assert_concurrency_source_rejected(
-        "\n#[cfg(any())]\nmod aliased_unbounded_queue {\n    use std::collections::VecDeque as Queue;\n    const FACTORY: usize = Queue::<usize>::default;\n}\n",
-        "concurrency primitive",
-    )?;
-    assert_concurrency_source_rejected(
-        "\n#[cfg(any())]\nmod globbed_unbounded_queue {\n    use std::collections::*;\n    const FACTORY: usize = VecDeque::<usize>::with_capacity;\n}\n",
-        "forbidden concurrency primitive glob import",
-    )?;
-    assert_concurrency_source_rejected(
-        "\n#[cfg(any())]\nmod extern_unbounded_queue {\n    extern crate std as runtime;\n    const FACTORY: usize = runtime::collections::VecDeque::<usize>::default;\n}\n",
-        "concurrency primitive",
-    )
+    assert_concurrency_source_cases_rejected(&[
+        (
+            "\n#[cfg(any())]\nmod aliased_unbounded_queue {\n    use std::collections::VecDeque as Queue;\n    const FACTORY: usize = Queue::<usize>::default;\n}\n",
+            "concurrency primitive",
+        ),
+        (
+            "\n#[cfg(any())]\nmod globbed_unbounded_queue {\n    use std::collections::*;\n    const FACTORY: usize = VecDeque::<usize>::with_capacity;\n}\n",
+            "forbidden concurrency primitive glob import",
+        ),
+        (
+            "\n#[cfg(any())]\nmod extern_unbounded_queue {\n    extern crate std as runtime;\n    const FACTORY: usize = runtime::collections::VecDeque::<usize>::default;\n}\n",
+            "concurrency primitive",
+        ),
+    ])
 }
 
 #[test]
