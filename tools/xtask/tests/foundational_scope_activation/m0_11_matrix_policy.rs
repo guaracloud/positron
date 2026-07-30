@@ -99,7 +99,7 @@ fn security_review_enforces_pc_0016_selected_input_boundaries() -> TestResult {
         for expected in [
             "policy-command-validation=PC-0016-m0-11-compatibility-exact-target-matrix",
             "external-input-count=29",
-            "external-input-aggregate-bytes=97379",
+            "external-input-aggregate-bytes=104229",
             "external-input-maximum-count=48",
             "external-input-maximum-aggregate-bytes=196608",
         ] {
@@ -122,8 +122,8 @@ fn security_review_enforces_pc_0016_selected_input_boundaries() -> TestResult {
             ),
             (
                 "\"maximum_aggregate_bytes\": 196608",
-                "\"maximum_aggregate_bytes\": 97373",
-                "external input aggregate exceeds 97373 bytes",
+                "\"maximum_aggregate_bytes\": 104228",
+                "external input aggregate exceeds 104228 bytes",
             ),
         ] {
             let drifted = original.replacen(from, to, 1);

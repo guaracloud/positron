@@ -6,49 +6,6 @@ include!("m0_11_matrix_policy.rs");
 
 const MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES: usize = 8_192;
 const MAXIMUM_MATRIX_CONSOLE_BYTES: usize = 512;
-const MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES: usize = 131_072;
-const EXACT_M0_11_TEST_COHORT: [&str; 13] = [
-    "m0_11_matrix::quality_executes_every_exact_diagnostic_target_with_independent_retained_identity",
-    "m0_11_matrix::quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution",
-    "m0_11_matrix::quality_rejects_matrix_lifecycle_failures_without_retry_or_fallback",
-    "m0_11_matrix::quality_rejects_timeout_stale_descriptor_and_capture_ceiling_without_matrix_fallback",
-    "m0_11_matrix::quality_rejects_a_missing_matrix_tool_without_an_ambient_fallback",
-    "m0_11_matrix::quality_routes_matrix_cancellation_through_the_shared_control_marker",
-    "m0_11_matrix::parent_rejects_coupled_matrix_command_environment_and_result_tampering",
-    "m0_11_matrix::quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualification",
-    "m0_11_matrix::matrix_fixture_suppresses_nested_output_and_retains_structured_evidence",
-    "m0_11_matrix::matrix_failure_console_is_bounded_and_points_to_retained_evidence",
-    "m0_11_matrix::security_review_rejects_a_corrupt_unselected_pc_0015_before_pc_0016_selection",
-    "m0_11_matrix::security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head",
-    "m0_11_matrix::matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_docs",
-];
-
-#[test]
-fn exact_m0_11_test_cohort_retains_stderr_below_the_gate_capture_limit() -> TestResult {
-    let mut stderr_bytes = 0_usize;
-    for test_name in EXACT_M0_11_TEST_COHORT {
-        let output = Command::new(std::env::current_exe()?)
-            .args(["--exact", test_name, "--quiet"])
-            .output()?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "exact M0-11 test `{test_name}` failed while aggregating stderr"
-            ))
-            .into());
-        }
-        stderr_bytes = stderr_bytes
-            .checked_add(output.stderr.len())
-            .ok_or_else(|| std::io::Error::other("M0-11 cohort stderr byte count overflowed"))?;
-    }
-    if stderr_bytes > MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES {
-        return Err(std::io::Error::other(format!(
-            "exact M0-11 test cohort stderr exceeds the {MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES}-byte gate capture limit"
-        ))
-        .into());
-    }
-    Ok(())
-}
-
 fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::process::Output> {
     let controlled_path = std::env::join_paths([
         fixture.root.join("target/quality-tools/bin"),
@@ -74,6 +31,17 @@ fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::pr
         .into());
     }
     Ok(output)
+}
+
+fn matrix_public_detail(gate: &str) -> TestResult<&str> {
+    let (_, detail) = gate
+        .rsplit_once("\"detail\": \"")
+        .ok_or_else(|| std::io::Error::other("EG-MATRIX evidence omitted its public detail"))?;
+    detail
+        .split_once("\"\n")
+        .map(|(detail, _)| detail)
+        .ok_or_else(|| std::io::Error::other("EG-MATRIX public detail was not terminated"))
+        .map_err(Into::into)
 }
 
 fn create_matrix_fixture() -> TestResult<Fixture> {

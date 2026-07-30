@@ -21,6 +21,24 @@ const DIAGNOSTIC: &str = "diagnostic-only";
 const MAXIMUM_BYTES: usize = 16_384;
 const MAXIMUM_FIELD_BYTES: usize = 256;
 
+/// The bounded public disposition of the optional product diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MatrixProductOutcome {
+    Missing,
+    Inactive,
+    Diagnostic,
+}
+
+impl MatrixProductOutcome {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Inactive => "inactive",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
+}
+
 /// An explicitly registered product target.
 #[derive(Debug)]
 pub(crate) struct MatrixProductTarget {

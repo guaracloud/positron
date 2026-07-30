@@ -1,12 +1,17 @@
 const TARGETS: &str = "qualification/engineering/exact-targets.tsv";
 const GOLDEN: &str = "qualification/engineering/exact-targets-golden.tsv";
 const FAILING: &str = "qualification/engineering/exact-targets-invalid.tsv";
+const PRODUCT_TARGET: &str = concat!(
+    "target_id\tartifact_scope\tgate_id\tstages\towner\tidentity\tdiagnostic\n",
+    "canonical-api-generation-1\tapi/positron/v1\tEG-MATRIX\tPR\tQuality Engineering\tcanonical-api-generation-v1\tdiagnostic-only\n",
+);
 
 #[test]
 fn quality_executes_every_exact_diagnostic_target_with_independent_retained_identity() -> TestResult
 {
     let fixture = create_matrix_fixture()?;
     let result = (|| {
+        install_product_target(&fixture)?;
         let output = matrix_quality_output(&fixture, "pr")?;
         if !output.status.success() {
             return Err(std::io::Error::other(
@@ -16,6 +21,16 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
         }
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
+        let detail = matrix_public_detail(gate)?;
+        if !detail.contains("product-outcome=diagnostic")
+            || detail.contains("identity=")
+            || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
+        {
+            return Err(std::io::Error::other(
+                "active product matrix summary is not the bounded typed public form",
+            )
+            .into());
+        }
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
             &evidence,
@@ -66,6 +81,7 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
 #[test]
 fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive() -> TestResult {
     let fixture = Fixture::create()?;
+    install_product_target(&fixture)?;
     fixture.build_fixture_xtask()?;
     let result = (|| {
         let output = matrix_quality_output(&fixture, "pr")?;
@@ -76,6 +92,17 @@ fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive()
             .into());
         }
         let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-MATRIX")?;
+        let detail = matrix_public_detail(gate)?;
+        if !detail.contains("product-outcome=inactive")
+            || detail.contains("identity=")
+            || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
+        {
+            return Err(std::io::Error::other(
+                "inactive product matrix summary is not the bounded typed public form",
+            )
+            .into());
+        }
         let report = fs::read_to_string(exact_raw_report_path(
             &fixture.root,
             &evidence,
@@ -86,6 +113,53 @@ fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive()
         {
             return Err(std::io::Error::other(
                 "inactive product target did not retain its typed diagnostic outcome",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+fn install_product_target(fixture: &Fixture) -> TestResult {
+    fs::write(
+        fixture
+            .root
+            .join("qualification/engineering/matrix-product-targets.tsv"),
+        PRODUCT_TARGET,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn matrix_product_target_missing_registry_retains_bounded_typed_outcome() -> TestResult {
+    let fixture = Fixture::create()?;
+    install_product_target(&fixture)?;
+    fixture.build_fixture_xtask()?;
+    let result = (|| {
+        fs::remove_file(
+            fixture
+                .root
+                .join("qualification/engineering/matrix-product-targets.tsv"),
+        )?;
+        let output = matrix_quality_output(&fixture, "pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "missing product registry must leave the diagnostic matrix runnable",
+            )
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let gate = gate_record(&evidence, "EG-MATRIX")?;
+        let detail = matrix_public_detail(gate)?;
+        if !detail.contains("product-outcome=missing")
+            || detail.contains("identity=")
+            || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
+        {
+            return Err(std::io::Error::other(
+                "missing product registry summary is not the bounded typed public form",
             )
             .into());
         }

@@ -7228,6 +7228,8 @@ case "${1:-}" in
     ;;
   diff)
     if [ -f target/quality-tools/m0-11-current-origin-main ]; then
+      printf '%s\n' 'qualification/engineering/exact-targets-golden.tsv'
+      printf '%s\n' 'qualification/engineering/exact-targets-invalid.tsv'
       printf '%s\n' 'qualification/engineering/exact-targets.tsv'
       printf '%s\n' 'qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json'
       printf '%s\n' 'qualification/engineering/scopes.tsv'
@@ -7235,9 +7237,11 @@ case "${1:-}" in
       printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
       printf '%s\n' 'tools/xtask/src/main.rs'
       printf '%s\n' 'tools/xtask/src/matrix_execution_plan.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_product_target.rs'
       printf '%s\n' 'tools/xtask/src/matrix_targets.rs'
       printf '%s\n' 'tools/xtask/src/matrix_verifier.rs'
       printf '%s\n' 'tools/xtask/src/quality.rs'
+      printf '%s\n' 'tools/xtask/src/registry.rs'
       printf '%s\n' 'tools/xtask/src/security_catalog.rs'
       printf '%s\n' 'tools/xtask/src/security_change_review.rs'
       printf '%s\n' 'tools/xtask/src/security_harness.rs'
@@ -7248,6 +7252,9 @@ case "${1:-}" in
       printf '%s\n' 'tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.tsv'
       printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
       printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_execution.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_lifecycle.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix_policy.rs'
       exit 0
     fi
     if [ -f target/quality-tools/m0-10-current-origin-main ]; then

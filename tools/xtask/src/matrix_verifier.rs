@@ -9,7 +9,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::error::XtaskError;
-use crate::matrix_product_target::load as load_product_target;
+use crate::matrix_product_target::{MatrixProductOutcome, load as load_product_target};
 use crate::matrix_targets::FrozenMatrixTargets;
 use crate::quality::Profile;
 use crate::registry::{Gate, Registry};
@@ -53,7 +53,7 @@ impl ExpectedMatrixStep {
 #[derive(Debug)]
 pub(crate) struct ExpectedMatrixGate {
     steps: Vec<ExpectedMatrixStep>,
-    product_outcome: String,
+    product_outcome: MatrixProductOutcome,
 }
 
 impl ExpectedMatrixGate {
@@ -129,8 +129,8 @@ impl ExpectedMatrixGate {
         &self.steps
     }
 
-    pub(crate) fn product_outcome(&self) -> &str {
-        &self.product_outcome
+    pub(crate) fn product_outcome(&self) -> MatrixProductOutcome {
+        self.product_outcome
     }
 }
 
@@ -138,22 +138,14 @@ fn expected_product_outcome(
     root: &Path,
     registry: &Registry,
     profile: Profile,
-) -> Result<String, XtaskError> {
+) -> Result<MatrixProductOutcome, XtaskError> {
     let Some(target) = load_product_target(root)? else {
-        return Ok("product-target=none; outcome=NoActiveProductTarget; qualification=no-product-qualification".to_owned());
+        return Ok(MatrixProductOutcome::Missing);
     };
     if !matches!(profile, Profile::Pr)
         || !registry.has_active_artifact_scope(target.artifact_scope())
     {
-        return Ok(format!(
-            "product-target={}; identity={}; outcome=NoActiveProductTarget; qualification=no-product-qualification",
-            target.id(),
-            target.identity(),
-        ));
+        return Ok(MatrixProductOutcome::Inactive);
     }
-    Ok(format!(
-        "product-target={}; identity={}; outcome=ProductTargetDiagnostic; qualification=no-product-qualification; canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, Schema Digest, and validation fixtures; ",
-        target.id(),
-        target.identity(),
-    ))
+    Ok(MatrixProductOutcome::Diagnostic)
 }

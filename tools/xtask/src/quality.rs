@@ -1090,12 +1090,10 @@ pub(crate) fn run_with_dynamic_cancellation(
                     gate.coordinator, gate.exception_class,
                 );
                 let (detail, raw_detail) = if gate.runner == "matrix" {
+                    let product_outcome =
+                        matrix_public_product_outcome(&root, &registry, options.profile)?;
                     (
-                        matrix_public_gate_detail(
-                            gate,
-                            controlled_steps.len(),
-                            matrix_public_product_outcome(&detail)?,
-                        ),
+                        matrix_public_gate_detail(gate, controlled_steps.len(), product_outcome)?,
                         Some(retained_detail),
                     )
                 } else {
@@ -2008,59 +2006,37 @@ fn matrix_product_outcome(
 fn matrix_public_gate_detail(
     gate: &Gate,
     executed_targets: usize,
-    product_outcome: &str,
-) -> String {
-    format!(
-        "exact-targets={executed_targets}; {product_outcome}; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
-        gate.coordinator, gate.exception_class,
-    )
+    product_outcome: crate::matrix_product_target::MatrixProductOutcome,
+) -> Result<String, XtaskError> {
+    let detail = format!(
+        "exact-targets={executed_targets}; product-outcome={}; qualification=no-product-qualification; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
+        product_outcome.label(),
+        gate.coordinator,
+        gate.exception_class,
+    );
+    if detail.len() > 512 {
+        return Err(XtaskError::invalid(
+            "exact target matrix",
+            "EG-MATRIX public summary exceeds its 512-byte bound",
+        ));
+    }
+    Ok(detail)
 }
 
-fn matrix_public_product_outcome(detail: &str) -> Result<&str, XtaskError> {
-    detail
-        .split("; ")
-        .find(|segment| segment.starts_with("product-target="))
-        .ok_or_else(|| {
-            XtaskError::invalid(
-                "exact target matrix",
-                "matrix runner omitted its product-target outcome",
-            )
-        })
-}
-
-fn legacy_matrix_public_gate_detail(gate: &Gate, executed_targets: usize) -> String {
-    format!(
-        "exact-targets={executed_targets}; target-specific command, environment, input, result, stdout, stderr, and digest evidence retained only in EG-MATRIX raw report; coordinator: {}; exception class: {}",
-        gate.coordinator, gate.exception_class,
-    )
-}
-
-fn matches_legacy_matrix_detail(detail: &str, executed_targets: usize) -> bool {
-    // Exact schema-v3 detail retained by the committed M0-11 runner before
-    // publication compaction. Controlled-step identity is verified separately.
-    let Some(rest) = detail.strip_prefix(&format!(
-        "exact-targets={executed_targets}; target=rust-host-1;kind=compile;mode=runner-capability;"
-    )) else {
-        return false;
+fn matrix_public_product_outcome(
+    root: &Path,
+    registry: &Registry,
+    profile: Profile,
+) -> Result<crate::matrix_product_target::MatrixProductOutcome, XtaskError> {
+    let Some(target) = crate::matrix_product_target::load(root)? else {
+        return Ok(crate::matrix_product_target::MatrixProductOutcome::Missing);
     };
-    [
-        "target=api-contract-1;kind=contract;mode=runner-capability;",
-        "target=otlp-protocol-1;kind=protocol;mode=runner-capability;",
-        "target=producer-fixture-1;kind=producer;mode=runner-capability;",
-        "target=provider-fixture-1;kind=provider;mode=runner-capability;",
-        "target=macos-host-1;kind=platform;mode=runner-capability;",
-        "target=crate-graph-1;kind=architecture;mode=runner-capability;",
-        "target=local-fs-1;kind=filesystem;mode=runner-capability;",
-        "target=storage-class-1;kind=storage-class;mode=runner-capability;",
-        "target=sdk-registry-1;kind=registry;mode=runner-capability;",
-        "target=native-archive-1;kind=distribution;mode=runner-capability;",
-        "target=generated-sdk-1;kind=sdk;mode=runner-capability;",
-        "target=old-new-api-1;kind=compatibility;mode=runner-capability;",
-        "target=evidence-schema-1;kind=evidence;mode=runner-capability;",
-        "product-target=none; outcome=NoActiveProductTarget; qualification=no-product-qualification",
-    ]
-    .iter()
-    .all(|required| rest.contains(required))
+    if !matches!(profile, Profile::Pr)
+        || !registry.has_active_artifact_scope(target.artifact_scope())
+    {
+        return Ok(crate::matrix_product_target::MatrixProductOutcome::Inactive);
+    }
+    Ok(crate::matrix_product_target::MatrixProductOutcome::Diagnostic)
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
@@ -3942,18 +3918,8 @@ fn validate_matrix_controlled_steps(
         );
     }
     let expected_detail =
-        matrix_public_gate_detail(gate, expected_steps.len(), expected.product_outcome());
-    let product_detail_matches = if expected
-        .product_outcome()
-        .contains("ProductTargetDiagnostic")
-    {
-        retained.detail.starts_with(&expected_detail)
-    } else {
-        retained.detail == expected_detail
-            || retained.detail == legacy_matrix_public_gate_detail(gate, expected_steps.len())
-            || matches_legacy_matrix_detail(&retained.detail, expected_steps.len())
-    };
-    if retained.result == "passed" && !product_detail_matches {
+        matrix_public_gate_detail(gate, expected_steps.len(), expected.product_outcome())?;
+    if retained.result == "passed" && retained.detail != expected_detail {
         return invalid_json(
             context.path,
             "retained EG-MATRIX summary does not match its bounded public contract",

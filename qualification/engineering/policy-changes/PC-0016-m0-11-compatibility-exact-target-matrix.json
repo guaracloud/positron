@@ -18,11 +18,13 @@
     "changed_path_contract": {
       "merge_base": "9879d5924cb9af75e95ec2634469973e09f681e5",
       "implementation_revision": "2e738ea10aac13fa34d45e77582b7910467c0b83",
-      "path_count": 20,
-      "path_set_digest": "sha256:693965607021cf4992beb582f1dba69b86f7b688e4a23f938d3b1f60249ef2e3",
-      "classification_digest": "sha256:029943c546677f8f9d2e487d8e50833652b0c712fdf17d94d48a3fa21055e23d",
+      "path_count": 27,
+      "path_set_digest": "sha256:71d3c51e8ab5aca0f2ee7551bddb0330a6fa088fcaedef0adb3827f9be277c7f",
+      "classification_digest": "sha256:84b64307d70c97bb65ad5a3127ee3da5e75bf625ff9bb325439d5f4499110cbb",
       "classification_record": "qualification/engineering/security-threat-surfaces.tsv",
       "classifications": [
+        {"path": "qualification/engineering/exact-targets-golden.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 canonical frozen descriptor fixture"},
+        {"path": "qualification/engineering/exact-targets-invalid.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 negative frozen descriptor fixture"},
         {"path": "qualification/engineering/exact-targets.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "frozen diagnostic matrix registry"},
         {"path": "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 policy review record"},
         {"path": "qualification/engineering/scopes.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "xtask gate activation metadata"},
@@ -30,9 +32,11 @@
         {"path": "tools/xtask/src/crypto_targets.rs", "disposition": "model", "owner": "Security and Key Management", "model_id": "TM-0010-m0-10-runner-crypto", "rationale": "existing crypto runner threat model"},
         {"path": "tools/xtask/src/main.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "xtask module registration"},
         {"path": "tools/xtask/src/matrix_execution_plan.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 exact matrix plan"},
+        {"path": "tools/xtask/src/matrix_product_target.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 bounded product-target descriptor"},
         {"path": "tools/xtask/src/matrix_targets.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 exact matrix registry parser"},
         {"path": "tools/xtask/src/matrix_verifier.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 independent matrix verifier"},
         {"path": "tools/xtask/src/quality.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "quality orchestration and retained evidence"},
+        {"path": "tools/xtask/src/registry.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "artifact-scope activation lookup"},
         {"path": "tools/xtask/src/security_catalog.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "security descriptor parser"},
         {"path": "tools/xtask/src/security_change_review.rs", "disposition": "reviewed-non-trust", "owner": "Security and Key Management", "rationale": "revision-bound review resolver"},
         {"path": "tools/xtask/src/security_harness.rs", "disposition": "model", "owner": "Security and Key Management", "model_id": "TM-0011-m0-10-runner-artifacts", "rationale": "existing candidate-artifact threat model"},
@@ -42,7 +46,10 @@
         {"path": "tools/xtask/tests/fixtures/m0_11_exact_targets_golden.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 canonical diagnostic fixture"},
         {"path": "tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 negative diagnostic fixture"},
         {"path": "tools/xtask/tests/foundational_scope_activation.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "public fixture harness"},
-        {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "public M0-11 runner regressions"}
+        {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "public M0-11 runner regressions"},
+        {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix_execution.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 execution regressions"},
+        {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix_lifecycle.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 lifecycle regressions"},
+        {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix_policy.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 policy regressions"}
       ]
     },
     "external_input_budget": {"maximum_count": 48, "maximum_aggregate_bytes": 196608},
