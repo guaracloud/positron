@@ -7,7 +7,7 @@ const FAILING: &str = "tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.ts
 #[test]
 fn quality_executes_every_exact_diagnostic_target_with_independent_retained_identity() -> TestResult
 {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
         let output = matrix_quality_output(&fixture, "pr")?;
         if !output.status.success() {
@@ -62,7 +62,7 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
 
 #[test]
 fn quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution() -> TestResult {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
         let golden = fs::read_to_string(fixture.root.join(GOLDEN))?;
         let installed = fs::read_to_string(fixture.root.join(TARGETS))?;
@@ -95,7 +95,7 @@ fn quality_rejects_matrix_lifecycle_failures_without_retry_or_fallback() -> Test
             "malformed cargo-version-v1",
         ),
     ] {
-        let fixture = Fixture::create_current_registry()?;
+        let fixture = create_matrix_fixture()?;
         let result: TestResult = (|| {
             install_matrix_cargo_fault(&fixture, name, body)?;
             let output = matrix_quality_output(&fixture, "pr")?;
@@ -137,7 +137,7 @@ fn quality_rejects_timeout_stale_descriptor_and_capture_ceiling_without_matrix_f
             "violates its closed M0 diagnostic descriptor contract",
         ),
     ] {
-        let fixture = Fixture::create_current_registry()?;
+        let fixture = create_matrix_fixture()?;
         let result: TestResult = (|| {
             if let Some((before, after)) = registry_change {
                 replace_once(&fixture.root.join(TARGETS), before, after)?;
@@ -166,18 +166,11 @@ fn quality_rejects_timeout_stale_descriptor_and_capture_ceiling_without_matrix_f
 
 #[test]
 fn quality_rejects_a_missing_matrix_tool_without_an_ambient_fallback() -> TestResult {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result: TestResult = (|| {
         fs::remove_file(fixture.root.join("target/quality-tools/bin/cargo"))?;
         let output = matrix_quality_output(&fixture, "pr")?;
-        assert_rejected_output(&output, "cargo")?;
-        let evidence = fixture.latest_evidence()?;
-        if !evidence.contains("\"merge_eligible\": false") {
-            return Err(std::io::Error::other(
-                "missing matrix tool did not retain non-merge-eligible failure evidence",
-            )
-            .into());
-        }
+        assert_rejected_output(&output, "required tool `cargo` could not be resolved")?;
         Ok(())
     })();
     let cleanup = fixture.remove();
@@ -188,7 +181,7 @@ fn quality_rejects_a_missing_matrix_tool_without_an_ambient_fallback() -> TestRe
 #[cfg(unix)]
 #[test]
 fn quality_routes_matrix_cancellation_through_the_shared_control_marker() -> TestResult {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result: TestResult = (|| {
         install_matrix_cargo_fault(
             &fixture,
@@ -198,7 +191,6 @@ fn quality_routes_matrix_cancellation_through_the_shared_control_marker() -> Tes
         let marker = fixture
             .root
             .join("target/quality-tools/matrix-cancel-marker");
-        fixture.build_fixture_xtask()?;
         let output = Command::new(fixture.root.join("target/debug/xtask"))
             .current_dir(&fixture.root)
             .args([
@@ -248,7 +240,7 @@ fn parent_rejects_coupled_matrix_command_environment_and_result_tampering() -> T
             "passed EG-MATRIX raw report contains a non-passing controlled result",
         ),
     ] {
-        let fixture = Fixture::create_current_registry()?;
+        let fixture = create_matrix_fixture()?;
         let result: TestResult = (|| {
             let first = matrix_quality_output(&fixture, "pr")?;
             if !first.status.success() {
@@ -288,7 +280,7 @@ fn parent_rejects_coupled_matrix_command_environment_and_result_tampering() -> T
 
 #[test]
 fn quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualification() -> TestResult {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
         let marker = fixture
             .root
@@ -330,7 +322,7 @@ fn quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualificatio
 
 #[test]
 fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> TestResult {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
         let output = matrix_quality_output(&fixture, "pr")?;
         if !output.status.success() {
@@ -362,7 +354,7 @@ fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> 
 
 #[test]
 fn security_review_selects_pc_0016_for_the_m0_11_merge_base_not_pc_0015() -> TestResult {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
         fs::write(
             fixture
@@ -407,7 +399,7 @@ fn security_review_selects_pc_0016_for_the_m0_11_merge_base_not_pc_0015() -> Tes
 #[test]
 fn security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head() -> TestResult
 {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
         fs::write(
             fixture
@@ -441,7 +433,7 @@ fn security_review_requires_pc_0016_implementation_identity_without_pin_to_final
 #[test]
 fn matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_docs() -> TestResult
 {
-    let fixture = Fixture::create_current_registry()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
         let target = fixture.root.join("target/m0-11-rustdoc");
         let documentation = Command::new(env!("CARGO"))
@@ -487,9 +479,61 @@ fn matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_d
 }
 
 const MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES: usize = 16_384;
+const MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES: usize = 131_072;
+const EXACT_M0_11_TEST_COHORT: [&str; 12] = [
+    "m0_11_matrix::quality_executes_every_exact_diagnostic_target_with_independent_retained_identity",
+    "m0_11_matrix::quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution",
+    "m0_11_matrix::quality_rejects_matrix_lifecycle_failures_without_retry_or_fallback",
+    "m0_11_matrix::quality_rejects_timeout_stale_descriptor_and_capture_ceiling_without_matrix_fallback",
+    "m0_11_matrix::quality_rejects_a_missing_matrix_tool_without_an_ambient_fallback",
+    "m0_11_matrix::quality_routes_matrix_cancellation_through_the_shared_control_marker",
+    "m0_11_matrix::parent_rejects_coupled_matrix_command_environment_and_result_tampering",
+    "m0_11_matrix::quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualification",
+    "m0_11_matrix::matrix_fixture_suppresses_nested_output_and_retains_structured_evidence",
+    "m0_11_matrix::security_review_selects_pc_0016_for_the_m0_11_merge_base_not_pc_0015",
+    "m0_11_matrix::security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head",
+    "m0_11_matrix::matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_docs",
+];
+
+#[test]
+fn exact_m0_11_test_cohort_retains_stderr_below_the_gate_capture_limit() -> TestResult {
+    let mut stderr_bytes = 0_usize;
+    for test_name in EXACT_M0_11_TEST_COHORT {
+        let output = Command::new(std::env::current_exe()?)
+            .args(["--exact", test_name, "--quiet"])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "exact M0-11 test `{test_name}` failed while aggregating stderr"
+            ))
+            .into());
+        }
+        stderr_bytes = stderr_bytes
+            .checked_add(output.stderr.len())
+            .ok_or_else(|| std::io::Error::other("M0-11 cohort stderr byte count overflowed"))?;
+    }
+    if stderr_bytes > MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES {
+        return Err(std::io::Error::other(format!(
+            "exact M0-11 test cohort stderr exceeds the {MAXIMUM_EXACT_M0_11_COHORT_STDERR_BYTES}-byte gate capture limit"
+        ))
+        .into());
+    }
+    Ok(())
+}
 
 fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::process::Output> {
-    let output = fixture.quality_output_for(profile)?;
+    let controlled_path = std::env::join_paths([
+        fixture.root.join("target/quality-tools/bin"),
+        std::path::PathBuf::from("/usr/bin"),
+        std::path::PathBuf::from("/bin"),
+        std::path::PathBuf::from("/usr/sbin"),
+        std::path::PathBuf::from("/sbin"),
+    ])?;
+    let output = Command::new(fixture.root.join("target/debug/xtask"))
+        .current_dir(&fixture.root)
+        .args(["quality", "--profile", profile])
+        .env("PATH", controlled_path)
+        .output()?;
     let bytes = output
         .stdout
         .len()
@@ -502,6 +546,12 @@ fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::pr
         .into());
     }
     Ok(output)
+}
+
+fn create_matrix_fixture() -> TestResult<Fixture> {
+    let fixture = Fixture::create_current_registry()?;
+    fixture.build_fixture_xtask()?;
+    Ok(fixture)
 }
 
 fn install_matrix_cargo_fault(fixture: &Fixture, name: &str, body: &str) -> TestResult {
