@@ -505,7 +505,7 @@ fn quality_rejects_a_duplicate_observed_semantic_spawn_site_through_the_public_s
             .join("tools/xtask/src/registered_task_lifecycle.rs");
         let mut content = fs::read_to_string(&source)?;
         content.push_str(
-            "\n// positron-concurrency-spawn: RegisteredTasks::spawn\\tquality-bounded-worker-v1\n#[allow(dead_code)]\nfn duplicate_registered_spawn_regression() { let _worker = thread::Builder::new().spawn(|| {}); }\n",
+            "\n#[allow(dead_code)]\nfn duplicate_registered_spawn_regression() {\n    let _worker = thread::Builder::new()\n        // positron-concurrency-spawn: RegisteredTasks::spawn\\tquality-bounded-worker-v1\n        .spawn(|| {});\n}\n",
         );
         fs::write(&source, content)?;
         let output = fixture.quality_output_from_fixture_source("pr")?;

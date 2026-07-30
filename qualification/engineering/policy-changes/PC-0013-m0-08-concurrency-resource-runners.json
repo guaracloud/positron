@@ -134,6 +134,14 @@
         "command": "git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
         "observed_state": "The clean exact-head pre-push PR profile retained failed evidence at /Users/victorbona/Code/Daedalus/positron/target/quality/evidence/1785372449510-436623e095aa-68212.json. EG-EVIDENCE honestly rejected older retained evidence whose gate selection predates EG-CONCURRENCY activation. EG-TEST ran 426 tests: 425 passed and the traversal regression expected child-side wording after the new pre-spawn validator correctly rejected the malformed outcome identity earlier. EG-CONCURRENCY and EG-RESOURCE passed, and origin remained at 7816d052f6311b9ac028fa6da582384b4fa73aaa.",
         "recovery": "Preserve both the older invalid retained evidence and this failed exact-head attempt. Return the same precise traversal and symbolic-link classifications from pre-spawn validation, keep the public regression at the earlier fail-closed seam, then run one fresh isolated exact-head publication attempt without erasing either failure."
+      },
+      {
+        "revision": "62b244bb4bfa4a61774c011787f6ae375343d534",
+        "worktree": "/private/tmp/positron-m0-08-final-62b244b.h6SWay",
+        "cargo_target_dir": "/private/tmp/positron-m0-08-target-62b244b.t7zLLL",
+        "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-target-62b244b.t7zLLL git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
+        "observed_state": "The clean detached exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-final-62b244b.h6SWay/target/quality/evidence/1785375756842-62b244bb4bfa-215.json. EG-TEST ran 443 tests: 442 passed and the duplicate-observed spawn-site copied-source regression failed because its duplicate marker was separated from the duplicate spawn by an attribute and function declaration; the new exact immediate-marker detector correctly rejected that earlier shape before the intended duplicate semantic-owner assertion. All preceding gates, including EG-CONCURRENCY and EG-RESOURCE, passed, and the push did not update origin.",
+        "recovery": "Preserve the worktree, external target directory, and exact failed evidence. Change only the copied-source mutation so its duplicate marker is immediately adjacent to its duplicate spawn, retain the intended later duplicate-observed assertion, and run one fresh isolated exact-head publication attempt without weakening either detector."
       }
     ]
   },
