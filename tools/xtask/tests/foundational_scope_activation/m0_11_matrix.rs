@@ -8,6 +8,7 @@ include!("m0_11_matrix_policy.rs");
 const MAXIMUM_MATRIX_CONSOLE_BYTES: usize = 512;
 const MAXIMUM_M0_11_CONSOLE_BYTES: usize = 4_096;
 const MAXIMUM_M0_11_CONSOLE_LINES: usize = 8;
+const MAXIMUM_MATRIX_REGISTRY_BYTES: usize = 16_384;
 fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::process::Output> {
     let controlled_path = std::env::join_paths([
         fixture.root.join("target/quality-tools/bin"),

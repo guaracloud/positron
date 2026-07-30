@@ -5,7 +5,6 @@
 //! themselves advance a Qualification Cell.
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -210,14 +209,7 @@ impl FrozenMatrixTargets {
             ));
         }
         let path = root.join(PATH);
-        let bytes = fs::read(&path)
-            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
-        if bytes.len() > MAXIMUM_BYTES {
-            return Err(XtaskError::invalid_path(
-                &path,
-                format!("exact target registry exceeds {MAXIMUM_BYTES} bytes"),
-            ));
-        }
+        let bytes = crate::bounded_input::read(&path, MAXIMUM_BYTES, "exact target registry")?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| XtaskError::invalid_path(&path, "exact target registry is not UTF-8"))?;
         let mut lines = text.lines();

@@ -215,3 +215,46 @@ fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive()
     cleanup?;
     result
 }
+
+#[test]
+fn matrix_registries_enforce_exact_and_max_plus_one_source_boundaries() -> TestResult {
+    for (name, path, bytes, expected) in [
+        (
+            "required-exact",
+            TARGETS,
+            MAXIMUM_MATRIX_REGISTRY_BYTES,
+            "exact target registry header does not match",
+        ),
+        (
+            "required-max-plus-one",
+            TARGETS,
+            MAXIMUM_MATRIX_REGISTRY_BYTES + 1,
+            "exact target registry exceeds 16384 bytes",
+        ),
+        (
+            "optional-exact",
+            "qualification/engineering/matrix-product-targets.tsv",
+            MAXIMUM_MATRIX_REGISTRY_BYTES,
+            "matrix product target registry header does not match",
+        ),
+        (
+            "optional-max-plus-one",
+            "qualification/engineering/matrix-product-targets.tsv",
+            MAXIMUM_MATRIX_REGISTRY_BYTES + 1,
+            "matrix product target registry exceeds 16384 bytes",
+        ),
+    ] {
+        let fixture = create_matrix_fixture()?;
+        let result: TestResult = (|| {
+            fs::write(fixture.root.join(path), vec![b'x'; bytes])?;
+            let output = matrix_quality_output(&fixture, "pr")?;
+            assert_rejected_output(&output, expected).map_err(|error| {
+                std::io::Error::other(format!("{name} boundary failed: {error}")).into()
+            })
+        })();
+        let cleanup = fixture.remove();
+        cleanup?;
+        result?;
+    }
+    Ok(())
+}

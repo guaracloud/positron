@@ -4,7 +4,6 @@
 //! catalog: their presence never turns a runner-capability matrix into an
 //! exact-artifact qualification claim.
 
-use std::fs;
 use std::path::Path;
 
 use crate::error::XtaskError;
@@ -64,17 +63,14 @@ impl MatrixProductTarget {
 /// Loads the sole optional product probe without expanding the diagnostic set.
 pub(crate) fn load(root: &Path) -> Result<Option<MatrixProductTarget>, XtaskError> {
     let path = root.join(PATH);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(XtaskError::io(format!("read {}", path.display()), source)),
+    let Some(bytes) = crate::bounded_input::read_optional(
+        &path,
+        MAXIMUM_BYTES,
+        "matrix product target registry",
+    )?
+    else {
+        return Ok(None);
     };
-    if bytes.len() > MAXIMUM_BYTES {
-        return Err(XtaskError::invalid_path(
-            &path,
-            format!("matrix product target registry exceeds {MAXIMUM_BYTES} bytes"),
-        ));
-    }
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         XtaskError::invalid_path(&path, "matrix product target registry is not UTF-8")
     })?;
