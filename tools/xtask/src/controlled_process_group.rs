@@ -10,12 +10,28 @@ use super::{
     ExecutionFailure, FailurePhase, POLL_INTERVAL, TERMINATION_GRACE, wait_for_direct_child,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TerminationOutcome {
+    AlreadyExited,
+    TerminationRequested,
+}
+
 pub(super) fn terminate_and_reap(
     child: &mut Child,
     group: &ProcessGroup,
     command: &str,
     shutdown_deadline: Instant,
-) -> Result<(), ExecutionFailure> {
+) -> Result<TerminationOutcome, ExecutionFailure> {
+    let direct_already_exited = child.try_wait().map_err(|source| {
+        ExecutionFailure::new(
+            command.to_owned(),
+            FailurePhase::DirectProcess,
+            source.to_string(),
+        )
+    })?;
+    if direct_already_exited.is_some() && !group.exists(command, shutdown_deadline)? {
+        return Ok(TerminationOutcome::AlreadyExited);
+    }
     group.signal(Signal::Terminate, command, shutdown_deadline)?;
     let grace_deadline = Instant::now()
         .checked_add(TERMINATION_GRACE)
@@ -39,7 +55,8 @@ pub(super) fn terminate_and_reap(
             return Err(group.not_empty_failure(command));
         }
     }
-    wait_for_direct_child(child, command, shutdown_deadline, None, None, None).map(|_| ())
+    wait_for_direct_child(child, command, shutdown_deadline, None, None, None)
+        .map(|_| TerminationOutcome::TerminationRequested)
 }
 
 fn wait_for_group_while_reaping_direct(
@@ -210,4 +227,34 @@ fn require_shutdown_time(
         ));
     }
     Ok(remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use super::{ProcessGroup, TerminationOutcome, terminate_and_reap};
+
+    #[test]
+    fn already_exited_child_is_reaped_without_a_termination_request() -> Result<(), std::io::Error>
+    {
+        let mut command = Command::new("/usr/bin/true");
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let group = ProcessGroup::new(child.id());
+        child.wait()?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(100))
+            .ok_or_else(|| std::io::Error::other("test shutdown deadline overflowed"))?;
+        let outcome = terminate_and_reap(&mut child, &group, "true", deadline)
+            .map_err(|failure| std::io::Error::other(failure.detail))?;
+        if outcome != TerminationOutcome::AlreadyExited {
+            return Err(std::io::Error::other(
+                "already exited child requested process-group termination",
+            ));
+        }
+        Ok(())
+    }
 }

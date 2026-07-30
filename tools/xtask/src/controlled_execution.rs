@@ -28,7 +28,7 @@ use crate::framed_stdout_broker::{
 #[path = "controlled_process_group.rs"]
 mod controlled_process_group;
 #[cfg(unix)]
-use controlled_process_group::{ProcessGroup, terminate_and_reap};
+use controlled_process_group::{ProcessGroup, TerminationOutcome, terminate_and_reap};
 
 pub(crate) const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const TERMINATION_GRACE: Duration = Duration::from_millis(10);
@@ -486,7 +486,13 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                 specification.cancellation.as_ref(),
             ) {
                 Ok(output) => ExecutionOutcome::Reconciled(ExecutionVerdict { status, output }),
-                Err(failure) => ExecutionOutcome::Failed(failure),
+                Err(failure) => finish_after_execution_failure(
+                    &mut child,
+                    &group,
+                    &mut workers,
+                    failure,
+                    specification.shutdown_timeout,
+                ),
             }
         },
         Err(failure) => finish_after_execution_failure(
@@ -553,8 +559,9 @@ fn finish_after_setup_failure(
     let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
     let process_elapsed = shutdown_started.elapsed();
     let process_reaped = cleanup.is_ok();
+    let termination_requested = !matches!(&cleanup, Ok(TerminationOutcome::AlreadyExited));
     let evidence = ShutdownEvidence {
-        termination_requested: true,
+        termination_requested,
         process_reaped,
         live: usize::from(!process_reaped),
         bound: shutdown_timeout,
@@ -572,7 +579,7 @@ fn finish_after_setup_failure(
         return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
     }
     match cleanup {
-        Ok(()) => {
+        Ok(_) => {
             failure.shutdown = Some(Box::new(evidence));
             ExecutionOutcome::Failed(failure)
         },
@@ -610,9 +617,10 @@ fn finish_after_execution_failure(
     let workers_result = workers.abort(&failure.command, shutdown_deadline);
     let resource_elapsed = resource_started.elapsed();
     let process_reaped = cleanup.is_ok();
+    let termination_requested = !matches!(&cleanup, Ok(TerminationOutcome::AlreadyExited));
     let elapsed = shutdown_started.elapsed();
     let evidence = ShutdownEvidence {
-        termination_requested: true,
+        termination_requested,
         process_reaped,
         live: usize::from(!process_reaped),
         bound: shutdown_timeout,

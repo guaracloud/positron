@@ -119,11 +119,11 @@ impl FramedStdoutBroker {
             },
             Ok(Event::Failure(detail)) => Err(Failure::new(FailurePhase::Capture, detail)),
             Err(TryRecvError::Empty) => {
-                self.observe_worker_completion()?;
+                self.observe_worker_completion(false)?;
                 self.validate_completed_outcome()
             },
             Err(TryRecvError::Disconnected) => {
-                self.observe_worker_completion()?;
+                self.observe_worker_completion(true)?;
                 if self.completed.is_none() {
                     Err(Failure::new(
                         FailurePhase::Capture,
@@ -190,7 +190,7 @@ impl FramedStdoutBroker {
             }
             wait_for_progress(deadline);
         }
-        self.observe_worker_completion()?;
+        self.observe_worker_completion(false)?;
         match self.completed.take() {
             Some(Ok(_)) => Ok(()),
             Some(Err(detail)) => Err(Failure::new(
@@ -211,12 +211,13 @@ impl FramedStdoutBroker {
         }
     }
 
-    fn observe_worker_completion(&mut self) -> Result<(), Failure> {
+    fn observe_worker_completion(&mut self, sender_disconnected: bool) -> Result<(), Failure> {
         if self.completed.is_some()
-            || !self
-                .handle
-                .as_ref()
-                .is_some_and(thread::JoinHandle::is_finished)
+            || (!sender_disconnected
+                && !self
+                    .handle
+                    .as_ref()
+                    .is_some_and(thread::JoinHandle::is_finished))
         {
             return Ok(());
         }
@@ -433,9 +434,34 @@ fn wait_for_progress(deadline: Instant) {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
-    use super::{Event, read_bounded_framed_stdout};
+    use super::{Event, FramedStdoutBroker, read_bounded_framed_stdout};
+
+    #[test]
+    fn late_event_disconnect_preserves_a_valid_terminal_outcome() -> Result<(), std::io::Error> {
+        let (sender, events) = std::sync::mpsc::sync_channel::<Event>(1);
+        drop(sender);
+        let mut broker = FramedStdoutBroker {
+            handle: None,
+            events,
+            stop: Arc::new(AtomicBool::new(false)),
+            completed: Some(Ok("runner-outcome-v1:6f6b\n".to_owned())),
+        };
+
+        broker
+            .poll_control_frame()
+            .map_err(|failure| std::io::Error::other(failure.detail))?;
+        if broker.stop.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "late terminal disconnect requested broker stop",
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn reports_parent_receiver_disappearance_as_a_typed_broker_failure()
