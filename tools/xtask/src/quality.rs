@@ -1680,22 +1680,38 @@ fn run_dynamic_analysis_gate(
         ));
     }
     let deadline = Instant::now() + budget;
+    let cancellation = Arc::new(AtomicBool::new(false));
     let mut results = Vec::with_capacity(selected.len());
     for target in selected {
         let available = remaining(deadline)?;
         let timeout = available.min(target.timeout());
-        let outcome = run_status(
+        let detector = match target.kind() {
+            crate::dynamic_quality::DynamicKind::Property => "property",
+            crate::dynamic_quality::DynamicKind::StateModel => "state-model",
+            crate::dynamic_quality::DynamicKind::Fuzz => "fuzz",
+            crate::dynamic_quality::DynamicKind::Corpus => "corpus",
+            crate::dynamic_quality::DynamicKind::Miri => "miri",
+            crate::dynamic_quality::DynamicKind::Sanitizer => "sanitizer",
+            crate::dynamic_quality::DynamicKind::Loom => "loom",
+        };
+        let outcome = run_status_with_options(
             root,
             environment,
             target.tool(),
             target.arguments(),
-            timeout,
-            capture,
+            StatusOptions {
+                timeout,
+                environment: &[],
+                cancellation: Arc::clone(&cancellation),
+                maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+                capture,
+            },
         )?;
+        target.validate_output(&outcome.stdout)?;
         results.push(format!(
             "{}; {}; {}",
             target.retained_identity(),
-            target.kind().label(),
+            detector,
             outcome.display,
         ));
     }
@@ -2898,6 +2914,8 @@ fn run_documentation_gate(
                 ("RUSTDOCFLAGS", "-D warnings"),
                 ("CARGO_TARGET_DIR", target_value),
             ],
+            cancellation: Arc::new(AtomicBool::new(false)),
+            maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
             capture,
         },
     )
@@ -5584,6 +5602,8 @@ fn run_status<'argument>(
         StatusOptions {
             timeout,
             environment: &[],
+            cancellation: Arc::new(AtomicBool::new(false)),
+            maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
             capture,
         },
     )
@@ -5592,6 +5612,8 @@ fn run_status<'argument>(
 struct StatusOptions<'environment, 'capture> {
     timeout: Duration,
     environment: &'environment [(&'environment str, &'environment str)],
+    cancellation: Arc<AtomicBool>,
+    maximum_capture_bytes: usize,
     capture: &'capture mut GateCapture,
 }
 
@@ -5627,9 +5649,9 @@ fn run_status_with_options<'argument>(
         tools: snapshot.execution_tools(),
         input,
         output: OutputMode::Capture {
-            maximum_bytes_per_stream: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+            maximum_bytes_per_stream: options.maximum_capture_bytes,
         },
-        cancellation: Arc::new(AtomicBool::new(false)),
+        cancellation: options.cancellation,
         deadline: deadline_after(options.timeout)?,
         shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
         cancellation_marker: None,

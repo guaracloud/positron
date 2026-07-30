@@ -15,8 +15,7 @@ use crate::error::XtaskError;
 use crate::quality::Profile;
 
 const REGISTRY_PATH: &str = "qualification/engineering/dynamic-targets.tsv";
-const REGISTRY_HEADER: &str =
-    "target_id\tgate_id\tkind\tstages\ttool\targuments\tcorpus\tseed\ttimeout_seconds";
+const REGISTRY_HEADER: &str = "target_id\tgate_id\tkind\tstages\ttool\targuments\tcorpus\tseed\tschedule\tminimized_failure\toutput_protocol\ttimeout_seconds";
 const MAXIMUM_REGISTRY_BYTES: usize = 16_384;
 const MAXIMUM_TARGETS: usize = 32;
 const MAXIMUM_FIELD_BYTES: usize = 256;
@@ -63,6 +62,32 @@ impl DynamicKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DynamicOutputProtocol {
+    ExitStatusV1,
+    ExactLineV1,
+}
+
+impl DynamicOutputProtocol {
+    fn parse(value: &str) -> Result<Self, XtaskError> {
+        match value {
+            "exit-status-v1" => Ok(Self::ExitStatusV1),
+            "exact-line-v1" => Ok(Self::ExactLineV1),
+            _ => Err(XtaskError::invalid(
+                "dynamic target registry",
+                format!("unknown dynamic target output protocol `{value}`"),
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExitStatusV1 => "exit-status-v1",
+            Self::ExactLineV1 => "exact-line-v1",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DynamicTarget {
     id: String,
@@ -72,6 +97,9 @@ pub(crate) struct DynamicTarget {
     arguments: Vec<String>,
     corpus: String,
     seed: String,
+    schedule: String,
+    minimized_failure: String,
+    output_protocol: DynamicOutputProtocol,
     timeout: Duration,
 }
 
@@ -92,13 +120,31 @@ impl DynamicTarget {
         self.timeout
     }
 
+    pub(crate) fn validate_output(&self, stdout: &str) -> Result<(), XtaskError> {
+        match self.output_protocol {
+            DynamicOutputProtocol::ExitStatusV1 => Ok(()),
+            DynamicOutputProtocol::ExactLineV1
+                if stdout.trim() == "dynamic-target-result-v1;status=passed" =>
+            {
+                Ok(())
+            },
+            DynamicOutputProtocol::ExactLineV1 => Err(XtaskError::invalid(
+                "dynamic target output",
+                "dynamic target result is malformed or does not match the registered exact-line-v1 protocol",
+            )),
+        }
+    }
+
     pub(crate) fn retained_identity(&self) -> String {
         format!(
-            "target={};kind={};corpus={};seed={}",
+            "target={};kind={};corpus={};seed={};schedule={};minimized-failure={};output-protocol={}",
             self.id,
             self.kind.label(),
             self.corpus,
             self.seed,
+            self.schedule,
+            self.minimized_failure,
+            self.output_protocol.label(),
         )
     }
 
@@ -167,6 +213,9 @@ impl FrozenDynamicTargets {
                 arguments,
                 corpus,
                 seed,
+                schedule,
+                minimized_failure,
+                output_protocol,
                 timeout_seconds,
             ] = fields.as_slice()
             else {
@@ -187,6 +236,9 @@ impl FrozenDynamicTargets {
                 *arguments,
                 *corpus,
                 *seed,
+                *schedule,
+                *minimized_failure,
+                *output_protocol,
                 *timeout_seconds,
             ] {
                 if field.is_empty() || field.len() > MAXIMUM_FIELD_BYTES {
@@ -222,6 +274,9 @@ impl FrozenDynamicTargets {
                 arguments,
                 corpus: (*corpus).to_owned(),
                 seed: (*seed).to_owned(),
+                schedule: (*schedule).to_owned(),
+                minimized_failure: (*minimized_failure).to_owned(),
+                output_protocol: DynamicOutputProtocol::parse(output_protocol)?,
                 timeout,
             });
         }
@@ -289,7 +344,7 @@ fn parse_timeout(path: &Path, value: &str) -> Result<Duration, XtaskError> {
 
 #[cfg(test)]
 mod tests {
-    use super::DynamicKind;
+    use super::{DynamicKind, DynamicOutputProtocol};
 
     #[test]
     fn every_registered_dynamic_detector_kind_has_a_closed_parser_label_pair() {
@@ -309,5 +364,12 @@ mod tests {
             }
         }
         assert!(DynamicKind::parse("best-effort").is_err());
+    }
+
+    #[test]
+    fn dynamic_output_protocols_are_closed_and_versioned() {
+        assert!(DynamicOutputProtocol::parse("exit-status-v1").is_ok());
+        assert!(DynamicOutputProtocol::parse("exact-line-v1").is_ok());
+        assert!(DynamicOutputProtocol::parse("best-effort").is_err());
     }
 }
