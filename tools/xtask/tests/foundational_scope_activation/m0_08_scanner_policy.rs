@@ -52,6 +52,43 @@ fn quality_rejects_bare_channel_from_a_transitively_aliased_mpsc_glob_through_th
 }
 
 #[test]
+fn quality_rejects_a_rebound_grouped_tokio_spawn_alias_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod external_tokio_spawn {\n    use tokio as runtime;\n    use runtime::{spawn as entry};\n    fn invoke() {\n        let rebound = entry;\n        let _worker = rebound(async {});\n    }\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )?;
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod external_tokio_spawn_glob {\n    use tokio as runtime;\n    use runtime::*;\n    fn invoke() {\n        let _worker = spawn(async {});\n    }\n}\n",
+        "forbidden concurrency primitive glob import",
+    )
+}
+
+#[test]
+fn quality_rejects_a_transitively_aliased_async_std_task_glob_through_the_public_seam() -> TestResult
+{
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod external_async_std_spawn {\n    use async_std as runtime;\n    use runtime::task as tasks;\n    use tasks::*;\n    fn invoke() {\n        let _worker = spawn(async {});\n    }\n}\n",
+        "forbidden concurrency primitive glob import",
+    )?;
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod external_async_std_spawn_alias {\n    use async_std::task::{spawn as entry};\n    const SPAWN: usize = entry;\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )
+}
+
+#[test]
+fn quality_rejects_a_tokio_unbounded_channel_function_item_through_the_public_seam() -> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nfn external_tokio_unbounded_channel() {\n    let factory = tokio::sync::mpsc::unbounded_channel::<()>;\n    let _channel = factory();\n}\n",
+        "unregistered imported concurrency primitive alias",
+    )?;
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod external_tokio_unbounded_channel_glob {\n    use tokio::sync as synchronization;\n    use synchronization::mpsc as mailbox;\n    use mailbox::*;\n    fn invoke() {\n        let _channel = unbounded_channel::<()>();\n    }\n}\n",
+        "forbidden concurrency primitive glob import",
+    )
+}
+
+#[test]
 fn quality_accepts_an_unrelated_glob_import_through_the_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -68,6 +105,33 @@ fn quality_accepts_an_unrelated_glob_import_through_the_public_seam() -> TestRes
         }
         Err(std::io::Error::other(format!(
             "safe unrelated glob import was rejected: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_accepts_unrelated_external_imports_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n#[cfg(any())]\nmod safe_external_imports {\n    use async_std::task::block_on as async_spawn;\n    use tokio::sync::mpsc::channel as unbounded_channel;\n    use tokio::task::yield_now as spawn;\n    use tokio::time::*;\n    fn invoke() {\n        let _async_std_item = async_spawn;\n        let _channel_item = unbounded_channel;\n        let _tokio_item = spawn;\n        let _time_item = sleep;\n        let local_spawn = || {};\n        local_spawn();\n    }\n}\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "safe unrelated external imports were rejected: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ))

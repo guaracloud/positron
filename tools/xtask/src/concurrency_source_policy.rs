@@ -288,10 +288,21 @@ fn reject_forbidden_invocations(source: &Path, tokens: &[SourceToken]) -> Result
         if matches!(
             resolved.as_slice(),
             [std, thread] if std == "std" && thread == "thread"
-        ) || matches!(
-            resolved.as_slice(),
-            [std, sync, mpsc] if std == "std" && sync == "sync" && mpsc == "mpsc"
-        ) {
+        ) || matches!(resolved.as_slice(), [tokio] if tokio == "tokio")
+            || matches!(
+                resolved.as_slice(),
+                [tokio, sync, mpsc]
+                    if tokio == "tokio" && sync == "sync" && mpsc == "mpsc"
+            )
+            || matches!(
+                resolved.as_slice(),
+                [std, sync, mpsc] if std == "std" && sync == "sync" && mpsc == "mpsc"
+            )
+            || matches!(
+                resolved.as_slice(),
+                [async_std, task] if async_std == "async_std" && task == "task"
+            )
+        {
             return Err(XtaskError::invalid_path(
                 source,
                 "forbidden concurrency primitive glob import in activated tooling source",
@@ -434,7 +445,6 @@ fn is_direct_unbounded_primitive(path: &[String], called: bool) -> bool {
                         && mpsc == "mpsc"
                         && channel == "channel"
             ) || matches!(path, [mpsc, channel] if mpsc == "mpsc" && channel == "channel")
-                || matches!(path, [unbounded] if unbounded == "unbounded_channel")
                 || matches!(path, [tokio, spawn] if tokio == "tokio" && spawn == "spawn")
                 || matches!(
                     path,
@@ -445,6 +455,20 @@ fn is_direct_unbounded_primitive(path: &[String], called: bool) -> bool {
 
 fn matches_forbidden_function_item(path: &[String]) -> bool {
     is_direct_thread_spawn(path)
+        || matches!(path, [tokio, spawn] if tokio == "tokio" && spawn == "spawn")
+        || matches!(
+            path,
+            [async_std, task, spawn]
+                if async_std == "async_std" && task == "task" && spawn == "spawn"
+        )
+        || matches!(
+            path,
+            [tokio, sync, mpsc, unbounded]
+                if tokio == "tokio"
+                    && sync == "sync"
+                    && mpsc == "mpsc"
+                    && unbounded == "unbounded_channel"
+        )
         || matches!(
             path,
             [std, sync, mpsc, channel]
