@@ -15,12 +15,44 @@
     "semantic_owner": "Quality Engineering",
     "public_seam": "cargo xtask quality returned EG-MATRIX verdict and immutable retained report",
     "affected_scopes": ["xtask", "qualification/engineering gate and evidence registries"],
+    "changed_path_contract": {
+      "merge_base": "9879d5924cb9af75e95ec2634469973e09f681e5",
+      "implementation_revision": "2e738ea10aac13fa34d45e77582b7910467c0b83",
+      "path_count": 20,
+      "path_set_digest": "sha256:693965607021cf4992beb582f1dba69b86f7b688e4a23f938d3b1f60249ef2e3",
+      "classification_digest": "sha256:029943c546677f8f9d2e487d8e50833652b0c712fdf17d94d48a3fa21055e23d",
+      "classification_record": "qualification/engineering/security-threat-surfaces.tsv",
+      "classifications": [
+        {"path": "qualification/engineering/exact-targets.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "frozen diagnostic matrix registry"},
+        {"path": "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 policy review record"},
+        {"path": "qualification/engineering/scopes.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "xtask gate activation metadata"},
+        {"path": "tools/xtask/src/bounded_input.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "bounded byte reader implementation detail"},
+        {"path": "tools/xtask/src/crypto_targets.rs", "disposition": "model", "owner": "Security and Key Management", "model_id": "TM-0010-m0-10-runner-crypto", "rationale": "existing crypto runner threat model"},
+        {"path": "tools/xtask/src/main.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "xtask module registration"},
+        {"path": "tools/xtask/src/matrix_execution_plan.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 exact matrix plan"},
+        {"path": "tools/xtask/src/matrix_targets.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 exact matrix registry parser"},
+        {"path": "tools/xtask/src/matrix_verifier.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 independent matrix verifier"},
+        {"path": "tools/xtask/src/quality.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "quality orchestration and retained evidence"},
+        {"path": "tools/xtask/src/security_catalog.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "security descriptor parser"},
+        {"path": "tools/xtask/src/security_change_review.rs", "disposition": "reviewed-non-trust", "owner": "Security and Key Management", "rationale": "revision-bound review resolver"},
+        {"path": "tools/xtask/src/security_harness.rs", "disposition": "model", "owner": "Security and Key Management", "model_id": "TM-0011-m0-10-runner-artifacts", "rationale": "existing candidate-artifact threat model"},
+        {"path": "tools/xtask/src/security_harness/canary.rs", "disposition": "model", "owner": "Security and Key Management", "model_id": "TM-0011-m0-10-runner-artifacts", "rationale": "existing candidate-artifact threat model"},
+        {"path": "tools/xtask/src/security_harness/canary_tests.rs", "disposition": "model", "owner": "Security and Key Management", "model_id": "TM-0011-m0-10-runner-artifacts", "rationale": "existing candidate-artifact threat model"},
+        {"path": "tools/xtask/src/security_threat_surface.rs", "disposition": "reviewed-non-trust", "owner": "Security and Key Management", "rationale": "threat-surface registry parser"},
+        {"path": "tools/xtask/tests/fixtures/m0_11_exact_targets_golden.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 canonical diagnostic fixture"},
+        {"path": "tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.tsv", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "M0-11 negative diagnostic fixture"},
+        {"path": "tools/xtask/tests/foundational_scope_activation.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "public fixture harness"},
+        {"path": "tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs", "disposition": "reviewed-non-trust", "owner": "Quality Engineering", "rationale": "public M0-11 runner regressions"}
+      ]
+    },
+    "external_input_budget": {"maximum_count": 48, "maximum_aggregate_bytes": 196608},
     "dependency_review": {"new_dependencies": "none", "rationale": "Uses the Rust standard library, existing sha2 dependency, and existing controlled-execution owner."},
     "runner_contract": [
       "exact-targets.tsv is a bounded frozen ordered registry containing exactly compile, contract, protocol, producer, provider, platform, architecture, filesystem, StorageClass, registry, distribution, SDK, compatibility, and evidence targets once each.",
       "Every target binds EG-MATRIX, Quality Engineering ownership, PR|EXT stage, diagnostic-only classification, concrete canonical identity, timeout, cargo tool identity/version, canonical argv, explicit environment, input digest, registry digest, plan digest, result, and controlled execution lifecycle evidence.",
       "The runner reuses controlled_execution for launch, bounded capture, process-group reconciliation, deadline, cancellation marker, missing-tool, and first-failure retention; it does not duplicate lifecycle ownership.",
       "matrix_verifier independently re-loads descriptors and derives plan, tool, argv, environment, input, timeout, ordering, and detail expectations without calling the runner execution-plan builder.",
+      "The attempt-wide security input budget is an internal quality-orchestration implementation detail, not a public interface. Its hidden rustdoc entry does not suppress private-item documentation generation: the unchanged complete rustdoc and generated-document secret scan remain an explicit public regression.",
       "QUAL executes no M0 diagnostic target and remains rejected by the existing exact-artifact qualification boundary; no matrix target, emulator, fixture, or local run becomes Qualified."
     ]
   },
@@ -44,6 +76,8 @@
     "cancellation": "quality_routes_matrix_cancellation_through_the_shared_control_marker",
     "golden_negative": "quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution",
     "retained_tamper": "parent_rejects_coupled_matrix_command_environment_and_result_tampering",
+    "fixture_output_and_docs": "matrix_fixture_suppresses_nested_output_and_retains_structured_evidence; matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_docs",
+    "security_change_review": "security_review_selects_pc_0016_for_the_m0_11_merge_base_not_pc_0015; security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head",
     "qualification_boundary": "quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualification"
   },
   "migration": {"from": "Generation-only EG-MATRIX verification", "to": "Frozen diagnostic target descriptors plus controlled per-target runner and independent retained verifier", "rollback": "Revert this policy record, registry, runner modules, fixtures, and tests together; retained evidence remains immutable."},

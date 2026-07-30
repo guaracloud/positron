@@ -1,7 +1,7 @@
 //! Frozen diagnostic exact-target descriptors for `EG-MATRIX`.
 //!
-//! These rows are a closed M0 runner-capability matrix.  They name the
-//! target shapes that later exact-artifact qualification will bind, but cannot
+//! These rows are a closed M0 runner-capability matrix. They name the target
+//! shapes that later exact-artifact qualification will bind, but cannot
 //! themselves advance a Qualification Cell.
 
 use std::collections::BTreeSet;
@@ -132,7 +132,11 @@ impl MatrixTarget {
     }
 
     pub(crate) fn validate_output(&self, stdout: &str) -> Result<(), XtaskError> {
-        if stdout.trim() == "cargo 1.96.0" {
+        let mut fields = stdout.split_ascii_whitespace();
+        if fields.next() == Some("cargo")
+            && fields.next() == Some("1.96.0")
+            && fields.next().is_none_or(|field| field.starts_with('('))
+        {
             return Ok(());
         }
         Err(XtaskError::invalid(

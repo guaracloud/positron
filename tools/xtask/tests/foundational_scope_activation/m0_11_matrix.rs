@@ -9,13 +9,11 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
 {
     let fixture = Fixture::create_current_registry()?;
     let result = (|| {
-        let output = fixture.quality_output_for("pr")?;
+        let output = matrix_quality_output(&fixture, "pr")?;
         if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "matrix fixture failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ))
+            return Err(std::io::Error::other(
+                "matrix fixture failed; inspect its retained structured evidence",
+            )
             .into());
         }
         let evidence = fixture.latest_evidence()?;
@@ -76,7 +74,7 @@ fn quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution() 
         }
         let invalid = fs::read_to_string(fixture.root.join(FAILING))?;
         fs::write(fixture.root.join(TARGETS), invalid)?;
-        let output = fixture.quality_output_for("pr")?;
+        let output = matrix_quality_output(&fixture, "pr")?;
         assert_rejected_output(
             &output,
             "must contain every closed matrix kind exactly once",
@@ -100,7 +98,7 @@ fn quality_rejects_matrix_lifecycle_failures_without_retry_or_fallback() -> Test
         let fixture = Fixture::create_current_registry()?;
         let result: TestResult = (|| {
             install_matrix_cargo_fault(&fixture, name, body)?;
-            let output = fixture.quality_output_for("pr")?;
+            let output = matrix_quality_output(&fixture, "pr")?;
             assert_rejected_output(&output, expected)?;
             let evidence = fixture.latest_evidence()?;
             let gate = gate_record(&evidence, "EG-MATRIX")?;
@@ -147,7 +145,7 @@ fn quality_rejects_timeout_stale_descriptor_and_capture_ceiling_without_matrix_f
             if name != "stale" {
                 install_matrix_cargo_fault(&fixture, name, body)?;
             }
-            let output = fixture.quality_output_for("pr")?;
+            let output = matrix_quality_output(&fixture, "pr")?;
             assert_rejected_output(&output, expected)?;
             let evidence = fixture.latest_evidence()?;
             let gate = gate_record(&evidence, "EG-MATRIX")?;
@@ -171,7 +169,7 @@ fn quality_rejects_a_missing_matrix_tool_without_an_ambient_fallback() -> TestRe
     let fixture = Fixture::create_current_registry()?;
     let result: TestResult = (|| {
         fs::remove_file(fixture.root.join("target/quality-tools/bin/cargo"))?;
-        let output = fixture.quality_output_for("pr")?;
+        let output = matrix_quality_output(&fixture, "pr")?;
         assert_rejected_output(&output, "cargo")?;
         let evidence = fixture.latest_evidence()?;
         if !evidence.contains("\"merge_eligible\": false") {
@@ -245,14 +243,14 @@ fn parent_rejects_coupled_matrix_command_environment_and_result_tampering() -> T
         ),
         (
             "result",
-            "\"verdict\": \"exit-status:exit status: 0\"",
-            "\"verdict\": \"exit-status:exit status: 73\"",
+            "\"verdict\":\"exit-status:exit status: 0\"",
+            "\"verdict\":\"exit-status:exit status: 73\"",
             "passed EG-MATRIX raw report contains a non-passing controlled result",
         ),
     ] {
         let fixture = Fixture::create_current_registry()?;
         let result: TestResult = (|| {
-            let first = fixture.quality_output_for("pr")?;
+            let first = matrix_quality_output(&fixture, "pr")?;
             if !first.status.success() {
                 return Err(std::io::Error::other(format!(
                     "{name} baseline matrix evidence failed"
@@ -260,8 +258,25 @@ fn parent_rejects_coupled_matrix_command_environment_and_result_tampering() -> T
                 .into());
             }
             let path = fixture.latest_evidence_path()?;
-            replace_once_after(&path, "\"gate_id\": \"EG-MATRIX\"", original, replacement)?;
-            let verified = fixture.quality_output_for("pr")?;
+            if name == "command" {
+                replace_once_after(&path, "\"gate_id\": \"EG-MATRIX\"", original, replacement)?;
+            } else {
+                let evidence = fixture.latest_evidence()?;
+                let raw = exact_raw_report_path(&fixture.root, &evidence, "EG-MATRIX")?;
+                replace_once(&raw, original, replacement)?;
+                let report = fs::read_to_string(&raw)?;
+                let digest = format!("sha256:{:x}", Sha256::digest(report.as_bytes()));
+                rewrite_gate_field(&path, &evidence, "EG-MATRIX", "\"sha256\": \"", &digest)?;
+                let rebound_evidence = fs::read_to_string(&path)?;
+                rewrite_gate_field(
+                    &path,
+                    &rebound_evidence,
+                    "EG-MATRIX",
+                    "\"bytes\": ",
+                    &report.len().to_string(),
+                )?;
+            }
+            let verified = matrix_quality_output(&fixture, "pr")?;
             assert_rejected_output(&verified, expected)
         })();
         let cleanup = fixture.remove();
@@ -284,7 +299,7 @@ fn quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualificatio
             "qual",
             "rm target/quality-tools/matrix-qual-must-not-run\n    exit 73",
         )?;
-        let output = fixture.quality_output_for("qual")?;
+        let output = matrix_quality_output(&fixture, "qual")?;
         if output.status.success() {
             return Err(std::io::Error::other(
                 "QUAL must remain rejected until exact-artifact qualification is authorized",
@@ -313,6 +328,182 @@ fn quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualificatio
     result
 }
 
+#[test]
+fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let output = matrix_quality_output(&fixture, "pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "matrix output-capture fixture failed; inspect retained structured evidence",
+            )
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-MATRIX",
+        )?)?;
+        let controlled_steps = report.contains("\"controlled_steps\"");
+        let resolved_programs = report.matches("\"resolved_program\"").count();
+        if !controlled_steps || resolved_programs != 28 {
+            return Err(std::io::Error::other(format!(
+                "nested matrix runner did not retain structured controlled evidence: steps={controlled_steps}; resolved-programs={resolved_programs}"
+            ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn security_review_selects_pc_0016_for_the_m0_11_merge_base_not_pc_0015() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/m0-11-current-origin-main"),
+            "armed\n",
+        )?;
+        let legacy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
+        );
+        replace_once(&legacy, "\"path_count\": 26", "\"path_count\": 0")?;
+        let output = matrix_quality_output(&fixture, "pr")?;
+        if !output.status.success() {
+            let evidence = fixture.latest_evidence()?;
+            let security = gate_record(&evidence, "EG-SECURITY")?;
+            return Err(std::io::Error::other(format!(
+                "M0-11 security review did not complete with PC-0015 corrupted: {security}"
+            ))
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-SECURITY",
+        )?)?;
+        if !report.contains("change-review=PC-0016-m0-11-compatibility-exact-target-matrix")
+            || report.contains("change-review=PC-0015-m0-10-security-crypto-runners")
+        {
+            return Err(std::io::Error::other(
+                "EG-SECURITY did not retain exact PC-0016 selection evidence",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head() -> TestResult
+{
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/m0-11-current-origin-main"),
+            "armed\n",
+        )?;
+        let baseline = matrix_quality_output(&fixture, "pr")?;
+        if !baseline.status.success() {
+            return Err(std::io::Error::other(
+                "PC-0016 implementation identity was incorrectly compared with fixture final HEAD",
+            )
+            .into());
+        }
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json",
+        );
+        replace_once(
+            &policy,
+            "\"implementation_revision\": \"2e738ea10aac13fa34d45e77582b7910467c0b83\"",
+            "\"implementation_revision\": \"not-a-revision\"",
+        )?;
+        let stale = matrix_quality_output(&fixture, "pr")?;
+        assert_rejected_output(&stale, "exact reviewed implementation revision identity")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn matrix_internal_input_budget_preserves_complete_rustdoc_and_clean_generated_docs() -> TestResult
+{
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let target = fixture.root.join("target/m0-11-rustdoc");
+        let documentation = Command::new(env!("CARGO"))
+            .current_dir(&fixture.root)
+            .env("CARGO_TARGET_DIR", &target)
+            .args([
+                "doc",
+                "--locked",
+                "--workspace",
+                "--all-features",
+                "--no-deps",
+                "--document-private-items",
+            ])
+            .output()?;
+        if !documentation.status.success() {
+            return Err(std::io::Error::other(
+                "complete private-item rustdoc generation failed for the matrix internal-input owner",
+            )
+            .into());
+        }
+        let generated = target.join("doc");
+        let scan = Command::new("gitleaks")
+            .args([
+                "dir",
+                "--no-banner",
+                "--no-color",
+                "--redact=100",
+                "--max-target-megabytes=20",
+            ])
+            .arg(&generated)
+            .output()?;
+        if !scan.status.success() {
+            return Err(std::io::Error::other(
+                "unchanged generated-doc gitleaks command rejected complete matrix rustdoc",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+const MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES: usize = 16_384;
+
+fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::process::Output> {
+    let output = fixture.quality_output_for(profile)?;
+    let bytes = output
+        .stdout
+        .len()
+        .checked_add(output.stderr.len())
+        .ok_or_else(|| std::io::Error::other("nested matrix output byte count overflowed"))?;
+    if bytes > MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES {
+        return Err(std::io::Error::other(format!(
+            "nested matrix runner output exceeds the {MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES}-byte fixture suppression budget"
+        ))
+        .into());
+    }
+    Ok(output)
+}
+
 fn install_matrix_cargo_fault(fixture: &Fixture, name: &str, body: &str) -> TestResult {
     let marker = format!("target/quality-tools/matrix-fault-{name}");
     let cargo = fixture.root.join("target/quality-tools/bin/cargo");
@@ -329,9 +520,11 @@ fn replace_once_after(path: &Path, marker: &str, before: &str, after: &str) -> T
     let (prefix, tail) = content
         .split_once(marker)
         .ok_or_else(|| std::io::Error::other("matrix evidence gate marker is missing"))?;
-    let (head, suffix) = tail
-        .split_once(before)
-        .ok_or_else(|| std::io::Error::other("matrix evidence target field is missing"))?;
+    let (head, suffix) = tail.split_once(before).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "matrix evidence target field `{before}` is missing"
+        ))
+    })?;
     fs::write(path, format!("{prefix}{marker}{head}{after}{suffix}"))?;
     Ok(())
 }

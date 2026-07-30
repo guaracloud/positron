@@ -17,7 +17,7 @@ fn executable_intentional_leak_is_rejected_by_parent_scanner() -> Result<(), Xta
     fs::create_dir(&artifact_root)
         .map_err(|source| XtaskError::io("create leak test root", source))?;
     emit_candidate(&artifact_root, LEAK_CANARY_ID)?;
-    let mut budget = crate::bounded_input::ExternalInputBudget::new();
+    let mut budget = crate::quality::SecurityInputBudget::new();
     assert!(scan_candidate(&repository, &artifact_root, &mut budget).is_err());
     fs::remove_dir_all(&artifact_root)
         .map_err(|source| XtaskError::io("remove leak test root", source))

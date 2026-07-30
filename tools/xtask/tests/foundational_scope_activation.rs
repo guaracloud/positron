@@ -7219,14 +7219,37 @@ set -eu
 case "${1:-}" in
   merge-base)
     if [ ! -f target/quality-tools/m0-10-missing-merge-base ]; then
-      if [ -f target/quality-tools/m0-10-current-origin-main ]; then
-        printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
+      if [ -f target/quality-tools/m0-11-current-origin-main ]; then
+        printf '%s\n' '9879d5924cb9af75e95ec2634469973e09f681e5'
       else
         printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
       fi
     fi
     ;;
   diff)
+    if [ -f target/quality-tools/m0-11-current-origin-main ]; then
+      printf '%s\n' 'qualification/engineering/exact-targets.tsv'
+      printf '%s\n' 'qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json'
+      printf '%s\n' 'qualification/engineering/scopes.tsv'
+      printf '%s\n' 'tools/xtask/src/bounded_input.rs'
+      printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+      printf '%s\n' 'tools/xtask/src/main.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_execution_plan.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_targets.rs'
+      printf '%s\n' 'tools/xtask/src/matrix_verifier.rs'
+      printf '%s\n' 'tools/xtask/src/quality.rs'
+      printf '%s\n' 'tools/xtask/src/security_catalog.rs'
+      printf '%s\n' 'tools/xtask/src/security_change_review.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary_tests.rs'
+      printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
+      printf '%s\n' 'tools/xtask/tests/fixtures/m0_11_exact_targets_golden.tsv'
+      printf '%s\n' 'tools/xtask/tests/fixtures/m0_11_exact_targets_invalid.tsv'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_11_matrix.rs'
+      exit 0
+    fi
     if [ -f target/quality-tools/m0-10-current-origin-main ]; then
       printf '%s\n' 'qualification/engineering/README.md'
       printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'

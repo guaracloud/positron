@@ -88,12 +88,12 @@ impl FrozenSecurityCatalog {
     pub(crate) fn load(
         root: &Path,
         registry: &Registry,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let threat_surfaces =
             crate::security_threat_surface::ThreatSurfaceRegistry::load(root, budget)?;
         let path = root.join(CATALOG_PATH);
-        let bytes = crate::bounded_input::read_external(
+        let bytes = crate::quality::read_external_input(
             &path,
             MAXIMUM_CATALOG_BYTES,
             "security runner catalog",

@@ -45,11 +45,10 @@ pub(crate) struct ThreatSurfaceRegistry {
 impl ThreatSurfaceRegistry {
     pub(crate) fn load(
         root: &Path,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
-        crate::security_change_review::validate_policy_commands(root, budget)?;
         let path = root.join(PATH);
-        let bytes = crate::bounded_input::read_external(
+        let bytes = crate::quality::read_external_input(
             &path,
             MAXIMUM_REGISTRY_BYTES,
             "security threat-surface registry",
@@ -241,7 +240,7 @@ impl ThreatSurfaceRegistry {
         root: &Path,
         merge_base: &str,
         changed_paths: &str,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<String, XtaskError> {
         crate::security_change_review::validate(
             root,
@@ -260,10 +259,10 @@ fn validate_model_record(
     owner: &str,
     boundary: &str,
     surfaces: &str,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
     let path = root.join(format!("qualification/engineering/security/{model}.json"));
-    let bytes = crate::bounded_input::read_external(
+    let bytes = crate::quality::read_external_input(
         &path,
         MAXIMUM_MODEL_BYTES,
         "versioned threat-model record",

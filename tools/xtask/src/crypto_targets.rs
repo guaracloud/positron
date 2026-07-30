@@ -19,10 +19,10 @@ pub(crate) enum Selection {
 pub(crate) fn select(
     root: &Path,
     profile: Profile,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<Selection, XtaskError> {
     let path = root.join(PATH);
-    let bytes = crate::bounded_input::read_external(
+    let bytes = crate::quality::read_external_input(
         &path,
         MAXIMUM_REGISTRY_BYTES,
         "profile-aware crypto target registry",
@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn extended_and_qualification_profiles_never_reuse_pr_runner_capability() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut budget = crate::bounded_input::ExternalInputBudget::new();
+        let mut budget = crate::quality::SecurityInputBudget::new();
         assert!(matches!(
             select(&root, Profile::Ext, &mut budget),
             Ok(Selection::NoActiveProductTarget(_))

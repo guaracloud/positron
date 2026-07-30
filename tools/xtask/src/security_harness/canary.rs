@@ -33,7 +33,7 @@ pub(super) fn emit_candidate(artifact_root: &Path, canary_id: &str) -> Result<()
 pub(super) fn scan_candidate(
     repository: &Path,
     artifact_root: &Path,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
     let target_digest = validate_target_contract(repository, budget)?;
     let golden = Golden::load(&repository.join(GOLDEN_PATH), budget)?;
@@ -96,7 +96,7 @@ pub(super) fn scan_candidate(
 
 fn validate_target_contract(
     repository: &Path,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<String, XtaskError> {
     let path = repository.join(TARGET_PATH);
     let bytes = read_fixture(&path, budget)?;
@@ -163,7 +163,7 @@ struct Golden {
 impl Golden {
     fn load(
         path: &Path,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let bytes = read_fixture(path, budget)?;
         let content = std::str::from_utf8(&bytes).map_err(|source| {
@@ -215,7 +215,7 @@ struct LeakFixture(Sink);
 impl LeakFixture {
     fn load(
         path: &Path,
-        budget: &mut crate::bounded_input::ExternalInputBudget,
+        budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let bytes = read_fixture(path, budget)?;
         let content = std::str::from_utf8(&bytes).map_err(|source| {
@@ -337,9 +337,9 @@ fn contains(bytes: &[u8], needle: &[u8]) -> bool {
 }
 fn read_fixture(
     path: &Path,
-    budget: &mut crate::bounded_input::ExternalInputBudget,
+    budget: &mut crate::quality::SecurityInputBudget,
 ) -> Result<Vec<u8>, XtaskError> {
-    crate::bounded_input::read_external(
+    crate::quality::read_external_input(
         path,
         MAXIMUM_FIXTURE_BYTES,
         "committed security fixture",

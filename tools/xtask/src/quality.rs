@@ -152,6 +152,110 @@ const M0_04_MUTATION_SELECTOR: &str = concat!(
 );
 const M0_04_MUTATION_OUTPUT: &str = "target/quality/mutation/m0-04-config-final";
 const M0_04_COVERAGE_FLOOR: f64 = 90.0;
+const MAXIMUM_EXTERNAL_INPUT_COUNT: usize = 64;
+const MAXIMUM_EXTERNAL_INPUT_BYTES: usize = 262_144;
+
+/// Counts repository-controlled security inputs across one quality attempt.
+///
+/// The security review selected for the exact merge base supplies the bounded
+/// limits before any result is accepted into retained evidence.
+#[doc(hidden)]
+pub(crate) struct SecurityInputBudget {
+    count: usize,
+    bytes: usize,
+    declared: Option<(usize, usize)>,
+}
+
+impl SecurityInputBudget {
+    pub(crate) const fn new() -> Self {
+        Self {
+            count: 0,
+            bytes: 0,
+            declared: None,
+        }
+    }
+
+    pub(crate) fn apply_declared_limits(
+        &mut self,
+        maximum_count: usize,
+        maximum_bytes: usize,
+    ) -> Result<(), XtaskError> {
+        if maximum_count == 0
+            || maximum_count > MAXIMUM_EXTERNAL_INPUT_COUNT
+            || maximum_bytes == 0
+            || maximum_bytes > MAXIMUM_EXTERNAL_INPUT_BYTES
+        {
+            return Err(XtaskError::invalid(
+                "external input budget",
+                "declared external input limits are zero or exceed the hard safety ceiling",
+            ));
+        }
+        if self
+            .declared
+            .is_some_and(|declared| declared != (maximum_count, maximum_bytes))
+        {
+            return Err(XtaskError::invalid(
+                "external input budget",
+                "declared external input limits changed during one quality attempt",
+            ));
+        }
+        self.declared = Some((maximum_count, maximum_bytes));
+        self.enforce()
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), XtaskError> {
+        self.count = self.count.checked_add(1).ok_or_else(|| {
+            XtaskError::invalid("external input budget", "input count overflowed")
+        })?;
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
+            XtaskError::invalid("external input budget", "aggregate input bytes overflowed")
+        })?;
+        self.enforce()
+    }
+
+    pub(crate) fn summary(&self) -> Result<String, XtaskError> {
+        let Some((maximum_count, maximum_bytes)) = self.declared else {
+            return Err(XtaskError::invalid(
+                "external input budget",
+                "security change-review did not declare attempt-wide external input limits",
+            ));
+        };
+        Ok(format!(
+            "external-input-count={}; external-input-aggregate-bytes={}; external-input-maximum-count={maximum_count}; external-input-maximum-aggregate-bytes={maximum_bytes}",
+            self.count, self.bytes,
+        ))
+    }
+
+    fn enforce(&self) -> Result<(), XtaskError> {
+        let (maximum_count, maximum_bytes) = self
+            .declared
+            .unwrap_or((MAXIMUM_EXTERNAL_INPUT_COUNT, MAXIMUM_EXTERNAL_INPUT_BYTES));
+        if self.count > maximum_count {
+            return Err(XtaskError::invalid(
+                "external input budget",
+                format!("external input count exceeds {maximum_count}"),
+            ));
+        }
+        if self.bytes > maximum_bytes {
+            return Err(XtaskError::invalid(
+                "external input budget",
+                format!("external input aggregate exceeds {maximum_bytes} bytes"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn read_external_input(
+    path: &Path,
+    maximum_bytes: usize,
+    subject: &str,
+    budget: &mut SecurityInputBudget,
+) -> Result<Vec<u8>, XtaskError> {
+    let bytes = crate::bounded_input::read(path, maximum_bytes, subject)?;
+    budget.charge(bytes.len())?;
+    Ok(bytes)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoverageTarget {
@@ -432,14 +536,14 @@ struct GateExecutionContext<'context> {
     identity: &'context EvidenceIdentity,
     dynamic_cancellation: &'context Arc<AtomicBool>,
     dynamic_cancellation_marker: Option<&'context Path>,
-    external_inputs: &'context mut crate::bounded_input::ExternalInputBudget,
+    external_inputs: &'context mut crate::quality::SecurityInputBudget,
 }
 
 struct M010GateContext<'context> {
     root: &'context Path,
     registry: &'context Registry,
     profile: Profile,
-    external_inputs: &'context mut crate::bounded_input::ExternalInputBudget,
+    external_inputs: &'context mut crate::quality::SecurityInputBudget,
 }
 
 struct DynamicAnalysisContext<'context> {
@@ -900,7 +1004,7 @@ pub(crate) fn run_with_dynamic_cancellation(
     );
 
     let mut attempts = Vec::with_capacity(registry.gates.len());
-    let mut external_inputs = crate::bounded_input::ExternalInputBudget::new();
+    let mut external_inputs = crate::quality::SecurityInputBudget::new();
     for gate in &registry.gates {
         if !gate_selected(gate, options.profile, &activated_risk_gates) {
             attempts.push(gate_attempt(
@@ -4311,7 +4415,7 @@ fn validate_retained_v3_reports(
                 "raw report fields do not exactly cross-reference their evidence gate",
             ));
         }
-        if gate.gate_id == "EG-DYNAMIC"
+        if matches!(gate.gate_id.as_str(), "EG-DYNAMIC" | "EG-MATRIX")
             && gate.result == "passed"
             && parsed_report
                 .controlled_verdicts
@@ -4320,7 +4424,10 @@ fn validate_retained_v3_reports(
         {
             return Err(XtaskError::invalid_path(
                 &report_path,
-                "passed EG-DYNAMIC raw report contains a non-passing controlled result",
+                format!(
+                    "passed {} raw report contains a non-passing controlled result",
+                    gate.gate_id
+                ),
             ));
         }
     }
@@ -5502,7 +5609,7 @@ fn run_security_gate(
         ));
     }
     let path = root.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json");
-    let threat_model = String::from_utf8(crate::bounded_input::read_external(
+    let threat_model = String::from_utf8(crate::quality::read_external_input(
         &path,
         8_192,
         "M0-04 parser threat-model record",
