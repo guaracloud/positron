@@ -23,8 +23,9 @@
     "runner_contract": [
       "security-runners.tsv is a bounded frozen catalog with exactly one descriptor for EG-SECURITY, EG-CRYPTO, and EG-SECRETS. Every descriptor binds the gate's registered stage and activation, evidence schema, threat-model identity, attack-surface identity, required checks, and secret-canary sink inventory.",
       "EG-SECURITY validates the M0-04 configuration parser threat model and executes its registered adversarial test through the controlled command boundary.",
+      "security-threat-surfaces.tsv freezes one real model identity, semantic owner, trust-boundary surface set, revision-bound M0-10 changed-path set, and review disposition per runner; missing, duplicate, unowned, stale, or changed-path-drifted coverage fails closed and its digest is retained.",
       "EG-CRYPTO executes deterministic harness self-tests for a known-answer vector, duplicate-nonce rejection, closed provider failure, and test-only secret-buffer clearing. No Data Protection product target is active and the retained result explicitly makes no product or Qualification claim.",
-      "EG-SECRETS retains the complete canary inventory for logs, errors, metrics, traces, diagnostics, evidence, binaries, packages, and support artifacts while running the current-tree scanner in PR and adding full-history scanning only in EXT and QUAL.",
+      "EG-SECRETS creates and owns a per-attempt candidate-artifact root, supplies the registered root and synthetic canary identity to the controlled xtask candidate command, then independently recollects and scans the nine registered artifact categories before parent cleanup. The outcome is runner capability only and makes no product qualification claim.",
       "Missing, malformed, oversized, duplicate, unknown, stage-drifted, activation-drifted, or field-drifted catalog descriptors fail closed in retained gate evidence. The catalog digest is included in each selected runner detail."
     ],
     "unchanged": [
@@ -39,12 +40,14 @@
   },
   "focused_validation": [
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
-    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor -- --exact"
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence -- --exact",
+    "cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact"
   ],
   "detection_gained": [
     "The security descriptor catalog is read through a 16385-byte bounded stream and rejects an oversize catalog before an unbounded allocation.",
     "EG-SECURITY retains typed harness outcomes for missing authentication, denied authorization, cross-tenant request, and allowed request alongside the active configuration-parser threat-model result.",
-    "EG-SECRETS executes one deterministic synthetic canary through logs, errors, metrics, traces, diagnostics, evidence, binaries, packages, and support artifacts; missing, duplicate, or tampered sink records fail closed and the retained detail binds the sink count and digest.",
+    "EG-SECRETS executes one deterministic synthetic canary through the registered candidate command into a parent-owned artifact root; the parent rejects missing, extra, duplicate, tampered, or leaking artifacts and retains exact category paths and their digest.",
     "The active xtask scope selects EG-CRYPTO, whose controlled self-test is retained with its exact command and runs known-answer, nonce, provider-failure, and test-buffer clearing checks."
   ],
   "detection_lost": [],
@@ -62,10 +65,12 @@
     "new": {
       "status": "passed-focused-local-diagnostic",
       "commands": [
-        "cargo test --locked --package xtask --bin xtask security_harness::tests::security_probe_and_canary_harnesses_fail_closed -- --exact",
-        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_security_catalog_at_the_exact_bounded_read_ceiling -- --exact"
+        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence -- --exact",
+        "cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact"
       ],
-      "result": "The new runner retains the exact descriptor, typed security probe, executable nine-sink synthetic canary result, and controlled crypto command. This diagnostic does not qualify a product target."
+      "result": "These exact targets exist and were run during the focused M0-10 cycles. The new runner retains owned threat/surface identities, the typed security probe, the parent-owned nine-category candidate artifact scan, and the controlled crypto command. This diagnostic does not qualify a product target."
     }
   },
   "qualification_claim": "None. Harness implementation and local evidence are diagnostic only; no exact target is Qualified or merge-eligible.",

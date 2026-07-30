@@ -34,8 +34,8 @@ const REQUIRED_DESCRIPTORS: [DescriptorContract; 3] = [
         stages: "PR|EXT|QUAL",
         activation: "risk",
         evidence_schema: "crypto-orchestration-v1",
-        threat_model: "data-protection-scope-pending-activation-v1",
-        attack_surface: "encryption-key-provider-boundary-v1",
+        threat_model: "TM-0010-m0-10-runner-crypto",
+        attack_surface: "xtask-crypto-known-answer-provider-boundary-v1",
         required_checks: "known-answer-vectors|nonce-safety|provider-failures|zeroization",
         canary_sinks: "-",
     },
@@ -45,8 +45,8 @@ const REQUIRED_DESCRIPTORS: [DescriptorContract; 3] = [
         stages: "PR|EXT|QUAL",
         activation: "always",
         evidence_schema: "secret-canary-orchestration-v1",
-        threat_model: "secret-disclosure-boundary-v1",
-        attack_surface: "diagnostic-and-distribution-outputs-v1",
+        threat_model: "TM-0011-m0-10-runner-artifacts",
+        attack_surface: "xtask-candidate-artifact-disclosure-boundary-v1",
         required_checks: "current-tree-scan|full-history-scan|artifact-canary-scan",
         canary_sinks: "logs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts",
     },
@@ -88,6 +88,7 @@ pub(crate) struct FrozenSecurityCatalog {
 
 impl FrozenSecurityCatalog {
     pub(crate) fn load(root: &Path, registry: &Registry) -> Result<Self, XtaskError> {
+        let threat_surfaces = crate::security_threat_surface::ThreatSurfaceRegistry::load(root)?;
         let path = root.join(CATALOG_PATH);
         let bytes = read_bounded_catalog(&path)?;
         let text = std::str::from_utf8(&bytes)
@@ -183,7 +184,8 @@ impl FrozenSecurityCatalog {
             if records.insert((*gate).to_owned(), SecurityDescriptor {
                 id: (*id).to_owned(),
                 evidence_summary: format!(
-                    "schema={evidence_schema}; threat-model={threat_model}; attack-surface={attack_surface}; checks={required_checks}; canary-sinks={canary_sinks}"
+                    "schema={evidence_schema}; threat-model={threat_model}; attack-surface={attack_surface}; checks={required_checks}; canary-sinks={canary_sinks}; {}",
+                    threat_surfaces.summary(id)?
                 ),
             }).is_some() {
                 return Err(XtaskError::invalid_path(&path, format!("security runner catalog repeats gate `{gate}`")));

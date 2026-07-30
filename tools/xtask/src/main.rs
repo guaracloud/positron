@@ -29,6 +29,7 @@ mod registered_task_lifecycle;
 mod registry;
 mod security_catalog;
 mod security_harness;
+mod security_threat_surface;
 
 use std::env;
 use std::process::ExitCode;
@@ -89,12 +90,20 @@ fn run() -> Result<(), XtaskError> {
             security_harness::run_security_probe_process()
         },
         "quality-secret-canary" => {
+            let artifact_root = arguments
+                .next()
+                .ok_or_else(|| XtaskError::usage("quality-secret-canary requires artifact root"))?;
+            let canary_id = arguments.next().ok_or_else(|| {
+                XtaskError::usage("quality-secret-canary requires canary identity")
+            })?;
             ensure_no_more_arguments(arguments)?;
             let root = env::current_dir()
                 .map_err(|source| XtaskError::io("resolve current directory", source))?;
-            let result = security_harness::run_secret_canary_harness(&root)?;
-            println!("{result}");
-            Ok(())
+            security_harness::emit_secret_candidate(
+                &root,
+                std::path::Path::new(&artifact_root),
+                &canary_id,
+            )
         },
         "quality-internal-cancel-dynamic" => dynamic_cancellation::run(arguments),
         "quality-fixture" => qualification_fixtures::run_process(arguments),

@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -13,44 +12,96 @@ const GOLDEN_PATH: &str =
     "qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv";
 const LEAK_PATH: &str =
     "qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv";
+const TARGET_PATH: &str = "qualification/engineering/security-canary-targets.tsv";
 const MAXIMUM_FIXTURE_BYTES: u64 = 4_096;
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+pub(super) const CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_V1";
 
-pub(super) fn run(root: &Path) -> Result<String, XtaskError> {
-    let golden = Golden::load(&root.join(GOLDEN_PATH))?;
-    let leak = LeakFixture::load(&root.join(LEAK_PATH))?;
-    let fixture = FixtureRoot::create(root)?;
-    let result = (|| {
-        let collected = materialize(&fixture.path, &golden, None)?;
-        independently_scan(&collected, &golden)?;
-        let leaking = materialize(
-            &fixture.path.join("intentional-leak"),
-            &golden,
-            Some(leak.0),
-        )?;
-        if independently_scan(&leaking, &golden).is_ok() {
+pub(super) fn emit_candidate(
+    repository: &Path,
+    artifact_root: &Path,
+    canary_id: &str,
+) -> Result<(), XtaskError> {
+    if canary_id != CANARY_ID || !artifact_root.is_dir() {
+        return Err(XtaskError::invalid(
+            "candidate artifact emitter",
+            "unregistered canary identity or parent-owned artifact root",
+        ));
+    }
+    let golden = Golden::load(&repository.join(GOLDEN_PATH))?;
+    let intentional_leak = LeakFixture::load(&repository.join(LEAK_PATH))?;
+    if intentional_leak.0 != Sink::SupportArtifacts {
+        return Err(XtaskError::invalid(
+            "candidate artifact emitter",
+            "intentional leak fixture does not select the registered support artifact",
+        ));
+    }
+    materialize(artifact_root, &golden, None)?;
+    Ok(())
+}
+
+pub(super) fn scan_candidate(
+    repository: &Path,
+    artifact_root: &Path,
+) -> Result<String, XtaskError> {
+    let target_digest = validate_target_contract(repository)?;
+    let golden = Golden::load(&repository.join(GOLDEN_PATH))?;
+    let collected_root = artifact_root.join("collected");
+    let mut collected = Vec::new();
+    let entries = fs::read_dir(&collected_root)
+        .map_err(|source| XtaskError::io(format!("read {}", collected_root.display()), source))?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            XtaskError::io(format!("read {}", collected_root.display()), source)
+        })?;
+        let path = entry.path();
+        let Some(label) = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_suffix(".artifact"))
+        else {
             return Err(XtaskError::invalid(
-                "secret canary harness",
-                "the committed intentional leak fixture was accepted",
+                "candidate artifact scanner",
+                "extra candidate artifact path is not registered",
             ));
-        }
-        let mut digest = Sha256::new();
-        digest.update(b"positron-secret-canary-harness-v2\0");
-        for artifact in &collected {
-            digest.update(artifact.sink.label());
+        };
+        let sink = Sink::parse(label)?;
+        let bytes = fs::read(&path)
+            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+        collected.push(Collected { sink, bytes });
+    }
+    independently_scan(&collected, &golden)?;
+    let mut digest = Sha256::new();
+    let paths = Sink::ALL
+        .into_iter()
+        .map(|sink| {
+            let path = collected_root.join(format!("{}.artifact", sink.label()));
+            digest.update(sink.label());
             digest.update(b"\0");
-            digest.update(&artifact.bytes);
-            digest.update(b"\0");
-        }
-        Ok(format!(
-            "secret-canary-harness-v2=collected-artifacts:{}; golden=sha256:{}; negative-fixture=secret-canary-leak-rejected; digest=sha256:{:x}",
-            collected.len(),
-            golden.digest,
-            digest.finalize()
-        ))
-    })();
-    fixture.remove()?;
-    result
+            digest
+                .update(fs::read(&path).map_err(|source| {
+                    XtaskError::io(format!("read {}", path.display()), source)
+                })?);
+            Ok(format!("{}={}", sink.label(), path.display()))
+        })
+        .collect::<Result<Vec<_>, XtaskError>>()?;
+    Ok(format!(
+        "candidate-target=xtask-security-runner-capability-v1; target-contract-digest={target_digest}; ownership=parent-attempt; artifact-paths={}; artifact-digest=sha256:{:x}; scanner-result=no-canary-disclosure; qualification=runner-capability-only",
+        paths.join("|"),
+        digest.finalize()
+    ))
+}
+
+fn validate_target_contract(repository: &Path) -> Result<String, XtaskError> {
+    let path = repository.join(TARGET_PATH);
+    let bytes = read_fixture(&path)?;
+    let expected = "target_id\trunner_id\tsemantic_owner\tcommand\tartifact_categories\tqualification\nxtask-security-runner-capability-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_V1\tlogs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts\trunner-capability-only\n";
+    if bytes != expected.as_bytes() {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "registered candidate artifact contract drifted",
+        ));
+    }
+    Ok(format!("sha256:{:x}", Sha256::digest(&bytes)))
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -102,7 +153,6 @@ impl Sink {
 
 struct Golden {
     outputs: Vec<(Sink, Vec<u8>)>,
-    digest: String,
 }
 impl Golden {
     fn load(path: &Path) -> Result<Self, XtaskError> {
@@ -141,10 +191,7 @@ impl Golden {
                 "golden does not cover every canary sink",
             ));
         }
-        Ok(Self {
-            outputs,
-            digest: format!("{:x}", Sha256::digest(&bytes)),
-        })
+        Ok(Self { outputs })
     }
     fn output(&self, sink: Sink) -> Result<&[u8], XtaskError> {
         self.outputs
@@ -194,40 +241,6 @@ impl LeakFixture {
             ));
         }
         Sink::parse(label).map(Self)
-    }
-}
-
-struct FixtureRoot {
-    path: PathBuf,
-}
-impl FixtureRoot {
-    fn create(root: &Path) -> Result<Self, XtaskError> {
-        let parent = root.join("target/quality/security-canary-fixtures");
-        fs::create_dir_all(&parent)
-            .map_err(|source| XtaskError::io(format!("create {}", parent.display()), source))?;
-        for _ in 0..16 {
-            let path = parent.join(format!(
-                "canary-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(source) => {
-                    return Err(XtaskError::io(format!("create {}", path.display()), source));
-                },
-            }
-        }
-        Err(XtaskError::invalid(
-            "secret canary fixture",
-            "bounded fixture root allocation exhausted",
-        ))
-    }
-    fn remove(self) -> Result<(), XtaskError> {
-        fs::remove_dir_all(&self.path).map_err(|source| {
-            XtaskError::io(format!("remove owned {}", self.path.display()), source)
-        })
     }
 }
 

@@ -23,7 +23,7 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
             ("EG-CRYPTO", "crypto-runner-v1"),
             (
                 "EG-SECRETS",
-                "secret-canary-harness-v2=collected-artifacts:9",
+                "candidate-target=xtask-security-runner-capability-v1",
             ),
         ] {
             let report =
@@ -161,6 +161,88 @@ fn quality_rejects_drifted_committed_canary_golden_and_leak_fixtures() -> TestRe
         let leak_output = fixture.quality_output_for("pr")?;
         assert_rejected_output(&leak_output, "intentional leak fixture")?;
         Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_unowned_or_stale_security_threat_surface_coverage() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let path = fixture
+            .root
+            .join("qualification/engineering/security-threat-surfaces.tsv");
+        let original = fs::read_to_string(&path)?;
+        for drifted in [
+            original.replacen("Security and Key Management", "-", 1),
+            original.replacen("reviewed-m0-10", "stale", 1),
+        ] {
+            fs::write(&path, drifted)?;
+            let output = fixture.quality_output_for("pr")?;
+            assert_rejected_output(&output, "security threat-surface registry")?;
+        }
+        fs::write(path, original)?;
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_retains_parent_owned_candidate_artifact_scan_evidence() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let output = fixture.quality_output_for("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other("valid candidate-artifact fixture failed").into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-SECRETS",
+        )?)?;
+        for required in [
+            "candidate-target=xtask-security-runner-capability-v1",
+            "ownership=parent-attempt",
+            "scanner-result=no-canary-disclosure",
+            "qualification=runner-capability-only",
+        ] {
+            if !report.contains(required) {
+                return Err(std::io::Error::other(format!(
+                    "candidate artifact evidence omitted `{required}`"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn policy_rejects_a_referenced_validation_test_target_that_does_not_resolve() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let path = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json",
+        );
+        let original = fs::read_to_string(&path)?;
+        fs::write(
+            &path,
+            original.replacen(
+                "m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam",
+                "m0_10_security_crypto::nonexistent_validation_target",
+                1,
+            ),
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&output, "PC-0015 validation command")
     })();
     let cleanup = fixture.remove();
     cleanup?;

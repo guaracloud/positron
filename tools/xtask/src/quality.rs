@@ -3784,17 +3784,26 @@ fn registered_runner_command_matches(
         "secrets" => match index {
             0 => {
                 program == "cargo"
-                    && args
-                    == [
-                        "run",
-                        "--locked",
-                        "--package",
-                        "xtask",
-                        "--bin",
-                        "xtask",
-                        "--",
-                        "quality-secret-canary",
-                    ]
+                    && args.len() == 10
+                    && args.get(..8)
+                        == Some(
+                            [
+                                "run",
+                                "--locked",
+                                "--package",
+                                "xtask",
+                                "--bin",
+                                "xtask",
+                                "--",
+                                "quality-secret-canary",
+                            ]
+                            .as_slice(),
+                        )
+                    && args.get(8).is_some_and(|path| {
+                        Path::new(path).is_absolute()
+                            && path.ends_with("/secret-candidate-artifacts")
+                    })
+                    && args.get(9) == Some(&"POSITRON_SYNTHETIC_CANARY_V1")
             },
             1 => {
                 program == "gitleaks"
@@ -5439,34 +5448,48 @@ fn run_secret_gate(
 ) -> Result<String, XtaskError> {
     let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
     let descriptor = catalog.descriptor_for("EG-SECRETS")?;
-    let canary = run_status(
-        root,
-        environment,
-        "cargo",
-        [
-            "run",
-            "--locked",
-            "--package",
-            "xtask",
-            "--bin",
-            "xtask",
-            "--",
-            "quality-secret-canary",
-        ],
-        budget,
-        capture,
-    )?;
-    let expected_canary = "secret-canary-harness-v2=collected-artifacts:9";
-    if !canary.stdout.contains(expected_canary)
-        || !canary
-            .stdout
-            .contains("negative-fixture=secret-canary-leak-rejected")
-    {
-        return Err(XtaskError::invalid(
-            "secret gate",
-            "controlled canary child did not return the registered redaction result",
-        ));
-    }
+    let artifact_root = environment
+        .temporary_root()
+        .join("secret-candidate-artifacts");
+    fs::create_dir(&artifact_root).map_err(|source| {
+        XtaskError::io(
+            format!("create parent-owned {}", artifact_root.display()),
+            source,
+        )
+    })?;
+    let artifact_argument = artifact_root.to_str().ok_or_else(|| {
+        XtaskError::invalid("secret gate", "candidate artifact root is not UTF-8")
+    })?;
+    let candidate = (|| {
+        run_status(
+            root,
+            environment,
+            "cargo",
+            [
+                "run",
+                "--locked",
+                "--package",
+                "xtask",
+                "--bin",
+                "xtask",
+                "--",
+                "quality-secret-canary",
+                artifact_argument,
+                "POSITRON_SYNTHETIC_CANARY_V1",
+            ],
+            budget,
+            capture,
+        )?;
+        crate::security_harness::scan_secret_candidate(root, &artifact_root)
+    })();
+    let cleanup = fs::remove_dir_all(&artifact_root).map_err(|source| {
+        XtaskError::io(
+            format!("remove parent-owned {}", artifact_root.display()),
+            source,
+        )
+    });
+    cleanup?;
+    let candidate = candidate?;
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
@@ -5511,7 +5534,7 @@ fn run_secret_gate(
         "internal:{} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
-        expected_canary,
+        candidate,
         commands.join(" | "),
     ))
 }

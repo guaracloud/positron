@@ -7063,7 +7063,27 @@ case "$command" in
           printf '%s\n' 'intentional leak fixture drifted' >&2
           exit 79
         fi
-        printf '%s\n' 'secret-canary-harness-v2=collected-artifacts:9; negative-fixture=secret-canary-leak-rejected'
+        artifact_root=
+        canary_id=
+        previous=
+        for argument in "$@"; do
+          if [ "$previous" = "quality-secret-canary" ]; then
+            artifact_root="$argument"
+          elif [ -n "$artifact_root" ]; then
+            canary_id="$argument"
+          fi
+          previous="$argument"
+        done
+        if [ -z "$artifact_root" ] || [ "$canary_id" != "POSITRON_SYNTHETIC_CANARY_V1" ]; then
+          printf '%s\n' 'candidate artifact invocation drifted' >&2
+          exit 79
+        fi
+        mkdir -p "$artifact_root/written" "$artifact_root/packaged" "$artifact_root/collected"
+        for sink in logs errors metrics traces diagnostics evidence binaries packages support-artifacts; do
+          printf 'REDACTED:%s' "$sink" > "$artifact_root/written/$sink.artifact"
+          printf 'REDACTED:%s' "$sink" > "$artifact_root/packaged/$sink.artifact"
+          printf 'REDACTED:%s' "$sink" > "$artifact_root/collected/$sink.artifact"
+        done
         ;;
       *)
         printf '%s\n' 'fixture received an unregistered xtask child command' >&2

@@ -17,8 +17,19 @@ pub(crate) fn run_security_probe_process() -> Result<(), XtaskError> {
     Ok(())
 }
 
-pub(crate) fn run_secret_canary_harness(root: &Path) -> Result<String, XtaskError> {
-    canary::run(root)
+pub(crate) fn emit_secret_candidate(
+    root: &Path,
+    artifact_root: &Path,
+    canary_id: &str,
+) -> Result<(), XtaskError> {
+    canary::emit_candidate(root, artifact_root, canary_id)
+}
+
+pub(crate) fn scan_secret_candidate(
+    root: &Path,
+    artifact_root: &Path,
+) -> Result<String, XtaskError> {
+    canary::scan_candidate(root, artifact_root)
 }
 
 pub(crate) fn security_probe_result() -> Result<&'static str, XtaskError> {
@@ -130,15 +141,5 @@ mod tests {
     #[test]
     fn typed_security_probe_child_covers_authn_authz_and_tenant_isolation() {
         assert!(security_probe_result().is_ok());
-    }
-    #[test]
-    fn committed_secret_canary_golden_rejects_the_intentional_leak_fixture()
-    -> Result<(), XtaskError> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        assert!(
-            run_secret_canary_harness(&root)?
-                .contains("negative-fixture=secret-canary-leak-rejected")
-        );
-        Ok(())
     }
 }
