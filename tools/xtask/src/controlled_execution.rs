@@ -2407,17 +2407,36 @@ done
     #[test]
     fn returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_capture_descriptors()
     -> TestResult {
+        let started = Instant::now();
         let outcome = execute_escaped_descriptor_fixture_with_deadline(Duration::from_millis(100))?;
+        if started.elapsed() > Duration::from_secs(1) {
+            return Err(io::Error::other(
+                "escaped capture deadline did not publish a terminal outcome inside the test watchdog",
+            )
+            .into());
+        }
         match outcome {
             ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => {
-                let reconciliation = failure.reconciliation.ok_or_else(|| {
-                    io::Error::other(
-                        "escaped capture deadline omitted secondary cleanup failure context",
-                    )
-                })?;
-                if reconciliation.detail.is_empty() {
+                if let Some(observed) = failure.shutdown
+                    && (!observed.termination_requested
+                        || observed.process_reaped != (observed.live == 0)
+                        || observed.elapsed > observed.bound)
+                {
                     return Err(io::Error::other(format!(
-                        "escaped capture deadline retained empty {} cleanup context",
+                        "escaped capture deadline retained dishonest shutdown state: requested={}, reaped={}, live={}, bound={}ms, elapsed={}ms",
+                        observed.termination_requested,
+                        observed.process_reaped,
+                        observed.live,
+                        observed.bound.as_millis(),
+                        observed.elapsed.as_millis(),
+                    ))
+                    .into());
+                }
+                if let Some(reconciliation) = failure.reconciliation
+                    && (reconciliation.detail.is_empty() || reconciliation.detail.len() > 512)
+                {
+                    return Err(io::Error::other(format!(
+                        "escaped capture deadline retained empty {} secondary reconciliation context",
                         reconciliation.phase.as_str(),
                     ))
                     .into());
@@ -2425,7 +2444,7 @@ done
                 Ok(())
             },
             ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
-                "escaped capture descriptors returned {} without secondary cleanup context: {}",
+                "escaped capture descriptors returned {} instead of deadline: {}",
                 failure.phase.as_str(),
                 failure.detail
             ))
@@ -2436,6 +2455,40 @@ done
             ))
             .into()),
         }
+    }
+
+    #[test]
+    fn cleanup_failure_is_typed_secondary_context_for_a_primary_deadline() -> TestResult {
+        let primary = ExecutionFailure::new(
+            "controlled-test".to_owned(),
+            FailurePhase::Deadline,
+            "injected primary deadline",
+        );
+        let cleanup = ExecutionFailure::new(
+            "controlled-test".to_owned(),
+            FailurePhase::Cleanup,
+            "injected bounded cleanup failure",
+        );
+
+        let failure = primary.with_reconciliation(cleanup);
+        let reconciliation = failure.reconciliation.ok_or_else(|| {
+            io::Error::other("primary deadline omitted injected secondary cleanup context")
+        })?;
+        if failure.phase != FailurePhase::Deadline
+            || failure.detail != "injected primary deadline"
+            || reconciliation.phase != FailurePhase::Cleanup
+            || reconciliation.detail != "injected bounded cleanup failure"
+            || reconciliation.detail.len() > 512
+        {
+            return Err(io::Error::other(format!(
+                "cleanup changed primary failure: primary={}; secondary={}; detail={}",
+                failure.phase.as_str(),
+                reconciliation.phase.as_str(),
+                reconciliation.detail,
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     #[test]

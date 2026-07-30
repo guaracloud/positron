@@ -63,6 +63,7 @@
       "commands": [
         "cargo test --locked --package xtask controlled_execution::tests::unix_repeated_signal_and_probe_phases_share_one_deadline_without_platform_helpers -- --exact --nocapture",
         "cargo test --locked --package xtask controlled_execution::tests::returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_capture_descriptors -- --exact --nocapture",
+        "cargo test --locked --package xtask controlled_execution::tests::cleanup_failure_is_typed_secondary_context_for_a_primary_deadline -- --exact --nocapture",
         "cargo test --locked --package xtask --test foundational_scope_activation m0_08_lifecycle_resource::quality_runs_concurrency_and_resource_through_the_registered_public_seam -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation m0_08_parent_verifier:: -- --nocapture --test-threads=1",
         "cargo test --locked --package xtask --test foundational_scope_activation m0_08_scanner_policy::quality_rejects_a_rebound_imported_spawn_alias_through_the_public_seam -- --exact",
@@ -71,7 +72,7 @@
         "cargo test --locked --package xtask --test foundational_scope_activation m0_08_lifecycle_resource::quality_rejects_duplicate_and_missing_resource_schedule_slots_through_the_public_seam -- --exact",
         "cargo test --locked --package xtask --test foundational_scope_activation m0_08_scanner_policy::quality_uses_the_frozen_spawn_registry_after_a_post_capture_swap_through_the_public_seam -- --exact"
       ],
-      "result": "Focused local diagnostics passed after the retained RED proof showed that post-verification child output could fabricate a passing measurement. The settled parent-verifier module passed 17 of 17 focused closed-schema, semantic-tamper, lifecycle-bound, parent-input, and frozen-registry-swap public-seam cases; the separate positive selector passed both gates and their retained verifier bindings. After the retained clean 99f46ea PR attempt exposed two hard-shutdown failures, focused local diagnostics proved that repeated in-process Unix TERM, probe, KILL, and probe phases share the unchanged 100ms deadline without launching the configured platform helper; a TERM-ignoring child was reaped with live=0; and an escaped-descriptor deadline remained primary while carrying nonempty typed secondary cleanup context. Earlier scanner, lifecycle, and resource diagnostics remain local context. These results are not Qualification Evidence and do not establish merge eligibility."
+      "result": "Focused local diagnostics passed after the retained RED proof showed that post-verification child output could fabricate a passing measurement. The settled parent-verifier module passed 17 of 17 focused closed-schema, semantic-tamper, lifecycle-bound, parent-input, and frozen-registry-swap public-seam cases; the separate positive selector passed both gates and their retained verifier bindings. After the retained clean 99f46ea PR attempt exposed two hard-shutdown failures, focused local diagnostics proved that repeated in-process Unix TERM, probe, KILL, and probe phases share the unchanged 100ms deadline without launching the configured platform helper; a TERM-ignoring child was reaped with live=0; and an escaped-descriptor deadline remained primary with no fabricated shutdown state. A deterministic lower-interface regression separately injects a typed cleanup failure and proves that it remains bounded secondary context without changing the primary Deadline phase; the escaped-descriptor regression validates that secondary context when cleanup actually fails but does not fabricate it when cleanup succeeds. Earlier scanner, lifecycle, and resource diagnostics remain local context. These results are not Qualification Evidence and do not establish merge eligibility."
     }
   },
   "compatibility_and_recovery": {
@@ -109,6 +110,14 @@
         "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-parent-verifier-target.KjNG06 git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
         "observed_state": "The clean detached exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-parent-verifier-worktree.dNG9xG/target/quality/evidence/1785368274739-99f46ea055fe-71124.json. EG-TEST ran 420 tests: 418 passed and the noncooperative-process and escaped-descriptor hard-shutdown regressions failed because external process-control helper launches exhausted the 100ms deadline and cleanup replaced the originating Deadline phase. Origin remained at 0a3ba63e78df2288276509d8dca144b71041d466.",
         "recovery": "Preserve the worktree, external target directory, top-level failed evidence, and nested failed evidence. Replace Unix helper launches with the pinned in-process rustix process API, preserve originating execution failures with typed secondary cleanup context, then run one fresh isolated exact-head publication attempt."
+      },
+      {
+        "revision": "2643b65c06a44b79db146f54142992326e91c285",
+        "worktree": "/private/tmp/positron-m0-08-rustix-worktree.rxb40c",
+        "cargo_target_dir": "/private/tmp/positron-m0-08-rustix-target.Cvy9T8",
+        "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-rustix-target.Cvy9T8 git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
+        "observed_state": "The clean detached exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-rustix-worktree.rxb40c/target/quality/evidence/1785369340431-2643b65c06a4-59436.json. EG-TEST ran 420 tests: 419 passed and one escaped-descriptor assertion failed because cleanup legitimately completed immediately and therefore retained no secondary cleanup-failure context. The product result remained the primary Deadline phase; the test incorrectly required a failure context even when no cleanup failure occurred. Origin remained at 0a3ba63e78df2288276509d8dca144b71041d466.",
+        "recovery": "Preserve the worktree, external target directory, and failed evidence. Make the escaped-descriptor assertion conditional on an actually observed cleanup failure, validate honest terminal state, and cover mandatory primary-versus-secondary classification through a deterministic lower-interface injected cleanup failure."
       }
     ]
   },
