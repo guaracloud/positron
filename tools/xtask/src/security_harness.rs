@@ -22,6 +22,191 @@ pub(crate) fn run_crypto_self_test() -> Result<&'static str, XtaskError> {
     Ok("crypto-self-test-v1=known-answer-vectors|nonce-safety|provider-failures|zeroization")
 }
 
+pub(crate) fn run_security_probe_harness() -> Result<&'static str, XtaskError> {
+    let tenant_a = ProbeTenant::Alpha;
+    let tenant_b = ProbeTenant::Beta;
+    if authorize(ProbeRequest::missing_principal(tenant_a)) != ProbeOutcome::Unauthenticated
+        || authorize(ProbeRequest::wrong_scope(tenant_a)) != ProbeOutcome::Forbidden
+        || authorize(ProbeRequest::cross_tenant(tenant_a, tenant_b)) != ProbeOutcome::TenantMismatch
+        || authorize(ProbeRequest::allowed(tenant_a)) != ProbeOutcome::Allowed
+    {
+        return Err(XtaskError::invalid(
+            "security probe harness",
+            "the typed authentication, authorization, or tenant-isolation outcome drifted",
+        ));
+    }
+    Ok("security-probe-v1=authn|authz|tenant-isolation")
+}
+
+pub(crate) fn run_secret_canary_harness() -> Result<String, XtaskError> {
+    let records = CanarySink::ALL
+        .into_iter()
+        .map(CanaryRecord::seeded)
+        .collect::<Vec<_>>();
+    verify_canaries(&records)?;
+    let mut digest = Sha256::new();
+    digest.update(b"positron-secret-canary-harness-v1\0");
+    for record in &records {
+        digest.update(record.sink.label().as_bytes());
+        digest.update(b"\0");
+        digest.update(&record.bytes);
+        digest.update(b"\0");
+    }
+    Ok(format!(
+        "secret-canary-harness-v1=sinks:{}; digest=sha256:{:x}",
+        records.len(),
+        digest.finalize()
+    ))
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProbeTenant {
+    Alpha,
+    Beta,
+}
+
+#[derive(Clone, Copy)]
+struct ProbeRequest {
+    principal: bool,
+    allowed_scope: bool,
+    attributed: ProbeTenant,
+    requested: ProbeTenant,
+}
+
+impl ProbeRequest {
+    const fn missing_principal(tenant: ProbeTenant) -> Self {
+        Self {
+            principal: false,
+            allowed_scope: true,
+            attributed: tenant,
+            requested: tenant,
+        }
+    }
+    const fn wrong_scope(tenant: ProbeTenant) -> Self {
+        Self {
+            principal: true,
+            allowed_scope: false,
+            attributed: tenant,
+            requested: tenant,
+        }
+    }
+    const fn cross_tenant(attributed: ProbeTenant, requested: ProbeTenant) -> Self {
+        Self {
+            principal: true,
+            allowed_scope: true,
+            attributed,
+            requested,
+        }
+    }
+    const fn allowed(tenant: ProbeTenant) -> Self {
+        Self {
+            principal: true,
+            allowed_scope: true,
+            attributed: tenant,
+            requested: tenant,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProbeOutcome {
+    Unauthenticated,
+    Forbidden,
+    TenantMismatch,
+    Allowed,
+}
+
+fn authorize(request: ProbeRequest) -> ProbeOutcome {
+    if !request.principal {
+        ProbeOutcome::Unauthenticated
+    } else if !request.allowed_scope {
+        ProbeOutcome::Forbidden
+    } else if request.attributed != request.requested {
+        ProbeOutcome::TenantMismatch
+    } else {
+        ProbeOutcome::Allowed
+    }
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum CanarySink {
+    Logs,
+    Errors,
+    Metrics,
+    Traces,
+    Diagnostics,
+    Evidence,
+    Binaries,
+    Packages,
+    SupportArtifacts,
+}
+
+impl CanarySink {
+    const ALL: [Self; 9] = [
+        Self::Logs,
+        Self::Errors,
+        Self::Metrics,
+        Self::Traces,
+        Self::Diagnostics,
+        Self::Evidence,
+        Self::Binaries,
+        Self::Packages,
+        Self::SupportArtifacts,
+    ];
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Errors => "errors",
+            Self::Metrics => "metrics",
+            Self::Traces => "traces",
+            Self::Diagnostics => "diagnostics",
+            Self::Evidence => "evidence",
+            Self::Binaries => "binaries",
+            Self::Packages => "packages",
+            Self::SupportArtifacts => "support-artifacts",
+        }
+    }
+}
+
+struct CanaryRecord {
+    sink: CanarySink,
+    bytes: Vec<u8>,
+}
+
+impl CanaryRecord {
+    fn seeded(sink: CanarySink) -> Self {
+        let mut bytes = b"POSITRON_SYNTHETIC_CANARY_V1:".to_vec();
+        bytes.extend_from_slice(sink.label().as_bytes());
+        Self { sink, bytes }
+    }
+}
+
+fn verify_canaries(records: &[CanaryRecord]) -> Result<(), XtaskError> {
+    if records.len() != CanarySink::ALL.len() {
+        return Err(XtaskError::invalid(
+            "secret canary harness",
+            "the sink inventory is incomplete",
+        ));
+    }
+    let mut observed = BTreeSet::new();
+    for record in records {
+        let expected = CanaryRecord::seeded(record.sink);
+        if record.bytes != expected.bytes || !observed.insert(record.sink) {
+            return Err(XtaskError::invalid(
+                "secret canary harness",
+                "a seeded canary sink is malformed, tampered, or duplicated",
+            ));
+        }
+    }
+    if observed.len() != CanarySink::ALL.len() {
+        return Err(XtaskError::invalid(
+            "secret canary harness",
+            "a required seeded canary sink is missing",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_known_answer_vector() -> Result<(), XtaskError> {
     let observed = Sha256::digest(b"abc");
     if observed.as_slice() != SHA256_ABC {
@@ -105,5 +290,29 @@ mod tests {
         let mut issued = BTreeSet::new();
         assert!(issue_nonce(&mut issued, "nonce").is_ok());
         assert!(issue_nonce(&mut issued, "nonce").is_err());
+    }
+
+    #[test]
+    fn security_probe_and_canary_harnesses_fail_closed() -> Result<(), XtaskError> {
+        assert!(run_security_probe_harness().is_ok());
+        let mut records = CanarySink::ALL
+            .into_iter()
+            .map(CanaryRecord::seeded)
+            .collect::<Vec<_>>();
+        records.pop();
+        assert!(verify_canaries(&records).is_err());
+        let mut records = CanarySink::ALL
+            .into_iter()
+            .map(CanaryRecord::seeded)
+            .collect::<Vec<_>>();
+        let record = records.first_mut().ok_or_else(|| {
+            XtaskError::invalid(
+                "secret canary harness test",
+                "seeded records are unexpectedly empty",
+            )
+        })?;
+        record.bytes.push(b'x');
+        assert!(verify_canaries(&records).is_err());
+        Ok(())
     }
 }

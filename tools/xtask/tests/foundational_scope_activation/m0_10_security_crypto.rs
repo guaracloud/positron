@@ -17,9 +17,12 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
         }
         let evidence = fixture.latest_evidence()?;
         for (gate, required) in [
-            ("EG-SECURITY", "security-runner-v1"),
+            (
+                "EG-SECURITY",
+                "security-probe-v1=authn|authz|tenant-isolation",
+            ),
             ("EG-CRYPTO", "crypto-runner-v1"),
-            ("EG-SECRETS", "secret-canary-runner-v1"),
+            ("EG-SECRETS", "secret-canary-harness-v1=sinks:9"),
         ] {
             let report =
                 fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, gate)?)?;
@@ -37,6 +40,60 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
                 String::from_utf8_lossy(&retained.stdout),
                 String::from_utf8_lossy(&retained.stderr)
             ))
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_security_catalog_at_the_exact_bounded_read_ceiling() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        enable_security_crypto_gate(&fixture)?;
+        let path = fixture
+            .root
+            .join("qualification/engineering/security-runners.tsv");
+        let valid = fs::read(&path)?;
+        let mut boundary = valid.clone();
+        boundary.resize(16_384, b' ');
+        fs::write(&path, boundary)?;
+        let boundary_output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&boundary_output, "security runner catalog")?;
+        let mut oversized = valid;
+        oversized.resize(16_385, b' ');
+        fs::write(&path, oversized)?;
+        let oversized_output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &oversized_output,
+            "security runner catalog exceeds 16384 bytes",
+        )
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn current_scope_registry_selects_crypto_without_a_fixture_activation_override() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let output = fixture.quality_output_for("pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "current registry did not run the complete quality fixture",
+            )
+            .into());
+        }
+        let evidence = fixture.latest_evidence()?;
+        let crypto = gate_record(&evidence, "EG-CRYPTO")?;
+        if !crypto.contains("\"result\": \"passed\"") {
+            return Err(std::io::Error::other(
+                "the committed xtask scope did not select EG-CRYPTO",
+            )
             .into());
         }
         Ok(())

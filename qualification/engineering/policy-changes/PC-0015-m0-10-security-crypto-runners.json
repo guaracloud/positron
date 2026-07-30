@@ -41,6 +41,33 @@
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor -- --exact"
   ],
+  "detection_gained": [
+    "The security descriptor catalog is read through a 16385-byte bounded stream and rejects an oversize catalog before an unbounded allocation.",
+    "EG-SECURITY retains typed harness outcomes for missing authentication, denied authorization, cross-tenant request, and allowed request alongside the active configuration-parser threat-model result.",
+    "EG-SECRETS executes one deterministic synthetic canary through logs, errors, metrics, traces, diagnostics, evidence, binaries, packages, and support artifacts; missing, duplicate, or tampered sink records fail closed and the retained detail binds the sink count and digest.",
+    "The active xtask scope selects EG-CRYPTO, whose controlled self-test is retained with its exact command and runs known-answer, nonce, provider-failure, and test-buffer clearing checks."
+  ],
+  "detection_lost": [],
+  "migration": {
+    "from": "Descriptive security-runners.tsv rows and an inactive EG-CRYPTO runner selection.",
+    "to": "Bounded, executable Quality Engineering harness descriptors and an active xtask EG-CRYPTO risk selection.",
+    "rollback": "Revert this complete policy record, catalog, runner, scope selection, and tests together; do not delete retained failed or passing evidence."
+  },
+  "old_new_dual_run_evidence": {
+    "old": {
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
+      "result": "Before M0-10, selected EG-CRYPTO failed because runner crypto was not implemented."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --bin xtask security_harness::tests::security_probe_and_canary_harnesses_fail_closed -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_security_catalog_at_the_exact_bounded_read_ceiling -- --exact"
+      ],
+      "result": "The new runner retains the exact descriptor, typed security probe, executable nine-sink synthetic canary result, and controlled crypto command. This diagnostic does not qualify a product target."
+    }
+  },
   "qualification_claim": "None. Harness implementation and local evidence are diagnostic only; no exact target is Qualified or merge-eligible.",
   "approvals_required": ["Architecture", "Quality Engineering", "Security and Key Management"],
   "approval": {

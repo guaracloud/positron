@@ -5247,11 +5247,13 @@ fn run_security_gate(
     validate_configuration_parser_threat_model_text(&threat_model)?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
+    let probes = crate::security_harness::run_security_probe_harness()?;
     Ok(format!(
-        "internal:{} | {} | {}",
+        "internal:{} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,
+        probes,
     ))
 }
 
@@ -5363,6 +5365,7 @@ fn run_secret_gate(
 ) -> Result<String, XtaskError> {
     let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
     let descriptor = catalog.descriptor_for("EG-SECRETS")?;
+    let canary = crate::security_harness::run_secret_canary_harness()?;
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
@@ -5404,9 +5407,10 @@ fn run_secret_gate(
         );
     }
     Ok(format!(
-        "internal:{} | {} | {}",
+        "internal:{} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
+        canary,
         commands.join(" | "),
     ))
 }
