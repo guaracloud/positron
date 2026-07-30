@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::canary::{LEAK_CANARY_ID, emit_candidate, read_bounded, scan_candidate};
+use super::canary::{LEAK_SELECTOR, emit_candidate, read_bounded, scan_candidate};
 use crate::error::XtaskError;
 
 const MAXIMUM_ARTIFACT_BYTES: usize = 4_096;
@@ -16,9 +16,9 @@ fn executable_intentional_leak_is_rejected_by_parent_scanner() -> Result<(), Xta
     let artifact_root = root("canary-leak");
     fs::create_dir(&artifact_root)
         .map_err(|source| XtaskError::io("create leak test root", source))?;
-    emit_candidate(&artifact_root, LEAK_CANARY_ID)?;
+    emit_candidate(&artifact_root, LEAK_SELECTOR)?;
     let mut budget = crate::quality::SecurityInputBudget::new();
-    assert!(scan_candidate(&repository, &artifact_root, &mut budget).is_err());
+    assert!(scan_candidate(&repository, &artifact_root, LEAK_SELECTOR, &mut budget).is_err());
     fs::remove_dir_all(&artifact_root)
         .map_err(|source| XtaskError::io("remove leak test root", source))
 }

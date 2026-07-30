@@ -95,23 +95,24 @@ pub(crate) fn validate(
 
 /// Validate every committed review record before the exact merge-base selector
 /// chooses the one that governs this attempt. A historical record therefore
-/// cannot silently stop enforcing its schema, command, model, or budget.
-pub(crate) fn validate_committed_records(
-    root: &Path,
-    surfaces: &crate::security_threat_surface::ThreatSurfaceRegistry,
-) -> Result<String, XtaskError> {
-    let (model_coverage, reviewed_non_trust) = surfaces.classification_maps();
+/// cannot silently stop enforcing its schema, command, immutable model
+/// references, classifications, or budget. This does not inspect a live diff.
+pub(crate) fn validate_committed_records(root: &Path) -> Result<String, XtaskError> {
     let mut summaries = Vec::with_capacity(REVIEW_LOCATORS.len());
     for locator in REVIEW_LOCATORS {
         let mut budget = crate::quality::SecurityInputBudget::new();
+        let surfaces =
+            crate::security_threat_surface::ThreatSurfaceRegistry::load_static_classifications(
+                root,
+                &mut budget,
+            )?;
+        let (model_coverage, reviewed_non_trust) = surfaces.classification_maps();
         let contract = ReviewContract::load(root, locator, &mut budget, true)?;
         let classifications = contract.classifications(model_coverage, reviewed_non_trust)?;
-        let paths = classifications
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n");
-        validate_actual_paths(&paths, &classifications, &contract)?;
+        drop(validate_classification_contract(
+            &classifications,
+            &contract,
+        )?);
         summaries.push(format!(
             "static-policy={}; {}",
             contract.id,
@@ -161,6 +162,10 @@ impl ReviewContract {
                 "security change-review record id drifted from its registry binding",
             ));
         }
+        let focused_validation = take_required(&mut document, "focused_validation")
+            .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
+        let mut initial_red = take_object(&mut document, "initial_red", &path)?;
+        let initial_red_command = take_string(&mut initial_red, "command", &path)?;
         let mut change = take_object(&mut document, "change", &path)?;
         let mut contract = take_object(&mut change, "changed_path_contract", &path)?;
         let reviewed_base = take_string(&mut contract, "merge_base", &path)?;
@@ -198,7 +203,7 @@ impl ReviewContract {
             .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
         apply_input_budget_contract(change, &path, budget)?;
         if validate_commands {
-            validate_policy_commands(locator, &content, &path)?;
+            validate_policy_commands(locator, &initial_red_command, focused_validation, &path)?;
         }
         Ok(Self {
             id: locator.id.to_owned(),
@@ -293,19 +298,33 @@ fn validate_actual_paths(
         };
         return invalid(detail);
     }
-    let mut records = Vec::with_capacity(actual.len());
+    let mut scoped = BTreeMap::new();
     for path in &actual {
         let Some(classification) = classifications.get(path) else {
             return invalid(format!(
                 "actual changed path `{path}` has no owned classification"
             ));
         };
-        records.push(classification.record(path));
+        scoped.insert(path.clone(), classification.clone());
     }
-    let sorted_paths = actual.iter().map(String::as_str).collect::<Vec<_>>();
+    validate_classification_contract(&scoped, contract)
+}
+
+fn validate_classification_contract(
+    classifications: &BTreeMap<String, Classification>,
+    contract: &ReviewContract,
+) -> Result<String, XtaskError> {
+    let records = classifications
+        .iter()
+        .map(|(path, classification)| classification.record(path))
+        .collect::<Vec<_>>();
+    let sorted_paths = classifications
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let path_digest = sha256(sorted_paths.join("\n").as_bytes());
     let classification_digest = sha256(records.join("\n").as_bytes());
-    if actual.len() != contract.path_count
+    if classifications.len() != contract.path_count
         || path_digest != contract.path_set_digest
         || classification_digest != contract.classification_digest
     {
@@ -329,7 +348,7 @@ fn validate_actual_paths(
         "change-review={}; implementation-revision={}; changed-path-count={}; changed-paths={}; changed-path-set-digest={path_digest}; changed-path-classification-digest={classification_digest}",
         contract.id,
         contract.revision.as_deref().unwrap_or("legacy-none"),
-        actual.len(),
+        classifications.len(),
         sorted_paths.join("|"),
     ))
 }
@@ -413,7 +432,8 @@ fn apply_input_budget_contract(
 
 fn validate_policy_commands(
     locator: ReviewLocator,
-    content: &str,
+    initial_red_command: &str,
+    focused_validation: JsonValue,
     path: &Path,
 ) -> Result<(), XtaskError> {
     let expected = match locator.id {
@@ -426,24 +446,55 @@ fn validate_policy_commands(
             ));
         },
     };
-    for command in expected {
-        if !content.contains(command) {
-            return Err(XtaskError::invalid_path(
-                path,
-                format!(
-                    "{} validation command `{command}` does not resolve",
-                    locator.id
-                ),
-            ));
-        }
-    }
-    if locator.id == "PC-0015-m0-10-security-crypto-runners"
-        && content.contains("security_probe_and_canary_harnesses_fail_closed")
-    {
+    let JsonValue::Array(entries) = focused_validation else {
         return Err(XtaskError::invalid_path(
             path,
-            "PC-0015 validation command references a removed test target",
+            format!(
+                "{} focused validation commands must be an array",
+                locator.id
+            ),
         ));
+    };
+    let mut commands = entries
+        .into_iter()
+        .map(|entry| match entry {
+            JsonValue::String(command) => Ok(command),
+            _ => Err(XtaskError::invalid_path(
+                path,
+                format!("{} focused validation command is not a string", locator.id),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    commands.push(initial_red_command.to_owned());
+    let policy_name = match locator.id {
+        "PC-0015-m0-10-security-crypto-runners" => "PC-0015",
+        "PC-0016-m0-11-compatibility-exact-target-matrix" => "PC-0016",
+        _ => {
+            return Err(XtaskError::invalid_path(
+                path,
+                "unknown policy command contract",
+            ));
+        },
+    };
+    let Some(initial_expected) = expected.first() else {
+        return Err(XtaskError::invalid_path(
+            path,
+            "policy command contract has no initial validation command",
+        ));
+    };
+    if !initial_red_command.contains(initial_expected) {
+        return Err(XtaskError::invalid_path(
+            path,
+            format!("{policy_name} validation command `{initial_expected}` does not resolve"),
+        ));
+    }
+    for command in expected {
+        if !commands.iter().any(|actual| actual.contains(command)) {
+            return Err(XtaskError::invalid_path(
+                path,
+                format!("{policy_name} validation command `{command}` does not resolve"),
+            ));
+        }
     }
     Ok(())
 }

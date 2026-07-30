@@ -7099,17 +7099,17 @@ case "$command" in
           exit 79
         fi
         artifact_root=
-        canary_id=
+        selector=
         previous=
         for argument in "$@"; do
           if [ "$previous" = "quality-secret-canary" ]; then
             artifact_root="$argument"
           elif [ -n "$artifact_root" ]; then
-            canary_id="$argument"
+            selector="$argument"
           fi
           previous="$argument"
         done
-        if [ -z "$artifact_root" ] || [ "$canary_id" != "POSITRON_SYNTHETIC_CANARY_V1" ]; then
+        if [ -z "$artifact_root" ] || [ "$selector" != "registered-synthetic-v1-r001" ]; then
           printf '%s\n' 'candidate artifact invocation drifted' >&2
           exit 79
         fi
@@ -7120,7 +7120,11 @@ case "$command" in
           printf 'REDACTED:%s' "$sink" > "$artifact_root/collected/$sink.artifact"
         done
         if [ -f target/quality-tools/emit-m0-10-intentional-leak ]; then
-          printf '%s' 'POSITRON_SYNTHETIC_CANARY_V1:support-artifacts' \
+          canary_prefix=POSITRON
+          canary_kind=SYNTHETIC
+          canary_label=CANARY
+          canary_version=V1
+          printf '%s_%s_%s_%s:%s' "$canary_prefix" "$canary_kind" "$canary_label" "$canary_version" support-artifacts \
             > "$artifact_root/collected/support-artifacts.artifact"
         fi
         ;;
@@ -7232,6 +7236,7 @@ case "${1:-}" in
       printf '%s\n' 'qualification/engineering/exact-targets-invalid.tsv'
       printf '%s\n' 'qualification/engineering/exact-targets.tsv'
       printf '%s\n' 'qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json'
+      printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
       printf '%s\n' 'qualification/engineering/scopes.tsv'
       printf '%s\n' 'tools/xtask/src/bounded_input.rs'
       printf '%s\n' 'tools/xtask/src/crypto_targets.rs'

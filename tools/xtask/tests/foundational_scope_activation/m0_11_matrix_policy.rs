@@ -23,6 +23,92 @@ fn security_review_rejects_a_corrupt_unselected_pc_0015_before_pc_0016_selection
 }
 
 #[test]
+fn static_policy_validation_rejects_unselected_pc_0016_schema_drift() -> TestResult {
+    let fixture = create_matrix_fixture()?;
+    let result = (|| {
+        let policy = fixture.root.join(
+            "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json",
+        );
+        replace_once(
+            &policy,
+            "\"id\": \"PC-0016-m0-11-compatibility-exact-target-matrix\"",
+            "\"id\": \"PC-0016-drifted\"",
+        )?;
+        // This fixture selects PC-0015. PC-0016 must still be validated as a
+        // committed record, without evaluating its live path set.
+        let output = matrix_quality_output(&fixture, "pr")?;
+        assert_rejected_output(&output, "security change-review record id drifted")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn retained_evidence_never_discloses_the_synthetic_canary() -> TestResult {
+    let fixture = create_matrix_fixture()?;
+    let result = (|| {
+        let output = matrix_quality_output(&fixture, "pr")?;
+        if !output.status.success() {
+            return Err(std::io::Error::other("canary evidence fixture baseline did not pass").into());
+        }
+        let canary = ["POSITRON", "SYNTHETIC", "CANARY", "V1"].join("_");
+        let evidence = fixture.latest_evidence()?;
+        if evidence.contains(&canary) {
+            return Err(std::io::Error::other("retained evidence disclosed the synthetic canary").into());
+        }
+        let secrets = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &evidence,
+            "EG-SECRETS",
+        )?)?;
+        if !secrets.contains("canary-selector=registered-synthetic-v1-r001")
+            || !secrets.contains("canary-digest=sha256:")
+        {
+            return Err(std::io::Error::other(
+                "retained secret evidence did not bind the registered canary selector and digest",
+            )
+            .into());
+        }
+        let reports = fixture.root.join("target/quality/evidence-reports");
+        for attempt in fs::read_dir(reports)? {
+            let attempt = attempt?;
+            for report in fs::read_dir(attempt.path())? {
+                let report = report?;
+                if fs::read_to_string(report.path())?.contains(&canary) {
+                    return Err(std::io::Error::other(
+                        "retained raw report disclosed the synthetic canary",
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn registered_canary_selector_contract_preserves_the_frozen_shared_input_bytes() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let bytes = fs::read(fixture.root.join("qualification/engineering/security-canary-targets.tsv"))?;
+        if bytes.len() != 628 {
+            return Err(std::io::Error::other(
+                "registered non-secret canary selectors changed the frozen shared input byte count",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn security_review_requires_pc_0016_implementation_identity_without_pin_to_final_head() -> TestResult
 {
     let fixture = create_matrix_fixture()?;
@@ -99,7 +185,7 @@ fn security_review_enforces_pc_0016_selected_input_boundaries() -> TestResult {
         for expected in [
             "policy-command-validation=PC-0016-m0-11-compatibility-exact-target-matrix",
             "external-input-count=29",
-            "external-input-aggregate-bytes=104229",
+            "external-input-aggregate-bytes=105264",
             "external-input-maximum-count=48",
             "external-input-maximum-aggregate-bytes=196608",
         ] {
@@ -122,8 +208,8 @@ fn security_review_enforces_pc_0016_selected_input_boundaries() -> TestResult {
             ),
             (
                 "\"maximum_aggregate_bytes\": 196608",
-                "\"maximum_aggregate_bytes\": 104228",
-                "external input aggregate exceeds 104228 bytes",
+                "\"maximum_aggregate_bytes\": 105263",
+                "external input aggregate exceeds 105263 bytes",
             ),
         ] {
             let drifted = original.replacen(from, to, 1);

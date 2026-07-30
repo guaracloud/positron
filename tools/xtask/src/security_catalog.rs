@@ -88,12 +88,15 @@ impl FrozenSecurityCatalog {
     pub(crate) fn load(
         root: &Path,
         registry: &Registry,
-        selected_review: &crate::security_change_review::SelectedReview,
+        selected_review: Option<&crate::security_change_review::SelectedReview>,
         budget: &mut crate::quality::SecurityInputBudget,
     ) -> Result<Self, XtaskError> {
         let threat_surfaces =
             crate::security_threat_surface::ThreatSurfaceRegistry::load(root, budget)?;
-        let policy_command_validation = selected_review.validate_policy_commands(root, budget)?;
+        let policy_command_validation = match selected_review {
+            Some(selected_review) => selected_review.validate_policy_commands(root, budget)?,
+            None => crate::security_change_review::validate_committed_records(root)?,
+        };
         let path = root.join(CATALOG_PATH);
         let bytes = crate::quality::read_external_input(
             &path,

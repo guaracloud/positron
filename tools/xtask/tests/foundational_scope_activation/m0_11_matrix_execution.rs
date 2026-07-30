@@ -36,38 +36,12 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
             &evidence,
             "EG-MATRIX",
         )?)?;
-        for required in [
-            "target=rust-host-1",
-            "target=api-contract-1",
-            "target=otlp-protocol-1",
-            "target=producer-fixture-1",
-            "target=provider-fixture-1",
-            "target=macos-host-1",
-            "target=crate-graph-1",
-            "target=local-fs-1",
-            "target=storage-class-1",
-            "target=sdk-registry-1",
-            "target=native-archive-1",
-            "target=generated-sdk-1",
-            "target=old-new-api-1",
-            "target=evidence-schema-1",
-            "plan=matrix-execution-plan-v1",
-            "diagnostic=diagnostic-only",
-            "argv-digest=sha256:",
-            "environment-digest=sha256:",
-            "input-digest=sha256:",
-            "registry-digest=sha256:",
-            "plan-digest=sha256:",
-        ] {
-            if !report.contains(required) {
-                return Err(
-                    std::io::Error::other(format!("matrix evidence omitted `{required}`")).into(),
-                );
-            }
-        }
-        if gate.matches("\"resolved_program\":").count() != 14 {
+        if !report.contains(&format!("\"detail\": \"{detail}\""))
+            || report.matches("\"resolved_program\":").count() != 28
+            || gate.matches("\"resolved_program\":").count() != 14
+        {
             return Err(std::io::Error::other(
-                "matrix did not retain one controlled result per exact target",
+                "matrix did not retain the exact compact detail and independently verifiable controlled target plans",
             )
             .into());
         }
@@ -108,11 +82,11 @@ fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive()
             &evidence,
             "EG-MATRIX",
         )?)?;
-        if !report.contains("outcome=NoActiveProductTarget")
+        if !report.contains(detail)
             || !report.contains("qualification=no-product-qualification")
         {
             return Err(std::io::Error::other(
-                "inactive product target did not retain its typed diagnostic outcome",
+                "inactive product target raw report did not cross-reference its typed diagnostic outcome",
             )
             .into());
         }
@@ -174,6 +148,7 @@ fn matrix_product_target_missing_registry_retains_bounded_typed_outcome() -> Tes
 fn matrix_active_product_target_fails_closed_when_its_artifact_is_missing() -> TestResult {
     let fixture = create_matrix_fixture()?;
     let result = (|| {
+        install_product_target(&fixture)?;
         fs::remove_file(fixture.root.join("api/positron/v1/positron.proto"))?;
         let output = matrix_quality_output(&fixture, "pr")?;
         assert_rejected_output(&output, "api/positron/v1/positron.proto")

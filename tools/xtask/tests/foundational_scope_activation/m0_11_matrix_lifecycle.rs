@@ -25,7 +25,7 @@ fn quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualificatio
         }
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
-        if !gate.contains("exact-targets=none-for-qual-diagnostic-boundary")
+        if !gate.contains("exact-targets=0; product-outcome=missing")
             || !gate.contains("\"controlled_steps\":[]")
         {
             return Err(std::io::Error::other(
@@ -90,7 +90,11 @@ fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> 
         )?)?;
         let controlled_steps = report.contains("\"controlled_steps\"");
         let resolved_programs = report.matches("\"resolved_program\"").count();
-        if !controlled_steps || resolved_programs != 28 || !report.contains("plan-digest=sha256:") {
+        let detail = matrix_public_detail(gate)?;
+        if !controlled_steps
+            || resolved_programs != 28
+            || !report.contains(&format!("\"detail\": \"{detail}\""))
+        {
             return Err(std::io::Error::other(format!(
                 "nested matrix runner did not retain structured controlled evidence: steps={controlled_steps}; resolved-programs={resolved_programs}"
             ))

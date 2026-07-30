@@ -551,7 +551,10 @@ struct GateExecutionContext<'context> {
     dynamic_cancellation: &'context Arc<AtomicBool>,
     dynamic_cancellation_marker: Option<&'context Path>,
     external_inputs: &'context mut crate::quality::SecurityInputBudget,
-    selected_security_review: &'context crate::security_change_review::SelectedReview,
+    // Only EG-SECURITY resolves the merge base and binds an exact review to
+    // the live diff. Other consumers may receive a pre-resolved selection,
+    // but must remain valid with static policy-record validation alone.
+    selected_security_review: Option<&'context crate::security_change_review::SelectedReview>,
 }
 
 struct M010GateContext<'context> {
@@ -559,7 +562,7 @@ struct M010GateContext<'context> {
     registry: &'context Registry,
     profile: Profile,
     external_inputs: &'context mut crate::quality::SecurityInputBudget,
-    selected_security_review: &'context crate::security_change_review::SelectedReview,
+    selected_security_review: Option<&'context crate::security_change_review::SelectedReview>,
 }
 
 struct DynamicAnalysisContext<'context> {
@@ -1012,7 +1015,24 @@ pub(crate) fn run_with_dynamic_cancellation(
             );
         },
     };
-    let selected_security_review = match resolve_selected_security_review(&root, &environment) {
+    if let Err(error) = crate::security_change_review::validate_committed_records(&root) {
+        return retain_aggregator_failure(
+            &root,
+            options.profile,
+            AggregatorFailure {
+                source,
+                started_unix_ms,
+                attempt_id,
+                environment_digest: environment.digest(),
+                registry_digest: &registry_digest,
+                error: &error,
+            },
+        );
+    }
+    // A successful pre-resolution lets catalog consumers debit the exact
+    // selected-policy validation they own. An unavailable merge base stays
+    // unset so EG-SECURITY, not the aggregator, retains that failure.
+    let selected_security_review = match try_resolve_selected_security_review(&root, &environment) {
         Ok(selection) => selection,
         Err(error) => {
             return retain_aggregator_failure(
@@ -1075,7 +1095,7 @@ pub(crate) fn run_with_dynamic_cancellation(
                 dynamic_cancellation: &dynamic_cancellation,
                 dynamic_cancellation_marker: dynamic_cancellation_marker.as_deref(),
                 external_inputs: &mut external_inputs,
-                selected_security_review: &selected_security_review,
+                selected_security_review: selected_security_review.as_ref(),
             },
             gate,
             &mut capture,
@@ -1094,7 +1114,7 @@ pub(crate) fn run_with_dynamic_cancellation(
                         matrix_public_product_outcome(&root, &registry, options.profile)?;
                     (
                         matrix_public_gate_detail(gate, controlled_steps.len(), product_outcome)?,
-                        Some(retained_detail),
+                        None,
                     )
                 } else {
                     (retained_detail, None)
@@ -4215,7 +4235,7 @@ fn registered_runner_command_matches(
                         Path::new(path).is_absolute()
                             && path.ends_with("/secret-candidate-artifacts")
                     })
-                    && args.get(9) == Some(&"POSITRON_SYNTHETIC_CANARY_V1")
+                    && args.get(9) == Some(&"registered-synthetic-v1-r001")
             },
             1 => {
                 program == "gitleaks"
@@ -5729,13 +5749,6 @@ fn run_security_gate(
     )?)
     .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
-    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(
-        root,
-        registry,
-        selected_security_review,
-        external_inputs,
-    )?;
-    let descriptor = catalog.descriptor_for("EG-SECURITY")?;
     let merge_base = run_capture(
         root,
         environment,
@@ -5751,12 +5764,23 @@ fn run_security_gate(
             "merge base could not be resolved to an exact revision",
         ));
     }
-    if base != selected_security_review.merge_base() {
-        return Err(XtaskError::invalid(
-            "security changed-path coverage",
-            "selected policy merge base drifted during the quality attempt",
-        ));
-    }
+    let selected_security_review = match selected_security_review {
+        Some(review) if base == review.merge_base() => *review,
+        Some(_) => {
+            return Err(XtaskError::invalid(
+                "security changed-path coverage",
+                "selected policy merge base drifted during the quality attempt",
+            ));
+        },
+        None => crate::security_change_review::select(base)?,
+    };
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(
+        root,
+        registry,
+        Some(&selected_security_review),
+        external_inputs,
+    )?;
+    let descriptor = catalog.descriptor_for("EG-SECURITY")?;
     let changed = run_capture(
         root,
         environment,
@@ -5770,7 +5794,7 @@ fn run_security_gate(
     let changed_path_policy_validation =
         selected_security_review.validate_policy_commands(root, external_inputs)?;
     let committed_policy_validation =
-        crate::security_change_review::validate_committed_records(root, &threat_surfaces)?;
+        crate::security_change_review::validate_committed_records(root)?;
     let changed_path_review =
         threat_surfaces.validate_changed_paths(root, base, &changed.stdout, external_inputs)?;
     let adversarial =
@@ -5975,12 +5999,17 @@ fn run_secret_gate(
                 "--",
                 "quality-secret-canary",
                 artifact_argument,
-                "POSITRON_SYNTHETIC_CANARY_V1",
+                "registered-synthetic-v1-r001",
             ],
             budget,
             capture,
         )?;
-        crate::security_harness::scan_secret_candidate(root, &artifact_root, external_inputs)
+        crate::security_harness::scan_secret_candidate(
+            root,
+            &artifact_root,
+            "registered-synthetic-v1-r001",
+            external_inputs,
+        )
     })();
     let cleanup = fs::remove_dir_all(&artifact_root).map_err(|source| {
         XtaskError::io(
@@ -7344,26 +7373,26 @@ fn source_identity(
     })
 }
 
-fn resolve_selected_security_review(
+fn try_resolve_selected_security_review(
     root: &Path,
     environment: &EnvironmentSnapshot,
-) -> Result<crate::security_change_review::SelectedReview, XtaskError> {
-    let merge_base = run_capture(
+) -> Result<Option<crate::security_change_review::SelectedReview>, XtaskError> {
+    let merge_base = match run_capture(
         root,
         environment,
         "git",
         ["merge-base", "HEAD", "origin/main"],
         Duration::from_secs(10),
         None,
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(_) => return Ok(None),
+    };
     let base = merge_base.stdout.trim();
     if !valid_hex_identity(base) {
-        return Err(XtaskError::invalid(
-            "security changed-path coverage",
-            "merge base could not be resolved to an exact revision",
-        ));
+        return Ok(None);
     }
-    crate::security_change_review::select(base)
+    crate::security_change_review::select(base).map(Some)
 }
 
 fn validate_trusted_ci_attempt(source: &SourceIdentity) -> Result<(), XtaskError> {
