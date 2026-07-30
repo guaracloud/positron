@@ -14,4 +14,4 @@ positron-release	crates/positron-release	Release Engineering	application	scaffol
 positron-runtime	crates/positron-runtime	Application Runtime	application	scaffold	-	-	-	-	-	-	-	-	-
 positron-signals	crates/positron-signals	Log Store and Trace Store	application	scaffold	-	-	-	-	-	-	-	-	-
 positron-upgrade	crates/positron-upgrade	Recovery and Lifecycle	application	scaffold	-	-	-	-	-	-	-	-	-
-xtask	tools/xtask	Rust and Toolchain	tooling	active	-	-	-	EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-CORRECT|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-INTEGRITY|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST	cargo test --locked --package xtask	-	-	-	-
+xtask	tools/xtask	Rust and Toolchain	tooling	active	-	-	-	EG-00|EG-ARCH|EG-BUILD|EG-CONCURRENCY|EG-CORRECT|EG-CRYPTO|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-FAULT|EG-INTEGRITY|EG-POLICY|EG-RESOURCE|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST	cargo test --locked --package xtask	-	-	-	-

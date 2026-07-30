@@ -481,6 +481,10 @@ mod m0_09_dynamic_plans;
 mod m0_09_dynamic_quality;
 #[path = "foundational_scope_activation/m0_09_dynamic_verifier.rs"]
 mod m0_09_dynamic_verifier;
+#[path = "foundational_scope_activation/m0_10_final_blockers.rs"]
+mod m0_10_final_blockers;
+#[path = "foundational_scope_activation/m0_10_security_crypto.rs"]
+mod m0_10_security_crypto;
 
 #[cfg(unix)]
 #[test]
@@ -4343,6 +4347,10 @@ impl Fixture {
         Self::create_with_policy(false, configure_m0_02_domain_types_ledger)
     }
 
+    fn create_current_registry() -> TestResult<Self> {
+        Self::create_with_policy(false, |_| Ok(()))
+    }
+
     fn create_with_identity(real_git: bool) -> TestResult<Self> {
         Self::create_with_policy(real_git, configure_activation_ledger)
     }
@@ -4684,6 +4692,37 @@ case ":$PATH:" in
     ;;
 esac
 case "${1:-}" in
+  merge-base)
+    printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
+    ;;
+  diff)
+    printf '%s\n' 'qualification/engineering/README.md'
+    printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'
+    printf '%s\n' 'qualification/engineering/scopes.tsv'
+    printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
+    printf '%s\n' 'qualification/engineering/security-crypto-targets.tsv'
+    printf '%s\n' 'qualification/engineering/security-runners.tsv'
+    printf '%s\n' 'qualification/engineering/security-threat-surfaces.tsv'
+    printf '%s\n' 'qualification/engineering/security/TM-0010-m0-10-runner-crypto.json'
+    printf '%s\n' 'qualification/engineering/security/TM-0011-m0-10-runner-artifacts.json'
+    printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv'
+    printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv'
+    printf '%s\n' 'tools/xtask/src/bounded_input.rs'
+    printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+    printf '%s\n' 'tools/xtask/src/main.rs'
+    printf '%s\n' 'tools/xtask/src/quality.rs'
+    printf '%s\n' 'tools/xtask/src/security_catalog.rs'
+    printf '%s\n' 'tools/xtask/src/security_change_review.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary_budget.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary_tests.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
+    printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
+    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
+    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_final_blockers.rs'
+    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_security_crypto.rs'
+    ;;
   rev-parse)
     printf '%s\n' '0000000000000000000000000000000000000000'
     ;;
@@ -7041,6 +7080,54 @@ case "$command" in
       printf '%s\n' 'GENERATED_DOC_NON_SQUARE_SECRET_CANARY' >> "$search_index"
     fi
     ;;
+  run)
+    case " $* " in
+      *" quality-security-probe "*)
+        printf '%s\n' 'security-probe-result-v1=authn:unauthenticated|authz:forbidden|tenant:tenant-mismatch|allow:allowed'
+        ;;
+      *" quality-secret-canary "*)
+        golden=qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv
+        leak=qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv
+        if [ "$(wc -l < "$golden")" -ne 10 ] || ! grep -qx 'logs	REDACTED:logs' "$golden"; then
+          printf '%s\n' 'committed canary golden drifted' >&2
+          exit 79
+        fi
+        if [ "$(wc -l < "$leak")" -ne 2 ] || ! grep -qx 'support-artifacts	leak' "$leak"; then
+          printf '%s\n' 'intentional leak fixture drifted' >&2
+          exit 79
+        fi
+        artifact_root=
+        canary_id=
+        previous=
+        for argument in "$@"; do
+          if [ "$previous" = "quality-secret-canary" ]; then
+            artifact_root="$argument"
+          elif [ -n "$artifact_root" ]; then
+            canary_id="$argument"
+          fi
+          previous="$argument"
+        done
+        if [ -z "$artifact_root" ] || [ "$canary_id" != "POSITRON_SYNTHETIC_CANARY_V1" ]; then
+          printf '%s\n' 'candidate artifact invocation drifted' >&2
+          exit 79
+        fi
+        mkdir -p "$artifact_root/written" "$artifact_root/packaged" "$artifact_root/collected"
+        for sink in logs errors metrics traces diagnostics evidence binaries packages support-artifacts; do
+          printf 'REDACTED:%s' "$sink" > "$artifact_root/written/$sink.artifact"
+          printf 'REDACTED:%s' "$sink" > "$artifact_root/packaged/$sink.artifact"
+          printf 'REDACTED:%s' "$sink" > "$artifact_root/collected/$sink.artifact"
+        done
+        if [ -f target/quality-tools/emit-m0-10-intentional-leak ]; then
+          printf '%s' 'POSITRON_SYNTHETIC_CANARY_V1:support-artifacts' \
+            > "$artifact_root/collected/support-artifacts.artifact"
+        fi
+        ;;
+      *)
+        printf '%s\n' 'fixture received an unregistered xtask child command' >&2
+        exit 77
+        ;;
+    esac
+    ;;
   test)
     package=
     previous=
@@ -7056,8 +7143,14 @@ case "$command" in
       exit 75
     fi
     if [ "$package" = "xtask" ]; then
-      printf '%s\n' 'private runner self-tests are not qualification fixtures' >&2
-      exit 77
+      case " $* " in
+        *" security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations "*)
+          ;;
+        *)
+          printf '%s\n' 'private runner self-tests are not qualification fixtures' >&2
+          exit 77
+          ;;
+      esac
     fi
     ;;
   tree)
@@ -7122,6 +7215,80 @@ exit 0
             r#"#!/bin/sh
 set -eu
 case "${1:-}" in
+  merge-base)
+    if [ ! -f target/quality-tools/m0-10-missing-merge-base ]; then
+      if [ -f target/quality-tools/m0-10-current-origin-main ]; then
+        printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
+      else
+        printf '%s\n' '542f3835dc67f819e566e017c04e165b15416861'
+      fi
+    fi
+    ;;
+  diff)
+    if [ -f target/quality-tools/m0-10-current-origin-main ]; then
+      printf '%s\n' 'qualification/engineering/README.md'
+      printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'
+      printf '%s\n' 'qualification/engineering/scopes.tsv'
+      printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
+      printf '%s\n' 'qualification/engineering/security-crypto-targets.tsv'
+      printf '%s\n' 'qualification/engineering/security-runners.tsv'
+      printf '%s\n' 'qualification/engineering/security-threat-surfaces.tsv'
+      printf '%s\n' 'qualification/engineering/security/TM-0010-m0-10-runner-crypto.json'
+      printf '%s\n' 'qualification/engineering/security/TM-0011-m0-10-runner-artifacts.json'
+      printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv'
+      printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv'
+      printf '%s\n' 'tools/xtask/src/bounded_input.rs'
+      printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+      printf '%s\n' 'tools/xtask/src/main.rs'
+      printf '%s\n' 'tools/xtask/src/quality.rs'
+      printf '%s\n' 'tools/xtask/src/security_catalog.rs'
+      printf '%s\n' 'tools/xtask/src/security_change_review.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary_budget.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/canary_tests.rs'
+      printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
+      printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_final_blockers.rs'
+      printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_security_crypto.rs'
+      exit 0
+    fi
+    if [ -f target/quality-tools/m0-10-unclassified-changed-path ]; then
+      printf '%s\n' 'tools/xtask/src/security_catalog.rs'
+      exit 0
+    fi
+    if [ -f target/quality-tools/m0-10-uncovered-security-path ]; then
+      printf '%s\n' 'tools/xtask/src/security_harness/uncovered.rs'
+      exit 0
+    fi
+    printf '%s\n' 'qualification/engineering/README.md'
+    printf '%s\n' 'qualification/engineering/policy-changes/PC-0015-m0-10-security-crypto-runners.json'
+    printf '%s\n' 'qualification/engineering/scopes.tsv'
+    printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
+    printf '%s\n' 'qualification/engineering/security-crypto-targets.tsv'
+    printf '%s\n' 'qualification/engineering/security-runners.tsv'
+    printf '%s\n' 'qualification/engineering/security-threat-surfaces.tsv'
+    printf '%s\n' 'qualification/engineering/security/TM-0010-m0-10-runner-crypto.json'
+    printf '%s\n' 'qualification/engineering/security/TM-0011-m0-10-runner-artifacts.json'
+    printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv'
+    printf '%s\n' 'qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv'
+    printf '%s\n' 'tools/xtask/src/bounded_input.rs'
+    printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+    printf '%s\n' 'tools/xtask/src/main.rs'
+    printf '%s\n' 'tools/xtask/src/quality.rs'
+    printf '%s\n' 'tools/xtask/src/security_catalog.rs'
+    printf '%s\n' 'tools/xtask/src/security_change_review.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary_budget.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary_tests.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
+    printf '%s\n' 'tools/xtask/src/security_threat_surface.rs'
+    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation.rs'
+    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_final_blockers.rs'
+    printf '%s\n' 'tools/xtask/tests/foundational_scope_activation/m0_10_security_crypto.rs'
+    ;;
   rev-parse)
     printf '%s\n' '0000000000000000000000000000000000000000'
     ;;

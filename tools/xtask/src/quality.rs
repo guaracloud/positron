@@ -432,6 +432,14 @@ struct GateExecutionContext<'context> {
     identity: &'context EvidenceIdentity,
     dynamic_cancellation: &'context Arc<AtomicBool>,
     dynamic_cancellation_marker: Option<&'context Path>,
+    external_inputs: &'context mut crate::bounded_input::ExternalInputBudget,
+}
+
+struct M010GateContext<'context> {
+    root: &'context Path,
+    registry: &'context Registry,
+    profile: Profile,
+    external_inputs: &'context mut crate::bounded_input::ExternalInputBudget,
 }
 
 struct DynamicAnalysisContext<'context> {
@@ -892,6 +900,7 @@ pub(crate) fn run_with_dynamic_cancellation(
     );
 
     let mut attempts = Vec::with_capacity(registry.gates.len());
+    let mut external_inputs = crate::bounded_input::ExternalInputBudget::new();
     for gate in &registry.gates {
         if !gate_selected(gate, options.profile, &activated_risk_gates) {
             attempts.push(gate_attempt(
@@ -927,6 +936,7 @@ pub(crate) fn run_with_dynamic_cancellation(
                 identity: &identity,
                 dynamic_cancellation: &dynamic_cancellation,
                 dynamic_cancellation_marker: dynamic_cancellation_marker.as_deref(),
+                external_inputs: &mut external_inputs,
             },
             gate,
             &mut capture,
@@ -1390,6 +1400,7 @@ fn execute_gate(
         identity,
         dynamic_cancellation,
         dynamic_cancellation_marker,
+        external_inputs,
     } = context;
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
@@ -1428,6 +1439,17 @@ fn execute_gate(
             capture,
         ),
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
+        "crypto" => run_crypto_gate(
+            M010GateContext {
+                root,
+                registry,
+                profile: options.profile,
+                external_inputs,
+            },
+            budget,
+            environment,
+            capture,
+        ),
         "fault" => run_fault_gate(qualification_fixtures, environment),
         "integrity" => run_integrity_gate(
             qualification_fixtures,
@@ -1442,8 +1464,28 @@ fn execute_gate(
         "policy" => run_policy_gate(root, registry),
         "rust" => run_rust_gate(root, budget, environment, capture),
         "safety" => run_safety_gate(root, registry, budget, environment, capture),
-        "security" => run_security_gate(root, registry, budget, environment, capture),
-        "secrets" => run_secret_gate(root, options.profile, budget, environment, capture),
+        "security" => run_security_gate(
+            M010GateContext {
+                root,
+                registry,
+                profile: options.profile,
+                external_inputs,
+            },
+            budget,
+            environment,
+            capture,
+        ),
+        "secrets" => run_secret_gate(
+            M010GateContext {
+                root,
+                registry,
+                profile: options.profile,
+                external_inputs,
+            },
+            budget,
+            environment,
+            capture,
+        ),
         "supply" => run_supply_gate(
             root,
             registry,
@@ -3438,6 +3480,7 @@ fn validate_registered_controlled_steps(
                 .tools
                 .iter()
                 .any(|tool| tool.command == step.program)
+                || required_snapshot_tools(context.profile).contains(step.program.as_str())
         };
         let resolved = Path::new(&step.resolved_program);
         let resolved_matches = resolved.is_absolute()
@@ -3570,16 +3613,24 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
         "fault" => 0,
         "integrity" => 0,
         "safety" => usize::from(registry.has_m0_04_configuration_scope()),
-        "security" => 1,
-        "secrets" | "supply" => {
+        "security" => 4,
+        "supply" => {
             if matches!(profile, Profile::Ext | Profile::Qual) {
                 2
             } else {
                 1
             }
         },
+        "secrets" => {
+            if matches!(profile, Profile::Ext | Profile::Qual) {
+                3
+            } else {
+                2
+            }
+        },
         "concurrency" | "resource" => 1,
-        "crypto" | "error-policy" | "evidence" | "matrix" | "performance" | "policy" | "soak" => 0,
+        "crypto" => usize::from(matches!(profile, Profile::Pr)),
+        "error-policy" | "evidence" | "matrix" | "performance" | "policy" | "soak" => 0,
         _ => 0,
     }
 }
@@ -3721,7 +3772,7 @@ fn registered_runner_command_matches(
             },
             _ => false,
         },
-        "safety" | "security" => {
+        "safety" => {
             index == 0
                 && program == "cargo"
                 && args
@@ -3735,20 +3786,83 @@ fn registered_runner_command_matches(
                         "preflight_",
                     ]
         },
-        "secrets" => match index {
+        "security" => match index {
             0 => {
-                program == "gitleaks"
+                program == "git" && args == ["merge-base", "HEAD", "origin/main"]
+            },
+            1 => {
+                program == "git"
+                    && args.len() == 5
+                    && args.get(0..3) == Some(["diff", "--name-only", "--diff-filter=ACMR"].as_slice())
+                    && args.get(3).is_some_and(|base| valid_hex_identity(base))
+                    && args.get(4) == Some(&"HEAD")
+            },
+            2 => {
+                program == "cargo"
                     && args
                         == [
-                            "dir",
-                            "--no-banner",
-                            "--no-color",
-                            "--redact=100",
-                            "--max-target-megabytes=20",
-                            ".",
+                            "test",
+                            "--locked",
+                            "--package",
+                            "positron-config",
+                            "--test",
+                            "configuration_foundation",
+                            "preflight_",
                         ]
             },
-            1 if matches!(profile, Profile::Ext | Profile::Qual) => {
+            3 => {
+                program == "cargo"
+                    && args
+                        == [
+                            "run",
+                            "--locked",
+                            "--package",
+                            "xtask",
+                            "--bin",
+                            "xtask",
+                            "--",
+                            "quality-security-probe",
+                        ]
+            },
+            _ => false,
+        },
+        "secrets" => match index {
+            0 => {
+                program == "cargo"
+                    && args.len() == 10
+                    && args.get(..8)
+                        == Some(
+                            [
+                                "run",
+                                "--locked",
+                                "--package",
+                                "xtask",
+                                "--bin",
+                                "xtask",
+                                "--",
+                                "quality-secret-canary",
+                            ]
+                            .as_slice(),
+                        )
+                    && args.get(8).is_some_and(|path| {
+                        Path::new(path).is_absolute()
+                            && path.ends_with("/secret-candidate-artifacts")
+                    })
+                    && args.get(9) == Some(&"POSITRON_SYNTHETIC_CANARY_V1")
+            },
+            1 => {
+                program == "gitleaks"
+                    && args
+                    == [
+                        "dir",
+                        "--no-banner",
+                        "--no-color",
+                        "--redact=100",
+                        "--max-target-megabytes=20",
+                        ".",
+                    ]
+            },
+            2 if matches!(profile, Profile::Ext | Profile::Qual) => {
                 program == "gitleaks"
                     && args
                         == [
@@ -3796,7 +3910,23 @@ fn registered_runner_command_matches(
                 step.timeout_ms,
                 &args,
             ),
-        "correctness" | "crypto" | "error-policy" | "evidence" | "fault" | "integrity"
+        "crypto" => {
+            index == 0
+                && program == "cargo"
+                && args
+                    == [
+                        "test",
+                        "--locked",
+                        "--package",
+                        "xtask",
+                        "--bin",
+                        "xtask",
+                        "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations",
+                        "--",
+                        "--exact",
+                    ]
+        }
+        "correctness" | "error-policy" | "evidence" | "fault" | "integrity"
         | "matrix" | "performance" | "policy" | "soak" => false,
         _ => false,
     }
@@ -5202,12 +5332,17 @@ fn run_safety_gate(
 }
 
 fn run_security_gate(
-    root: &Path,
-    registry: &Registry,
+    context: M010GateContext<'_>,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let M010GateContext {
+        root,
+        registry,
+        external_inputs,
+        ..
+    } = context;
     if !registry.has_m0_04_configuration_scope() {
         return Err(XtaskError::invalid(
             "security gate",
@@ -5215,14 +5350,129 @@ fn run_security_gate(
         ));
     }
     let path = root.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json");
-    let threat_model = fs::read_to_string(&path)
-        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    let threat_model = String::from_utf8(crate::bounded_input::read_external(
+        &path,
+        8_192,
+        "M0-04 parser threat-model record",
+        external_inputs,
+    )?)
+    .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
+    let catalog =
+        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
+    let descriptor = catalog.descriptor_for("EG-SECURITY")?;
+    let merge_base = run_capture(
+        root,
+        environment,
+        "git",
+        ["merge-base", "HEAD", "origin/main"],
+        budget,
+        Some(capture),
+    )?;
+    let base = merge_base.stdout.trim();
+    if !valid_hex_identity(base) {
+        return Err(XtaskError::invalid(
+            "security changed-path coverage",
+            "merge base could not be resolved to an exact revision",
+        ));
+    }
+    let changed = run_capture(
+        root,
+        environment,
+        "git",
+        ["diff", "--name-only", "--diff-filter=ACMR", base, "HEAD"],
+        budget,
+        Some(capture),
+    )?;
+    let changed_path_review =
+        crate::security_threat_surface::ThreatSurfaceRegistry::load(root, external_inputs)?
+            .validate_changed_paths(root, base, &changed.stdout, external_inputs)?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
+    let probes = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "run",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "--",
+            "quality-security-probe",
+        ],
+        budget,
+        capture,
+    )?;
+    let expected_probe = "security-probe-result-v1=authn:unauthenticated|authz:forbidden|tenant:tenant-mismatch|allow:allowed";
+    if !probes.stdout.contains(expected_probe) {
+        return Err(XtaskError::invalid(
+            "security gate",
+            "controlled probe child did not return the registered typed result",
+        ));
+    }
     Ok(format!(
-        "internal:versioned-parser-threat-model-and-pending-security-owner-review validation | {}",
-        adversarial.display
+        "internal:{} | {} | merge-base={base}; {changed_path_review} | {} | {} | {}",
+        descriptor.id(),
+        descriptor.evidence_summary(),
+        adversarial.display,
+        expected_probe,
+        external_inputs.summary()?,
+    ))
+}
+
+fn run_crypto_gate(
+    context: M010GateContext<'_>,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    let M010GateContext {
+        root,
+        registry,
+        profile,
+        external_inputs,
+    } = context;
+    let catalog =
+        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
+    let descriptor = catalog.descriptor_for("EG-CRYPTO")?;
+    let target_digest = match crate::crypto_targets::select(root, profile, external_inputs)? {
+        crate::crypto_targets::Selection::RunnerCapability(digest) => digest,
+        crate::crypto_targets::Selection::NoActiveProductTarget(digest) => {
+            return Ok(format!(
+                "internal:{} | {} | outcome=NoActiveProductTarget; target-registry-digest={digest}; qualification=no-product-qualification",
+                descriptor.id(),
+                descriptor.evidence_summary(),
+            ));
+        },
+    };
+    let self_test = crate::security_harness::run_crypto_self_test()?;
+    let controlled = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations",
+            "--",
+            "--exact",
+        ],
+        budget,
+        capture,
+    )?;
+    Ok(format!(
+        "internal:{} | {} | target=xtask-crypto-runner-capability-v1; target-registry-digest={target_digest}; {} | {}; no Data Protection product scope is active, so no crypto qualification target was executed",
+        descriptor.id(),
+        descriptor.evidence_summary(),
+        self_test,
+        controlled.display,
     ))
 }
 
@@ -5288,12 +5538,62 @@ fn validate_configuration_parser_threat_model_text(content: &str) -> Result<(), 
 }
 
 fn run_secret_gate(
-    root: &Path,
-    profile: Profile,
+    context: M010GateContext<'_>,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let M010GateContext {
+        root,
+        registry,
+        profile,
+        external_inputs,
+    } = context;
+    let catalog =
+        crate::security_catalog::FrozenSecurityCatalog::load(root, registry, external_inputs)?;
+    let descriptor = catalog.descriptor_for("EG-SECRETS")?;
+    let artifact_root = environment
+        .temporary_root()
+        .join("secret-candidate-artifacts");
+    fs::create_dir(&artifact_root).map_err(|source| {
+        XtaskError::io(
+            format!("create parent-owned {}", artifact_root.display()),
+            source,
+        )
+    })?;
+    let artifact_argument = artifact_root.to_str().ok_or_else(|| {
+        XtaskError::invalid("secret gate", "candidate artifact root is not UTF-8")
+    })?;
+    let candidate = (|| {
+        run_status(
+            root,
+            environment,
+            "cargo",
+            [
+                "run",
+                "--locked",
+                "--package",
+                "xtask",
+                "--bin",
+                "xtask",
+                "--",
+                "quality-secret-canary",
+                artifact_argument,
+                "POSITRON_SYNTHETIC_CANARY_V1",
+            ],
+            budget,
+            capture,
+        )?;
+        crate::security_harness::scan_secret_candidate(root, &artifact_root, external_inputs)
+    })();
+    let cleanup = fs::remove_dir_all(&artifact_root).map_err(|source| {
+        XtaskError::io(
+            format!("remove parent-owned {}", artifact_root.display()),
+            source,
+        )
+    });
+    cleanup?;
+    let candidate = candidate?;
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
@@ -5334,7 +5634,13 @@ fn run_secret_gate(
             .display,
         );
     }
-    Ok(commands.join(" | "))
+    Ok(format!(
+        "internal:{} | {} | {} | {}",
+        descriptor.id(),
+        descriptor.evidence_summary(),
+        candidate,
+        commands.join(" | "),
+    ))
 }
 
 fn run_supply_gate(

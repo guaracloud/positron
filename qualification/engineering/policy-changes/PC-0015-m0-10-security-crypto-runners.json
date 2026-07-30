@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "id": "PC-0015-m0-10-security-crypto-runners",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Implement the Quality Engineering-owned EG-SECURITY, EG-CRYPTO, and EG-SECRETS runner orchestration without application behavior or Qualification Cell advancement.",
+  "change": {
+    "issue": 11,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and immutable target/quality/evidence report",
+    "affected_scopes": ["xtask", "qualification/engineering gate and evidence registries"],
+    "changed_path_contract": {
+      "merge_base": "542f3835dc67f819e566e017c04e165b15416861",
+      "path_count": 26,
+      "path_set_digest": "sha256:6105ea257f79be4fed8d4e5a3c31879ac4c5fbfb590c7f2f3d2e4ac67374e224",
+      "classification_digest": "sha256:d523f4485cd2991864ee96c3edf26c44c88696dd83b49dfc9761942a4f13130a",
+      "classification_record": "qualification/engineering/security-threat-surfaces.tsv"
+    },
+    "external_input_budget": {
+      "maximum_count": 29,
+      "maximum_aggregate_bytes": 108614
+    },
+    "dependency_review": {
+      "new_dependencies": "none",
+      "rationale": "The runner uses the Rust standard library and the existing reviewed sha2 xtask dependency."
+    },
+    "runner_contract": [
+      "security-runners.tsv is a bounded frozen catalog with exactly one descriptor for EG-SECURITY, EG-CRYPTO, and EG-SECRETS. Every descriptor binds the gate's registered stage and activation, evidence schema, threat-model identity, attack-surface identity, required checks, and secret-canary sink inventory.",
+      "EG-SECURITY validates the M0-04 configuration parser threat model and executes its registered adversarial test through the controlled command boundary.",
+      "security-threat-surfaces.tsv freezes each owned threat-model surface and every explicitly reviewed non-trust-boundary path with one semantic owner and rationale. The complete merge-base diff must exactly equal model-covered plus reviewed paths; missing, extra, duplicate, conflicting, unowned, rationale-free, stale, or changed-set-drifted classifications fail closed.",
+      "TM-0010 and TM-0011 are committed versioned threat-model records whose model, owner, trust boundary, covered surfaces, review revision, and record digest are resolved by the runner catalog.",
+      "security-crypto-targets.tsv selects the PR runner-capability target only in PR; EXT and QUAL return the typed NoActiveProductTarget outcome and cannot reuse the PR self-test or claim product qualification.",
+      "EG-CRYPTO executes deterministic harness self-tests for a known-answer vector, duplicate-nonce rejection, closed provider failure, and test-only secret-buffer clearing. No Data Protection product target is active and the retained result explicitly makes no product or Qualification claim.",
+      "EG-SECRETS creates and owns a per-attempt candidate-artifact root, supplies the registered root and synthetic canary identity to the controlled xtask candidate command, then independently recollects and scans the nine registered artifact categories before parent cleanup. The outcome is runner capability only and makes no product qualification claim.",
+      "Missing, malformed, oversized, duplicate, unknown, stage-drifted, activation-drifted, or field-drifted catalog descriptors fail closed in retained gate evidence. The catalog digest is included in each selected runner detail."
+    ],
+    "unchanged": [
+      "No application, Data Protection, authentication, authorization, tenant-isolation, diagnostics, distribution, provider, or Qualification Cell behavior is introduced.",
+      "No threshold, timeout, memory declaration, exception class, selector, existing detector command, or gate is weakened.",
+      "The existing controlled-execution, timeout, cancellation, missing-tool, retry-retention, capture ceiling, and immutable evidence framework remains authoritative."
+    ]
+  },
+  "initial_red": {
+    "command": "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
+    "result": "Failed before implementation because active EG-CRYPTO returned invalid gate runner crypto; no executable harness had been implemented."
+  },
+  "focused_validation": [
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_executable_intentional_leak_with_retained_failed_evidence -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_missing_merge_base_and_uncovered_security_changes -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_an_actual_changed_path_without_owned_classification -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_retains_the_complete_sorted_changed_path_classification -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_stale_conflicting_or_unowned_path_dispositions -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_rejects_an_extra_stale_model_classification -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_enforces_the_shared_external_input_count_boundary -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_enforces_the_shared_external_input_aggregate_boundary -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::quality_uses_the_actual_m0_09_merge_base_and_rejects_the_old_base_pin -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::policy_and_catalog_inputs_enforce_exact_bounds -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::threat_model_inputs_enforce_exact_bounds -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::target_registry_inputs_enforce_exact_bounds -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_final_blockers::canary_fixture_inputs_enforce_exact_bounds -- --exact",
+    "cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact",
+    "cargo test --locked --package xtask --bin xtask security_harness::canary_tests:: -- --nocapture",
+    "cargo test --locked --package xtask --bin xtask crypto_targets:: -- --nocapture"
+  ],
+  "detection_gained": [
+    "Every M0-10 external policy, registry, model, and canary fixture input is read through one shared max-plus-one bounded stream and rejects oversize content before unbounded allocation.",
+    "EG-SECURITY retains typed harness outcomes for missing authentication, denied authorization, cross-tenant request, and allowed request alongside the active configuration-parser threat-model result.",
+    "EG-SECRETS executes one deterministic synthetic canary through the registered candidate command into a parent-owned artifact root; the parent rejects missing, extra, duplicate, tampered, or leaking artifacts and retains exact category paths and their digest.",
+    "Candidate artifact reads are bounded before allocation per artifact and in aggregate, and the committed intentional leak target is materialized by the real child then rejected by the independent parent scanner.",
+    "The active xtask scope selects EG-CRYPTO, whose controlled self-test is retained with its exact command and runs known-answer, nonce, provider-failure, and test-buffer clearing checks."
+  ],
+  "detection_lost": [],
+  "migration": {
+    "from": "Descriptive security-runners.tsv rows and an inactive EG-CRYPTO runner selection.",
+    "to": "Bounded, executable Quality Engineering harness descriptors and an active xtask EG-CRYPTO risk selection.",
+    "rollback": "Revert this complete policy record, catalog, runner, scope selection, and tests together; do not delete retained failed or passing evidence."
+  },
+  "old_new_dual_run_evidence": {
+    "old": {
+      "status": "failed-local-diagnostic",
+      "command": "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
+      "result": "Before M0-10, selected EG-CRYPTO failed because runner crypto was not implemented."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor -- --exact",
+        "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence -- --exact",
+        "cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact"
+      ],
+      "result": "These exact targets exist and were run during the focused M0-10 cycles. The new runner retains owned threat/surface identities, the typed security probe, the parent-owned nine-category candidate artifact scan, and the controlled crypto command. This diagnostic does not qualify a product target."
+    }
+  },
+  "publication_attempts": [
+    {
+      "revision": "bbc3c7d841aedafe940c0b8de830189f3be15879",
+      "worktree": "/private/tmp/positron-m0-10-final-push.AvIOAV",
+      "evidence": "/private/tmp/positron-m0-10-final-push.AvIOAV/target/quality/evidence/1785412656008-bbc3c7d841ae-84772.json",
+      "observed_state": "The clean exact-head pre-push PR profile retained a failed attempt. EG-DOCS reported one redacted square-access-token finding in the generated combined-workspace Rust search index. EG-TEST ran 523 tests: 522 passed and the single 20-run M0-10 external-input boundary matrix timed out at 120.007 seconds under full-suite contention. EG-SECURITY and every other selected gate passed. Origin remained at 18bcbac0c8c0291d725451a9c13d50662d2ef903.",
+      "recovery": "Preserve the exact failed evidence. Keep the unchanged generated-document secret detector and split the same public-seam boundary matrix into independently bounded table partitions. Reduce the shared bounded-input module to its one byte-reading primitive so the combined rustdoc projection contains no false-positive token, then rerun focused rustdoc scanning and one fresh isolated exact-head publication attempt."
+    }
+  ],
+  "qualification_claim": "None. Harness implementation and local evidence are diagnostic only; no exact target is Qualified or merge-eligible.",
+  "approvals_required": ["Architecture", "Quality Engineering", "Security and Key Management"],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": []
+  }
+}

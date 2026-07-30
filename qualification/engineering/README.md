@@ -21,6 +21,7 @@ a scaffold-only scope.
 | `dependencies.tsv` | Mandatory review for each direct third-party dependency |
 | `unsafe-allowlist.tsv` | Approved owned-unsafe boundaries; empty by default |
 | `temporary-work.tsv` | Owner, issue, and expiry for temporary markers; empty by default |
+| `security-runners.tsv` | Frozen security, crypto, and secret-canary runner descriptors and evidence obligations |
 
 The initial scaffold policy record is
 `policy-changes/M0-INITIAL.json`. Later policy changes require their own
