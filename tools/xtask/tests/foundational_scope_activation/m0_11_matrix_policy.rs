@@ -160,7 +160,7 @@ fn security_review_requires_pc_0016_implementation_identity_without_pin_to_final
         )?)?;
         let summary = security_policy_summary(gate_record(&evidence, "EG-SECURITY")?)?;
         if summary
-            != "selected=PC-0016-m0-11-compatibility-exact-target-matrix; committed-record-count=2; selected-result=passed; unselected-result=passed; external-input-count=29; external-input-aggregate-bytes=108039; external-input-maximum-count=48; external-input-maximum-aggregate-bytes=196608"
+            != "selected=PC-0016-m0-11-compatibility-exact-target-matrix; committed-record-count=2; selected-result=passed; unselected-result=passed; external-input-count=29; external-input-aggregate-bytes=111494; external-input-maximum-count=48; external-input-maximum-aggregate-bytes=196608"
             || summary.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
             || report.contains("changed-paths=")
         {
@@ -198,7 +198,7 @@ fn security_policy_failure_console_is_bounded_and_retains_evidence_pointer() -> 
         let policy = fixture.root.join(
             "qualification/engineering/policy-changes/PC-0016-m0-11-compatibility-exact-target-matrix.json",
         );
-        replace_once(&policy, "\"path_count\": 29", "\"path_count\": 0")?;
+        replace_once(&policy, "\"path_count\": 30", "\"path_count\": 0")?;
         let output = matrix_quality_output(&fixture, "pr")?;
         if output.status.success() {
             return Err(std::io::Error::other(
@@ -257,7 +257,7 @@ fn security_review_enforces_pc_0016_selected_input_boundaries() -> TestResult {
         for expected in [
             "policy-command-validation=PC-0016-m0-11-compatibility-exact-target-matrix",
             "external-input-count=29",
-            "external-input-aggregate-bytes=108039",
+            "external-input-aggregate-bytes=111494",
             "external-input-maximum-count=48",
             "external-input-maximum-aggregate-bytes=196608",
         ] {

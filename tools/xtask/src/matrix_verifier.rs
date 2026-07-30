@@ -3,6 +3,7 @@
 //! This verifier re-parses the frozen target catalog and derives command and
 //! evidence identities without using the runner's plan builder or serializer.
 
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,6 +17,16 @@ use crate::registry::{Gate, Registry};
 
 const TOOL_ID: &str = "cargo";
 const TOOL_VERSION: &str = "1.96.0";
+const GENERATION_ARTIFACTS: [&str; 8] = [
+    "api/positron/v1/http.json",
+    "api/positron/v1/openapi.json",
+    "api/positron/v1/schema.sha256",
+    "api/positron/v1/validation-fixtures.json",
+    "configuration/reference.md",
+    "configuration/schema.json",
+    "configuration/validation-fixtures.json",
+    "crates/positron-api/src/generated.rs",
+];
 
 #[derive(Debug)]
 pub(crate) struct ExpectedMatrixStep {
@@ -59,6 +70,7 @@ pub(crate) struct ExpectedMatrixGate {
     steps: Vec<ExpectedMatrixStep>,
     product_outcome: MatrixProductOutcome,
     binding_root: String,
+    generation_root: Option<String>,
 }
 
 impl ExpectedMatrixGate {
@@ -171,10 +183,14 @@ impl ExpectedMatrixGate {
         let binding_root =
             independent_binding_root(steps.iter().map(ExpectedMatrixStep::binding_manifest));
         let product_outcome = expected_product_outcome(root, registry, profile)?;
+        let generation_root = matches!(profile, Profile::Pr | Profile::Ext)
+            .then(|| independent_generation_root(root))
+            .transpose()?;
         Ok(Self {
             steps,
             product_outcome,
             binding_root,
+            generation_root,
         })
     }
     pub(crate) fn steps(&self) -> &[ExpectedMatrixStep] {
@@ -187,6 +203,10 @@ impl ExpectedMatrixGate {
 
     pub(crate) fn binding_root(&self) -> &str {
         &self.binding_root
+    }
+
+    pub(crate) fn generation_root(&self) -> Option<&str> {
+        self.generation_root.as_deref()
     }
 }
 
@@ -224,6 +244,26 @@ fn independent_binding_root<'manifest>(manifests: impl Iterator<Item = &'manifes
         hasher.update(b"\0");
     }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn independent_generation_root(root: &Path) -> Result<String, XtaskError> {
+    let mut hasher = Sha256::new();
+    for relative in GENERATION_ARTIFACTS {
+        let path = root.join(relative);
+        let contents = fs::read(&path)
+            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+        let path_length = u64::try_from(relative.len()).map_err(|_| {
+            XtaskError::invalid_path(&path, "artifact path length exceeds the digest format")
+        })?;
+        let content_length = u64::try_from(contents.len()).map_err(|_| {
+            XtaskError::invalid_path(&path, "artifact byte length exceeds the digest format")
+        })?;
+        hasher.update(path_length.to_le_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update(content_length.to_le_bytes());
+        hasher.update(contents);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn expected_product_outcome(

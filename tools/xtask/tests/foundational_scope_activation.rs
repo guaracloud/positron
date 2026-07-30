@@ -7251,6 +7251,7 @@ case "${1:-}" in
       printf '%s\n' 'qualification/engineering/scopes.tsv'
       printf '%s\n' 'tools/xtask/src/bounded_input.rs'
       printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+      printf '%s\n' 'tools/xtask/src/generation.rs'
       printf '%s\n' 'tools/xtask/src/main.rs'
       printf '%s\n' 'tools/xtask/src/matrix_execution_plan.rs'
       printf '%s\n' 'tools/xtask/src/matrix_product_target.rs'

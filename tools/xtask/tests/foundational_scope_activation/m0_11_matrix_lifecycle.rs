@@ -26,7 +26,7 @@ fn quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualificatio
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
         if !gate.contains(
-            "exact-targets=0; binding-root=not-applicable; product-outcome=missing",
+            "generation-outcome=not-run-qual-boundary; generation-root=not-applicable; exact-targets=0; binding-root=not-applicable; product-outcome=missing",
         )
             || !gate.contains("\"controlled_steps\":[]")
         {
@@ -141,7 +141,9 @@ fn quality_ext_executes_all_diagnostic_targets_without_reusing_product_qualifica
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
         let detail = matrix_public_detail(gate)?;
-        if !detail.contains("exact-targets=14")
+        if !detail.contains("generation-outcome=clean")
+            || !detail.contains("generation-root=sha256:")
+            || !detail.contains("exact-targets=14")
             || !detail.contains("product-outcome=inactive")
             || !detail.contains("qualification=no-product-qualification")
         {
@@ -172,22 +174,23 @@ fn quality_ext_executes_all_diagnostic_targets_without_reusing_product_qualifica
 }
 
 #[test]
-fn matrix_product_target_is_not_applicable_when_its_artifact_scope_is_inactive() -> TestResult {
-    let fixture = Fixture::create()?;
+fn matrix_product_target_is_inactive_outside_pr_without_suppressing_generation() -> TestResult {
+    let fixture = create_matrix_fixture()?;
     install_product_target(&fixture)?;
-    fixture.build_fixture_xtask()?;
     let result = (|| {
-        let output = matrix_quality_output(&fixture, "pr")?;
+        let output = matrix_quality_output(&fixture, "ext")?;
         if !output.status.success() {
             return Err(std::io::Error::other(
-                "inactive product matrix scope must retain a diagnostic-only outcome",
+                "inactive product stage must retain generation and a diagnostic-only outcome",
             )
             .into());
         }
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
         let detail = matrix_public_detail(gate)?;
-        if !detail.contains("product-outcome=inactive")
+        if !detail.contains("generation-outcome=clean")
+            || !detail.contains("generation-root=sha256:")
+            || !detail.contains("product-outcome=inactive")
             || detail.contains("identity=")
             || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
         {

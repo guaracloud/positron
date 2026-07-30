@@ -55,6 +55,7 @@ const MAXIMUM_SNAPSHOT_DIGEST_INPUT_BYTES: usize = 65_536;
 const SNAPSHOT_DIGEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAXIMUM_CAPTURED_REPORT_STREAM_BYTES: usize = 131_072;
 const MAXIMUM_MATRIX_CAPTURED_REPORT_STREAM_BYTES: usize = MAXIMUM_CAPTURED_REPORT_STREAM_BYTES;
+const LEGACY_MATRIX_BINDING_REVISION: &str = "bd5386209359d8395b90e18a16fa20a6962c935b";
 const MAXIMUM_RAW_REPORT_BYTES: usize = 8_388_608;
 const MAXIMUM_RETAINED_EVIDENCE_BYTES: usize = 2_097_152;
 const MAXIMUM_CONTROLLED_REPORT_STEPS: usize = 128;
@@ -538,6 +539,7 @@ struct GateCapture {
     steps: Vec<ControlledStepReport>,
     charged_bytes: usize,
     matrix_binding_root: Option<String>,
+    matrix_generation_root: Option<String>,
 }
 
 struct GateExecutionContext<'context> {
@@ -582,6 +584,7 @@ impl GateCapture {
             steps: Vec::new(),
             charged_bytes: 0,
             matrix_binding_root: None,
+            matrix_generation_root: None,
         }
     }
 
@@ -656,6 +659,20 @@ impl GateCapture {
 
     fn matrix_binding_root(&self) -> Option<&str> {
         self.matrix_binding_root.as_deref()
+    }
+
+    fn set_matrix_generation_root(&mut self, digest: String) -> Result<(), XtaskError> {
+        if self.matrix_generation_root.replace(digest).is_some() {
+            return Err(XtaskError::invalid(
+                "exact target matrix",
+                "matrix generation root was assigned more than once",
+            ));
+        }
+        Ok(())
+    }
+
+    fn matrix_generation_root(&self) -> Option<&str> {
+        self.matrix_generation_root.as_deref()
     }
 }
 
@@ -1117,6 +1134,7 @@ pub(crate) fn run_with_dynamic_cancellation(
             &mut capture,
         );
         let matrix_binding_root = capture.matrix_binding_root().map(str::to_owned);
+        let matrix_generation_root = capture.matrix_generation_root().map(str::to_owned);
         let controlled_steps = capture.finish();
         let duration_ms = started.elapsed().as_millis();
         match execution {
@@ -1140,6 +1158,8 @@ pub(crate) fn run_with_dynamic_cancellation(
                             gate,
                             controlled_steps.len(),
                             binding_root,
+                            matrix_generation_root.as_deref(),
+                            options.profile,
                             product_outcome,
                         )?,
                         None,
@@ -1984,6 +2004,8 @@ fn run_exact_target_matrix_gate(
         cancellation,
         cancellation_marker,
     } = context;
+    let generation =
+        matches!(profile, Profile::Pr | Profile::Ext).then(|| run_generation_matrix_gate(root));
     let targets = crate::matrix_targets::FrozenMatrixTargets::load(root, gate)?;
     let deadline = Instant::now() + budget;
     let mut results = Vec::new();
@@ -2020,13 +2042,20 @@ fn run_exact_target_matrix_gate(
         results.push(plan.retained_identity().to_owned());
     }
     capture.set_matrix_binding_root(matrix_binding_root(&binding_manifests))?;
-    let generation = matrix_product_outcome(root, registry, profile)?;
     let target_detail = if results.is_empty() {
         "exact-targets=none-for-qual-diagnostic-boundary".to_owned()
     } else {
         results.join(" | ")
     };
-    Ok(format!("{target_detail}; {generation}"))
+    let product = matrix_product_outcome(root, registry, profile)?;
+    match generation {
+        Some(Ok(generation)) => {
+            capture.set_matrix_generation_root(generation.root)?;
+            Ok(format!("{target_detail}; {product}"))
+        },
+        Some(Err(error)) => Err(error),
+        None => Ok(format!("{target_detail}; {product}")),
+    }
 }
 
 fn matrix_product_outcome(
@@ -2046,9 +2075,8 @@ fn matrix_product_outcome(
             target.identity(),
         ));
     }
-    let report = run_generation_matrix_gate(root)?;
     Ok(format!(
-        "product-target={}; identity={}; outcome=ProductTargetDiagnostic; qualification=no-product-qualification; {report}",
+        "product-target={}; identity={}; outcome=ProductTargetDiagnostic; qualification=no-product-qualification",
         target.id(),
         target.identity(),
     ))
@@ -2058,10 +2086,25 @@ fn matrix_public_gate_detail(
     gate: &Gate,
     executed_targets: usize,
     binding_root: &str,
+    generation_root: Option<&str>,
+    profile: Profile,
     product_outcome: crate::matrix_product_target::MatrixProductOutcome,
 ) -> Result<String, XtaskError> {
+    let (generation_outcome, generation_root) = if matches!(profile, Profile::Pr | Profile::Ext) {
+        (
+            "clean",
+            generation_root.ok_or_else(|| {
+                XtaskError::invalid(
+                    "exact target matrix",
+                    "selected PR or EXT EG-MATRIX omitted its generation root",
+                )
+            })?,
+        )
+    } else {
+        ("not-run-qual-boundary", "not-applicable")
+    };
     let detail = format!(
-        "exact-targets={executed_targets}; binding-root={binding_root}; product-outcome={}; qualification=no-product-qualification; coordinator: {}; exception class: {}",
+        "generation-outcome={generation_outcome}; generation-root={generation_root}; exact-targets={executed_targets}; binding-root={binding_root}; product-outcome={}; qualification=no-product-qualification; coordinator: {}; exception class: {}",
         product_outcome.label(),
         gate.coordinator,
         gate.exception_class,
@@ -2086,6 +2129,10 @@ fn legacy_matrix_public_gate_detail(
         gate.coordinator,
         gate.exception_class,
     )
+}
+
+fn uses_legacy_matrix_binding_contract(profile: Profile, revision: &str) -> bool {
+    profile == Profile::Pr && revision == LEGACY_MATRIX_BINDING_REVISION
 }
 
 fn matrix_binding_root(manifests: &[Vec<u8>]) -> String {
@@ -2117,13 +2164,16 @@ fn matrix_public_product_outcome(
     Ok(crate::matrix_product_target::MatrixProductOutcome::Diagnostic)
 }
 
-fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
+struct MatrixGenerationOutcome {
+    root: String,
+}
+
+fn run_generation_matrix_gate(root: &Path) -> Result<MatrixGenerationOutcome, XtaskError> {
     let invocation = crate::generation::VerificationInvocation::claim(root)?;
     let report = crate::generation::verify(root, invocation)?;
-    Ok(format!(
-        "canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, Schema Digest, and validation fixtures; {}",
-        report.display()
-    ))
+    Ok(MatrixGenerationOutcome {
+        root: format!("sha256:{}", report.artifact_digest()),
+    })
 }
 
 fn run_dynamic_analysis_gate(
@@ -3987,8 +4037,8 @@ fn validate_matrix_controlled_steps(
     )?;
     let steps = &retained.typed_invocation.controlled_steps;
     let expected_steps = expected.steps();
-    let legacy_binding_contract = context.profile == Profile::Pr
-        && context.revision == "bd5386209359d8395b90e18a16fa20a6962c935b";
+    let legacy_binding_contract =
+        uses_legacy_matrix_binding_contract(context.profile, context.revision);
     let cardinality_matches = match retained.result.as_str() {
         "passed" => steps.len() == expected_steps.len(),
         "failed" => expected_steps.is_empty() || (1..=expected_steps.len()).contains(&steps.len()),
@@ -4007,6 +4057,8 @@ fn validate_matrix_controlled_steps(
             gate,
             expected_steps.len(),
             expected.binding_root(),
+            expected.generation_root(),
+            context.profile,
             expected.product_outcome(),
         )?
     };
@@ -9303,15 +9355,45 @@ mod tests {
         NEXTEST_PR_ARGUMENTS, NotApplicableReason, Options, Profile, RawReportBinding,
         RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
         character_count_in_range, evidence_json, gate_invocation_json, json_string,
-        nextest_completed_test_count, parse_gate_invocation_value, raw_report_json_with_limit,
+        legacy_matrix_public_gate_detail, nextest_completed_test_count,
+        parse_gate_invocation_value, raw_report_json_with_limit,
         registered_dependency_command_matches, registered_runner_command_matches,
         run_generation_matrix_gate, sha256_digest, unavailable_evidence_identity,
-        valid_hex_identity, valid_raw_report_schema_path, valid_sha256_digest,
-        validate_configuration_parser_threat_model_text, validate_serialized_evidence,
+        uses_legacy_matrix_binding_contract, valid_hex_identity, valid_raw_report_schema_path,
+        valid_sha256_digest, validate_configuration_parser_threat_model_text,
+        validate_serialized_evidence,
     };
-    use crate::registry::Registry;
+    use crate::matrix_product_target::MatrixProductOutcome;
+    use crate::registry::{Gate, Registry};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn historical_matrix_binding_summary_remains_exact_and_bounded() {
+        let gate = Gate {
+            id: "EG-MATRIX".to_owned(),
+            stages: BTreeSet::from(["PR".to_owned(), "EXT".to_owned(), "QUAL".to_owned()]),
+            coordinator: "Quality Engineering".to_owned(),
+            timeout_seconds: 1_800,
+            memory_mib: 4_096,
+            exception_class: "temporary".to_owned(),
+            activation: "risk".to_owned(),
+            runner: "matrix".to_owned(),
+        };
+        let detail = legacy_matrix_public_gate_detail(&gate, 14, MatrixProductOutcome::Missing);
+        assert!(uses_legacy_matrix_binding_contract(
+            Profile::Pr,
+            "bd5386209359d8395b90e18a16fa20a6962c935b"
+        ));
+        assert!(!uses_legacy_matrix_binding_contract(
+            Profile::Ext,
+            "bd5386209359d8395b90e18a16fa20a6962c935b"
+        ));
+        assert!(detail.starts_with(
+            "exact-targets=14; product-outcome=missing; qualification=no-product-qualification"
+        ));
+        assert!(detail.len() <= 512);
+    }
 
     #[test]
     fn defaults_to_the_complete_pull_request_profile() {

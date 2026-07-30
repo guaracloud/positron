@@ -23,6 +23,8 @@ fn quality_executes_every_exact_diagnostic_target_with_independent_retained_iden
         let gate = gate_record(&evidence, "EG-MATRIX")?;
         let detail = matrix_public_detail(gate)?;
         if !detail.contains("binding-root=sha256:")
+            || !detail.contains("generation-outcome=clean")
+            || !detail.contains("generation-root=sha256:")
             || !detail.contains("product-outcome=diagnostic")
             || detail.contains("identity=")
             || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
@@ -74,26 +76,29 @@ fn install_product_target(fixture: &Fixture) -> TestResult {
 
 #[test]
 fn matrix_product_target_missing_registry_retains_bounded_typed_outcome() -> TestResult {
-    let fixture = Fixture::create()?;
-    install_product_target(&fixture)?;
-    fixture.build_fixture_xtask()?;
+    let fixture = create_matrix_fixture()?;
     let result = (|| {
-        fs::remove_file(
-            fixture
-                .root
-                .join("qualification/engineering/matrix-product-targets.tsv"),
-        )?;
+        let registry = fixture
+            .root
+            .join("qualification/engineering/matrix-product-targets.tsv");
+        if registry.exists() {
+            fs::remove_file(registry)?;
+        }
         let output = matrix_quality_output(&fixture, "pr")?;
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                "missing product registry must leave the diagnostic matrix runnable",
-            )
+            return Err(std::io::Error::other(format!(
+                "missing product registry must leave the diagnostic matrix runnable: stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
             .into());
         }
         let evidence = fixture.latest_evidence()?;
         let gate = gate_record(&evidence, "EG-MATRIX")?;
         let detail = matrix_public_detail(gate)?;
-        if !detail.contains("product-outcome=missing")
+        if !detail.contains("generation-outcome=clean")
+            || !detail.contains("generation-root=sha256:")
+            || !detail.contains("product-outcome=missing")
             || detail.contains("identity=")
             || detail.len() > MAXIMUM_MATRIX_CONSOLE_BYTES
         {
@@ -107,6 +112,49 @@ fn matrix_product_target_missing_registry_retains_bounded_typed_outcome() -> Tes
     let cleanup = fixture.remove();
     cleanup?;
     result
+}
+
+#[test]
+fn missing_product_registry_cannot_mask_generation_drift_with_passing_diagnostics() -> TestResult {
+    for relative in [
+        "crates/positron-api/src/generated.rs",
+        "configuration/reference.md",
+        "configuration/schema.json",
+    ] {
+        let fixture = create_matrix_fixture()?;
+        let result: TestResult = (|| {
+            let product_registry = fixture
+                .root
+                .join("qualification/engineering/matrix-product-targets.tsv");
+            if product_registry.exists() {
+                fs::remove_file(product_registry)?;
+            }
+            fs::write(
+                fixture.root.join(relative),
+                b"drifted generated artifact\n",
+            )?;
+            let output = matrix_quality_output(&fixture, "pr")?;
+            assert_rejected_output(
+                &output,
+                "canonical generation is not clean and deterministic",
+            )?;
+            let evidence = fixture.latest_evidence()?;
+            let gate = gate_record(&evidence, "EG-MATRIX")?;
+            if !gate.contains("\"result\": \"failed\"")
+                || gate.matches("\"resolved_program\":").count() != 14
+            {
+                return Err(std::io::Error::other(format!(
+                    "{relative} generation drift was masked or did not retain all passing exact diagnostics"
+                ))
+                .into());
+            }
+            Ok(())
+        })();
+        let cleanup = fixture.remove();
+        cleanup?;
+        result?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -297,6 +345,18 @@ fn parent_rejects_coupled_matrix_command_environment_and_result_tampering() -> T
             "retained EG-MATRIX summary does not match its bounded public contract",
         ),
         (
+            "generation-outcome",
+            "generation-outcome=clean",
+            "generation-outcome=unchecked",
+            "retained EG-MATRIX summary does not match its bounded public contract",
+        ),
+        (
+            "generation-root",
+            "generation-root=sha256:",
+            "generation-root=sha256:0",
+            "retained EG-MATRIX summary does not match its bounded public contract",
+        ),
+        (
             "result",
             "\"verdict\":\"exit-status:exit status: 0\"",
             "\"verdict\":\"exit-status:exit status: 73\"",
@@ -313,7 +373,7 @@ fn parent_rejects_coupled_matrix_command_environment_and_result_tampering() -> T
                 .into());
             }
             let path = fixture.latest_evidence_path()?;
-            if name == "command" {
+            if name != "result" {
                 replace_once_after(&path, "\"gate_id\": \"EG-MATRIX\"", original, replacement)?;
             } else {
                 let evidence = fixture.latest_evidence()?;
