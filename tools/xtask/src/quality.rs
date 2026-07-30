@@ -1282,6 +1282,23 @@ fn dynamic_invocation_environment_digest(
     format!("sha256:{:x}", hasher.finalize())
 }
 
+fn matrix_invocation_environment_digest(
+    snapshot_digest: &str,
+    overrides: &[(String, String)],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"positron-matrix-invocation-environment-v1\0");
+    hasher.update(snapshot_digest.as_bytes());
+    hasher.update(b"\0");
+    for (name, value) in overrides {
+        hasher.update(name.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 fn invocation_input_identity(input: &InvocationInput) -> (&'static str, usize, String) {
     match input {
         InvocationInput::Null => ("null", 0, "-".to_owned()),
@@ -1495,7 +1512,19 @@ fn execute_gate(
             capture,
         ),
         "test" => run_test_gate(root, budget, environment, capture),
-        "matrix" => run_generation_matrix_gate(root),
+        "matrix" => run_exact_target_matrix_gate(
+            DynamicAnalysisContext {
+                root,
+                registry,
+                profile: options.profile,
+                budget,
+                environment,
+                cancellation: Arc::clone(dynamic_cancellation),
+                cancellation_marker: dynamic_cancellation_marker,
+            },
+            gate,
+            capture,
+        ),
         "resource" => run_bounded_runner_gate(
             qualification_fixtures.bounded_runners(),
             root,
@@ -1733,6 +1762,61 @@ fn run_integrity_gate(
         &environment.temporary_root,
         &integrity_identity,
     )
+}
+
+fn run_exact_target_matrix_gate(
+    context: DynamicAnalysisContext<'_>,
+    gate: &Gate,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    let DynamicAnalysisContext {
+        root,
+        registry,
+        profile,
+        budget,
+        environment,
+        cancellation,
+        cancellation_marker,
+    } = context;
+    let targets = crate::matrix_targets::FrozenMatrixTargets::load(root, gate)?;
+    let deadline = Instant::now() + budget;
+    let mut results = Vec::new();
+    for target in targets.selected(profile) {
+        let plan =
+            crate::matrix_execution_plan::MatrixExecutionPlan::capture(target, &registry.tools)?;
+        let timeout = remaining(deadline)?.min(plan.timeout());
+        let plan_environment = plan
+            .environment()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let retained_environment_digest =
+            matrix_invocation_environment_digest(environment.digest(), plan.environment());
+        let outcome = run_status_with_options(
+            root,
+            environment,
+            plan.program(),
+            plan.arguments(),
+            StatusOptions {
+                timeout,
+                environment: &plan_environment,
+                retained_environment_digest: Some(retained_environment_digest),
+                cancellation: Arc::clone(&cancellation),
+                cancellation_marker,
+                maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
+                capture,
+            },
+        )?;
+        target.validate_output(&outcome.stdout)?;
+        results.push(plan.retained_identity().to_owned());
+    }
+    let generation = run_generation_matrix_gate(root)?;
+    let target_detail = if results.is_empty() {
+        "exact-targets=none-for-qual-diagnostic-boundary".to_owned()
+    } else {
+        results.join(" | ")
+    };
+    Ok(format!("{target_detail}; {generation}"))
 }
 
 fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
@@ -3434,6 +3518,9 @@ fn validate_registered_controlled_steps(
     if gate.runner == "dynamic-analysis" {
         return validate_dynamic_controlled_steps(gate, retained, context);
     }
+    if gate.runner == "matrix" {
+        return validate_matrix_controlled_steps(gate, retained, context);
+    }
     let expected_step_count =
         canonical_controlled_step_count(gate, context.profile, context.registry);
     let cardinality_matches = if expected_step_count == 0 {
@@ -3577,6 +3664,71 @@ fn validate_dynamic_controlled_steps(
                 context.path,
                 format!(
                     "retained EG-DYNAMIC controlled step {index} does not match its independently derived canonical plan"
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_matrix_controlled_steps(
+    gate: &Gate,
+    retained: &ParsedGateRecord,
+    context: &RetainedGateValidationContext<'_>,
+) -> Result<(), XtaskError> {
+    let expected = crate::matrix_verifier::ExpectedMatrixGate::capture(
+        context.root,
+        gate,
+        context.profile,
+        &context.registry.tools,
+    )?;
+    let steps = &retained.typed_invocation.controlled_steps;
+    let expected_steps = expected.steps();
+    let cardinality_matches = match retained.result.as_str() {
+        "passed" => steps.len() == expected_steps.len(),
+        "failed" => expected_steps.is_empty() || (1..=expected_steps.len()).contains(&steps.len()),
+        _ => false,
+    };
+    if !cardinality_matches {
+        return invalid_json(
+            context.path,
+            "retained EG-MATRIX does not contain the independently derived exact target step set",
+        );
+    }
+    let generation_suffix = "canonical generation parity is clean across configuration, Rust, HTTP/JSON, OpenAPI, Schema Digest, and validation fixtures";
+    let expected_prefix = if expected_steps.is_empty() {
+        "exact-targets=none-for-qual-diagnostic-boundary".to_owned()
+    } else {
+        expected.passed_detail().to_owned()
+    };
+    if retained.result == "passed"
+        && (!retained.detail.starts_with(&expected_prefix)
+            || !retained.detail.contains(generation_suffix))
+    {
+        return invalid_json(
+            context.path,
+            "retained EG-MATRIX detail does not match independently derived target and plan identities",
+        );
+    }
+    for (index, (step, expected_step)) in steps.iter().zip(expected_steps.iter()).enumerate() {
+        let resolved = Path::new(&step.resolved_program);
+        let resolved_matches = resolved.is_absolute()
+            && resolved.file_name().and_then(OsStr::to_str) == Some(expected_step.program());
+        if step.program != expected_step.program()
+            || step.arguments != expected_step.arguments()
+            || !resolved_matches
+            || step.timeout_ms > expected_step.maximum_timeout().as_millis()
+            || step.timeout_ms > u128::from(gate.timeout_seconds) * 1_000
+            || step.environment_digest
+                != expected_step.invocation_environment_digest(context.snapshot_digest)
+            || step.input_kind != "null"
+            || step.input_bytes != 0
+            || step.input_sha256 != "-"
+        {
+            return invalid_json(
+                context.path,
+                format!(
+                    "retained EG-MATRIX controlled step {index} does not match its independently derived canonical plan"
                 ),
             );
         }
@@ -6417,6 +6569,10 @@ impl EnvironmentSnapshot {
                     | "POSITRON_DYNAMIC_SEED"
                     | "POSITRON_DYNAMIC_SCHEDULE"
                     | "POSITRON_DYNAMIC_MINIMIZED_FAILURE_ID"
+                    | "POSITRON_MATRIX_TARGET_ID"
+                    | "POSITRON_MATRIX_KIND"
+                    | "POSITRON_MATRIX_TARGET_IDENTITY"
+                    | "POSITRON_MATRIX_DIAGNOSTIC"
             ) {
                 return Err(XtaskError::invalid(
                     "controlled harness environment",

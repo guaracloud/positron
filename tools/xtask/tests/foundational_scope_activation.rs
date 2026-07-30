@@ -485,6 +485,8 @@ mod m0_09_dynamic_verifier;
 mod m0_10_final_blockers;
 #[path = "foundational_scope_activation/m0_10_security_crypto.rs"]
 mod m0_10_security_crypto;
+#[path = "foundational_scope_activation/m0_11_matrix.rs"]
+mod m0_11_matrix;
 
 #[cfg(unix)]
 #[test]

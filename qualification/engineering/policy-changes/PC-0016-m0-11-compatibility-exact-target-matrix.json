@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "id": "PC-0016-m0-11-compatibility-exact-target-matrix",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0027-implement-the-positron-application-entirely-in-rust.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/quality-gates.md"
+  ],
+  "purpose": "Implement Quality Engineering-owned diagnostic EG-MATRIX exact-target runner capability without application behavior or Qualification Cell advancement.",
+  "change": {
+    "issue": 12,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned EG-MATRIX verdict and immutable retained report",
+    "affected_scopes": ["xtask", "qualification/engineering gate and evidence registries"],
+    "dependency_review": {"new_dependencies": "none", "rationale": "Uses the Rust standard library, existing sha2 dependency, and existing controlled-execution owner."},
+    "runner_contract": [
+      "exact-targets.tsv is a bounded frozen ordered registry containing exactly compile, contract, protocol, producer, provider, platform, architecture, filesystem, StorageClass, registry, distribution, SDK, compatibility, and evidence targets once each.",
+      "Every target binds EG-MATRIX, Quality Engineering ownership, PR|EXT stage, diagnostic-only classification, concrete canonical identity, timeout, cargo tool identity/version, canonical argv, explicit environment, input digest, registry digest, plan digest, result, and controlled execution lifecycle evidence.",
+      "The runner reuses controlled_execution for launch, bounded capture, process-group reconciliation, deadline, cancellation marker, missing-tool, and first-failure retention; it does not duplicate lifecycle ownership.",
+      "matrix_verifier independently re-loads descriptors and derives plan, tool, argv, environment, input, timeout, ordering, and detail expectations without calling the runner execution-plan builder.",
+      "QUAL executes no M0 diagnostic target and remains rejected by the existing exact-artifact qualification boundary; no matrix target, emulator, fixture, or local run becomes Qualified."
+    ]
+  },
+  "initial_red": {"command": "cargo test --locked --package xtask --test foundational_scope_activation m0_11_matrix::quality_executes_every_exact_diagnostic_target_with_independent_retained_identity -- --exact", "result": "Failed before implementation because EG-MATRIX performed generation parity only and retained no exact target executions."},
+  "focused_validation": [
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_11_matrix:: -- --nocapture",
+    "cargo test --locked --package xtask --bin xtask matrix_targets::tests -- --nocapture",
+    "cargo fmt --check"
+  ],
+  "detection_gained": [
+    "Missing, malformed, oversized, duplicate, reordered, stale, noncanonical owner/stage/gate/timeout, non-diagnostic, or identity-less matrix rows fail closed before execution.",
+    "Each selected diagnostic target produces an independent controlled step; nonzero, malformed output, deadline, cancellation, capture ceiling, missing tool, and retry-to-green retain a failed first attempt and never fall back.",
+    "Golden and intentionally invalid descriptor fixtures exercise canonical registry parity and the retained negative path; parent evidence validation rejects tampered raw matrix evidence."
+  ],
+  "detection_lost": [],
+  "lifecycle_test_map": {
+    "pass_and_independence": "quality_executes_every_exact_diagnostic_target_with_independent_retained_identity",
+    "fail_malformed_retry": "quality_rejects_matrix_lifecycle_failures_without_retry_or_fallback",
+    "timeout_resource_stale": "quality_rejects_timeout_stale_descriptor_and_capture_ceiling_without_matrix_fallback",
+    "missing_tool": "quality_rejects_a_missing_matrix_tool_without_an_ambient_fallback",
+    "cancellation": "quality_routes_matrix_cancellation_through_the_shared_control_marker",
+    "golden_negative": "quality_rejects_retained_golden_invalid_matrix_descriptor_before_execution",
+    "retained_tamper": "parent_rejects_coupled_matrix_command_environment_and_result_tampering",
+    "qualification_boundary": "quality_qual_does_not_execute_diagnostic_matrix_targets_or_claim_qualification"
+  },
+  "migration": {"from": "Generation-only EG-MATRIX verification", "to": "Frozen diagnostic target descriptors plus controlled per-target runner and independent retained verifier", "rollback": "Revert this policy record, registry, runner modules, fixtures, and tests together; retained evidence remains immutable."},
+  "qualification_claim": "None. This is diagnostic Quality Engineering harness behavior only. No exact target or Qualification Cell is Qualified, merge eligible, released, or deployed.",
+  "approvals_required": ["Architecture", "Quality Engineering"],
+  "approval": {"status": "pending-independent-review", "reviewers": [], "reviewed_revisions": []}
+}
