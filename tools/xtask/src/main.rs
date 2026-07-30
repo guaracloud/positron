@@ -84,6 +84,18 @@ fn run() -> Result<(), XtaskError> {
             let options = quality::Options::parse(arguments)?;
             quality::run(&options)
         },
+        "quality-security-probe" => {
+            ensure_no_more_arguments(arguments)?;
+            security_harness::run_security_probe_process()
+        },
+        "quality-secret-canary" => {
+            ensure_no_more_arguments(arguments)?;
+            let root = env::current_dir()
+                .map_err(|source| XtaskError::io("resolve current directory", source))?;
+            let result = security_harness::run_secret_canary_harness(&root)?;
+            println!("{result}");
+            Ok(())
+        },
         "quality-internal-cancel-dynamic" => dynamic_cancellation::run(arguments),
         "quality-fixture" => qualification_fixtures::run_process(arguments),
         "quality-bounded-runner" => bounded_runners::run_process(arguments),
@@ -116,7 +128,7 @@ fn ensure_no_more_arguments(mut arguments: impl Iterator<Item = String>) -> Resu
 
 fn usage() -> String {
     format!(
-        "Usage:\n  cargo xtask generate\n  cargo xtask verify-generation\n  cargo xtask generate-api\n  cargo xtask generate-config\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation|--retain-m0-03-mutation|--retain-m0-04-mutation]\n  cargo xtask setup\n  cargo xtask help",
+        "Usage:\n  cargo xtask generate\n  cargo xtask verify-generation\n  cargo xtask generate-api\n  cargo xtask generate-config\n  cargo xtask quality [--profile {}] [--retain-m0-02-mutation|--retain-m0-03-mutation|--retain-m0-04-mutation]\n  cargo xtask quality-security-probe\n  cargo xtask quality-secret-canary\n  cargo xtask setup\n  cargo xtask help",
         Profile::accepted_values()
     )
 }

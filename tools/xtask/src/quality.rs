@@ -3578,12 +3578,19 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
         "fault" => 0,
         "integrity" => 0,
         "safety" => usize::from(registry.has_m0_04_configuration_scope()),
-        "security" => 1,
-        "secrets" | "supply" => {
+        "security" => 2,
+        "supply" => {
             if matches!(profile, Profile::Ext | Profile::Qual) {
                 2
             } else {
                 1
+            }
+        },
+        "secrets" => {
+            if matches!(profile, Profile::Ext | Profile::Qual) {
+                3
+            } else {
+                2
             }
         },
         "concurrency" | "resource" => 1,
@@ -3730,7 +3737,7 @@ fn registered_runner_command_matches(
             },
             _ => false,
         },
-        "safety" | "security" => {
+        "safety" => {
             index == 0
                 && program == "cargo"
                 && args
@@ -3744,20 +3751,64 @@ fn registered_runner_command_matches(
                         "preflight_",
                     ]
         },
-        "secrets" => match index {
+        "security" => match index {
             0 => {
-                program == "gitleaks"
+                program == "cargo"
                     && args
                         == [
-                            "dir",
-                            "--no-banner",
-                            "--no-color",
-                            "--redact=100",
-                            "--max-target-megabytes=20",
-                            ".",
+                            "test",
+                            "--locked",
+                            "--package",
+                            "positron-config",
+                            "--test",
+                            "configuration_foundation",
+                            "preflight_",
                         ]
             },
-            1 if matches!(profile, Profile::Ext | Profile::Qual) => {
+            1 => {
+                program == "cargo"
+                    && args
+                        == [
+                            "run",
+                            "--locked",
+                            "--package",
+                            "xtask",
+                            "--bin",
+                            "xtask",
+                            "--",
+                            "quality-security-probe",
+                        ]
+            },
+            _ => false,
+        },
+        "secrets" => match index {
+            0 => {
+                program == "cargo"
+                    && args
+                    == [
+                        "run",
+                        "--locked",
+                        "--package",
+                        "xtask",
+                        "--bin",
+                        "xtask",
+                        "--",
+                        "quality-secret-canary",
+                    ]
+            },
+            1 => {
+                program == "gitleaks"
+                    && args
+                    == [
+                        "dir",
+                        "--no-banner",
+                        "--no-color",
+                        "--redact=100",
+                        "--max-target-megabytes=20",
+                        ".",
+                    ]
+            },
+            2 if matches!(profile, Profile::Ext | Profile::Qual) => {
                 program == "gitleaks"
                     && args
                         == [
@@ -5247,13 +5298,36 @@ fn run_security_gate(
     validate_configuration_parser_threat_model_text(&threat_model)?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
-    let probes = crate::security_harness::run_security_probe_harness()?;
+    let probes = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "run",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "--",
+            "quality-security-probe",
+        ],
+        budget,
+        capture,
+    )?;
+    let expected_probe = "security-probe-result-v1=authn:unauthenticated|authz:forbidden|tenant:tenant-mismatch|allow:allowed";
+    if !probes.stdout.contains(expected_probe) {
+        return Err(XtaskError::invalid(
+            "security gate",
+            "controlled probe child did not return the registered typed result",
+        ));
+    }
     Ok(format!(
         "internal:{} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,
-        probes,
+        expected_probe,
     ))
 }
 
@@ -5365,7 +5439,34 @@ fn run_secret_gate(
 ) -> Result<String, XtaskError> {
     let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
     let descriptor = catalog.descriptor_for("EG-SECRETS")?;
-    let canary = crate::security_harness::run_secret_canary_harness()?;
+    let canary = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "run",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "--",
+            "quality-secret-canary",
+        ],
+        budget,
+        capture,
+    )?;
+    let expected_canary = "secret-canary-harness-v2=collected-artifacts:9";
+    if !canary.stdout.contains(expected_canary)
+        || !canary
+            .stdout
+            .contains("negative-fixture=secret-canary-leak-rejected")
+    {
+        return Err(XtaskError::invalid(
+            "secret gate",
+            "controlled canary child did not return the registered redaction result",
+        ));
+    }
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
@@ -5410,7 +5511,7 @@ fn run_secret_gate(
         "internal:{} | {} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
-        canary,
+        expected_canary,
         commands.join(" | "),
     ))
 }

@@ -5,7 +5,6 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
 -> TestResult {
     let fixture = Fixture::create_current_registry()?;
     let result = (|| {
-        enable_security_crypto_gate(&fixture)?;
         let output = fixture.quality_output_for("pr")?;
         if !output.status.success() {
             return Err(std::io::Error::other(format!(
@@ -19,10 +18,13 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
         for (gate, required) in [
             (
                 "EG-SECURITY",
-                "security-probe-v1=authn|authz|tenant-isolation",
+                "security-probe-result-v1=authn:unauthenticated|authz:forbidden|tenant:tenant-mismatch|allow:allowed",
             ),
             ("EG-CRYPTO", "crypto-runner-v1"),
-            ("EG-SECRETS", "secret-canary-harness-v1=sinks:9"),
+            (
+                "EG-SECRETS",
+                "secret-canary-harness-v2=collected-artifacts:9",
+            ),
         ] {
             let report =
                 fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, gate)?)?;
@@ -53,7 +55,6 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
 fn quality_rejects_security_catalog_at_the_exact_bounded_read_ceiling() -> TestResult {
     let fixture = Fixture::create_current_registry()?;
     let result = (|| {
-        enable_security_crypto_gate(&fixture)?;
         let path = fixture
             .root
             .join("qualification/engineering/security-runners.tsv");
@@ -107,7 +108,6 @@ fn current_scope_registry_selects_crypto_without_a_fixture_activation_override()
 fn quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor() -> TestResult {
     let fixture = Fixture::create_current_registry()?;
     let result = (|| {
-        enable_security_crypto_gate(&fixture)?;
         let path = fixture
             .root
             .join("qualification/engineering/security-runners.tsv");
@@ -137,11 +137,32 @@ fn quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor() -> Te
     result
 }
 
-fn enable_security_crypto_gate(fixture: &Fixture) -> TestResult {
-    set_scope_field(
-        &fixture.root,
-        "xtask",
-        "risk_gates",
-        "EG-00|EG-ARCH|EG-BUILD|EG-CRYPTO|EG-DEPS|EG-DOCS|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
-    )
+#[test]
+fn quality_rejects_drifted_committed_canary_golden_and_leak_fixtures() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        let golden = fixture.root.join(
+            "qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv",
+        );
+        let original_golden = fs::read_to_string(&golden)?;
+        fs::write(
+            &golden,
+            original_golden.replacen("REDACTED:logs", "REDACTED:forged", 1),
+        )?;
+        let golden_output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&golden_output, "committed canary golden")?;
+        fs::write(&golden, original_golden)?;
+
+        let leak = fixture
+            .root
+            .join("qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv");
+        let original_leak = fs::read_to_string(&leak)?;
+        fs::write(&leak, original_leak.replacen("\tleak", "\tredacted", 1))?;
+        let leak_output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(&leak_output, "intentional leak fixture")?;
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
 }

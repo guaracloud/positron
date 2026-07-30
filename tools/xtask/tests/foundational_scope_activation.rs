@@ -7047,6 +7047,30 @@ case "$command" in
       printf '%s\n' 'GENERATED_DOC_NON_SQUARE_SECRET_CANARY' >> "$search_index"
     fi
     ;;
+  run)
+    case " $* " in
+      *" quality-security-probe "*)
+        printf '%s\n' 'security-probe-result-v1=authn:unauthenticated|authz:forbidden|tenant:tenant-mismatch|allow:allowed'
+        ;;
+      *" quality-secret-canary "*)
+        golden=qualification/fixtures/adversarial/cryptography/m0-10-security-canary-golden.tsv
+        leak=qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv
+        if [ "$(wc -l < "$golden")" -ne 10 ] || ! grep -qx 'logs	REDACTED:logs' "$golden"; then
+          printf '%s\n' 'committed canary golden drifted' >&2
+          exit 79
+        fi
+        if [ "$(wc -l < "$leak")" -ne 2 ] || ! grep -qx 'support-artifacts	leak' "$leak"; then
+          printf '%s\n' 'intentional leak fixture drifted' >&2
+          exit 79
+        fi
+        printf '%s\n' 'secret-canary-harness-v2=collected-artifacts:9; negative-fixture=secret-canary-leak-rejected'
+        ;;
+      *)
+        printf '%s\n' 'fixture received an unregistered xtask child command' >&2
+        exit 77
+        ;;
+    esac
+    ;;
   test)
     package=
     previous=
