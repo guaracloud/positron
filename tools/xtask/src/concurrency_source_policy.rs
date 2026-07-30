@@ -281,7 +281,22 @@ fn reject_forbidden_invocations(source: &Path, tokens: &[SourceToken]) -> Result
         .iter()
         .map(|token| token.kind.clone())
         .collect::<Vec<_>>();
-    let aliases = resolved_import_aliases(&kinds)?;
+    let imports = resolved_imports(&kinds)?;
+    for glob in &imports.globs {
+        let resolved = resolve_alias_path(glob, &imports.aliases);
+        if matches!(
+            resolved.as_slice(),
+            [std, thread] if std == "std" && thread == "thread"
+        ) || matches!(
+            resolved.as_slice(),
+            [std, sync, mpsc] if std == "std" && sync == "sync" && mpsc == "mpsc"
+        ) {
+            return Err(XtaskError::invalid_path(
+                source,
+                "forbidden concurrency primitive glob import in activated tooling source",
+            ));
+        }
+    }
     for start in 0..kinds.len() {
         let Some(path) = source_path_at(&kinds, start) else {
             continue;
@@ -299,7 +314,7 @@ fn reject_forbidden_invocations(source: &Path, tokens: &[SourceToken]) -> Result
                 "unbounded concurrency primitive in activated tooling source",
             ));
         }
-        let resolved = resolve_alias_path(&path.segments, &aliases);
+        let resolved = resolve_alias_path(&path.segments, &imports.aliases);
         if matches_forbidden_function_item(&resolved) {
             return Err(XtaskError::invalid_path(
                 source,
@@ -338,10 +353,14 @@ struct SourcePath {
     end: usize,
 }
 
-fn resolved_import_aliases(
-    tokens: &[UseToken],
-) -> Result<BTreeMap<String, Vec<String>>, XtaskError> {
+struct ResolvedImports {
+    aliases: BTreeMap<String, Vec<String>>,
+    globs: Vec<Vec<String>>,
+}
+
+fn resolved_imports(tokens: &[UseToken]) -> Result<ResolvedImports, XtaskError> {
     let mut bindings = Vec::new();
+    let mut globs = Vec::new();
     let mut cursor = 0;
     while cursor < tokens.len() {
         if identifier_at(tokens, cursor) != Some("use") {
@@ -349,7 +368,7 @@ fn resolved_import_aliases(
             continue;
         }
         cursor += 1;
-        parse_use_tree(tokens, &mut cursor, &[], &mut bindings)?;
+        parse_use_tree(tokens, &mut cursor, &[], &mut bindings, &mut globs)?;
         if tokens.get(cursor) != Some(&UseToken::Semicolon) {
             return Err(XtaskError::invalid(
                 "concurrency source policy",
@@ -376,7 +395,7 @@ fn resolved_import_aliases(
             break;
         }
     }
-    Ok(aliases)
+    Ok(ResolvedImports { aliases, globs })
 }
 
 fn resolve_alias_path(path: &[String], aliases: &BTreeMap<String, Vec<String>>) -> Vec<String> {
@@ -561,7 +580,13 @@ fn parse_use_tree(
     cursor: &mut usize,
     prefix: &[String],
     bindings: &mut Vec<(Vec<String>, String)>,
+    globs: &mut Vec<Vec<String>>,
 ) -> Result<(), XtaskError> {
+    if tokens.get(*cursor) == Some(&UseToken::Glob) {
+        globs.push(prefix.to_vec());
+        *cursor += 1;
+        return Ok(());
+    }
     let mut path = prefix.to_vec();
     let Some(first) = identifier_at(tokens, *cursor) else {
         return Err(XtaskError::invalid(
@@ -588,6 +613,7 @@ fn parse_use_tree(
         }
         let Some(segment) = identifier_at(tokens, *cursor) else {
             if tokens.get(*cursor) == Some(&UseToken::Glob) {
+                globs.push(path);
                 *cursor += 1;
                 return Ok(());
             }
@@ -607,7 +633,7 @@ fn parse_use_tree(
                 *cursor += 1;
                 return Ok(());
             }
-            parse_use_tree(tokens, cursor, &path, bindings)?;
+            parse_use_tree(tokens, cursor, &path, bindings, globs)?;
             match tokens.get(*cursor) {
                 Some(UseToken::Comma) => *cursor += 1,
                 Some(UseToken::CloseGroup) => {

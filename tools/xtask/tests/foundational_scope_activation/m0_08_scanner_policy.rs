@@ -34,6 +34,51 @@ fn quality_rejects_raw_module_and_import_aliases_through_the_public_seam() -> Te
 }
 
 #[test]
+fn quality_rejects_bare_spawn_from_a_transitively_aliased_thread_glob_through_the_public_seam()
+-> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod transitive_thread_glob {\n    use std as platform;\n    use platform::thread as workers;\n    use workers::*;\n    fn invoke() {\n        let _worker = spawn(|| {});\n    }\n}\n",
+        "forbidden concurrency primitive glob import",
+    )
+}
+
+#[test]
+fn quality_rejects_bare_channel_from_a_transitively_aliased_mpsc_glob_through_the_public_seam()
+-> TestResult {
+    assert_concurrency_source_rejected(
+        "\n#[cfg(any())]\nmod transitive_mpsc_glob {\n    use std::sync as synchronization;\n    use synchronization::mpsc as mailbox;\n    use mailbox::*;\n    fn invoke() {\n        let _channel = channel::<()>();\n    }\n}\n",
+        "forbidden concurrency primitive glob import",
+    )
+}
+
+#[test]
+fn quality_accepts_an_unrelated_glob_import_through_the_public_seam() -> TestResult {
+    let fixture = Fixture::create()?;
+    let result = (|| {
+        enable_concurrency_gate(&fixture)?;
+        let source = fixture.root.join("tools/xtask/src/bounded_runners.rs");
+        let mut content = fs::read_to_string(&source)?;
+        content.push_str(
+            "\n#[cfg(any())]\nmod unrelated_glob {\n    use std::cmp::*;\n    fn invoke() {\n        let _minimum = min(1_usize, 2_usize);\n    }\n}\n",
+        );
+        fs::write(&source, content)?;
+        let output = fixture.quality_output_from_fixture_source("pr")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "safe unrelated glob import was rejected: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn quality_accepts_unrelated_raw_identifiers_through_the_public_seam() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
