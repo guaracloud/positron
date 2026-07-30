@@ -281,9 +281,10 @@ fn reject_forbidden_invocations(source: &Path, tokens: &[SourceToken]) -> Result
         .iter()
         .map(|token| token.kind.clone())
         .collect::<Vec<_>>();
-    let imports = resolved_imports(&kinds)?;
-    for glob in &imports.globs {
-        let resolved = resolve_alias_path(glob, &imports.aliases);
+    let mut globs = Vec::new();
+    let aliases = resolved_import_aliases(&kinds, &mut globs)?;
+    for glob in &globs {
+        let resolved = resolve_alias_path(glob, &aliases);
         if matches!(
             resolved.as_slice(),
             [std, thread] if std == "std" && thread == "thread"
@@ -314,7 +315,7 @@ fn reject_forbidden_invocations(source: &Path, tokens: &[SourceToken]) -> Result
                 "unbounded concurrency primitive in activated tooling source",
             ));
         }
-        let resolved = resolve_alias_path(&path.segments, &imports.aliases);
+        let resolved = resolve_alias_path(&path.segments, &aliases);
         if matches_forbidden_function_item(&resolved) {
             return Err(XtaskError::invalid_path(
                 source,
@@ -353,14 +354,11 @@ struct SourcePath {
     end: usize,
 }
 
-struct ResolvedImports {
-    aliases: BTreeMap<String, Vec<String>>,
-    globs: Vec<Vec<String>>,
-}
-
-fn resolved_imports(tokens: &[UseToken]) -> Result<ResolvedImports, XtaskError> {
+fn resolved_import_aliases(
+    tokens: &[UseToken],
+    globs: &mut Vec<Vec<String>>,
+) -> Result<BTreeMap<String, Vec<String>>, XtaskError> {
     let mut bindings = Vec::new();
-    let mut globs = Vec::new();
     let mut cursor = 0;
     while cursor < tokens.len() {
         if identifier_at(tokens, cursor) != Some("use") {
@@ -368,7 +366,7 @@ fn resolved_imports(tokens: &[UseToken]) -> Result<ResolvedImports, XtaskError> 
             continue;
         }
         cursor += 1;
-        parse_use_tree(tokens, &mut cursor, &[], &mut bindings, &mut globs)?;
+        parse_use_tree(tokens, &mut cursor, &[], &mut bindings, globs)?;
         if tokens.get(cursor) != Some(&UseToken::Semicolon) {
             return Err(XtaskError::invalid(
                 "concurrency source policy",
@@ -395,7 +393,7 @@ fn resolved_imports(tokens: &[UseToken]) -> Result<ResolvedImports, XtaskError> 
             break;
         }
     }
-    Ok(ResolvedImports { aliases, globs })
+    Ok(aliases)
 }
 
 fn resolve_alias_path(path: &[String], aliases: &BTreeMap<String, Vec<String>>) -> Vec<String> {

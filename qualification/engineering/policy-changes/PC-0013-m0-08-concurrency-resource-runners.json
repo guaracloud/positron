@@ -164,6 +164,14 @@
         "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-terminal-target-bd78786.WO3SyZ git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
         "observed_state": "The clean exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-terminal-races-bd78786.SheMaE/target/quality/evidence/1785379762336-bd78786df17f-15949.json. EG-TEST ran 454 tests: 453 passed. The two terminal lifecycle race regressions passed, while the escaped-descriptor regression retained its older unconditional termination-requested=true assertion even when the corrected owner honestly observed the direct child already reaped and its process group absent, with termination-requested=false, process-reaped=true, and live=0. All preceding gates, including EG-CONCURRENCY and EG-RESOURCE, passed, and origin remained at e9a5d950b6f44b556c992529fd6a49e9c2a83067.",
         "recovery": "Preserve this worktree, external target directory, and exact failed evidence. Keep the shutdown bound and reaping assertions, but accept termination-requested=false only for the closed already-exited, group-absent, process-reaped=true, live=0 path; retain termination-requested=true when signaling a live process group."
+      },
+      {
+        "revision": "7423795ad8185b75ba1a07521491e3bca46bf916",
+        "worktree": "/private/tmp/positron-m0-08-glob-worktree.c1L3Gu",
+        "cargo_target_dir": "/private/tmp/positron-m0-08-glob-target.yM9q1w",
+        "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-glob-target.yM9q1w git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
+        "observed_state": "The clean detached exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-glob-worktree.c1L3Gu/target/quality/evidence/1785381092162-7423795ad818-50745.json. EG-DOCS reported one redacted square-access-token finding at line 1 of the generated combined-workspace Rust search index, while EG-SECRETS passed the current tree, an isolated xtask rustdoc artifact contained no finding, and the exact parent revision's combined rustdoc artifact contained no finding. EG-TEST ran 457 tests and all 457 passed. The push did not update origin from ac6914bc06b15333c723d5027c26aa3028a53939.",
+        "recovery": "Preserve the failed evidence and inspect only the detector rule ID, generated file, line, and fingerprint metadata. Retain the existing resolved_import_aliases documentation owner, collect bounded glob paths through its explicit output parameter instead of adding a redundant private wrapper item that changes the compressed combined-workspace search-index projection, rerun targeted rustdoc and redacted artifact scanning, then run one fresh isolated exact-head publication attempt without adding a detector suppression or reclassifying the failed gate."
       }
     ]
   },
