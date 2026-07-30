@@ -2,10 +2,13 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use super::canary_budget::{ArtifactBudget, MAXIMUM_ARTIFACT_BYTES};
 use crate::error::XtaskError;
 
 const GOLDEN_PATH: &str =
@@ -15,13 +18,14 @@ const LEAK_PATH: &str =
 const TARGET_PATH: &str = "qualification/engineering/security-canary-targets.tsv";
 const MAXIMUM_FIXTURE_BYTES: u64 = 4_096;
 pub(super) const CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_V1";
+pub(super) const LEAK_CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_LEAK_V1";
 
 pub(super) fn emit_candidate(
     repository: &Path,
     artifact_root: &Path,
     canary_id: &str,
 ) -> Result<(), XtaskError> {
-    if canary_id != CANARY_ID || !artifact_root.is_dir() {
+    if !matches!(canary_id, CANARY_ID | LEAK_CANARY_ID) || !artifact_root.is_dir() {
         return Err(XtaskError::invalid(
             "candidate artifact emitter",
             "unregistered canary identity or parent-owned artifact root",
@@ -35,7 +39,8 @@ pub(super) fn emit_candidate(
             "intentional leak fixture does not select the registered support artifact",
         ));
     }
-    materialize(artifact_root, &golden, None)?;
+    let leak = (canary_id == LEAK_CANARY_ID).then_some(intentional_leak.0);
+    materialize(artifact_root, &golden, leak)?;
     Ok(())
 }
 
@@ -47,6 +52,7 @@ pub(super) fn scan_candidate(
     let golden = Golden::load(&repository.join(GOLDEN_PATH))?;
     let collected_root = artifact_root.join("collected");
     let mut collected = Vec::new();
+    let mut budget = ArtifactBudget::candidate();
     let entries = fs::read_dir(&collected_root)
         .map_err(|source| XtaskError::io(format!("read {}", collected_root.display()), source))?;
     for entry in entries {
@@ -65,8 +71,8 @@ pub(super) fn scan_candidate(
             ));
         };
         let sink = Sink::parse(label)?;
-        let bytes = fs::read(&path)
-            .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+        let bytes = read_bounded(&path, MAXIMUM_ARTIFACT_BYTES, "candidate artifact")?;
+        budget.charge(bytes.len())?;
         collected.push(Collected { sink, bytes });
     }
     independently_scan(&collected, &golden)?;
@@ -77,10 +83,13 @@ pub(super) fn scan_candidate(
             let path = collected_root.join(format!("{}.artifact", sink.label()));
             digest.update(sink.label());
             digest.update(b"\0");
-            digest
-                .update(fs::read(&path).map_err(|source| {
-                    XtaskError::io(format!("read {}", path.display()), source)
-                })?);
+            let artifact = collected
+                .iter()
+                .find(|artifact| artifact.sink == sink)
+                .ok_or_else(|| {
+                    XtaskError::invalid("candidate artifact scanner", "registered artifact missing")
+                })?;
+            digest.update(&artifact.bytes);
             Ok(format!("{}={}", sink.label(), path.display()))
         })
         .collect::<Result<Vec<_>, XtaskError>>()?;
@@ -94,7 +103,7 @@ pub(super) fn scan_candidate(
 fn validate_target_contract(repository: &Path) -> Result<String, XtaskError> {
     let path = repository.join(TARGET_PATH);
     let bytes = read_fixture(&path)?;
-    let expected = "target_id\trunner_id\tsemantic_owner\tcommand\tartifact_categories\tqualification\nxtask-security-runner-capability-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_V1\tlogs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts\trunner-capability-only\n";
+    let expected = "target_id\trunner_id\tsemantic_owner\tcommand\tartifact_categories\tqualification\nxtask-security-runner-capability-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_V1\tlogs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts\trunner-capability-only\nxtask-security-intentional-leak-negative-v1\tsecret-canary-runner-v1\tQuality Engineering\tcargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> POSITRON_SYNTHETIC_CANARY_LEAK_V1\tsupport-artifacts\tnegative-test-only\n";
     if bytes != expected.as_bytes() {
         return Err(XtaskError::invalid_path(
             &path,
@@ -286,16 +295,13 @@ fn redact(serialized: &[u8], sink: Sink) -> Vec<u8> {
     }
 }
 fn package_adapter(root: &Path, sink: Sink, written: &Path) -> Result<PathBuf, XtaskError> {
-    let bytes = fs::read(written)
-        .map_err(|source| XtaskError::io(format!("read {}", written.display()), source))?;
+    let bytes = read_bounded(written, MAXIMUM_ARTIFACT_BYTES, "written artifact")?;
     write_adapter(root, "packaged", sink, &bytes)
 }
 fn collect_adapter(root: &Path, sink: Sink, packaged: &Path) -> Result<Collected, XtaskError> {
-    let bytes = fs::read(packaged)
-        .map_err(|source| XtaskError::io(format!("read {}", packaged.display()), source))?;
+    let bytes = read_bounded(packaged, MAXIMUM_ARTIFACT_BYTES, "packaged artifact")?;
     let path = write_adapter(root, "collected", sink, &bytes)?;
-    let bytes = fs::read(&path)
-        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    let bytes = read_bounded(&path, MAXIMUM_ARTIFACT_BYTES, "collected artifact")?;
     Ok(Collected { sink, bytes })
 }
 fn write_adapter(
@@ -337,13 +343,30 @@ fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
 fn read_fixture(path: &Path) -> Result<Vec<u8>, XtaskError> {
-    let metadata = fs::metadata(path)
-        .map_err(|source| XtaskError::io(format!("stat {}", path.display()), source))?;
-    if metadata.len() > MAXIMUM_FIXTURE_BYTES {
-        return Err(XtaskError::invalid(
-            path.display().to_string(),
-            "committed fixture exceeds bounded size",
+    let maximum = usize::try_from(MAXIMUM_FIXTURE_BYTES)
+        .map_err(|_| XtaskError::invalid_path(path, "fixture bound is invalid"))?;
+    read_bounded(path, maximum, "committed fixture")
+}
+
+pub(super) fn read_bounded(
+    path: &Path,
+    maximum: usize,
+    subject: &str,
+) -> Result<Vec<u8>, XtaskError> {
+    let mut file = File::open(path)
+        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
+    let limit = u64::try_from(maximum.saturating_add(1))
+        .map_err(|_| XtaskError::invalid_path(path, "read bound is invalid"))?;
+    let mut bytes = Vec::with_capacity(maximum.saturating_add(1));
+    file.by_ref()
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| XtaskError::io(format!("bounded read {}", path.display()), source))?;
+    if bytes.len() > maximum {
+        return Err(XtaskError::invalid_path(
+            path,
+            format!("{subject} exceeds {maximum} bytes"),
         ));
     }
-    fs::read(path).map_err(|source| XtaskError::io(format!("read {}", path.display()), source))
+    Ok(bytes)
 }

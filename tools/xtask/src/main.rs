@@ -13,6 +13,7 @@ mod bounded_runners;
 mod concurrency_source_policy;
 mod config_generation;
 mod controlled_execution;
+mod crypto_targets;
 mod dynamic_cancellation;
 mod dynamic_catalog;
 mod dynamic_execution_plan;

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "version": 1,
+  "model_id": "TM-0010-m0-10-runner-crypto",
+  "semantic_owner": "Security and Key Management",
+  "trust_boundaries": ["xtask-crypto-known-answer-provider-boundary-v1"],
+  "surfaces": [
+    "tools/xtask/src/security_harness/crypto.rs",
+    "tools/xtask/src/crypto_targets.rs",
+    "tools/xtask/src/quality.rs",
+    "qualification/engineering/security-crypto-targets.tsv"
+  ],
+  "review_disposition": "reviewed-m0-10",
+  "review_revision": "542f383",
+  "record_digest": "sha256:13fc0dabcc5a71015de407eda2dd2cf36904bb1bd0b50eb1f02e17bdabe1108a"
+}

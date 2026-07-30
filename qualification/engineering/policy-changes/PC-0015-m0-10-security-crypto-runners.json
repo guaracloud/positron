@@ -24,6 +24,8 @@
       "security-runners.tsv is a bounded frozen catalog with exactly one descriptor for EG-SECURITY, EG-CRYPTO, and EG-SECRETS. Every descriptor binds the gate's registered stage and activation, evidence schema, threat-model identity, attack-surface identity, required checks, and secret-canary sink inventory.",
       "EG-SECURITY validates the M0-04 configuration parser threat model and executes its registered adversarial test through the controlled command boundary.",
       "security-threat-surfaces.tsv freezes one real model identity, semantic owner, trust-boundary surface set, revision-bound M0-10 changed-path set, and review disposition per runner; missing, duplicate, unowned, stale, or changed-path-drifted coverage fails closed and its digest is retained.",
+      "TM-0010 and TM-0011 are committed versioned threat-model records whose model, owner, trust boundary, covered surfaces, review revision, and record digest are resolved by the runner catalog.",
+      "security-crypto-targets.tsv selects the PR runner-capability target only in PR; EXT and QUAL return the typed NoActiveProductTarget outcome and cannot reuse the PR self-test or claim product qualification.",
       "EG-CRYPTO executes deterministic harness self-tests for a known-answer vector, duplicate-nonce rejection, closed provider failure, and test-only secret-buffer clearing. No Data Protection product target is active and the retained result explicitly makes no product or Qualification claim.",
       "EG-SECRETS creates and owns a per-attempt candidate-artifact root, supplies the registered root and synthetic canary identity to the controlled xtask candidate command, then independently recollects and scans the nine registered artifact categories before parent cleanup. The outcome is runner capability only and makes no product qualification claim.",
       "Missing, malformed, oversized, duplicate, unknown, stage-drifted, activation-drifted, or field-drifted catalog descriptors fail closed in retained gate evidence. The catalog digest is included in each selected runner detail."
@@ -42,12 +44,17 @@
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor -- --exact",
     "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence -- --exact",
-    "cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact"
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_executable_intentional_leak_with_retained_failed_evidence -- --exact",
+    "cargo test --locked --package xtask --test foundational_scope_activation m0_10_security_crypto::quality_rejects_missing_merge_base_and_uncovered_security_changes -- --exact",
+    "cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact",
+    "cargo test --locked --package xtask --bin xtask security_harness::canary_tests:: -- --nocapture",
+    "cargo test --locked --package xtask --bin xtask crypto_targets:: -- --nocapture"
   ],
   "detection_gained": [
     "The security descriptor catalog is read through a 16385-byte bounded stream and rejects an oversize catalog before an unbounded allocation.",
     "EG-SECURITY retains typed harness outcomes for missing authentication, denied authorization, cross-tenant request, and allowed request alongside the active configuration-parser threat-model result.",
     "EG-SECRETS executes one deterministic synthetic canary through the registered candidate command into a parent-owned artifact root; the parent rejects missing, extra, duplicate, tampered, or leaking artifacts and retains exact category paths and their digest.",
+    "Candidate artifact reads are bounded before allocation per artifact and in aggregate, and the committed intentional leak target is materialized by the real child then rejected by the independent parent scanner.",
     "The active xtask scope selects EG-CRYPTO, whose controlled self-test is retained with its exact command and runs known-answer, nonce, provider-failure, and test-buffer clearing checks."
   ],
   "detection_lost": [],

@@ -28,10 +28,22 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
         ] {
             let report =
                 fs::read_to_string(exact_raw_report_path(&fixture.root, &evidence, gate)?)?;
-            if !report.contains(required) {
+            if !report.contains(required)
+                || !report.contains("model-record-digest=sha256:")
+                || !report.contains("registered-surface-set-digest=sha256:")
+            {
                 return Err(std::io::Error::other(format!(
-                    "{gate} did not retain its registered runner identity `{required}`"
+                    "{gate} did not retain its registered runner and threat-model identity `{required}`"
                 ))
+                .into());
+            }
+            if gate == "EG-SECURITY"
+                && (!report.contains("merge-base=1111111111111111111111111111111111111111")
+                    || !report.contains("changed-path-set-digest=sha256:"))
+            {
+                return Err(std::io::Error::other(
+                    "EG-SECURITY did not bind the revision-derived changed-path set",
+                )
                 .into());
             }
         }
@@ -226,6 +238,38 @@ fn quality_retains_parent_owned_candidate_artifact_scan_evidence() -> TestResult
 }
 
 #[test]
+fn quality_rejects_executable_intentional_leak_with_retained_failed_evidence() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/emit-m0-10-intentional-leak"),
+            b"armed\n",
+        )?;
+        let output = fixture.quality_output_for("pr")?;
+        assert_rejected_output(
+            &output,
+            "collected artifact exposed a canary or drifted from golden",
+        )?;
+        let evidence = fixture.latest_evidence()?;
+        let secret_gate = gate_record(&evidence, "EG-SECRETS")?;
+        if !secret_gate.contains("\"result\": \"failed\"")
+            || !secret_gate.contains("secret canary scanner")
+        {
+            return Err(std::io::Error::other(
+                "intentional leak did not retain the failed parent-scanner verdict",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
 fn policy_rejects_a_referenced_validation_test_target_that_does_not_resolve() -> TestResult {
     let fixture = Fixture::create_current_registry()?;
     let result = (|| {
@@ -243,6 +287,72 @@ fn policy_rejects_a_referenced_validation_test_target_that_does_not_resolve() ->
         )?;
         let output = fixture.quality_output_for("pr")?;
         assert_rejected_output(&output, "PC-0015 validation command")
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_tampered_crypto_target_or_versioned_threat_model() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        for (path, from, to, subject) in [
+            (
+                "qualification/engineering/security-crypto-targets.tsv",
+                "xtask-crypto-runner-capability-v1",
+                "forged-target",
+                "profile-aware crypto target registry",
+            ),
+            (
+                "qualification/engineering/security/TM-0011-m0-10-runner-artifacts.json",
+                "\"version\": 1",
+                "\"version\": 2",
+                "versioned threat-model record",
+            ),
+        ] {
+            let path = fixture.root.join(path);
+            let original = fs::read_to_string(&path)?;
+            fs::write(&path, original.replacen(from, to, 1))?;
+            let output = fixture.quality_output_for("pr")?;
+            assert_rejected_output(&output, subject)?;
+            fs::write(path, original)?;
+        }
+        Ok(())
+    })();
+    let cleanup = fixture.remove();
+    cleanup?;
+    result
+}
+
+#[test]
+fn quality_rejects_missing_merge_base_and_uncovered_security_changes() -> TestResult {
+    let fixture = Fixture::create_current_registry()?;
+    let result = (|| {
+        for (marker, expected) in [
+            (
+                "m0-10-missing-merge-base",
+                "merge base could not be resolved to an exact revision",
+            ),
+            (
+                "m0-10-uncovered-security-path",
+                "security changed-path coverage",
+            ),
+        ] {
+            let path = fixture.root.join("target/quality-tools").join(marker);
+            fs::write(&path, b"armed\n")?;
+            let output = fixture.quality_output_for("pr")?;
+            fs::remove_file(path)?;
+            assert_rejected_output(&output, expected)?;
+            let evidence = fixture.latest_evidence()?;
+            if !gate_record(&evidence, "EG-SECURITY")?.contains("\"result\": \"failed\"") {
+                return Err(std::io::Error::other(format!(
+                    "{marker} did not retain a failed EG-SECURITY verdict"
+                ))
+                .into());
+            }
+        }
+        Ok(())
     })();
     let cleanup = fixture.remove();
     cleanup?;

@@ -24,13 +24,13 @@ const CONTRACTS: [(&str, &str, &str, &str); 3] = [
         "crypto-runner-v1",
         "TM-0010-m0-10-runner-crypto",
         "xtask-crypto-known-answer-provider-boundary-v1",
-        "tools/xtask/src/security_harness/crypto.rs|tools/xtask/src/quality.rs",
+        "tools/xtask/src/security_harness/crypto.rs|tools/xtask/src/crypto_targets.rs|tools/xtask/src/quality.rs|qualification/engineering/security-crypto-targets.tsv",
     ),
     (
         "secret-canary-runner-v1",
         "TM-0011-m0-10-runner-artifacts",
         "xtask-candidate-artifact-disclosure-boundary-v1",
-        "tools/xtask/src/security_harness/canary.rs|qualification/engineering/security-canary-targets.tsv",
+        "tools/xtask/src/security_harness.rs|tools/xtask/src/security_harness/canary.rs|tools/xtask/src/security_harness/canary_budget.rs|qualification/engineering/security-canary-targets.tsv",
     ),
 ];
 
@@ -108,11 +108,14 @@ impl ThreatSurfaceRegistry {
                     format!("security threat-surface registry has stale coverage for `{runner}`"),
                 ));
             }
+            let model_digest = validate_model_record(root, model, owner, boundary, paths)?;
+            let registered_surface_digest =
+                format!("sha256:{:x}", Sha256::digest(paths.as_bytes()));
             if summaries
                 .insert(
                     (*runner).to_owned(),
                     format!(
-                        "model={model}; owner={owner}; trust-boundary={boundary}; changed-paths={paths}; change-set={change_set}; disposition={disposition}"
+                        "model={model}; model-record-digest={model_digest}; owner={owner}; trust-boundary={boundary}; registered-surfaces={paths}; registered-surface-set-digest={registered_surface_digest}; change-set={change_set}; disposition={disposition}"
                     ),
                 )
                 .is_some()
@@ -148,6 +151,111 @@ impl ThreatSurfaceRegistry {
                 )
             })
     }
+
+    pub(crate) fn validate_changed_paths(
+        root: &Path,
+        changed_paths: &str,
+    ) -> Result<String, XtaskError> {
+        let registry = fs::read_to_string(root.join(PATH))
+            .map_err(|source| XtaskError::io("read security threat-surface registry", source))?;
+        let covered = registry
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split('\t').nth(4))
+            .flat_map(|paths| paths.split('|'))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut relevant = changed_paths
+            .lines()
+            .filter(|path| {
+                covered.contains(*path)
+                    || (path.starts_with("tools/xtask/src/security_harness/")
+                        && !path.ends_with("_tests.rs"))
+            })
+            .collect::<Vec<_>>();
+        relevant.sort_unstable();
+        relevant.dedup();
+        if let Some(uncovered) = relevant.iter().find(|path| !covered.contains(**path)) {
+            return Err(XtaskError::invalid(
+                "security changed-path coverage",
+                format!("changed registered trust-surface path `{uncovered}` is uncovered"),
+            ));
+        }
+        Ok(format!(
+            "sha256:{:x}",
+            Sha256::digest(relevant.join("\n").as_bytes())
+        ))
+    }
+}
+
+fn validate_model_record(
+    root: &Path,
+    model: &str,
+    owner: &str,
+    boundary: &str,
+    surfaces: &str,
+) -> Result<String, XtaskError> {
+    let path = root.join(format!("qualification/engineering/security/{model}.json"));
+    let bytes = fs::read(&path)
+        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    if model == "TM-0001-m0-04-toml-parser" {
+        return Ok(format!("sha256:{:x}", Sha256::digest(&bytes)));
+    }
+    let content = std::str::from_utf8(&bytes)
+        .map_err(|source| XtaskError::invalid_path(&path, source.to_string()))?;
+    for required in [
+        "\"schema_version\": 1",
+        "\"version\": 1",
+        &format!("\"model_id\": \"{model}\""),
+        &format!("\"semantic_owner\": \"{owner}\""),
+        &format!("\"trust_boundaries\": [\"{boundary}\"]"),
+        "\"review_disposition\": \"reviewed-m0-10\"",
+        "\"review_revision\": \"542f383\"",
+    ] {
+        if !content.contains(required) {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("versioned threat-model record is stale or missing `{required}`"),
+            ));
+        }
+    }
+    for surface in surfaces.split('|') {
+        if !content.contains(&format!("\"{surface}\"")) {
+            return Err(XtaskError::invalid_path(
+                &path,
+                format!("versioned threat-model record does not cover `{surface}`"),
+            ));
+        }
+    }
+    let (declared_digest, expected_record_digest) = match model {
+        "TM-0010-m0-10-runner-crypto" => (
+            "sha256:13fc0dabcc5a71015de407eda2dd2cf36904bb1bd0b50eb1f02e17bdabe1108a",
+            "sha256:0d818cbcfad3b505ec38974bd90171385ceddfe864e660f26c90d58f02a093b1",
+        ),
+        "TM-0011-m0-10-runner-artifacts" => (
+            "sha256:4dd3266ba77cc7185f72d0ef2af77fc75fe032e9b14cdeaf8b82d9afa335523b",
+            "sha256:85b1bd2023ef1dbea39f2d73d673e4c038214b6d94019a4ca1f584f5109bd466",
+        ),
+        _ => {
+            return Err(XtaskError::invalid_path(
+                &path,
+                "unknown threat-model identity",
+            ));
+        },
+    };
+    if !content.contains(&format!("\"record_digest\": \"{declared_digest}\"")) {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "versioned threat-model record digest is stale",
+        ));
+    }
+    let actual_record_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    if actual_record_digest != expected_record_digest {
+        return Err(XtaskError::invalid_path(
+            &path,
+            "versioned threat-model record bytes drifted from the reviewed digest",
+        ));
+    }
+    Ok(actual_record_digest)
 }
 
 fn validate_policy_commands(root: &Path) -> Result<(), XtaskError> {
@@ -160,6 +268,8 @@ fn validate_policy_commands(root: &Path) -> Result<(), XtaskError> {
         "m0_10_security_crypto::quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_the_public_seam",
         "m0_10_security_crypto::quality_rejects_a_drifted_security_crypto_or_secret_canary_descriptor",
         "m0_10_security_crypto::quality_retains_parent_owned_candidate_artifact_scan_evidence",
+        "m0_10_security_crypto::quality_rejects_executable_intentional_leak_with_retained_failed_evidence",
+        "m0_10_security_crypto::quality_rejects_missing_merge_base_and_uncovered_security_changes",
     ];
     for target in public_targets {
         if !content.contains(target) {

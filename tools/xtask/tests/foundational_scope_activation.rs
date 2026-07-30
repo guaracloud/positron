@@ -4690,6 +4690,16 @@ case ":$PATH:" in
     ;;
 esac
 case "${1:-}" in
+  merge-base)
+    printf '%s\n' '1111111111111111111111111111111111111111'
+    ;;
+  diff)
+    printf '%s\n' 'tools/xtask/src/security_harness.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary_budget.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
+    printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
+    ;;
   rev-parse)
     printf '%s\n' '0000000000000000000000000000000000000000'
     ;;
@@ -7084,6 +7094,10 @@ case "$command" in
           printf 'REDACTED:%s' "$sink" > "$artifact_root/packaged/$sink.artifact"
           printf 'REDACTED:%s' "$sink" > "$artifact_root/collected/$sink.artifact"
         done
+        if [ -f target/quality-tools/emit-m0-10-intentional-leak ]; then
+          printf '%s' 'POSITRON_SYNTHETIC_CANARY_V1:support-artifacts' \
+            > "$artifact_root/collected/support-artifacts.artifact"
+        fi
         ;;
       *)
         printf '%s\n' 'fixture received an unregistered xtask child command' >&2
@@ -7178,6 +7192,25 @@ exit 0
             r#"#!/bin/sh
 set -eu
 case "${1:-}" in
+  merge-base)
+    if [ ! -f target/quality-tools/m0-10-missing-merge-base ]; then
+      printf '%s\n' '1111111111111111111111111111111111111111'
+    fi
+    ;;
+  diff)
+    if [ -f target/quality-tools/m0-10-uncovered-security-path ]; then
+      printf '%s\n' 'tools/xtask/src/security_harness/uncovered.rs'
+      exit 0
+    fi
+    printf '%s\n' 'tools/xtask/src/security_harness.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/canary_budget.rs'
+    printf '%s\n' 'tools/xtask/src/security_harness/crypto.rs'
+    printf '%s\n' 'tools/xtask/src/crypto_targets.rs'
+    printf '%s\n' 'tools/xtask/src/quality.rs'
+    printf '%s\n' 'qualification/engineering/security-canary-targets.tsv'
+    printf '%s\n' 'qualification/engineering/security-crypto-targets.tsv'
+    ;;
   rev-parse)
     printf '%s\n' '0000000000000000000000000000000000000000'
     ;;

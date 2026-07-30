@@ -1428,7 +1428,14 @@ fn execute_gate(
             capture,
         ),
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
-        "crypto" => run_crypto_gate(root, registry, budget, environment, capture),
+        "crypto" => run_crypto_gate(
+            root,
+            registry,
+            options.profile,
+            budget,
+            environment,
+            capture,
+        ),
         "fault" => run_fault_gate(qualification_fixtures, environment),
         "integrity" => run_integrity_gate(
             qualification_fixtures,
@@ -3446,6 +3453,7 @@ fn validate_registered_controlled_steps(
                 .tools
                 .iter()
                 .any(|tool| tool.command == step.program)
+                || required_snapshot_tools(context.profile).contains(step.program.as_str())
         };
         let resolved = Path::new(&step.resolved_program);
         let resolved_matches = resolved.is_absolute()
@@ -3578,7 +3586,7 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
         "fault" => 0,
         "integrity" => 0,
         "safety" => usize::from(registry.has_m0_04_configuration_scope()),
-        "security" => 2,
+        "security" => 4,
         "supply" => {
             if matches!(profile, Profile::Ext | Profile::Qual) {
                 2
@@ -3594,7 +3602,7 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
             }
         },
         "concurrency" | "resource" => 1,
-        "crypto" => 1,
+        "crypto" => usize::from(matches!(profile, Profile::Pr)),
         "error-policy" | "evidence" | "matrix" | "performance" | "policy" | "soak" => 0,
         _ => 0,
     }
@@ -3753,6 +3761,16 @@ fn registered_runner_command_matches(
         },
         "security" => match index {
             0 => {
+                program == "git" && args == ["merge-base", "HEAD", "origin/main"]
+            },
+            1 => {
+                program == "git"
+                    && args.len() == 5
+                    && args.get(0..3) == Some(["diff", "--name-only", "--diff-filter=ACMR"].as_slice())
+                    && args.get(3).is_some_and(|base| valid_hex_identity(base))
+                    && args.get(4) == Some(&"HEAD")
+            },
+            2 => {
                 program == "cargo"
                     && args
                         == [
@@ -3765,7 +3783,7 @@ fn registered_runner_command_matches(
                             "preflight_",
                         ]
             },
-            1 => {
+            3 => {
                 program == "cargo"
                     && args
                         == [
@@ -5305,6 +5323,34 @@ fn run_security_gate(
     let threat_model = fs::read_to_string(&path)
         .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
+    let merge_base = run_capture(
+        root,
+        environment,
+        "git",
+        ["merge-base", "HEAD", "origin/main"],
+        budget,
+        Some(capture),
+    )?;
+    let base = merge_base.stdout.trim();
+    if !valid_hex_identity(base) {
+        return Err(XtaskError::invalid(
+            "security changed-path coverage",
+            "merge base could not be resolved to an exact revision",
+        ));
+    }
+    let changed = run_capture(
+        root,
+        environment,
+        "git",
+        ["diff", "--name-only", "--diff-filter=ACMR", base, "HEAD"],
+        budget,
+        Some(capture),
+    )?;
+    let changed_path_digest =
+        crate::security_threat_surface::ThreatSurfaceRegistry::validate_changed_paths(
+            root,
+            &changed.stdout,
+        )?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
     let probes = run_status(
@@ -5332,7 +5378,7 @@ fn run_security_gate(
         ));
     }
     Ok(format!(
-        "internal:{} | {} | {} | {}",
+        "internal:{} | {} | merge-base={base}; changed-path-set-digest={changed_path_digest} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,
@@ -5343,12 +5389,23 @@ fn run_security_gate(
 fn run_crypto_gate(
     root: &Path,
     registry: &Registry,
+    profile: Profile,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
     let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
     let descriptor = catalog.descriptor_for("EG-CRYPTO")?;
+    let target_digest = match crate::crypto_targets::select(root, profile)? {
+        crate::crypto_targets::Selection::RunnerCapability(digest) => digest,
+        crate::crypto_targets::Selection::NoActiveProductTarget(digest) => {
+            return Ok(format!(
+                "internal:{} | {} | outcome=NoActiveProductTarget; target-registry-digest={digest}; qualification=no-product-qualification",
+                descriptor.id(),
+                descriptor.evidence_summary(),
+            ));
+        },
+    };
     let self_test = crate::security_harness::run_crypto_self_test()?;
     let controlled = run_status(
         root,
@@ -5369,7 +5426,7 @@ fn run_crypto_gate(
         capture,
     )?;
     Ok(format!(
-        "internal:{} | {} | {} | {}; no Data Protection product scope is active, so no crypto qualification target was executed",
+        "internal:{} | {} | target=xtask-crypto-runner-capability-v1; target-registry-digest={target_digest}; {} | {}; no Data Protection product scope is active, so no crypto qualification target was executed",
         descriptor.id(),
         descriptor.evidence_summary(),
         self_test,

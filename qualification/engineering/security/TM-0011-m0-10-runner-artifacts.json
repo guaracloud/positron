@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "version": 1,
+  "model_id": "TM-0011-m0-10-runner-artifacts",
+  "semantic_owner": "Security and Key Management",
+  "trust_boundaries": ["xtask-candidate-artifact-disclosure-boundary-v1"],
+  "surfaces": [
+    "tools/xtask/src/security_harness.rs",
+    "tools/xtask/src/security_harness/canary.rs",
+    "tools/xtask/src/security_harness/canary_budget.rs",
+    "qualification/engineering/security-canary-targets.tsv"
+  ],
+  "review_disposition": "reviewed-m0-10",
+  "review_revision": "542f383",
+  "record_digest": "sha256:4dd3266ba77cc7185f72d0ef2af77fc75fe032e9b14cdeaf8b82d9afa335523b"
+}

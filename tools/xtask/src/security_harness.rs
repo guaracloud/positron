@@ -1,6 +1,9 @@
 //! Typed security probes and the pre-product security gate child protocol.
 
 mod canary;
+mod canary_budget;
+#[cfg(test)]
+mod canary_tests;
 mod crypto;
 
 use std::path::Path;
