@@ -1,0 +1,4 @@
+runner_id	gate_id	stages	activation	evidence_schema	threat_model	attack_surface	required_checks	canary_sinks
+security-runner-v1	EG-SECURITY	PR|EXT|QUAL	risk	security-orchestration-v1	TM-0001-m0-04-toml-parser	configuration-parser-before-typed-construction-v1	threat-model|attack-surface|authn-authz|tenant-isolation	-
+crypto-runner-v1	EG-CRYPTO	PR|EXT|QUAL	risk	crypto-orchestration-v1	data-protection-scope-pending-activation-v1	encryption-key-provider-boundary-v1	known-answer-vectors|nonce-safety|provider-failures|zeroization	-
+secret-canary-runner-v1	EG-SECRETS	PR|EXT|QUAL	always	secret-canary-orchestration-v1	secret-disclosure-boundary-v1	diagnostic-and-distribution-outputs-v1	current-tree-scan|full-history-scan|artifact-canary-scan	logs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts

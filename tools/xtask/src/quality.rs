@@ -1428,6 +1428,7 @@ fn execute_gate(
             capture,
         ),
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
+        "crypto" => run_crypto_gate(root, registry, budget, environment, capture),
         "fault" => run_fault_gate(qualification_fixtures, environment),
         "integrity" => run_integrity_gate(
             qualification_fixtures,
@@ -1443,7 +1444,14 @@ fn execute_gate(
         "rust" => run_rust_gate(root, budget, environment, capture),
         "safety" => run_safety_gate(root, registry, budget, environment, capture),
         "security" => run_security_gate(root, registry, budget, environment, capture),
-        "secrets" => run_secret_gate(root, options.profile, budget, environment, capture),
+        "secrets" => run_secret_gate(
+            root,
+            registry,
+            options.profile,
+            budget,
+            environment,
+            capture,
+        ),
         "supply" => run_supply_gate(
             root,
             registry,
@@ -3579,7 +3587,8 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
             }
         },
         "concurrency" | "resource" => 1,
-        "crypto" | "error-policy" | "evidence" | "matrix" | "performance" | "policy" | "soak" => 0,
+        "crypto" => 1,
+        "error-policy" | "evidence" | "matrix" | "performance" | "policy" | "soak" => 0,
         _ => 0,
     }
 }
@@ -3796,7 +3805,23 @@ fn registered_runner_command_matches(
                 step.timeout_ms,
                 &args,
             ),
-        "correctness" | "crypto" | "error-policy" | "evidence" | "fault" | "integrity"
+        "crypto" => {
+            index == 0
+                && program == "cargo"
+                && args
+                    == [
+                        "test",
+                        "--locked",
+                        "--package",
+                        "xtask",
+                        "--bin",
+                        "xtask",
+                        "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations",
+                        "--",
+                        "--exact",
+                    ]
+        }
+        "correctness" | "error-policy" | "evidence" | "fault" | "integrity"
         | "matrix" | "performance" | "policy" | "soak" => false,
         _ => false,
     }
@@ -5208,6 +5233,8 @@ fn run_security_gate(
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
+    let descriptor = catalog.descriptor_for("EG-SECURITY")?;
     if !registry.has_m0_04_configuration_scope() {
         return Err(XtaskError::invalid(
             "security gate",
@@ -5221,8 +5248,47 @@ fn run_security_gate(
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
     Ok(format!(
-        "internal:versioned-parser-threat-model-and-pending-security-owner-review validation | {}",
-        adversarial.display
+        "internal:{} | {} | {}",
+        descriptor.id(),
+        descriptor.evidence_summary(),
+        adversarial.display,
+    ))
+}
+
+fn run_crypto_gate(
+    root: &Path,
+    registry: &Registry,
+    budget: Duration,
+    environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
+    let descriptor = catalog.descriptor_for("EG-CRYPTO")?;
+    let self_test = crate::security_harness::run_crypto_self_test()?;
+    let controlled = run_status(
+        root,
+        environment,
+        "cargo",
+        [
+            "test",
+            "--locked",
+            "--package",
+            "xtask",
+            "--bin",
+            "xtask",
+            "security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations",
+            "--",
+            "--exact",
+        ],
+        budget,
+        capture,
+    )?;
+    Ok(format!(
+        "internal:{} | {} | {} | {}; no Data Protection product scope is active, so no crypto qualification target was executed",
+        descriptor.id(),
+        descriptor.evidence_summary(),
+        self_test,
+        controlled.display,
     ))
 }
 
@@ -5289,11 +5355,14 @@ fn validate_configuration_parser_threat_model_text(content: &str) -> Result<(), 
 
 fn run_secret_gate(
     root: &Path,
+    registry: &Registry,
     profile: Profile,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
+    let descriptor = catalog.descriptor_for("EG-SECRETS")?;
     let deadline = Instant::now() + budget;
     let mut commands = Vec::new();
     commands.push(
@@ -5334,7 +5403,12 @@ fn run_secret_gate(
             .display,
         );
     }
-    Ok(commands.join(" | "))
+    Ok(format!(
+        "internal:{} | {} | {}",
+        descriptor.id(),
+        descriptor.evidence_summary(),
+        commands.join(" | "),
+    ))
 }
 
 fn run_supply_gate(

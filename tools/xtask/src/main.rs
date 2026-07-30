@@ -27,6 +27,8 @@ mod qualification_fixtures;
 mod quality;
 mod registered_task_lifecycle;
 mod registry;
+mod security_catalog;
+mod security_harness;
 
 use std::env;
 use std::process::ExitCode;

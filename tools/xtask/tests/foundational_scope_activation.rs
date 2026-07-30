@@ -481,6 +481,8 @@ mod m0_09_dynamic_plans;
 mod m0_09_dynamic_quality;
 #[path = "foundational_scope_activation/m0_09_dynamic_verifier.rs"]
 mod m0_09_dynamic_verifier;
+#[path = "foundational_scope_activation/m0_10_security_crypto.rs"]
+mod m0_10_security_crypto;
 
 #[cfg(unix)]
 #[test]
@@ -4343,6 +4345,10 @@ impl Fixture {
         Self::create_with_policy(false, configure_m0_02_domain_types_ledger)
     }
 
+    fn create_current_registry() -> TestResult<Self> {
+        Self::create_with_policy(false, |_| Ok(()))
+    }
+
     fn create_with_identity(real_git: bool) -> TestResult<Self> {
         Self::create_with_policy(real_git, configure_activation_ledger)
     }
@@ -7056,8 +7062,14 @@ case "$command" in
       exit 75
     fi
     if [ "$package" = "xtask" ]; then
-      printf '%s\n' 'private runner self-tests are not qualification fixtures' >&2
-      exit 77
+      case " $* " in
+        *" security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations "*)
+          ;;
+        *)
+          printf '%s\n' 'private runner self-tests are not qualification fixtures' >&2
+          exit 77
+          ;;
+      esac
     fi
     ;;
   tree)
