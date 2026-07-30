@@ -1363,9 +1363,14 @@ fn execute_gate(
         "architecture" => run_architecture_gate(root, registry, budget, environment, capture),
         "build" => run_build_gate(root, options.profile, budget, environment, capture),
         "coverage" => run_coverage_gate(root, registry, budget, options, environment, capture),
-        "dynamic-analysis" => {
-            run_dynamic_analysis_gate(root, registry, budget, environment, capture)
-        },
+        "dynamic-analysis" => run_dynamic_analysis_gate(
+            root,
+            registry,
+            options.profile,
+            budget,
+            environment,
+            capture,
+        ),
         "dependencies" => {
             run_dependency_gate(attempt_id, root, registry, budget, environment, capture)
         },
@@ -1655,44 +1660,46 @@ fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
 fn run_dynamic_analysis_gate(
     root: &Path,
     registry: &Registry,
+    profile: Profile,
     budget: Duration,
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
-    if !registry.has_m0_02_domain_types_scope() {
+    if !registry.has_active_application_scope() {
         return Err(XtaskError::invalid(
             "dynamic analysis runner",
             "EG-DYNAMIC was selected without an applicable registered dynamic target",
         ));
     }
+    let targets = crate::dynamic_quality::FrozenDynamicTargets::load(root)?;
+    let selected = targets.selected(profile).collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(XtaskError::invalid(
+            "dynamic analysis runner",
+            "EG-DYNAMIC selected no registered dynamic targets for this profile",
+        ));
+    }
     let deadline = Instant::now() + budget;
-    let contract = run_status(
-        root,
-        environment,
-        "cargo",
-        [
-            "test",
-            "--locked",
-            "--package",
-            "positron-domain",
-            "--test",
-            "foundational_domain_types",
-        ],
-        remaining(deadline)?,
-        capture,
-    )?;
-    let compile_fail = run_status(
-        root,
-        environment,
-        "cargo",
-        ["test", "--locked", "--package", "positron-domain", "--doc"],
-        remaining(deadline)?,
-        capture,
-    )?;
-    Ok(format!(
-        "M0-02 Domain Types retained-seed contract/property cases: {} | compile-fail: {}",
-        contract.display, compile_fail.display,
-    ))
+    let mut results = Vec::with_capacity(selected.len());
+    for target in selected {
+        let available = remaining(deadline)?;
+        let timeout = available.min(target.timeout());
+        let outcome = run_status(
+            root,
+            environment,
+            target.tool(),
+            target.arguments(),
+            timeout,
+            capture,
+        )?;
+        results.push(format!(
+            "{}; {}; {}",
+            target.retained_identity(),
+            target.kind().label(),
+            outcome.display,
+        ));
+    }
+    Ok(results.join(" | "))
 }
 
 fn run_coverage_gate(

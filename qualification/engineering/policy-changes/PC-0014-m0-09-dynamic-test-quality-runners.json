@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "id": "PC-0014-m0-09-dynamic-test-quality-runners",
+  "status": "proposed-for-independent-review",
+  "authority": [
+    "CONTRIBUTING.md",
+    "docs/adr/0073-bind-every-artifact-to-a-reproducible-signed-security-supported-release.md",
+    "docs/adr/0074-freeze-release-1-through-an-evidence-backed-qualification-matrix.md",
+    "docs/engineering/standards.md",
+    "docs/engineering/quality-gates.md",
+    "docs/release-1-qualification.md"
+  ],
+  "purpose": "Implement the existing EG-DYNAMIC target registry and runner for active Quality Engineering harness scope without application behavior or Qualification Cell advancement.",
+  "change": {
+    "issue": 10,
+    "semantic_owner": "Quality Engineering",
+    "public_seam": "cargo xtask quality returned verdict and immutable target/quality/evidence report",
+    "dependency_review": {
+      "new_dependencies": "none",
+      "rationale": "The runner uses the Rust standard library and existing reviewed xtask execution boundaries."
+    },
+    "runner_changes": [
+      "dynamic-targets.tsv is a bounded, exact target registry with stable target identity, gate, detector kind, selected stages, controlled tool arguments, corpus, seed, and target timeout.",
+      "EG-DYNAMIC freezes and validates the complete descriptor registry before executing any selected target. Each target is invoked only through the existing controlled command and capture boundary, with the smaller of its registered timeout and the owning gate's remaining monotonic budget.",
+      "The parser has closed support for property, state-model, fuzz, corpus, Miri, sanitizer, and Loom descriptors. The currently applicable M0 targets are the existing Domain Types public property and lifecycle-state-model seams; later application activation must register the corresponding real detector target before claiming its behavior.",
+      "The runner retains each target's exact descriptor identity including seed and corpus in its immutable raw gate report. Missing, malformed, stale, duplicate, oversized, noncanonical-timeout, or unselected-target descriptors fail closed without a fallback command.",
+      "Existing line, region, branch, changed-code, mutation, ratchet, exclusion, and measured-baseline enforcement stays in the registered EG-COVERAGE owner. This ticket does not alter a threshold, target selection, exception class, stage, or detector command."
+    ],
+    "unchanged": [
+      "No application, runtime, Metrics, Profiles, replication, clustering, distribution, provider, or Qualification Cell behavior is added.",
+      "Developer evidence remains diagnostic and non-merge-eligible. The harness may be Implemented but no target is Qualified.",
+      "No dependency, unsafe boundary, threshold, timeout, memory declaration, selector, test command, or existing gate behavior is weakened."
+    ]
+  },
+  "detection_gained": [
+    "EG-DYNAMIC no longer embeds an ad-hoc Domain Types command pair; every selected dynamic target has a bounded registered identity and immutable corpus/seed report.",
+    "Unknown detector kinds, missing registries, duplicate target identities, malformed rows, noncanonical timeouts, unsupported stages, and oversized target registries fail the public quality seam before a target can run.",
+    "The exact target command is subject to the existing controlled execution timeout, process cleanup, bounded capture, missing-tool, nonzero, and retained failed-attempt semantics."
+  ],
+  "detection_lost": [],
+  "lifecycle_test_map": {
+    "pass": "quality_runs_each_registered_dynamic_target_through_the_public_seam proves every selected descriptor produces a passed EG-DYNAMIC outcome and immutable target/kind/corpus/seed evidence.",
+    "fail_and_missing_tool": "The existing controlled command owner retains a typed failed gate outcome for a nonzero, missing tool, timeout, cancellation, or bounded capture failure; M0-09 adds no fallback execution path.",
+    "malformed_and_stale": "quality_rejects_a_missing_dynamic_target_registry_without_fallback, quality_rejects_a_stale_or_unknown_dynamic_detector_kind_through_the_public_seam, and quality_rejects_a_noncanonical_dynamic_timeout_before_running_the_target prove retained public failures.",
+    "retry_and_resource": "Descriptor execution is single-attempt: a failed detector does not retry to green. Registry bytes, row count, fields, argument values, and timeouts have fixed caps; the owning controlled command capture applies its existing stream and report ceilings.",
+    "coverage_and_mutation": "Existing EG-COVERAGE retains pinned line, region, branch, changed-code, mutation, ratchet, exclusion, and baseline checks through the authoritative quality registry; no coverage policy changed here."
+  },
+  "representative_old_new_evidence": {
+    "old": {
+      "status": "specified-ad-hoc-runner",
+      "command": "cargo xtask quality --profile pr",
+      "result": "EG-DYNAMIC directly encoded two M0-02 commands and did not retain first-class target, corpus, or seed identities."
+    },
+    "new": {
+      "status": "passed-focused-local-diagnostic",
+      "commands": [
+        "cargo test --locked --package xtask --test foundational_scope_activation -- m0_09_dynamic_quality",
+        "cargo test --locked --package xtask --bin xtask dynamic_quality",
+        "cargo fmt --check"
+      ],
+      "result": "Focused public-seam and parser tests passed locally. This is diagnostic only; the exact committed revision's normal pre-push and trusted CI evidence remain required."
+    }
+  },
+  "approvals_required": ["Architecture", "Quality Engineering"],
+  "approval": {
+    "status": "pending-independent-review",
+    "reviewers": [],
+    "reviewed_revisions": [],
+    "attribution": "No implementation agent, reviewer, or repository owner is recorded as granting a required approval."
+  },
+  "qualification_claim": "None. This is Quality Engineering harness behavior only. It does not claim a Qualified cell, trusted CI pass, merge eligibility, release readiness, or role approval."
+}

@@ -13,6 +13,7 @@ mod bounded_runners;
 mod concurrency_source_policy;
 mod config_generation;
 mod controlled_execution;
+mod dynamic_quality;
 mod error;
 mod evidence_json;
 mod framed_stdout_reader;
