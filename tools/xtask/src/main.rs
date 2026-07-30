@@ -7,14 +7,20 @@
 #![forbid(unsafe_code)]
 
 mod api_generation;
+mod bounded_measurement_verifier;
+mod bounded_runner_frames;
+mod bounded_runners;
+mod concurrency_source_policy;
 mod config_generation;
 mod controlled_execution;
 mod error;
 mod evidence_json;
+mod framed_stdout_reader;
 mod generation;
 mod hooks;
 mod qualification_fixtures;
 mod quality;
+mod registered_task_lifecycle;
 mod registry;
 
 use std::env;
@@ -72,6 +78,7 @@ fn run() -> Result<(), XtaskError> {
             quality::run(&options)
         },
         "quality-fixture" => qualification_fixtures::run_process(arguments),
+        "quality-bounded-runner" => bounded_runners::run_process(arguments),
         "setup" => {
             ensure_no_more_arguments(arguments)?;
             hooks::install()

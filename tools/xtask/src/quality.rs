@@ -818,8 +818,10 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     };
     let activated_risk_gates = registry.activated_risk_gates();
     let qualification_fixture_selected = registry.gates.iter().any(|gate| {
-        matches!(gate.id.as_str(), "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY")
-            && gate_selected(gate, options.profile, &activated_risk_gates)
+        matches!(
+            gate.id.as_str(),
+            "EG-CONCURRENCY" | "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY" | "EG-RESOURCE"
+        ) && gate_selected(gate, options.profile, &activated_risk_gates)
     });
     let qualification_fixtures =
         match crate::qualification_fixtures::FrozenQualificationFixtures::capture(&root) {
@@ -1368,6 +1370,13 @@ fn execute_gate(
             run_dependency_gate(attempt_id, root, registry, budget, environment, capture)
         },
         "documentation" => run_documentation_gate(root, budget, environment, capture),
+        "concurrency" => run_bounded_runner_gate(
+            qualification_fixtures.bounded_runners(),
+            root,
+            gate,
+            environment,
+            capture,
+        ),
         "correctness" => run_correctness_gate(qualification_fixtures, environment),
         "fault" => run_fault_gate(qualification_fixtures, environment),
         "integrity" => run_integrity_gate(
@@ -1395,11 +1404,204 @@ fn execute_gate(
         ),
         "test" => run_test_gate(root, budget, environment, capture),
         "matrix" => run_generation_matrix_gate(root),
+        "resource" => run_bounded_runner_gate(
+            qualification_fixtures.bounded_runners(),
+            root,
+            gate,
+            environment,
+            capture,
+        ),
         unsupported => Err(XtaskError::invalid(
             format!("gate runner `{unsupported}`"),
             "an active risk scope selected a gate whose executable harness has not been implemented",
         )),
     }
+}
+
+fn run_bounded_runner_gate(
+    registry: &crate::bounded_runners::FrozenBoundedRunnerRegistry,
+    root: &Path,
+    gate: &Gate,
+    environment: &EnvironmentSnapshot,
+    capture: &mut GateCapture,
+) -> Result<String, XtaskError> {
+    let execution_timeout = Duration::from_secs(gate.timeout_seconds);
+    let gate_id = gate.id.as_str();
+    crate::bounded_runners::validate_source_policy(registry, root)?;
+    let shutdown = registry.shutdown_bound(gate_id)?;
+    let program = env::current_exe()
+        .map_err(|source| XtaskError::io("resolve bounded runner executable", source))?;
+    if !program.is_absolute() || !program.is_file() {
+        return Err(XtaskError::invalid_path(
+            &program,
+            "bounded runner executable is not an absolute file",
+        ));
+    }
+    let arguments = registry.child_arguments(gate_id, execution_timeout)?;
+    let retained_arguments = arguments
+        .iter()
+        .map(|argument| {
+            argument.to_str().ok_or_else(|| {
+                XtaskError::invalid(
+                    "bounded runner child invocation",
+                    "child argument is not canonical UTF-8",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::bounded_runners::FrozenBoundedRunnerRegistry::validate_child_invocation(
+        gate_id,
+        execution_timeout.as_millis(),
+        &retained_arguments,
+    )?;
+    let invocation_environment = environment.invocation_environment(&[])?;
+    let input = InvocationInput::Null;
+    let invocation = controlled_invocation(
+        "cargo-xtask-quality/bounded-runner",
+        program.as_os_str(),
+        &arguments,
+        &invocation_environment,
+        execution_timeout,
+        &input,
+    );
+    let outcome = controlled_execution::execute(InvocationSpec {
+        program: program.as_os_str().to_owned(),
+        arguments,
+        current_dir: root.to_path_buf(),
+        environment: invocation_environment,
+        tools: environment.execution_tools(),
+        input,
+        output: OutputMode::FramedStdout {
+            maximum_bytes: crate::bounded_runner_frames::MAXIMUM_FRAME_BYTES,
+        },
+        cancellation: Arc::new(AtomicBool::new(false)),
+        deadline: deadline_after(execution_timeout)?,
+        shutdown_timeout: shutdown,
+        cancellation_marker: None,
+    })
+    .into_result();
+    let completed_lifecycle = |phase: &str| {
+        format!(
+            "process-lifecycle-v1;phase={phase};termination-requested=false;process-reaped=true;live=0;shutdown-ms={};process-shutdown-elapsed-ms=0;resource-shutdown-elapsed-ms=0;shutdown-elapsed-ms=0",
+            shutdown.as_millis(),
+        )
+    };
+    let verdict = match outcome {
+        Ok(verdict) => {
+            let step_verdict = format!("exit-status:{}", verdict.status);
+            capture.record(
+                invocation,
+                &step_verdict,
+                &verdict.output.stdout,
+                &verdict.output.stderr,
+            )?;
+            verdict
+        },
+        Err(error) => {
+            let lifecycle = match error.shutdown.as_deref() {
+                Some(observed) => format!(
+                    "process-lifecycle-v1;phase={};termination-requested={};process-reaped={};live={};shutdown-ms={};process-shutdown-elapsed-ms={};resource-shutdown-elapsed-ms={};shutdown-elapsed-ms={}",
+                    error.phase.as_str(),
+                    observed.termination_requested,
+                    observed.process_reaped,
+                    observed.live,
+                    observed.bound.as_millis(),
+                    observed.process_elapsed.as_millis(),
+                    observed.resource_elapsed.as_millis(),
+                    observed.elapsed.as_millis(),
+                ),
+                None => format!(
+                    "process-lifecycle-v1;phase={};termination-requested=false;process-reaped=false;live=0;shutdown-ms={};process-shutdown-elapsed-ms=0;resource-shutdown-elapsed-ms=0;shutdown-elapsed-ms=0",
+                    error.phase.as_str(),
+                    shutdown.as_millis(),
+                ),
+            };
+            let reconciliation =
+                error
+                    .reconciliation
+                    .as_deref()
+                    .map_or_else(String::new, |observed| {
+                        format!(
+                            "; reconciliation-phase={}; reconciliation-detail={}",
+                            observed.phase.as_str(),
+                            observed.detail,
+                        )
+                    });
+            let step_verdict = format!("controlled-failure:{}", error.phase.as_str());
+            capture.record(
+                invocation,
+                &step_verdict,
+                "",
+                &format!("{}{}; {lifecycle}", error.detail, reconciliation),
+            )?;
+            return Err(XtaskError::invalid(
+                "bounded runner process lifecycle",
+                format!(
+                    "controlled runner failed during {}: {}{}; {}",
+                    error.phase.as_str(),
+                    error.detail,
+                    reconciliation,
+                    lifecycle,
+                ),
+            ));
+        },
+    };
+    let frame =
+        crate::bounded_runner_frames::parse_captured(&verdict.output.stdout).map_err(|error| {
+            XtaskError::invalid(
+                "bounded runner process lifecycle",
+                format!("{error}; {}", completed_lifecycle("malformed-output")),
+            )
+        })?;
+    let record = match frame {
+        crate::bounded_runner_frames::CapturedFrame::Outcome(record) => {
+            if !verdict.status.success() {
+                return Err(XtaskError::invalid(
+                    "bounded runner process lifecycle",
+                    format!(
+                        "child returned {} after publishing a success frame; {}",
+                        verdict.status,
+                        completed_lifecycle("child-error"),
+                    ),
+                ));
+            }
+            record
+        },
+        crate::bounded_runner_frames::CapturedFrame::Error(detail) => {
+            return Err(XtaskError::invalid(
+                "bounded runner process lifecycle",
+                format!(
+                    "child returned {}: {}; {}",
+                    verdict.status,
+                    detail.split_whitespace().collect::<Vec<_>>().join(" "),
+                    completed_lifecycle("child-error"),
+                ),
+            ));
+        },
+    };
+    if record.is_empty() || record.lines().count() != 1 {
+        return Err(XtaskError::invalid(
+            "bounded runner process lifecycle",
+            format!(
+                "child omitted its exact one-line measurement; {}",
+                completed_lifecycle("malformed-output"),
+            ),
+        ));
+    }
+    let verified = crate::bounded_measurement_verifier::verify(
+        crate::bounded_measurement_verifier::VerificationInput {
+            gate,
+            scenario_registry: registry.bytes(),
+            spawn_registry: registry.spawn_site_bytes(),
+            measurement: &record,
+            execution: &verdict,
+        },
+    )?;
+    Ok(format!(
+        "{record}; {}; {}",
+        verified.evidence(),
+        completed_lifecycle("completed"),
+    ))
 }
 
 fn run_correctness_gate(
@@ -2466,6 +2668,8 @@ fn run_dependency_metadata_capture(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(timeout)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result();
     let verdict = match verdict {
@@ -3115,16 +3319,26 @@ fn validate_registered_controlled_steps(
             XtaskError::invalid_path(path, "registered gate timeout milliseconds overflow")
         })?;
     for (index, step) in steps.iter().enumerate() {
-        let registered_program = registry
-            .tools
-            .iter()
-            .any(|tool| tool.command == step.program);
+        let process_backed_runner = matches!(gate.runner.as_str(), "concurrency" | "resource");
+        let registered_program = if process_backed_runner {
+            step.program == "cargo-xtask-quality/bounded-runner"
+        } else {
+            registry
+                .tools
+                .iter()
+                .any(|tool| tool.command == step.program)
+        };
         let resolved = Path::new(&step.resolved_program);
         let resolved_matches = resolved.is_absolute()
-            && resolved.file_name().and_then(OsStr::to_str) == Some(step.program.as_str());
+            && if process_backed_runner {
+                resolved.file_stem().and_then(OsStr::to_str) == Some("xtask")
+            } else {
+                resolved.file_name().and_then(OsStr::to_str) == Some(step.program.as_str())
+            };
         if !registered_program
             || !resolved_matches
             || step.timeout_ms > maximum_timeout_ms
+            || (process_backed_runner && step.timeout_ms != maximum_timeout_ms)
             || step.input_kind != "null"
             || step.input_bytes != 0
             || step.input_sha256 != "-"
@@ -3132,8 +3346,7 @@ fn validate_registered_controlled_steps(
                 gate.runner.as_str(),
                 profile,
                 index,
-                step.program.as_str(),
-                &step.arguments,
+                step,
                 registry,
             )
         {
@@ -3187,8 +3400,8 @@ fn canonical_controlled_step_count(gate: &Gate, profile: Profile, registry: &Reg
                 1
             }
         },
-        "concurrency" | "crypto" | "error-policy" | "evidence" | "matrix" | "performance"
-        | "policy" | "resource" | "soak" => 0,
+        "concurrency" | "resource" => 1,
+        "crypto" | "error-policy" | "evidence" | "matrix" | "performance" | "policy" | "soak" => 0,
         _ => 0,
     }
 }
@@ -3197,11 +3410,15 @@ fn registered_runner_command_matches(
     runner: &str,
     profile: Profile,
     index: usize,
-    program: &str,
-    arguments: &[String],
+    step: &ControlledInvocation,
     registry: &Registry,
 ) -> bool {
-    let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let program = step.program.as_str();
+    let args = step
+        .arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     match runner {
         "registry" => registry
             .tools
@@ -3406,8 +3623,22 @@ fn registered_runner_command_matches(
                 && args.first() == Some(&"+nightly-2026-07-20")
                 && args.get(1) == Some(&"llvm-cov")
         },
-        "concurrency" | "correctness" | "crypto" | "error-policy" | "evidence" | "fault"
-        | "integrity" | "matrix" | "performance" | "policy" | "resource" | "soak" => false,
+        "concurrency" => index == 0
+            && program == "cargo-xtask-quality/bounded-runner"
+            && crate::bounded_runners::FrozenBoundedRunnerRegistry::retained_child_invocation_matches(
+                "EG-CONCURRENCY",
+                step.timeout_ms,
+                &args,
+            ),
+        "resource" => index == 0
+            && program == "cargo-xtask-quality/bounded-runner"
+            && crate::bounded_runners::FrozenBoundedRunnerRegistry::retained_child_invocation_matches(
+                "EG-RESOURCE",
+                step.timeout_ms,
+                &args,
+            ),
+        "correctness" | "crypto" | "error-policy" | "evidence" | "fault" | "integrity"
+        | "matrix" | "performance" | "policy" | "soak" => false,
         _ => false,
     }
 }
@@ -5393,6 +5624,8 @@ fn run_status_with_options<'argument>(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(options.timeout)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result();
     let verdict = match verdict {
@@ -5492,6 +5725,8 @@ fn run_capture_with_input<'argument>(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(options.timeout)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result();
     let verdict = match verdict {
@@ -6047,6 +6282,8 @@ fn snapshot_digest(
         },
         cancellation: Arc::new(AtomicBool::new(false)),
         deadline: deadline_after(SNAPSHOT_DIGEST_TIMEOUT)?,
+        shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
+        cancellation_marker: None,
     })
     .into_result()
     .map_err(XtaskError::controlled_harness)?;
@@ -7324,7 +7561,7 @@ fn validate_evidence_identity(evidence: &Evidence) -> Result<(), XtaskError> {
     let qualification_fixture_selected = evidence.gates.iter().any(|gate| {
         matches!(
             gate.gate_id.as_str(),
-            "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY"
+            "EG-CONCURRENCY" | "EG-CORRECT" | "EG-FAULT" | "EG-INTEGRITY" | "EG-RESOURCE"
         ) && gate.result != GateStatus::NotSelected
     });
     match (
@@ -7947,7 +8184,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         CANONICAL_GATE_IDS, ControlledInvocation, ControlledStepReport, EnvironmentSnapshot,
@@ -7962,11 +8199,12 @@ mod tests {
         RawReportDocument, SourceIdentity, build_gate_attempt_with_report_limit,
         character_count_in_range, evidence_json, gate_invocation_json, json_string,
         nextest_completed_test_count, parse_gate_invocation_value, raw_report_json_with_limit,
-        registered_dependency_command_matches, run_generation_matrix_gate, sha256_digest,
-        unavailable_evidence_identity, valid_hex_identity, valid_raw_report_schema_path,
-        valid_sha256_digest, validate_configuration_parser_threat_model_text,
-        validate_serialized_evidence,
+        registered_dependency_command_matches, registered_runner_command_matches,
+        run_generation_matrix_gate, sha256_digest, unavailable_evidence_identity,
+        valid_hex_identity, valid_raw_report_schema_path, valid_sha256_digest,
+        validate_configuration_parser_threat_model_text, validate_serialized_evidence,
     };
+    use crate::registry::Registry;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -8396,6 +8634,63 @@ mod tests {
         let parsed =
             parse_gate_invocation_value(value, std::path::Path::new("retained-invocation.json"))?;
         assert_eq!(parsed.typed.arguments, invocation.arguments);
+        Ok(())
+    }
+
+    #[test]
+    fn parent_runner_verifier_requires_exact_canonical_child_arguments() -> TestResult {
+        let registry = crate::bounded_runners::FrozenBoundedRunnerRegistry::capture(
+            include_bytes!("../../../qualification/engineering/concurrency-fixtures.tsv").to_vec(),
+            include_bytes!("../../../qualification/engineering/concurrency-spawn-sites.tsv")
+                .to_vec(),
+        )?;
+        let mut step = report_test_step(String::new()).invocation;
+        step.program = "cargo-xtask-quality/bounded-runner".to_owned();
+        step.timeout_ms = 900_000;
+        step.arguments = registry
+            .child_arguments("EG-CONCURRENCY", Duration::from_millis(900_000))?
+            .into_iter()
+            .map(|argument| argument.into_string())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| std::io::Error::other("test child argument was not UTF-8"))?;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| std::io::Error::other("test repository root is unavailable"))?;
+        let quality_registry = Registry::load(root)?;
+        assert!(registered_runner_command_matches(
+            "concurrency",
+            Profile::Pr,
+            0,
+            &step,
+            &quality_registry,
+        ));
+
+        let timeout_argument = step
+            .arguments
+            .get_mut(4)
+            .ok_or_else(|| std::io::Error::other("test timeout argument is unavailable"))?;
+        *timeout_argument = "0900000".to_owned();
+        assert!(!registered_runner_command_matches(
+            "concurrency",
+            Profile::Pr,
+            0,
+            &step,
+            &quality_registry,
+        ));
+        let timeout_argument = step
+            .arguments
+            .get_mut(4)
+            .ok_or_else(|| std::io::Error::other("test timeout argument is unavailable"))?;
+        *timeout_argument = "900000".to_owned();
+        step.arguments.push("unexpected".to_owned());
+        assert!(!registered_runner_command_matches(
+            "concurrency",
+            Profile::Pr,
+            0,
+            &step,
+            &quality_registry,
+        ));
         Ok(())
     }
 

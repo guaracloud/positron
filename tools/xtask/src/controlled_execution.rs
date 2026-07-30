@@ -19,8 +19,19 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PLATFORM_CONTROL_BUDGET: Duration = Duration::from_secs(1);
-const TERMINATION_GRACE: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+use crate::framed_stdout_reader::{
+    Failure as FramedStdoutFailure, FailurePhase as FramedStdoutFailurePhase, FramedStdoutReader,
+};
+
+#[cfg(unix)]
+#[path = "controlled_process_group.rs"]
+mod controlled_process_group;
+#[cfg(unix)]
+use controlled_process_group::{ProcessGroup, TerminationOutcome, terminate_and_reap};
+
+pub(crate) const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const TERMINATION_GRACE: Duration = Duration::from_millis(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The explicit inputs for one controlled external invocation.
@@ -42,8 +53,12 @@ pub(crate) struct InvocationSpec {
     pub(crate) output: OutputMode,
     /// The caller-owned cancellation signal for this invocation only.
     pub(crate) cancellation: Arc<AtomicBool>,
-    /// The complete deadline for direct execution and reconciliation.
+    /// The registered deadline for ordinary direct execution.
     pub(crate) deadline: Instant,
+    /// The separately registered bound for termination and process reaping.
+    pub(crate) shutdown_timeout: Duration,
+    /// An optional create-new marker that requests controlled termination.
+    pub(crate) cancellation_marker: Option<PathBuf>,
 }
 
 /// Resolved helper executables that are outside the target child's environment.
@@ -89,8 +104,13 @@ pub(crate) enum InvocationInput {
 /// The externally visible output ownership mode.
 #[derive(Debug)]
 pub(crate) enum OutputMode {
+    /// Close both child output streams without capture workers in lifecycle tests.
+    #[cfg(test)]
+    Discard,
     /// Capture independently bounded standard output and standard error.
     Capture { maximum_bytes_per_stream: usize },
+    /// Capture one strict bounded stdout frame through an owned pipe broker.
+    FramedStdout { maximum_bytes: usize },
     /// Stream stdout into one create-new bounded artifact while capturing stderr.
     CaptureWithStdoutArtifact {
         artifact: ArtifactOutput,
@@ -185,6 +205,8 @@ pub(crate) enum FailurePhase {
     Descendant,
     /// A captured stream could not be read or decoded.
     Capture,
+    /// A bounded child could not deliver its lifecycle control frame.
+    ControlDelivery,
     /// Controlled termination or cleanup could not complete.
     Cleanup,
     /// This host cannot establish the required process-ownership boundary.
@@ -204,6 +226,7 @@ impl FailurePhase {
             Self::Cancellation => "cancellation",
             Self::Descendant => "descendant",
             Self::Capture => "capture",
+            Self::ControlDelivery => "control-delivery",
             Self::Cleanup => "cleanup",
             #[cfg(not(unix))]
             Self::UnsupportedPlatform => "unsupported-platform",
@@ -220,6 +243,10 @@ pub(crate) struct ExecutionFailure {
     pub(crate) phase: FailurePhase,
     /// Bounded diagnostic context for the failed phase.
     pub(crate) detail: String,
+    /// Honest reconciliation observations when a launched process was shut down.
+    pub(crate) shutdown: Option<Box<ShutdownEvidence>>,
+    /// A cleanup failure observed while preserving the originating failure.
+    pub(crate) reconciliation: Option<Box<ReconciliationFailure>>,
 }
 
 impl ExecutionFailure {
@@ -228,8 +255,57 @@ impl ExecutionFailure {
             command,
             phase,
             detail: detail.into(),
+            shutdown: None,
+            reconciliation: None,
         }
     }
+
+    fn with_reconciliation(mut self, failure: Self) -> Self {
+        let nested = failure.reconciliation;
+        let observed = ReconciliationFailure {
+            phase: failure.phase,
+            detail: failure.detail,
+        };
+        match self.reconciliation.as_mut() {
+            Some(existing) => {
+                existing.detail.push_str("; additional ");
+                existing.detail.push_str(observed.phase.as_str());
+                existing.detail.push_str(" reconciliation failure: ");
+                existing.detail.push_str(&observed.detail);
+            },
+            None => self.reconciliation = Some(Box::new(observed)),
+        }
+        if let Some(nested) = nested
+            && let Some(existing) = self.reconciliation.as_mut()
+        {
+            existing.detail.push_str("; additional ");
+            existing.detail.push_str(nested.phase.as_str());
+            existing.detail.push_str(" reconciliation failure: ");
+            existing.detail.push_str(&nested.detail);
+        }
+        self
+    }
+}
+
+/// Typed secondary context from cleanup after an originating failure.
+#[derive(Debug)]
+pub(crate) struct ReconciliationFailure {
+    /// The phase reported by the failed cleanup operation.
+    pub(crate) phase: FailurePhase,
+    /// Bounded diagnostic context for that cleanup operation.
+    pub(crate) detail: String,
+}
+
+/// Observed shutdown behavior for a failed controlled invocation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShutdownEvidence {
+    pub(crate) termination_requested: bool,
+    pub(crate) process_reaped: bool,
+    pub(crate) live: usize,
+    pub(crate) bound: Duration,
+    pub(crate) process_elapsed: Duration,
+    pub(crate) resource_elapsed: Duration,
+    pub(crate) elapsed: Duration,
 }
 
 fn cancellation_requested(cancellation: &AtomicBool) -> bool {
@@ -242,6 +318,27 @@ fn cancellation_failure(command: &str) -> ExecutionFailure {
         FailurePhase::Cancellation,
         "the caller requested cancellation before reconciliation completed",
     )
+}
+
+#[cfg(unix)]
+fn framed_stdout_failure(command: &str, failure: FramedStdoutFailure) -> ExecutionFailure {
+    let phase = match failure.phase {
+        FramedStdoutFailurePhase::Descriptor => FailurePhase::Descriptor,
+        FramedStdoutFailurePhase::Capture => FailurePhase::Capture,
+        FramedStdoutFailurePhase::ControlDelivery => FailurePhase::ControlDelivery,
+        FramedStdoutFailurePhase::Cancellation => FailurePhase::Cancellation,
+        FramedStdoutFailurePhase::Deadline => FailurePhase::Deadline,
+        FramedStdoutFailurePhase::Cleanup => FailurePhase::Cleanup,
+    };
+    let primary = ExecutionFailure::new(command.to_owned(), phase, failure.detail);
+    match failure.cleanup {
+        Some(detail) => primary.with_reconciliation(ExecutionFailure::new(
+            command.to_owned(),
+            FailurePhase::Cleanup,
+            detail,
+        )),
+        None => primary,
+    }
 }
 
 /// Executes one explicit invocation and returns a closed reconciliation outcome.
@@ -294,6 +391,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
     configure_standard_descriptors(&mut command, &specification.output, &specification.input);
     configure_isolated_process_group(&mut command);
 
+    // positron-concurrency-spawn: execute_unix\tcontrolled-command-v1
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -304,18 +402,26 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
             ));
         },
     };
-    let group = ProcessGroup::new(child.id(), specification.tools.process_control.clone());
+    let group = ProcessGroup::new(child.id());
     let mut workers = match OwnedWorkers::start(
         &mut child,
-        &command_display,
-        specification.output,
-        specification.input,
-        &specification.current_dir,
-        &specification.tools,
+        OwnedWorkersRequest {
+            command: &command_display,
+            output: specification.output,
+            input: specification.input,
+            current_dir: &specification.current_dir,
+            tools: &specification.tools,
+            deadline: specification.deadline,
+        },
     ) {
         Ok(workers) => workers,
         Err(failure) => {
-            return finish_after_setup_failure(&mut child, &group, failure);
+            return finish_after_setup_failure(
+                &mut child,
+                &group,
+                failure,
+                specification.shutdown_timeout,
+            );
         },
     };
 
@@ -324,10 +430,18 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
         &command_display,
         specification.deadline,
         Some(specification.cancellation.as_ref()),
+        specification.cancellation_marker.as_deref(),
+        Some(&mut workers),
     ) {
         Ok(status) => status,
         Err(failure) => {
-            return finish_after_execution_failure(&mut child, &group, &mut workers, failure);
+            return finish_after_execution_failure(
+                &mut child,
+                &group,
+                &mut workers,
+                failure,
+                specification.shutdown_timeout,
+            );
         },
     };
 
@@ -337,17 +451,24 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
             &group,
             &mut workers,
             cancellation_failure(&command_display),
+            specification.shutdown_timeout,
         );
     }
 
-    match group.exists(&command_display) {
+    match group.exists(&command_display, specification.deadline) {
         Ok(true) => {
             let failure = ExecutionFailure::new(
                 command_display,
                 FailurePhase::Descendant,
                 "the direct child exited while its controlled process group still owned descendants or inherited descriptors",
             );
-            finish_after_execution_failure(&mut child, &group, &mut workers, failure)
+            finish_after_execution_failure(
+                &mut child,
+                &group,
+                &mut workers,
+                failure,
+                specification.shutdown_timeout,
+            )
         },
         Ok(false) => {
             if cancellation_requested(specification.cancellation.as_ref()) {
@@ -356,6 +477,7 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                     &group,
                     &mut workers,
                     cancellation_failure(&command_display),
+                    specification.shutdown_timeout,
                 );
             }
             match workers.join_until(
@@ -364,10 +486,22 @@ fn execute_unix(specification: InvocationSpec) -> ExecutionOutcome {
                 specification.cancellation.as_ref(),
             ) {
                 Ok(output) => ExecutionOutcome::Reconciled(ExecutionVerdict { status, output }),
-                Err(failure) => ExecutionOutcome::Failed(failure),
+                Err(failure) => finish_after_execution_failure(
+                    &mut child,
+                    &group,
+                    &mut workers,
+                    failure,
+                    specification.shutdown_timeout,
+                ),
             }
         },
-        Err(failure) => finish_after_execution_failure(&mut child, &group, &mut workers, failure),
+        Err(failure) => finish_after_execution_failure(
+            &mut child,
+            &group,
+            &mut workers,
+            failure,
+            specification.shutdown_timeout,
+        ),
     }
 }
 
@@ -393,20 +527,66 @@ fn configure_standard_descriptors(
         },
     }
     match output {
-        OutputMode::Capture { .. } | OutputMode::CaptureWithStdoutArtifact { .. } => {},
+        #[cfg(test)]
+        OutputMode::Discard => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        },
+        OutputMode::FramedStdout { .. } => {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        },
+        OutputMode::Capture { .. } | OutputMode::CaptureWithStdoutArtifact { .. } => {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        },
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 }
 
 #[cfg(unix)]
 fn finish_after_setup_failure(
     child: &mut Child,
     group: &ProcessGroup,
-    failure: ExecutionFailure,
+    mut failure: ExecutionFailure,
+    shutdown_timeout: Duration,
 ) -> ExecutionOutcome {
-    match terminate_and_reap(child, group, &failure.command) {
-        Ok(()) => ExecutionOutcome::Failed(failure),
-        Err(cleanup) => ExecutionOutcome::Failed(cleanup),
+    let shutdown_started = Instant::now();
+    let Some(shutdown_deadline) = shutdown_started.checked_add(shutdown_timeout) else {
+        let cleanup = ExecutionFailure::new(
+            failure.command.clone(),
+            FailurePhase::Cleanup,
+            "the setup-failure shutdown deadline cannot be represented",
+        );
+        return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
+    };
+    let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
+    let process_elapsed = shutdown_started.elapsed();
+    let process_reaped = cleanup.is_ok();
+    let termination_requested = !matches!(&cleanup, Ok(TerminationOutcome::AlreadyExited));
+    let evidence = ShutdownEvidence {
+        termination_requested,
+        process_reaped,
+        live: usize::from(!process_reaped),
+        bound: shutdown_timeout,
+        process_elapsed,
+        resource_elapsed: Duration::ZERO,
+        elapsed: process_elapsed,
+    };
+    if process_elapsed > shutdown_timeout {
+        let cleanup = ExecutionFailure::new(
+            failure.command.clone(),
+            FailurePhase::Cleanup,
+            "controlled setup reconciliation exceeded the registered shutdown deadline",
+        );
+        failure.shutdown = Some(Box::new(evidence));
+        return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
+    }
+    match cleanup {
+        Ok(_) => {
+            failure.shutdown = Some(Box::new(evidence));
+            ExecutionOutcome::Failed(failure)
+        },
+        Err(cleanup) => {
+            failure.shutdown = Some(Box::new(evidence));
+            ExecutionOutcome::Failed(failure.with_reconciliation(cleanup))
+        },
     }
 }
 
@@ -415,15 +595,65 @@ fn finish_after_execution_failure(
     child: &mut Child,
     group: &ProcessGroup,
     workers: &mut OwnedWorkers,
-    failure: ExecutionFailure,
+    mut failure: ExecutionFailure,
+    shutdown_timeout: Duration,
 ) -> ExecutionOutcome {
-    let cleanup = terminate_and_reap(child, group, &failure.command);
-    let workers_result = workers.abort(&failure.command);
-    match (cleanup, workers_result) {
-        (Ok(()), Ok(())) => ExecutionOutcome::Failed(failure),
-        (Err(cleanup), _) => ExecutionOutcome::Failed(cleanup),
-        (Ok(()), Err(worker)) => ExecutionOutcome::Failed(worker),
+    let shutdown_started = Instant::now();
+    let shutdown_deadline = match shutdown_started.checked_add(shutdown_timeout) {
+        Some(deadline) => deadline,
+        None => {
+            let cleanup = ExecutionFailure::new(
+                failure.command.clone(),
+                FailurePhase::Cleanup,
+                "the registered shutdown deadline cannot be represented",
+            );
+            return ExecutionOutcome::Failed(failure.with_reconciliation(cleanup));
+        },
+    };
+    workers.request_abort();
+    let cleanup = terminate_and_reap(child, group, &failure.command, shutdown_deadline);
+    let process_elapsed = shutdown_started.elapsed();
+    let resource_started = Instant::now();
+    let workers_result = workers.abort(&failure.command, shutdown_deadline);
+    let resource_elapsed = resource_started.elapsed();
+    let process_reaped = cleanup.is_ok();
+    let termination_requested = !matches!(&cleanup, Ok(TerminationOutcome::AlreadyExited));
+    let elapsed = shutdown_started.elapsed();
+    let evidence = ShutdownEvidence {
+        termination_requested,
+        process_reaped,
+        live: usize::from(!process_reaped),
+        bound: shutdown_timeout,
+        process_elapsed,
+        resource_elapsed,
+        elapsed,
+    };
+    let mut reconciliation = if elapsed > shutdown_timeout {
+        Some(ExecutionFailure::new(
+            failure.command.clone(),
+            FailurePhase::Cleanup,
+            "controlled reconciliation exceeded the registered shutdown deadline",
+        ))
+    } else {
+        None
+    };
+    if let Err(cleanup) = cleanup {
+        reconciliation = Some(match reconciliation {
+            Some(existing) => existing.with_reconciliation(cleanup),
+            None => cleanup,
+        });
     }
+    if let Err(worker) = workers_result {
+        reconciliation = Some(match reconciliation {
+            Some(existing) => existing.with_reconciliation(worker),
+            None => worker,
+        });
+    }
+    failure.shutdown = Some(Box::new(evidence));
+    if let Some(reconciliation) = reconciliation {
+        failure = failure.with_reconciliation(reconciliation);
+    }
+    ExecutionOutcome::Failed(failure)
 }
 
 #[cfg(unix)]
@@ -432,12 +662,33 @@ fn wait_for_direct_child(
     command: &str,
     deadline: Instant,
     cancellation: Option<&AtomicBool>,
+    cancellation_marker: Option<&std::path::Path>,
+    mut workers: Option<&mut OwnedWorkers>,
 ) -> Result<ExitStatus, ExecutionFailure> {
     loop {
+        if let Some(workers) = workers.as_deref_mut() {
+            workers.poll_control_frame(command)?;
+        }
         if let Some(cancellation) = cancellation
             && cancellation_requested(cancellation)
         {
             return Err(cancellation_failure(command));
+        }
+        if let Some(marker) = cancellation_marker {
+            match marker.try_exists() {
+                Ok(true) => return Err(cancellation_failure(command)),
+                Ok(false) => {},
+                Err(source) => {
+                    return Err(ExecutionFailure::new(
+                        command.to_owned(),
+                        FailurePhase::Descriptor,
+                        format!(
+                            "inspect controlled cancellation marker {}: {source}",
+                            marker.display()
+                        ),
+                    ));
+                },
+            }
         }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -463,207 +714,42 @@ fn wait_for_direct_child(
 }
 
 #[cfg(unix)]
-fn terminate_and_reap(
-    child: &mut Child,
-    group: &ProcessGroup,
-    command: &str,
-) -> Result<(), ExecutionFailure> {
-    group.signal(Signal::Terminate, command)?;
-    let grace_deadline = Instant::now() + TERMINATION_GRACE;
-    if !wait_for_group_while_reaping_direct(child, group, command, grace_deadline)? {
-        group.signal(Signal::Kill, command)?;
-        let kill_deadline = Instant::now() + TERMINATION_GRACE;
-        if !wait_for_group_while_reaping_direct(child, group, command, kill_deadline)? {
-            return Err(group.not_empty_failure(command));
-        }
-    }
-    let reap_deadline = Instant::now() + TERMINATION_GRACE;
-    wait_for_direct_child(child, command, reap_deadline, None).map(|_| ())
-}
-
-#[cfg(unix)]
-fn wait_for_group_while_reaping_direct(
-    child: &mut Child,
-    group: &ProcessGroup,
-    command: &str,
-    deadline: Instant,
-) -> Result<bool, ExecutionFailure> {
-    loop {
-        child.try_wait().map_err(|source| {
-            ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::DirectProcess,
-                source.to_string(),
-            )
-        })?;
-        if !group.exists(command)? {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        wait_for_progress(deadline);
-    }
-}
-
-#[cfg(unix)]
 fn wait_for_progress(deadline: Instant) {
     let remaining = deadline.saturating_duration_since(Instant::now());
     thread::park_timeout(remaining.min(POLL_INTERVAL));
 }
 
 #[cfg(unix)]
-struct ProcessGroup {
-    identifier: u32,
-    process_control: PathBuf,
-}
-
-#[cfg(unix)]
-impl ProcessGroup {
-    fn new(identifier: u32, process_control: PathBuf) -> Self {
-        Self {
-            identifier,
-            process_control,
-        }
-    }
-
-    fn exists(&self, command: &str) -> Result<bool, ExecutionFailure> {
-        let target = format!("-{}", self.identifier);
-        let status = run_platform_kill(
-            &[
-                OsString::from("-0"),
-                OsString::from("--"),
-                OsString::from(target),
-            ],
-            command,
-            &self.process_control,
-        )?;
-        Ok(status.success())
-    }
-
-    fn signal(&self, signal: Signal, command: &str) -> Result<(), ExecutionFailure> {
-        if !self.exists(command)? {
-            return Ok(());
-        }
-        let target = format!("-{}", self.identifier);
-        let status = run_platform_kill(
-            &[
-                OsString::from(signal.flag()),
-                OsString::from("--"),
-                OsString::from(target),
-            ],
-            command,
-            &self.process_control,
-        )?;
-        if status.success() || !self.exists(command)? {
-            return Ok(());
-        }
-        Err(ExecutionFailure::new(
-            command.to_owned(),
-            FailurePhase::Cleanup,
-            format!(
-                "{} did not terminate controlled process group {}",
-                signal.name(),
-                self.identifier
-            ),
-        ))
-    }
-
-    fn not_empty_failure(&self, command: &str) -> ExecutionFailure {
-        ExecutionFailure::new(
-            command.to_owned(),
-            FailurePhase::Cleanup,
-            format!(
-                "controlled process group {} remained alive after forced termination",
-                self.identifier
-            ),
-        )
-    }
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy)]
-enum Signal {
-    Terminate,
-    Kill,
-}
-
-#[cfg(unix)]
-impl Signal {
-    fn flag(self) -> &'static str {
-        match self {
-            Self::Terminate => "-TERM",
-            Self::Kill => "-KILL",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Terminate => "termination signal",
-            Self::Kill => "forced termination signal",
-        }
-    }
-}
-
-#[cfg(unix)]
-fn run_platform_kill(
-    arguments: &[OsString],
-    command: &str,
-    process_control: &std::path::Path,
-) -> Result<ExitStatus, ExecutionFailure> {
-    let mut child = std::process::Command::new(process_control)
-        .env_clear()
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| {
-            ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Cleanup,
-                source.to_string(),
-            )
-        })?;
-    let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-    match wait_for_direct_child(&mut child, command, deadline, None) {
-        Ok(status) => Ok(status),
-        Err(failure) if failure.phase == FailurePhase::Deadline => {
-            child.kill().map_err(|source| {
-                ExecutionFailure::new(
-                    command.to_owned(),
-                    FailurePhase::Cleanup,
-                    source.to_string(),
-                )
-            })?;
-            let reap_deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-            wait_for_direct_child(&mut child, command, reap_deadline, None).map(|_| ())?;
-            Err(ExecutionFailure::new(
-                command.to_owned(),
-                FailurePhase::Cleanup,
-                "platform process-control command exceeded its bounded deadline",
-            ))
-        },
-        Err(failure) => Err(failure),
-    }
-}
-
-#[cfg(unix)]
 struct OwnedWorkers {
     capture: Option<CaptureBroker>,
+    framed_stdout: Option<FramedStdoutReader>,
     input: Option<InputBroker>,
+}
+
+#[cfg(unix)]
+struct OwnedWorkersRequest<'a> {
+    command: &'a str,
+    output: OutputMode,
+    input: InvocationInput,
+    current_dir: &'a std::path::Path,
+    tools: &'a ExecutionTools,
+    deadline: Instant,
 }
 
 #[cfg(unix)]
 impl OwnedWorkers {
     fn start(
         child: &mut Child,
-        command: &str,
-        output: OutputMode,
-        input: InvocationInput,
-        current_dir: &std::path::Path,
-        tools: &ExecutionTools,
+        request: OwnedWorkersRequest<'_>,
     ) -> Result<Self, ExecutionFailure> {
+        let OwnedWorkersRequest {
+            command,
+            output,
+            input,
+            current_dir,
+            tools,
+            deadline,
+        } = request;
         let input_pipe = match input {
             InvocationInput::Null => None,
             InvocationInput::Bytes(bytes) => {
@@ -677,6 +763,21 @@ impl OwnedWorkers {
                 Some((stdin, bytes))
             },
         };
+        #[cfg(test)]
+        if matches!(output, OutputMode::Discard) {
+            if input_pipe.is_some() {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "discarded output mode requires closed standard input",
+                ));
+            }
+            return Ok(Self {
+                capture: None,
+                framed_stdout: None,
+                input: None,
+            });
+        }
         let stdout = child.stdout.take().ok_or_else(|| {
             ExecutionFailure::new(
                 command.to_owned(),
@@ -684,6 +785,29 @@ impl OwnedWorkers {
                 "owned stdout capture pipe was unavailable",
             )
         })?;
+        if let OutputMode::FramedStdout { maximum_bytes } = output {
+            if input_pipe.is_some() {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "framed stdout mode requires closed standard input",
+                ));
+            }
+            let stderr = child.stderr.take().ok_or_else(|| {
+                ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "owned framed stderr control-failure pipe was unavailable",
+                )
+            })?;
+            let framed_stdout = FramedStdoutReader::start(stdout, stderr, maximum_bytes)
+                .map_err(|failure| framed_stdout_failure(command, failure))?;
+            return Ok(Self {
+                capture: None,
+                framed_stdout: Some(framed_stdout),
+                input: None,
+            });
+        }
         let stderr = child.stderr.take().ok_or_else(|| {
             ExecutionFailure::new(
                 command.to_owned(),
@@ -692,6 +816,21 @@ impl OwnedWorkers {
             )
         })?;
         let request = match output {
+            #[cfg(test)]
+            OutputMode::Discard => {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "discarded output mode reached capture setup",
+                ));
+            },
+            OutputMode::FramedStdout { .. } => {
+                return Err(ExecutionFailure::new(
+                    command.to_owned(),
+                    FailurePhase::Descriptor,
+                    "framed stdout mode reached ordinary capture setup",
+                ));
+            },
             OutputMode::Capture {
                 maximum_bytes_per_stream,
             } => CaptureBrokerRequest {
@@ -720,7 +859,7 @@ impl OwnedWorkers {
                 capture_broker: &tools.capture_broker,
             },
         };
-        let mut capture = Some(CaptureBroker::start(stdout, stderr, request)?);
+        let mut capture = Some(CaptureBroker::start(stdout, stderr, request, deadline)?);
         let input = match input_pipe {
             Some((stdin, bytes)) => match InputBroker::start(
                 stdin,
@@ -733,7 +872,7 @@ impl OwnedWorkers {
                 Ok(input) => Some(input),
                 Err(failure) => {
                     let cleanup = match capture.take() {
-                        Some(capture) => capture.abort(command),
+                        Some(capture) => capture.abort(command, deadline),
                         None => Ok(()),
                     };
                     return match cleanup {
@@ -744,7 +883,11 @@ impl OwnedWorkers {
             },
             None => None,
         };
-        Ok(Self { capture, input })
+        Ok(Self {
+            capture,
+            framed_stdout: None,
+            input,
+        })
     }
 
     fn join_until(
@@ -757,35 +900,70 @@ impl OwnedWorkers {
             && let Err(failure) = input.join_until(command, deadline, cancellation)
         {
             let cleanup = match self.capture.take() {
-                Some(capture) => capture.abort(command),
+                Some(capture) => capture.abort(command, deadline),
                 None => Ok(()),
             };
             return match cleanup {
                 Ok(()) => Err(failure),
-                Err(cleanup) => Err(cleanup),
+                Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
             };
         }
-        match self.capture.take() {
-            Some(capture) => capture.join_until(command, deadline, cancellation),
-            None => Ok(CapturedOutput {
+        match (self.capture.take(), self.framed_stdout.take()) {
+            (Some(capture), None) => capture.join_until(command, deadline, cancellation),
+            (None, Some(framed)) => framed
+                .join_until(deadline, cancellation)
+                .map(|stdout| CapturedOutput {
+                    stdout,
+                    stderr: String::new(),
+                })
+                .map_err(|failure| framed_stdout_failure(command, failure)),
+            (None, None) => Ok(CapturedOutput {
                 stdout: String::new(),
                 stderr: String::new(),
             }),
+            (Some(_), Some(_)) => Err(ExecutionFailure::new(
+                command.to_owned(),
+                FailurePhase::Descriptor,
+                "controlled invocation retained two stdout owners",
+            )),
         }
     }
 
-    fn abort(&mut self, command: &str) -> Result<(), ExecutionFailure> {
+    fn abort(&mut self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
         let capture = match self.capture.take() {
-            Some(capture) => capture.abort(command),
+            Some(capture) => capture.abort(command, deadline),
             None => Ok(()),
         };
         let input = match self.input.take() {
-            Some(input) => input.abort(command),
+            Some(input) => input.abort(command, deadline),
             None => Ok(()),
         };
-        match (capture, input) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(failure), _) | (Ok(()), Err(failure)) => Err(failure),
+        let framed = match self.framed_stdout.take() {
+            Some(framed) => framed
+                .abort(deadline)
+                .map_err(|failure| framed_stdout_failure(command, failure)),
+            None => Ok(()),
+        };
+        match (capture, framed, input) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(failure), _, _) | (Ok(()), Err(failure), _) | (Ok(()), Ok(()), Err(failure)) => {
+                Err(failure)
+            },
+        }
+    }
+
+    fn request_abort(&mut self) {
+        if let Some(framed) = self.framed_stdout.as_mut() {
+            framed.close_descriptors();
+        }
+    }
+
+    fn poll_control_frame(&mut self, command: &str) -> Result<(), ExecutionFailure> {
+        match self.framed_stdout.as_mut() {
+            Some(framed) => framed
+                .poll_control_frame()
+                .map_err(|failure| framed_stdout_failure(command, failure)),
+            None => Ok(()),
         }
     }
 }
@@ -877,6 +1055,7 @@ impl InputBroker {
             .stdin(Stdio::from(source))
             .stdout(Stdio::from(input))
             .stderr(Stdio::null())
+            // positron-concurrency-spawn: InputBroker::start\tcontrolled-input-broker-v1
             .spawn()
         {
             Ok(child) => child,
@@ -908,18 +1087,18 @@ impl InputBroker {
         loop {
             if cancellation_requested(cancellation) {
                 let failure = cancellation_failure(command);
-                return match self.abort(command) {
+                return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             match self.poll(command) {
                 Ok(Some(status)) => return self.finish(command, status),
                 Ok(None) => {},
                 Err(failure) => {
-                    return match self.abort(command) {
+                    return match self.abort(command, deadline) {
                         Ok(()) => Err(failure),
-                        Err(cleanup) => Err(cleanup),
+                        Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                     };
                 },
             }
@@ -929,9 +1108,9 @@ impl InputBroker {
                     FailurePhase::Deadline,
                     "input broker remained blocked after the invocation deadline",
                 );
-                return match self.abort(command) {
+                return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             wait_for_progress(deadline);
@@ -978,7 +1157,7 @@ impl InputBroker {
         cleanup
     }
 
-    fn abort(mut self, command: &str) -> Result<(), ExecutionFailure> {
+    fn abort(mut self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
         let process = match self.child.take() {
             Some(mut child) => match child.try_wait() {
                 Ok(Some(status)) => {
@@ -999,10 +1178,11 @@ impl InputBroker {
                             )),
                         }
                     } else {
-                        let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-                        wait_for_direct_child(&mut child, command, deadline, None).map(|status| {
-                            self.status = Some(status);
-                        })
+                        wait_for_direct_child(&mut child, command, deadline, None, None, None).map(
+                            |status| {
+                                self.status = Some(status);
+                            },
+                        )
                     }
                 },
                 Err(source) => Err(ExecutionFailure::new(
@@ -1168,6 +1348,7 @@ impl CaptureBroker {
         stdout: std::process::ChildStdout,
         stderr: std::process::ChildStderr,
         request: CaptureBrokerRequest<'_>,
+        deadline: Instant,
     ) -> Result<Self, ExecutionFailure> {
         let CaptureBrokerRequest {
             stdout: stdout_target,
@@ -1317,7 +1498,7 @@ impl CaptureBroker {
         ) {
             Ok(reader) => reader,
             Err(failure) => {
-                let broker_cleanup = stdout.abort(command);
+                let broker_cleanup = stdout.abort(command, deadline);
                 let cleanup_paths = if artifact_cleanup.is_some() {
                     vec![stderr_path.as_path()]
                 } else {
@@ -1352,26 +1533,26 @@ impl CaptureBroker {
         loop {
             if cancellation_requested(cancellation) {
                 let failure = cancellation_failure(command);
-                return match self.abort(command) {
+                return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             let stdout_complete = match self.stdout.poll(command) {
                 Ok(complete) => complete,
                 Err(failure) => {
-                    return match self.abort(command) {
+                    return match self.abort(command, deadline) {
                         Ok(()) => Err(failure),
-                        Err(cleanup) => Err(cleanup),
+                        Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                     };
                 },
             };
             let stderr_complete = match self.stderr.poll(command) {
                 Ok(complete) => complete,
                 Err(failure) => {
-                    return match self.abort(command) {
+                    return match self.abort(command, deadline) {
                         Ok(()) => Err(failure),
-                        Err(cleanup) => Err(cleanup),
+                        Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                     };
                 },
             };
@@ -1384,9 +1565,9 @@ impl CaptureBroker {
                     FailurePhase::Deadline,
                     "capture descriptors remained open after the invocation deadline",
                 );
-                return match self.abort(command) {
+                return match self.abort(command, deadline) {
                     Ok(()) => Err(failure),
-                    Err(cleanup) => Err(cleanup),
+                    Err(cleanup) => Err(failure.with_reconciliation(cleanup)),
                 };
             }
             wait_for_progress(deadline);
@@ -1424,11 +1605,11 @@ impl CaptureBroker {
         }
     }
 
-    fn abort(mut self, command: &str) -> Result<(), ExecutionFailure> {
+    fn abort(mut self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
         let stdout_path = self.stdout.path.clone();
         let stderr_path = self.stderr.path.clone();
-        let stdout = self.stdout.abort(command);
-        let stderr = self.stderr.abort(command);
+        let stdout = self.stdout.abort(command, deadline);
+        let stderr = self.stderr.abort(command, deadline);
         let cleanup_paths = if self.artifact_cleanup.is_some() {
             vec![stderr_path.as_path()]
         } else {
@@ -1506,6 +1687,7 @@ impl CaptureReader {
             .stdin(input)
             .stdout(Stdio::from(output))
             .stderr(Stdio::null())
+            // positron-concurrency-spawn: CaptureReader::start\tcontrolled-capture-broker-v1
             .spawn()
             .map_err(|source| {
                 ExecutionFailure::new(
@@ -1622,7 +1804,7 @@ impl CaptureReader {
         Ok(())
     }
 
-    fn abort(mut self, command: &str) -> Result<(), ExecutionFailure> {
+    fn abort(mut self, command: &str, deadline: Instant) -> Result<(), ExecutionFailure> {
         let Some(mut child) = self.child.take() else {
             return Ok(());
         };
@@ -1645,10 +1827,11 @@ impl CaptureReader {
                         )),
                     };
                 }
-                let deadline = Instant::now() + PLATFORM_CONTROL_BUDGET;
-                wait_for_direct_child(&mut child, command, deadline, None).map(|status| {
-                    self.status = Some(status);
-                })
+                wait_for_direct_child(&mut child, command, deadline, None, None, None).map(
+                    |status| {
+                        self.status = Some(status);
+                    },
+                )
             },
             Err(source) => Err(ExecutionFailure::new(
                 command.to_owned(),
@@ -1764,15 +1947,15 @@ fn command_display(program: &OsStr, arguments: &[OsString]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        ArtifactOutput, CapturedOutput, ExecutionFailure, ExecutionOutcome, ExecutionTools,
-        ExecutionVerdict, FailurePhase, InvocationInput, InvocationSpec, OutputMode, execute,
+        ArtifactOutput, CapturedOutput, DEFAULT_SHUTDOWN_TIMEOUT, ExecutionFailure,
+        ExecutionOutcome, ExecutionTools, ExecutionVerdict, FailurePhase, InvocationInput,
+        InvocationSpec, OutputMode, execute,
     };
     use std::error::Error;
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File, OpenOptions};
-    use std::io;
-    use std::io::Write as _;
-    use std::os::unix::fs::MetadataExt as _;
+    use std::io::{self, Write};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1783,6 +1966,34 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
     static CANCELLATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct WriteFailure;
+
+    impl Write for WriteFailure {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushFailure {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("deterministic flush failure"))
+        }
+    }
 
     #[test]
     fn reconciles_a_successful_child_with_independent_captured_streams() -> TestResult {
@@ -1807,6 +2018,91 @@ mod tests {
     }
 
     #[test]
+    fn reconciles_one_bounded_stdout_frame_without_an_ambient_path() -> TestResult {
+        let verdict = reconciled(execute(framed_shell(
+            "printf '%s\\n' runner-outcome-v1:6f6b",
+            Duration::from_secs(1),
+        )?))?;
+        assert_output(
+            verdict.output,
+            "runner-outcome-v1:6f6b\n",
+            "",
+            "framed stdout child",
+        )
+    }
+
+    #[test]
+    fn runner_ready_frame_triggers_bounded_process_group_shutdown() -> TestResult {
+        let outcome = execute(framed_shell(
+            "printf '%s\\n' runner-ready-v1; exec /bin/sleep 60",
+            Duration::from_secs(2),
+        )?);
+        assert_framed_control_shutdown(outcome, FailurePhase::Cancellation, "runner-ready-v1")
+    }
+
+    #[test]
+    fn lifecycle_stalled_frame_triggers_bounded_process_group_shutdown() -> TestResult {
+        let outcome = execute(framed_shell(
+            "printf '%s\\n' lifecycle-stalled-v1; exec /bin/sleep 60",
+            Duration::from_secs(2),
+        )?);
+        assert_framed_control_shutdown(outcome, FailurePhase::Deadline, "lifecycle-stalled-v1")
+    }
+
+    #[test]
+    fn early_framed_stdout_eof_triggers_bounded_process_group_shutdown() -> TestResult {
+        let outcome = execute(framed_shell(
+            "exec 1>&-; exec /bin/sleep 60",
+            Duration::from_secs(2),
+        )?);
+        assert_framed_control_shutdown(
+            outcome,
+            FailurePhase::Capture,
+            "completed before a valid outcome",
+        )
+    }
+
+    #[test]
+    fn stalled_control_delivery_reports_a_broken_pipe() -> TestResult {
+        assert_stalled_control_delivery_is_parent_visible(&mut WriteFailure, "broken pipe")
+    }
+
+    #[test]
+    fn stalled_control_delivery_reports_a_flush_failure() -> TestResult {
+        assert_stalled_control_delivery_is_parent_visible(
+            &mut FlushFailure::default(),
+            "deterministic flush failure",
+        )
+    }
+
+    #[test]
+    fn oversized_framed_stdout_fails_closed_without_waiting_for_eof() -> TestResult {
+        let outcome = execute(framed_shell(
+            "exec /bin/dd if=/dev/zero bs=9000 count=1 2>/dev/null",
+            Duration::from_secs(2),
+        )?);
+        match outcome {
+            ExecutionOutcome::Failed(failure)
+                if failure.phase == FailurePhase::Capture
+                    && failure.detail.contains("exact byte bound") =>
+            {
+                Ok(())
+            },
+            ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
+                "oversized framed stdout returned {} instead of capture: {}",
+                failure.phase.as_str(),
+                failure.detail,
+            ))
+            .into()),
+            ExecutionOutcome::Reconciled(verdict) => Err(io::Error::other(format!(
+                "oversized framed stdout reconciled with {}",
+                verdict.status,
+            ))
+            .into()),
+        }
+    }
+
+    #[test]
     fn reconciles_an_immediate_child_after_its_process_group_disappears() -> TestResult {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(1))
@@ -1823,6 +2119,8 @@ mod tests {
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         }))?;
 
         if !verdict.status.success() {
@@ -1882,6 +2180,8 @@ mod tests {
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         }))?;
 
         if !verdict.status.success() {
@@ -1916,6 +2216,8 @@ mod tests {
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         });
 
         match outcome {
@@ -1982,6 +2284,8 @@ mod tests {
             },
             cancellation: worker_cancellation,
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         };
         let worker = thread::spawn(move || execute(specification));
 
@@ -2012,6 +2316,85 @@ mod tests {
     }
 
     #[test]
+    fn unix_repeated_signal_and_probe_phases_share_one_deadline_without_platform_helpers()
+    -> TestResult {
+        let protocol = CancellationProtocol::create()?;
+        let helpers = SlowExecutionTools::create(Duration::from_millis(40))?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or_else(|| io::Error::other("slow-helper execution deadline overflowed"))?;
+        let specification = InvocationSpec {
+            program: OsString::from("/bin/sh"),
+            arguments: vec![
+                OsString::from("-c"),
+                OsString::from(
+                    ": > \"$POSITRON_CONTROLLED_READY\"; trap '' TERM; while :; do /bin/sleep 60; done",
+                ),
+            ],
+            current_dir: std::env::current_dir()?,
+            environment: protocol.environment(),
+            tools: helpers.tools(),
+            input: InvocationInput::Null,
+            output: OutputMode::Discard,
+            cancellation: worker_cancellation,
+            deadline,
+            shutdown_timeout: Duration::from_millis(100),
+            cancellation_marker: None,
+        };
+        let worker = thread::spawn(move || execute(specification));
+
+        protocol.wait_until_ready(Duration::from_secs(1))?;
+        cancellation.store(true, Ordering::Release);
+        let outcome = joined_outcome(worker, "slow process-control cancellation")?;
+        let process_control_started = helpers.process_control_started();
+        let capture_started = helpers.capture_started();
+        let helper_cleanup = helpers.remove();
+        let protocol_cleanup = protocol.remove();
+        helper_cleanup?;
+        protocol_cleanup?;
+        if capture_started? {
+            return Err(io::Error::other(
+                "discard output mode started a capture broker during bounded shutdown",
+            )
+            .into());
+        }
+        if process_control_started? {
+            return Err(io::Error::other(
+                "Unix bounded shutdown launched the configured platform process-control helper",
+            )
+            .into());
+        }
+        let ExecutionOutcome::Failed(failure) = outcome else {
+            return Err(io::Error::other(
+                "slow process-control cancellation unexpectedly reconciled",
+            )
+            .into());
+        };
+        let observed = failure.shutdown.ok_or_else(|| {
+            io::Error::other("slow process-control failure omitted shutdown evidence")
+        })?;
+        if observed.bound != Duration::from_millis(100)
+            || observed.elapsed > Duration::from_millis(100)
+            || !observed.process_reaped
+            || observed.live != 0
+            || failure.phase != FailurePhase::Cancellation
+        {
+            return Err(io::Error::other(format!(
+                "Unix cancellation did not reap inside one shutdown deadline: phase={}, bound={}ms, elapsed={}ms, process-reaped={}, live={}",
+                failure.phase.as_str(),
+                observed.bound.as_millis(),
+                observed.elapsed.as_millis(),
+                observed.process_reaped,
+                observed.live,
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn returns_a_closed_descendant_failure_after_killing_a_term_ignoring_group() -> TestResult {
         let protocol = TermIgnoringProtocol::create()?;
         let mut specification = captured_shell(
@@ -2038,7 +2421,9 @@ done
         cleanup?;
         if descendant_running? {
             return Err(io::Error::other(
-                "controlled owner returned before killing the TERM-ignoring process group",
+                format!(
+                    "controlled owner returned before killing the TERM-ignoring process group: {outcome:?}"
+                ),
             )
             .into());
         }
@@ -2064,9 +2449,43 @@ done
     #[test]
     fn returns_a_bounded_deadline_failure_when_an_escaped_descendant_retains_capture_descriptors()
     -> TestResult {
+        let started = Instant::now();
         let outcome = execute_escaped_descriptor_fixture_with_deadline(Duration::from_millis(100))?;
+        if started.elapsed() > Duration::from_secs(1) {
+            return Err(io::Error::other(
+                "escaped capture deadline did not publish a terminal outcome inside the test watchdog",
+            )
+            .into());
+        }
         match outcome {
-            ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => Ok(()),
+            ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => {
+                if let Some(observed) = failure.shutdown
+                    && (observed.process_reaped != (observed.live == 0)
+                        || (!observed.termination_requested
+                            && (!observed.process_reaped || observed.live != 0))
+                        || observed.elapsed > observed.bound)
+                {
+                    return Err(io::Error::other(format!(
+                        "escaped capture deadline retained dishonest shutdown state: requested={}, reaped={}, live={}, bound={}ms, elapsed={}ms",
+                        observed.termination_requested,
+                        observed.process_reaped,
+                        observed.live,
+                        observed.bound.as_millis(),
+                        observed.elapsed.as_millis(),
+                    ))
+                    .into());
+                }
+                if let Some(reconciliation) = failure.reconciliation
+                    && (reconciliation.detail.is_empty() || reconciliation.detail.len() > 512)
+                {
+                    return Err(io::Error::other(format!(
+                        "escaped capture deadline retained empty {} secondary reconciliation context",
+                        reconciliation.phase.as_str(),
+                    ))
+                    .into());
+                }
+                Ok(())
+            },
             ExecutionOutcome::Failed(failure) => Err(io::Error::other(format!(
                 "escaped capture descriptors returned {} instead of deadline: {}",
                 failure.phase.as_str(),
@@ -2079,6 +2498,40 @@ done
             ))
             .into()),
         }
+    }
+
+    #[test]
+    fn cleanup_failure_is_typed_secondary_context_for_a_primary_deadline() -> TestResult {
+        let primary = ExecutionFailure::new(
+            "controlled-test".to_owned(),
+            FailurePhase::Deadline,
+            "injected primary deadline",
+        );
+        let cleanup = ExecutionFailure::new(
+            "controlled-test".to_owned(),
+            FailurePhase::Cleanup,
+            "injected bounded cleanup failure",
+        );
+
+        let failure = primary.with_reconciliation(cleanup);
+        let reconciliation = failure.reconciliation.ok_or_else(|| {
+            io::Error::other("primary deadline omitted injected secondary cleanup context")
+        })?;
+        if failure.phase != FailurePhase::Deadline
+            || failure.detail != "injected primary deadline"
+            || reconciliation.phase != FailurePhase::Cleanup
+            || reconciliation.detail != "injected bounded cleanup failure"
+            || reconciliation.detail.len() > 512
+        {
+            return Err(io::Error::other(format!(
+                "cleanup changed primary failure: primary={}; secondary={}; detail={}",
+                failure.phase.as_str(),
+                reconciliation.phase.as_str(),
+                reconciliation.detail,
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
@@ -2355,6 +2808,8 @@ done
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         })
     }
 
@@ -2418,6 +2873,8 @@ os._exit(0)
             },
             cancellation,
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         })
     }
 
@@ -2521,7 +2978,99 @@ os._exit(0)
             },
             cancellation: Arc::new(AtomicBool::new(false)),
             deadline,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            cancellation_marker: None,
         })
+    }
+
+    fn framed_shell(script: &str, timeout: Duration) -> TestResult<InvocationSpec> {
+        let mut specification = captured_shell_with_limit(
+            script,
+            timeout,
+            crate::bounded_runner_frames::MAXIMUM_FRAME_BYTES,
+        )?;
+        specification.output = OutputMode::FramedStdout {
+            maximum_bytes: crate::bounded_runner_frames::MAXIMUM_FRAME_BYTES,
+        };
+        specification.shutdown_timeout = Duration::from_millis(100);
+        Ok(specification)
+    }
+
+    fn assert_framed_control_shutdown(
+        outcome: ExecutionOutcome,
+        expected_phase: FailurePhase,
+        expected_frame: &str,
+    ) -> TestResult {
+        let ExecutionOutcome::Failed(failure) = outcome else {
+            return Err(io::Error::other(format!(
+                "{expected_frame} did not fail the controlled invocation"
+            ))
+            .into());
+        };
+        if failure.phase != expected_phase || !failure.detail.contains(expected_frame) {
+            return Err(io::Error::other(format!(
+                "{expected_frame} returned {}: {}",
+                failure.phase.as_str(),
+                failure.detail,
+            ))
+            .into());
+        }
+        let observed = failure.shutdown.ok_or_else(|| {
+            io::Error::other(format!("{expected_frame} omitted shutdown evidence"))
+        })?;
+        if !observed.termination_requested
+            || !observed.process_reaped
+            || observed.live != 0
+            || observed.elapsed > observed.bound
+        {
+            return Err(io::Error::other(format!(
+                "{expected_frame} did not reconcile inside its bound: requested={}, reaped={}, live={}, bound={}ms, elapsed={}ms",
+                observed.termination_requested,
+                observed.process_reaped,
+                observed.live,
+                observed.bound.as_millis(),
+                observed.elapsed.as_millis(),
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    fn assert_stalled_control_delivery_is_parent_visible<W: Write>(
+        writer: &mut W,
+        expected_detail: &str,
+    ) -> TestResult {
+        let mut fallback = Vec::new();
+        let state = crate::bounded_runner_frames::emit_control_with_failure_to(
+            writer,
+            &mut fallback,
+            crate::bounded_runner_frames::ControlFrame::LifecycleStalled,
+        )?;
+        if state != crate::bounded_runner_frames::ControlDeliveryState::ControlDeliveryFailed {
+            return Err(io::Error::other(
+                "failed stalled control delivery did not return its typed state",
+            )
+            .into());
+        }
+        let frame = std::str::from_utf8(&fallback)?;
+        let detail = crate::bounded_runner_frames::control_delivery_failure(frame.as_bytes())?
+            .ok_or_else(|| io::Error::other("fallback was not a control-delivery failure frame"))?;
+        if !detail.contains(expected_detail) {
+            return Err(io::Error::other(format!(
+                "control-delivery fallback omitted `{expected_detail}`: {detail}"
+            ))
+            .into());
+        }
+        let frame = frame
+            .strip_suffix('\n')
+            .ok_or_else(|| io::Error::other("control-delivery fallback was not newline framed"))?;
+        let script = format!("printf '%s\\n' '{frame}' >&2; exec /bin/sleep 60");
+        let outcome = execute(framed_shell(&script, Duration::from_secs(2))?);
+        assert_framed_control_shutdown(
+            outcome,
+            FailurePhase::ControlDelivery,
+            "ControlDeliveryFailed",
+        )
     }
 
     fn reconciled(outcome: ExecutionOutcome) -> TestResult<ExecutionVerdict> {
@@ -2566,6 +3115,77 @@ os._exit(0)
             failure.command,
             failure.detail
         ))
+    }
+
+    struct SlowExecutionTools {
+        directory: PathBuf,
+        process_control: PathBuf,
+        capture_broker: PathBuf,
+        process_control_marker: PathBuf,
+        capture_marker: PathBuf,
+    }
+
+    impl SlowExecutionTools {
+        fn create(delay: Duration) -> TestResult<Self> {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let sequence = CANCELLATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "positron-controlled-slow-tools-{}-{timestamp}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory)?;
+            let process_control = directory.join("process-control");
+            let capture_broker = directory.join("capture-broker");
+            let process_control_marker = directory.join("process-control-started");
+            let capture_marker = directory.join("capture-started");
+            let delay_seconds = format!("{:.3}", delay.as_secs_f64());
+            fs::write(
+                &process_control,
+                format!(
+                    "#!/bin/sh\n: > '{}'\n/bin/sleep {delay_seconds}\nexec /bin/kill \"$@\"\n",
+                    process_control_marker.display()
+                ),
+            )?;
+            fs::write(
+                &capture_broker,
+                format!(
+                    "#!/bin/sh\n: > '{}'\nexec /usr/bin/head \"$@\"\n",
+                    capture_marker.display()
+                ),
+            )?;
+            for path in [&process_control, &capture_broker] {
+                let mut permissions = fs::metadata(path)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(path, permissions)?;
+            }
+            Ok(Self {
+                directory,
+                process_control,
+                capture_broker,
+                process_control_marker,
+                capture_marker,
+            })
+        }
+
+        fn tools(&self) -> ExecutionTools {
+            ExecutionTools {
+                process_control: self.process_control.clone(),
+                capture_broker: self.capture_broker.clone(),
+            }
+        }
+
+        fn capture_started(&self) -> TestResult<bool> {
+            Ok(self.capture_marker.try_exists()?)
+        }
+
+        fn process_control_started(&self) -> TestResult<bool> {
+            Ok(self.process_control_marker.try_exists()?)
+        }
+
+        fn remove(self) -> TestResult {
+            fs::remove_dir_all(self.directory)?;
+            Ok(())
+        }
     }
 
     struct CancellationProtocol {

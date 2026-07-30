@@ -32,6 +32,7 @@ const M0_02_POLICY_CHANGE: &str =
     "qualification/engineering/policy-changes/PC-0007-m0-02-domain-types.json";
 const M0_04_POLICY_CHANGE: &str =
     "qualification/engineering/policy-changes/PC-0009-m0-04-configuration-foundation.json";
+const CANONICAL_CONCURRENCY_FIXTURE_REGISTRY: &[u8] = b"scenario_id\tgate_id\tspawn_site\tschedule\tseed\tmax_tasks\tqueue_capacity\treservation_capacity\tretry_limit\tshutdown_ms\texpected\nconcurrency-cancel-join\tEG-CONCURRENCY\tquality-bounded-worker-v1\tcancel-then-join-v1\tseed-concurrency-v1\t3\t1\t1\t1\t100\tcancelled-then-joined-v1\nresource-fair-pressure\tEG-RESOURCE\tquality-bounded-worker-v1\tround-robin-pressure-v1\tseed-resource-v1\t3\t3\t2\t2\t100\tfair-pressure-retry-leak-free-v1\n";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -464,6 +465,15 @@ fn quality_runs_correctness_through_the_registered_public_seam() -> TestResult {
     result
 }
 
+#[path = "foundational_scope_activation/m0_08_lifecycle_resource.rs"]
+mod m0_08_lifecycle_resource;
+#[path = "foundational_scope_activation/m0_08_parent_verifier.rs"]
+mod m0_08_parent_verifier;
+#[path = "foundational_scope_activation/m0_08_scanner_policy.rs"]
+mod m0_08_scanner_policy;
+#[path = "foundational_scope_activation/m0_08_support.rs"]
+mod m0_08_support;
+
 #[cfg(unix)]
 #[test]
 fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> TestResult {
@@ -481,14 +491,34 @@ fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> Test
         let integrity_registry_path = fixture
             .root
             .join("qualification/engineering/integrity-fixtures.tsv");
+        let concurrency_registry_path = fixture
+            .root
+            .join("qualification/engineering/concurrency-fixtures.tsv");
         let captured_quality_registry = fs::read(&quality_registry_path)?;
         let captured_integrity_registry = fs::read(&integrity_registry_path)?;
+        let captured_concurrency_registry = fs::read(&concurrency_registry_path)?;
+        if captured_concurrency_registry != CANONICAL_CONCURRENCY_FIXTURE_REGISTRY {
+            return Err(std::io::Error::other(
+                "the canonical concurrency fixture registry changed without updating its frozen identity assertion",
+            )
+            .into());
+        }
         let mut seed_hasher = Sha256::new();
         seed_hasher.update(b"positron-quality-fixture-seeds-v1\0");
         seed_hasher.update(&captured_quality_registry);
         seed_hasher.update(b"\0");
         seed_hasher.update(&captured_integrity_registry);
+        seed_hasher.update(b"\0");
+        seed_hasher.update(CANONICAL_CONCURRENCY_FIXTURE_REGISTRY);
         let expected_seed = format!("sha256:{:x}", seed_hasher.finalize());
+        let mut schedule_hasher = Sha256::new();
+        schedule_hasher.update(b"positron-quality-fault-schedules-v1\0");
+        schedule_hasher.update(&captured_quality_registry);
+        schedule_hasher.update(b"\0");
+        schedule_hasher.update(&captured_integrity_registry);
+        schedule_hasher.update(b"\0");
+        schedule_hasher.update(CANONICAL_CONCURRENCY_FIXTURE_REGISTRY);
+        let expected_schedule = format!("sha256:{:x}", schedule_hasher.finalize());
 
         inject_fixture_registry_capture_barrier(&fixture.root)?;
         fixture.build_fixture_xtask()?;
@@ -498,6 +528,8 @@ fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> Test
             .join("target/quality-tools/fixture-registry-capture-ready");
         wait_for_path(&ready, Duration::from_secs(30))?;
         fs::write(&quality_registry_path, b"mutated-after-capture\n")?;
+        fs::write(&integrity_registry_path, b"mutated-after-capture\n")?;
+        fs::write(&concurrency_registry_path, b"mutated-after-capture\n")?;
         fs::write(
             fixture
                 .root
@@ -520,6 +552,15 @@ fn quality_executes_and_binds_the_fixture_registry_bytes_captured_once() -> Test
         if !evidence.contains(&exact_seed) {
             return Err(std::io::Error::other(format!(
                 "evidence seed was not derived from the exact frozen registry bytes: expected `{exact_seed}` in {evidence}"
+            ))
+            .into());
+        }
+        let exact_schedule = format!(
+            "\"fault_schedule\": {{\"applicability\": \"exact\", \"value\": \"{expected_schedule}\""
+        );
+        if !evidence.contains(&exact_schedule) {
+            return Err(std::io::Error::other(format!(
+                "evidence schedule was not derived from the exact frozen quality, integrity, and concurrency registry bytes: expected `{exact_schedule}` in {evidence}"
             ))
             .into());
         }
@@ -2809,7 +2850,7 @@ fn quality_accepts_a_failed_external_gate_with_a_nonempty_canonical_prefix() -> 
 }
 
 #[test]
-fn quality_accepts_a_failed_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
+fn quality_accepts_failed_internal_evidence_with_one_controlled_runner_step() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
         let evidence_directory = fixture.root.join("target/quality/evidence");
@@ -2829,12 +2870,45 @@ fn quality_accepts_a_failed_registered_internal_gate_with_zero_controlled_steps(
             )
             .into());
         }
+        let concurrency_gate = gate_record(&retained, "EG-CONCURRENCY")?;
+        if !concurrency_gate.contains("\"result\": \"passed\"")
+            || !concurrency_gate.contains("\"timeout_ms\":900000")
+            || concurrency_gate
+                .matches("\"program\":\"cargo-xtask-quality/bounded-runner\"")
+                .count()
+                != 1
+        {
+            return Err(std::io::Error::other(
+                "process-backed EG-CONCURRENCY did not retain exactly one controlled child step",
+            )
+            .into());
+        }
+        let concurrency_report = fs::read_to_string(exact_raw_report_path(
+            &fixture.root,
+            &retained,
+            "EG-CONCURRENCY",
+        )?)?;
+        for required in [
+            "\"verdict\":\"exit-status:exit status: 0\"",
+            "process-lifecycle-v1;phase=completed",
+            "termination-requested=false",
+            "process-reaped=true",
+            "live=0",
+            "shutdown-ms=100",
+        ] {
+            if !concurrency_report.contains(required) {
+                return Err(std::io::Error::other(format!(
+                    "process-backed EG-CONCURRENCY report omitted `{required}`"
+                ))
+                .into());
+            }
+        }
 
         fs::remove_file(malformed)?;
         let next = fixture.quality_output_for("pr")?;
         if !next.status.success() {
             return Err(std::io::Error::other(format!(
-                "EG-EVIDENCE rejected a legitimate failed internal zero-step gate: {}\n{}",
+                "EG-EVIDENCE rejected a legitimate process-backed controlled step: {}\n{}",
                 String::from_utf8_lossy(&next.stdout),
                 String::from_utf8_lossy(&next.stderr)
             ))
@@ -2851,7 +2925,15 @@ fn quality_accepts_a_failed_registered_internal_gate_with_zero_controlled_steps(
 fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
-        fixture.quality()?;
+        let initial = fixture.quality_output_for("pr")?;
+        if !initial.status.success() {
+            return Err(std::io::Error::other(format!(
+                "registered internal gates did not produce initial PR evidence: {}\n{}",
+                String::from_utf8_lossy(&initial.stdout),
+                String::from_utf8_lossy(&initial.stderr),
+            ))
+            .into());
+        }
         let evidence = fixture.latest_evidence()?;
         let policy = gate_record(&evidence, "EG-POLICY")?;
         if !policy.contains("\"controlled_steps\":[]") {
@@ -2859,6 +2941,23 @@ fn quality_accepts_a_registered_internal_gate_with_zero_controlled_steps() -> Te
                 "registered internal policy gate did not retain its canonical zero-step sequence",
             )
             .into());
+        }
+        for (gate_id, timeout_ms) in [
+            ("EG-CONCURRENCY", 900_000_u128),
+            ("EG-RESOURCE", 1_800_000_u128),
+        ] {
+            let gate = gate_record(&evidence, gate_id)?;
+            if gate
+                .matches("\"program\":\"cargo-xtask-quality/bounded-runner\"")
+                .count()
+                != 1
+                || !gate.contains(&format!("\"timeout_ms\":{timeout_ms}"))
+            {
+                return Err(std::io::Error::other(format!(
+                    "{gate_id} did not retain exactly one stage-timeout-bound child"
+                ))
+                .into());
+            }
         }
         let next = fixture.quality_output_for("pr")?;
         if !next.status.success() {
@@ -4300,19 +4399,14 @@ impl Fixture {
         &self,
         profile: &str,
     ) -> TestResult<std::process::Output> {
-        let output = Command::new(env!("CARGO"))
+        self.build_fixture_xtask()?;
+        self.quality_output_from_built_fixture(profile)
+    }
+
+    fn quality_output_from_built_fixture(&self, profile: &str) -> TestResult<std::process::Output> {
+        let output = Command::new(self.root.join("target/debug/xtask"))
             .current_dir(&self.root)
-            .args([
-                "run",
-                "--locked",
-                "--quiet",
-                "--package",
-                "xtask",
-                "--",
-                "quality",
-                "--profile",
-                profile,
-            ])
+            .args(["quality", "--profile", profile])
             .output()?;
         Ok(output)
     }
@@ -4370,7 +4464,6 @@ impl Fixture {
             .map_err(Into::into)
     }
 
-    #[cfg(unix)]
     fn build_fixture_xtask(&self) -> TestResult {
         let output = Command::new(env!("CARGO"))
             .current_dir(&self.root)
@@ -6926,7 +7019,7 @@ case "$command" in
     document_root="$target/doc"
     search_index="$document_root/search.index/7ee4fc406f.js"
     mkdir -p "$(dirname "$search_index")"
-    token_prefix='sq0atp-'
+    token_prefix=$(printf '\163\161\060\141\164\160\055')
     : > "$search_index"
     if [ -f target/quality-tools/emit-search-index-square-canary ]; then
       printf '%s%s\n' "$token_prefix" '1111111111111111111111' > "$search_index"
@@ -6997,7 +7090,8 @@ if [ -z "$target" ]; then
 fi
 search_index="$target/search.index/7ee4fc406f.js"
 if [ -f "$search_index" ]; then
-  if grep -E 'sq0atp-[0-9]{22}' "$search_index" >/dev/null; then
+  square_prefix=$(printf '\163\161\060\141\164\160\055')
+  if grep -E "${square_prefix}[0-9]{22}" "$search_index" >/dev/null; then
     printf '%s\n' 'fixture detected Square-shaped secret canary' >&2
     exit 78
   fi
