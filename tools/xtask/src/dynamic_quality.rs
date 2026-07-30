@@ -104,16 +104,40 @@ pub(crate) struct DynamicTarget {
 }
 
 impl DynamicTarget {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     pub(crate) fn kind(&self) -> DynamicKind {
         self.kind
     }
 
-    pub(crate) fn tool(&self) -> &str {
+    pub(crate) fn tool_id(&self) -> &str {
         &self.tool
     }
 
-    pub(crate) fn arguments(&self) -> impl Iterator<Item = &str> {
-        self.arguments.iter().map(String::as_str)
+    pub(crate) fn arguments_slice(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub(crate) fn corpus(&self) -> &str {
+        &self.corpus
+    }
+
+    pub(crate) fn seed(&self) -> &str {
+        &self.seed
+    }
+
+    pub(crate) fn schedule(&self) -> &str {
+        &self.schedule
+    }
+
+    pub(crate) fn minimized_failure(&self) -> &str {
+        &self.minimized_failure
+    }
+
+    pub(crate) fn output_protocol_label(&self) -> &'static str {
+        self.output_protocol.label()
     }
 
     pub(crate) fn timeout(&self) -> Duration {
@@ -168,7 +192,10 @@ pub(crate) struct FrozenDynamicTargets {
 }
 
 impl FrozenDynamicTargets {
-    pub(crate) fn load(root: &Path) -> Result<Self, XtaskError> {
+    pub(crate) fn load(
+        root: &Path,
+        owning_gate_stages: &BTreeSet<String>,
+    ) -> Result<Self, XtaskError> {
         let path = root.join(REGISTRY_PATH);
         let bytes = fs::read(&path)
             .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
@@ -263,7 +290,24 @@ impl FrozenDynamicTargets {
                     format!("dynamic target registry repeats target `{id}`"),
                 ));
             }
+            for (label, value) in [
+                ("corpus", *corpus),
+                ("seed", *seed),
+                ("schedule", *schedule),
+                ("minimized failure", *minimized_failure),
+            ] {
+                validate_input_identity(&path, label, value)?;
+            }
             let stages = parse_stages(&path, stages)?;
+            if !stages.is_subset(owning_gate_stages) {
+                return Err(XtaskError::invalid_path(
+                    &path,
+                    format!(
+                        "dynamic target stages must be an exact nonempty subset of owning gate stages `{}`",
+                        display_stages(owning_gate_stages),
+                    ),
+                ));
+            }
             let arguments = parse_arguments(&path, arguments)?;
             let timeout = parse_timeout(&path, timeout_seconds)?;
             targets.push(DynamicTarget {
@@ -294,6 +338,28 @@ impl FrozenDynamicTargets {
             .iter()
             .filter(move |target| target.selected_by(profile))
     }
+}
+
+fn validate_input_identity(path: &Path, label: &str, value: &str) -> Result<(), XtaskError> {
+    if value == "-"
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(XtaskError::invalid_path(
+            path,
+            format!("dynamic target {label} identity must be a concrete bounded input"),
+        ));
+    }
+    Ok(())
+}
+
+fn display_stages(stages: &BTreeSet<String>) -> String {
+    ["PR", "EXT", "QUAL"]
+        .into_iter()
+        .filter(|stage| stages.contains(*stage))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn parse_stages(path: &Path, value: &str) -> Result<BTreeSet<String>, XtaskError> {

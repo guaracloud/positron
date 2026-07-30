@@ -13,6 +13,8 @@ mod bounded_runners;
 mod concurrency_source_policy;
 mod config_generation;
 mod controlled_execution;
+mod dynamic_cancellation;
+mod dynamic_execution_plan;
 mod dynamic_quality;
 mod error;
 mod evidence_json;
@@ -78,6 +80,7 @@ fn run() -> Result<(), XtaskError> {
             let options = quality::Options::parse(arguments)?;
             quality::run(&options)
         },
+        "quality-internal-cancel-dynamic" => dynamic_cancellation::run(arguments),
         "quality-fixture" => qualification_fixtures::run_process(arguments),
         "quality-bounded-runner" => bounded_runners::run_process(arguments),
         "setup" => {

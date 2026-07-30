@@ -430,6 +430,18 @@ struct GateExecutionContext<'context> {
     environment: &'context EnvironmentSnapshot,
     source: &'context SourceIdentity,
     identity: &'context EvidenceIdentity,
+    dynamic_cancellation: &'context Arc<AtomicBool>,
+    dynamic_cancellation_marker: Option<&'context Path>,
+}
+
+struct DynamicAnalysisContext<'context> {
+    root: &'context Path,
+    registry: &'context Registry,
+    profile: Profile,
+    budget: Duration,
+    environment: &'context EnvironmentSnapshot,
+    cancellation: Arc<AtomicBool>,
+    cancellation_marker: Option<&'context Path>,
 }
 
 impl GateCapture {
@@ -739,6 +751,14 @@ fn digest_relative_files(
 }
 
 pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
+    run_with_dynamic_cancellation(options, Arc::new(AtomicBool::new(false)), None)
+}
+
+pub(crate) fn run_with_dynamic_cancellation(
+    options: &Options,
+    dynamic_cancellation: Arc<AtomicBool>,
+    dynamic_cancellation_marker: Option<PathBuf>,
+) -> Result<(), XtaskError> {
     let root = hooks::workspace_root()?;
     let started_unix_ms = unix_time_ms()?;
     let environment = EnvironmentSnapshot::capture(&root, options.profile)?;
@@ -905,6 +925,8 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
                 environment: &environment,
                 source: &source,
                 identity: &identity,
+                dynamic_cancellation: &dynamic_cancellation,
+                dynamic_cancellation_marker: dynamic_cancellation_marker.as_deref(),
             },
             gate,
             &mut capture,
@@ -1349,6 +1371,8 @@ fn execute_gate(
         environment,
         source,
         identity,
+        dynamic_cancellation,
+        dynamic_cancellation_marker,
     } = context;
     let budget = Duration::from_secs(gate.timeout_seconds);
     match gate.runner.as_str() {
@@ -1364,11 +1388,15 @@ fn execute_gate(
         "build" => run_build_gate(root, options.profile, budget, environment, capture),
         "coverage" => run_coverage_gate(root, registry, budget, options, environment, capture),
         "dynamic-analysis" => run_dynamic_analysis_gate(
-            root,
-            registry,
-            options.profile,
-            budget,
-            environment,
+            DynamicAnalysisContext {
+                root,
+                registry,
+                profile: options.profile,
+                budget,
+                environment,
+                cancellation: Arc::clone(dynamic_cancellation),
+                cancellation_marker: dynamic_cancellation_marker,
+            },
             capture,
         ),
         "dependencies" => {
@@ -1658,20 +1686,36 @@ fn run_generation_matrix_gate(root: &Path) -> Result<String, XtaskError> {
 }
 
 fn run_dynamic_analysis_gate(
-    root: &Path,
-    registry: &Registry,
-    profile: Profile,
-    budget: Duration,
-    environment: &EnvironmentSnapshot,
+    context: DynamicAnalysisContext<'_>,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
+    let DynamicAnalysisContext {
+        root,
+        registry,
+        profile,
+        budget,
+        environment,
+        cancellation,
+        cancellation_marker,
+    } = context;
     if !registry.has_active_application_scope() {
         return Err(XtaskError::invalid(
             "dynamic analysis runner",
             "EG-DYNAMIC was selected without an applicable registered dynamic target",
         ));
     }
-    let targets = crate::dynamic_quality::FrozenDynamicTargets::load(root)?;
+    let owning_stages = registry
+        .gates
+        .iter()
+        .find(|gate| gate.id == "EG-DYNAMIC")
+        .map(|gate| &gate.stages)
+        .ok_or_else(|| {
+            XtaskError::invalid(
+                "dynamic analysis runner",
+                "EG-DYNAMIC is missing from the captured gate registry",
+            )
+        })?;
+    let targets = crate::dynamic_quality::FrozenDynamicTargets::load(root, owning_stages)?;
     let selected = targets.selected(profile).collect::<Vec<_>>();
     if selected.is_empty() {
         return Err(XtaskError::invalid(
@@ -1680,29 +1724,27 @@ fn run_dynamic_analysis_gate(
         ));
     }
     let deadline = Instant::now() + budget;
-    let cancellation = Arc::new(AtomicBool::new(false));
     let mut results = Vec::with_capacity(selected.len());
     for target in selected {
         let available = remaining(deadline)?;
         let timeout = available.min(target.timeout());
-        let detector = match target.kind() {
-            crate::dynamic_quality::DynamicKind::Property => "property",
-            crate::dynamic_quality::DynamicKind::StateModel => "state-model",
-            crate::dynamic_quality::DynamicKind::Fuzz => "fuzz",
-            crate::dynamic_quality::DynamicKind::Corpus => "corpus",
-            crate::dynamic_quality::DynamicKind::Miri => "miri",
-            crate::dynamic_quality::DynamicKind::Sanitizer => "sanitizer",
-            crate::dynamic_quality::DynamicKind::Loom => "loom",
-        };
+        let plan =
+            crate::dynamic_execution_plan::DynamicExecutionPlan::capture(target, &registry.tools)?;
+        let plan_environment = plan
+            .environment()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
         let outcome = run_status_with_options(
             root,
             environment,
-            target.tool(),
-            target.arguments(),
+            plan.program(),
+            plan.arguments(),
             StatusOptions {
                 timeout,
-                environment: &[],
+                environment: &plan_environment,
                 cancellation: Arc::clone(&cancellation),
+                cancellation_marker,
                 maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
                 capture,
             },
@@ -1711,7 +1753,7 @@ fn run_dynamic_analysis_gate(
         results.push(format!(
             "{}; {}; {}",
             target.retained_identity(),
-            detector,
+            plan.retained_identity(),
             outcome.display,
         ));
     }
@@ -2915,6 +2957,7 @@ fn run_documentation_gate(
                 ("CARGO_TARGET_DIR", target_value),
             ],
             cancellation: Arc::new(AtomicBool::new(false)),
+            cancellation_marker: None,
             maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
             capture,
         },
@@ -5603,6 +5646,7 @@ fn run_status<'argument>(
             timeout,
             environment: &[],
             cancellation: Arc::new(AtomicBool::new(false)),
+            cancellation_marker: None,
             maximum_capture_bytes: MAXIMUM_CAPTURED_REPORT_STREAM_BYTES,
             capture,
         },
@@ -5613,6 +5657,7 @@ struct StatusOptions<'environment, 'capture> {
     timeout: Duration,
     environment: &'environment [(&'environment str, &'environment str)],
     cancellation: Arc<AtomicBool>,
+    cancellation_marker: Option<&'environment Path>,
     maximum_capture_bytes: usize,
     capture: &'capture mut GateCapture,
 }
@@ -5654,7 +5699,7 @@ fn run_status_with_options<'argument>(
         cancellation: options.cancellation,
         deadline: deadline_after(options.timeout)?,
         shutdown_timeout: controlled_execution::DEFAULT_SHUTDOWN_TIMEOUT,
-        cancellation_marker: None,
+        cancellation_marker: options.cancellation_marker.map(Path::to_path_buf),
     })
     .into_result();
     let verdict = match verdict {
@@ -5899,7 +5944,18 @@ impl EnvironmentSnapshot {
                     format!("duplicate invocation override `{name}`"),
                 ));
             }
-            if !matches!(*name, "CARGO_TARGET_DIR" | "RUSTDOCFLAGS") {
+            if !matches!(
+                *name,
+                "CARGO_TARGET_DIR"
+                    | "RUSTDOCFLAGS"
+                    | "RUSTFLAGS"
+                    | "POSITRON_DYNAMIC_TARGET_ID"
+                    | "POSITRON_DYNAMIC_KIND"
+                    | "POSITRON_DYNAMIC_CORPUS_ID"
+                    | "POSITRON_DYNAMIC_SEED"
+                    | "POSITRON_DYNAMIC_SCHEDULE"
+                    | "POSITRON_DYNAMIC_MINIMIZED_FAILURE_ID"
+            ) {
                 return Err(XtaskError::invalid(
                     "controlled harness environment",
                     format!("unapproved invocation override `{name}`"),
@@ -5927,7 +5983,7 @@ impl EnvironmentSnapshot {
             }
             configured.push((OsString::from(*name), value));
         }
-        if configured.len() > MAXIMUM_ENVIRONMENT_ENTRIES + 2 {
+        if configured.len() > MAXIMUM_ENVIRONMENT_ENTRIES + 7 {
             return Err(XtaskError::invalid(
                 "controlled harness environment",
                 "invocation environment exceeds its bounded entry count",

@@ -475,6 +475,8 @@ mod m0_08_scanner_policy;
 mod m0_08_support;
 #[path = "foundational_scope_activation/m0_09_coverage_audit.rs"]
 mod m0_09_coverage_audit;
+#[path = "foundational_scope_activation/m0_09_dynamic_plans.rs"]
+mod m0_09_dynamic_plans;
 #[path = "foundational_scope_activation/m0_09_dynamic_quality.rs"]
 mod m0_09_dynamic_quality;
 
@@ -5194,9 +5196,14 @@ fn restore_m0_01_domain_source_shape(root: &Path) -> TestResult {
             fs::remove_file(path)?;
         }
     }
-    let contract_test = root.join("crates/positron-domain/tests/foundational_domain_types.rs");
-    if contract_test.is_file() {
-        fs::remove_file(contract_test)?;
+    for contract_test in [
+        "crates/positron-domain/tests/dynamic_domain_properties.rs",
+        "crates/positron-domain/tests/foundational_domain_types.rs",
+    ] {
+        let contract_test = root.join(contract_test);
+        if contract_test.is_file() {
+            fs::remove_file(contract_test)?;
+        }
     }
     fs::write(
         source_root.join("lib.rs"),

@@ -46,6 +46,11 @@ fn quality_runs_each_registered_dynamic_target_through_the_public_seam() -> Test
         for required in [
             "target=domain-value-properties;kind=property;corpus=domain-value-boundaries-v1;seed=seed-domain-properties-v1;schedule=proptest-sequence-v1;minimized-failure=domain-value-minimized-v1;output-protocol=exit-status-v1",
             "target=domain-lifecycle-state-model;kind=state-model;corpus=domain-lifecycle-transitions-v1;seed=seed-domain-state-model-v1;schedule=transition-schedule-v1;minimized-failure=domain-lifecycle-minimized-v1;output-protocol=exit-status-v1",
+            "tenant_lifecycle_makes_purge_one_way",
+            "plan=dynamic-execution-plan-v1",
+            "argv-digest=sha256:",
+            "input-digest=sha256:",
+            "plan-digest=sha256:",
             "\"program\":\"cargo\"",
         ] {
             if !report.contains(required) {
@@ -54,6 +59,12 @@ fn quality_runs_each_registered_dynamic_target_through_the_public_seam() -> Test
                 ))
                 .into());
             }
+        }
+        if report.contains("\"--doc\"") {
+            return Err(std::io::Error::other(
+                "the state-model descriptor executed documentation instead of lifecycle transitions",
+            )
+            .into());
         }
         Ok(())
     })();
@@ -127,8 +138,8 @@ fn quality_retains_a_missing_dynamic_tool_without_fallback() -> TestResult {
         enable_dynamic_gate(&fixture)?;
         replace_once(
             &fixture.root.join(DYNAMIC_TARGETS),
-            "\tcargo\ttest|--locked|--package|positron-domain|--test|foundational_domain_types\t",
-            "\tdefinitively-absent-dynamic-tool\ttest|--locked|--package|positron-domain|--test|foundational_domain_types\t",
+            "\tcargo\ttest|--locked|--package|positron-domain|--test|dynamic_domain_properties\t",
+            "\tdefinitively-absent-dynamic-tool\ttest|--locked|--package|positron-domain|--test|dynamic_domain_properties\t",
         )?;
         let output = fixture.quality_output_for("pr")?;
         assert_rejected_output(&output, "definitively-absent-dynamic-tool")?;
@@ -220,53 +231,6 @@ fn quality_uses_dynamic_target_bytes_captured_before_a_post_capture_registry_swa
 }
 
 #[test]
-fn quality_executes_every_closed_dynamic_kind_through_the_public_descriptor_seam() -> TestResult {
-    let fixture = Fixture::create()?;
-    let result = (|| {
-        enable_dynamic_gate(&fixture)?;
-        fs::write(
-            fixture.root.join(DYNAMIC_TARGETS),
-            all_dynamic_kinds_registry(),
-        )?;
-        let output = fixture.quality_output_for("pr")?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "the complete dynamic-kind descriptor fixture failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            ))
-            .into());
-        }
-        let evidence = fixture.latest_evidence()?;
-        let report = fs::read_to_string(exact_raw_report_path(
-            &fixture.root,
-            &evidence,
-            "EG-DYNAMIC",
-        )?)?;
-        for kind in [
-            "property",
-            "state-model",
-            "fuzz",
-            "corpus",
-            "miri",
-            "sanitizer",
-            "loom",
-        ] {
-            if !report.contains(&format!("kind={kind}")) {
-                return Err(std::io::Error::other(format!(
-                    "the complete descriptor fixture did not execute `{kind}`"
-                ))
-                .into());
-            }
-        }
-        Ok(())
-    })();
-    let cleanup = fixture.remove();
-    cleanup?;
-    result
-}
-
-#[test]
 fn quality_does_not_retry_a_failed_dynamic_target_to_green() -> TestResult {
     let fixture = Fixture::create()?;
     let result = (|| {
@@ -322,17 +286,51 @@ fn quality_retains_dynamic_target_cancellation_through_the_public_seam() -> Test
     let fixture = Fixture::create()?;
     let result = (|| {
         enable_dynamic_gate(&fixture)?;
-        replace_once(
-            &fixture.root.join("tools/xtask/src/quality.rs"),
-            "    let cancellation = Arc::new(AtomicBool::new(false));\n",
-            "    let cancellation = Arc::new(AtomicBool::new(true));\n",
+        install_dynamic_cargo_fault(
+            &fixture,
+            "dynamic-cancellation-enabled",
+            "printf '%s\\n' \"$$\" > target/quality-tools/dynamic-cancellation.pid\n    : > target/quality-tools/dynamic-cancellation.ready\n    exec sleep 30",
         )?;
-        let output = fixture.quality_output_from_fixture_source("pr")?;
+        fixture.build_fixture_xtask()?;
+        fs::write(
+            fixture
+                .root
+                .join("target/quality-tools/dynamic-cancellation-enabled"),
+            "dynamic target cancellation must become reachable\n",
+        )?;
+        let ready = fixture
+            .root
+            .join("target/quality-tools/dynamic-cancellation.ready");
+        let ready_value = ready.to_str().ok_or_else(|| {
+            std::io::Error::other("dynamic cancellation readiness path is not UTF-8")
+        })?;
+        let output = Command::new(fixture.root.join("target/debug/xtask"))
+            .current_dir(&fixture.root)
+            .args([
+                "quality-internal-cancel-dynamic",
+                "--profile",
+                "pr",
+                "--ready-marker",
+                ready_value,
+            ])
+            .output()?;
         assert_rejected_output(
             &output,
             "controlled harness execution failed during cancellation",
         )?;
-        assert_failed_dynamic_evidence(&fixture)
+        assert_failed_dynamic_evidence(&fixture)?;
+        let pid = fs::read_to_string(
+            fixture
+                .root
+                .join("target/quality-tools/dynamic-cancellation.pid"),
+        )?;
+        if process_is_running(pid.trim())? {
+            return Err(std::io::Error::other(
+                "cancelled dynamic target remained live after quality owner reconciliation",
+            )
+            .into());
+        }
+        Ok(())
     })();
     let cleanup = fixture.remove();
     cleanup?;
@@ -394,6 +392,16 @@ fn quality_rejects_dynamic_target_output_that_exceeds_the_bounded_capture_ceilin
     result
 }
 
+fn process_is_running(pid: &str) -> TestResult<bool> {
+    Ok(Command::new("kill")
+        .args(["-0", pid])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success())
+}
+
 fn assert_failed_dynamic_evidence(fixture: &Fixture) -> TestResult {
     let evidence = fixture.latest_evidence()?;
     let gate = gate_record(&evidence, "EG-DYNAMIC")?;
@@ -413,26 +421,6 @@ fn enable_dynamic_gate(fixture: &Fixture) -> TestResult {
         "risk_gates",
         "EG-00|EG-ARCH|EG-BUILD|EG-DEPS|EG-DOCS|EG-DYNAMIC|EG-ERROR|EG-EVIDENCE|EG-POLICY|EG-RUST|EG-SAFETY|EG-SECRETS|EG-SUPPLY|EG-TEST",
     )
-}
-
-fn all_dynamic_kinds_registry() -> String {
-    let mut registry = String::from(
-        "target_id\tgate_id\tkind\tstages\ttool\targuments\tcorpus\tseed\tschedule\tminimized_failure\toutput_protocol\ttimeout_seconds\n",
-    );
-    for kind in [
-        "property",
-        "state-model",
-        "fuzz",
-        "corpus",
-        "miri",
-        "sanitizer",
-        "loom",
-    ] {
-        registry.push_str(&format!(
-            "fixture-{kind}\tEG-DYNAMIC\t{kind}\tPR\tcargo\ttest|--locked|--package|positron-domain|--test|foundational_domain_types\tfixture-corpus-{kind}-v1\tfixture-seed-{kind}-v1\tfixture-schedule-{kind}-v1\tfixture-minimized-{kind}-v1\texit-status-v1\t30\n"
-        ));
-    }
-    registry
 }
 
 fn install_dynamic_cargo_fault(fixture: &Fixture, marker: &str, action: &str) -> TestResult {

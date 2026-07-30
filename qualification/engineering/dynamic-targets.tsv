@@ -1,3 +1,3 @@
 target_id	gate_id	kind	stages	tool	arguments	corpus	seed	schedule	minimized_failure	output_protocol	timeout_seconds
-domain-value-properties	EG-DYNAMIC	property	PR|EXT	cargo	test|--locked|--package|positron-domain|--test|foundational_domain_types	domain-value-boundaries-v1	seed-domain-properties-v1	proptest-sequence-v1	domain-value-minimized-v1	exit-status-v1	300
-domain-lifecycle-state-model	EG-DYNAMIC	state-model	PR|EXT	cargo	test|--locked|--package|positron-domain|--doc	domain-lifecycle-transitions-v1	seed-domain-state-model-v1	transition-schedule-v1	domain-lifecycle-minimized-v1	exit-status-v1	300
+domain-value-properties	EG-DYNAMIC	property	PR|EXT	cargo	test|--locked|--package|positron-domain|--test|dynamic_domain_properties	domain-value-boundaries-v1	seed-domain-properties-v1	proptest-sequence-v1	domain-value-minimized-v1	exit-status-v1	300
+domain-lifecycle-state-model	EG-DYNAMIC	state-model	PR|EXT	cargo	test|--locked|--package|positron-domain|--test|foundational_domain_types|tenant_lifecycle_makes_purge_one_way|--|--exact	domain-lifecycle-transitions-v1	seed-domain-state-model-v1	transition-schedule-v1	domain-lifecycle-minimized-v1	exit-status-v1	300
