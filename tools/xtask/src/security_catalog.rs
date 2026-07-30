@@ -5,8 +5,6 @@
 //! immutable descriptor before executing its bounded detector command.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use crate::error::XtaskError;
@@ -90,7 +88,8 @@ impl FrozenSecurityCatalog {
     pub(crate) fn load(root: &Path, registry: &Registry) -> Result<Self, XtaskError> {
         let threat_surfaces = crate::security_threat_surface::ThreatSurfaceRegistry::load(root)?;
         let path = root.join(CATALOG_PATH);
-        let bytes = read_bounded_catalog(&path)?;
+        let bytes =
+            crate::bounded_input::read(&path, MAXIMUM_CATALOG_BYTES, "security runner catalog")?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| XtaskError::invalid_path(&path, "security runner catalog is not UTF-8"))?;
         let mut lines = text.lines();
@@ -219,25 +218,6 @@ impl FrozenSecurityCatalog {
             )
         })
     }
-}
-
-fn read_bounded_catalog(path: &Path) -> Result<Vec<u8>, XtaskError> {
-    let mut file = File::open(path)
-        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
-    let mut bytes = Vec::with_capacity(MAXIMUM_CATALOG_BYTES + 1);
-    let maximum = u64::try_from(MAXIMUM_CATALOG_BYTES + 1)
-        .map_err(|_| XtaskError::invalid_path(path, "security catalog read bound is invalid"))?;
-    file.by_ref()
-        .take(maximum)
-        .read_to_end(&mut bytes)
-        .map_err(|source| XtaskError::io(format!("bounded read {}", path.display()), source))?;
-    if bytes.len() > MAXIMUM_CATALOG_BYTES {
-        return Err(XtaskError::invalid_path(
-            path,
-            format!("security runner catalog exceeds {MAXIMUM_CATALOG_BYTES} bytes"),
-        ));
-    }
-    Ok(bytes)
 }
 
 fn validate_contract(

@@ -5311,8 +5311,6 @@ fn run_security_gate(
     environment: &EnvironmentSnapshot,
     capture: &mut GateCapture,
 ) -> Result<String, XtaskError> {
-    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
-    let descriptor = catalog.descriptor_for("EG-SECURITY")?;
     if !registry.has_m0_04_configuration_scope() {
         return Err(XtaskError::invalid(
             "security gate",
@@ -5320,9 +5318,11 @@ fn run_security_gate(
         ));
     }
     let path = root.join("qualification/engineering/security/TM-0001-m0-04-toml-parser.json");
-    let threat_model = fs::read_to_string(&path)
-        .map_err(|source| XtaskError::io(format!("read {}", path.display()), source))?;
+    let threat_model =
+        crate::bounded_input::read_utf8(&path, 8_192, "M0-04 parser threat-model record")?;
     validate_configuration_parser_threat_model_text(&threat_model)?;
+    let catalog = crate::security_catalog::FrozenSecurityCatalog::load(root, registry)?;
+    let descriptor = catalog.descriptor_for("EG-SECURITY")?;
     let merge_base = run_capture(
         root,
         environment,
@@ -5346,11 +5346,8 @@ fn run_security_gate(
         budget,
         Some(capture),
     )?;
-    let changed_path_digest =
-        crate::security_threat_surface::ThreatSurfaceRegistry::validate_changed_paths(
-            root,
-            &changed.stdout,
-        )?;
+    let changed_path_review = crate::security_threat_surface::ThreatSurfaceRegistry::load(root)?
+        .validate_changed_paths(root, base, &changed.stdout)?;
     let adversarial =
         run_configuration_parser_adversarial_tests(root, budget, environment, capture)?;
     let probes = run_status(
@@ -5378,7 +5375,7 @@ fn run_security_gate(
         ));
     }
     Ok(format!(
-        "internal:{} | {} | merge-base={base}; changed-path-set-digest={changed_path_digest} | {} | {}",
+        "internal:{} | {} | merge-base={base}; {changed_path_review} | {} | {}",
         descriptor.id(),
         descriptor.evidence_summary(),
         adversarial.display,

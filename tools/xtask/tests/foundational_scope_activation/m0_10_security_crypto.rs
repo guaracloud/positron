@@ -38,7 +38,7 @@ fn quality_orchestrates_security_crypto_and_secret_canary_descriptors_through_th
                 .into());
             }
             if gate == "EG-SECURITY"
-                && (!report.contains("merge-base=1111111111111111111111111111111111111111")
+                && (!report.contains("merge-base=76d784d5cfe8bcd85267a21b906d12d02af5afce")
                     || !report.contains("changed-path-set-digest=sha256:"))
             {
                 return Err(std::io::Error::other(
@@ -336,7 +336,7 @@ fn quality_rejects_missing_merge_base_and_uncovered_security_changes() -> TestRe
             ),
             (
                 "m0-10-uncovered-security-path",
-                "security changed-path coverage",
+                "complete changed-path classification",
             ),
         ] {
             let path = fixture.root.join("target/quality-tools").join(marker);

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod api_generation;
+mod bounded_input;
 mod bounded_measurement_verifier;
 mod bounded_runner_frames;
 mod bounded_runners;
@@ -29,6 +30,7 @@ mod quality;
 mod registered_task_lifecycle;
 mod registry;
 mod security_catalog;
+mod security_change_review;
 mod security_harness;
 mod security_threat_surface;
 

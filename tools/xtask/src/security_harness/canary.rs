@@ -2,8 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -16,7 +14,7 @@ const GOLDEN_PATH: &str =
 const LEAK_PATH: &str =
     "qualification/fixtures/adversarial/cryptography/m0-10-secret-canary-leak.tsv";
 const TARGET_PATH: &str = "qualification/engineering/security-canary-targets.tsv";
-const MAXIMUM_FIXTURE_BYTES: u64 = 4_096;
+const MAXIMUM_FIXTURE_BYTES: usize = 4_096;
 pub(super) const CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_V1";
 pub(super) const LEAK_CANARY_ID: &str = "POSITRON_SYNTHETIC_CANARY_LEAK_V1";
 
@@ -50,6 +48,7 @@ pub(super) fn scan_candidate(
 ) -> Result<String, XtaskError> {
     let target_digest = validate_target_contract(repository)?;
     let golden = Golden::load(&repository.join(GOLDEN_PATH))?;
+    let _intentional_leak = LeakFixture::load(&repository.join(LEAK_PATH))?;
     let collected_root = artifact_root.join("collected");
     let mut collected = Vec::new();
     let mut budget = ArtifactBudget::candidate();
@@ -343,9 +342,7 @@ fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
 fn read_fixture(path: &Path) -> Result<Vec<u8>, XtaskError> {
-    let maximum = usize::try_from(MAXIMUM_FIXTURE_BYTES)
-        .map_err(|_| XtaskError::invalid_path(path, "fixture bound is invalid"))?;
-    read_bounded(path, maximum, "committed fixture")
+    read_bounded(path, MAXIMUM_FIXTURE_BYTES, "committed security fixture")
 }
 
 pub(super) fn read_bounded(
@@ -353,20 +350,5 @@ pub(super) fn read_bounded(
     maximum: usize,
     subject: &str,
 ) -> Result<Vec<u8>, XtaskError> {
-    let mut file = File::open(path)
-        .map_err(|source| XtaskError::io(format!("open {}", path.display()), source))?;
-    let limit = u64::try_from(maximum.saturating_add(1))
-        .map_err(|_| XtaskError::invalid_path(path, "read bound is invalid"))?;
-    let mut bytes = Vec::with_capacity(maximum.saturating_add(1));
-    file.by_ref()
-        .take(limit)
-        .read_to_end(&mut bytes)
-        .map_err(|source| XtaskError::io(format!("bounded read {}", path.display()), source))?;
-    if bytes.len() > maximum {
-        return Err(XtaskError::invalid_path(
-            path,
-            format!("{subject} exceeds {maximum} bytes"),
-        ));
-    }
-    Ok(bytes)
+    crate::bounded_input::read(path, maximum, subject)
 }
