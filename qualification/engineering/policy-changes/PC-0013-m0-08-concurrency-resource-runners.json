@@ -156,6 +156,14 @@
         "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-control-target-29fe591.UerWtk git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
         "observed_state": "The clean exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-control-delivery-29fe591.xbOzJB/target/quality/evidence/1785379177144-29fe5913f528-54907.json. EG-TEST ran 452 tests: 450 passed. One typed control-delivery schedule observed the child exit between event delivery and signal reconciliation and incorrectly retained process-reaped=false and live=1; one valid legacy terminal outcome observed event-channel disconnect just before the broker handle published its finished state and was incorrectly reclassified as capture failure. All preceding gates, including EG-CONCURRENCY and EG-RESOURCE, passed, and origin remained at e9a5d950b6f44b556c992529fd6a49e9c2a83067.",
         "recovery": "Preserve this worktree, external target directory, and exact failed evidence. Reap and probe an already-exited direct child before signaling, and force broker completion on sender disconnect before validating the retained terminal outcome; then run one fresh isolated exact-head publication attempt."
+      },
+      {
+        "revision": "bd78786df17fe6ed013050efb046b093dbcf1b36",
+        "worktree": "/private/tmp/positron-m0-08-terminal-races-bd78786.SheMaE",
+        "cargo_target_dir": "/private/tmp/positron-m0-08-terminal-target-bd78786.WO3SyZ",
+        "command": "CARGO_TARGET_DIR=/private/tmp/positron-m0-08-terminal-target-bd78786.WO3SyZ git push origin HEAD:refs/heads/codex/m0-08-concurrency-resource-runners",
+        "observed_state": "The clean exact-head pre-push PR profile retained failed evidence at /private/tmp/positron-m0-08-terminal-races-bd78786.SheMaE/target/quality/evidence/1785379762336-bd78786df17f-15949.json. EG-TEST ran 454 tests: 453 passed. The two terminal lifecycle race regressions passed, while the escaped-descriptor regression retained its older unconditional termination-requested=true assertion even when the corrected owner honestly observed the direct child already reaped and its process group absent, with termination-requested=false, process-reaped=true, and live=0. All preceding gates, including EG-CONCURRENCY and EG-RESOURCE, passed, and origin remained at e9a5d950b6f44b556c992529fd6a49e9c2a83067.",
+        "recovery": "Preserve this worktree, external target directory, and exact failed evidence. Keep the shutdown bound and reaping assertions, but accept termination-requested=false only for the closed already-exited, group-absent, process-reaped=true, live=0 path; retain termination-requested=true when signaling a live process group."
       }
     ]
   },

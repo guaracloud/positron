@@ -2460,8 +2460,9 @@ done
         match outcome {
             ExecutionOutcome::Failed(failure) if failure.phase == FailurePhase::Deadline => {
                 if let Some(observed) = failure.shutdown
-                    && (!observed.termination_requested
-                        || observed.process_reaped != (observed.live == 0)
+                    && (observed.process_reaped != (observed.live == 0)
+                        || (!observed.termination_requested
+                            && (!observed.process_reaped || observed.live != 0))
                         || observed.elapsed > observed.bound)
                 {
                     return Err(io::Error::other(format!(
