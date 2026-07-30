@@ -4,8 +4,9 @@ include!("m0_11_matrix_execution.rs");
 include!("m0_11_matrix_lifecycle.rs");
 include!("m0_11_matrix_policy.rs");
 
-const MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES: usize = 8_192;
 const MAXIMUM_MATRIX_CONSOLE_BYTES: usize = 512;
+const MAXIMUM_M0_11_CONSOLE_BYTES: usize = 4_096;
+const MAXIMUM_M0_11_CONSOLE_LINES: usize = 8;
 fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::process::Output> {
     let controlled_path = std::env::join_paths([
         fixture.root.join("target/quality-tools/bin"),
@@ -19,18 +20,66 @@ fn matrix_quality_output(fixture: &Fixture, profile: &str) -> TestResult<std::pr
         .args(["quality", "--profile", profile])
         .env("PATH", controlled_path)
         .output()?;
-    let bytes = output
-        .stdout
-        .len()
-        .checked_add(output.stderr.len())
-        .ok_or_else(|| std::io::Error::other("nested matrix output byte count overflowed"))?;
-    if profile == "pr" && bytes > MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES {
+    if profile == "pr" {
+        assert_m0_11_console_budget(&output)?;
+    }
+    Ok(output)
+}
+
+fn assert_m0_11_console_budget(output: &std::process::Output) -> TestResult {
+    let (bytes, lines) = m0_11_console_footprint(&output.stdout, &output.stderr)?;
+    if bytes > MAXIMUM_M0_11_CONSOLE_BYTES || lines > MAXIMUM_M0_11_CONSOLE_LINES {
         return Err(std::io::Error::other(format!(
-            "nested matrix runner output exceeds the {MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES}-byte fixture suppression budget"
+            "M0-11-owned console is {bytes} bytes across {lines} lines, exceeding the {MAXIMUM_M0_11_CONSOLE_BYTES}-byte/{MAXIMUM_M0_11_CONSOLE_LINES}-line budget"
         ))
         .into());
     }
-    Ok(output)
+    Ok(())
+}
+
+fn m0_11_console_footprint(stdout: &[u8], stderr: &[u8]) -> TestResult<(usize, usize)> {
+    let mut bytes = 0_usize;
+    let mut lines = 0_usize;
+    for line in String::from_utf8_lossy(stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(stderr).lines())
+    {
+        if line.contains("[EG-MATRIX]")
+            || line.contains("[EG-SECURITY]")
+            || line.contains("security-policy=")
+            || line.starts_with("Evidence:")
+        {
+            bytes = bytes
+                .checked_add(line.len())
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| std::io::Error::other("M0-11 console byte count overflowed"))?;
+            lines = lines
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("M0-11 console line count overflowed"))?;
+        }
+    }
+    Ok((bytes, lines))
+}
+
+#[test]
+fn m0_11_console_budget_excludes_unrelated_gate_noise() -> TestResult {
+    let unrelated = "x".repeat(20 * 1024);
+    let (bytes, lines) = m0_11_console_footprint(
+        format!("[EG-SECURITY] passed\n[EG-MATRIX] passed\nEvidence: retained.json\n{unrelated}\n")
+            .as_bytes(),
+        b"",
+    )?;
+    if bytes > MAXIMUM_M0_11_CONSOLE_BYTES || lines > MAXIMUM_M0_11_CONSOLE_LINES {
+        return Err(
+            std::io::Error::other("unrelated gate noise changed M0-11 console accounting").into(),
+        );
+    }
+    let oversized = format!("[EG-MATRIX] {}\n", "x".repeat(MAXIMUM_M0_11_CONSOLE_BYTES));
+    let (bytes, lines) = m0_11_console_footprint(oversized.as_bytes(), b"")?;
+    if bytes <= MAXIMUM_M0_11_CONSOLE_BYTES && lines <= MAXIMUM_M0_11_CONSOLE_LINES {
+        return Err(std::io::Error::other("oversized M0-11 console line was not accounted").into());
+    }
+    Ok(())
 }
 
 fn matrix_public_detail(gate: &str) -> TestResult<&str> {

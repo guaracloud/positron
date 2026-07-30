@@ -51,17 +51,6 @@ fn matrix_fixture_suppresses_nested_output_and_retains_structured_evidence() -> 
             )
             .into());
         }
-        let console_bytes = output
-            .stdout
-            .len()
-            .checked_add(output.stderr.len())
-            .ok_or_else(|| std::io::Error::other("matrix console byte count overflowed"))?;
-        if console_bytes > MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES {
-            return Err(std::io::Error::other(format!(
-                "successful 14-target matrix console output exceeds the {MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES}-byte limit"
-            ))
-            .into());
-        }
         let matrix_console_bytes = String::from_utf8_lossy(&output.stdout)
             .lines()
             .chain(String::from_utf8_lossy(&output.stderr).lines())

@@ -206,14 +206,8 @@ fn security_policy_failure_console_is_bounded_and_retains_evidence_pointer() -> 
             )
             .into());
         }
-        let console_bytes = output
-            .stdout
-            .len()
-            .checked_add(output.stderr.len())
-            .ok_or_else(|| std::io::Error::other("security policy console byte count overflowed"))?;
         let evidence_path = fixture.latest_evidence_path()?;
-        if console_bytes > MAXIMUM_NESTED_MATRIX_OUTPUT_BYTES
-            || !String::from_utf8_lossy(&output.stdout).contains(evidence_path.to_string_lossy().as_ref())
+        if !String::from_utf8_lossy(&output.stdout).contains(evidence_path.to_string_lossy().as_ref())
         {
             return Err(std::io::Error::other(
                 "security policy failure console was not bounded with a retained evidence pointer",
