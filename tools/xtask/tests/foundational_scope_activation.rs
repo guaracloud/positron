@@ -473,6 +473,8 @@ mod m0_08_parent_verifier;
 mod m0_08_scanner_policy;
 #[path = "foundational_scope_activation/m0_08_support.rs"]
 mod m0_08_support;
+#[path = "foundational_scope_activation/m0_09_coverage_audit.rs"]
+mod m0_09_coverage_audit;
 #[path = "foundational_scope_activation/m0_09_dynamic_quality.rs"]
 mod m0_09_dynamic_quality;
 
