@@ -48,9 +48,4 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo llvm-cov --locked --workspace --lib --bins --tests --all-features --fail-under-lines 95
 cargo test --locked --workspace --tests
 ```
-
-Run applicable fuzz targets with `cargo fuzz run <target>`. Do not introduce a
-custom validation runner, evidence system, or parallel governance framework.
-
-Commit, push, pull request, tag, publish, deploy, and release actions each
-require explicit user authorization.
+Run applicable fuzz targets with `cargo fuzz run <target>`. Do not introduce a custom validation runner, evidence system, or parallel governance framework.
