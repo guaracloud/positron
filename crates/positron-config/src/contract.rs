@@ -1,8 +1,7 @@
 //! Rust-owned canonical setting declarations.
 //!
-//! The deliberately bounded `define_settings!` invocation below is also read
-//! by `cargo xtask generate-config`. Keep each declaration on one line and use
-//! only the closed grammar accepted by that generator.
+//! Keep each `define_settings!` declaration on one line so the canonical
+//! setting table remains easy to review alongside its reference documentation.
 
 use super::{
     MutabilityClass, ProvenancePolicy, SecrecyClass, Setting, SettingDefinition, SettingKind,

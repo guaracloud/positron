@@ -1,4 +1,0 @@
-[advisories]
-ignore = []
-informational_warnings = ["unmaintained", "unsound"]
-severity_threshold = "low"

@@ -1,6 +1,5 @@
-// Canonical Positron public API definition. Generated artifacts are produced
-// by `cargo xtask generate`; `cargo xtask generate-api` remains supported for
-// API-only regeneration.
+// Canonical Positron public API definition. The committed Rust, HTTP/JSON,
+// OpenAPI, schema, reference, and fixture artifacts change with this contract.
 syntax = "proto3";
 
 package positron.v1;

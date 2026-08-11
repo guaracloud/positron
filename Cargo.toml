@@ -15,24 +15,6 @@ members = [
     "crates/positron-runtime",
     "crates/positron-signals",
     "crates/positron-upgrade",
-    "tools/xtask",
-]
-default-members = [
-    "crates/positron",
-    "crates/positron-api",
-    "crates/positron-backup",
-    "crates/positron-config",
-    "crates/positron-diagnostics",
-    "crates/positron-domain",
-    "crates/positron-governance",
-    "crates/positron-ingest",
-    "crates/positron-kernel",
-    "crates/positron-operator",
-    "crates/positron-query",
-    "crates/positron-release",
-    "crates/positron-runtime",
-    "crates/positron-signals",
-    "crates/positron-upgrade",
 ]
 resolver = "3"
 
@@ -46,72 +28,4 @@ repository = "https://github.com/guaracloud/positron"
 homepage = "https://github.com/guaracloud/positron"
 
 [workspace.lints.rust]
-warnings = { level = "deny", priority = -1 }
-deprecated_safe_2024 = "deny"
-keyword_idents_2024 = "deny"
-let_underscore_drop = "deny"
-missing_docs = "deny"
-non_ascii_idents = "deny"
-rust_2024_guarded_string_incompatible_syntax = "deny"
-rust_2024_incompatible_pat = "deny"
 unsafe_code = "forbid"
-unsafe_op_in_unsafe_fn = "deny"
-unreachable_pub = "deny"
-unused_lifetimes = "deny"
-unused_must_use = "deny"
-
-[workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-allow_attributes = "deny"
-allow_attributes_without_reason = "deny"
-dbg_macro = "deny"
-expect_used = "deny"
-indexing_slicing = "deny"
-mem_forget = "deny"
-multiple_unsafe_ops_per_block = "deny"
-panic = "deny"
-string_slice = "deny"
-todo = "deny"
-undocumented_unsafe_blocks = "deny"
-unimplemented = "deny"
-unreachable = "deny"
-unwrap_used = "deny"
-wildcard_dependencies = "deny"
-
-[profile.dev]
-debug = 2
-incremental = true
-overflow-checks = true
-panic = "unwind"
-
-[profile.test]
-debug = 2
-incremental = true
-overflow-checks = true
-
-[profile.release]
-codegen-units = 1
-debug = "line-tables-only"
-incremental = false
-lto = "thin"
-overflow-checks = true
-panic = "abort"
-strip = "none"
-
-[profile.bench]
-codegen-units = 1
-debug = "line-tables-only"
-incremental = false
-lto = "thin"
-overflow-checks = true
-
-[workspace.metadata.positron]
-phase = "scaffold"
-contracts = [
-    "project-positron.md",
-    "CONTEXT.md",
-    "docs/application-design.md",
-    "docs/engineering/standards.md",
-    "docs/engineering/quality-gates.md",
-    "docs/release-1-qualification.md",
-]

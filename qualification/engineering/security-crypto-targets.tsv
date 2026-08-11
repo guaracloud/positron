@@ -1,4 +1,0 @@
-profile	target_id	target_kind	state	command	outcome	qualification
-PR	xtask-crypto-runner-capability-v1	runner-capability	active	cargo test --locked --package xtask --bin xtask security_harness::tests::crypto_self_test_covers_the_registered_harness_obligations -- --exact	ExecutedRunnerCapability	no-product-qualification
-EXT	-	product-target	not-applicable	-	NoActiveProductTarget	no-product-qualification
-QUAL	-	product-target	not-applicable	-	NoActiveProductTarget	no-product-qualification

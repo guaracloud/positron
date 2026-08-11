@@ -11,16 +11,16 @@ native Logs and Traces by Guara Cloud. Two pages:
 
 - `index.html` — the product landing page. States what Positron is. No
   superlatives, no benchmarks, no fabricated metrics; declarative facts from
-  the frozen product contract only.
-- `architecture.html` — the complete Release 1 architecture, rendered from
-  `docs/application-design.md`, the 74 accepted ADRs, and the engineering
-  standards in the main repository.
+  the product vision only.
+- `architecture.html` — the Release 1 architecture, rendered from
+  `project-positron.md`, `docs/application-design.md`, and the accepted
+  product ADRs.
 
 ## Constraints
 
 - Static only; served by GitHub Pages from the `gh-pages` branch. No build
   step, no framework.
-- Content must state only what the frozen contract defines. Never invent
+- Content must state only what the product vision defines. Never invent
   numbers, benchmarks, version strings, or availability claims.
 - The logo is a placeholder SVG; the final mark will replace
   `assets/logo.svg` (same viewBox) later.

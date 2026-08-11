@@ -1,9 +1,13 @@
-# Fuzzing scaffold
+# Fuzz tests
 
-Fuzz targets are added only with the untrusted boundary they exercise. Each
-target must have an owner, finite PR/extended/release budgets, committed seed
-corpus, crash retention, minimized regression promotion, and an oracle that
-does not disable authentication or validation through `cfg(fuzzing)`.
+Add fuzz targets with the untrusted-input or stateful product boundary they
+exercise. Applicable targets include parsers, protocol decoders, public request
+bodies, persistent formats, recovery inputs, cryptographic envelopes, and
+state-machine transitions.
 
-No application boundary exists yet, so the scaffold contains no vacuous fuzz
-target.
+Keep useful seed inputs and promote every fixed crash to the regression corpus.
+Run a target with:
+
+```console
+cargo fuzz run <target>
+```

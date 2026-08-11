@@ -20,13 +20,13 @@ instrument panels. Two signal hues with fixed meaning everywhere:
 | `--positron-bright` | `oklch(72% 0.14 262)` | logs on dark |
 | `--trace` | `oklch(54% 0.17 342)` | traces, secondary signal |
 | `--trace-bright` | `oklch(74% 0.13 342)` | traces on dark |
-| `--verify` | `oklch(50% 0.115 166)` | evidence, qualification, green |
+| `--verify` | `oklch(50% 0.115 166)` | healthy / available |
 | `--warn` | `oklch(55% 0.12 76)` | fenced / caution states |
 | `--deep` | `oklch(16% 0.03 268)` | dark field (hero, diagrams) |
 | `--surface` | `oklch(98% 0.008 262)` | body |
 | `--ink` | `oklch(19% 0.028 265)` | body text |
 
-Hue meaning never drifts: blue = logs, rose = traces, green = evidence.
+Hue meaning never drifts: blue = logs, rose = traces, green = healthy state.
 
 ## Type
 

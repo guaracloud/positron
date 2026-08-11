@@ -220,7 +220,7 @@
               <g data-mod>
                 <rect class="dg-box dg-box--ext" x="110" y="830" width="210" height="46" rx="9"/>
                 <text class="dg-label" x="130" y="850">Primary Data Volume</text>
-                <text class="dg-sub" x="130" y="866">one qualified filesystem</text>
+                <text class="dg-sub" x="130" y="866">one supported filesystem</text>
               </g>
               <g data-mod>
                 <rect class="dg-box dg-box--ext" x="380" y="830" width="200" height="46" rx="9"/>
@@ -438,7 +438,7 @@
           </div>
 
           <div class="modmap__group" data-reveal>
-            <h3>Ecosystem &amp; trust <span class="modmap__count">3 modules</span></h3>
+            <h3>Ecosystem &amp; trust <span class="modmap__count">2 modules</span></h3>
             <details class="mod">
               <summary><b>Positron Operator</b><span class="mod__learn">reconcile Kubernetes desired state through public calls</span></summary>
               <div class="mod__body">
@@ -451,13 +451,6 @@
               <div class="mod__body">
                 <div><h4>Callers learn</h4><p><code>verify_release(artifacts, trust) → report</code> — fully offline.</p></div>
                 <div><h4>Implementation hides</h4><p>Manifest authentication, revocation, checksums, schema digests, compatibility identity, and reproducible-payload comparison.</p></div>
-              </div>
-            </details>
-            <details class="mod">
-              <summary><b>Qualification Harness</b><span class="mod__learn">execute one qualification cell, retain its evidence</span></summary>
-              <div class="mod__body">
-                <div><h4>Callers learn</h4><p>The exact built artifact and its public interfaces are the test subject; targets are expanded before execution.</p></div>
-                <div><h4>Implementation hides</h4><p>Environment capture and immutable pass-and-fail evidence. A private function call cannot qualify an external protocol, provider, or recovery claim.</p></div>
               </div>
             </details>
           </div>
@@ -474,7 +467,7 @@
         </p>
         <figure class="diagram-wrap" data-reveal>
           <div class="diagram">
-            <svg viewBox="0 0 960 440" role="img" aria-label="Kernel diagram: four capability handles — KernelIngest, KernelQuery, KernelControl, KernelInspect — sit above the storage kernel, which contains eight internal modules and owns the qualified filesystem volume below it.">
+            <svg viewBox="0 0 960 440" role="img" aria-label="Kernel diagram: four capability handles — KernelIngest, KernelQuery, KernelControl, KernelInspect — sit above the storage kernel, which contains eight internal modules and owns the supported filesystem volume below it.">
               <g data-mod>
                 <rect class="dg-chip" x="60" y="24" width="190" height="44" rx="9"/>
                 <circle class="dg-accent-logs" cx="84" cy="46" r="4.5"/>
@@ -553,7 +546,7 @@
               <path class="dg-edge dg-edge--logs flow-edge" d="M480 326 L 480 366" marker-end="url(#ar2)"/>
               <g data-mod>
                 <rect class="dg-box dg-box--ext" x="330" y="370" width="300" height="46" rx="9"/>
-                <text class="dg-label" x="350" y="390">qualified filesystem volume</text>
+                <text class="dg-label" x="350" y="390">supported filesystem volume</text>
                 <text class="dg-sub" x="350" y="406">database-safe persistence semantics</text>
               </g>
             </svg>
@@ -1050,34 +1043,27 @@
 
       <!-- ================= 10. Discipline ================= -->
       <section class="arch-section" id="discipline">
-        <h2>Invariants with enforcement, not intentions.</h2>
+        <h2>A small development loop.</h2>
         <p class="lede">
-          Forty-two mandatory invariants across nine families, each mapped
-          one-to-one to an automated quality gate. A green gate is evidence for
-          the exact revision; review never substitutes for a missing gate.
+          Product code is formatted, linted, and protected by unit,
+          integration, and fuzz tests. That is the complete development
+          policy.
         </p>
         <div class="invariants" data-reveal>
           <dl>
-            <div class="inv"><dt>ARC ×5</dt><dd>contracts, single ownership, deep modules, boundary types, commit-then-publish</dd></div>
-            <div class="inv"><dt>RUST ×4</dt><dd>Rust 2024, pinned toolchain, locked builds, clean lints, owned dependencies</dd></div>
-            <div class="inv"><dt>SAFE ×4</dt><dd>unsafe forbidden by default, hard limits before use, verify before decode</dd></div>
-            <div class="inv"><dt>CON ×5</dt><dd>owned tasks, bounded queues, explicit deadlines, no blocking on async workers</dd></div>
-            <div class="inv"><dt>ERR ×4</dt><dd>closed typed outcomes, no panics in production paths, fail closed</dd></div>
+            <div class="inv"><dt>FMT</dt><dd>rustfmt keeps the source consistent</dd></div>
+            <div class="inv"><dt>LINT</dt><dd>Clippy catches ordinary Rust mistakes</dd></div>
           </dl>
           <dl>
-            <div class="inv"><dt>SEC ×5</dt><dd>threat models first, attribution before decoding, no ambient authority, SBOM + provenance</dd></div>
-            <div class="inv"><dt>DOC ×4</dt><dd>documented invariants, one canonical source, ADR before contract change</dd></div>
-            <div class="inv"><dt>TEST ×7</dt><dd>adversarial tests at the lowest interface, fault injection at every publication point, and scheduled coverage baselines</dd></div>
-            <div class="inv"><dt>PERF ×4</dt><dd>declared budgets, preregistered benchmarks, soak proof on the release artifact</dd></div>
+            <div class="inv"><dt>UNIT</dt><dd>each changed module covers its product behavior comprehensively</dd></div>
+            <div class="inv"><dt>INT</dt><dd>cross-module and externally observable behavior is tested together</dd></div>
+            <div class="inv"><dt>FUZZ</dt><dd>untrusted input and stateful boundaries are fuzzed where applicable</dd></div>
           </dl>
         </div>
         <div class="flow-panel flow-panel--single" data-reveal>
           <p class="guarantee">
-            <b>Evidence-gated development:</b> one Rust gate runner
-            (<code>cargo xtask quality</code>) drives every check from committed
-            registries. A retry is a new attempt and cannot erase the first
-            result; a timeout is a failure, not a skip; local evidence is
-            deliberately ineligible for merge.
+            <b>The whole policy:</b> format, lint, run unit and integration
+            tests, and fuzz applicable boundaries.
           </p>
         </div>
       </section>
@@ -1092,16 +1078,9 @@
         </p>
         <ol class="ladder" data-reveal>
           <li data-now>
-            <span class="m">M0</span>
-            <div>
-              <h3>Foundation <span class="now-tag">in progress</span></h3>
-              <p>Workspace, domain types, configuration skeleton, canonical public interface, stable errors, target registry, fault harness — and the quality-gate machinery that everything else must pass.</p>
-            </div>
-          </li>
-          <li>
             <span class="m">M1</span>
             <div>
-              <h3>First durable vertical</h3>
+              <h3>First durable vertical <span class="now-tag">in progress</span></h3>
               <p>Runtime startup, instance bootstrap, local data protection, the primary data volume, catalog, resource governor, segment ledger, a minimal OTLP log receiver, ingest, minimal log store and query. M1 must prove acknowledged-data preservation before anything broadens.</p>
             </div>
           </li>
@@ -1131,13 +1110,6 @@
             <div>
               <h3>Providers and platforms</h3>
               <p>External key providers, repository adapters, backup, restore, purge, upgrade, all distributions, the operator, Kubernetes, Grafana, and the SDK release set.</p>
-            </div>
-          </li>
-          <li>
-            <span class="m">M6</span>
-            <div>
-              <h3>Qualification and release</h3>
-              <p>The complete qualification matrix, performance and soak evidence, reproducibility, publication, and independent verification.</p>
             </div>
           </li>
         </ol>

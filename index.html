@@ -217,17 +217,17 @@
           </article>
           <article class="pillar" data-reveal>
             <div>
-              <h3>Releases ship with evidence</h3>
+              <h3>Releases are verifiable</h3>
               <span class="pillar__kicker">trust</span>
             </div>
             <div class="pillar__body">
               <p>
-                Every artifact binds to a signed release manifest with SBOMs,
-                reproducible payloads, and provenance. Every supported target
-                is a qualification cell with retained, immutable evidence — a
-                capability is not claimed until its cell is qualified.
+                Every artifact binds to a signed release manifest with
+                checksums, compatibility identity, SBOMs, and provenance.
+                Offline verification checks an artifact against the installed
+                project trust root.
               </p>
-              <span class="fact">ADR-0073 · ADR-0074</span>
+              <span class="fact">Release trust</span>
             </div>
           </article>
         </div>

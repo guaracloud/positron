@@ -1,3 +1,0 @@
-target_id	runner_id	semantic_owner	command	artifact_categories	qualification
-xtask-security-runner-capability-v1	secret-canary-runner-v1	Quality Engineering	cargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> registered-synthetic-v1-r001	logs|errors|metrics|traces|diagnostics|evidence|binaries|packages|support-artifacts	runner-capability-only
-xtask-security-intentional-leak-negative-v1	secret-canary-runner-v1	Quality Engineering	cargo run --locked --package xtask --bin xtask -- quality-secret-canary <artifact-root> intentional-leak-synthetic-v1-r01	support-artifacts	negative-test-only

@@ -1,115 +1,63 @@
 # Contributing to Positron
 
-Positron uses evidence-gated development. A review opinion supplements the
-automated contracts; it never replaces a missing or failed gate.
+Positron keeps its development loop deliberately small: implement product
+behavior, format it, lint it, test it, and review it.
 
-## Prerequisites
+## Source of truth
 
-- the exact stable Rust toolchain and targets in `rust-toolchain.toml`
-- every PR-stage tool and exact version in
-  `qualification/engineering/toolchains.tsv`
-- Git
+Read the relevant parts of:
 
-Run:
+1. `project-positron.md`
+2. `CONTEXT.md`
+3. accepted product decisions under `docs/adr/`
+4. `docs/application-design.md`
 
-```console
-cargo xtask setup
-cargo xtask quality
-```
+If a change alters an accepted product decision, update or supersede the
+relevant ADR with the code.
 
-`setup` configures this checkout to use `.githooks/`. It does not change global
-Git configuration. The pre-commit hook runs the bounded fast profile and the
-pre-push hook runs the complete lightweight PR profile. Expensive cross-target,
-coverage, full-history, and deep supply-chain campaigns run in the scheduled
-extended profile. Hooks are convenience feedback; protected-branch CI is
-authoritative.
+## Development checks
 
-## Fast feedback loop
-
-Use the smallest check that can disprove the change while editing:
+All Rust code is formatted with rustfmt and linted with Clippy:
 
 ```console
-cargo test --locked --package <owner-crate> <test-filter>
-cargo clippy --locked --package <owner-crate> --all-targets --all-features
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
-Local development and test profiles use incremental compilation. Trusted CI
-still sets `CARGO_INCREMENTAL=0` so retained evidence is built reproducibly.
+Every product change includes:
 
-The normal validation ladder is:
+- comprehensive unit tests for the behavior owned by the changed module;
+- integration tests for cross-module, public-interface, persistence, provider,
+  and end-to-end behavior affected by the change; and
+- fuzz tests for applicable untrusted-input, parser, protocol, storage,
+  recovery, and state-machine boundaries.
 
-1. run focused owner-crate tests while editing;
-2. let pre-commit run the bounded structural profile;
-3. let pre-push run the complete local PR profile once; and
-4. rely on protected-branch CI for authoritative evidence.
+Run the relevant focused tests while working, then the workspace tests:
 
-When repository hooks are installed, do not manually run
-`cargo xtask quality --profile pr` immediately before `git push`: the pre-push
-hook runs that same profile. Run it manually only when a final check is needed
-without pushing. Scheduled extended and release qualification profiles remain
-separate and are selected only for their registered risks and lifecycle stage.
+```console
+cargo test --locked --workspace --lib
+cargo test --locked --workspace --tests
+```
 
-## Change discipline
+Run each applicable fuzz target from `fuzz/` with `cargo fuzz run <target>`.
+Fuzzing is expected where the change introduces or alters a fuzzable boundary.
+There is no numeric coverage threshold or repository-specific validation
+runner beyond formatting, linting, unit tests, integration tests, and fuzz
+tests.
 
-Before editing code:
-
-1. identify the semantic owner in `docs/application-design.md`;
-2. identify every affected invariant and Qualification Cell;
-3. decide whether the change alters caller knowledge, ownership, a durable
-   format, compatibility, a non-waivable invariant, or Release 1 scope;
-4. if it does, land the accepted superseding ADR and all corresponding
-   contract, test, migration, and gate changes together; and
-5. write the lowest-interface positive, boundary, negative, and adversarial
-   tests that prove the behavior.
-
-Application crates begin in a machine-enforced scaffold-only state. Activating
-one requires an owner, explicit allowed dependency edges, risk gates, test
-entry points, applicable measured coverage baselines, and any required threat
-model or format/API decision. The gate runner rejects application behavior in
-an unactivated crate.
-
-API schemas, integrations, generated SDKs, distribution surfaces, fuzz targets,
-and model tests have the same protection through
-`qualification/engineering/artifact-scopes.tsv`. Executable or product source
-outside every registered scope fails the architecture gate.
+Defect fixes begin with a failing regression test. Tests should assert returned
+outcomes or externally readable behavior rather than private implementation
+shape.
 
 ## Dependencies
 
-New dependencies are exceptional, not routine. Before adding one:
+Add a dependency only when it directly supports the product and the standard
+library or an existing dependency is insufficient. Use minimal features and
+update `Cargo.lock` with the manifest change.
 
-- record its necessity, owner, exact source and version, minimal feature set,
-  license, maintenance and security assessment, and removal condition in
-  `qualification/engineering/dependencies.tsv`;
-- update `deny.toml` and Cargo Vet policy without weakening existing policy;
-- use exact manifest versions and regenerate `Cargo.lock` intentionally; and
-- run `cargo xtask quality`.
+## Pull requests
 
-Wire, provider, SDK, and persistence types may not leak across their owning
-module interfaces merely to avoid defining an invariant-bearing native type.
-
-## Gate and policy changes
-
-Gate, tool, threshold, corpus, target, fixture, workflow, owner, CODEOWNERS,
-hook, and baseline changes are policy changes. They require a record under
-`qualification/engineering/policy-changes/` describing detection gained and
-lost, migration, old/new dual-run evidence, and approvals. A gate may not be
-weakened in the same change to make a behavior change pass.
-
-Temporary exceptions use the exact schema documented in
-`qualification/engineering/exceptions/README.md`. Non-waivable properties,
-evidence integrity, secret disclosure, and known correctness, durability,
-isolation, safety, security, or authenticity failures have no exception path.
-
-## Completion
-
-A change is ready for review only when:
-
-- formatting, compiler, Clippy, rustdoc, tests, architecture, dependency,
-  policy, and secret gates pass;
-- every selected dynamic gate has retained evidence;
-- the worktree contains no generated drift or unexplained temporary marker;
-- failures and negative evidence remain visible; and
-- the pull request explains contracts, risks, tests, and operational impact.
-
-Commit, push, publication, qualification, and release are separate actions.
-Perform only the actions explicitly authorized for the task.
+Explain the product outcome and the unit, integration, and fuzz tests that
+cover it. Formatting, Clippy, and applicable tests must pass. Commit, push,
+publish, deploy, and release are separate actions and must be explicitly
+authorized.

@@ -1,33 +1,16 @@
-## Contract and ownership
+## Product outcome
 
-- Semantic owner:
-- Affected invariant IDs:
-- Affected Qualification Cell IDs and targets:
-- ADR/design impact:
+- What product behavior does this deliver?
+- Which vision or ADR decision does it implement?
 
-## Behavior and risk
+## Tests
 
-- Intended externally observable outcome:
-- Boundaries and failure modes:
-- Security, durability, isolation, resource, and compatibility impact:
-- Rollback or recovery behavior:
+- Unit tests:
+- Integration tests:
+- Fuzz tests, or why this change has no fuzzable boundary:
 
-## Evidence
-
-- Positive, boundary, negative, and adversarial tests:
-- Property/model/fuzz/fault/detector coverage:
-- Exact `cargo xtask quality` attempt:
-- Performance evidence or reason not selected:
-- Retained negative or inconclusive evidence:
-
-## Policy checklist
-
-- [ ] No gate, threshold, target, tool, fixture, corpus, workflow, owner, or
-      baseline was weakened to make this change pass.
-- [ ] Generated outputs were produced by their pinned generator and a clean
-      regeneration is byte-identical.
-- [ ] New dependencies have complete review records and minimal features.
-- [ ] Temporary markers and exceptions have an owner, issue, expiry, and
-      removal condition.
-- [ ] No production secret, tenant data, credential, or key material appears
-      in code, fixtures, logs, evidence, or artifacts.
+- [ ] Rust formatting passes.
+- [ ] Clippy passes without warnings.
+- [ ] Changed behavior has comprehensive unit-test coverage.
+- [ ] Affected cross-module and externally observable behavior has integration coverage.
+- [ ] Applicable untrusted-input, protocol, storage, recovery, or state-machine boundaries have fuzz coverage.

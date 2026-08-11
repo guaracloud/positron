@@ -1,11 +1,10 @@
 # Positron Whole-Application Design
 
-> Status: proposed implementation design derived from the frozen Release 1
-> architecture.
+> Status: proposed implementation design derived from the Release 1 product
+> vision.
 >
 > Authority: [Project Positron](../project-positron.md), the binding
-> [language](../CONTEXT.md), accepted [ADRs](adr/), and the
-> [Release 1 Qualification Matrix](release-1-qualification.md) remain
+> [language](../CONTEXT.md), and accepted product [ADRs](adr/) remain
 > normative. This document organizes those decisions into implementable
 > modules and does not supersede them.
 
@@ -26,8 +25,8 @@ leave open:
    implementation details?
 
 The design covers the complete Release 1 product: standalone Logs and Traces,
-governance, lifecycle, storage, recovery, integrations, distribution, and
-qualification. Metrics, Profiles, replication, and clustering influence
+governance, lifecycle, storage, recovery, integrations, and distribution.
+Metrics, Profiles, replication, and clustering influence
 identities and interfaces but do not create speculative Release 1 runtime
 machinery.
 
@@ -85,10 +84,10 @@ The implementation applies the following rules:
 - Internal seams may exist for deterministic tests and fault injection, but
   they remain private to the owning module.
 
-### 2.3 Non-waivable invariants
+### 2.3 Core invariants
 
 Every module interface must make it impossible, or at minimum explicit and
-testable, to violate the Qualification Matrix's non-waivable gates:
+testable, to violate these product invariants:
 
 - no loss of acknowledged Store Blocks
 - no unauthenticated or corrupt telemetry returned as valid
@@ -240,7 +239,6 @@ Not every noun deserves a crate or public interface.
 | Diagnostics | Produce one Doctor Report or Support Bundle | Read-only inspection, allowlists, pseudonymization, declared truncation, encryption, and signing |
 | Positron Operator | Reconcile Kubernetes desired state through public Positron calls | Watches, lease leadership, server-side apply, drift, finalizers, status, and operation reattachment |
 | Release Trust | Verify one artifact set against an installed Project Trust Root | Release Manifest authentication, revocation, checksums, compatibility identity, and reproducibility |
-| Qualification Harness | Execute one Qualification Cell and retain its evidence | Exact target expansion, artifact identity, environment capture, pass and fail evidence, and gate status |
 
 The deletion test confirms the central depth:
 
@@ -849,7 +847,7 @@ publication, multipart recovery, and observable deletion.
 
 Release 1 adapters are local filesystem, AWS S3, each named S3-compatible
 target, Google Cloud Storage, and Azure Blob Storage. Mocks support module
-tests; only real-provider qualification supports a compatibility claim.
+tests; only real-provider integration tests support a compatibility claim.
 
 Backup capture rolls active segments, pins one Catalog Generation, transfers
 immutable encrypted objects, publishes signed repository control state, and
@@ -946,14 +944,6 @@ Compatibility Manifest identity, target matching, transparency evidence, and
 Reproducible Payload comparison. It does not reuse the Instance Integrity Key
 as the Project Trust Root.
 
-### 4.19 Qualification Harness
-
-The Qualification harness is outside runtime code. It treats the exact built
-artifact and its public interfaces as the test subject, expands targets before
-execution, and retains immutable pass and fail evidence. A private Rust
-function call cannot qualify an external protocol, provider, distribution, or
-recovery claim.
-
 ## 5. Real seams and adapters
 
 | Seam | Dependency category | Adapters | Visibility | Reason it is real |
@@ -972,7 +962,7 @@ recovery claim.
 
 The following are intentionally not ports:
 
-- Primary Data Volume: Release 1 has one concrete qualified filesystem
+- Primary Data Volume: Release 1 has one concrete supported filesystem
   contract. A `StorageBackend` abstraction would falsely imply object-store or
   multi-writer equivalence.
 - Ingest: there is one native ingest implementation.
@@ -1181,7 +1171,7 @@ belongs to another module. Both are shown explicitly.
 | Backup Snapshot and Repository Key Registry | Backup and Restore | repository immutable objects and CAS head | Backup, restore, purge |
 | Upgrade plan, migration state, and published Format Epoch | Upgrade and Migration | Durable Operation and Catalog Writer | administration and operator |
 | Kubernetes desired and observed state | Positron Operator | Kubernetes API | operator reconciliation |
-| Release Manifest and Qualification Evidence | Release Trust / Qualification | signed release artifact and evidence repository | offline verification |
+| Release Manifest | Release Trust | signed release artifact | offline verification |
 
 No second module maintains an independently authoritative copy. Caches carry
 source generation or identity and invalidate when it changes.
@@ -1209,7 +1199,6 @@ crates/
   positron-diagnostics/      doctor and support bundles
   positron-operator/         Kubernetes reconciliation
   positron-release/          manifest and trust verification
-qualification/              target registry, gates, fixtures, evidence tooling
 integrations/grafana/        minimal host-required Grafana implementation
 sdk/                         generated SDK publication workspaces
 deploy/                      OCI, packages, Compose, Helm, Nix, and examples
@@ -1277,9 +1266,7 @@ flowchart TD
 An arrow means “may depend on.” Registered handlers invert calls at runtime:
 Governance does not depend on Backup, and the Storage Kernel does not depend on
 Signal Store or backup implementations merely because it invokes their
-injected handler adapters. The Qualification harness does not link private
-production crates as its proof path; it executes built artifacts through their
-published interfaces.
+injected handler adapters.
 
 Rules for this layout:
 
@@ -1295,8 +1282,8 @@ Rules for this layout:
   runtime
 
 A crate may be split only when its resulting module retains a small interface
-and the split improves dependency direction, independent qualification, or
-maintainer locality.
+and the split improves dependency direction, testability, or maintainer
+locality.
 
 ## 9. Type-state handoffs
 
@@ -1324,6 +1311,10 @@ constructors. This makes ordering part of the interface and keeps tests focused
 on observable transitions.
 
 ## 10. Testing through interfaces
+
+Rust code is formatted with rustfmt and linted with Clippy. Behavioral
+assurance is intentionally limited to unit tests, integration tests, and fuzz
+tests.
 
 ### 10.1 Module contract tests
 
@@ -1365,68 +1356,40 @@ publicly observable behavior. They should not assert private queue layouts,
 helper calls, struct fields, or internal task ordering unless that ordering is
 part of the interface.
 
-### 10.2 Dependency-specific testing
+### 10.2 Integration tests
 
-- In-process modules use their concrete implementations.
-- Local-substitutable dependencies use real temporary filesystems and
-  deterministic fault adapters rather than mocks layered over the same code.
-- True external providers use mock adapters for fast module tests and real
-  provider targets for qualification.
-- Remote owned calls use generated in-memory clients for module tests and live
-  gRPC/HTTP clients for artifact qualification.
+Integration tests cover behavior that crosses module or process boundaries:
 
-Mocks prove caller behavior, not provider compatibility. Emulator success
-never qualifies a named Key Provider, Repository, Kubernetes, receiver, or
-distribution target.
+- real temporary filesystems for storage and recovery behavior
+- live in-process or socket clients for gRPC and HTTP behavior
+- provider adapters against supported provider targets where practical
+- complete ingest, query, administration, backup, restore, upgrade, operator,
+  and lifecycle flows
+- crash, restart, corruption, dependency-outage, and resource-pressure paths
 
-### 10.3 Replace, do not layer
+Mocks and deterministic adapters may isolate caller behavior in unit tests, but
+provider and public-interface behavior is asserted at the integration
+boundary.
 
-When a deep interface test makes an old helper-level test redundant, remove
-the helper-level test. Keeping both makes implementation structure falsely
-stable and increases change cost without adding behavioral proof.
+### 10.3 Fuzz tests
 
-### 10.4 Qualification surfaces
-
-Qualification owner roles remain those in the binding matrix. This table maps
-their gates to the primary module interfaces or artifact surfaces they
-exercise:
-
-| Modules or artifacts | Primary gates |
-| --- | --- |
-| Public Interface and Generated SDKs | `Q-API-001`, `Q-SDK-001`, `Q-COMPAT-001` |
-| Receiver Adapters and Ingest | `Q-RX-001`, `Q-RX-002`, `Q-RX-003`, `Q-RX-004` |
-| Log Store | `Q-LOG-001`, `Q-TAIL-001` |
-| Trace Store | `Q-TRACE-001` |
-| Query and Grafana adapter | `Q-QUERY-001`, `Q-QUERY-002`, `Q-GRAFANA-001` |
-| Identity and Administration | `Q-AUTH-001`, `Q-TENANT-001`, `Q-AUDIT-001`, `Q-POLICY-001` |
-| Dynamic values and Resource Governor | `Q-SCHEMA-001`, `Q-RESOURCE-001` |
-| Primary Data Volume, Catalog, Active Segments, Integrity, and time | `Q-STORAGE-001`, `Q-CATALOG-001`, `Q-CRASH-001`, `Q-INTEGRITY-001`, `Q-TIME-001` |
-| Data Protection and Listener Set | `Q-KEY-001`, `Q-KEY-002`, `Q-CRYPTO-001`, `Q-LISTENER-001`, `Q-SECURITY-001` |
-| Backup and Restore | `Q-BACKUP-001`, `Q-BACKUP-002` |
-| Upgrade, Configuration, Runtime, and Maintenance | `Q-UPGRADE-001`, `Q-CONFIG-001`, `Q-PROCESS-001`, `Q-MAINT-001` |
-| Diagnostics and Operational State | `Q-DIAG-001`, `Q-DIAG-002`, `Q-OPS-001` |
-| Positron Operator and Kubernetes artifacts | `Q-K8S-001`, `Q-K8S-002`, `Q-K8S-003` |
-| Native, package, and container artifacts | `Q-BUILD-001`, `Q-DIST-001`, `Q-DIST-002`, `Q-DIST-003` |
-| Release Trust and publication artifacts | `Q-SUPPLY-001`, `Q-SECURITY-001` |
-| Qualification Harness | `Q-PERF-001`, `Q-SOAK-001`, plus evidence capture for every gate |
-
-One test may contribute to several gates, but every Qualification Cell retains
-its own target identity and outcome. A passing interface test cannot collapse
-independent provider, platform, architecture, registry, or distribution cells.
+Fuzz tests cover applicable untrusted-input and stateful boundaries, including
+configuration, query and policy parsers, protocol decoders, public request
+bodies, persistent formats, recovery inputs, cryptographic envelopes, and
+state-machine transitions. Each fixed fuzz defect remains in the regression
+corpus.
 
 ## 11. Vertical implementation order
 
-This module design follows, rather than replaces, the binding milestones.
+This module design follows the product milestones.
 
 | Milestone | Module slice that must work end to end |
 | --- | --- |
-| M0 | workspace, Domain Types, Configuration skeleton, canonical Public Interface, stable errors, target registry, fault harness |
 | M1 | Runtime startup, Instance Bootstrap, local Data Protection, Primary Data Volume, Catalog, Resource Governor, Active Segment Ledger, minimal OTLP Log Receiver, Ingest, minimal Log Store, minimal Query |
 | M2 | complete Log Store, OTLP/Loki adapters, policy, schema bounds, search, tail, retention, compaction |
 | M3 | complete Trace Store, observation consolidation, summaries, quiescence, structural query, and log/trace Correlation |
 | M4 | full Identity, Administration, tenant lifecycle, audit, durable operations, time, maintenance, integrity, process lifecycle, operational state, and diagnostics |
 | M5 | external Key Providers, Repository Adapters, backup, restore, purge, upgrade, all distributions, operator, Kubernetes, Grafana, and SDK set |
-| M6 | complete Qualification Matrix, performance and soak, reproducibility, publication, and independent verification |
 
 M1 must prove acknowledged-data preservation before broadening the feature
 surface. Later milestones may add implementations behind existing seams but
@@ -1443,7 +1406,7 @@ defines:
 - canonical Store Blocks and physical query behavior
 - Receiver Adapters with pinned conformance targets
 - native query semantics and budget behavior
-- qualification cells and retained evidence
+- unit, integration, and fuzz tests for the new signal behavior
 
 Release 1 carries `SignalKind`, storage identity, and extensible public
 versioning. It does not carry empty modules, inactive schedulers, or advertised
@@ -1495,15 +1458,14 @@ The following shapes fail the deletion test or contradict accepted decisions:
 - deferred Metrics, Profiles, HA, or FIPS implementations hidden behind
   disabled feature flags
 
-## 14. M0 design inventory
+## 14. Open product design inventory
 
 The architecture fixes ownership and invariants but not every implementation
-choice. M0 must resolve these items in the named owner without weakening this
-design:
+choice. Product implementation resolves these items in the named owner:
 
 | Decision | Owner | Required output |
 | --- | --- | --- |
-| public Protobuf messages and stable error taxonomy | Public Interface | versioned API Definition and breaking-change gate |
+| public Protobuf messages and stable error taxonomy | Public Interface | versioned API Definition and compatibility tests |
 | exact configuration fields, defaults, and mutability | Configuration | Rust types, JSON Schema, reference, and validation fixtures |
 | Log Store Block and index formats | Log Store | versioned format specification and golden/crash fixtures |
 | Trace Store Block, observation, and summary formats | Trace Store | versioned format specification and golden/crash fixtures |
@@ -1513,9 +1475,7 @@ design:
 | pipeline grammar, bounded SQL grammar, and Logical Plan | Query | versioned language specification and equivalence fixtures |
 | cursor, tail, batch, and digest encodings | Query | authenticated versioned formats and restart fixtures |
 | concrete Rust cryptographic dependencies | Data Protection | inventory, safety review, vectors, and cross-target proof |
-| concrete provider SDKs and retry classifications | adapter owners | conformance harness and redacted credential model |
-| exact qualified dynamic targets | Qualification | versioned Qualification Target Registry |
-| reference performance hardware and workloads | Qualification | preregistration before candidate tuning |
+| concrete provider SDKs and retry classifications | adapter owners | integration tests and redacted credential model |
 
 An internal choice needs a new ADR when it changes caller knowledge, a durable
 format promise, a compatibility claim, a non-waivable invariant, or Release 1
@@ -1542,11 +1502,11 @@ scope. A refactor behind an unchanged interface does not.
 | 0030 | Listener Set | native TLS defaults and explicit visible plaintext opt-out |
 | 0031–0045 | Data Protection | mandatory framed encryption, key hierarchy, providers, recovery, context, rotation, and truthful crypto profile |
 | 0046–0048 | Application Runtime, Instance Bootstrap, distribution adapters | standalone same-binary behavior and safe non-interactive initialization |
-| 0049–0053 | Positron Operator, Administration, Upgrade and Migration, Runtime | optional same-image operator, qualified Kubernetes behavior, safe upgrades, visible backups, fencing and hibernation |
+| 0049–0053 | Positron Operator, Administration, Upgrade and Migration, Runtime | optional same-image operator, supported Kubernetes behavior, safe upgrades, visible backups, fencing and hibernation |
 | 0054 | Operational State | bounded operational telemetry without a Metric Store |
 | 0055 | Configuration | one generated transactional Configuration Contract |
 | 0056 | Resource Governor | hierarchical reservations, pressure states, fairness, and Recovery Reserve |
-| 0057 | Primary Data Volume | one concrete qualified filesystem contract and ownership lock |
+| 0057 | Primary Data Volume | one concrete supported filesystem contract and ownership lock |
 | 0058 | Integrity | continuous verification, quarantine, fencing, and explicit abandonment |
 | 0059 | Lifecycle Clock, Signal Stores, Query | separate source, query, ingest, and lifecycle time |
 | 0060 | Public Interface, Release Trust | independent compatibility claims and explicit Format Epoch migration |
@@ -1555,17 +1515,15 @@ scope. A refactor behind an unchanged interface does not.
 | 0065 | Domain Types, Signal Stores | typed dynamic values, occurrence sets, bounded catalog, and Schema Overflow |
 | 0066 | Query, Storage Kernel | stable snapshots, leases, resumable batches, and cumulative budgets |
 | 0067 | Application Runtime | one truthful Process Phase and Drain contract |
-| 0068 | Backup and Restore | provider-behavior Repository port and real-target qualification |
+| 0068 | Backup and Restore | provider-behavior Repository port and real-provider integration tests |
 | 0069 | Catalog | immutable generations and one joint audited commit point |
 | 0070 | Listener Set | separated listener roles and pre-authentication Connection Admission |
 | 0071 | Maintenance Coordinator | one bounded scheduler and conflict graph |
 | 0072 | Diagnostics | read-only doctor and secret-safe bounded Support Bundles |
-| 0073 | Release Trust | signed reproducible artifacts and security support |
-| 0074 | Qualification | frozen logs-and-traces scope and evidence-gated completion |
 
-## 16. Design acceptance checklist
+## 16. Design checklist
 
-Before implementation begins, this design is internally complete when:
+This design remains coherent when:
 
 - every Release 1 behavior has one semantic owner
 - every durable state has one publication owner
@@ -1581,7 +1539,6 @@ Before implementation begins, this design is internally complete when:
 - every long operation declares retry, cancellation, and irreversible
   semantics
 - every test targets an interface or an external artifact
-- every Qualification Cell can name the interface or artifact it exercises
 - deferred work has an extension seam but no speculative runtime
 
 This is the implementation architecture Positron should build unless a

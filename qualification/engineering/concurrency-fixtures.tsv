@@ -1,3 +1,0 @@
-scenario_id	gate_id	spawn_site	schedule	seed	max_tasks	queue_capacity	reservation_capacity	retry_limit	shutdown_ms	expected
-concurrency-cancel-join	EG-CONCURRENCY	quality-bounded-worker-v1	cancel-then-join-v1	seed-concurrency-v1	3	1	1	1	100	cancelled-then-joined-v1
-resource-fair-pressure	EG-RESOURCE	quality-bounded-worker-v1	round-robin-pressure-v1	seed-resource-v1	3	3	2	2	100	fair-pressure-retry-leak-free-v1

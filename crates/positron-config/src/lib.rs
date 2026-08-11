@@ -1,6 +1,6 @@
 //! Canonical, bounded Configuration Contract resolution for Positron.
 //!
-//! This M0 boundary resolves compiled defaults, one canonical TOML document,
+//! This boundary resolves compiled defaults, one canonical TOML document,
 //! environment overrides, and command-line overrides into checked native
 //! values. It owns source provenance, secrecy, validation, mutability, and
 //! deterministic schema/reference generation. Runtime publication and live
@@ -167,7 +167,7 @@ impl SettingDefinition {
     }
 }
 
-/// Canonical settings owned by the M0 Configuration Contract.
+/// Canonical settings owned by the Configuration Contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Setting {
     /// The version of the canonical configuration document.
@@ -567,7 +567,7 @@ impl EffectiveConfiguration {
         self.shutdown_grace_seconds
     }
 
-    /// Returns the checked listener address that remains loopback-only in M0.
+    /// Returns the checked listener address that remains loopback-only.
     #[must_use]
     pub const fn control_bind_address(&self) -> SocketAddr {
         self.control_bind_address

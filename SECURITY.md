@@ -9,5 +9,4 @@ owner through a private established channel before sharing sensitive details.
 
 Reports should include the affected revision or artifact digest, impact,
 reproduction conditions, and any safe minimized reproducer. Use synthetic
-values only. Positron retains failing security evidence and does not treat a
-scanner pass as proof that a vulnerability is impossible.
+values only.

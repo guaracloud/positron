@@ -145,7 +145,7 @@ The server and required generated SDK packages that share one release version, A
 _Avoid_: Best-effort SDK release, independently versioned clients
 
 **Release Manifest**:
-The signed machine-readable root binding one Positron version to its source, Compatibility Manifest, schemas, artifacts, checksums, toolchains, SBOMs, provenance, evidence, and registry publication state.
+The signed machine-readable root binding one Positron version to its source, Compatibility Manifest, schemas, artifacts, checksums, toolchains, SBOMs, provenance, and registry publication state.
 _Avoid_: changelog, Git tag, OCI index
 
 **Project Trust Root**:
@@ -159,26 +159,6 @@ _Avoid_: identical timestamped signature, CI success, source archive alone
 **Security Support Window**:
 The published product-version range eligible for coordinated advisories and security fixes, covering the current and immediately previous minor in Release 1.
 _Avoid_: API compatibility lifetime, operator skew, best-effort patching
-
-**Release Scope Ledger**:
-The binding inventory of capabilities required in Release 1 and those explicitly deferred, changed only through a superseding ADR with stated cost and schedule impact.
-_Avoid_: roadmap wish list, issue backlog, marketing checklist
-
-**Qualification Matrix**:
-The release-blocking set of supported targets and executable gates mapping every required capability to ownership and retained evidence.
-_Avoid_: test suite count, CI dashboard, best-effort compatibility list
-
-**Qualification Cell**:
-One independently reportable capability-and-target pair whose state is Specified, Implemented, or Qualified and whose failure cannot be hidden by another passing target.
-_Avoid_: umbrella feature status, test case alone, platform assumption
-
-**Qualification Target Registry**:
-The versioned exact expansion of every selector in the Qualification Matrix into provider, product, version, architecture, platform, registry, and deployment target identities before implementation claims begin.
-_Avoid_: current-latest alias, test environment inventory, post-failure target selection
-
-**Qualification Evidence**:
-The immutable machine-readable results, environment identity, inputs, artifact digests, logs, metrics, and failure details proving one Qualification Cell's outcome.
-_Avoid_: verbal sign-off, screenshot alone, mutable CI link
 
 **Compatibility Manifest**:
 The machine-readable release artifact that declares product, API, query, configuration, receiver, CRD, storage-format, backup-format, operator, and migration compatibility as separate tested claims.
@@ -273,7 +253,7 @@ The sole internal Rust boundary for authenticated encryption, key wrapping, hash
 _Avoid_: Key Provider, cipher configuration, cryptographic profile claim
 
 **Cryptographic Profile**:
-A release-qualified combination of Crypto Backend, algorithms, operating environments, build inputs, and compliance evidence.
+A supported combination of Crypto Backend, algorithms, operating environments, build inputs, and compliance status.
 _Avoid_: runtime cipher preference, algorithm identifier, marketing claim
 
 **Key Bootstrap**:
@@ -353,7 +333,7 @@ A supported way to install and run the same standalone Positron application and 
 _Avoid_: separate edition, client SDK, deployment dependency
 
 **Container Contract**:
-The release-blocking behavior that makes one signed multi-architecture OCI image run identically under Docker, Docker Compose, and Kubernetes with explicit persistence, security, health, and shutdown semantics.
+The product behavior that makes one signed multi-architecture OCI image run identically under Docker, Docker Compose, and Kubernetes with explicit persistence, security, health, and shutdown semantics.
 _Avoid_: Docker-only edition, Helm behavior, development container
 
 **Configuration Contract**:
@@ -457,7 +437,7 @@ A Kubernetes schedule that creates visible PositronBackup resources under explic
 _Avoid_: hidden CronJob, database retention, continuous archive
 
 **Kubernetes Conformance Matrix**:
-The release-specific evidence identifying every supported Kubernetes patch version, architecture, distribution, storage class, upgrade path, and exercised failure scenario.
+The release-specific inventory identifying every supported Kubernetes patch version, architecture, distribution, storage class, upgrade path, and integration-test scenario.
 _Avoid_: best-effort support, Helm lint result, latest Kubernetes
 
 **Quiescent Upgrade Snapshot**:
@@ -569,11 +549,11 @@ An application-consistent manifest and catalog generation whose referenced immut
 _Avoid_: File copy, point-in-time recovery
 
 **Backup Repository**:
-A qualified local filesystem, AWS S3, named S3-compatible, Google Cloud Storage, or Azure Blob destination that stores verified snapshots, immutable checksum-addressed objects, and its Repository Key Registry.
+A supported local filesystem, AWS S3, named S3-compatible, Google Cloud Storage, or Azure Blob destination that stores verified snapshots, immutable checksum-addressed objects, and its Repository Key Registry.
 _Avoid_: Primary storage, live replica
 
 **Repository Adapter**:
-The Rust boundary that implements one qualified backup provider's immutable-object, range-read, checksum, resumable-upload, compare-and-swap, identity, and deletion semantics.
+The Rust boundary that implements one supported backup provider's immutable-object, range-read, checksum, resumable-upload, compare-and-swap, identity, and deletion semantics.
 _Avoid_: Primary Data Volume backend, generic object-store claim, provider credential
 
 **Repository Identity**:

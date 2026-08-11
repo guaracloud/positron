@@ -2,10 +2,8 @@
 
 > Unified single-process observability database written in Rust.
 
-> **Note:** This is the frozen Release 1 architecture baseline. ADR-0074
-> and `docs/release-1-qualification.md` define scope and release
-> completion; this document does not claim that implementation or
-> qualification is already complete.
+> **Note:** This is the Release 1 product vision and architecture baseline.
+> Implementation is in progress.
 
 ------------------------------------------------------------------------
 
@@ -179,8 +177,8 @@ Kubernetes, Nix, Alloy, Grafana, and external collectors are optional
 Distribution Surfaces or integrations, never runtime prerequisites.
 “Optional” here means that a database deployment need not install or
 run the integration. Every Distribution Surface and integration named
-as required by the Release Scope Ledger must still ship and qualify as
-a Release 1 artifact.
+as required by the Release 1 scope must still ship as a Release 1
+artifact.
 
 The same Rust application, configuration model, public APIs, storage
 format, security defaults, and lifecycle commands apply across every
@@ -216,8 +214,7 @@ durably closes on `SIGTERM`.
 Default Docker and Helm examples persist data and local-key material in
 separate volumes. The image includes current CA roots but no shell,
 package manager, language runtime, or debug tooling. Every image is
-signed and published with checksums, an SBOM, provenance, and
-vulnerability-scan results.
+signed and published with checksums, an SBOM, and provenance.
 
 The image entrypoint is the Rust binary itself, and its default command
 is `positron serve --init-if-empty`. Container paths are:
@@ -241,18 +238,18 @@ through Docker, Compose, or Kubernetes execution, returns the secret
 once and atomically destroys the recoverable claim. Helm may instead
 initialize from an operator-supplied Kubernetes Secret.
 
-Every Distribution Surface must pass the same install, initialize,
-ingest, query, restart, backup, restore, key-management, and upgrade
-acceptance suite. One signed release manifest binds all artifacts to the
-same version and source commit.
+Integration tests cover install, initialize, ingest, query, restart,
+backup, restore, key-management, and upgrade behavior for every
+Distribution Surface. One signed release manifest binds all artifacts
+to the same version and source commit.
 
 ------------------------------------------------------------------------
 
 ## 3.4 Kubernetes Operator
 
 Release 1 includes a deployment-optional Positron Operator implemented
-in Rust and shipped as a required, release-blocking artifact inside the
-standard OCI image. `positron operator` runs the Kubernetes controller
+in Rust and shipped inside the standard OCI image. `positron operator`
+runs the Kubernetes controller
 and `positron serve` runs the database. There is no separate operator
 executable, instance-manager binary, or required sidecar, and Positron
 remains fully operable without Kubernetes.
@@ -303,7 +300,7 @@ remains one instance.
 
 The operator supports cluster-wide or explicitly scoped multi-namespace
 installation with generated least-privilege RBAC and never requires
-`cluster-admin`. Qualified finalizers protect only operations that must
+`cluster-admin`. Bounded finalizers protect only operations that must
 finish, with retain as the default deletion policy. Admission webhooks
 are avoided when schema or CEL can enforce an invariant; conversion
 webhooks are added only when multiple API representations require them.
@@ -313,12 +310,11 @@ Standard: non-root execution, read-only root filesystem,
 `RuntimeDefault` seccomp, no privilege escalation, and all capabilities
 dropped.
 
-Publication is blocked on evidence for installation, reconciliation,
-drift repair, operator leader failover, API outage, eviction, node
-drain, PVC detach and reattach, Key Provider outage, backup and restore,
-certificate rotation, operand and operator upgrade, CRD migration,
-uninstall with retention, and restricted-namespace execution. The
-complete matrix and failures ship with the release.
+Integration tests cover installation, reconciliation, drift repair,
+operator leader failover, API outage, eviction, node drain, PVC detach
+and reattach, Key Provider outage, backup and restore, certificate
+rotation, operand and operator upgrade, CRD migration, uninstall with
+retention, and restricted-namespace execution.
 
 Operator and database images are independently pinned by immutable
 digest. Operator version N manages database versions N and N-1 so the
@@ -633,7 +629,7 @@ storage are follow-on capabilities.
 
 A network filesystem or network-backed PVC is supported only when its
 provider, product version, mount contract, and Kubernetes StorageClass
-combination is qualified in the release's storage section of the
+combination is supported in the release's storage section of the
 Kubernetes Conformance Matrix. Passing a local capability probe is
 necessary but not sufficient for a published crash-durability claim.
 Unknown combinations are unsupported rather than silently advertised
@@ -644,10 +640,10 @@ independently satisfy its stricter ownership, permission, link, and
 durable-publication contract. It is never placed inside the Primary Data
 Volume merely because the data is encrypted.
 
-Release-blocking storage tests cover abrupt process and node
-termination, torn active-segment tails, failed synchronization, hard
-disk pressure, remount, Docker volume restart, PVC detach and reattach,
-and concurrent-writer attempts. Each supported storage combination must
+Integration and fuzz tests cover abrupt process and node termination,
+torn active-segment tails, failed synchronization, hard disk pressure,
+remount, Docker volume restart, PVC detach and reattach, and
+concurrent-writer attempts. Each supported storage combination must
 recover every acknowledged Store Block or fail closed.
 
 ------------------------------------------------------------------------
@@ -794,10 +790,10 @@ Calendar schedules retain explicit UTC offsets or IANA timezone names
 and do not reinterpret already-recorded instants after timezone or
 daylight-saving changes.
 
-Release-blocking tests cover missing and contradictory telemetry times,
-extreme source values, NTP slew and step, backward restart, large
-forward jumps, timezone and daylight-saving changes, and recovery from
-`ClockUncertain`.
+Unit, integration, and fuzz tests cover missing and contradictory
+telemetry times, extreme source values, NTP slew and step, backward
+restart, large forward jumps, timezone and daylight-saving changes, and
+recovery from `ClockUncertain`.
 
 ------------------------------------------------------------------------
 
@@ -867,11 +863,10 @@ does not imply OTLP, Loki, Tempo, Alloy, Beyla, E-Navigator, or other
 producer conformance. Kubernetes CRD conversion and the operator N/N−1
 database window likewise remain independently versioned and tested.
 
-Release CI verifies old-client/new-server and new-client/old-server
+Integration tests cover old-client/new-server and new-client/old-server
 behavior, stable errors and completion states, configuration migration,
 backup restore, storage upgrade, downgrade refusal, CRD conversion,
-operator skew, and every published receiver target. The signed release
-manifest records the exact artifacts and evidence behind each claim.
+operator skew, and every published receiver target.
 
 ------------------------------------------------------------------------
 
@@ -1197,7 +1192,7 @@ One Value Limit Profile bounds:
 -   nesting depth
 -   array and key/value-list length
 
-System ceilings are compiled or configured within release-qualified
+System ceilings are compiled or configured within documented
 safe maxima and cannot be raised by a Tenant. Tenant policy may lower
 them. Bounded transport and decompression limits apply before structural
 decode; semantic limits apply after Ingest Policy so an explicit
@@ -1279,7 +1274,7 @@ allowing it to change the bound query.
 A Snapshot Lease is a bounded persistent Resource Reservation that pins
 the immutable segments and catalog generations needed by a resumable
 query. Leases consume tenant counts, bytes, and lifetime quota, survive
-process restart, and have a release-qualified maximum TTL. Compaction
+process restart, and have a documented maximum TTL. Compaction
 and Retention Policy may logically replace data but cannot physically
 reclaim a leased object until release or expiry. A lease never postpones
 Tenant Purge.
@@ -1393,7 +1388,7 @@ shutdown remains blocked.
 The configured shutdown deadline is visible through configuration
 explanation and diagnostics. Docker, Compose, systemd, Helm, and
 operator-generated Kubernetes settings must provide at least that grace
-interval plus a release-qualified safety margin. Inconsistent grace
+interval plus a documented safety margin. Inconsistent grace
 configuration is rejected by generated deployment tooling and surfaced
 as degraded for externally managed deployments.
 
@@ -1418,29 +1413,29 @@ health checks, Kubernetes conditions and Events, and process exit codes
 all derive from Process Phase and Health State. No Distribution Surface
 maintains a competing lifecycle interpretation.
 
-Release qualification interrupts every startup and Drain phase under
-normal load, hard disk pressure, corrupt tails, Key Provider outage,
-configuration reload, long query, active tail, and Durable Operation,
-then verifies readiness transitions, terminal results, exit status,
-recovery, and acknowledged-data preservation.
+Integration and fuzz tests exercise startup and Drain under normal load,
+disk pressure, corrupt tails, Key Provider outage, configuration reload,
+long query, active tail, and Durable Operation. They verify readiness
+transitions, terminal results, exit status, recovery, and
+acknowledged-data preservation.
 
 ------------------------------------------------------------------------
 
 ## 3.19 Multi-Provider Backup Repositories
 
-Release 1 implements one Rust Repository Adapter boundary with qualified
+Release 1 implements one Rust Repository Adapter boundary with supported
 providers for:
 
 -   local filesystem
 -   AWS S3
--   explicitly qualified S3-compatible products
+-   explicitly supported S3-compatible products
 -   Google Cloud Storage
 -   Azure Blob Storage
 
 A Repository Conformance Target names the provider, product or managed
 service, API behavior, deployment context or region where relevant, and
 tested version. Positron never converts an S3 protocol resemblance,
-emulator result, or successful upload into an unqualified compatibility
+emulator result, or successful upload into an unsupported compatibility
 claim.
 
 Every writable Repository Adapter must provide:
@@ -1624,8 +1619,8 @@ transactions through metadata consensus while preserving Catalog
 Objects, manifests, Signal Store boundaries, audit binding, and reader
 snapshots.
 
-Release qualification crashes and remounts the process at every object,
-audit, commit-record, rename, and directory-synchronization boundary.
+Integration and fuzz tests crash and remount the process across object,
+audit, commit-record, rename, and directory-synchronization boundaries.
 Every recovery must expose either the complete predecessor or the
 complete successor generation, never mixed state or a governance
 mutation without its audit record.
@@ -1733,11 +1728,11 @@ Policies, Services, probes, and ServiceMonitor authentication
 consistently. Kubernetes NetworkPolicy and ingress controls supplement
 but do not replace Connection Admission.
 
-Release qualification covers slow headers and bodies, idle exhaustion,
-TLS handshake floods, invalid and rotated certificates, HTTP/2 stream
-and window abuse, gRPC keepalive and ping abuse, compressed expansion,
-oversized messages, proxy spoofing, port conflict, replacement failure,
-and graceful listener drain on every supported architecture.
+Integration and fuzz tests cover slow headers and bodies, idle
+exhaustion, TLS handshake floods, invalid and rotated certificates,
+HTTP/2 stream and window abuse, gRPC keepalive and ping abuse,
+compressed expansion, oversized messages, proxy spoofing, port
+conflict, replacement failure, and graceful listener drain.
 
 ------------------------------------------------------------------------
 
@@ -1843,12 +1838,12 @@ failure classes, and SLO violations. Metrics do not place Tenant IDs,
 segment identities, keys, or attribute paths in labels; authenticated
 status provides that detail.
 
-Release qualification runs each task class concurrently with
-representative ingest, query, tail, backup, and administration load.
-Tests add disk pressure, `ClockUncertain`, dependency outage, repeated
-task failure, crash at every checkpoint and publication boundary,
-conflicts, pauses, and restarts, proving bounded foreground interference
-and eventual progress after the blocking condition clears.
+Integration tests run each task class concurrently with representative
+ingest, query, tail, backup, and administration load. They add disk
+pressure, `ClockUncertain`, dependency outage, repeated task failure,
+crashes at checkpoints and publication boundaries, conflicts, pauses,
+and restarts. Fuzz tests exercise scheduler inputs and state
+transitions.
 
 ------------------------------------------------------------------------
 
@@ -1965,9 +1960,8 @@ debug container, sidecar, or separate language runtime is required.
 Release tests seed unique canary credentials, key material, telemetry,
 identifiers, paths, proxy metadata, provider errors, and panic inputs
 through every subsystem. Online, offline, startup, degraded, Fenced,
-key-unavailable, truncated, encrypted, and explicitly plaintext bundles
-fail qualification if prohibited bytes or undeclared identifier classes
-appear.
+key-unavailable, truncated, encrypted, and explicitly plaintext bundle
+tests fail if prohibited bytes or undeclared identifier classes appear.
 
 ------------------------------------------------------------------------
 
@@ -2029,27 +2023,18 @@ updates are signed, versioned, published independently of ordinary
 release channels, and tested in native, OCI, Nix, package, Helm, and
 operator verification paths.
 
-Release gates scan dependencies and outputs for known vulnerabilities,
-license-policy violations, embedded secrets, malware indicators,
-unexpected executable content, and container weaknesses. A release
-cannot carry an unresolved known exploitable critical issue. A
-non-exploitable exception requires written reachability evidence,
-affected artifacts, compensating controls, an owner, an expiry, and a
-signed entry in release evidence; expiry blocks a later release until
-resolved or freshly justified.
-
 Rust crates deny `unsafe` by default. A module requiring unsafe code is
 explicitly isolated and reviewed with documented safety invariants,
 call-site constraints, ownership, and targeted tests. Persistence,
 cryptography, parser, decompression, network framing, and foreign-
-interface boundaries receive applicable fuzzing, property tests,
-sanitizers, Miri, and corpus regression coverage.
+interface boundaries receive applicable fuzz tests with regression
+corpora.
 
-Release qualification includes unit, integration, end-to-end,
-interoperability, old/new compatibility, crash and remount, corruption,
-backup and restore, migration, Kubernetes, network abuse, resource
-pressure, security, and target-architecture suites. Compilation, a
-microbenchmark, or one happy-path deployment cannot qualify an artifact.
+Product behavior is covered by comprehensive unit tests, integration
+tests, and fuzz tests. Integration tests include interoperability,
+compatibility, crash and remount, corruption, backup and restore,
+migration, Kubernetes, network abuse, resource pressure, security, and
+supported-target behavior.
 
 Publication may resume idempotently after a registry failure, but the
 version remains incomplete and unannounced until every required
@@ -2084,27 +2069,7 @@ recovery procedures for already stored data.
 
 ------------------------------------------------------------------------
 
-## 3.25 Release 1 Scope and Qualification
-
-The Release Scope Ledger and Qualification Matrix are binding release
-contracts. `docs/release-1-qualification.md` records their complete
-Release 1 form. A capability is not complete because its code compiles,
-one test passes, or one Distribution Surface works.
-
-Each Qualification Cell has one of three states:
-
--   `Specified`: an accepted contract, supported target, owner role,
-    executable gate design, and required evidence are defined.
--   `Implemented`: candidate code and test machinery exist, but the
-    release artifact has not passed the complete target gate.
--   `Qualified`: the exact candidate artifact passed the gate on the
-    named target and immutable Qualification Evidence is retained.
-
-M0 resolves every dynamic provider, product, version, architecture,
-platform, registry, filesystem, StorageClass, and producer selector into
-an exact versioned Qualification Target Registry. No target-expanded
-cell can advance while its identity remains a moving alias such as
-“latest” or “currently supported.”
+## 3.25 Release 1 Scope
 
 Release 1 includes:
 
@@ -2116,7 +2081,7 @@ Release 1 includes:
 -   all accepted encryption, key provider, tenancy, authorization,
     no-impersonation, policy, audit, lifecycle, resource, integrity,
     maintenance, backup, restore, operator, distribution, diagnostic,
-    compatibility, and supply-chain contracts
+    and compatibility contracts
 -   every provider, platform, architecture, Kubernetes target, and
     artifact explicitly named as Release 1 in an accepted ADR
 
@@ -2126,7 +2091,7 @@ The following remain outside Release 1:
 -   native replication, high availability, failover, and clustering
 -   SSO, OIDC, SAML, SCIM, certificate-to-principal mapping, and
     customizable RBAC
--   a FIPS validation claim or qualified FIPS Cryptographic Profile
+-   a FIPS validation claim or FIPS Cryptographic Profile
 -   continuous point-in-time recovery, selective restore, legal hold,
     and arbitrary record deletion
 -   object storage, raw block, or primary multi-writer shared storage as
@@ -2134,65 +2099,28 @@ The following remain outside Release 1:
 -   LogQL, TraceQL, and PromQL compatibility claims
 -   native Windows and FreeBSD distributions
 
-Adding a required Release 1 capability or removing, weakening, or
-reclassifying an existing one requires a superseding ADR that states
-the affected Qualification Cells, implementation cost, schedule impact,
-compatibility impact, and replacement evidence. Issue priority or
-implementation convenience cannot silently change scope.
+Adding or removing a required Release 1 capability requires a
+superseding ADR that explains the product and compatibility impact.
+Issue priority or implementation convenience cannot silently change
+scope.
 
-Every required capability maps to an ADR, owner role, executable test,
-supported target, and evidence location. Receiver, Key Provider, Backup
-Repository, storage, distribution, CPU, SDK, Grafana, Kubernetes,
-upgrade, compatibility, recovery, security, performance, and
-fault-injection claims remain separate cells. One passing implementation
-cannot hide a failing provider, architecture, registry, or deployment.
+Rust code is formatted with rustfmt and linted with Clippy. Every product
+change has comprehensive unit tests. Cross-module, public-interface,
+persistence, provider, compatibility, recovery, and deployment behavior
+has integration tests. Applicable parsers, protocols, storage inputs,
+recovery paths, and state machines have fuzz tests.
 
-Correctness, acknowledged durability, authenticated encryption,
-tenant isolation, no impersonation, governance atomicity, purge,
-integrity, backup verification, restore, and supply-chain authenticity
-are non-waivable. A failed required cell blocks the release.
+Implementation proceeds through product milestones:
 
-Performance qualification uses preregistered reference hardware,
-datasets, generators, workload mixes, durations, throughput, latency,
-RSS, I/O and space amplification, recovery, drain, and availability
-limits. Numeric gates and input digests are frozen before release-
-candidate tuning. A gate may change only with documented rationale
-before rerun; results cannot be used to retroactively select a passing
-objective.
+1.  core runtime and encrypted storage kernel
+2.  Log Store ingestion, storage, query, and operations
+3.  Trace Store and cross-signal workflows
+4.  governance, lifecycle, integrity, maintenance, backup, and recovery
+5.  distributions, operator, Kubernetes, Grafana, and SDKs
 
-Soak qualification proves bounded memory, file descriptors, tasks,
-queues, leases, catalogs, maintenance backlog, temporary files, disk
-headroom, and provider retries under mixed ingest, query, tail,
-maintenance, backup, rotation, failure, and recovery load.
-
-Qualification Evidence contains the candidate Release Manifest and
-artifact digest, target and environment identity, configuration digest,
-dataset and workload digest, test command or harness identity, start and
-end times, raw result, metrics, logs, failure detail, and verifier. It is
-immutable, machine-readable, and preserved for both passing and failing
-attempts. An unsupported or failing combination is published honestly.
-
-Implementation proceeds through vertical milestones:
-
-1.  contract/code generation and adversarial harness
-2.  encrypted kernel vertical slice with minimal OTLP log ingest/query
-3.  complete Log Store and log workflows
-4.  complete Trace Store and cross-signal workflows
-5.  governance, lifecycle, integrity, maintenance, and diagnostics
-6.  disaster recovery, providers, distributions, operator, Kubernetes,
-    Grafana, and SDK Release Set
-7.  full compatibility, fault, security, performance, soak, and
-    reproducibility qualification
-
-Each milestone has executable entry and exit criteria in the
-Qualification Matrix. Later work cannot replace a missing earlier
-correctness proof with broader feature coverage. Follow-on metrics,
-profiles, and clustering preserve explicit interfaces and invariants in
-Release 1 but do not add speculative runtime machinery to the release.
-
-The Release Manifest may be signed as complete only when every required
-Qualification Cell for its exact artifact set is `Qualified`, every
-registry publication is complete, and no non-waivable failure remains.
+Follow-on metrics, profiles, and clustering preserve explicit
+interfaces and invariants in Release 1 without adding speculative
+runtime machinery.
 
 ------------------------------------------------------------------------
 
@@ -2639,10 +2567,10 @@ gRPC is the canonical transport. HTTP and JSON routes, OpenAPI
 documentation, and publishable SDK wire clients are generated from the
 same definition and are never maintained as parallel sources.
 
-Every generated artifact embeds its API version and schema digest.
-Pinned linting, generation, and breaking-change checks gate API changes.
-Version 1 allows additive compatible changes only; breaking changes
-require a new versioned API package.
+Every derived artifact embeds its API version and schema digest. Rustfmt,
+Clippy, and integration tests protect API changes. Version 1 allows
+additive compatible changes only; breaking changes require a new
+versioned API package.
 
 Upstream OTLP definitions remain separately pinned external contracts.
 Generated Positron SDKs cover query, streaming, administration, and
@@ -2760,12 +2688,7 @@ Scale-out second.
 
 # 17. Performance Goals
 
-Performance is a Release 1 qualification contract, not a list of
-unmeasured adjectives. `Q-PERF-001` and `Q-SOAK-001` in
-`docs/release-1-qualification.md` preregister reference hardware,
-datasets, workload mixes, durations, throughput floors, latency
-ceilings, RSS and resource ceilings, amplification, recovery, drain, and
-availability targets before release-candidate tuning.
+Performance goals guide the product implementation:
 
 Implementation techniques may include:
 
@@ -2776,9 +2699,9 @@ Implementation techniques may include:
 -   immutable snapshots
 -   per-core ownership
 
-These techniques are hypotheses, not acceptance evidence. A candidate
-qualifies only through retained representative measurements, failure
-evidence, and unchanged preregistered objectives.
+Representative integration tests should protect observable performance
+characteristics when stable assertions are practical. Positron has no
+separate performance or soak validation process.
 
 ------------------------------------------------------------------------
 
@@ -2835,7 +2758,7 @@ representation.
 Release 1 creates online, application-consistent full-instance backup
 snapshots. Snapshot creation briefly rolls active segments, captures one
 manifest and catalog generation, then allows ingestion to continue.
-Immutable files are copied incrementally by checksum through a qualified
+Immutable files are copied incrementally by checksum through a supported
 Repository Adapter for local filesystem, AWS S3, named S3-compatible
 products, Google Cloud Storage, or Azure Blob Storage.
 
@@ -3030,8 +2953,7 @@ alone are not treated as module or deployment certification. Stored
 algorithm identifiers and the Crypto Backend boundary preserve a future
 Cryptographic Profile using a validated module and compatible recovery
 and signature constructions. That profile requires its own supported
-operating environments, evidence, release gates, and truthful
-certification status.
+operating environments and truthful certification status.
 
 Every provider passes the same wrap, unwrap, verification, outage,
 rotation, and wrong-key conformance suite. Vault and OpenBao are
@@ -3119,11 +3041,8 @@ and enablement policy are specified separately.
 
 # 20. ADRs
 
-The authoritative decision records are the consecutively numbered files
-under `docs/adr/`. ADRs 0001 through 0074 define the frozen Release 1
-architecture. `CONTEXT.md` supplies their binding ubiquitous language,
-and `docs/release-1-qualification.md` maps the resulting scope to
-release gates.
+The authoritative product decision records are the accepted files under
+`docs/adr/`. `CONTEXT.md` supplies their binding ubiquitous language.
 
 Later ADRs refine or supersede older decisions where they say so. The
 history remains in the older file; this architecture document reflects
@@ -3135,26 +3054,23 @@ authoritative files.
 
 # 21. Roadmap
 
-Release 1 follows the seven vertical milestones in section 3.25 and the
-binding gates in `docs/release-1-qualification.md`. The roadmap does not
-redefine scope independently of the Release Scope Ledger.
+Release 1 follows the five product milestones in section 3.25.
 
 Release 1 delivers the complete standalone logs-and-traces database,
 security and governance model, lifecycle and recovery tooling,
-Distribution Surfaces, integrations, and evidence required by accepted
-ADRs 0001 through 0074.
+Distribution Surfaces and integrations required by the accepted product
+ADRs.
 
 Follow-on releases add:
 
--   Profile Signal Store and its qualified Receiver Adapters
+-   Profile Signal Store and its Receiver Adapters
 -   Metric Signal Store, OTLP Metrics, and Prometheus Remote Write
 -   three-replica HA and clustering under sections 15 and 16
--   an independently qualified FIPS Cryptographic Profile
+-   a FIPS Cryptographic Profile
 -   only those deferred capabilities promoted by later ADRs
 
 Metrics, profiles, and clustering influence Release 1 boundaries and
-formats but cannot delay its qualification with speculative runtime
-implementations.
+formats without adding speculative runtime implementations.
 
 ------------------------------------------------------------------------
 

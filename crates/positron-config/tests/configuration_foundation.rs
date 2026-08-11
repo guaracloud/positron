@@ -1,4 +1,4 @@
-//! Public contract tests for the M0 Configuration foundation.
+//! Public contract tests for the Configuration foundation.
 
 use std::{error::Error, io};
 
