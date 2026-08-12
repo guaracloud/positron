@@ -143,6 +143,7 @@ struct OpenSuccessBackend {
 
 struct SealLengthBackend {
     output_bytes: usize,
+    seal_calls: std::cell::Cell<usize>,
 }
 
 impl CryptoBackend for SealLengthBackend {
@@ -153,6 +154,7 @@ impl CryptoBackend for SealLengthBackend {
         _associated_data: &[u8],
         _plaintext: &[u8],
     ) -> Result<Vec<u8>, super::CryptoBackendFailure> {
+        self.seal_calls.set(self.seal_calls.get().saturating_add(1));
         Ok(vec![0x5a; self.output_bytes])
     }
 
@@ -392,7 +394,10 @@ fn seal_backend_output_must_match_plaintext_plus_tag() -> Result<(), &'static st
     let expected = plaintext.len() + 16;
 
     for (output_bytes, key_byte) in [(expected - 1, 0xa5), (expected + 1, 0xa7)] {
-        let protection = super::DataProtection::with_backend(SealLengthBackend { output_bytes });
+        let protection = super::DataProtection::with_backend(SealLengthBackend {
+            output_bytes,
+            seal_calls: std::cell::Cell::new(0),
+        });
         let key = protection.import_object_key(
             super::SecretKeyInput::from_test_bytes([key_byte; 32]),
             context.object,
@@ -408,24 +413,49 @@ fn seal_backend_output_must_match_plaintext_plus_tag() -> Result<(), &'static st
 }
 
 #[test]
-#[should_panic(expected = "test attempted duplicate protection under one DEK and sequence")]
-fn protection_authority_guard_covers_custom_backends() {
+fn protection_authority_guard_covers_custom_backends() -> Result<(), &'static str> {
     let (_, context, limits, _) =
-        protected_segment_fixture().expect("protected segment fixture must be valid");
+        protected_segment_fixture().map_err(|_| "protected segment fixture must be valid")?;
+    let context = context
+        .object
+        .frame(
+            super::SegmentFramePurpose::StoreBlock,
+            super::FrameSequence::new(0xfafa_fafa_fafa_fafa),
+        )
+        .map_err(|_| "duplicate-guard context fixture must be valid")?;
     let protection = super::DataProtection::with_backend(SealLengthBackend {
         output_bytes: b"contract".len() + 16,
+        seal_calls: std::cell::Cell::new(0),
     });
     let key = protection.import_object_key(
         super::SecretKeyInput::from_test_bytes([0xfa; 32]),
         context.object,
     );
 
-    assert!(
-        protection
-            .protect_frame(&key, context, b"contract", limits)
-            .is_ok()
-    );
-    let _duplicate = protection.protect_frame(&key, context, b"contract", limits);
+    let _first = protection
+        .protect_frame(&key, context, b"contract", limits)
+        .map_err(|_| "first custom-backend protection must succeed")?;
+    if protection.backend.seal_calls.get() != 1 {
+        return Err("first custom-backend protection did not dispatch exactly once");
+    }
+
+    let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _result = protection.protect_frame(&key, context, b"contract", limits);
+    }));
+    let panic = duplicate
+        .expect_err("the exact duplicate protection authority must panic before backend dispatch");
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .ok_or("duplicate-protection panic did not contain a string message")?;
+    if message != "test attempted duplicate protection under one DEK and sequence" {
+        return Err("duplicate-protection panic message differed");
+    }
+    if protection.backend.seal_calls.get() != 1 {
+        return Err("duplicate protection reached the custom backend");
+    }
+    Ok(())
 }
 
 #[test]
