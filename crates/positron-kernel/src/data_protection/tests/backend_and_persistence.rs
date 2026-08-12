@@ -141,6 +141,82 @@ struct OpenSuccessBackend {
     zeroized_before_release: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
+struct SealLengthBackend {
+    output_bytes: usize,
+}
+
+impl CryptoBackend for SealLengthBackend {
+    fn seal_aes_256_gcm(
+        &self,
+        _key: &SecretKeyBytes,
+        _nonce: [u8; 12],
+        _associated_data: &[u8],
+        _plaintext: &[u8],
+    ) -> Result<Vec<u8>, super::CryptoBackendFailure> {
+        Ok(vec![0x5a; self.output_bytes])
+    }
+
+    fn open_aes_256_gcm(
+        &self,
+        _key: &SecretKeyBytes,
+        _nonce: [u8; 12],
+        _associated_data: &[u8],
+        _ciphertext: &[u8],
+    ) -> Result<super::SecretPlaintext, super::CryptoBackendFailure> {
+        Err(super::CryptoBackendFailure::AuthenticationFailed)
+    }
+
+    fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32], super::CryptoBackendFailure> {
+        use sha2::{Digest, Sha256};
+
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    fn fill_random(&self, _destination: &mut [u8]) -> Result<(), super::CryptoBackendFailure> {
+        Ok(())
+    }
+}
+
+struct OpenLengthBackend {
+    output_bytes: usize,
+    zeroized_before_release: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl CryptoBackend for OpenLengthBackend {
+    fn seal_aes_256_gcm(
+        &self,
+        _key: &SecretKeyBytes,
+        _nonce: [u8; 12],
+        _associated_data: &[u8],
+        _plaintext: &[u8],
+    ) -> Result<Vec<u8>, super::CryptoBackendFailure> {
+        Err(super::CryptoBackendFailure::SealFailed)
+    }
+
+    fn open_aes_256_gcm(
+        &self,
+        _key: &SecretKeyBytes,
+        _nonce: [u8; 12],
+        _associated_data: &[u8],
+        _ciphertext: &[u8],
+    ) -> Result<super::SecretPlaintext, super::CryptoBackendFailure> {
+        Ok(super::SecretPlaintext::new_for_test(
+            vec![b'P'; self.output_bytes],
+            std::rc::Rc::clone(&self.zeroized_before_release),
+        ))
+    }
+
+    fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32], super::CryptoBackendFailure> {
+        use sha2::{Digest, Sha256};
+
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    fn fill_random(&self, _destination: &mut [u8]) -> Result<(), super::CryptoBackendFailure> {
+        Ok(())
+    }
+}
+
 impl CryptoBackend for OpenSuccessBackend {
     fn seal_aes_256_gcm(
         &self,
@@ -185,29 +261,59 @@ pub(super) fn protected_segment_fixture() -> Result<
     ),
     &'static str,
 > {
-    let tenant = TenantId::from_bytes([0xd1; 16]).map_err(|_| "tenant fixture was invalid")?;
-    let shard = VirtualShardId::new(2).map_err(|_| "shard fixture was invalid")?;
+    const FRAME: &[u8; 68] =
+        include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/valid_empty_frame");
+
+    let tenant = TenantId::from_bytes([0x11; 16]).map_err(|_| "tenant fixture was invalid")?;
+    let shard = VirtualShardId::new(1).map_err(|_| "shard fixture was invalid")?;
     let object = super::FrameObjectContext::tenant_segment(
         tenant,
         SignalKind::Logs,
         shard,
-        super::FrameObjectId::new([0xd2; 16]).map_err(|_| "object fixture was invalid")?,
+        super::FrameObjectId::new([0x22; 16]).map_err(|_| "object fixture was invalid")?,
         super::KeyEpoch::new(1),
         super::FormatEpoch::new(1).map_err(|_| "format epoch fixture was invalid")?,
     );
     let context = object
         .frame(
             super::SegmentFramePurpose::StoreBlock,
-            super::FrameSequence::new(5),
+            super::FrameSequence::new(1),
         )
         .map_err(|_| "frame context fixture was invalid")?;
     let key =
-        super::ObjectDataKey::import(super::SecretKeyInput::from_test_bytes([0xd3; 32]), object);
+        super::ObjectDataKey::import(super::SecretKeyInput::from_test_bytes([0x33; 32]), object);
     let limits = super::FrameLimits::new(256).map_err(|_| "frame limit fixture was invalid")?;
-    let encrypted =
-        super::DataProtection::protect_frame(&key, context, b"persistent-frame-fixture", limits)
-            .map_err(|_| "frame fixture protection failed")?;
+    let encrypted = super::EncryptedFrame(FRAME.to_vec());
     Ok((key, context, limits, encrypted))
+}
+
+fn encoded_frame_declaring_plaintext_bytes(
+    plaintext_bytes: usize,
+) -> Result<Vec<u8>, &'static str> {
+    use sha2::{Digest, Sha256};
+
+    let (_, _, _, encrypted) = protected_segment_fixture()?;
+    let ciphertext_bytes = plaintext_bytes
+        .checked_add(16)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or("declared plaintext fixture exceeded its bound")?;
+    let mut encoded = encrypted
+        .as_bytes()
+        .get(..52)
+        .ok_or("frame omitted header")?
+        .to_vec();
+    encoded
+        .get_mut(16..20)
+        .ok_or("frame omitted length")?
+        .copy_from_slice(&ciphertext_bytes.to_be_bytes());
+    let ciphertext = vec![0x5a; ciphertext_bytes as usize];
+    let checksum: [u8; 32] = Sha256::digest(&ciphertext).into();
+    encoded
+        .get_mut(20..52)
+        .ok_or("frame omitted checksum")?
+        .copy_from_slice(&checksum);
+    encoded.extend_from_slice(&ciphertext);
+    Ok(encoded)
 }
 
 #[test]
@@ -275,6 +381,28 @@ fn seal_failure_is_typed_and_secret_safe() -> Result<(), &'static str> {
         || diagnostic.len() > 128
     {
         return Err("seal failure was not typed and secret-safe");
+    }
+    Ok(())
+}
+
+#[test]
+fn seal_backend_output_must_match_plaintext_plus_tag() -> Result<(), &'static str> {
+    let (_, context, limits, _) = protected_segment_fixture()?;
+    let plaintext = b"contract";
+    let expected = plaintext.len() + 16;
+
+    for output_bytes in [expected - 1, expected + 1] {
+        let protection = super::DataProtection::with_backend(SealLengthBackend { output_bytes });
+        let key = protection.import_object_key(
+            super::SecretKeyInput::from_test_bytes([0xa5; 32]),
+            context.object,
+        );
+        let failure = protection
+            .protect_frame(&key, context, plaintext, limits)
+            .expect_err("a backend length-contract violation must not create a frame");
+        if failure.code() != super::FrameFailureCode::SealFailed {
+            return Err("seal length-contract failure classification differed");
+        }
     }
     Ok(())
 }
@@ -348,8 +476,36 @@ fn open_backend_failure_is_typed_and_returns_no_plaintext() -> Result<(), &'stat
 }
 
 #[test]
+fn open_backend_output_must_match_declared_plaintext_and_zeroize_on_error()
+-> Result<(), &'static str> {
+    let (_, context, limits, _) = protected_segment_fixture()?;
+    let expected_plaintext_bytes = 2;
+    let encoded = encoded_frame_declaring_plaintext_bytes(expected_plaintext_bytes)?;
+
+    for output_bytes in [expected_plaintext_bytes - 1, expected_plaintext_bytes + 1] {
+        let zeroized = std::rc::Rc::new(std::cell::Cell::new(false));
+        let protection = super::DataProtection::with_backend(OpenLengthBackend {
+            output_bytes,
+            zeroized_before_release: std::rc::Rc::clone(&zeroized),
+        });
+        let key = protection.import_object_key(
+            super::SecretKeyInput::from_test_bytes([0xa6; 32]),
+            context.object,
+        );
+        let failure = protection
+            .open_frame(&key, context, &encoded, limits)
+            .expect_err("a backend length-contract violation must not expose plaintext");
+        if failure.code() != super::FrameFailureCode::OpenFailed || !zeroized.get() {
+            return Err("open length-contract failure was not typed and zeroizing");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn verified_plaintext_is_zeroized_before_positron_releases_it() -> Result<(), &'static str> {
-    let (_, context, limits, encrypted) = protected_segment_fixture()?;
+    let (_, context, limits, _) = protected_segment_fixture()?;
+    let encoded = encoded_frame_declaring_plaintext_bytes(b"backend-owned-plaintext-canary".len())?;
     let zeroized_before_release = std::rc::Rc::new(std::cell::Cell::new(false));
     let protection = super::DataProtection::with_backend(OpenSuccessBackend {
         zeroized_before_release: std::rc::Rc::clone(&zeroized_before_release),
@@ -360,7 +516,7 @@ fn verified_plaintext_is_zeroized_before_positron_releases_it() -> Result<(), &'
     );
 
     let verified = protection
-        .open_frame(&key, context, encrypted.as_bytes(), limits)
+        .open_frame(&key, context, &encoded, limits)
         .map_err(|_| "controlled frame opening failed")?;
     if verified.as_plaintext() != b"backend-owned-plaintext-canary" {
         return Err("controlled backend plaintext differed");

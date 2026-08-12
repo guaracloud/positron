@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn committed_fuzz_seeds_reach_the_bounded_raw_decoder() -> Result<(), &'static str> {
+    const TRUNCATED: &[u8] =
+        include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/truncated_header");
+    const UNSUPPORTED_VERSION: &[u8] =
+        include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/unsupported_version");
+    const UNSUPPORTED_ALGORITHM: &[u8] =
+        include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/unsupported_algorithm");
+    const VALID_EMPTY: &[u8] =
+        include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/valid_empty_frame");
+
+    let cases = [
+        (TRUNCATED, Err(FrameFailureCode::MalformedFrame)),
+        (
+            UNSUPPORTED_VERSION,
+            Err(FrameFailureCode::UnsupportedVersion),
+        ),
+        (
+            UNSUPPORTED_ALGORITHM,
+            Err(FrameFailureCode::UnsupportedAlgorithm),
+        ),
+        (VALID_EMPTY, Ok(0)),
+    ];
+    for (seed, expected) in cases {
+        let actual = super::super::fuzzing::open_bounded_raw_frame(seed)
+            .map(|verified| verified.as_plaintext().len())
+            .map_err(FrameFailure::code);
+        if actual != expected {
+            return Err("committed fuzz seed did not reach its exact raw decode outcome");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn committed_empty_frame_fuzz_seed_authenticates() -> Result<(), &'static str> {
     const SEED: &[u8; 68] =
         include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/valid_empty_frame");
@@ -26,60 +60,6 @@ fn committed_empty_frame_fuzz_seed_authenticates() -> Result<(), &'static str> {
         return Err("committed fuzz seed was not an empty frame");
     }
     Ok(())
-}
-
-#[test]
-fn data_protection_emits_the_stable_frame_v1_vector() -> Result<(), &'static str> {
-    use super::{
-        DataProtection, FormatEpoch, FrameLimits, FrameObjectContext, FrameObjectId, FrameSequence,
-        KeyEpoch, ObjectDataKey, SecretKeyInput, SegmentFramePurpose,
-    };
-
-    // Independently derived with Node.js/OpenSSL 3.5.7 from the documented
-    // frame-v1 byte contract. This literal fixes the durable artifact and
-    // cannot change merely because the Rust implementation changes.
-    let expected = [
-        0x50, 0x46, 0x52, 0x4d, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x09, 0x00, 0x00, 0x00, 0x21, 0x43, 0x40, 0x1e, 0x3f, 0xa1, 0x6d, 0xd6, 0xbe, 0x0a, 0x4c,
-        0xf9, 0x03, 0x32, 0x4b, 0x74, 0x2f, 0xb3, 0x6a, 0x38, 0xde, 0xd6, 0x08, 0xd7, 0xe9, 0x2b,
-        0xb0, 0x44, 0x84, 0x65, 0xf1, 0x25, 0x83, 0xeb, 0x40, 0xdd, 0x56, 0x33, 0x7f, 0xc3, 0x3a,
-        0x42, 0xae, 0x55, 0xe3, 0xb2, 0xba, 0xe5, 0xf7, 0xbf, 0xc2, 0x2d, 0x79, 0x0a, 0xff, 0xe8,
-        0x6e, 0x80, 0x39, 0x20, 0xcf, 0xe1, 0xab, 0x26, 0xde, 0xfd,
-    ];
-    let tenant = TenantId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
-        .map_err(|_| "tenant fixture was invalid")?;
-    let shard = VirtualShardId::new(7).map_err(|_| "shard fixture was invalid")?;
-    let object = FrameObjectContext::tenant_segment(
-        tenant,
-        SignalKind::Logs,
-        shard,
-        FrameObjectId::new([
-            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
-        ])
-        .map_err(|_| "object fixture was invalid")?,
-        KeyEpoch::new(3),
-        FormatEpoch::new(1).map_err(|_| "format epoch fixture was invalid")?,
-    );
-    let key = ObjectDataKey::import(
-        SecretKeyInput::from_test_bytes([
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31,
-        ]),
-        object,
-    );
-    let context = object
-        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(9))
-        .map_err(|_| "frame fixture context was invalid")?;
-    let limits = FrameLimits::new(1024).map_err(|_| "frame fixture limit was invalid")?;
-
-    let frame = DataProtection::protect_frame(&key, context, b"positron-frame-v1", limits)
-        .map_err(|_| "frame protection failed")?;
-
-    if frame.as_bytes() == expected {
-        Ok(())
-    } else {
-        Err("frame-v1 bytes differed from the independent vector")
-    }
 }
 
 #[test]

@@ -1,27 +1,25 @@
+use positron_domain::identity::TenantId;
+use positron_domain::routing::{SignalKind, VirtualShardId};
+
+use super::{
+    DataProtection, FormatEpoch, FrameContext, FrameFailure, FrameFailureCode, FrameLimits,
+    FrameObjectContext, FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput,
+    SegmentFramePurpose, VerifiedFrame,
+};
+
 #[cfg(fuzzing)]
-#[doc(hidden)]
-pub fn fuzz_authenticated_frame(data: &[u8]) {
-    use positron_domain::identity::TenantId;
-    use positron_domain::routing::{SignalKind, VirtualShardId};
+use super::{CryptoBackend, RustCryptoBackend};
 
-    use super::{
-        CryptoBackend, DataProtection, FormatEpoch, FrameFailureCode, FrameLimits,
-        FrameObjectContext, FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey,
-        RustCryptoBackend, SecretKeyInput, SegmentFramePurpose,
-    };
-    const MAX_PLAINTEXT_BYTES: usize = 1024;
-    const MAX_ENCODED_BYTES: u32 = 2048;
+const MAX_ENCODED_BYTES: u32 = 2048;
+const VALID_EMPTY_FRAME: &[u8; 68] =
+    include_bytes!("../../../../fuzz/corpus/encrypted_frame_open/valid_empty_frame");
 
-    let tenant = TenantId::from_bytes([0x11; 16]);
-    let shard = VirtualShardId::new(1);
-    let object_id = FrameObjectId::new([0x22; 16]);
-    let format_epoch = FormatEpoch::new(1);
-    let limits = FrameLimits::new(MAX_ENCODED_BYTES);
-    let (Ok(tenant), Ok(shard), Ok(object_id), Ok(format_epoch), Ok(limits)) =
-        (tenant, shard, object_id, format_epoch, limits)
-    else {
-        return;
-    };
+fn frame_fixture() -> Option<(ObjectDataKey, FrameContext, FrameObjectContext, FrameLimits)> {
+    let tenant = TenantId::from_bytes([0x11; 16]).ok()?;
+    let shard = VirtualShardId::new(1).ok()?;
+    let object_id = FrameObjectId::new([0x22; 16]).ok()?;
+    let format_epoch = FormatEpoch::new(1).ok()?;
+    let limits = FrameLimits::new(MAX_ENCODED_BYTES).ok()?;
     let object = FrameObjectContext::tenant_segment(
         tenant,
         SignalKind::Logs,
@@ -30,22 +28,46 @@ pub fn fuzz_authenticated_frame(data: &[u8]) {
         KeyEpoch::new(1),
         format_epoch,
     );
-    let Ok(context) = object.frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(1)) else {
-        return;
-    };
+    let context = object
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(1))
+        .ok()?;
     let key = ObjectDataKey::import(SecretKeyInput::from_owned(Box::new([0x33; 32])), object);
-    let plaintext_end = data.len().min(MAX_PLAINTEXT_BYTES);
-    let plaintext = data.get(..plaintext_end).unwrap_or_default();
-    let Ok(frame) = DataProtection::protect_frame(&key, context, plaintext, limits) else {
+    Some((key, context, object, limits))
+}
+
+pub(super) fn open_bounded_raw_frame(data: &[u8]) -> Result<VerifiedFrame, FrameFailure> {
+    let (key, context, _, limits) =
+        frame_fixture().ok_or_else(|| FrameFailure::new(FrameFailureCode::InvalidContext))?;
+    let bounded_end = data.len().min(
+        usize::try_from(MAX_ENCODED_BYTES)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1),
+    );
+    let bounded = data.get(..bounded_end).unwrap_or_default();
+    DataProtection::open_frame(&key, context, bounded, limits)
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_authenticated_frame(data: &[u8]) {
+    // The corpus is itself an encoded-frame input. This directly exercises the
+    // bounded structural/checksum/AEAD decoder, including retained seeds.
+    if let Ok(verified) = open_bounded_raw_frame(data) {
+        assert!(verified.as_plaintext().len() <= MAX_ENCODED_BYTES as usize);
+    }
+
+    // Keep a deterministic valid frame as the structured mutation oracle.
+    // It was generated independently and is never resealed by a fuzz callback.
+    let Some((key, context, object, limits)) = frame_fixture() else {
         return;
     };
-    let Ok(verified) = DataProtection::open_frame(&key, context, frame.as_bytes(), limits) else {
-        panic!("a freshly protected bounded frame must authenticate");
+    let Ok(verified) = DataProtection::open_frame(&key, context, VALID_EMPTY_FRAME, limits) else {
+        panic!("the committed valid frame must authenticate");
     };
-    assert_eq!(verified.as_plaintext(), plaintext);
+    assert!(verified.as_plaintext().is_empty());
 
     let selector = data.first().copied().unwrap_or_default() % 6;
-    let mut hostile = frame.as_bytes().to_vec();
+    let mut hostile = VALID_EMPTY_FRAME.to_vec();
     let expected = match selector {
         0 => {
             if let Some(version) = hostile.get_mut(4..6) {

@@ -101,6 +101,9 @@ impl<B: CryptoBackend> BackendDataProtection<B> {
                 plaintext,
             )
             .map_err(|_| FrameFailure::new(FrameFailureCode::SealFailed))?;
+        if ciphertext.len() != ciphertext_bytes as usize {
+            return Err(FrameFailure::new(FrameFailureCode::SealFailed));
+        }
         let checksum = self
             .backend
             .sha256(&ciphertext)
@@ -154,6 +157,14 @@ impl<B: CryptoBackend> BackendDataProtection<B> {
                 CryptoBackendFailure::OpenFailed => FrameFailure::new(FrameFailureCode::OpenFailed),
                 _ => FrameFailure::new(FrameFailureCode::AuthenticationFailed),
             })?;
+        let expected_plaintext_bytes = parsed
+            .ciphertext
+            .len()
+            .checked_sub(AES_256_GCM_TAG_BYTES as usize)
+            .ok_or_else(|| FrameFailure::new(FrameFailureCode::MalformedFrame))?;
+        if plaintext.len() != expected_plaintext_bytes {
+            return Err(FrameFailure::new(FrameFailureCode::OpenFailed));
+        }
         Ok(VerifiedFrame(plaintext))
     }
 }

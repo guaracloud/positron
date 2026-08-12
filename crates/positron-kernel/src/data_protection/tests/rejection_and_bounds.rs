@@ -140,14 +140,14 @@ fn ciphertext_checksum_detects_keyless_corruption() -> Result<(), &'static str> 
 
 #[test]
 fn restart_sequence_reset_uses_a_fresh_object_key() -> Result<(), &'static str> {
-    use super::{DataProtection, ObjectDataKey};
+    use super::{DataProtection, ObjectDataKey, SecretKeyInput};
 
     let (_, context, limits, _) = protected_segment_fixture()?;
     let object = context.object;
     let first_restart_key =
-        ObjectDataKey::generate(object).map_err(|_| "first key generation failed")?;
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xf1; 32]), object);
     let second_restart_key =
-        ObjectDataKey::generate(object).map_err(|_| "second key generation failed")?;
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xf2; 32]), object);
     let first =
         DataProtection::protect_frame(&first_restart_key, context, b"restart-sequence", limits)
             .map_err(|_| "first restarted frame protection failed")?;
@@ -240,7 +240,7 @@ fn malformed_headers_are_refused_as_structural_failures() -> Result<(), &'static
     let declared_length = mismatched_length
         .get_mut(16..20)
         .ok_or("frame fixture omitted its declared length")?;
-    declared_length.copy_from_slice(&16_u32.to_be_bytes());
+    declared_length.copy_from_slice(&17_u32.to_be_bytes());
 
     for malformed in [
         Vec::new(),
@@ -266,24 +266,33 @@ fn malformed_headers_are_refused_as_structural_failures() -> Result<(), &'static
 fn finite_policy_bounds_both_protection_and_opening() -> Result<(), &'static str> {
     use super::{DataProtection, FrameFailureCode, FrameLimits};
 
-    let (key, context, _, encrypted) = protected_segment_fixture()?;
+    let (_, context, _, _) = protected_segment_fixture()?;
     let minimum = FrameLimits::new(68).map_err(|_| "minimum frame limit was invalid")?;
-    let empty = DataProtection::protect_frame(&key, context, b"", minimum)
+    let empty_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xe4; 32]), context.object);
+    let empty = DataProtection::protect_frame(&empty_key, context, b"", minimum)
         .map_err(|_| "empty frame did not fit the exact minimum limit")?;
     if empty.as_bytes().len() != 68 {
         return Err("empty frame size differed from the fixed minimum");
     }
-    let verified_empty = DataProtection::open_frame(&key, context, empty.as_bytes(), minimum)
+    let verified_empty = DataProtection::open_frame(&empty_key, context, empty.as_bytes(), minimum)
         .map_err(|_| "minimum-size empty frame did not authenticate")?;
     if !verified_empty.as_plaintext().is_empty() {
         return Err("minimum-size empty frame exposed non-empty plaintext");
     }
-    let protect_failure = DataProtection::protect_frame(&key, context, b"x", minimum)
+    let refused_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xe5; 32]), context.object);
+    let protect_failure = DataProtection::protect_frame(&refused_key, context, b"x", minimum)
         .expect_err("a one-byte plaintext cannot fit the minimum empty-frame limit");
     if protect_failure.code() != FrameFailureCode::LimitExceeded {
         return Err("protection limit failure classification differed");
     }
-    let open_failure = DataProtection::open_frame(&key, context, encrypted.as_bytes(), minimum)
+    let larger_limit = FrameLimits::new(69).map_err(|_| "larger frame limit was invalid")?;
+    let larger_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xe6; 32]), context.object);
+    let larger = DataProtection::protect_frame(&larger_key, context, b"x", larger_limit)
+        .map_err(|_| "larger frame protection failed")?;
+    let open_failure = DataProtection::open_frame(&larger_key, context, larger.as_bytes(), minimum)
         .expect_err("an encoded frame above the caller policy must be refused");
     if open_failure.code() != FrameFailureCode::LimitExceeded {
         return Err("open limit failure classification differed");
@@ -433,20 +442,18 @@ fn keys_plaintext_and_failures_have_bounded_redacted_diagnostics() -> Result<(),
 fn immutable_frame_reread_and_nonce_sequence_semantics_are_explicit() -> Result<(), &'static str> {
     use super::{DataProtection, FrameSequence, SegmentFramePurpose};
 
-    let (key, context, limits, _) = protected_segment_fixture()?;
-    let same_address = DataProtection::protect_frame(&key, context, b"immutable", limits)
-        .map_err(|_| "frame protection failed")?;
+    let (key, context, limits, same_address) = protected_segment_fixture()?;
     for _ in 0..2 {
         let verified = DataProtection::open_frame(&key, context, same_address.as_bytes(), limits)
             .map_err(|_| "legitimate immutable-frame reread failed")?;
-        if verified.as_plaintext() != b"immutable" {
+        if !verified.as_plaintext().is_empty() {
             return Err("legitimate immutable-frame reread differed");
         }
     }
 
     let next_context = context
         .object
-        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(6))
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(2))
         .map_err(|_| "next frame context was invalid")?;
     let next = DataProtection::protect_frame(&key, next_context, b"immutable", limits)
         .map_err(|_| "next sequence frame protection failed")?;

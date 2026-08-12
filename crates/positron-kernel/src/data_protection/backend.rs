@@ -99,6 +99,8 @@ impl CryptoBackend for RustCryptoBackend {
         associated_data: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoBackendFailure> {
+        #[cfg(test)]
+        record_test_protection_authority(key, nonce);
         let cipher = Aes256Gcm::new_from_slice(key.expose_to_backend())
             .map_err(|_| CryptoBackendFailure::InvalidKey)?;
         cipher
@@ -140,6 +142,24 @@ impl CryptoBackend for RustCryptoBackend {
     fn fill_random(&self, destination: &mut [u8]) -> Result<(), CryptoBackendFailure> {
         getrandom::fill(destination).map_err(|_| CryptoBackendFailure::EntropyUnavailable)
     }
+}
+
+#[cfg(test)]
+fn record_test_protection_authority(key: &SecretKeyBytes, nonce: [u8; 12]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    type ProtectionAuthority = ([u8; 32], [u8; 12]);
+    static USED: OnceLock<Mutex<HashSet<ProtectionAuthority>>> = OnceLock::new();
+    let digest: [u8; 32] = Sha256::digest(key.expose_to_backend()).into();
+    let mut used = USED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        used.insert((digest, nonce)),
+        "test attempted duplicate protection under one DEK and sequence"
+    );
 }
 
 /// An explicitly secret 256-bit input transferred into an object data key.
@@ -213,6 +233,10 @@ impl SecretPlaintext {
             #[cfg(test)]
             zeroized_before_release: None,
         }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.bytes.len()
     }
 
     #[cfg(test)]

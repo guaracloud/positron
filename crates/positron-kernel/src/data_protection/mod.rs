@@ -17,7 +17,7 @@ mod context;
 mod frame;
 mod service;
 
-#[cfg(fuzzing)]
+#[cfg(any(test, fuzzing))]
 mod fuzzing;
 
 use backend::{

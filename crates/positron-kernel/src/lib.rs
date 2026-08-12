@@ -9,10 +9,60 @@
 //! durable frame-sequence allocation remain outside this crate's implemented
 //! surface.
 //!
-//! Frame authority is deliberately unavailable to dependent crates:
+//! Frame authority is deliberately unavailable to dependent crates. Each
+//! promised private name is checked independently so one inaccessible import
+//! cannot hide an accidentally exported sibling:
 //!
 //! ```compile_fail
-//! use positron_kernel::{DataProtection, FrameObjectContext, ObjectDataKey};
+//! use positron_kernel::DataProtection;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::ObjectDataKey;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::SecretKeyInput;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameObjectContext;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameContext;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameSequence;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameLimits;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::EncryptedFrame;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::ProtectedFrame;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::VerifiedFrame;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameObjectId;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::KeyEpoch;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FormatEpoch;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::SegmentFramePurpose;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::SystemObjectKind;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameFailure;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameFailureCode;
 //! ```
 
 #![forbid(unsafe_code)]
