@@ -32,7 +32,7 @@ jobs:
         run: cargo test --locked --workspace --lib --bins --tests
 
   authenticated-frame-vectors:
-    name: Authenticated frame vectors (${{ matrix.runner }})
+    name: Frame vectors and local-key ACL/bootstrap (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
@@ -53,3 +53,9 @@ jobs:
 
       - name: Run authenticated-frame vectors
         run: cargo test --locked -p positron-kernel --lib data_protection::tests::vectors::every_persistent_kind_matches_its_canonical_frame_v1_vector -- --exact
+
+      - name: Run native local-key ACL contract tests
+        run: cargo test --locked -p positron-darwin-acl
+
+      - name: Run native local-key bootstrap and format tests
+        run: cargo test --locked -p positron-kernel --lib data_protection::local_key

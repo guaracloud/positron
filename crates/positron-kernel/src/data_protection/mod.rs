@@ -15,6 +15,7 @@ mod backend;
 mod codec;
 mod context;
 mod frame;
+mod local_key;
 mod service;
 
 #[cfg(any(test, fuzzing))]
@@ -47,6 +48,10 @@ const FRAME_NONCE_DOMAIN: [u8; 4] = [0x50, 0x46, 0x52, 0x01];
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use fuzzing::fuzz_authenticated_frame;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use local_key::fuzz_local_root_key_file;
 
 #[cfg(test)]
 mod tests;

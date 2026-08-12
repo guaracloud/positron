@@ -26,5 +26,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "local_root_key_file"
+path = "fuzz_targets/local_root_key_file.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

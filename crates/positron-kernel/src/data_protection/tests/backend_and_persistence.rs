@@ -3,6 +3,32 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use super::{CryptoBackend, RustCryptoBackend, SecretKeyBytes};
 
+#[test]
+fn rust_crypto_sha256_context_zeroizes_on_drop() {
+    fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    require_zeroize_on_drop::<sha2::Sha256>();
+}
+
+#[test]
+fn rust_crypto_backend_matches_nist_sha256_vector() -> Result<(), &'static str> {
+    // NIST FIPS 180-4 SHA-256 example for the ASCII message "abc".
+    let expected = [
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22,
+        0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
+        0x15, 0xad,
+    ];
+    let actual = RustCryptoBackend
+        .sha256(b"abc")
+        .map_err(|_| "NIST SHA-256 hashing failed")?;
+
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("NIST SHA-256 output differed")
+    }
+}
+
 struct EntropyFailureBackend;
 
 impl CryptoBackend for EntropyFailureBackend {
