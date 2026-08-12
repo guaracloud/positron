@@ -103,6 +103,36 @@ fn v2_controller_root_needs_no_resource_control_files() {
 }
 
 #[test]
+fn namespaced_v2_mount_root_remains_governed_and_fails_closed() {
+    let missing_root = FakeReader::default()
+        .with("/proc/self/cgroup", b"0::/tenant/leaf\n")
+        .with(
+            "/proc/self/mountinfo",
+            b"36 29 0:32 /tenant /control rw - cgroup2 cgroup rw\n",
+        )
+        .with("/control/leaf/cpu.max", b"max 100000\n")
+        .with("/control/leaf/memory.max", b"max\n")
+        .with("/control/leaf/memory.current", b"100000\n");
+    assert_eq!(
+        observe_cgroups(&missing_root).map(|_| ()),
+        Err(CapacityObservationFailure::ObservationUnavailable {
+            source: CapacityObservationSource::CgroupCpu
+        })
+    );
+
+    let overused_root = missing_root
+        .with("/control/cpu.max", b"100000 100000\n")
+        .with("/control/memory.max", b"100000\n")
+        .with("/control/memory.current", b"100001\n");
+    assert_eq!(
+        observe_cgroups(&overused_root).map(|_| ()),
+        Err(CapacityObservationFailure::Arithmetic {
+            source: CapacityObservationSource::CgroupMemory
+        })
+    );
+}
+
+#[test]
 fn missing_or_overused_governed_ancestor_fails_closed() {
     let base = FakeReader::default()
         .with("/proc/self/cgroup", b"0::/parent/leaf\n")
