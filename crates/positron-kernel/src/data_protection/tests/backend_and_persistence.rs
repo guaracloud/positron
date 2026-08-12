@@ -366,7 +366,7 @@ fn seal_failure_is_typed_and_secret_safe() -> Result<(), &'static str> {
     let (_, context, limits, _) = protected_segment_fixture()?;
     let protection = super::DataProtection::with_backend(SealFailureBackend);
     let key = protection.import_object_key(
-        super::SecretKeyInput::from_test_bytes([b'K'; 32]),
+        super::SecretKeyInput::from_test_bytes([0x9a; 32]),
         context.object,
     );
 
@@ -377,7 +377,7 @@ fn seal_failure_is_typed_and_secret_safe() -> Result<(), &'static str> {
 
     if failure.code() != super::FrameFailureCode::SealFailed
         || diagnostic.contains("seal-failure-plaintext-canary")
-        || diagnostic.contains("KKKKKKKK")
+        || diagnostic.contains("9a9a9a9a")
         || diagnostic.len() > 128
     {
         return Err("seal failure was not typed and secret-safe");
@@ -391,10 +391,10 @@ fn seal_backend_output_must_match_plaintext_plus_tag() -> Result<(), &'static st
     let plaintext = b"contract";
     let expected = plaintext.len() + 16;
 
-    for output_bytes in [expected - 1, expected + 1] {
+    for (output_bytes, key_byte) in [(expected - 1, 0xa5), (expected + 1, 0xa7)] {
         let protection = super::DataProtection::with_backend(SealLengthBackend { output_bytes });
         let key = protection.import_object_key(
-            super::SecretKeyInput::from_test_bytes([0xa5; 32]),
+            super::SecretKeyInput::from_test_bytes([key_byte; 32]),
             context.object,
         );
         let failure = protection
@@ -405,6 +405,27 @@ fn seal_backend_output_must_match_plaintext_plus_tag() -> Result<(), &'static st
         }
     }
     Ok(())
+}
+
+#[test]
+#[should_panic(expected = "test attempted duplicate protection under one DEK and sequence")]
+fn protection_authority_guard_covers_custom_backends() {
+    let (_, context, limits, _) =
+        protected_segment_fixture().expect("protected segment fixture must be valid");
+    let protection = super::DataProtection::with_backend(SealLengthBackend {
+        output_bytes: b"contract".len() + 16,
+    });
+    let key = protection.import_object_key(
+        super::SecretKeyInput::from_test_bytes([0xfa; 32]),
+        context.object,
+    );
+
+    assert!(
+        protection
+            .protect_frame(&key, context, b"contract", limits)
+            .is_ok()
+    );
+    let _duplicate = protection.protect_frame(&key, context, b"contract", limits);
 }
 
 #[test]

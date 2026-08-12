@@ -92,6 +92,8 @@ impl<B: CryptoBackend> BackendDataProtection<B> {
 
         let header = encode_authenticated_header(context.sequence, ciphertext_bytes);
         let associated_data = encode_associated_data(&header, context);
+        #[cfg(test)]
+        record_test_protection_authority(key, nonce_for(context.sequence));
         let ciphertext = self
             .backend
             .seal_aes_256_gcm(
@@ -167,4 +169,25 @@ impl<B: CryptoBackend> BackendDataProtection<B> {
         }
         Ok(VerifiedFrame(plaintext))
     }
+}
+
+#[cfg(test)]
+fn record_test_protection_authority(key: &ObjectDataKey, nonce: [u8; 12]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    use sha2::{Digest, Sha256};
+
+    type ProtectionAuthority = ([u8; 32], [u8; 12]);
+    static USED: OnceLock<Mutex<HashSet<ProtectionAuthority>>> = OnceLock::new();
+    let digest: [u8; 32] = Sha256::digest(key.key.expose_to_backend()).into();
+    let unique = USED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((digest, nonce));
+    assert!(
+        unique,
+        "test attempted duplicate protection under one DEK and sequence"
+    );
 }

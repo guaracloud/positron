@@ -1,6 +1,75 @@
 use super::*;
 
 #[test]
+fn raw_fuzz_oracle_rejects_bounded_plaintext_for_unauthenticated_bytes() {
+    let faulty_success = Ok(VerifiedFrame(SecretPlaintext::new(
+        b"unauthenticated".to_vec(),
+    )));
+
+    assert!(
+        !super::super::fuzzing::raw_open_result_matches_oracle(
+            b"not-an-authentic-frame",
+            faulty_success,
+        ),
+        "a bounded plaintext result must not satisfy the authenticity oracle"
+    );
+}
+
+#[test]
+fn structured_fuzz_mutates_ciphertext_and_tag_independently() -> Result<(), &'static str> {
+    use sha2::{Digest, Sha256};
+
+    let authentic = super::super::fuzzing::AUTHENTIC_FRAME;
+    let body_end = authentic
+        .len()
+        .checked_sub(16)
+        .ok_or("authentic frame omitted its tag")?;
+    if body_end <= 52 {
+        return Err("authentic structured seed had no ciphertext body");
+    }
+
+    for selector in [3, 4] {
+        let (hostile, expected) = super::super::fuzzing::structured_mutation(selector)
+            .ok_or("structured mutation fixture was unavailable")?;
+        if expected != FrameFailureCode::AuthenticationFailed {
+            return Err("structured AEAD mutation expected the wrong failure");
+        }
+        let checksum: [u8; 32] = Sha256::digest(
+            hostile
+                .get(52..)
+                .ok_or("structured mutation omitted ciphertext")?,
+        )
+        .into();
+        if hostile.get(20..52) != Some(checksum.as_slice()) {
+            return Err("structured mutation did not refresh its checksum");
+        }
+
+        let body_differences = authentic[52..body_end]
+            .iter()
+            .zip(&hostile[52..body_end])
+            .filter(|(left, right)| left != right)
+            .count();
+        let tag_differences = authentic[body_end..]
+            .iter()
+            .zip(&hostile[body_end..])
+            .filter(|(left, right)| left != right)
+            .count();
+        if (selector == 3 && (body_differences, tag_differences) != (1, 0))
+            || (selector == 4 && (body_differences, tag_differences) != (0, 1))
+        {
+            return Err("ciphertext and tag selectors did not mutate distinct regions");
+        }
+
+        let failure = super::super::fuzzing::open_bounded_raw_frame(&hostile)
+            .expect_err("a structured AEAD mutation must expose no plaintext");
+        if failure.code() != FrameFailureCode::AuthenticationFailed {
+            return Err("structured AEAD mutation failure classification differed");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn committed_fuzz_seeds_reach_the_bounded_raw_decoder() -> Result<(), &'static str> {
     const TRUNCATED: &[u8] =
         include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/truncated_header");
@@ -10,6 +79,8 @@ fn committed_fuzz_seeds_reach_the_bounded_raw_decoder() -> Result<(), &'static s
         include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/unsupported_algorithm");
     const VALID_EMPTY: &[u8] =
         include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/valid_empty_frame");
+    const VALID_NON_EMPTY: &[u8] =
+        include_bytes!("../../../../../fuzz/corpus/encrypted_frame_open/valid_non_empty_frame");
 
     let cases = [
         (TRUNCATED, Err(FrameFailureCode::MalformedFrame)),
@@ -21,14 +92,21 @@ fn committed_fuzz_seeds_reach_the_bounded_raw_decoder() -> Result<(), &'static s
             UNSUPPORTED_ALGORITHM,
             Err(FrameFailureCode::UnsupportedAlgorithm),
         ),
-        (VALID_EMPTY, Ok(0)),
+        (VALID_EMPTY, Err(FrameFailureCode::AuthenticationFailed)),
+        (
+            VALID_NON_EMPTY,
+            Ok(super::super::fuzzing::AUTHENTIC_PLAINTEXT.len()),
+        ),
     ];
     for (seed, expected) in cases {
         let actual = super::super::fuzzing::open_bounded_raw_frame(seed)
             .map(|verified| verified.as_plaintext().len())
             .map_err(FrameFailure::code);
-        if actual != expected {
-            return Err("committed fuzz seed did not reach its exact raw decode outcome");
+        let oracle_result = super::super::fuzzing::open_bounded_raw_frame(seed);
+        if actual != expected
+            || !super::super::fuzzing::raw_open_result_matches_oracle(seed, oracle_result)
+        {
+            return Err("committed fuzz seed did not reach its exact authenticated raw outcome");
         }
     }
     Ok(())

@@ -38,7 +38,7 @@
 //! use positron_kernel::EncryptedFrame;
 //! ```
 //! ```compile_fail
-//! use positron_kernel::ProtectedFrame;
+//! use positron_kernel::CryptoBackend;
 //! ```
 //! ```compile_fail
 //! use positron_kernel::VerifiedFrame;
