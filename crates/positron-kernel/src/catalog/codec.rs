@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
+use crate::data_protection::DataProtection;
 
 use super::types::{
     AuditFrontier, CatalogFailure, CatalogFailureCode, CatalogGenerationId, CatalogObjectId,
@@ -33,34 +33,34 @@ pub(super) struct CommitRecord {
     pub(super) objects: Vec<CatalogObjectId>,
 }
 
-pub(super) fn object_set_digest(objects: &[CatalogObjectId]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(OBJECT_SET_DIGEST_DOMAIN);
-    digest.update((objects.len() as u64).to_be_bytes());
+pub(super) fn object_set_digest(objects: &[CatalogObjectId]) -> Result<[u8; 32], CatalogFailure> {
+    let mut encoded = Vec::with_capacity(OBJECT_SET_DIGEST_DOMAIN.len() + 8 + objects.len() * 32);
+    encoded.extend_from_slice(OBJECT_SET_DIGEST_DOMAIN);
+    encoded.extend_from_slice(&(objects.len() as u64).to_be_bytes());
     for object in objects {
-        digest.update(object.0);
+        encoded.extend_from_slice(&object.0);
     }
-    digest.finalize().into()
+    hash(&encoded)
 }
 
 pub(super) fn transaction_digest(
     format_epoch: FormatEpoch,
     objects: &[CatalogObjectId],
     audit: Option<&[u8]>,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(TRANSACTION_DIGEST_DOMAIN);
-    digest.update(format_epoch.0.to_be_bytes());
-    digest.update(object_set_digest(objects));
+) -> Result<[u8; 32], CatalogFailure> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(TRANSACTION_DIGEST_DOMAIN);
+    encoded.extend_from_slice(&format_epoch.0.to_be_bytes());
+    encoded.extend_from_slice(&object_set_digest(objects)?);
     match audit {
         Some(intent) => {
-            digest.update([1]);
-            digest.update((intent.len() as u64).to_be_bytes());
-            digest.update(intent);
+            encoded.push(1);
+            encoded.extend_from_slice(&(intent.len() as u64).to_be_bytes());
+            encoded.extend_from_slice(intent);
         },
-        None => digest.update([0]),
+        None => encoded.push(0),
     }
-    digest.finalize().into()
+    hash(&encoded)
 }
 
 pub(super) fn prepare_audit(
@@ -75,7 +75,7 @@ pub(super) fn prepare_audit(
         .position
         .checked_add(1)
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    let hash = audit_hash(position, predecessor.hash, transaction, intent);
+    let hash = audit_hash(position, predecessor.hash, transaction, intent)?;
     let record = GovernanceAuditRecord {
         position,
         predecessor_hash: predecessor.hash,
@@ -91,15 +91,15 @@ fn audit_hash(
     predecessor_hash: [u8; 32],
     transaction: TransactionId,
     intent: &[u8],
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(AUDIT_HASH_DOMAIN);
-    digest.update(position.to_be_bytes());
-    digest.update(predecessor_hash);
-    digest.update(transaction.0);
-    digest.update((intent.len() as u64).to_be_bytes());
-    digest.update(intent);
-    digest.finalize().into()
+) -> Result<[u8; 32], CatalogFailure> {
+    let mut encoded = Vec::with_capacity(AUDIT_HASH_DOMAIN.len() + 8 + 32 + 16 + 8 + intent.len());
+    encoded.extend_from_slice(AUDIT_HASH_DOMAIN);
+    encoded.extend_from_slice(&position.to_be_bytes());
+    encoded.extend_from_slice(&predecessor_hash);
+    encoded.extend_from_slice(&transaction.0);
+    encoded.extend_from_slice(&(intent.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(intent);
+    hash(&encoded)
 }
 
 fn encode_audit(record: &GovernanceAuditRecord) -> Vec<u8> {
@@ -135,7 +135,7 @@ pub(super) fn decode_audit(encoded: &[u8]) -> Result<GovernanceAuditRecord, Cata
     let intent: Arc<[u8]> = Arc::from(decoder.take(intent_length)?);
     let stored_hash = decoder.take_array::<32>()?;
     decoder.finish()?;
-    if stored_hash != audit_hash(position, predecessor_hash, transaction, &intent) {
+    if stored_hash != audit_hash(position, predecessor_hash, transaction, &intent)? {
         return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
     }
     Ok(GovernanceAuditRecord {
@@ -172,7 +172,7 @@ pub(super) fn decode_commit(
     generation: CatalogGenerationId,
     encoded: &[u8],
 ) -> Result<CommitRecord, CatalogFailure> {
-    if CatalogGenerationId(Sha256::digest(encoded).into()) != generation {
+    if CatalogGenerationId(hash(encoded)?) != generation {
         return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
     }
     let mut decoder = Decoder::new(encoded);
@@ -209,7 +209,7 @@ pub(super) fn decode_commit(
         .iter()
         .zip(objects.iter().skip(1))
         .any(|(first, second)| first >= second)
-        || object_set_digest(&objects) != stored_object_set_digest
+        || object_set_digest(&objects)? != stored_object_set_digest
     {
         return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
     }
@@ -227,8 +227,15 @@ pub(super) fn decode_commit(
     })
 }
 
-pub(super) fn generation_identity(encoded_commit: &[u8]) -> CatalogGenerationId {
-    CatalogGenerationId(Sha256::digest(encoded_commit).into())
+pub(super) fn generation_identity(
+    encoded_commit: &[u8],
+) -> Result<CatalogGenerationId, CatalogFailure> {
+    Ok(CatalogGenerationId(hash(encoded_commit)?))
+}
+
+fn hash(bytes: &[u8]) -> Result<[u8; 32], CatalogFailure> {
+    DataProtection::hash(bytes)
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))
 }
 
 pub(super) fn snapshot_from_record(

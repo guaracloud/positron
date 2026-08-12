@@ -10,6 +10,7 @@ use super::super::{
     AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject, CatalogProposal,
     CatalogSecret, FormatEpoch, InstanceId, TransactionId,
 };
+use super::support::establish_catalog_authority;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -81,7 +82,8 @@ fn every_pre_marker_fault_recovers_only_the_predecessor() -> Result<(), Box<dyn 
         let root = TemporaryRoot::new()?;
         let instance = InstanceId::new(id(51))?;
         let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-        let catalog = Catalog::open(volume, instance, secret())?;
+        let authority = establish_catalog_authority(volume)?;
+        let catalog = Catalog::open(&authority, instance, secret())?;
         let expected = catalog.pin()?.identity();
         let failure = with_catalog_fault(event, || {
             let value = 80_u8.saturating_add(offset as u8);
@@ -98,9 +100,11 @@ fn every_pre_marker_fault_recovers_only_the_predecessor() -> Result<(), Box<dyn 
             "{event:?}"
         );
         drop(catalog);
+        drop(authority);
 
         let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-        let recovered = Catalog::open(volume, instance, secret())?;
+        let authority = establish_catalog_authority(volume)?;
+        let recovered = Catalog::open(&authority, instance, secret())?;
         assert_eq!(recovered.pin()?.number(), 0, "{event:?}");
         assert!(
             recovered.governance_audit_records()?.is_empty(),
@@ -116,7 +120,8 @@ fn post_rename_directory_sync_fault_recovers_only_the_complete_successor()
     let root = TemporaryRoot::new()?;
     let instance = InstanceId::new(id(71))?;
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-    let catalog = Catalog::open(volume, instance, secret())?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
     let expected = catalog.pin()?.identity();
 
     let failure = with_catalog_fault(CatalogFileEvent::SynchronizeGenerationDirectory, || {
@@ -141,9 +146,11 @@ fn post_rename_directory_sync_fault_recovers_only_the_complete_successor()
         Some(1)
     );
     drop(catalog);
+    drop(authority);
 
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-    let recovered = Catalog::open(volume, instance, secret())?;
+    let authority = establish_catalog_authority(volume)?;
+    let recovered = Catalog::open(&authority, instance, secret())?;
     assert_eq!(recovered.pin()?.number(), 1);
     assert_eq!(recovered.governance_audit_records()?.len(), 1);
     Ok(())
@@ -155,7 +162,8 @@ fn failed_audited_successor_releases_its_chain_position() -> Result<(), Box<dyn 
     let root = TemporaryRoot::new()?;
     let instance = InstanceId::new(id(91))?;
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-    let catalog = Catalog::open(volume, instance, secret())?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
     let first = catalog.commit(
         catalog.pin()?.identity(),
         proposal(92, 2)?,
@@ -196,7 +204,8 @@ fn partial_staging_write_can_be_retried_idempotently() -> Result<(), Box<dyn std
     let root = TemporaryRoot::new()?;
     let instance = InstanceId::new(id(101))?;
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-    let catalog = Catalog::open(volume, instance, secret())?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
     let expected = catalog.pin()?.identity();
 
     let failure = with_catalog_fault(CatalogFileEvent::PartialObjectWrite, || {
@@ -216,5 +225,49 @@ fn partial_staging_write_can_be_retried_idempotently() -> Result<(), Box<dyn std
     )?;
     assert_eq!(retried.number(), 1);
     assert_eq!(catalog.governance_audit_records()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn every_existing_artifact_is_resynchronized_before_retry_acknowledgement()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (offset, event) in [
+        CatalogFileEvent::SynchronizeObjectDirectory,
+        CatalogFileEvent::SynchronizeAuditDirectory,
+        CatalogFileEvent::SynchronizeCommitDirectory,
+        CatalogFileEvent::SynchronizeGenerationDirectory,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(111))?;
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let catalog = Catalog::open(&authority, instance, secret())?;
+        let expected = catalog.pin()?.identity();
+        let transaction = 112_u8.saturating_add(offset as u8);
+        let attempt = || {
+            catalog.commit(
+                expected,
+                proposal(transaction, transaction)?,
+                Some(AuditIntent::new(b"resynchronize".to_vec())?),
+            )
+        };
+        assert_eq!(
+            with_catalog_fault(event, attempt)
+                .expect_err("first directory synchronization must fail")
+                .code(),
+            CatalogFailureCode::StorageUnavailable
+        );
+        assert_eq!(
+            with_catalog_fault(event, attempt)
+                .expect_err("retry must repeat the same durability barrier")
+                .code(),
+            CatalogFailureCode::StorageUnavailable,
+            "{event:?}"
+        );
+        assert_eq!(attempt()?.number(), 1, "{event:?}");
+    }
     Ok(())
 }

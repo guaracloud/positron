@@ -15,13 +15,16 @@ use super::super::types::{
     AuditFrontier, CatalogFailureCode, CatalogGenerationId, CatalogObjectId, CatalogSecret,
     FormatEpoch, InstanceId, TransactionId,
 };
-use super::CatalogStorage;
-use super::artifact::{ArtifactKind, open_artifact, protect_artifact};
+use super::artifact::{ArtifactKind, open_artifact, protect_artifact, rewrap_artifact_envelope};
 use super::fault::{CatalogFileEvent, with_catalog_fault};
 use super::io::{
     entry_exists, open_or_create_directory, read_exact_file, write_new_file, write_transaction_file,
 };
 use super::marker::{MarkerDecode, decode_marker, encode_marker};
+use super::{
+    CatalogStorage, MAX_GENERATION_DIRECTORY_NAME_BYTES, MAX_GENERATIONS, marker_name, object_name,
+    reserve_directory_entry,
+};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -82,8 +85,9 @@ fn base_record(
         instance,
         format_epoch,
         transaction,
-        transaction_digest: transaction_digest(format_epoch, &objects, None),
-        object_set_digest: object_set_digest(&objects),
+        transaction_digest: transaction_digest(format_epoch, &objects, None)
+            .expect("test transaction digest"),
+        object_set_digest: object_set_digest(&objects).expect("test object-set digest"),
         audit_frontier: AuditFrontier::ORIGIN,
         objects,
     }
@@ -96,9 +100,9 @@ fn publish_record(
     mut record: CommitRecord,
 ) -> Result<CatalogGenerationId, super::super::types::CatalogFailure> {
     let encoded = encode_commit(&record);
-    let generation = generation_identity(&encoded);
+    let generation = generation_identity(&encoded)?;
     record.generation = generation;
-    storage.publish_commit(staging, secret, generation, &encoded)?;
+    storage.publish_commit(staging, secret, record.instance, generation, &encoded)?;
     storage.publish_marker(staging, secret, record.number, generation)?;
     Ok(generation)
 }
@@ -112,21 +116,34 @@ fn protected_artifacts_bind_kind_identity_epoch_and_secret() {
         ArtifactKind::Audit,
         ArtifactKind::Commit,
     ] {
-        let first = protect_artifact(&secret(1), kind, identity, epoch, b"plaintext")
+        let first = protect_artifact(&secret(1), instance(1), kind, identity, epoch, b"plaintext")
             .expect("valid artifact must protect");
-        let second = protect_artifact(&secret(1), kind, identity, epoch, b"plaintext")
+        let second = protect_artifact(&secret(1), instance(1), kind, identity, epoch, b"plaintext")
             .expect("valid artifact must protect");
         assert_ne!(first, second, "each protection attempt needs fresh salt");
+        assert_ne!(
+            &first[39..71],
+            &second[39..71],
+            "each artifact needs an independent immutable child-key identity"
+        );
         assert_eq!(
-            open_artifact(&secret(1), kind, identity, epoch, &first)
+            open_artifact(&secret(1), instance(1), kind, identity, epoch, &first)
                 .expect("matching context must open"),
             b"plaintext"
         );
 
         for failure in [
-            open_artifact(&secret(2), kind, identity, epoch, &first),
-            open_artifact(&secret(1), kind, [0x32; 32], epoch, &first),
-            open_artifact(&secret(1), kind, identity, FormatEpoch(5), &first),
+            open_artifact(&secret(2), instance(1), kind, identity, epoch, &first),
+            open_artifact(&secret(1), instance(1), kind, [0x32; 32], epoch, &first),
+            open_artifact(
+                &secret(1),
+                instance(1),
+                kind,
+                identity,
+                FormatEpoch(5),
+                &first,
+            ),
+            open_artifact(&secret(1), instance(2), kind, identity, epoch, &first),
         ] {
             assert_eq!(
                 failure.expect_err("context substitution must fail").code(),
@@ -139,33 +156,67 @@ fn protected_artifacts_bind_kind_identity_epoch_and_secret() {
             ArtifactKind::Audit | ArtifactKind::Commit => ArtifactKind::Object,
         };
         assert_eq!(
-            open_artifact(&secret(1), other_kind, identity, epoch, &first)
+            open_artifact(&secret(1), instance(1), other_kind, identity, epoch, &first)
                 .expect_err("artifact kind substitution must fail")
                 .code(),
-            CatalogFailureCode::IntegrityCorruption
+            CatalogFailureCode::UnsupportedFormat
         );
 
-        for length in 0..25 {
+        for offset in [31_usize, 39, 78, 79, 111] {
+            let mut corrupt_envelope = first.clone();
+            corrupt_envelope[offset] ^= 1;
             assert_eq!(
-                open_artifact(&secret(1), kind, identity, epoch, &first[..length])
-                    .expect_err("truncated header must fail")
-                    .code(),
+                open_artifact(
+                    &secret(1),
+                    instance(1),
+                    kind,
+                    identity,
+                    epoch,
+                    &corrupt_envelope,
+                )
+                .expect_err("outer or wrapped envelope substitution must fail")
+                .code(),
+                CatalogFailureCode::AuthenticationFailed
+            );
+        }
+
+        for length in 0..247 {
+            assert_eq!(
+                open_artifact(
+                    &secret(1),
+                    instance(1),
+                    kind,
+                    identity,
+                    epoch,
+                    &first[..length]
+                )
+                .expect_err("truncated header must fail")
+                .code(),
                 CatalogFailureCode::IntegrityCorruption
             );
         }
         let mut corrupt = first;
         corrupt[0] ^= 1;
         assert_eq!(
-            open_artifact(&secret(1), kind, identity, epoch, &corrupt)
+            open_artifact(&secret(1), instance(1), kind, identity, epoch, &corrupt)
                 .expect_err("corrupt magic must fail")
                 .code(),
-            CatalogFailureCode::IntegrityCorruption
+            CatalogFailureCode::UnsupportedFormat
+        );
+        corrupt[0] ^= 1;
+        corrupt[14] ^= 1;
+        assert_eq!(
+            open_artifact(&secret(1), instance(1), kind, identity, epoch, &corrupt)
+                .expect_err("unknown wrapping algorithm must fail")
+                .code(),
+            CatalogFailureCode::UnsupportedFormat
         );
     }
 
     assert_eq!(
         protect_artifact(
             &secret(1),
+            instance(1),
             ArtifactKind::Object,
             identity,
             FormatEpoch(0),
@@ -174,6 +225,120 @@ fn protected_artifacts_bind_kind_identity_epoch_and_secret() {
         .expect_err("zero artifact epoch must fail")
         .code(),
         CatalogFailureCode::IntegrityCorruption
+    );
+}
+
+#[test]
+fn authenticated_object_bytes_must_match_their_content_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let storage = CatalogStorage::open(&volume)?;
+    let identity = CatalogObjectId([0x35; 32]);
+    let epoch = FormatEpoch(2);
+    let protected = protect_artifact(
+        &secret(2),
+        instance(2),
+        ArtifactKind::Object,
+        identity.0,
+        epoch,
+        b"authenticated bytes with a different digest",
+    )?;
+    write_new_file(&storage.objects, &object_name(epoch, identity), &protected)?;
+
+    assert_eq!(
+        storage
+            .read_object(&secret(2), instance(2), identity, epoch)
+            .expect_err("the authenticated object identity must remain content-addressed")
+            .code(),
+        CatalogFailureCode::IntegrityCorruption
+    );
+    Ok(())
+}
+
+#[test]
+fn root_rotation_rewraps_only_the_dek_envelope() {
+    let current = CatalogSecret::from_owned_at_epoch(Box::new([0x11; 32]), [0x21; 16], 7)
+        .expect("valid current root epoch");
+    let replacement = CatalogSecret::from_owned_at_epoch(Box::new([0x12; 32]), [0x22; 16], 8)
+        .expect("valid replacement root epoch");
+    let identity = [0x31; 32];
+    let epoch = FormatEpoch(4);
+    let encoded = protect_artifact(
+        &current,
+        instance(3),
+        ArtifactKind::Object,
+        identity,
+        epoch,
+        b"ciphertext remains immutable",
+    )
+    .expect("artifact protects");
+    let rewrapped = rewrap_artifact_envelope(
+        &current,
+        &replacement,
+        instance(3),
+        ArtifactKind::Object,
+        identity,
+        epoch,
+        &encoded,
+    )
+    .expect("root rotation rewraps the envelope");
+
+    assert_eq!(&encoded[247..], &rewrapped[247..]);
+    assert_eq!(
+        open_artifact(
+            &replacement,
+            instance(3),
+            ArtifactKind::Object,
+            identity,
+            epoch,
+            &rewrapped,
+        )
+        .expect("replacement epoch opens the unchanged ciphertext"),
+        b"ciphertext remains immutable"
+    );
+    assert_eq!(
+        open_artifact(
+            &current,
+            instance(3),
+            ArtifactKind::Object,
+            identity,
+            epoch,
+            &rewrapped,
+        )
+        .expect_err("retired routing identity must fail closed")
+        .code(),
+        CatalogFailureCode::AuthenticationFailed
+    );
+    let wrong_current = CatalogSecret::from_owned_at_epoch(Box::new([0x11; 32]), [0x23; 16], 7)
+        .expect("valid alternate routing identity");
+    assert_eq!(
+        rewrap_artifact_envelope(
+            &wrong_current,
+            &replacement,
+            instance(3),
+            ArtifactKind::Object,
+            identity,
+            epoch,
+            &encoded,
+        )
+        .expect_err("rewrap must authenticate the current provider routing identity")
+        .code(),
+        CatalogFailureCode::AuthenticationFailed
+    );
+    assert_eq!(
+        rewrap_artifact_envelope(
+            &current,
+            &replacement,
+            instance(4),
+            ArtifactKind::Object,
+            identity,
+            epoch,
+            &encoded,
+        )
+        .expect_err("rewrap must authenticate the complete envelope context")
+        .code(),
+        CatalogFailureCode::AuthenticationFailed
     );
 }
 
@@ -196,7 +361,14 @@ fn markers_distinguish_published_torn_and_unauthenticated_records() {
     bad_magic[0] ^= 1;
     assert!(matches!(
         decode_marker(&secret(3), &bad_magic).expect("invalid marker is classified"),
-        MarkerDecode::Torn
+        MarkerDecode::Corrupt
+    ));
+    let mut unsupported_version = published;
+    unsupported_version[9] = 2;
+    assert!(matches!(
+        decode_marker(&secret(3), &unsupported_version)
+            .expect("unknown marker version is classified"),
+        MarkerDecode::Unsupported
     ));
     assert!(matches!(
         decode_marker(&secret(4), &published).expect("wrong key is classified"),
@@ -209,9 +381,25 @@ fn markers_distinguish_published_torn_and_unauthenticated_records() {
     ] {
         assert!(matches!(
             decode_marker(&secret(3), &marker).expect("sentinel marker is classified"),
-            MarkerDecode::Torn
+            MarkerDecode::Corrupt
         ));
     }
+}
+
+#[test]
+fn generation_enumeration_bounds_every_entry_before_classification() {
+    let mut count = MAX_GENERATIONS - 1;
+    let mut name_bytes = MAX_GENERATION_DIRECTORY_NAME_BYTES - 1;
+    reserve_directory_entry(&mut count, &mut name_bytes, 1)
+        .expect("the exact enumeration boundary is accepted");
+    assert_eq!(count, MAX_GENERATIONS);
+    assert_eq!(name_bytes, MAX_GENERATION_DIRECTORY_NAME_BYTES);
+    assert_eq!(
+        reserve_directory_entry(&mut count, &mut name_bytes, 1)
+            .expect_err("one unrelated directory entry past the bound must be refused")
+            .code(),
+        CatalogFailureCode::LimitExceeded
+    );
 }
 
 #[test]
@@ -324,42 +512,79 @@ fn immutable_storage_reuses_only_byte_identical_reserved_artifacts()
     let plaintext = b"immutable object";
     let object_id = CatalogObjectId(Sha256::digest(plaintext).into());
     let epoch = FormatEpoch(1);
-    storage.publish_object(&staging, &secret(5), object_id, epoch, plaintext)?;
-    assert_eq!(
-        storage.read_object(&secret(5), object_id, epoch)?.as_ref(),
-        plaintext
-    );
-    storage.publish_object(&staging, &secret(5), object_id, epoch, plaintext)?;
+    storage.publish_object(
+        &staging,
+        &secret(5),
+        instance(1),
+        object_id,
+        epoch,
+        plaintext,
+    )?;
     assert_eq!(
         storage
-            .publish_object(&staging, &secret(5), object_id, epoch, b"substitution")
+            .read_object(&secret(5), instance(1), object_id, epoch)?
+            .as_ref(),
+        plaintext
+    );
+    storage.publish_object(
+        &staging,
+        &secret(5),
+        instance(1),
+        object_id,
+        epoch,
+        plaintext,
+    )?;
+    assert_eq!(
+        storage
+            .publish_object(
+                &staging,
+                &secret(5),
+                instance(1),
+                object_id,
+                epoch,
+                b"substitution",
+            )
             .expect_err("reserved object substitution must fail")
             .code(),
         CatalogFailureCode::IntegrityCorruption
     );
 
     let (audit, encoded_audit) = prepare_audit(AuditFrontier::ORIGIN, transaction_id, b"redacted")?;
-    storage.publish_audit(&staging, &secret(5), &audit, &encoded_audit)?;
+    storage.publish_audit(&staging, &secret(5), instance(1), &audit, &encoded_audit)?;
     assert_eq!(
-        storage.read_audit(&secret(5), audit.position(), audit.record_hash())?,
+        storage.read_audit(
+            &secret(5),
+            instance(1),
+            audit.position(),
+            audit.record_hash(),
+        )?,
         encoded_audit
     );
-    storage.publish_audit(&staging, &secret(5), &audit, &encoded_audit)?;
+    storage.publish_audit(&staging, &secret(5), instance(1), &audit, &encoded_audit)?;
     assert_eq!(
         storage
-            .publish_audit(&staging, &secret(5), &audit, b"substitution")
+            .publish_audit(&staging, &secret(5), instance(1), &audit, b"substitution",)
             .expect_err("reserved audit substitution must fail")
             .code(),
         CatalogFailureCode::IntegrityCorruption
     );
 
     let generation = CatalogGenerationId([0x51; 32]);
-    storage.publish_commit(&staging, &secret(5), generation, b"commit")?;
-    assert_eq!(storage.read_commit(&secret(5), generation)?, b"commit");
-    storage.publish_commit(&staging, &secret(5), generation, b"commit")?;
+    storage.publish_commit(&staging, &secret(5), instance(1), generation, b"commit")?;
+    assert_eq!(
+        storage.read_commit(&secret(5), instance(1), generation)?,
+        b"commit"
+    );
+    storage.publish_commit(&staging, &secret(5), instance(1), generation, b"commit")?;
     assert_eq!(
         storage
-            .publish_commit(&staging, &secret(5), generation, b"substitution")
+            .publish_commit(
+                &staging,
+                &secret(5),
+                instance(1),
+                generation,
+                b"substitution",
+            )
             .expect_err("reserved commit substitution must fail")
             .code(),
         CatalogFailureCode::IntegrityCorruption
@@ -380,6 +605,11 @@ fn marker_scan_ignores_torn_entries_but_counts_authenticated_shape_failures()
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let storage = CatalogStorage::open(&volume)?;
     write_new_file(&storage.generations, "short.marker", b"torn")?;
+    write_new_file(
+        &storage.generations,
+        "oversized.marker",
+        &[0_u8; super::marker::MARKER_BYTES + 1],
+    )?;
     let generation = CatalogGenerationId([0x61; 32]);
     let marker = encode_marker(&secret(7), 1, generation)?;
     write_new_file(&storage.generations, "wrong-key.marker", &marker)?;
@@ -387,6 +617,98 @@ fn marker_scan_ignores_torn_entries_but_counts_authenticated_shape_failures()
     let scan = storage.markers(&secret(8))?;
     assert!(scan.verified.is_empty());
     assert_eq!(scan.authentication_failures, 1);
+    Ok(())
+}
+
+#[test]
+fn marker_scan_rejects_one_generation_published_at_two_numbers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let storage = CatalogStorage::open(&volume)?;
+    let generation = CatalogGenerationId([0x63; 32]);
+    write_new_file(
+        &storage.generations,
+        &marker_name(1, generation),
+        &encode_marker(&secret(8), 1, generation)?,
+    )?;
+    write_new_file(
+        &storage.generations,
+        &marker_name(2, generation),
+        &encode_marker(&secret(8), 2, generation)?,
+    )?;
+
+    let failure = match storage.markers(&secret(8)) {
+        Ok(_) => return Err("one immutable generation cannot have two publication numbers".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
+    Ok(())
+}
+
+#[test]
+fn marker_scan_fails_closed_on_an_unreadable_directory_entry()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let storage = CatalogStorage::open(&volume)?;
+    symlink(
+        "missing-marker-target",
+        root.path().join("catalog/generations/link.marker"),
+    )?;
+
+    let failure = match storage.markers(&secret(8)) {
+        Ok(_) => return Err("an unreadable generation entry cannot be ignored".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
+    Ok(())
+}
+
+#[test]
+fn existing_marker_retry_classifies_authentication_format_and_shape_failures()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generation = CatalogGenerationId([0x64; 32]);
+    for (replacement, expected) in [
+        (
+            encode_marker(&secret(9), 1, generation)?.to_vec(),
+            CatalogFailureCode::AuthenticationFailed,
+        ),
+        (
+            {
+                let mut marker = encode_marker(&secret(8), 1, generation)?.to_vec();
+                marker[9] = 2;
+                marker
+            },
+            CatalogFailureCode::UnsupportedFormat,
+        ),
+        (
+            {
+                let mut marker = encode_marker(&secret(8), 1, generation)?.to_vec();
+                marker[0] ^= 1;
+                marker
+            },
+            CatalogFailureCode::IntegrityCorruption,
+        ),
+    ] {
+        let root = TemporaryRoot::new()?;
+        let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+        let storage = CatalogStorage::open(&volume)?;
+        write_new_file(
+            &storage.generations,
+            &marker_name(1, generation),
+            &replacement,
+        )?;
+        assert_eq!(
+            storage
+                .publish_marker(&storage.staging, &secret(8), 1, generation)
+                .expect_err("an existing invalid marker must fail closed")
+                .code(),
+            expected
+        );
+    }
     Ok(())
 }
 
@@ -406,7 +728,7 @@ fn recovery_rejects_authenticated_but_semantically_inconsistent_records()
                 .err()
                 .expect("instance substitution must fail")
                 .code(),
-            CatalogFailureCode::IntegrityCorruption
+            CatalogFailureCode::AuthenticationFailed
         );
     }
 
@@ -506,7 +828,7 @@ fn recovery_rejects_authenticated_but_semantically_inconsistent_records()
             hash: audit.record_hash(),
         };
         let staging = storage.open_transaction(record.transaction, record.transaction_digest)?;
-        storage.publish_audit(&staging, &key, &audit, &encoded_audit)?;
+        storage.publish_audit(&staging, &key, instance(1), &audit, &encoded_audit)?;
         publish_record(&storage, &staging, &key, record)?;
         assert_eq!(
             recover(&storage, &key, instance(1))
@@ -528,8 +850,8 @@ fn recovery_rejects_authenticated_but_semantically_inconsistent_records()
         let first_generation = publish_record(&storage, &first_staging, &key, first)?;
         let mut second = base_record(2, first_generation, instance(1), transaction(9));
         second.objects = vec![CatalogObjectId([0x71; 32]), CatalogObjectId([0x71; 32])];
-        second.object_set_digest = object_set_digest(&second.objects);
-        second.transaction_digest = transaction_digest(second.format_epoch, &second.objects, None);
+        second.object_set_digest = object_set_digest(&second.objects)?;
+        second.transaction_digest = transaction_digest(second.format_epoch, &second.objects, None)?;
         let second_staging =
             storage.open_transaction(second.transaction, second.transaction_digest)?;
         publish_record(&storage, &second_staging, &key, second)?;

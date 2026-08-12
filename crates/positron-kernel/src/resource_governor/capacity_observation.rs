@@ -128,7 +128,7 @@ impl ObservedVolumeBinding {
 
 impl ObservedResourceEnvironment {
     #[cfg(test)]
-    pub(super) fn for_test(
+    pub(crate) fn for_test(
         volume: &crate::OwnedPrimaryDataVolume,
         detected: ResourceAmounts,
         initial_disk: DiskObservation,

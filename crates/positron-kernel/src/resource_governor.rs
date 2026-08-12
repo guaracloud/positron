@@ -329,6 +329,21 @@ impl StorageKernelResourceAuthority {
             inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
         })
     }
+
+    /// Establishes fuzz-only authority while retaining a real owned test volume.
+    #[cfg(fuzzing)]
+    #[doc(hidden)]
+    pub fn establish_for_fuzz_with_volume(
+        volume: crate::OwnedPrimaryDataVolume,
+        inventory: ResourceInventory,
+        policy: GovernorPolicy,
+        recovery_pools: RecoveryPoolCapacities,
+    ) -> Result<Self, GovernorFailure> {
+        let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
+        Ok(Self {
+            inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
+        })
+    }
     /// Establishes the sole governor after earlier private bootstrap/recovery steps.
     #[expect(
         clippy::result_large_err,
@@ -364,6 +379,14 @@ impl StorageKernelResourceAuthority {
     #[must_use]
     pub const fn recovery(&self) -> RecoveryAuthority<'_> {
         RecoveryAuthority { inner: &self.inner }
+    }
+
+    pub(crate) const fn primary_data_volume(&self) -> Option<&crate::OwnedPrimaryDataVolume> {
+        match &self.inner.ownership {
+            KernelOwnership::Owned { volume } => Some(volume),
+            #[cfg(any(test, fuzzing))]
+            KernelOwnership::TestOnly => None,
+        }
     }
 
     #[cfg(test)]

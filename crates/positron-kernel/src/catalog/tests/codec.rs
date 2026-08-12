@@ -37,15 +37,16 @@ fn commit(objects: Vec<CatalogObjectId>) -> CommitRecord {
         instance: instance(1),
         format_epoch,
         transaction: transaction(2),
-        transaction_digest: transaction_digest(format_epoch, &objects, None),
-        object_set_digest: object_set_digest(&objects),
+        transaction_digest: transaction_digest(format_epoch, &objects, None)
+            .expect("test transaction digest"),
+        object_set_digest: object_set_digest(&objects).expect("test object-set digest"),
         audit_frontier: AuditFrontier::ORIGIN,
         objects,
     }
 }
 
 fn decode_rehashed(encoded: &[u8]) -> Result<CommitRecord, super::super::CatalogFailure> {
-    decode_commit(generation_identity(encoded), encoded)
+    decode_commit(generation_identity(encoded)?, encoded)
 }
 
 #[test]
@@ -53,7 +54,7 @@ fn commit_codec_round_trips_and_builds_the_pinned_snapshot() {
     let objects = vec![object(1), object(2)];
     let record = commit(objects.clone());
     let encoded = encode_commit(&record);
-    let generation = generation_identity(&encoded);
+    let generation = generation_identity(&encoded).expect("test generation digest");
     let decoded = decode_commit(generation, &encoded).expect("valid commit must decode");
 
     assert_eq!(decoded.generation, generation);

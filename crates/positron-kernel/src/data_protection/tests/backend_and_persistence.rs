@@ -29,6 +29,225 @@ fn rust_crypto_backend_matches_nist_sha256_vector() -> Result<(), &'static str> 
     }
 }
 
+#[test]
+fn rust_crypto_backend_kwp_round_trip_fails_closed_on_corruption() -> Result<(), &'static str> {
+    let wrapping_key = SecretKeyBytes::from_owned(Box::new([0x11; 32]));
+    let object_key = SecretKeyBytes::from_owned(Box::new([0x22; 32]));
+    let wrapped = RustCryptoBackend
+        .wrap_key_aes_256_kwp(&wrapping_key, object_key.expose_to_backend())
+        .map_err(|_| "AES-KWP wrap failed")?;
+    let opened = RustCryptoBackend
+        .unwrap_key_aes_256_kwp(&wrapping_key, &wrapped)
+        .map_err(|_| "AES-KWP unwrap failed")?;
+    if opened.bytes != object_key.expose_to_backend() {
+        return Err("AES-KWP round trip differed");
+    }
+    let mut corrupt = wrapped;
+    corrupt[19] ^= 0x80;
+    if RustCryptoBackend
+        .unwrap_key_aes_256_kwp(&wrapping_key, &corrupt)
+        .is_ok()
+    {
+        return Err("corrupt AES-KWP envelope authenticated");
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_crypto_backend_matches_independent_aes_256_kwp_vector() -> Result<(), &'static str> {
+    // Independently generated with OpenSSL 3 EVP AES-256-WRAP-PAD, which
+    // implements RFC 5649 under a 256-bit KEK.
+    let wrapping_key = SecretKeyBytes::from_owned(Box::new([
+        0x58, 0x40, 0xdf, 0x6e, 0x29, 0xb0, 0x2a, 0xf1, 0xab, 0x49, 0x3b, 0x70, 0x5b, 0xf1, 0x6e,
+        0xa1, 0xae, 0x83, 0x38, 0xf4, 0xdc, 0xc1, 0x76, 0xa8, 0xb7, 0xbe, 0x5f, 0x2c, 0x57, 0x5f,
+        0x2f, 0x2f,
+    ]));
+    let plaintext = [
+        0xc3, 0x7b, 0x7e, 0x64, 0x92, 0x58, 0x43, 0x40, 0xbe, 0xd1, 0x22, 0x07, 0x80, 0x89, 0x41,
+        0x15, 0x50, 0x68, 0xf7, 0x38,
+    ];
+    let expected = [
+        0x2d, 0x5e, 0x2c, 0x92, 0x07, 0xa6, 0x80, 0x9c, 0xee, 0x3e, 0xbd, 0x30, 0xc1, 0x5d, 0xf9,
+        0x80, 0xf5, 0x9e, 0x46, 0xed, 0x0d, 0x0a, 0x33, 0x4b, 0x8f, 0xc0, 0x7a, 0xc4, 0xed, 0xb5,
+        0xc8, 0xd6,
+    ];
+    let actual = RustCryptoBackend
+        .wrap_key_aes_256_kwp(&wrapping_key, &plaintext)
+        .map_err(|_| "RFC 5649 wrap failed")?;
+    assert_eq!(actual, expected, "RFC 5649 wrapped output differed");
+    let opened = RustCryptoBackend
+        .unwrap_key_aes_256_kwp(&wrapping_key, &expected)
+        .map_err(|_| "RFC 5649 unwrap failed")?;
+    if opened.bytes != plaintext {
+        return Err("RFC 5649 unwrapped output differed");
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_crypto_backend_kwp_supports_one_block_payloads_and_rejects_invalid_sizes() {
+    let wrapping_key = SecretKeyBytes::from_owned(Box::new([0x71; 32]));
+    let plaintext = [0x83; 7];
+    let wrapped = RustCryptoBackend
+        .wrap_key_aes_256_kwp(&wrapping_key, &plaintext)
+        .expect("one-block AES-KWP wrap should succeed");
+    let opened = RustCryptoBackend
+        .unwrap_key_aes_256_kwp(&wrapping_key, &wrapped)
+        .expect("one-block AES-KWP unwrap should succeed");
+    assert_eq!(opened.bytes, plaintext);
+
+    assert_eq!(
+        RustCryptoBackend.wrap_key_aes_256_kwp(&wrapping_key, &[]),
+        Err(super::CryptoBackendFailure::WrapFailed)
+    );
+    assert_eq!(
+        RustCryptoBackend.wrap_key_aes_256_kwp(&wrapping_key, &[0_u8; 4_097]),
+        Err(super::CryptoBackendFailure::WrapFailed)
+    );
+    for invalid in [&[0_u8; 15][..], &[0_u8; 17][..], &[0_u8; 4_112][..]] {
+        assert!(matches!(
+            RustCryptoBackend.unwrap_key_aes_256_kwp(&wrapping_key, invalid),
+            Err(super::CryptoBackendFailure::UnwrapFailed)
+        ));
+    }
+}
+
+#[test]
+fn substituted_backends_inherit_the_reviewed_envelope_primitives() -> Result<(), &'static str> {
+    let backend = EntropyFailureBackend;
+    let wrapping_key = SecretKeyBytes::from_owned(Box::new([0x31; 32]));
+    let object_key = SecretKeyBytes::from_owned(Box::new([0x42; 32]));
+    let message = b"catalog-envelope-context";
+    let tag = backend
+        .hmac_sha256(&wrapping_key, message)
+        .map_err(|_| "default HMAC failed")?;
+    backend
+        .verify_hmac_sha256(&wrapping_key, message, &tag)
+        .map_err(|_| "default HMAC verification failed")?;
+    let wrapped = backend
+        .wrap_key_aes_256_kwp(&wrapping_key, object_key.expose_to_backend())
+        .map_err(|_| "default AES-KWP wrap failed")?;
+    let opened = backend
+        .unwrap_key_aes_256_kwp(&wrapping_key, &wrapped)
+        .map_err(|_| "default AES-KWP unwrap failed")?;
+    if opened.bytes != object_key.expose_to_backend() {
+        return Err("default AES-KWP round trip differed");
+    }
+    let mut wrong_tag = tag;
+    wrong_tag[0] ^= 1;
+    if backend
+        .verify_hmac_sha256(&wrapping_key, message, &wrong_tag)
+        .is_ok()
+    {
+        return Err("default HMAC accepted a corrupt tag");
+    }
+    Ok(())
+}
+
+#[test]
+fn wrapped_key_payload_round_trip_verifies_its_embedded_authority() -> Result<(), &'static str> {
+    let object = super::FrameObjectContext::system(
+        super::SystemObjectKind::Catalog,
+        super::FrameObjectId::new([0x52; 16]).map_err(|_| "invalid object")?,
+        super::KeyEpoch::new(4),
+        super::FormatEpoch::new(7).map_err(|_| "invalid format epoch")?,
+    );
+    let context = super::WrappedKeyContext::system(
+        [0x41; 16],
+        super::SystemObjectKind::Catalog,
+        [0x52; 32],
+        4,
+        [0x63; 32],
+    )
+    .map_err(|_| "invalid wrapped-key context")?;
+    let wrapping_key = SecretKeyBytes::from_owned(Box::new([0x31; 32]));
+    let object_key =
+        super::ObjectDataKey::import(super::SecretKeyInput::from_test_bytes([0x42; 32]), object);
+    let wrapped = super::DataProtection::wrap_key_payload(&wrapping_key, &object_key, context)
+        .map_err(|_| "wrapped-key payload protection failed")?;
+    let opened =
+        super::DataProtection::unwrap_key_payload(&wrapping_key, &wrapped, context, object)
+            .map_err(|_| "wrapped-key payload verification failed")?;
+    if opened.key.expose_to_backend() != object_key.key.expose_to_backend() {
+        return Err("wrapped-key payload round trip differed");
+    }
+    let substituted = super::WrappedKeyContext::system(
+        [0x41; 16],
+        super::SystemObjectKind::GovernanceAudit,
+        [0x52; 32],
+        4,
+        [0x63; 32],
+    )
+    .map_err(|_| "invalid substituted context")?;
+    if super::DataProtection::unwrap_key_payload(&wrapping_key, &wrapped, substituted, object)
+        .is_ok()
+    {
+        return Err("wrapped-key payload accepted substituted embedded authority");
+    }
+    Ok(())
+}
+
+#[test]
+fn wrapped_key_context_rejects_every_sentinel_and_encodes_every_key_kind() {
+    use super::{FrameFailureCode, SystemObjectKind, WrappedKeyContext};
+
+    let valid_instance = [0x11; 16];
+    let valid_key_id = [0x22; 32];
+    let valid_digest = [0x33; 32];
+    for result in [
+        WrappedKeyContext::system(
+            [0; 16],
+            SystemObjectKind::Catalog,
+            valid_key_id,
+            1,
+            valid_digest,
+        ),
+        WrappedKeyContext::system(
+            valid_instance,
+            SystemObjectKind::Catalog,
+            [0; 32],
+            1,
+            valid_digest,
+        ),
+        WrappedKeyContext::system(
+            valid_instance,
+            SystemObjectKind::Catalog,
+            valid_key_id,
+            0,
+            valid_digest,
+        ),
+        WrappedKeyContext::system(
+            valid_instance,
+            SystemObjectKind::Catalog,
+            valid_key_id,
+            1,
+            [0; 32],
+        ),
+    ] {
+        assert_eq!(
+            result.expect_err("sentinel context must fail").code(),
+            FrameFailureCode::InvalidContext
+        );
+    }
+
+    let wrapping_key = SecretKeyBytes::from_owned(Box::new([0x44; 32]));
+    let object = super::FrameObjectContext::system(
+        SystemObjectKind::Manifest,
+        super::FrameObjectId::new([0x55; 16]).expect("non-sentinel object ID"),
+        super::KeyEpoch::new(1),
+        super::FormatEpoch::new(1).expect("nonzero format epoch"),
+    );
+    let object_key =
+        super::ObjectDataKey::import(super::SecretKeyInput::from_test_bytes([0x66; 32]), object);
+    for kind in [SystemObjectKind::Manifest, SystemObjectKind::BackupMetadata] {
+        let context =
+            WrappedKeyContext::system(valid_instance, kind, valid_key_id, 128, valid_digest)
+                .expect("valid wrapped-key context");
+        super::DataProtection::wrap_key_payload(&wrapping_key, &object_key, context)
+            .expect("key kind should encode");
+    }
+}
+
 struct EntropyFailureBackend;
 
 impl CryptoBackend for EntropyFailureBackend {

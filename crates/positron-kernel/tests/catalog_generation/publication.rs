@@ -6,9 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSecret,
-    FormatEpoch, InstanceId, MountQualification, PrimaryDataVolume, TransactionId,
+    AdmissionFailureCode, AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal,
+    CatalogSecret, FormatEpoch, InstanceId, MountQualification, PrimaryDataVolume,
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension, TransactionId,
 };
+
+use super::support::{catalog_recovery_claim, establish_catalog_authority};
 
 static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -34,31 +37,34 @@ impl TemporaryRoot {
 fn stale_and_concurrent_proposals_publish_at_most_one_successor() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
     let catalog = Arc::new(Catalog::open(
-        volume,
+        &authority,
         InstanceId::new(id(21))?,
         CatalogSecret::from_owned(Box::new([0xb1; 32])),
     )?);
     let predecessor = catalog.pin()?.identity();
-    let mut handles = Vec::new();
-    for value in [22_u8, 23] {
-        let writer = Arc::clone(&catalog);
-        handles.push(thread::spawn(move || {
-            writer.commit(
-                predecessor,
-                CatalogProposal::new(
-                    TransactionId::new(id(value))?,
-                    FormatEpoch::new(1)?,
-                    vec![CatalogObject::new(vec![value])?],
-                )?,
-                None,
-            )
-        }));
-    }
-    let outcomes = handles
-        .into_iter()
-        .map(|handle| handle.join().map_err(|_| "catalog writer thread panicked"))
-        .collect::<Result<Vec<_>, _>>()?;
+    let outcomes = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for value in [22_u8, 23] {
+            let writer = Arc::clone(&catalog);
+            handles.push(scope.spawn(move || {
+                writer.commit(
+                    predecessor,
+                    CatalogProposal::new(
+                        TransactionId::new(id(value))?,
+                        FormatEpoch::new(1)?,
+                        vec![CatalogObject::new(vec![value])?],
+                    )?,
+                    None,
+                )
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().map_err(|_| "catalog writer thread panicked"))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
     assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
     let failure = outcomes
@@ -79,8 +85,9 @@ fn retry_with_same_transaction_is_idempotent_and_changed_content_conflicts()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
     let catalog = Catalog::open(
-        volume,
+        &authority,
         InstanceId::new(id(31))?,
         CatalogSecret::from_owned(Box::new([0xc1; 32])),
     )?;
@@ -119,8 +126,9 @@ fn governance_sensitive_generation_and_audit_record_publish_jointly() -> Result<
 {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
     let catalog = Catalog::open(
-        volume,
+        &authority,
         InstanceId::new(id(11))?,
         CatalogSecret::from_owned(Box::new([0xa1; 32])),
     )?;
@@ -156,6 +164,45 @@ fn governance_sensitive_generation_and_audit_record_publish_jointly() -> Result<
     assert_eq!(
         audit[0].intent(),
         b"principal=system; action=tenant.read-only; outcome=succeeded"
+    );
+    Ok(())
+}
+
+#[test]
+fn catalog_recovery_admission_is_typed_and_released_for_retry() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let blocker = authority.recovery().reserve(RecoveryWorkClaim::system(
+        RecoveryWorkKind::Repair,
+        catalog_recovery_claim(),
+    )?)?;
+
+    let failure = Catalog::open(
+        &authority,
+        InstanceId::new(id(61))?,
+        CatalogSecret::from_owned(Box::new([0xc2; 32])),
+    )
+    .expect_err("recovery without its bounded reservation must fail closed");
+    assert_eq!(failure.code(), CatalogFailureCode::ResourceAdmissionRefused);
+    assert_eq!(
+        failure.admission_failure().map(|failure| failure.code()),
+        Some(AdmissionFailureCode::ProtectedCapacityUnavailable)
+    );
+
+    drop(blocker);
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(id(61))?,
+        CatalogSecret::from_owned(Box::new([0xc2; 32])),
+    )?;
+    assert_eq!(catalog.pin()?.number(), 0);
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .recovery_pool_usage(RecoveryWorkKind::Repair, ResourceDimension::MemoryBytes),
+        0
     );
     Ok(())
 }
@@ -284,8 +331,9 @@ fn catalog_writer_publishes_an_externally_readable_immutable_generation()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
     let catalog = Catalog::open(
-        volume,
+        &authority,
         InstanceId::new(id(1))?,
         CatalogSecret::from_owned(Box::new([0x91; 32])),
     )?;

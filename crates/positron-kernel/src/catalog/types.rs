@@ -3,9 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
-
-use crate::data_protection::SecretKeyBytes;
+use crate::data_protection::{DataProtection, SecretKeyBytes};
 
 pub(super) const MAX_CATALOG_OBJECTS: usize = 1_024;
 pub(super) const MAX_CATALOG_OBJECT_BYTES: usize = 1_048_576;
@@ -77,12 +75,35 @@ impl FormatEpoch {
     }
 }
 
-pub struct CatalogSecret(pub(super) SecretKeyBytes);
+pub struct CatalogSecret {
+    pub(super) key: SecretKeyBytes,
+    pub(super) provider_key_reference: [u8; 16],
+    pub(super) key_epoch: u64,
+}
 
 impl CatalogSecret {
     #[must_use]
     pub fn from_owned(bytes: Box<[u8; 32]>) -> Self {
-        Self(SecretKeyBytes::from_owned(bytes))
+        Self {
+            key: SecretKeyBytes::from_owned(bytes),
+            provider_key_reference: [1; 16],
+            key_epoch: 1,
+        }
+    }
+
+    pub fn from_owned_at_epoch(
+        bytes: Box<[u8; 32]>,
+        provider_key_reference: [u8; 16],
+        key_epoch: u64,
+    ) -> Result<Self, CatalogFailure> {
+        if provider_key_reference.iter().all(|byte| *byte == 0) || key_epoch == 0 {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        Ok(Self {
+            key: SecretKeyBytes::from_owned(bytes),
+            provider_key_reference,
+            key_epoch,
+        })
     }
 }
 
@@ -102,7 +123,10 @@ impl CatalogObject {
         if plaintext.is_empty() || plaintext.len() > MAX_CATALOG_OBJECT_BYTES {
             return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
         }
-        let identity = CatalogObjectId(Sha256::digest(&plaintext).into());
+        let identity = CatalogObjectId(
+            DataProtection::hash(&plaintext)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?,
+        );
         Ok(Self {
             identity,
             plaintext,
@@ -340,12 +364,15 @@ pub enum CatalogFailureCode {
     IntegrityCorruption,
     AuthenticationFailed,
     ConcurrentWriter,
+    ResourceAdmissionRefused,
+    UnsupportedFormat,
 }
 
 #[derive(Debug)]
 pub struct CatalogFailure {
     pub(super) code: CatalogFailureCode,
     pub(super) current: Option<CatalogGenerationId>,
+    pub(super) admission: Option<crate::AdmissionFailure>,
 }
 
 impl CatalogFailure {
@@ -353,6 +380,7 @@ impl CatalogFailure {
         Self {
             code,
             current: None,
+            admission: None,
         }
     }
 
@@ -360,6 +388,15 @@ impl CatalogFailure {
         Self {
             code: CatalogFailureCode::StaleGeneration,
             current: Some(current),
+            admission: None,
+        }
+    }
+
+    pub(super) const fn admission(admission: crate::AdmissionFailure) -> Self {
+        Self {
+            code: CatalogFailureCode::ResourceAdmissionRefused,
+            current: None,
+            admission: Some(admission),
         }
     }
 
@@ -371,6 +408,11 @@ impl CatalogFailure {
     #[must_use]
     pub const fn current_generation(&self) -> Option<CatalogGenerationId> {
         self.current
+    }
+
+    #[must_use]
+    pub const fn admission_failure(&self) -> Option<crate::AdmissionFailure> {
+        self.admission
     }
 }
 

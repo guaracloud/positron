@@ -320,6 +320,7 @@ dependencies = [
  "positron-domain",
  "rustix",
  "sha2",
+ "subtle",
  "zeroize",
 ]
 

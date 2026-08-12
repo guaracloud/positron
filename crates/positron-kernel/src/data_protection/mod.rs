@@ -15,6 +15,7 @@ mod backend;
 mod codec;
 mod context;
 mod frame;
+mod key_envelope;
 mod local_key;
 mod service;
 
@@ -29,6 +30,8 @@ pub(crate) use context::{
     FrameSequence, KeyEpoch, SystemObjectKind,
 };
 pub(crate) use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
+pub(crate) use key_envelope::WrappedKeyContext;
+use key_envelope::{encode_wrapped_key_payload, verify_wrapped_key_payload};
 pub(crate) use service::DataProtection;
 
 #[cfg(any(test, fuzzing))]
