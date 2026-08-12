@@ -271,6 +271,9 @@ fn unique_hierarchy<'a>(
                 controller,
                 mount_point: mount.mount_point,
                 relative,
+                first_limit_depth: usize::from(
+                    controller == Controller::Unified && mount.root.len == 0,
+                ),
             });
         }
     }

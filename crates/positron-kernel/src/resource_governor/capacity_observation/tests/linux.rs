@@ -83,16 +83,36 @@ fn nested_v2_uses_minimum_finite_ancestor_limits() {
 }
 
 #[test]
-fn root_is_included_and_missing_or_overused_ancestor_fails_closed() {
-    let base = FakeReader::default()
-        .with("/proc/self/cgroup", b"0::/leaf\n")
+fn v2_controller_root_needs_no_resource_control_files() {
+    let reader = FakeReader::default()
+        .with("/proc/self/cgroup", b"0::/actions_job/leaf\n")
         .with(
             "/proc/self/mountinfo",
             b"36 29 0:32 / /control rw - cgroup2 cgroup rw\n",
         )
-        .with("/control/leaf/cpu.max", b"max 100000\n")
-        .with("/control/leaf/memory.max", b"max\n")
-        .with("/control/leaf/memory.current", b"100000\n");
+        .with("/control/actions_job/cpu.max", b"max 100000\n")
+        .with("/control/actions_job/memory.max", b"max\n")
+        .with("/control/actions_job/memory.current", b"300000\n")
+        .with("/control/actions_job/leaf/cpu.max", b"50000 100000\n")
+        .with("/control/actions_job/leaf/memory.max", b"800000\n")
+        .with("/control/actions_job/leaf/memory.current", b"100000\n");
+
+    let limits = observe_cgroups(&reader).expect("global v2 root has no controller files");
+    assert_eq!(limits.cpu, Some(500));
+    assert_eq!(limits.memory, Some(700_000));
+}
+
+#[test]
+fn missing_or_overused_governed_ancestor_fails_closed() {
+    let base = FakeReader::default()
+        .with("/proc/self/cgroup", b"0::/parent/leaf\n")
+        .with(
+            "/proc/self/mountinfo",
+            b"36 29 0:32 / /control rw - cgroup2 cgroup rw\n",
+        )
+        .with("/control/parent/leaf/cpu.max", b"max 100000\n")
+        .with("/control/parent/leaf/memory.max", b"max\n")
+        .with("/control/parent/leaf/memory.current", b"100000\n");
     assert_eq!(
         observe_cgroups(&base).map(|_| ()),
         Err(CapacityObservationFailure::ObservationUnavailable {
@@ -100,9 +120,9 @@ fn root_is_included_and_missing_or_overused_ancestor_fails_closed() {
         })
     );
     let overused = base
-        .with("/control/cpu.max", b"100000 100000\n")
-        .with("/control/memory.max", b"100000\n")
-        .with("/control/memory.current", b"100001\n");
+        .with("/control/parent/cpu.max", b"100000 100000\n")
+        .with("/control/parent/memory.max", b"100000\n")
+        .with("/control/parent/memory.current", b"100001\n");
     assert_eq!(
         observe_cgroups(&overused).map(|_| ()),
         Err(CapacityObservationFailure::Arithmetic {

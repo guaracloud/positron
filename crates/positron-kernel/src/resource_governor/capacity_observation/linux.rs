@@ -41,6 +41,7 @@ struct Hierarchy<'a> {
     controller: Controller,
     mount_point: &'a str,
     relative: ComponentPath<'a>,
+    first_limit_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,7 +333,7 @@ fn observe_cgroups(reader: &impl FileReader) -> Result<CgroupLimits, CapacityObs
     let hierarchies = parsers::resolve(memberships, mounts)?;
     let mut limits = CgroupLimits::default();
     for hierarchy in hierarchies.iter() {
-        for depth in (0..=hierarchy.relative.len).rev() {
+        for depth in (hierarchy.first_limit_depth..=hierarchy.relative.len).rev() {
             match hierarchy.controller {
                 Controller::Unified => {
                     let cpu = reader.read_limit(
