@@ -9,5 +9,14 @@ Keep useful seed inputs and promote every fixed crash to the regression corpus.
 Run a target with:
 
 ```console
-cargo fuzz run <target>
+cargo +nightly fuzz run <target>
+```
+
+The repository's production toolchain remains pinned; `cargo-fuzz` uses an
+installed nightly toolchain only for sanitizer instrumentation.
+
+Current storage target:
+
+```console
+cargo +nightly fuzz run primary_data_volume_stateful
 ```

@@ -1,0 +1,22 @@
+[package]
+name = "positron-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+positron-kernel = { path = "../crates/positron-kernel" }
+
+[[bin]]
+name = "primary_data_volume_stateful"
+path = "fuzz_targets/primary_data_volume_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
