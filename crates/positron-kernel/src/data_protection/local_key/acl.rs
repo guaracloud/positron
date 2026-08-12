@@ -7,6 +7,9 @@ use rustix::fs as unix_fs;
 
 use super::{LocalKeyFailure, LocalKeyFailureCode};
 
+pub(super) const LINUX_ACCESS_ACL_XATTR_NAME: &[u8] = b"system.posix_acl_access";
+pub(super) const LINUX_DEFAULT_ACL_XATTR_NAME: &[u8] = b"system.posix_acl_default";
+
 #[cfg(target_os = "macos")]
 pub(super) fn verify_directory_acl(directory: &File) -> Result<(), LocalKeyFailure> {
     verify_macos_acl(directory)
@@ -42,13 +45,13 @@ fn verify_macos_acl(file: &File) -> Result<(), LocalKeyFailure> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn verify_directory_acl(directory: &File) -> Result<(), LocalKeyFailure> {
-    verify_linux_acl(directory, b"system.posix_acl_access\0")?;
-    verify_linux_acl(directory, b"system.posix_acl_default\0")
+    verify_linux_acl(directory, LINUX_ACCESS_ACL_XATTR_NAME)?;
+    verify_linux_acl(directory, LINUX_DEFAULT_ACL_XATTR_NAME)
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn verify_file_acl(file: &File) -> Result<(), LocalKeyFailure> {
-    verify_linux_acl(file, b"system.posix_acl_access\0")
+    verify_linux_acl(file, LINUX_ACCESS_ACL_XATTR_NAME)
 }
 
 #[cfg(target_os = "linux")]

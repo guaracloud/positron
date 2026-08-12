@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
-use super::acl::{LinuxAclQueryOutcome, classify_linux_acl_query};
+use super::acl::{
+    LINUX_ACCESS_ACL_XATTR_NAME, LINUX_DEFAULT_ACL_XATTR_NAME, LinuxAclQueryOutcome,
+    classify_linux_acl_query,
+};
 #[cfg(target_os = "linux")]
 use super::acl::{verify_directory_acl, verify_file_acl};
 use super::bootstrap::{
@@ -17,6 +20,15 @@ use super::bootstrap::{
 use super::{LOCAL_KEY_FILE_NAME, LocalKeyFailure, LocalKeyFailureCode};
 
 static NEXT_SECURITY_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn linux_acl_attribute_names_are_valid_rustix_arguments() {
+    use rustix::path::Arg;
+
+    for name in [LINUX_ACCESS_ACL_XATTR_NAME, LINUX_DEFAULT_ACL_XATTR_NAME] {
+        assert_eq!(name.into_with_c_str(|_| Ok(())), Ok(()));
+    }
+}
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -79,21 +91,21 @@ fn native_linux_acl_attributes_are_rejected_on_exact_descriptors()
     assert_eq!(verify_directory_acl(&directory), Ok(()));
     assert_eq!(verify_file_acl(&key), Ok(()));
 
-    set_linux_acl(&key, b"system.posix_acl_access\0")?;
+    set_linux_acl(&key, LINUX_ACCESS_ACL_XATTR_NAME)?;
     assert_eq!(
         verify_file_acl(&key),
         Err(LocalKeyFailure::new(LocalKeyFailureCode::UnsafeAcl))
     );
-    rustix::fs::fremovexattr(&key, b"system.posix_acl_access\0".as_slice())?;
+    rustix::fs::fremovexattr(&key, LINUX_ACCESS_ACL_XATTR_NAME)?;
     assert_eq!(verify_file_acl(&key), Ok(()));
 
-    set_linux_acl(&directory, b"system.posix_acl_access\0")?;
+    set_linux_acl(&directory, LINUX_ACCESS_ACL_XATTR_NAME)?;
     assert_eq!(
         verify_directory_acl(&directory),
         Err(LocalKeyFailure::new(LocalKeyFailureCode::UnsafeAcl))
     );
-    rustix::fs::fremovexattr(&directory, b"system.posix_acl_access\0".as_slice())?;
-    set_linux_acl(&directory, b"system.posix_acl_default\0")?;
+    rustix::fs::fremovexattr(&directory, LINUX_ACCESS_ACL_XATTR_NAME)?;
+    set_linux_acl(&directory, LINUX_DEFAULT_ACL_XATTR_NAME)?;
     assert_eq!(
         verify_directory_acl(&directory),
         Err(LocalKeyFailure::new(LocalKeyFailureCode::UnsafeAcl))
@@ -108,7 +120,7 @@ fn unsafe_linux_directory_is_rejected_before_entropy_or_file_creation()
     let root = TestSecurityRoot::create()?;
     let proof = FreshInitializationRootProof::for_test(&root.path)?;
     let directory = File::open(&root.path)?;
-    set_linux_acl(&directory, b"system.posix_acl_default\0")?;
+    set_linux_acl(&directory, LINUX_DEFAULT_ACL_XATTR_NAME)?;
 
     let (observed, events) = capture_initialization_events(|| initialize_local_key(proof));
 
