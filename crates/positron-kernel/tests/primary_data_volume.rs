@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_kernel::{
-    PrimaryDataVolume, VolumeCompletionState, VolumeFailureCode, VolumeFileSystem, VolumeOperation,
-    VolumeRetryClass,
+    PrimaryDataVolume, VolumeCompletionState, VolumeFailureCode, VolumeOperation, VolumeRetryClass,
 };
+
+#[cfg(target_os = "macos")]
+use positron_kernel::VolumeFileSystem;
 
 static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
 
