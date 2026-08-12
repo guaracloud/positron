@@ -34,6 +34,7 @@ pub struct OwnedPrimaryDataVolume {
     _root: File,
     _ownership_lock: File,
     _root_identity: VolumeRootIdentity,
+    qualification: MountQualification,
     filesystem: VolumeFileSystem,
     mount_identity: VolumeMountIdentity,
 }
@@ -45,6 +46,12 @@ impl std::fmt::Debug for OwnedPrimaryDataVolume {
 }
 
 impl OwnedPrimaryDataVolume {
+    /// Returns the trusted deployment provenance accepted at acquisition.
+    #[must_use]
+    pub const fn qualification(&self) -> MountQualification {
+        self.qualification
+    }
+
     /// Returns the stable opaque filesystem identity captured at acquisition.
     #[must_use]
     pub const fn root_identity(&self) -> VolumeRootIdentity {
@@ -62,6 +69,20 @@ impl OwnedPrimaryDataVolume {
     pub const fn mount_identity(&self) -> VolumeMountIdentity {
         self.mount_identity
     }
+}
+
+/// Trusted deployment provenance for a Primary Data Volume mount.
+///
+/// This value must be supplied by trusted application composition. `LocalHost`
+/// is valid only for a native local-host mount and must never be used to
+/// relabel PVC, network, or other externally provided storage. Release 1 has
+/// no accepted external or PVC qualification-matrix entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountQualification {
+    /// A native local-host mount selected by trusted composition.
+    LocalHost,
+    /// External or PVC storage without an accepted Release 1 matrix entry.
+    UnverifiedExternalOrPvc,
 }
 
 /// A kernel-identified local filesystem qualified for the Release 1 contract.
@@ -392,9 +413,26 @@ impl Error for VolumeFailure {
 impl PrimaryDataVolume {
     /// Acquires an existing filesystem directory as the Primary Data Volume.
     ///
+    /// `qualification` is trusted deployment provenance, not a filesystem
+    /// inference. After accepting that provenance, the kernel performs its
+    /// filesystem consistency check before creating ownership or probe
+    /// artifacts.
+    ///
     /// This operation never creates a missing root and refuses a root reached
     /// through a symbolic link.
-    pub fn acquire(root: &Path) -> Result<OwnedPrimaryDataVolume, VolumeFailure> {
+    pub fn acquire(
+        root: &Path,
+        qualification: MountQualification,
+    ) -> Result<OwnedPrimaryDataVolume, VolumeFailure> {
+        if qualification == MountQualification::UnverifiedExternalOrPvc {
+            return Err(VolumeFailure::from_io(
+                VolumeOperation::ClassifyMount,
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "external or PVC mount has no Release 1 qualification-matrix entry",
+                ),
+            ));
+        }
         acquisition_event(VolumeEvent::ClassifyRootPath, VolumeOperation::ClassifyRoot)?;
         let path_metadata =
             perform_io(VolumeOperation::ClassifyRoot, || fs::symlink_metadata(root))
@@ -493,6 +531,7 @@ impl PrimaryDataVolume {
             _root: root_file,
             _ownership_lock: ownership_lock,
             _root_identity: handle_identity,
+            qualification,
             filesystem,
             mount_identity,
         })
@@ -1164,7 +1203,7 @@ mod tests {
                     .expect("test root move must succeed");
                 fs::create_dir(&configured_for_swap).expect("test replacement must succeed");
             },
-            || PrimaryDataVolume::acquire(&configured),
+            || PrimaryDataVolume::acquire(&configured, MountQualification::LocalHost),
         )
         .expect_err("replaced root must fail closed");
 
@@ -1172,6 +1211,69 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::VerifyRootIdentity);
         assert!(fs::read_dir(&configured)?.next().is_none());
         assert!(fs::read_dir(&original)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn detached_root_before_ownership_fails_without_creating_volume_artifacts()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestRoot::new()?;
+        let configured = parent.0.join("configured");
+        let detached = parent.0.join("detached");
+        fs::create_dir(&configured)?;
+        let configured_for_detach = configured.clone();
+        let detached_for_detach = detached.clone();
+
+        let failure = with_event_action(
+            VolumeEvent::BeforeOwnershipArtifact,
+            move || {
+                fs::rename(&configured_for_detach, &detached_for_detach)
+                    .expect("test root detach must succeed");
+            },
+            || PrimaryDataVolume::acquire(&configured, MountQualification::LocalHost),
+        )
+        .expect_err("detached root must fail closed");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Missing);
+        assert_eq!(failure.operation(), VolumeOperation::VerifyRootIdentity);
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::RejectedBeforeProbeMutation
+        );
+        assert!(fs::read_dir(&detached)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn detached_root_after_probe_fails_with_synchronized_cleanup_truth()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestRoot::new()?;
+        let configured = parent.0.join("configured");
+        let detached = parent.0.join("detached");
+        fs::create_dir(&configured)?;
+        let configured_for_detach = configured.clone();
+        let detached_for_detach = detached.clone();
+
+        let failure = with_event_action(
+            VolumeEvent::SynchronizeRootAfterCleanup,
+            move || {
+                fs::rename(&configured_for_detach, &detached_for_detach)
+                    .expect("test root detach must succeed");
+            },
+            || PrimaryDataVolume::acquire(&configured, MountQualification::LocalHost),
+        )
+        .expect_err("detached root must fail closed");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Missing);
+        assert_eq!(failure.operation(), VolumeOperation::VerifyRootIdentity);
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::ProbeCleanupSynchronized
+        );
+        let names = fs::read_dir(&detached)?
+            .map(|entry| entry.map(|value| value.file_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(names, [".positron-volume.lock"]);
         Ok(())
     }
 
@@ -1218,7 +1320,7 @@ mod tests {
                         .expect("test root move must succeed");
                     fs::create_dir(&configured_for_swap).expect("test replacement must succeed");
                 },
-                || PrimaryDataVolume::acquire(&configured),
+                || PrimaryDataVolume::acquire(&configured, MountQualification::LocalHost),
             )
             .expect_err("replaced configured root must fail closed");
 
@@ -1247,7 +1349,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::ClassifyMount,
             io::ErrorKind::Unsupported,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("unknown mount must fail closed");
 
@@ -1280,7 +1382,7 @@ mod tests {
                     .expect("competitor lock acquisition must work");
                 *held_for_race.lock().expect("test mutex must be healthy") = Some(competitor);
             },
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("contended first creation must fail");
 
@@ -1299,7 +1401,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::SynchronizeRootAfterCleanup,
             io::ErrorKind::Interrupted,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("final cleanup sync must remain truthful");
 
@@ -1328,7 +1430,7 @@ mod tests {
                     .expect("test lock move must succeed");
                 fs::write(&lock_for_swap, b"unknown-owner").expect("replacement must succeed");
             },
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("swapped ownership artifact must fail closed");
 
@@ -1355,7 +1457,7 @@ mod tests {
                     .expect("test probe move must succeed");
                 fs::create_dir(&probe_for_swap).expect("probe replacement must succeed");
             },
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("swapped probe directory must fail closed");
 
@@ -1387,7 +1489,7 @@ mod tests {
                 fs::write(probe_for_swap.join("unknown"), b"preserve")
                     .expect("unknown replacement entry must succeed");
             },
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("swapped probe directory must fail closed");
 
@@ -1419,7 +1521,7 @@ mod tests {
                 fs::hard_link(&foreign_for_swap, probe.join("candidate"))
                     .expect("replacement hard link must succeed");
             },
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("swapped candidate must fail closed");
 
@@ -1439,7 +1541,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::WriteProbePayload,
             io::ErrorKind::PermissionDenied,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("injected probe write must fail");
 
@@ -1460,7 +1562,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::SynchronizeProbePayload,
             io::ErrorKind::StorageFull,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("injected probe sync must fail");
 
@@ -1481,7 +1583,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::ReadProbePayload,
             io::ErrorKind::UnexpectedEof,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("injected short read must fail");
 
@@ -1502,7 +1604,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::TruncateProbePayload,
             io::ErrorKind::ReadOnlyFilesystem,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("injected read-only truncation must fail");
 
@@ -1523,7 +1625,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::RenameProbeCandidate,
             io::ErrorKind::Unsupported,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("injected unsupported rename must fail");
 
@@ -1544,7 +1646,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::SynchronizeProbeDirectory,
             io::ErrorKind::Interrupted,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("injected directory sync interruption must fail");
 
@@ -1567,7 +1669,7 @@ mod tests {
         let root = TestRoot::new()?;
 
         let failure = with_partial_write_fault(5, io::ErrorKind::StorageFull, || {
-            PrimaryDataVolume::acquire(&root.0)
+            PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
         })
         .expect_err("partial probe write must fail");
 
@@ -1588,7 +1690,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::ReopenTruncatedProbe,
             io::ErrorKind::Interrupted,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("second probe reopen must be faultable");
 
@@ -1609,7 +1711,7 @@ mod tests {
         let failure = with_event_fault(
             VolumeEvent::CleanupProbePublished,
             io::ErrorKind::PermissionDenied,
-            || PrimaryDataVolume::acquire(&root.0),
+            || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
         )
         .expect_err("injected cleanup failure must fail closed");
 
@@ -1673,8 +1775,10 @@ mod tests {
 
         for (event, operation, kind, expected_code) in cases {
             let root = TestRoot::new()?;
-            let failure = with_event_fault(event, kind, || PrimaryDataVolume::acquire(&root.0))
-                .expect_err("scheduled root acquisition fault must fail");
+            let failure = with_event_fault(event, kind, || {
+                PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
+            })
+            .expect_err("scheduled root acquisition fault must fail");
 
             assert_eq!(failure.code(), expected_code);
             assert_eq!(failure.operation(), operation);
@@ -1692,7 +1796,7 @@ mod tests {
         let root = TestRoot::new()?;
 
         let failure = with_forced_mismatch(VolumeOperation::VerifyRootIdentity, || {
-            PrimaryDataVolume::acquire(&root.0)
+            PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
         })
         .expect_err("changed root identity must fail");
 
@@ -1711,7 +1815,7 @@ mod tests {
         let root = TestRoot::new()?;
 
         let failure = with_forced_mismatch(VolumeOperation::VerifyProbeContents, || {
-            PrimaryDataVolume::acquire(&root.0)
+            PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
         })
         .expect_err("changed reopened contents must fail");
 
@@ -1730,7 +1834,7 @@ mod tests {
         let root = TestRoot::new()?;
 
         let failure = with_forced_mismatch(VolumeOperation::VerifyProbeTruncation, || {
-            PrimaryDataVolume::acquire(&root.0)
+            PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
         })
         .expect_err("unstable truncation must fail");
 
@@ -1777,7 +1881,7 @@ mod tests {
         for (event, operation) in cases {
             let root = TestRoot::new()?;
             let failure = with_event_fault(event, io::ErrorKind::PermissionDenied, || {
-                PrimaryDataVolume::acquire(&root.0)
+                PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
             })
             .expect_err("scheduled probe fault must fail");
 
@@ -1810,7 +1914,7 @@ mod tests {
         for (event, completion_state, residue_exists) in cases {
             let root = TestRoot::new()?;
             let failure = with_event_fault(event, io::ErrorKind::PermissionDenied, || {
-                PrimaryDataVolume::acquire(&root.0)
+                PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
             })
             .expect_err("scheduled cleanup fault must fail closed");
 
@@ -1829,7 +1933,8 @@ mod tests {
     fn typed_failure_retains_its_operating_system_source() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
         let missing = root.0.join("missing");
-        let failure = PrimaryDataVolume::acquire(&missing).expect_err("missing root must fail");
+        let failure = PrimaryDataVolume::acquire(&missing, MountQualification::LocalHost)
+            .expect_err("missing root must fail");
 
         let source = Error::source(&failure).ok_or("volume failure must retain a source")?;
 

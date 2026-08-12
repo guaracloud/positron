@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use libfuzzer_sys::fuzz_target;
-use positron_kernel::{PrimaryDataVolume, VolumeCompletionState};
+use positron_kernel::{MountQualification, PrimaryDataVolume, VolumeCompletionState};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -88,16 +88,18 @@ fuzz_target!(|data: &[u8]| {
     };
     install_bounded_layout(&root.0, data);
 
-    match PrimaryDataVolume::acquire(&root.0) {
+    match PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost) {
         Ok(first) => {
             assert!(!root.0.join(".positron-volume-probe").exists());
             if data.get(1).copied().unwrap_or_default() & 1 == 0 {
-                let second = PrimaryDataVolume::acquire(&root.0);
+                let second =
+                    PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost);
                 assert!(second.is_err());
             }
             drop(first);
             if data.get(1).copied().unwrap_or_default() & 2 != 0 {
-                let reopened = PrimaryDataVolume::acquire(&root.0);
+                let reopened =
+                    PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost);
                 assert!(reopened.is_ok());
             }
         },
