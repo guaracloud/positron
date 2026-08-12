@@ -30,3 +30,26 @@ jobs:
 
       - name: Run unit and integration tests
         run: cargo test --locked --workspace --lib --bins --tests
+
+  authenticated-frame-vectors:
+    name: Authenticated frame vectors (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15-intel
+          - macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Run authenticated-frame vectors
+        run: cargo test --locked -p positron-kernel --lib data_protection::tests::vectors::every_persistent_kind_matches_its_canonical_frame_v1_vector -- --exact

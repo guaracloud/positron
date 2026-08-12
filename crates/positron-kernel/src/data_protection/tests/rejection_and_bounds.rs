@@ -1,0 +1,464 @@
+use super::*;
+
+#[test]
+fn declared_frame_length_above_policy_is_rejected_before_authentication() -> Result<(), &'static str>
+{
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,
+        FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput, SegmentFramePurpose,
+    };
+
+    let tenant = TenantId::from_bytes([0xb1; 16]).map_err(|_| "tenant fixture was invalid")?;
+    let shard = VirtualShardId::new(1).map_err(|_| "shard fixture was invalid")?;
+    let object = FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        FrameObjectId::new([0xb2; 16]).map_err(|_| "object fixture was invalid")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "format epoch fixture was invalid")?,
+    );
+    let context = object
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(1))
+        .map_err(|_| "frame context fixture was invalid")?;
+    let key = ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xb3; 32]), object);
+    let limits = FrameLimits::new(128).map_err(|_| "frame limit fixture was invalid")?;
+    let encrypted = DataProtection::protect_frame(&key, context, b"bounded", limits)
+        .map_err(|_| "frame protection failed")?;
+    let mut hostile = encrypted.as_bytes().to_vec();
+    let declared_length = hostile
+        .get_mut(16..20)
+        .ok_or("frame fixture omitted its declared length")?;
+    declared_length.copy_from_slice(&200_u32.to_be_bytes());
+
+    let failure = DataProtection::open_frame(&key, context, &hostile, limits)
+        .expect_err("an over-policy declaration must not reach authentication");
+    if failure.code() == FrameFailureCode::LimitExceeded {
+        Ok(())
+    } else {
+        Err("over-policy declaration failure classification differed")
+    }
+}
+
+#[test]
+fn truncated_frame_is_structurally_refused_without_plaintext() -> Result<(), &'static str> {
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,
+        FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput, SegmentFramePurpose,
+    };
+
+    let tenant = TenantId::from_bytes([0xc1; 16]).map_err(|_| "tenant fixture was invalid")?;
+    let shard = VirtualShardId::new(1).map_err(|_| "shard fixture was invalid")?;
+    let object = FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        FrameObjectId::new([0xc2; 16]).map_err(|_| "object fixture was invalid")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "format epoch fixture was invalid")?,
+    );
+    let context = object
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(1))
+        .map_err(|_| "frame context fixture was invalid")?;
+    let key = ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xc3; 32]), object);
+    let limits = FrameLimits::new(256).map_err(|_| "frame limit fixture was invalid")?;
+    let encrypted = DataProtection::protect_frame(&key, context, b"truncate-me", limits)
+        .map_err(|_| "frame protection failed")?;
+    let mut truncated = encrypted.as_bytes().to_vec();
+    truncated
+        .pop()
+        .ok_or("frame fixture was unexpectedly empty")?;
+
+    let failure = DataProtection::open_frame(&key, context, &truncated, limits)
+        .expect_err("a truncated frame must not produce plaintext");
+    if failure.code() == FrameFailureCode::MalformedFrame {
+        Ok(())
+    } else {
+        Err("truncated frame failure classification differed")
+    }
+}
+
+#[test]
+fn unsupported_frame_version_is_refused_before_authentication() -> Result<(), &'static str> {
+    use super::{DataProtection, FrameFailureCode};
+
+    let (key, context, limits, encrypted) = protected_segment_fixture()?;
+    let mut hostile = encrypted.as_bytes().to_vec();
+    let version = hostile
+        .get_mut(4..6)
+        .ok_or("frame fixture omitted its version")?;
+    version.copy_from_slice(&2_u16.to_be_bytes());
+
+    let failure = DataProtection::open_frame(&key, context, &hostile, limits)
+        .expect_err("an unsupported version must not produce plaintext");
+    if failure.code() == FrameFailureCode::UnsupportedVersion {
+        Ok(())
+    } else {
+        Err("unsupported-version failure classification differed")
+    }
+}
+
+#[test]
+fn unsupported_frame_algorithm_is_refused_before_authentication() -> Result<(), &'static str> {
+    use super::{DataProtection, FrameFailureCode};
+
+    let (key, context, limits, encrypted) = protected_segment_fixture()?;
+    let mut hostile = encrypted.as_bytes().to_vec();
+    let algorithm = hostile
+        .get_mut(6..8)
+        .ok_or("frame fixture omitted its algorithm")?;
+    algorithm.copy_from_slice(&2_u16.to_be_bytes());
+
+    let failure = DataProtection::open_frame(&key, context, &hostile, limits)
+        .expect_err("an unsupported algorithm must not produce plaintext");
+    if failure.code() == FrameFailureCode::UnsupportedAlgorithm {
+        Ok(())
+    } else {
+        Err("unsupported-algorithm failure classification differed")
+    }
+}
+
+#[test]
+fn ciphertext_checksum_detects_keyless_corruption() -> Result<(), &'static str> {
+    use super::{DataProtection, FrameFailureCode};
+
+    let (key, context, limits, encrypted) = protected_segment_fixture()?;
+    let mut corrupt = encrypted.as_bytes().to_vec();
+    let last = corrupt
+        .last_mut()
+        .ok_or("frame fixture was unexpectedly empty")?;
+    *last ^= 0x01;
+
+    let failure = DataProtection::open_frame(&key, context, &corrupt, limits)
+        .expect_err("ciphertext corruption must not produce plaintext");
+    if failure.code() == FrameFailureCode::ChecksumMismatch {
+        Ok(())
+    } else {
+        Err("ciphertext corruption failure classification differed")
+    }
+}
+
+#[test]
+fn restart_sequence_reset_uses_a_fresh_object_key() -> Result<(), &'static str> {
+    use super::{DataProtection, ObjectDataKey, SecretKeyInput};
+
+    let (_, context, limits, _) = protected_segment_fixture()?;
+    let object = context.object;
+    let first_restart_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xf1; 32]), object);
+    let second_restart_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xf2; 32]), object);
+    let first =
+        DataProtection::protect_frame(&first_restart_key, context, b"restart-sequence", limits)
+            .map_err(|_| "first restarted frame protection failed")?;
+    let second =
+        DataProtection::protect_frame(&second_restart_key, context, b"restart-sequence", limits)
+            .map_err(|_| "second restarted frame protection failed")?;
+
+    if first.as_bytes() != second.as_bytes() {
+        Ok(())
+    } else {
+        Err("fresh object keys produced the same restarted frame")
+    }
+}
+
+#[test]
+fn aead_tag_remains_authoritative_when_the_checksum_is_recomputed() -> Result<(), &'static str> {
+    use super::{DataProtection, FrameFailureCode};
+    use sha2::{Digest, Sha256};
+
+    let (key, context, limits, encrypted) = protected_segment_fixture()?;
+    let mut hostile = encrypted.as_bytes().to_vec();
+    let ciphertext = hostile
+        .get_mut(52..)
+        .ok_or("frame fixture omitted ciphertext")?;
+    let first = ciphertext
+        .first_mut()
+        .ok_or("frame fixture ciphertext was unexpectedly empty")?;
+    *first ^= 0x01;
+    let recomputed_checksum: [u8; 32] = Sha256::digest(ciphertext).into();
+    let stored_checksum = hostile
+        .get_mut(20..52)
+        .ok_or("frame fixture omitted its checksum")?;
+    stored_checksum.copy_from_slice(&recomputed_checksum);
+
+    let failure = DataProtection::open_frame(&key, context, &hostile, limits)
+        .expect_err("a forged checksum must not replace AEAD authentication");
+    if failure.code() == FrameFailureCode::AuthenticationFailed {
+        Ok(())
+    } else {
+        Err("forged ciphertext failure classification differed")
+    }
+}
+
+#[test]
+fn tenant_frame_substituted_as_a_system_object_returns_no_plaintext() -> Result<(), &'static str> {
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameObjectContext, FrameObjectId,
+        FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput, SystemObjectKind,
+    };
+
+    let (_, _, limits, encrypted) = protected_segment_fixture()?;
+    let system_object = FrameObjectContext::system(
+        SystemObjectKind::Catalog,
+        FrameObjectId::new([0xd2; 16]).map_err(|_| "system object fixture was invalid")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "format epoch fixture was invalid")?,
+    );
+    let system_context = system_object
+        .system_frame(FrameSequence::new(5))
+        .map_err(|_| "system frame context was invalid")?;
+    let system_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xd3; 32]), system_object);
+
+    let failure =
+        DataProtection::open_frame(&system_key, system_context, encrypted.as_bytes(), limits)
+            .expect_err("tenant ciphertext must not authenticate as system state");
+    if failure.code() == FrameFailureCode::AuthenticationFailed {
+        Ok(())
+    } else {
+        Err("tenant/system substitution failure classification differed")
+    }
+}
+
+#[test]
+fn malformed_headers_are_refused_as_structural_failures() -> Result<(), &'static str> {
+    use super::{DataProtection, FrameFailureCode};
+
+    let (key, context, limits, encrypted) = protected_segment_fixture()?;
+    let mut bad_magic = encrypted.as_bytes().to_vec();
+    let magic = bad_magic
+        .first_mut()
+        .ok_or("frame fixture was unexpectedly empty")?;
+    *magic ^= 0x01;
+    let mut undersized_ciphertext = encrypted.as_bytes().to_vec();
+    let declared_length = undersized_ciphertext
+        .get_mut(16..20)
+        .ok_or("frame fixture omitted its declared length")?;
+    declared_length.copy_from_slice(&15_u32.to_be_bytes());
+    let mut mismatched_length = encrypted.as_bytes().to_vec();
+    let declared_length = mismatched_length
+        .get_mut(16..20)
+        .ok_or("frame fixture omitted its declared length")?;
+    declared_length.copy_from_slice(&17_u32.to_be_bytes());
+
+    for malformed in [
+        Vec::new(),
+        encrypted
+            .as_bytes()
+            .get(..19)
+            .ok_or("frame fixture was shorter than its header")?
+            .to_vec(),
+        bad_magic,
+        undersized_ciphertext,
+        mismatched_length,
+    ] {
+        let failure = DataProtection::open_frame(&key, context, &malformed, limits)
+            .expect_err("a malformed header must not produce plaintext");
+        if failure.code() != FrameFailureCode::MalformedFrame {
+            return Err("malformed header failure classification differed");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn finite_policy_bounds_both_protection_and_opening() -> Result<(), &'static str> {
+    use super::{DataProtection, FrameFailureCode, FrameLimits};
+
+    let (_, context, _, _) = protected_segment_fixture()?;
+    let minimum = FrameLimits::new(68).map_err(|_| "minimum frame limit was invalid")?;
+    let empty_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xe4; 32]), context.object);
+    let empty = DataProtection::protect_frame(&empty_key, context, b"", minimum)
+        .map_err(|_| "empty frame did not fit the exact minimum limit")?;
+    if empty.as_bytes().len() != 68 {
+        return Err("empty frame size differed from the fixed minimum");
+    }
+    let verified_empty = DataProtection::open_frame(&empty_key, context, empty.as_bytes(), minimum)
+        .map_err(|_| "minimum-size empty frame did not authenticate")?;
+    if !verified_empty.as_plaintext().is_empty() {
+        return Err("minimum-size empty frame exposed non-empty plaintext");
+    }
+    let refused_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xe5; 32]), context.object);
+    let protect_failure = DataProtection::protect_frame(&refused_key, context, b"x", minimum)
+        .expect_err("a one-byte plaintext cannot fit the minimum empty-frame limit");
+    if protect_failure.code() != FrameFailureCode::LimitExceeded {
+        return Err("protection limit failure classification differed");
+    }
+    let larger_limit = FrameLimits::new(69).map_err(|_| "larger frame limit was invalid")?;
+    let larger_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xe6; 32]), context.object);
+    let larger = DataProtection::protect_frame(&larger_key, context, b"x", larger_limit)
+        .map_err(|_| "larger frame protection failed")?;
+    let open_failure = DataProtection::open_frame(&larger_key, context, larger.as_bytes(), minimum)
+        .expect_err("an encoded frame above the caller policy must be refused");
+    if open_failure.code() != FrameFailureCode::LimitExceeded {
+        return Err("open limit failure classification differed");
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_context_and_limit_construction_fails_closed() -> Result<(), &'static str> {
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,
+        FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput, SegmentFramePurpose,
+        SystemObjectKind,
+    };
+
+    if FrameObjectId::new([0_u8; 16])
+        .expect_err("the object sentinel must be rejected")
+        .code()
+        != FrameFailureCode::InvalidContext
+    {
+        return Err("object sentinel failure classification differed");
+    }
+    if FormatEpoch::new(0)
+        .expect_err("the Format Epoch sentinel must be rejected")
+        .code()
+        != FrameFailureCode::InvalidContext
+    {
+        return Err("Format Epoch sentinel failure classification differed");
+    }
+    if FrameLimits::new(67)
+        .expect_err("a policy below the fixed empty-frame size must be rejected")
+        .code()
+        != FrameFailureCode::InvalidLimit
+    {
+        return Err("minimum limit failure classification differed");
+    }
+
+    let tenant = TenantId::from_bytes([0xe1; 16]).map_err(|_| "tenant fixture was invalid")?;
+    let shard = VirtualShardId::new(1).map_err(|_| "shard fixture was invalid")?;
+    let object_id = FrameObjectId::new([0xe2; 16]).map_err(|_| "object fixture was invalid")?;
+    let epoch = FormatEpoch::new(1).map_err(|_| "format epoch fixture was invalid")?;
+    let segment = FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        object_id,
+        KeyEpoch::new(1),
+        epoch,
+    );
+    if segment
+        .system_frame(FrameSequence::new(1))
+        .expect_err("a segment must not create a system frame")
+        .code()
+        != FrameFailureCode::InvalidContext
+    {
+        return Err("segment/system purpose failure classification differed");
+    }
+    let system = FrameObjectContext::system(
+        SystemObjectKind::Catalog,
+        object_id,
+        KeyEpoch::new(1),
+        epoch,
+    );
+    if system
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(1))
+        .expect_err("a system object must not create a segment frame")
+        .code()
+        != FrameFailureCode::InvalidContext
+    {
+        return Err("system/segment purpose failure classification differed");
+    }
+    let system_context = system
+        .system_frame(FrameSequence::new(1))
+        .map_err(|_| "system frame context was invalid")?;
+    let segment_key = ObjectDataKey::import(SecretKeyInput::from_test_bytes([0xe3; 32]), segment);
+    let limits = FrameLimits::new(128).map_err(|_| "frame limit fixture was invalid")?;
+    if DataProtection::protect_frame(&segment_key, system_context, b"object mismatch", limits)
+        .expect_err("a key bound to another object must be refused")
+        .code()
+        != FrameFailureCode::InvalidContext
+    {
+        return Err("key/object mismatch failure classification differed");
+    }
+    Ok(())
+}
+
+#[test]
+fn keys_plaintext_and_failures_have_bounded_redacted_diagnostics() -> Result<(), &'static str> {
+    use std::error::Error;
+
+    use super::{DataProtection, ObjectDataKey, SecretKeyInput};
+
+    let (_, context, limits, _) = protected_segment_fixture()?;
+    let key_canary = [b'K'; 32];
+    let key = ObjectDataKey::import(SecretKeyInput::from_test_bytes(key_canary), context.object);
+    let plaintext = b"plaintext-secret-canary";
+    let encrypted = DataProtection::protect_frame(&key, context, plaintext, limits)
+        .map_err(|_| "frame protection failed")?;
+    if encrypted
+        .as_bytes()
+        .windows(plaintext.len())
+        .any(|window| window == plaintext)
+    {
+        return Err("encrypted frame exposed plaintext");
+    }
+    if encrypted
+        .as_bytes()
+        .windows(key_canary.len())
+        .any(|window| window == key_canary)
+    {
+        return Err("encrypted frame exposed key material");
+    }
+    let verified = DataProtection::open_frame(&key, context, encrypted.as_bytes(), limits)
+        .map_err(|_| "authentic frame open failed")?;
+    let key_debug = format!("{key:?}");
+    let encrypted_debug = format!("{encrypted:?}");
+    let verified_debug = format!("{verified:?}");
+    for diagnostic in [&key_debug, &encrypted_debug, &verified_debug] {
+        if diagnostic.contains("plaintext-secret-canary") || diagnostic.contains("KKKKKKKK") {
+            return Err("debug output exposed a secret canary");
+        }
+        if diagnostic.len() > 96 {
+            return Err("debug output exceeded its bounded representation");
+        }
+    }
+
+    let wrong_key =
+        ObjectDataKey::import(SecretKeyInput::from_test_bytes([b'W'; 32]), context.object);
+    let failure = DataProtection::open_frame(&wrong_key, context, encrypted.as_bytes(), limits)
+        .expect_err("a wrong key must fail authentication");
+    let failure_display = failure.to_string();
+    let failure_debug = format!("{failure:?}");
+    if failure_display.contains("plaintext-secret-canary")
+        || failure_debug.contains("plaintext-secret-canary")
+        || failure_display.contains("KKKKKKKK")
+        || failure_debug.contains("KKKKKKKK")
+        || failure.source().is_some()
+        || failure_display.len() > 96
+        || failure_debug.len() > 96
+    {
+        return Err("frame failure diagnostics exposed or retained secret context");
+    }
+    Ok(())
+}
+
+#[test]
+fn immutable_frame_reread_and_nonce_sequence_semantics_are_explicit() -> Result<(), &'static str> {
+    use super::{DataProtection, FrameSequence, SegmentFramePurpose};
+
+    let (key, context, limits, same_address) = protected_segment_fixture()?;
+    for _ in 0..2 {
+        let verified = DataProtection::open_frame(&key, context, same_address.as_bytes(), limits)
+            .map_err(|_| "legitimate immutable-frame reread failed")?;
+        if !verified.as_plaintext().is_empty() {
+            return Err("legitimate immutable-frame reread differed");
+        }
+    }
+
+    let next_context = context
+        .object
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(2))
+        .map_err(|_| "next frame context was invalid")?;
+    let next = DataProtection::protect_frame(&key, next_context, b"immutable", limits)
+        .map_err(|_| "next sequence frame protection failed")?;
+    if next.as_bytes() == same_address.as_bytes() {
+        return Err("distinct sequences reused one encrypted frame");
+    }
+    Ok(())
+}

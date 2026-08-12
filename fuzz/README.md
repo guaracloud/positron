@@ -20,3 +20,9 @@ Current storage target:
 ```console
 cargo +nightly fuzz run primary_data_volume_stateful
 ```
+
+Current authenticated-frame target:
+
+```console
+cargo +nightly fuzz run encrypted_frame_open
+```

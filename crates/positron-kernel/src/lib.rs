@@ -1,10 +1,78 @@
 //! Positron's shared Storage Kernel boundary.
 //!
-//! This slice owns the concrete Release 1 Primary Data Volume. Catalog,
-//! encryption, active-segment, durability-frontier, and bootstrap behavior are
-//! intentionally outside this crate's current implemented surface.
+//! This slice owns the concrete Release 1 Primary Data Volume and authenticated
+//! encrypted-frame protection. Authoritative frame context, object keys, and
+//! frame protection remain private to the Storage Kernel until the Active
+//! Segment Ledger can issue sequence-owned capabilities.
+//!
+//! Provider bootstrap, Key Envelopes, the Envelope Catalog, key lifecycle, and
+//! durable frame-sequence allocation remain outside this crate's implemented
+//! surface.
+//!
+//! Frame authority is deliberately unavailable to dependent crates. Each
+//! promised private name is checked independently so one inaccessible import
+//! cannot hide an accidentally exported sibling:
+//!
+//! ```compile_fail
+//! use positron_kernel::DataProtection;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::ObjectDataKey;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::SecretKeyInput;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameObjectContext;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameContext;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameSequence;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameLimits;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::EncryptedFrame;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::CryptoBackend;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::VerifiedFrame;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameObjectId;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::KeyEpoch;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FormatEpoch;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::SegmentFramePurpose;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::SystemObjectKind;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameFailure;
+//! ```
+//! ```compile_fail
+//! use positron_kernel::FrameFailureCode;
+//! ```
 
 #![forbid(unsafe_code)]
+
+#[allow(dead_code)]
+mod data_protection;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use data_protection::fuzz_authenticated_frame;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
