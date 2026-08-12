@@ -10,10 +10,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 positron-kernel = { path = "../crates/positron-kernel" }
+positron-domain = { path = "../crates/positron-domain" }
 
 [[bin]]
 name = "primary_data_volume_stateful"
 path = "fuzz_targets/primary_data_volume_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypted_frame_open"
+path = "fuzz_targets/encrypted_frame_open.rs"
 test = false
 doc = false
 bench = false

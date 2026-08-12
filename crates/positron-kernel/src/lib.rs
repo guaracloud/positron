@@ -6,6 +6,14 @@
 
 #![forbid(unsafe_code)]
 
+mod data_protection;
+
+pub use data_protection::{
+    DataProtection, EncryptedFrame, FormatEpoch, FrameContext, FrameFailure, FrameFailureCode,
+    FrameLimits, FrameObjectContext, FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey,
+    SecretKeyInput, SegmentFramePurpose, SystemObjectKind, VerifiedFrame,
+};
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, TryLockError};
