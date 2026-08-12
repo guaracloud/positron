@@ -6,7 +6,7 @@ use super::{
 };
 
 /// The Storage Kernel's authenticated encrypted-frame entry point.
-pub(super) enum DataProtection {}
+pub(crate) enum DataProtection {}
 
 impl DataProtection {
     pub(super) fn release() -> BackendDataProtection<RustCryptoBackend> {

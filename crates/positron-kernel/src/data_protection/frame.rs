@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use super::SecretPlaintext;
 
 /// An authenticated encrypted frame ready for persistent storage.
-pub(super) struct EncryptedFrame(pub(super) Vec<u8>);
+pub(crate) struct EncryptedFrame(pub(super) Vec<u8>);
 
 impl EncryptedFrame {
     /// Returns the stable encrypted frame-v1 artifact bytes.
@@ -24,7 +24,7 @@ impl std::fmt::Debug for EncryptedFrame {
 }
 
 /// Plaintext from a frame that passed structural, checksum, and AEAD checks.
-pub(super) struct VerifiedFrame(pub(super) SecretPlaintext);
+pub(crate) struct VerifiedFrame(pub(super) SecretPlaintext);
 
 impl VerifiedFrame {
     /// Returns authenticated plaintext to the owning decoder.
@@ -45,7 +45,7 @@ impl std::fmt::Debug for VerifiedFrame {
 
 /// The stable class of a frame protection or authentication failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FrameFailureCode {
+pub(crate) enum FrameFailureCode {
     /// The caller supplied an invalid identity or context.
     InvalidContext,
     /// The caller supplied an invalid finite limit.
@@ -74,7 +74,7 @@ pub(super) enum FrameFailureCode {
 
 /// A bounded secret-free frame failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FrameFailure {
+pub(crate) struct FrameFailure {
     pub(super) code: FrameFailureCode,
 }
 

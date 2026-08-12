@@ -47,5 +47,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "catalog_generation_stateful"
+path = "fuzz_targets/catalog_generation_stateful.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

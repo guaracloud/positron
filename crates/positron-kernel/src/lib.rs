@@ -70,9 +70,16 @@
 #[cfg(test)]
 extern crate self as positron_kernel;
 
+mod catalog;
 #[allow(dead_code)]
 mod data_protection;
 mod resource_governor;
+
+pub use catalog::{
+    AuditIntent, Catalog, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
+    CatalogObject, CatalogObjectId, CatalogProposal, CatalogSecret, CatalogSnapshot, FormatEpoch,
+    GovernanceAuditRecord, InstanceId, TransactionId,
+};
 
 pub use resource_governor::{
     AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,
@@ -101,6 +108,10 @@ pub use data_protection::fuzz_authenticated_frame;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use data_protection::fuzz_local_root_key_file;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use catalog::fuzz_catalog_stateful;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};

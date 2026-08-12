@@ -21,20 +21,18 @@ mod service;
 #[cfg(any(test, fuzzing))]
 mod fuzzing;
 
-use backend::{
-    CryptoBackend, CryptoBackendFailure, ObjectDataKey, RustCryptoBackend, SecretKeyBytes,
-    SecretKeyInput, SecretPlaintext,
-};
+use backend::{CryptoBackend, CryptoBackendFailure, RustCryptoBackend, SecretPlaintext};
+pub(crate) use backend::{ObjectDataKey, SecretKeyBytes, SecretKeyInput};
 use codec::{encode_associated_data, encode_authenticated_header, nonce_for, parse_frame};
-use context::{FrameContext, FrameLimits, FrameObjectContext, FrameSequence};
-use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
-use service::DataProtection;
+pub(crate) use context::{
+    FormatEpoch as FrameFormatEpoch, FrameContext, FrameLimits, FrameObjectContext, FrameObjectId,
+    FrameSequence, KeyEpoch, SystemObjectKind,
+};
+pub(crate) use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
+pub(crate) use service::DataProtection;
 
 #[cfg(any(test, fuzzing))]
-use context::{FormatEpoch, FrameObjectId, KeyEpoch, SegmentFramePurpose};
-
-#[cfg(test)]
-use context::SystemObjectKind;
+use context::{FormatEpoch, SegmentFramePurpose};
 
 const FRAME_MAGIC: [u8; 4] = *b"PFRM";
 const FRAME_VERSION: u16 = 1;

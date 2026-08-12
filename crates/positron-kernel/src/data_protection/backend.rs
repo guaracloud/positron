@@ -12,14 +12,14 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::rc::Rc;
 
-pub(super) struct SecretKeyBytes {
+pub(crate) struct SecretKeyBytes {
     bytes: Box<[u8; 32]>,
     #[cfg(test)]
     zeroized_before_release: Option<Rc<Cell<bool>>>,
 }
 
 impl SecretKeyBytes {
-    pub(super) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
+    pub(crate) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
         Self {
             bytes,
             #[cfg(test)]
@@ -38,11 +38,11 @@ impl SecretKeyBytes {
         }
     }
 
-    pub(super) fn expose_to_backend(&self) -> &[u8] {
+    pub(crate) fn expose_to_backend(&self) -> &[u8] {
         self.bytes.as_ref()
     }
 
-    pub(super) fn expose_to_backend_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn expose_to_backend_mut(&mut self) -> &mut [u8] {
         self.bytes.as_mut()
     }
 }
@@ -150,7 +150,7 @@ impl CryptoBackend for RustCryptoBackend {
 ///
 /// This type intentionally implements neither `Clone`, `Debug`, nor `Display`
 /// and exposes no byte accessor. Its memory is zeroized when custody ends.
-pub(super) struct SecretKeyInput(pub(super) SecretKeyBytes);
+pub(crate) struct SecretKeyInput(pub(super) SecretKeyBytes);
 
 impl SecretKeyInput {
     /// Takes ownership of exactly one AES-256 key buffer.
@@ -158,7 +158,7 @@ impl SecretKeyInput {
     /// Positron zeroizes this owned buffer before releasing it. This makes no
     /// claim about copies created before ownership transfer.
     #[must_use]
-    pub(super) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
+    pub(crate) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
         Self(SecretKeyBytes::from_owned(bytes))
     }
 
@@ -180,7 +180,7 @@ impl SecretKeyInput {
 }
 
 /// A per-object data key bound to its authoritative identity and epochs.
-pub(super) struct ObjectDataKey {
+pub(crate) struct ObjectDataKey {
     pub(super) key: SecretKeyBytes,
     pub(super) object: FrameObjectContext,
 }
