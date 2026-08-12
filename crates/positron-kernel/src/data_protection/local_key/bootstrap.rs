@@ -1,0 +1,248 @@
+//! Fresh-root proof consumption and durable one-time key initialization.
+
+use std::fs::File;
+use std::path::{Component, Path, PathBuf};
+
+use std::os::unix::fs::MetadataExt;
+
+use rustix::fs::{self as unix_fs, AtFlags, Mode, OFlags};
+use zeroize::Zeroize;
+
+use super::acl::{verify_directory_acl, verify_file_acl};
+use super::codec::{SecretRootKey, encode_file_v1, parse_file_v1};
+use super::{
+    LOCAL_KEY_FILE_NAME, LocalKeyCreationTime, LocalKeyFailure, LocalKeyFailureCode, LocalKeyId,
+    VerifiedLocalKey, initialization_io,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalObjectIdentity {
+    device: u64,
+    inode: u64,
+}
+
+pub(super) struct FreshInitializationRootProof {
+    location: PathBuf,
+    expected_owner: u32,
+    identity: LocalObjectIdentity,
+}
+
+impl FreshInitializationRootProof {
+    #[cfg(test)]
+    pub(super) fn for_test(location: &Path) -> Result<Self, LocalKeyFailure> {
+        let canonical = std::fs::canonicalize(location)
+            .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
+        validate_absolute_normalized_location(&canonical)?;
+        let metadata = std::fs::symlink_metadata(&canonical)
+            .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
+        if !metadata.file_type().is_dir() {
+            return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation));
+        }
+        Ok(Self {
+            location: canonical,
+            expected_owner: metadata.uid(),
+            identity: LocalObjectIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LocalKeyInitializationEvent {
+    OpenSecurityDirectory,
+    InspectSecurityDirectoryAcl,
+    CreateFinalKeyFile,
+    RequestEntropy,
+}
+
+pub(super) fn initialize_local_key(
+    proof: FreshInitializationRootProof,
+) -> Result<VerifiedLocalKey, LocalKeyFailure> {
+    initialization_event(LocalKeyInitializationEvent::OpenSecurityDirectory);
+    let directory = open_absolute_directory(&proof.location)?;
+    verify_security_directory(&directory, &proof)?;
+    initialization_event(LocalKeyInitializationEvent::InspectSecurityDirectoryAcl);
+    verify_directory_acl(&directory)?;
+
+    initialization_event(LocalKeyInitializationEvent::CreateFinalKeyFile);
+    let mut file = unix_fs::openat(
+        &directory,
+        LOCAL_KEY_FILE_NAME,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map(File::from)
+    .map_err(|error| {
+        if error == rustix::io::Errno::EXIST {
+            LocalKeyFailure::new(LocalKeyFailureCode::KeyAlreadyExists)
+        } else {
+            LocalKeyFailure::new(LocalKeyFailureCode::CreateKeyFileFailed)
+        }
+    })?;
+    verify_key_file(&directory, &file, proof.expected_owner)?;
+    verify_file_acl(&file)?;
+
+    initialization_event(LocalKeyInitializationEvent::RequestEntropy);
+    let mut key_id_bytes = [0_u8; 16];
+    initialization_io::fill_random(&mut key_id_bytes)
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::EntropyUnavailable))?;
+    let key_id = LocalKeyId::new(key_id_bytes)?;
+    let mut root_key_bytes = Box::new([0_u8; 32]);
+    if initialization_io::fill_random(root_key_bytes.as_mut()).is_err() {
+        root_key_bytes.zeroize();
+        return Err(LocalKeyFailure::new(
+            LocalKeyFailureCode::EntropyUnavailable,
+        ));
+    }
+    let root_key = SecretRootKey::from_owned(root_key_bytes);
+    let creation_seconds = initialization_io::unix_creation_seconds()
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::ClockUnavailable))?;
+    let encoded = encode_file_v1(
+        key_id,
+        LocalKeyCreationTime::from_unix_seconds(creation_seconds),
+        root_key,
+    )?;
+    initialization_io::write_new_key(&mut file, encoded.as_bytes())
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::WriteFailed))?;
+    initialization_io::synchronize_key_file(&file)
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::SynchronizeKeyFileFailed))?;
+    initialization_io::synchronize_security_directory(&directory).map_err(|_| {
+        LocalKeyFailure::new(LocalKeyFailureCode::SynchronizeSecurityDirectoryFailed)
+    })?;
+    verify_key_file(&directory, &file, proof.expected_owner)?;
+    verify_file_acl(&file)?;
+    parse_file_v1(encoded)
+}
+
+fn validate_absolute_normalized_location(location: &Path) -> Result<(), LocalKeyFailure> {
+    if !location.is_absolute() {
+        return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation));
+    }
+    if location
+        .components()
+        .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        Ok(())
+    } else {
+        Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))
+    }
+}
+
+pub(super) fn open_absolute_directory(location: &Path) -> Result<File, LocalKeyFailure> {
+    validate_absolute_normalized_location(location)?;
+    let mut current =
+        File::open("/").map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
+    for component in location.components() {
+        match component {
+            Component::RootDir => {},
+            Component::Normal(name) => {
+                current = unix_fs::openat(
+                    &current,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
+            },
+            _ => return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation)),
+        }
+    }
+    Ok(current)
+}
+
+fn verify_security_directory(
+    directory: &File,
+    proof: &FreshInitializationRootProof,
+) -> Result<(), LocalKeyFailure> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::UnsafeSecurityDirectory))?;
+    let safe = metadata.file_type().is_dir()
+        && metadata.uid() == proof.expected_owner
+        && metadata.mode() & 0o7777 == 0o700
+        && metadata.nlink() == 2
+        && LocalObjectIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        } == proof.identity;
+    if safe {
+        Ok(())
+    } else {
+        Err(LocalKeyFailure::new(
+            LocalKeyFailureCode::UnsafeSecurityDirectory,
+        ))
+    }
+}
+
+pub(super) fn verify_key_file(
+    directory: &File,
+    file: &File,
+    expected_owner: u32,
+) -> Result<(), LocalKeyFailure> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::UnsafeKeyFile))?;
+    let entry = unix_fs::statat(directory, LOCAL_KEY_FILE_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::UnsafeKeyFile))?;
+    let safe = metadata.file_type().is_file()
+        && metadata.uid() == expected_owner
+        && metadata.mode() & 0o7777 == 0o600
+        && metadata.nlink() == 1
+        && entry.st_dev as u64 == metadata.dev()
+        && entry.st_ino == metadata.ino()
+        && entry.st_nlink == 1;
+    if safe {
+        Ok(())
+    } else {
+        Err(LocalKeyFailure::new(LocalKeyFailureCode::UnsafeKeyFile))
+    }
+}
+
+fn initialization_event(_event: LocalKeyInitializationEvent) {
+    #[cfg(test)]
+    {
+        INITIALIZATION_EVENTS.with(|events| events.borrow_mut().push(_event));
+        INITIALIZATION_EVENT_ACTION.with(|action| {
+            let mut current = action.borrow_mut().take();
+            if let Some(callback) = current.as_mut() {
+                callback(_event);
+            }
+            *action.borrow_mut() = current;
+        });
+    }
+}
+
+#[cfg(test)]
+type InitializationEventAction = Box<dyn FnMut(LocalKeyInitializationEvent)>;
+
+#[cfg(test)]
+thread_local! {
+    static INITIALIZATION_EVENTS: std::cell::RefCell<Vec<LocalKeyInitializationEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+    static INITIALIZATION_EVENT_ACTION: std::cell::RefCell<Option<InitializationEventAction>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn capture_initialization_events<T>(
+    action: impl FnOnce() -> T,
+) -> (T, Vec<LocalKeyInitializationEvent>) {
+    INITIALIZATION_EVENTS.with(|events| events.borrow_mut().clear());
+    let result = action();
+    let events = INITIALIZATION_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()));
+    (result, events)
+}
+
+#[cfg(test)]
+pub(super) fn with_initialization_event_action<T>(
+    action: impl FnMut(LocalKeyInitializationEvent) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    INITIALIZATION_EVENT_ACTION.with(|injected| {
+        let previous = injected.replace(Some(Box::new(action)));
+        let result = operation();
+        injected.replace(previous);
+        result
+    })
+}

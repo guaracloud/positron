@@ -26,3 +26,9 @@ Current authenticated-frame target:
 ```console
 cargo +nightly fuzz run encrypted_frame_open
 ```
+
+Current Local Root Key File parser target:
+
+```console
+cargo +nightly fuzz run local_root_key_file
+```

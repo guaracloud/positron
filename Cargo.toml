@@ -5,6 +5,7 @@ members = [
     "crates/positron-backup",
     "crates/positron-config",
     "crates/positron-diagnostics",
+    "crates/positron-darwin-acl",
     "crates/positron-domain",
     "crates/positron-governance",
     "crates/positron-ingest",

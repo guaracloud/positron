@@ -74,6 +74,10 @@ mod data_protection;
 #[doc(hidden)]
 pub use data_protection::fuzz_authenticated_frame;
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use data_protection::fuzz_local_root_key_file;
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, TryLockError};

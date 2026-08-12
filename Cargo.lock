@@ -230,6 +230,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "positron-darwin-acl"
+version = "0.0.0"
+
+[[package]]
 name = "positron-diagnostics"
 version = "0.0.0"
 
@@ -252,6 +256,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "getrandom",
+ "positron-darwin-acl",
  "positron-domain",
  "rustix",
  "sha2",
