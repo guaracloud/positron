@@ -266,6 +266,10 @@ name = "positron-darwin-acl"
 version = "0.0.0"
 
 [[package]]
+name = "positron-darwin-system"
+version = "0.0.0"
+
+[[package]]
 name = "positron-domain"
 version = "0.0.0"
 
@@ -286,6 +290,7 @@ dependencies = [
  "aes-gcm",
  "getrandom",
  "positron-darwin-acl",
+ "positron-darwin-system",
  "positron-domain",
  "rustix",
  "sha2",

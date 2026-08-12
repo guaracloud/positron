@@ -1,0 +1,109 @@
+use std::cell::Cell;
+
+use super::{
+    KERNEL_SUCCESS, MachHostApi, VmStatistics64RevisionZero, host_available_memory_bytes_with,
+};
+use crate::DarwinSystemObservationError;
+
+struct FakeMachHostApi {
+    page_status: i32,
+    statistics_status: i32,
+    deallocation_status: i32,
+    page_size: usize,
+    free_pages: u32,
+    inactive_pages: u32,
+    deallocations: Cell<u32>,
+}
+
+impl FakeMachHostApi {
+    fn succeeding() -> Self {
+        Self {
+            page_status: KERNEL_SUCCESS,
+            statistics_status: KERNEL_SUCCESS,
+            deallocation_status: KERNEL_SUCCESS,
+            page_size: 4,
+            free_pages: 2,
+            inactive_pages: 3,
+            deallocations: Cell::new(0),
+        }
+    }
+}
+
+impl MachHostApi for FakeMachHostApi {
+    fn host_self(&self) -> u32 {
+        7
+    }
+
+    fn task_self(&self) -> u32 {
+        11
+    }
+
+    fn page_size(&self, _host: u32, page_size: &mut usize) -> i32 {
+        *page_size = self.page_size;
+        self.page_status
+    }
+
+    fn statistics(
+        &self,
+        _host: u32,
+        statistics: &mut VmStatistics64RevisionZero,
+        _count: &mut u32,
+    ) -> i32 {
+        statistics.free_count = self.free_pages;
+        statistics.inactive_count = self.inactive_pages;
+        self.statistics_status
+    }
+
+    fn deallocate(&self, _task: u32, _host: u32) -> i32 {
+        self.deallocations.set(self.deallocations.get() + 1);
+        self.deallocation_status
+    }
+}
+
+#[test]
+fn deallocates_the_host_right_once_on_every_observation_exit() {
+    let cases = [
+        (
+            FakeMachHostApi {
+                page_status: 1,
+                ..FakeMachHostApi::succeeding()
+            },
+            DarwinSystemObservationError::HostAvailableMemoryUnavailable,
+        ),
+        (
+            FakeMachHostApi {
+                statistics_status: 1,
+                ..FakeMachHostApi::succeeding()
+            },
+            DarwinSystemObservationError::HostAvailableMemoryUnavailable,
+        ),
+        (
+            FakeMachHostApi {
+                page_size: usize::MAX,
+                ..FakeMachHostApi::succeeding()
+            },
+            DarwinSystemObservationError::HostAvailableMemoryArithmetic,
+        ),
+    ];
+    for (api, expected) in cases {
+        assert_eq!(host_available_memory_bytes_with(&api), Err(expected));
+        assert_eq!(api.deallocations.get(), 1);
+    }
+
+    let api = FakeMachHostApi::succeeding();
+    assert_eq!(host_available_memory_bytes_with(&api), Ok(20));
+    assert_eq!(api.deallocations.get(), 1);
+}
+
+#[test]
+fn reports_host_right_deallocation_failure_once() {
+    let api = FakeMachHostApi {
+        deallocation_status: 1,
+        ..FakeMachHostApi::succeeding()
+    };
+    assert_eq!(
+        host_available_memory_bytes_with(&api),
+        Err(DarwinSystemObservationError::HostPortDeallocationUnavailable)
+    );
+    assert_eq!(api.deallocations.get(), 1);
+}

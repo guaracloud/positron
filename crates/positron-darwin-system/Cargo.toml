@@ -1,0 +1,16 @@
+[package]
+name = "positron-darwin-system"
+description = "Private macOS host-resource observation leaf for Positron"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

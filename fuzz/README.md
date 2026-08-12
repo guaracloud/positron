@@ -48,3 +48,16 @@ libFuzzer crash or reproducer artifacts therefore contain only selectors,
 opcodes, indices, sizes, and mutation values; they must never contain a complete
 134-byte Local Root Key File, its 268-character hexadecimal representation, or
 Root KEK material.
+
+Current Resource Governor state-machine target:
+
+```console
+cargo +nightly fuzz run resource_governor_stateful
+```
+
+This harness executes a bounded program of ordinary, tenant-attributed recovery,
+and system recovery reservations; drop/cancel; resize; disk-pressure observation;
+shutdown; and recovery-safe completion. It retains at most eight handles and
+checks conservation, fixed pool accounting, capacity observations, bounded
+reason telemetry, reserve consumption, lifecycle counts, and final drainage
+after every transition.

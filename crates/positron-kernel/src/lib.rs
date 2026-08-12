@@ -67,8 +67,32 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as positron_kernel;
+
 #[allow(dead_code)]
 mod data_protection;
+mod resource_governor;
+
+pub use resource_governor::{
+    AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,
+    CAPACITY_OBSERVATION_TRANSIENT_MEMORY_BYTES, CPU_WORK_UNITS_PER_LOGICAL_CPU,
+    CapacityObservationFailure, CapacityObservationSource, DetectedCapacity, DiskObservation,
+    DiskPressureState, DiskPressureThresholds, EstablishmentFailure, ExistingCapacityDisposition,
+    GovernorFailure, GovernorLifecycle, GovernorPolicy, InventoryCardinalityLimits, LimitingScope,
+    MAX_OUTSTANDING_RESERVATIONS, MAX_TENANT_QUOTAS, ObservedResourceEnvironment, OperatorLimits,
+    OrdinaryPool, OrdinaryPoolPolicy, RESOURCE_DIMENSION_COUNT, RecoveryAuthority,
+    RecoveryInterruption, RecoveryPoolCapacities, RecoveryReserve, RecoveryScope,
+    RecoveryWorkClaim, RecoveryWorkKind, RegisteredResourceBounds, ReleaseOutcome, ResizeFailure,
+    ResizeFailureCode, ResizeOutcome, ResourceAmounts, ResourceDimension, ResourceGovernor,
+    ResourceGovernorConfiguration, ResourceInventory, ResourceReservation, ResourceSnapshot,
+    ShutdownReconciliation, StorageKernelResourceAuthority, TenantQuota, WorkClaim, WorkClass,
+    WorkKind,
+};
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use resource_governor::fuzz_linux_capacity_parsers;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -100,6 +124,52 @@ use std::os::unix::fs::MetadataExt;
 /// Construction is intentionally unavailable: callers receive ownership only
 /// through [`PrimaryDataVolume::acquire`].
 pub enum PrimaryDataVolume {}
+
+const PRIMARY_DATA_VOLUME_PROBE_PAYLOAD_BYTES: usize = 21;
+const PRIMARY_DATA_VOLUME_PROBE_PAYLOAD: &[u8; PRIMARY_DATA_VOLUME_PROBE_PAYLOAD_BYTES] =
+    b"positron-volume-probe";
+
+/// Fixed resource bound of the synchronous pre-governor volume bootstrap.
+///
+/// Primary Data Volume qualification precedes Resource Governor establishment,
+/// so it cannot consume a governor reservation. The acquisition algorithm is
+/// instead structurally bounded: it retains the root and ownership handles,
+/// opens at most one probe directory and one probe file at a time, performs no
+/// concurrent I/O, and writes only the fixed probe payload reported here. This
+/// value describes that bootstrap algorithm; it is not an admission authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrimaryDataVolumeBootstrapBounds {
+    maximum_open_file_descriptors: u8,
+    maximum_concurrent_io_operations: u8,
+    maximum_probe_payload_bytes: usize,
+}
+
+impl PrimaryDataVolumeBootstrapBounds {
+    /// Maximum volume-owned file descriptors open at the same time.
+    #[must_use]
+    pub const fn maximum_open_file_descriptors(self) -> u8 {
+        self.maximum_open_file_descriptors
+    }
+
+    /// Maximum bootstrap I/O operations executing at the same time.
+    #[must_use]
+    pub const fn maximum_concurrent_io_operations(self) -> u8 {
+        self.maximum_concurrent_io_operations
+    }
+
+    /// Exact byte length of the only payload written by the capability probe.
+    #[must_use]
+    pub const fn maximum_probe_payload_bytes(self) -> usize {
+        self.maximum_probe_payload_bytes
+    }
+}
+
+const PRIMARY_DATA_VOLUME_BOOTSTRAP_BOUNDS: PrimaryDataVolumeBootstrapBounds =
+    PrimaryDataVolumeBootstrapBounds {
+        maximum_open_file_descriptors: 4,
+        maximum_concurrent_io_operations: 1,
+        maximum_probe_payload_bytes: PRIMARY_DATA_VOLUME_PROBE_PAYLOAD_BYTES,
+    };
 
 /// A process-lifetime ownership claim over one Primary Data Volume.
 pub struct OwnedPrimaryDataVolume {
@@ -483,6 +553,12 @@ impl Error for VolumeFailure {
 }
 
 impl PrimaryDataVolume {
+    /// Returns the immutable resource bound for pre-governor acquisition.
+    #[must_use]
+    pub const fn bootstrap_resource_bounds() -> PrimaryDataVolumeBootstrapBounds {
+        PRIMARY_DATA_VOLUME_BOOTSTRAP_BOUNDS
+    }
+
     /// Acquires an existing filesystem directory as the Primary Data Volume.
     ///
     /// `qualification` is trusted deployment provenance, not a filesystem
@@ -742,8 +818,6 @@ fn reject_existing_probe_residue(root: &File) -> Result<(), VolumeFailure> {
 }
 
 fn run_capability_probe(root: &File) -> Result<(), VolumeFailure> {
-    const PROBE_PAYLOAD: &[u8] = b"positron-volume-probe";
-
     acquisition_event(
         VolumeEvent::CreateProbeDirectory,
         VolumeOperation::PrepareProbe,
@@ -812,9 +886,9 @@ fn run_capability_probe(root: &File) -> Result<(), VolumeFailure> {
             VolumeEvent::WriteProbePayload,
             VolumeOperation::WriteProbeFile,
         )?;
-        write_probe_payload(&mut candidate, PROBE_PAYLOAD).map_err(|source| {
-            VolumeFailure::probe_failure(VolumeOperation::WriteProbeFile, source)
-        })?;
+        write_probe_payload(&mut candidate, PRIMARY_DATA_VOLUME_PROBE_PAYLOAD).map_err(
+            |source| VolumeFailure::probe_failure(VolumeOperation::WriteProbeFile, source),
+        )?;
         probe_event(
             VolumeEvent::SynchronizeProbePayload,
             VolumeOperation::SynchronizeProbeFile,
@@ -840,7 +914,7 @@ fn run_capability_probe(root: &File) -> Result<(), VolumeFailure> {
             candidate_identity,
             VolumeOperation::ReopenProbeFile,
         )?;
-        let mut observed = [0_u8; PROBE_PAYLOAD.len()];
+        let mut observed = [0_u8; PRIMARY_DATA_VOLUME_PROBE_PAYLOAD_BYTES];
         probe_event(
             VolumeEvent::ReadProbePayload,
             VolumeOperation::ReadProbeFile,
@@ -852,7 +926,7 @@ fn run_capability_probe(root: &File) -> Result<(), VolumeFailure> {
         if !values_match(
             VolumeOperation::VerifyProbeContents,
             observed.as_slice(),
-            PROBE_PAYLOAD,
+            PRIMARY_DATA_VOLUME_PROBE_PAYLOAD,
         ) {
             return Err(VolumeFailure::probe_failure(
                 VolumeOperation::VerifyProbeContents,
@@ -1313,6 +1387,133 @@ mod tests {
             VolumeCompletionState::RejectedBeforeProbeMutation
         );
         assert!(fs::read_dir(&detached)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_resource_bounds_are_exact_and_immutable() {
+        let bounds = PrimaryDataVolume::bootstrap_resource_bounds();
+
+        assert_eq!(bounds.maximum_open_file_descriptors(), 4);
+        assert_eq!(bounds.maximum_concurrent_io_operations(), 1);
+        assert_eq!(bounds.maximum_probe_payload_bytes(), 21);
+    }
+
+    #[cfg(unix)]
+    fn open_volume_descriptor_count(root: &Path) -> Result<usize, io::Error> {
+        use std::collections::HashSet;
+
+        fn insert_identity(
+            identities: &mut HashSet<(u64, u64)>,
+            path: &Path,
+        ) -> Result<(), io::Error> {
+            match fs::metadata(path) {
+                Ok(metadata) => {
+                    identities.insert((metadata.dev(), metadata.ino()));
+                    Ok(())
+                },
+                Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(source),
+            }
+        }
+
+        let probe = root.join(".positron-volume-probe");
+        let mut identities = HashSet::new();
+        insert_identity(&mut identities, root)?;
+        insert_identity(&mut identities, &root.join(".positron-volume.lock"))?;
+        insert_identity(&mut identities, &probe)?;
+        insert_identity(&mut identities, &probe.join("candidate"))?;
+        insert_identity(&mut identities, &probe.join("published"))?;
+
+        #[cfg(target_os = "linux")]
+        let descriptor_directory = Path::new("/proc/self/fd");
+        #[cfg(not(target_os = "linux"))]
+        let descriptor_directory = Path::new("/dev/fd");
+
+        let mut count = 0_usize;
+        for entry in fs::read_dir(descriptor_directory)? {
+            let entry = entry?;
+            if let Ok(metadata) = fs::metadata(entry.path())
+                && identities.contains(&(metadata.dev(), metadata.ino()))
+            {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("descriptor count overflow"))?;
+            }
+        }
+        Ok(count)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_never_exceeds_descriptor_bound_and_failures_leak_none()
+    -> Result<(), Box<dyn Error>> {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let events = [
+            VolumeEvent::ClassifyRootPath,
+            VolumeEvent::OpenRootDirectory,
+            VolumeEvent::ReadRootHandleIdentity,
+            VolumeEvent::ClassifyMount,
+            VolumeEvent::InspectProbeResidue,
+            VolumeEvent::BeforeOwnershipArtifact,
+            VolumeEvent::CreateOwnershipArtifact,
+            VolumeEvent::OpenOwnershipArtifact,
+            VolumeEvent::AcquireOwnership,
+            VolumeEvent::VerifyOwnershipAfterLock,
+            VolumeEvent::CreateProbeDirectory,
+            VolumeEvent::OpenProbeDirectory,
+            VolumeEvent::CreateProbeCandidate,
+            VolumeEvent::WriteProbePayload,
+            VolumeEvent::SynchronizeProbePayload,
+            VolumeEvent::ReopenProbePayload,
+            VolumeEvent::ReadProbePayload,
+            VolumeEvent::TruncateProbePayload,
+            VolumeEvent::SynchronizeProbeTruncation,
+            VolumeEvent::ReopenTruncatedProbe,
+            VolumeEvent::ReadTruncatedProbe,
+            VolumeEvent::RenameProbeCandidate,
+            VolumeEvent::SynchronizeProbeDirectory,
+            VolumeEvent::CleanupProbeCandidate,
+            VolumeEvent::CleanupProbePublished,
+            VolumeEvent::CleanupProbeDirectory,
+            VolumeEvent::SynchronizeRootAfterCleanup,
+        ];
+        let maximum = usize::from(
+            PrimaryDataVolume::bootstrap_resource_bounds().maximum_open_file_descriptors(),
+        );
+
+        for event in events {
+            let root = TestRoot::new()?;
+            let observed = Rc::new(Cell::new(None));
+            let observed_at_event = Rc::clone(&observed);
+            let inspected_root = root.0.clone();
+            let acquired = with_event_action(
+                event,
+                move || {
+                    observed_at_event.set(Some(
+                        open_volume_descriptor_count(&inspected_root)
+                            .expect("descriptor observation must succeed"),
+                    ));
+                },
+                || PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost),
+            )?;
+            assert!(
+                observed.get().is_some_and(|count| count <= maximum),
+                "descriptor bound exceeded at {event:?}: {:?}",
+                observed.get()
+            );
+            drop(acquired);
+            assert_eq!(open_volume_descriptor_count(&root.0)?, 0);
+
+            let failed_root = TestRoot::new()?;
+            let failure = with_event_fault(event, io::ErrorKind::Interrupted, || {
+                PrimaryDataVolume::acquire(&failed_root.0, MountQualification::LocalHost)
+            });
+            assert!(failure.is_err(), "fault must be observed at {event:?}");
+            assert_eq!(open_volume_descriptor_count(&failed_root.0)?, 0);
+        }
         Ok(())
     }
 
