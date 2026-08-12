@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::rc::Rc;
 
+use zeroize::Zeroizing;
+
 use super::bootstrap::{
     FreshInitializationRootProof, LocalKeyInitializationEvent, capture_initialization_events,
     initialize_local_key, with_initialization_event_action,
@@ -54,11 +56,11 @@ fn stale_fresh_root_proof_refuses_without_changing_the_existing_key()
     let stale_proof = FreshInitializationRootProof::for_test(&root.path)?;
     let first = initialize_local_key(first_proof)?;
     let expected = ExpectedLocalKeyIdentity::from_evidence(first.evidence());
-    let before = std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?;
+    let before = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
     let expected_directory = ExpectedSecurityDirectory::for_test(&root.path)?;
 
     let (second, events) = capture_initialization_events(|| initialize_local_key(stale_proof));
-    let after = std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?;
+    let after = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
 
     #[cfg(target_os = "macos")]
     let expected_failure = LocalKeyFailureCode::UnsafeSecurityDirectory;
@@ -69,8 +71,14 @@ fn stale_fresh_root_proof_refuses_without_changing_the_existing_key()
         Err(LocalKeyFailure::new(expected_failure))
     );
     assert!(!events.contains(&LocalKeyInitializationEvent::RequestEntropy));
-    assert_eq!(after, before);
-    assert_eq!(after.len(), LOCAL_KEY_FILE_BYTES);
+    assert!(
+        after.as_slice() == before.as_slice(),
+        "stale initialization changed the existing local key file"
+    );
+    assert!(
+        after.len() == LOCAL_KEY_FILE_BYTES,
+        "existing local key file length changed"
+    );
     assert_eq!(
         open_local_key(&root.path, expected_directory, expected)?.evidence(),
         first.evidence()
@@ -109,7 +117,11 @@ fn exclusive_creation_refuses_a_racing_final_name_before_entropy()
         Err(LocalKeyFailure::new(LocalKeyFailureCode::KeyAlreadyExists))
     );
     assert!(!events.contains(&LocalKeyInitializationEvent::RequestEntropy));
-    assert_eq!(std::fs::read(final_path)?, b"racing-entry");
+    let racing_bytes = Zeroizing::new(std::fs::read(final_path)?);
+    assert!(
+        racing_bytes.as_slice() == b"racing-entry",
+        "exclusive creation changed the racing final-name entry"
+    );
     Ok(())
 }
 
@@ -118,7 +130,7 @@ fn valid_file_with_wrong_expected_identity_is_refused_without_replacement()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = SecurityRoot::create()?;
     let initialized = initialize_local_key(FreshInitializationRootProof::for_test(&root.path)?)?;
-    let before = std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?;
+    let before = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
     let expected_directory = ExpectedSecurityDirectory::for_test(&root.path)?;
     let wrong = ExpectedLocalKeyIdentity::with_test_fingerprint(
         initialized.evidence(),
@@ -131,7 +143,11 @@ fn valid_file_with_wrong_expected_identity_is_refused_without_replacement()
         observed.map(|_| ()),
         Err(LocalKeyFailure::new(LocalKeyFailureCode::IdentityMismatch))
     );
-    assert_eq!(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?, before);
+    let after = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
+    assert!(
+        after.as_slice() == before.as_slice(),
+        "identity mismatch handling changed the existing local key file"
+    );
     Ok(())
 }
 
@@ -293,7 +309,7 @@ fn local_key_diagnostics_do_not_expose_identity_or_key_material()
         LocalKeyFailure::new(LocalKeyFailureCode::FingerprintMismatch),
         LocalKeyFailure::new(LocalKeyFailureCode::FingerprintMismatch),
     );
-    let file_bytes = std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?;
+    let file_bytes = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
     let secret_hex = hex_bytes(
         file_bytes
             .get(70..102)
@@ -301,8 +317,8 @@ fn local_key_diagnostics_do_not_expose_identity_or_key_material()
     );
     let fingerprint_hex = hex_bytes(&initialized.evidence().fingerprint.0);
 
-    assert!(!diagnostics.contains(&secret_hex));
-    assert!(!diagnostics.contains(&fingerprint_hex));
+    assert!(!diagnostics.contains(secret_hex.as_str()));
+    assert!(!diagnostics.contains(fingerprint_hex.as_str()));
     assert!(!diagnostics.contains("fingerprint"));
     assert!(!diagnostics.contains("key_id"));
     assert!(!diagnostics.contains(root.path.to_string_lossy().as_ref()));
@@ -310,9 +326,9 @@ fn local_key_diagnostics_do_not_expose_identity_or_key_material()
     Ok(())
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
+fn hex_bytes(bytes: &[u8]) -> Zeroizing<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    let mut encoded = Zeroizing::new(String::with_capacity(bytes.len().saturating_mul(2)));
     for byte in bytes {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));

@@ -422,7 +422,7 @@ fn independent_file_v1_decodes_to_opaque_custody_and_recovery_required() -> Resu
     {
         return Err("verified local-key evidence differed");
     }
-    let diagnostic = format!("{verified:?}");
+    let diagnostic = Zeroizing::new(format!("{verified:?}"));
     if diagnostic.contains("20212223") || diagnostic.len() > 320 {
         return Err("verified local-key custody diagnostics exposed secret material");
     }
@@ -544,7 +544,8 @@ fn parsed_root_key_custody_zeroizes_before_release_on_success_and_fingerprint_fa
 #[test]
 fn local_key_fuzz_boundary_accepts_bounded_raw_and_independent_hex_seeds() {
     fuzz_local_root_key_file(b"short");
-    fuzz_local_root_key_file(format!("hex:{VALID_V1}").as_bytes());
+    let hex_seed = local_key_hex_seed(VALID_V1);
+    fuzz_local_root_key_file(hex_seed.as_slice());
 }
 
 #[test]
@@ -553,8 +554,9 @@ fn local_key_fuzz_boundary_zeroizes_decoded_artifact_custody() {
     use std::rc::Rc;
 
     let temporary_observer = Rc::new(RefCell::new(Vec::new()));
+    let hex_seed = local_key_hex_seed(VALID_V1);
     with_codec_secret_release_observer(Rc::clone(&temporary_observer), || {
-        fuzz_local_root_key_file(format!("hex:{VALID_V1}").as_bytes());
+        fuzz_local_root_key_file(hex_seed.as_slice());
     });
 
     assert!(released_zeroized_once(
@@ -568,6 +570,13 @@ fn local_key_fuzz_boundary_zeroizes_decoded_artifact_custody() {
             CodecSecretRelease::FuzzCandidate,
         ]
     ));
+}
+
+fn local_key_hex_seed(encoded: &str) -> Zeroizing<Vec<u8>> {
+    let mut seed = Zeroizing::new(Vec::with_capacity(b"hex:".len() + encoded.len()));
+    seed.extend_from_slice(b"hex:");
+    seed.extend_from_slice(encoded.as_bytes());
+    seed
 }
 
 fn decode_hex(source: &str) -> Result<Zeroizing<Vec<u8>>, &'static str> {

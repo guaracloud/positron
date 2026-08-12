@@ -1,5 +1,7 @@
 use std::os::unix::fs::MetadataExt;
 
+use zeroize::Zeroizing;
+
 use super::bootstrap::{FreshInitializationRootProof, initialize_local_key};
 use super::initialization_io::{InitializationFault, with_initialization_fault};
 use super::test_support::SecurityRoot;
@@ -19,7 +21,7 @@ fn partial_write_failure_retains_final_name_residue_without_cleanup()
         observed.map(|_| ()),
         Err(LocalKeyFailure::new(LocalKeyFailureCode::WriteFailed))
     );
-    let residue = std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?;
+    let residue = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
     assert_eq!(residue.len(), 80);
     assert!(residue.starts_with(&LOCAL_KEY_FILE_MAGIC));
     Ok(())
