@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_kernel::{
-    PrimaryDataVolume, VolumeCompletionState, VolumeFailureCode, VolumeOperation, VolumeRetryClass,
+    PrimaryDataVolume, VolumeCompletionState, VolumeFailureCode, VolumeFileSystem, VolumeOperation,
+    VolumeRetryClass,
 };
 
 static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -48,6 +49,21 @@ fn existing_filesystem_directory_can_be_acquired() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn acquisition_reports_the_kernel_qualified_local_filesystem() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+
+    let volume = PrimaryDataVolume::acquire(root.path())?;
+    let first_mount_identity = volume.mount_identity();
+
+    assert_eq!(volume.filesystem(), VolumeFileSystem::Apfs);
+    drop(volume);
+    let reopened = PrimaryDataVolume::acquire(root.path())?;
+    assert_eq!(reopened.mount_identity(), first_mount_identity);
+    Ok(())
+}
+
 #[test]
 fn missing_root_is_rejected_without_creating_it() -> Result<(), Box<dyn Error>> {
     let parent = TemporaryRoot::new()?;
@@ -60,7 +76,10 @@ fn missing_root_is_rejected_without_creating_it() -> Result<(), Box<dyn Error>> 
         failure.retry_class(),
         VolumeRetryClass::AfterExternalCorrection
     );
-    assert_eq!(failure.completion_state(), VolumeCompletionState::Rejected);
+    assert_eq!(
+        failure.completion_state(),
+        VolumeCompletionState::RejectedBeforeProbeMutation
+    );
     assert_eq!(failure.operation(), VolumeOperation::ClassifyRoot);
     assert!(!missing.exists());
     Ok(())
@@ -88,7 +107,10 @@ fn a_second_writer_is_rejected_while_ownership_is_held() -> Result<(), Box<dyn E
 
     assert_eq!(failure.code(), VolumeFailureCode::Busy);
     assert_eq!(failure.retry_class(), VolumeRetryClass::AfterBackoff);
-    assert_eq!(failure.completion_state(), VolumeCompletionState::Rejected);
+    assert_eq!(
+        failure.completion_state(),
+        VolumeCompletionState::RejectedBeforeProbeMutation
+    );
     assert_eq!(failure.operation(), VolumeOperation::AcquireOwnershipLock);
     Ok(())
 }
@@ -146,9 +168,15 @@ fn unexpected_probe_residue_is_preserved_and_fails_closed() -> Result<(), Box<dy
     assert_eq!(failure.operation(), VolumeOperation::PrepareProbe);
     assert_eq!(
         failure.completion_state(),
-        VolumeCompletionState::ProbeCleanupIncomplete
+        VolumeCompletionState::ProbeResiduePresent
     );
     assert_eq!(fs::read(unexpected)?, b"do-not-delete");
+    assert!(!root.path().join(".positron-volume.lock").exists());
+    let mut names = fs::read_dir(root.path())?
+        .map(|entry| entry.map(|value| value.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    assert_eq!(names, [".positron-volume-probe"]);
     Ok(())
 }
 

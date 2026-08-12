@@ -8,12 +8,17 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use rustix::fs::{self as unix_fs, AtFlags, Mode, OFlags};
+
 #[cfg(test)]
 use std::path::PathBuf;
+
+#[cfg(test)]
+use std::cell::RefCell;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -29,6 +34,8 @@ pub struct OwnedPrimaryDataVolume {
     _root: File,
     _ownership_lock: File,
     _root_identity: VolumeRootIdentity,
+    filesystem: VolumeFileSystem,
+    mount_identity: VolumeMountIdentity,
 }
 
 impl std::fmt::Debug for OwnedPrimaryDataVolume {
@@ -43,6 +50,40 @@ impl OwnedPrimaryDataVolume {
     pub const fn root_identity(&self) -> VolumeRootIdentity {
         self._root_identity
     }
+
+    /// Returns the closed local filesystem qualification used at acquisition.
+    #[must_use]
+    pub const fn filesystem(&self) -> VolumeFileSystem {
+        self.filesystem
+    }
+
+    /// Returns the opaque qualified mount identity bound at acquisition.
+    #[must_use]
+    pub const fn mount_identity(&self) -> VolumeMountIdentity {
+        self.mount_identity
+    }
+}
+
+/// A kernel-identified local filesystem qualified for the Release 1 contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VolumeFileSystem {
+    /// Apple File System.
+    Apfs,
+    /// Linux ext2, ext3, or ext4.
+    Ext,
+    /// XFS.
+    Xfs,
+    /// Btrfs.
+    Btrfs,
+    /// ZFS.
+    Zfs,
+}
+
+/// The opaque identity of a qualified local filesystem mount.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeMountIdentity {
+    device: u64,
+    filesystem: VolumeFileSystem,
 }
 
 /// The opaque filesystem identity of one Primary Data Volume root.
@@ -99,12 +140,14 @@ pub enum VolumeRetryClass {
 /// The durable completion truth of a failed acquisition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolumeCompletionState {
-    /// Acquisition stopped before the owned probe began.
-    Rejected,
-    /// The failed probe left no dedicated probe artifacts behind.
-    ProbeCleaned,
-    /// Probe residue remains because bounded cleanup could not prove it safe.
-    ProbeCleanupIncomplete,
+    /// Acquisition stopped before creating the dedicated probe directory.
+    RejectedBeforeProbeMutation,
+    /// Probe artifacts are absent and their removal was synchronized to the root.
+    ProbeCleanupSynchronized,
+    /// Probe artifacts are physically absent, but the final root synchronization failed.
+    ProbeCleanupDurabilityUncertain,
+    /// Probe residue is present or cannot be safely distinguished from unknown state.
+    ProbeResiduePresent,
 }
 
 /// The bounded operation that produced a Primary Data Volume failure.
@@ -112,6 +155,8 @@ pub enum VolumeCompletionState {
 pub enum VolumeOperation {
     /// Classifying the configured root before acquisition.
     ClassifyRoot,
+    /// Binding the root handle to a qualified local filesystem mount.
+    ClassifyMount,
     /// Confirming that the opened directory is the classified filesystem root.
     VerifyRootIdentity,
     /// Opening the fixed process-lifetime ownership-lock file.
@@ -142,6 +187,99 @@ pub enum VolumeOperation {
     SynchronizeProbeDirectory,
     /// Removing the bounded set of dedicated probe artifacts.
     CleanupProbe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VolumeEvent {
+    ClassifyRootPath,
+    OpenRootDirectory,
+    ReadRootHandleIdentity,
+    ClassifyMount,
+    InspectProbeResidue,
+    BeforeOwnershipArtifact,
+    CreateOwnershipArtifact,
+    OpenOwnershipArtifact,
+    AcquireOwnership,
+    VerifyOwnershipAfterLock,
+    CreateProbeDirectory,
+    OpenProbeDirectory,
+    CreateProbeCandidate,
+    WriteProbePayload,
+    SynchronizeProbePayload,
+    ReopenProbePayload,
+    ReadProbePayload,
+    TruncateProbePayload,
+    SynchronizeProbeTruncation,
+    ReopenTruncatedProbe,
+    ReadTruncatedProbe,
+    RenameProbeCandidate,
+    SynchronizeProbeDirectory,
+    CleanupProbeCandidate,
+    CleanupProbePublished,
+    CleanupProbeDirectory,
+    SynchronizeRootAfterCleanup,
+}
+
+#[cfg(test)]
+thread_local! {
+    static EVENT_ACTION: RefCell<Option<ScheduledEventAction>> = RefCell::new(None);
+    static EVENT_FAULT: std::cell::Cell<Option<(VolumeEvent, io::ErrorKind)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+type ScheduledEventAction = (VolumeEvent, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+fn with_event_action<T>(
+    event: VolumeEvent,
+    event_action: impl FnOnce() + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    EVENT_ACTION.with(|scheduled| {
+        let previous = scheduled.replace(Some((event, Box::new(event_action))));
+        let result = action();
+        scheduled.replace(previous);
+        result
+    })
+}
+
+#[cfg(test)]
+fn with_event_fault<T>(event: VolumeEvent, kind: io::ErrorKind, action: impl FnOnce() -> T) -> T {
+    EVENT_FAULT.with(|scheduled| {
+        let previous = scheduled.replace(Some((event, kind)));
+        let result = action();
+        scheduled.set(previous);
+        result
+    })
+}
+
+fn emit_event(_event: VolumeEvent) -> Result<(), io::Error> {
+    #[cfg(test)]
+    EVENT_ACTION.with(|scheduled| {
+        let should_run = scheduled
+            .borrow()
+            .as_ref()
+            .is_some_and(|(event, _)| *event == _event);
+        if should_run && let Some((_, action)) = scheduled.borrow_mut().take() {
+            action();
+        }
+    });
+    #[cfg(test)]
+    if let Some((event, kind)) = EVENT_FAULT.with(|scheduled| scheduled.get())
+        && event == _event
+    {
+        EVENT_FAULT.with(|scheduled| scheduled.set(None));
+        return Err(io::Error::from(kind));
+    }
+    Ok(())
+}
+
+fn acquisition_event(event: VolumeEvent, operation: VolumeOperation) -> Result<(), VolumeFailure> {
+    emit_event(event).map_err(|source| VolumeFailure::from_io(operation, source))
+}
+
+fn probe_event(event: VolumeEvent, operation: VolumeOperation) -> Result<(), VolumeFailure> {
+    emit_event(event).map_err(|source| VolumeFailure::probe_failure(operation, source))
 }
 
 impl VolumeFailure {
@@ -178,7 +316,7 @@ impl VolumeFailure {
         Self {
             code,
             retry_class,
-            completion_state: VolumeCompletionState::Rejected,
+            completion_state: VolumeCompletionState::RejectedBeforeProbeMutation,
             operation,
             source,
         }
@@ -188,7 +326,7 @@ impl VolumeFailure {
         Self {
             code: VolumeFailureCode::Inconsistent,
             retry_class: VolumeRetryClass::Never,
-            completion_state: VolumeCompletionState::ProbeCleanupIncomplete,
+            completion_state: VolumeCompletionState::ProbeResiduePresent,
             operation: VolumeOperation::PrepareProbe,
             source,
         }
@@ -196,15 +334,19 @@ impl VolumeFailure {
 
     fn probe_failure(operation: VolumeOperation, source: io::Error) -> Self {
         let mut failure = Self::from_io(operation, source);
-        failure.completion_state = VolumeCompletionState::ProbeCleaned;
+        failure.completion_state = VolumeCompletionState::ProbeCleanupSynchronized;
         failure
     }
 
-    fn inconsistent_cleanup(source: io::Error) -> Self {
+    fn inconsistent_cleanup(source: io::Error, artifacts_absent: bool) -> Self {
         Self {
             code: VolumeFailureCode::Inconsistent,
             retry_class: VolumeRetryClass::Never,
-            completion_state: VolumeCompletionState::ProbeCleanupIncomplete,
+            completion_state: if artifacts_absent {
+                VolumeCompletionState::ProbeCleanupDurabilityUncertain
+            } else {
+                VolumeCompletionState::ProbeResiduePresent
+            },
             operation: VolumeOperation::CleanupProbe,
             source,
         }
@@ -253,6 +395,7 @@ impl PrimaryDataVolume {
     /// This operation never creates a missing root and refuses a root reached
     /// through a symbolic link.
     pub fn acquire(root: &Path) -> Result<OwnedPrimaryDataVolume, VolumeFailure> {
+        acquisition_event(VolumeEvent::ClassifyRootPath, VolumeOperation::ClassifyRoot)?;
         let path_metadata =
             perform_io(VolumeOperation::ClassifyRoot, || fs::symlink_metadata(root))
                 .map_err(|source| VolumeFailure::from_io(VolumeOperation::ClassifyRoot, source))?;
@@ -266,8 +409,16 @@ impl PrimaryDataVolume {
             ));
         }
 
+        acquisition_event(
+            VolumeEvent::OpenRootDirectory,
+            VolumeOperation::ClassifyRoot,
+        )?;
         let root_file = perform_io(VolumeOperation::ClassifyRoot, || File::open(root))
             .map_err(|source| VolumeFailure::from_io(VolumeOperation::ClassifyRoot, source))?;
+        acquisition_event(
+            VolumeEvent::ReadRootHandleIdentity,
+            VolumeOperation::ClassifyRoot,
+        )?;
         let handle_metadata = perform_io(VolumeOperation::ClassifyRoot, || root_file.metadata())
             .map_err(|source| VolumeFailure::from_io(VolumeOperation::ClassifyRoot, source))?;
         let path_identity = root_identity(&path_metadata)?;
@@ -286,57 +437,173 @@ impl PrimaryDataVolume {
             ));
         }
 
-        let ownership_lock_path = root.join(".positron-volume.lock");
-        let ownership_lock = open_ownership_artifact(&ownership_lock_path)?;
-        verify_ownership_artifact(&ownership_lock_path, &ownership_lock, handle_identity)?;
+        let filesystem = qualify_local_mount(&root_file)?;
+        let mount_identity = VolumeMountIdentity {
+            device: handle_identity.device,
+            filesystem,
+        };
+
+        acquisition_event(
+            VolumeEvent::BeforeOwnershipArtifact,
+            VolumeOperation::VerifyRootIdentity,
+        )?;
+        let current_metadata = fs::symlink_metadata(root).map_err(|source| {
+            VolumeFailure::from_io(VolumeOperation::VerifyRootIdentity, source)
+        })?;
+        if root_identity(&current_metadata)? != handle_identity {
+            return Err(VolumeFailure::from_io(
+                VolumeOperation::VerifyRootIdentity,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "primary data volume root changed before ownership acquisition",
+                ),
+            ));
+        }
+        reject_existing_probe_residue(&root_file)?;
+        let ownership_lock = open_ownership_artifact(&root_file)?;
+        verify_ownership_artifact(&root_file, &ownership_lock, handle_identity)?;
         try_lock_ownership(&ownership_lock).map_err(|source| {
             VolumeFailure::from_io(VolumeOperation::AcquireOwnershipLock, source)
         })?;
-        run_capability_probe(root, &root_file)?;
+        acquisition_event(
+            VolumeEvent::VerifyOwnershipAfterLock,
+            VolumeOperation::OpenOwnershipLock,
+        )?;
+        verify_ownership_artifact(&root_file, &ownership_lock, handle_identity)?;
+        run_capability_probe(&root_file)?;
+        verify_ownership_artifact(&root_file, &ownership_lock, handle_identity)?;
+        let final_metadata = fs::symlink_metadata(root).map_err(|source| {
+            let mut failure = VolumeFailure::from_io(VolumeOperation::VerifyRootIdentity, source);
+            failure.completion_state = VolumeCompletionState::ProbeCleanupSynchronized;
+            failure
+        })?;
+        if root_identity(&final_metadata)? != handle_identity {
+            let mut failure = VolumeFailure::from_io(
+                VolumeOperation::VerifyRootIdentity,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "primary data volume root changed during capability verification",
+                ),
+            );
+            failure.completion_state = VolumeCompletionState::ProbeCleanupSynchronized;
+            return Err(failure);
+        }
 
         Ok(OwnedPrimaryDataVolume {
             _root: root_file,
             _ownership_lock: ownership_lock,
             _root_identity: handle_identity,
+            filesystem,
+            mount_identity,
         })
     }
 }
 
-fn open_ownership_artifact(path: &Path) -> Result<File, VolumeFailure> {
-    let existing = perform_io(VolumeOperation::OpenOwnershipLock, || {
-        fs::symlink_metadata(path)
-    });
-    let create_new = match existing {
-        Ok(metadata) if metadata.file_type().is_file() => false,
-        Ok(_) => {
-            return Err(VolumeFailure::from_io(
+fn open_ownership_artifact(root: &File) -> Result<File, VolumeFailure> {
+    const NAME: &str = ".positron-volume.lock";
+    let existing_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    acquisition_event(
+        VolumeEvent::OpenOwnershipArtifact,
+        VolumeOperation::OpenOwnershipLock,
+    )?;
+    match unix_fs::openat(root, NAME, existing_flags, Mode::empty()) {
+        Ok(fd) => Ok(File::from(fd)),
+        Err(rustix::io::Errno::NOENT) => {
+            acquisition_event(
+                VolumeEvent::CreateOwnershipArtifact,
                 VolumeOperation::OpenOwnershipLock,
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "ownership artifact is not a regular volume file",
-                ),
-            ));
+            )?;
+            match unix_fs::openat(
+                root,
+                NAME,
+                existing_flags | OFlags::CREATE | OFlags::EXCL,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(fd) => Ok(File::from(fd)),
+                Err(rustix::io::Errno::EXIST) => {
+                    unix_fs::openat(root, NAME, existing_flags, Mode::empty())
+                        .map(File::from)
+                        .map_err(io::Error::from)
+                        .map_err(|source| {
+                            VolumeFailure::from_io(VolumeOperation::OpenOwnershipLock, source)
+                        })
+                },
+                Err(source) => Err(VolumeFailure::from_io(
+                    VolumeOperation::OpenOwnershipLock,
+                    io::Error::from(source),
+                )),
+            }
         },
-        Err(source) if source.kind() == io::ErrorKind::NotFound => true,
-        Err(source) => {
-            return Err(VolumeFailure::from_io(
-                VolumeOperation::OpenOwnershipLock,
-                source,
-            ));
-        },
-    };
-    perform_io(VolumeOperation::OpenOwnershipLock, || {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        if create_new {
-            options.create_new(true);
-        }
-        options.open(path)
-    })
-    .map_err(|source| VolumeFailure::from_io(VolumeOperation::OpenOwnershipLock, source))
+        Err(source) => Err(VolumeFailure::from_io(
+            VolumeOperation::OpenOwnershipLock,
+            io::Error::from(source),
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn qualify_local_mount(root: &File) -> Result<VolumeFileSystem, VolumeFailure> {
+    acquisition_event(VolumeEvent::ClassifyMount, VolumeOperation::ClassifyMount)?;
+    let statistics = unix_fs::fstatfs(root)
+        .map_err(io::Error::from)
+        .map_err(|source| VolumeFailure::from_io(VolumeOperation::ClassifyMount, source))?;
+    let end = statistics
+        .f_fstypename
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(statistics.f_fstypename.len());
+    let name = statistics.f_fstypename.get(..end).unwrap_or_default();
+    if name
+        .iter()
+        .copied()
+        .eq(b"apfs".iter().map(|byte| *byte as i8))
+    {
+        Ok(VolumeFileSystem::Apfs)
+    } else {
+        Err(VolumeFailure::from_io(
+            VolumeOperation::ClassifyMount,
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem mount is not in the Release 1 local qualification set",
+            ),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn qualify_local_mount(root: &File) -> Result<VolumeFileSystem, VolumeFailure> {
+    acquisition_event(VolumeEvent::ClassifyMount, VolumeOperation::ClassifyMount)?;
+    let statistics = unix_fs::fstatfs(root)
+        .map_err(io::Error::from)
+        .map_err(|source| VolumeFailure::from_io(VolumeOperation::ClassifyMount, source))?;
+    match statistics.f_type as u64 {
+        0xEF53 => Ok(VolumeFileSystem::Ext),
+        0x5846_5342 => Ok(VolumeFileSystem::Xfs),
+        0x9123_683E => Ok(VolumeFileSystem::Btrfs),
+        0x2FC1_2FC1 => Ok(VolumeFileSystem::Zfs),
+        _ => Err(VolumeFailure::from_io(
+            VolumeOperation::ClassifyMount,
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem mount is not in the Release 1 local qualification set",
+            ),
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn qualify_local_mount(_root: &File) -> Result<VolumeFileSystem, VolumeFailure> {
+    Err(VolumeFailure::from_io(
+        VolumeOperation::ClassifyMount,
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem mount qualification is unavailable on this platform",
+        ),
+    ))
 }
 
 fn try_lock_ownership(ownership_lock: &File) -> Result<(), io::Error> {
+    emit_event(VolumeEvent::AcquireOwnership)?;
     perform_io(VolumeOperation::AcquireOwnershipLock, || {
         ownership_lock.try_lock().map_err(|failure| match failure {
             TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
@@ -345,46 +612,102 @@ fn try_lock_ownership(ownership_lock: &File) -> Result<(), io::Error> {
     })
 }
 
-fn reject_existing_probe_residue(root: &Path) -> Result<(), VolumeFailure> {
-    let probe_path = root.join(".positron-volume-probe");
-    match perform_io(VolumeOperation::PrepareProbe, || {
-        fs::symlink_metadata(&probe_path)
-    }) {
+fn reject_existing_probe_residue(root: &File) -> Result<(), VolumeFailure> {
+    acquisition_event(
+        VolumeEvent::InspectProbeResidue,
+        VolumeOperation::PrepareProbe,
+    )?;
+    match unix_fs::statat(root, ".positron-volume-probe", AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => Err(VolumeFailure::inconsistent_probe(io::Error::new(
             io::ErrorKind::InvalidData,
             "dedicated capability-probe area contains residual state",
         ))),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(rustix::io::Errno::NOENT) => Ok(()),
         Err(source) => Err(VolumeFailure::from_io(
             VolumeOperation::PrepareProbe,
-            source,
+            io::Error::from(source),
         )),
     }
 }
 
-fn run_capability_probe(root: &Path, root_file: &File) -> Result<(), VolumeFailure> {
+fn run_capability_probe(root: &File) -> Result<(), VolumeFailure> {
     const PROBE_PAYLOAD: &[u8] = b"positron-volume-probe";
 
-    reject_existing_probe_residue(root)?;
-    let probe_path = root.join(".positron-volume-probe");
-    perform_io(VolumeOperation::PrepareProbe, || {
-        fs::create_dir(&probe_path)
-    })
+    acquisition_event(
+        VolumeEvent::CreateProbeDirectory,
+        VolumeOperation::PrepareProbe,
+    )?;
+    unix_fs::mkdirat(
+        root,
+        ".positron-volume-probe",
+        Mode::RUSR | Mode::WUSR | Mode::XUSR,
+    )
+    .map_err(io::Error::from)
     .map_err(|source| VolumeFailure::from_io(VolumeOperation::PrepareProbe, source))?;
+    let created_probe_identity = entry_identity(root, ".positron-volume-probe")
+        .map_err(|source| VolumeFailure::probe_failure(VolumeOperation::PrepareProbe, source))?;
+    if let Err(failure) = probe_event(
+        VolumeEvent::OpenProbeDirectory,
+        VolumeOperation::PrepareProbe,
+    ) {
+        return finish_unopened_probe_failure(root, created_probe_identity, failure);
+    }
+    let probe_directory = match unix_fs::openat(
+        root,
+        ".positron-volume-probe",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    {
+        Ok(directory) => directory,
+        Err(source) => {
+            let failure = VolumeFailure::probe_failure(
+                VolumeOperation::PrepareProbe,
+                io::Error::from(source),
+            );
+            return finish_unopened_probe_failure(root, created_probe_identity, failure);
+        },
+    };
+    let probe_identity = file_identity(&probe_directory)?;
+    if probe_identity != created_probe_identity {
+        return Err(VolumeFailure::inconsistent_cleanup(
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "probe directory identity changed while opening",
+            ),
+            false,
+        ));
+    }
 
+    let mut owned_artifact_identity = None;
     let probe_result = (|| {
-        let candidate_path = probe_path.join("candidate");
-        let mut candidate = perform_io(VolumeOperation::OpenProbeFile, || {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&candidate_path)
-        })
+        probe_event(
+            VolumeEvent::CreateProbeCandidate,
+            VolumeOperation::OpenProbeFile,
+        )?;
+        let mut candidate = unix_fs::openat(
+            &probe_directory,
+            "candidate",
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
         .map_err(|source| VolumeFailure::probe_failure(VolumeOperation::OpenProbeFile, source))?;
+        let candidate_identity = file_identity(&candidate)?;
+        owned_artifact_identity = Some(candidate_identity);
+        probe_event(
+            VolumeEvent::WriteProbePayload,
+            VolumeOperation::WriteProbeFile,
+        )?;
         write_probe_payload(&mut candidate, PROBE_PAYLOAD).map_err(|source| {
             VolumeFailure::probe_failure(VolumeOperation::WriteProbeFile, source)
         })?;
+        probe_event(
+            VolumeEvent::SynchronizeProbePayload,
+            VolumeOperation::SynchronizeProbeFile,
+        )?;
         perform_io(VolumeOperation::SynchronizeProbeFile, || {
             candidate.sync_all()
         })
@@ -393,14 +716,24 @@ fn run_capability_probe(root: &Path, root_file: &File) -> Result<(), VolumeFailu
         })?;
         drop(candidate);
 
-        let mut reopened = perform_io(VolumeOperation::ReopenProbeFile, || {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&candidate_path)
-        })
-        .map_err(|source| VolumeFailure::probe_failure(VolumeOperation::ReopenProbeFile, source))?;
+        probe_event(
+            VolumeEvent::ReopenProbePayload,
+            VolumeOperation::ReopenProbeFile,
+        )?;
+        let mut reopened =
+            open_probe_file(&probe_directory, "candidate", true).map_err(|source| {
+                VolumeFailure::probe_failure(VolumeOperation::ReopenProbeFile, source)
+            })?;
+        verify_file_identity(
+            &reopened,
+            candidate_identity,
+            VolumeOperation::ReopenProbeFile,
+        )?;
         let mut observed = [0_u8; PROBE_PAYLOAD.len()];
+        probe_event(
+            VolumeEvent::ReadProbePayload,
+            VolumeOperation::ReadProbeFile,
+        )?;
         perform_io(VolumeOperation::ReadProbeFile, || {
             reopened.read_exact(&mut observed)
         })
@@ -418,8 +751,16 @@ fn run_capability_probe(root: &Path, root_file: &File) -> Result<(), VolumeFailu
                 ),
             ));
         }
+        probe_event(
+            VolumeEvent::TruncateProbePayload,
+            VolumeOperation::TruncateProbeFile,
+        )?;
         perform_io(VolumeOperation::TruncateProbeFile, || reopened.set_len(8)).map_err(
             |source| VolumeFailure::probe_failure(VolumeOperation::TruncateProbeFile, source),
+        )?;
+        probe_event(
+            VolumeEvent::SynchronizeProbeTruncation,
+            VolumeOperation::SynchronizeProbeFile,
         )?;
         perform_io(VolumeOperation::SynchronizeProbeFile, || {
             reopened.sync_all()
@@ -429,12 +770,25 @@ fn run_capability_probe(root: &Path, root_file: &File) -> Result<(), VolumeFailu
         })?;
         drop(reopened);
 
-        let mut truncated = perform_io(VolumeOperation::ReopenProbeFile, || {
-            File::open(&candidate_path)
-        })
-        .map_err(|source| VolumeFailure::probe_failure(VolumeOperation::ReopenProbeFile, source))?;
+        probe_event(
+            VolumeEvent::ReopenTruncatedProbe,
+            VolumeOperation::ReopenProbeFile,
+        )?;
+        let mut truncated =
+            open_probe_file(&probe_directory, "candidate", false).map_err(|source| {
+                VolumeFailure::probe_failure(VolumeOperation::ReopenProbeFile, source)
+            })?;
+        verify_file_identity(
+            &truncated,
+            candidate_identity,
+            VolumeOperation::ReopenProbeFile,
+        )?;
         let expected_prefix = b"positron";
         let mut observed_prefix = [0_u8; 8];
+        probe_event(
+            VolumeEvent::ReadTruncatedProbe,
+            VolumeOperation::ReadProbeFile,
+        )?;
         perform_io(VolumeOperation::ReadProbeFile, || {
             truncated.read_exact(&mut observed_prefix)
         })
@@ -460,32 +814,135 @@ fn run_capability_probe(root: &Path, root_file: &File) -> Result<(), VolumeFailu
         }
         drop(truncated);
 
-        let published_path = probe_path.join("published");
-        perform_io(VolumeOperation::RenameProbeFile, || {
-            fs::rename(&candidate_path, &published_path)
-        })
-        .map_err(|source| VolumeFailure::probe_failure(VolumeOperation::RenameProbeFile, source))?;
-        let probe_directory = perform_io(VolumeOperation::SynchronizeProbeDirectory, || {
-            File::open(&probe_path)
-        })
-        .map_err(|source| {
-            VolumeFailure::probe_failure(VolumeOperation::SynchronizeProbeDirectory, source)
-        })?;
+        probe_event(
+            VolumeEvent::RenameProbeCandidate,
+            VolumeOperation::RenameProbeFile,
+        )?;
+        verify_entry_identity(&probe_directory, "candidate", candidate_identity)?;
+        unix_fs::renameat(&probe_directory, "candidate", &probe_directory, "published")
+            .map_err(io::Error::from)
+            .map_err(|source| {
+                VolumeFailure::probe_failure(VolumeOperation::RenameProbeFile, source)
+            })?;
+        verify_entry_identity(&probe_directory, "published", candidate_identity)?;
+        probe_event(
+            VolumeEvent::SynchronizeProbeDirectory,
+            VolumeOperation::SynchronizeProbeDirectory,
+        )?;
         perform_io(VolumeOperation::SynchronizeProbeDirectory, || {
             probe_directory.sync_all()
         })
         .map_err(|source| {
             VolumeFailure::probe_failure(VolumeOperation::SynchronizeProbeDirectory, source)
         })?;
-        Ok(())
+        Ok(candidate_identity)
     })();
 
-    let cleanup_result = cleanup_probe(root, root_file);
+    let cleanup_result = cleanup_probe(
+        root,
+        &probe_directory,
+        probe_identity,
+        owned_artifact_identity,
+    );
     match (probe_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(_), Ok(())) => Ok(()),
         (Err(failure), Ok(())) => Err(failure),
-        (_, Err(source)) => Err(VolumeFailure::inconsistent_cleanup(source)),
+        (_, Err((source, artifacts_absent))) => Err(VolumeFailure::inconsistent_cleanup(
+            source,
+            artifacts_absent,
+        )),
     }
+}
+
+fn finish_unopened_probe_failure(
+    root: &File,
+    probe_identity: VolumeRootIdentity,
+    failure: VolumeFailure,
+) -> Result<(), VolumeFailure> {
+    let cleanup = verify_entry_identity(root, ".positron-volume-probe", probe_identity)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        .and_then(|()| {
+            unix_fs::unlinkat(root, ".positron-volume-probe", AtFlags::REMOVEDIR)
+                .map_err(io::Error::from)
+        });
+    match cleanup {
+        Ok(()) => match root.sync_all() {
+            Ok(()) => Err(failure),
+            Err(source) => Err(VolumeFailure::inconsistent_cleanup(source, true)),
+        },
+        Err(source) => Err(VolumeFailure::inconsistent_cleanup(source, false)),
+    }
+}
+
+fn file_identity(file: &File) -> Result<VolumeRootIdentity, VolumeFailure> {
+    file.metadata()
+        .map_err(|source| VolumeFailure::from_io(VolumeOperation::VerifyRootIdentity, source))
+        .and_then(|metadata| root_identity(&metadata))
+}
+
+fn verify_file_identity(
+    file: &File,
+    expected: VolumeRootIdentity,
+    operation: VolumeOperation,
+) -> Result<(), VolumeFailure> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| VolumeFailure::probe_failure(operation, source))?;
+    let observed = root_identity(&metadata)?;
+    if observed == expected && metadata.file_type().is_file() && metadata.nlink() == 1 {
+        Ok(())
+    } else {
+        Err(VolumeFailure::probe_failure(
+            operation,
+            io::Error::new(io::ErrorKind::InvalidData, "probe file identity changed"),
+        ))
+    }
+}
+
+fn entry_identity(directory: &File, name: &str) -> Result<VolumeRootIdentity, io::Error> {
+    let metadata =
+        unix_fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    Ok(VolumeRootIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino,
+    })
+}
+
+fn verify_entry_identity(
+    directory: &File,
+    name: &str,
+    expected: VolumeRootIdentity,
+) -> Result<(), VolumeFailure> {
+    let observed = entry_identity(directory, name).map_err(|source| {
+        VolumeFailure::probe_failure(VolumeOperation::VerifyRootIdentity, source)
+    })?;
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(VolumeFailure::probe_failure(
+            VolumeOperation::VerifyRootIdentity,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "volume artifact identity changed",
+            ),
+        ))
+    }
+}
+
+fn open_probe_file(directory: &File, name: &str, writable: bool) -> Result<File, io::Error> {
+    let access = if writable {
+        OFlags::RDWR
+    } else {
+        OFlags::RDONLY
+    };
+    unix_fs::openat(
+        directory,
+        name,
+        access | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)
 }
 
 fn write_probe_payload(file: &mut File, payload: &[u8]) -> Result<(), io::Error> {
@@ -501,74 +958,54 @@ fn write_probe_payload(file: &mut File, payload: &[u8]) -> Result<(), io::Error>
     perform_io(VolumeOperation::WriteProbeFile, || file.write_all(payload))
 }
 
-fn cleanup_probe(root: &Path, root_file: &File) -> Result<(), io::Error> {
-    let probe_path = root.join(".positron-volume-probe");
-    for name in ["candidate", "published"] {
-        let artifact_path = probe_path.join(name);
-        match perform_io(VolumeOperation::CleanupProbe, || {
-            fs::remove_file(&artifact_path)
-        }) {
-            Ok(()) => {},
+fn cleanup_probe(
+    root: &File,
+    probe: &File,
+    probe_identity: VolumeRootIdentity,
+    expected_artifact: Option<VolumeRootIdentity>,
+) -> Result<(), (io::Error, bool)> {
+    for (name, event) in [
+        ("candidate", VolumeEvent::CleanupProbeCandidate),
+        ("published", VolumeEvent::CleanupProbePublished),
+    ] {
+        emit_event(event).map_err(|source| (source, false))?;
+        match entry_identity(probe, name) {
+            Ok(identity) if Some(identity) == expected_artifact => {
+                unix_fs::unlinkat(probe, name, AtFlags::empty())
+                    .map_err(io::Error::from)
+                    .map_err(|source| (source, false))?;
+            },
+            Ok(_) => {
+                return Err((
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "probe cleanup encountered an unowned artifact",
+                    ),
+                    false,
+                ));
+            },
             Err(source) if source.kind() == io::ErrorKind::NotFound => {},
-            Err(source) => return Err(source),
+            Err(source) => return Err((source, false)),
         }
     }
-    perform_io(VolumeOperation::CleanupProbe, || {
-        fs::remove_dir(&probe_path)
+    verify_entry_identity(root, ".positron-volume-probe", probe_identity).map_err(|failure| {
+        (
+            io::Error::new(io::ErrorKind::InvalidData, failure.to_string()),
+            false,
+        )
     })?;
-    perform_io(VolumeOperation::CleanupProbe, || root_file.sync_all())
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct OperationFault {
-    operation: VolumeOperation,
-    remaining_matches: usize,
-    effect: OperationFaultEffect,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-enum OperationFaultEffect {
-    Before(io::ErrorKind),
-    PartialWrite {
-        byte_count: usize,
-        kind: io::ErrorKind,
-    },
+    emit_event(VolumeEvent::CleanupProbeDirectory).map_err(|source| (source, false))?;
+    unix_fs::unlinkat(root, ".positron-volume-probe", AtFlags::REMOVEDIR)
+        .map_err(io::Error::from)
+        .map_err(|source| (source, false))?;
+    emit_event(VolumeEvent::SynchronizeRootAfterCleanup).map_err(|source| (source, true))?;
+    root.sync_all().map_err(|source| (source, true))
 }
 
 #[cfg(test)]
 thread_local! {
-    static OPERATION_FAULT: std::cell::Cell<Option<OperationFault>> = const { std::cell::Cell::new(None) };
+    static PARTIAL_WRITE_FAULT: std::cell::Cell<Option<(usize, io::ErrorKind)>> = const { std::cell::Cell::new(None) };
     static FORCED_MISMATCH: std::cell::Cell<Option<VolumeOperation>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn with_operation_fault<T>(
-    operation: VolumeOperation,
-    kind: io::ErrorKind,
-    action: impl FnOnce() -> T,
-) -> T {
-    with_operation_fault_at(operation, 1, kind, action)
-}
-
-#[cfg(test)]
-fn with_operation_fault_at<T>(
-    operation: VolumeOperation,
-    occurrence: usize,
-    kind: io::ErrorKind,
-    action: impl FnOnce() -> T,
-) -> T {
-    OPERATION_FAULT.with(|fault| {
-        let previous = fault.replace(Some(OperationFault {
-            operation,
-            remaining_matches: occurrence.max(1),
-            effect: OperationFaultEffect::Before(kind),
-        }));
-        let result = action();
-        fault.set(previous);
-        result
-    })
 }
 
 #[cfg(test)]
@@ -577,12 +1014,8 @@ fn with_partial_write_fault<T>(
     kind: io::ErrorKind,
     action: impl FnOnce() -> T,
 ) -> T {
-    OPERATION_FAULT.with(|fault| {
-        let previous = fault.replace(Some(OperationFault {
-            operation: VolumeOperation::WriteProbeFile,
-            remaining_matches: 1,
-            effect: OperationFaultEffect::PartialWrite { byte_count, kind },
-        }));
+    PARTIAL_WRITE_FAULT.with(|fault| {
+        let previous = fault.replace(Some((byte_count, kind)));
         let result = action();
         fault.set(previous);
         result
@@ -609,19 +1042,10 @@ fn values_match<T: PartialEq + ?Sized>(_operation: VolumeOperation, left: &T, ri
 
 #[cfg(test)]
 fn take_partial_write_fault() -> Option<(usize, io::ErrorKind)> {
-    OPERATION_FAULT.with(|fault| {
-        let scheduled = fault.get()?;
-        match scheduled {
-            OperationFault {
-                operation: VolumeOperation::WriteProbeFile,
-                remaining_matches: 1,
-                effect: OperationFaultEffect::PartialWrite { byte_count, kind },
-            } => {
-                fault.set(None);
-                Some((byte_count, kind))
-            },
-            _ => None,
-        }
+    PARTIAL_WRITE_FAULT.with(|fault| {
+        let scheduled = fault.get();
+        fault.set(None);
+        scheduled
     })
 }
 
@@ -629,52 +1053,21 @@ fn perform_io<T>(
     _operation: VolumeOperation,
     action: impl FnOnce() -> Result<T, io::Error>,
 ) -> Result<T, io::Error> {
-    #[cfg(test)]
-    if let Some(kind) = take_operation_fault(_operation) {
-        return Err(io::Error::from(kind));
-    }
     action()
-}
-
-#[cfg(test)]
-fn take_operation_fault(operation: VolumeOperation) -> Option<io::ErrorKind> {
-    OPERATION_FAULT.with(|fault| {
-        let mut scheduled = fault.get()?;
-        if scheduled.operation != operation {
-            return None;
-        }
-        if scheduled.remaining_matches > 1 {
-            scheduled.remaining_matches -= 1;
-            fault.set(Some(scheduled));
-            return None;
-        }
-        match scheduled.effect {
-            OperationFaultEffect::Before(kind) => {
-                fault.set(None);
-                Some(kind)
-            },
-            OperationFaultEffect::PartialWrite { .. } => None,
-        }
-    })
 }
 
 #[cfg(unix)]
 fn verify_ownership_artifact(
-    path: &Path,
+    root: &File,
     file: &File,
     root_id: VolumeRootIdentity,
 ) -> Result<(), VolumeFailure> {
-    let path_metadata = perform_io(VolumeOperation::OpenOwnershipLock, || {
-        fs::symlink_metadata(path)
-    })
-    .map_err(|source| VolumeFailure::from_io(VolumeOperation::OpenOwnershipLock, source))?;
     let handle_metadata = perform_io(VolumeOperation::OpenOwnershipLock, || file.metadata())
         .map_err(|source| VolumeFailure::from_io(VolumeOperation::OpenOwnershipLock, source))?;
-    let path_identity = root_identity(&path_metadata)?;
+    let path_identity = entry_identity(root, ".positron-volume.lock")
+        .map_err(|source| VolumeFailure::from_io(VolumeOperation::OpenOwnershipLock, source))?;
     let handle_identity = root_identity(&handle_metadata)?;
-    let safe = path_metadata.file_type().is_file()
-        && handle_metadata.file_type().is_file()
-        && path_metadata.nlink() == 1
+    let safe = handle_metadata.file_type().is_file()
         && handle_metadata.nlink() == 1
         && path_identity == handle_identity
         && handle_identity.device == root_id.device;
@@ -693,7 +1086,7 @@ fn verify_ownership_artifact(
 
 #[cfg(not(unix))]
 fn verify_ownership_artifact(
-    _path: &Path,
+    _root: &File,
     _file: &File,
     _root_identity: VolumeRootIdentity,
 ) -> Result<(), VolumeFailure> {
@@ -755,11 +1148,296 @@ mod tests {
     }
 
     #[test]
+    fn root_swap_before_ownership_mutation_fails_without_touching_either_directory()
+    -> Result<(), Box<dyn Error>> {
+        let parent = TestRoot::new()?;
+        let configured = parent.0.join("configured");
+        let original = parent.0.join("original");
+        fs::create_dir(&configured)?;
+        let configured_for_swap = configured.clone();
+        let original_for_swap = original.clone();
+
+        let failure = with_event_action(
+            VolumeEvent::BeforeOwnershipArtifact,
+            move || {
+                fs::rename(&configured_for_swap, &original_for_swap)
+                    .expect("test root move must succeed");
+                fs::create_dir(&configured_for_swap).expect("test replacement must succeed");
+            },
+            || PrimaryDataVolume::acquire(&configured),
+        )
+        .expect_err("replaced root must fail closed");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Inconsistent);
+        assert_eq!(failure.operation(), VolumeOperation::VerifyRootIdentity);
+        assert!(fs::read_dir(&configured)?.next().is_none());
+        assert!(fs::read_dir(&original)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn root_swaps_at_semantic_boundaries_never_redirect_volume_mutation()
+    -> Result<(), Box<dyn Error>> {
+        let events = [
+            VolumeEvent::ClassifyMount,
+            VolumeEvent::InspectProbeResidue,
+            VolumeEvent::OpenOwnershipArtifact,
+            VolumeEvent::CreateOwnershipArtifact,
+            VolumeEvent::AcquireOwnership,
+            VolumeEvent::CreateProbeDirectory,
+            VolumeEvent::OpenProbeDirectory,
+            VolumeEvent::CreateProbeCandidate,
+            VolumeEvent::WriteProbePayload,
+            VolumeEvent::SynchronizeProbePayload,
+            VolumeEvent::ReopenProbePayload,
+            VolumeEvent::ReadProbePayload,
+            VolumeEvent::TruncateProbePayload,
+            VolumeEvent::SynchronizeProbeTruncation,
+            VolumeEvent::ReopenTruncatedProbe,
+            VolumeEvent::ReadTruncatedProbe,
+            VolumeEvent::RenameProbeCandidate,
+            VolumeEvent::SynchronizeProbeDirectory,
+            VolumeEvent::CleanupProbeCandidate,
+            VolumeEvent::CleanupProbePublished,
+            VolumeEvent::CleanupProbeDirectory,
+            VolumeEvent::SynchronizeRootAfterCleanup,
+        ];
+
+        for event in events {
+            let parent = TestRoot::new()?;
+            let configured = parent.0.join("configured");
+            let original = parent.0.join("original");
+            fs::create_dir(&configured)?;
+            let configured_for_swap = configured.clone();
+            let original_for_swap = original.clone();
+
+            let failure = with_event_action(
+                event,
+                move || {
+                    fs::rename(&configured_for_swap, &original_for_swap)
+                        .expect("test root move must succeed");
+                    fs::create_dir(&configured_for_swap).expect("test replacement must succeed");
+                },
+                || PrimaryDataVolume::acquire(&configured),
+            )
+            .expect_err("replaced configured root must fail closed");
+
+            assert!(fs::read_dir(&configured)?.next().is_none(), "{event:?}");
+            assert_eq!(failure.operation(), VolumeOperation::VerifyRootIdentity);
+            if matches!(
+                event,
+                VolumeEvent::ClassifyMount | VolumeEvent::BeforeOwnershipArtifact
+            ) {
+                assert!(fs::read_dir(&original)?.next().is_none(), "{event:?}");
+            } else {
+                let names = fs::read_dir(&original)?
+                    .map(|entry| entry.map(|value| value.file_name()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                assert_eq!(names, [".positron-volume.lock"], "{event:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_mount_qualification_fails_before_any_volume_artifact() -> Result<(), Box<dyn Error>>
+    {
+        let root = TestRoot::new()?;
+
+        let failure = with_event_fault(
+            VolumeEvent::ClassifyMount,
+            io::ErrorKind::Unsupported,
+            || PrimaryDataVolume::acquire(&root.0),
+        )
+        .expect_err("unknown mount must fail closed");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Unsupported);
+        assert_eq!(failure.operation(), VolumeOperation::ClassifyMount);
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::RejectedBeforeProbeMutation
+        );
+        assert!(fs::read_dir(&root.0)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn competing_first_lock_creator_is_reported_busy() -> Result<(), Box<dyn Error>> {
+        use std::sync::{Arc, Mutex};
+
+        let root = TestRoot::new()?;
+        let held = Arc::new(Mutex::new(None));
+        let held_for_race = Arc::clone(&held);
+        let lock_path = root.0.join(".positron-volume.lock");
+
+        let failure = with_event_action(
+            VolumeEvent::CreateOwnershipArtifact,
+            move || {
+                let competitor =
+                    File::create(&lock_path).expect("competitor lock create must work");
+                competitor
+                    .try_lock()
+                    .expect("competitor lock acquisition must work");
+                *held_for_race.lock().expect("test mutex must be healthy") = Some(competitor);
+            },
+            || PrimaryDataVolume::acquire(&root.0),
+        )
+        .expect_err("contended first creation must fail");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Busy);
+        assert_eq!(failure.retry_class(), VolumeRetryClass::AfterBackoff);
+        assert_eq!(failure.operation(), VolumeOperation::AcquireOwnershipLock);
+        assert!(!root.0.join(".positron-volume-probe").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn final_cleanup_sync_failure_reports_absent_but_durability_uncertain()
+    -> Result<(), Box<dyn Error>> {
+        let root = TestRoot::new()?;
+
+        let failure = with_event_fault(
+            VolumeEvent::SynchronizeRootAfterCleanup,
+            io::ErrorKind::Interrupted,
+            || PrimaryDataVolume::acquire(&root.0),
+        )
+        .expect_err("final cleanup sync must remain truthful");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Inconsistent);
+        assert_eq!(failure.operation(), VolumeOperation::CleanupProbe);
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::ProbeCleanupDurabilityUncertain
+        );
+        assert!(!root.0.join(".positron-volume-probe").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_artifact_swap_before_locking_fails_closed() -> Result<(), Box<dyn Error>> {
+        let root = TestRoot::new()?;
+        let lock = root.0.join(".positron-volume.lock");
+        let displaced = root.0.join("displaced-lock");
+        let lock_for_swap = lock.clone();
+        let displaced_for_swap = displaced.clone();
+
+        let failure = with_event_action(
+            VolumeEvent::AcquireOwnership,
+            move || {
+                fs::rename(&lock_for_swap, &displaced_for_swap)
+                    .expect("test lock move must succeed");
+                fs::write(&lock_for_swap, b"unknown-owner").expect("replacement must succeed");
+            },
+            || PrimaryDataVolume::acquire(&root.0),
+        )
+        .expect_err("swapped ownership artifact must fail closed");
+
+        assert_eq!(failure.operation(), VolumeOperation::OpenOwnershipLock);
+        assert_eq!(fs::read(lock)?, b"unknown-owner");
+        assert!(displaced.exists());
+        assert!(!root.0.join(".positron-volume-probe").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn probe_directory_swap_before_opening_never_mutates_the_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let root = TestRoot::new()?;
+        let probe = root.0.join(".positron-volume-probe");
+        let displaced = root.0.join("displaced-probe");
+        let probe_for_swap = probe.clone();
+        let displaced_for_swap = displaced.clone();
+
+        let failure = with_event_action(
+            VolumeEvent::OpenProbeDirectory,
+            move || {
+                fs::rename(&probe_for_swap, &displaced_for_swap)
+                    .expect("test probe move must succeed");
+                fs::create_dir(&probe_for_swap).expect("probe replacement must succeed");
+            },
+            || PrimaryDataVolume::acquire(&root.0),
+        )
+        .expect_err("swapped probe directory must fail closed");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Inconsistent);
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::ProbeResiduePresent
+        );
+        assert!(fs::read_dir(&probe)?.next().is_none());
+        assert!(fs::read_dir(&displaced)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn probe_directory_swap_after_opening_preserves_the_replacement() -> Result<(), Box<dyn Error>>
+    {
+        let root = TestRoot::new()?;
+        let probe = root.0.join(".positron-volume-probe");
+        let displaced = root.0.join("displaced-probe");
+        let probe_for_swap = probe.clone();
+        let displaced_for_swap = displaced.clone();
+
+        let failure = with_event_action(
+            VolumeEvent::WriteProbePayload,
+            move || {
+                fs::rename(&probe_for_swap, &displaced_for_swap)
+                    .expect("test probe move must succeed");
+                fs::create_dir(&probe_for_swap).expect("probe replacement must succeed");
+                fs::write(probe_for_swap.join("unknown"), b"preserve")
+                    .expect("unknown replacement entry must succeed");
+            },
+            || PrimaryDataVolume::acquire(&root.0),
+        )
+        .expect_err("swapped probe directory must fail closed");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Inconsistent);
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::ProbeResiduePresent
+        );
+        assert_eq!(fs::read(probe.join("unknown"))?, b"preserve");
+        assert!(fs::read_dir(displaced)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_swap_before_truncation_never_truncates_the_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let root = TestRoot::new()?;
+        let foreign = root.0.join("foreign");
+        fs::write(&foreign, b"foreign-content-must-survive")?;
+        let root_for_swap = root.0.clone();
+        let foreign_for_swap = foreign.clone();
+
+        let failure = with_event_action(
+            VolumeEvent::TruncateProbePayload,
+            move || {
+                let probe = root_for_swap.join(".positron-volume-probe");
+                fs::rename(probe.join("candidate"), probe.join("displaced-candidate"))
+                    .expect("candidate move must succeed");
+                fs::hard_link(&foreign_for_swap, probe.join("candidate"))
+                    .expect("replacement hard link must succeed");
+            },
+            || PrimaryDataVolume::acquire(&root.0),
+        )
+        .expect_err("swapped candidate must fail closed");
+
+        assert_eq!(failure.code(), VolumeFailureCode::Inconsistent);
+        assert_eq!(fs::read(foreign)?, b"foreign-content-must-survive");
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::ProbeResiduePresent
+        );
+        Ok(())
+    }
+
+    #[test]
     fn probe_write_permission_failure_is_typed_and_cleaned() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault(
-            VolumeOperation::WriteProbeFile,
+        let failure = with_event_fault(
+            VolumeEvent::WriteProbePayload,
             io::ErrorKind::PermissionDenied,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -769,7 +1447,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::WriteProbeFile);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -779,8 +1457,8 @@ mod tests {
     fn probe_file_sync_exhaustion_is_typed_and_cleaned() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault(
-            VolumeOperation::SynchronizeProbeFile,
+        let failure = with_event_fault(
+            VolumeEvent::SynchronizeProbePayload,
             io::ErrorKind::StorageFull,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -790,7 +1468,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::SynchronizeProbeFile);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -800,8 +1478,8 @@ mod tests {
     fn probe_reopen_short_read_is_inconsistent_and_cleaned() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault(
-            VolumeOperation::ReadProbeFile,
+        let failure = with_event_fault(
+            VolumeEvent::ReadProbePayload,
             io::ErrorKind::UnexpectedEof,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -811,7 +1489,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::ReadProbeFile);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -821,8 +1499,8 @@ mod tests {
     fn probe_truncation_read_only_failure_is_typed_and_cleaned() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault(
-            VolumeOperation::TruncateProbeFile,
+        let failure = with_event_fault(
+            VolumeEvent::TruncateProbePayload,
             io::ErrorKind::ReadOnlyFilesystem,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -832,7 +1510,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::TruncateProbeFile);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -842,8 +1520,8 @@ mod tests {
     fn probe_rename_unsupported_failure_is_typed_and_cleaned() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault(
-            VolumeOperation::RenameProbeFile,
+        let failure = with_event_fault(
+            VolumeEvent::RenameProbeCandidate,
             io::ErrorKind::Unsupported,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -853,7 +1531,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::RenameProbeFile);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -863,8 +1541,8 @@ mod tests {
     fn probe_directory_sync_interruption_is_transient_and_cleaned() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault(
-            VolumeOperation::SynchronizeProbeDirectory,
+        let failure = with_event_fault(
+            VolumeEvent::SynchronizeProbeDirectory,
             io::ErrorKind::Interrupted,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -878,7 +1556,7 @@ mod tests {
         );
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -897,7 +1575,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::WriteProbeFile);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -907,9 +1585,8 @@ mod tests {
     fn post_truncation_reopen_failure_is_typed_and_cleaned() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault_at(
-            VolumeOperation::ReopenProbeFile,
-            2,
+        let failure = with_event_fault(
+            VolumeEvent::ReopenTruncatedProbe,
             io::ErrorKind::Interrupted,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -919,7 +1596,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::ReopenProbeFile);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -929,9 +1606,8 @@ mod tests {
     fn ambiguous_probe_cleanup_is_preserved_and_fails_closed() -> Result<(), Box<dyn Error>> {
         let root = TestRoot::new()?;
 
-        let failure = with_operation_fault_at(
-            VolumeOperation::CleanupProbe,
-            2,
+        let failure = with_event_fault(
+            VolumeEvent::CleanupProbePublished,
             io::ErrorKind::PermissionDenied,
             || PrimaryDataVolume::acquire(&root.0),
         )
@@ -942,7 +1618,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::CleanupProbe);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleanupIncomplete
+            VolumeCompletionState::ProbeResiduePresent
         );
         assert!(root.0.join(".positron-volume-probe/published").exists());
         Ok(())
@@ -952,60 +1628,61 @@ mod tests {
     fn root_acquisition_faults_remain_typed_and_precede_the_probe() -> Result<(), Box<dyn Error>> {
         let cases = [
             (
+                VolumeEvent::ClassifyRootPath,
                 VolumeOperation::ClassifyRoot,
-                1,
                 io::ErrorKind::PermissionDenied,
                 VolumeFailureCode::PermissionDenied,
             ),
             (
+                VolumeEvent::OpenRootDirectory,
                 VolumeOperation::ClassifyRoot,
-                2,
                 io::ErrorKind::TimedOut,
                 VolumeFailureCode::Transient,
             ),
             (
+                VolumeEvent::ReadRootHandleIdentity,
                 VolumeOperation::ClassifyRoot,
-                3,
                 io::ErrorKind::InvalidData,
                 VolumeFailureCode::Inconsistent,
             ),
             (
+                VolumeEvent::OpenOwnershipArtifact,
                 VolumeOperation::OpenOwnershipLock,
-                1,
                 io::ErrorKind::ReadOnlyFilesystem,
                 VolumeFailureCode::ReadOnly,
             ),
             (
+                VolumeEvent::CreateOwnershipArtifact,
                 VolumeOperation::OpenOwnershipLock,
-                2,
                 io::ErrorKind::PermissionDenied,
                 VolumeFailureCode::PermissionDenied,
             ),
             (
+                VolumeEvent::VerifyOwnershipAfterLock,
                 VolumeOperation::OpenOwnershipLock,
-                3,
                 io::ErrorKind::InvalidData,
                 VolumeFailureCode::Inconsistent,
             ),
             (
+                VolumeEvent::AcquireOwnership,
                 VolumeOperation::AcquireOwnershipLock,
-                1,
                 io::ErrorKind::Unsupported,
                 VolumeFailureCode::Unsupported,
             ),
         ];
 
-        for (operation, occurrence, kind, expected_code) in cases {
+        for (event, operation, kind, expected_code) in cases {
             let root = TestRoot::new()?;
-            let failure = with_operation_fault_at(operation, occurrence, kind, || {
-                PrimaryDataVolume::acquire(&root.0)
-            })
-            .expect_err("scheduled root acquisition fault must fail");
+            let failure = with_event_fault(event, kind, || PrimaryDataVolume::acquire(&root.0))
+                .expect_err("scheduled root acquisition fault must fail");
 
             assert_eq!(failure.code(), expected_code);
             assert_eq!(failure.operation(), operation);
-            assert_eq!(failure.completion_state(), VolumeCompletionState::Rejected);
-            assert!(!root.0.join(".positron-volume-probe").exists());
+            assert_eq!(
+                failure.completion_state(),
+                VolumeCompletionState::RejectedBeforeProbeMutation
+            );
+            assert!(!root.0.join(".positron-volume-probe").exists(), "{event:?}");
         }
         Ok(())
     }
@@ -1021,7 +1698,10 @@ mod tests {
 
         assert_eq!(failure.code(), VolumeFailureCode::Inconsistent);
         assert_eq!(failure.operation(), VolumeOperation::VerifyRootIdentity);
-        assert_eq!(failure.completion_state(), VolumeCompletionState::Rejected);
+        assert_eq!(
+            failure.completion_state(),
+            VolumeCompletionState::RejectedBeforeProbeMutation
+        );
         assert!(fs::read_dir(&root.0)?.next().is_none());
         Ok(())
     }
@@ -1039,7 +1719,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::VerifyProbeContents);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -1058,7 +1738,7 @@ mod tests {
         assert_eq!(failure.operation(), VolumeOperation::VerifyProbeTruncation);
         assert_eq!(
             failure.completion_state(),
-            VolumeCompletionState::ProbeCleaned
+            VolumeCompletionState::ProbeCleanupSynchronized
         );
         assert!(!root.0.join(".positron-volume-probe").exists());
         Ok(())
@@ -1068,53 +1748,78 @@ mod tests {
     fn remaining_probe_boundaries_are_faultable_through_acquisition() -> Result<(), Box<dyn Error>>
     {
         let cases = [
-            (VolumeOperation::PrepareProbe, 1),
-            (VolumeOperation::PrepareProbe, 2),
-            (VolumeOperation::OpenProbeFile, 1),
-            (VolumeOperation::SynchronizeProbeFile, 2),
-            (VolumeOperation::ReadProbeFile, 2),
-            (VolumeOperation::ReadProbeFile, 3),
-            (VolumeOperation::SynchronizeProbeDirectory, 2),
+            (
+                VolumeEvent::InspectProbeResidue,
+                VolumeOperation::PrepareProbe,
+            ),
+            (
+                VolumeEvent::CreateProbeDirectory,
+                VolumeOperation::PrepareProbe,
+            ),
+            (
+                VolumeEvent::OpenProbeDirectory,
+                VolumeOperation::PrepareProbe,
+            ),
+            (
+                VolumeEvent::CreateProbeCandidate,
+                VolumeOperation::OpenProbeFile,
+            ),
+            (
+                VolumeEvent::SynchronizeProbeTruncation,
+                VolumeOperation::SynchronizeProbeFile,
+            ),
+            (
+                VolumeEvent::ReadTruncatedProbe,
+                VolumeOperation::ReadProbeFile,
+            ),
         ];
 
-        for (operation, occurrence) in cases {
+        for (event, operation) in cases {
             let root = TestRoot::new()?;
-            let failure = with_operation_fault_at(
-                operation,
-                occurrence,
-                io::ErrorKind::PermissionDenied,
-                || PrimaryDataVolume::acquire(&root.0),
-            )
+            let failure = with_event_fault(event, io::ErrorKind::PermissionDenied, || {
+                PrimaryDataVolume::acquire(&root.0)
+            })
             .expect_err("scheduled probe fault must fail");
 
             assert_eq!(failure.code(), VolumeFailureCode::PermissionDenied);
             assert_eq!(failure.operation(), operation);
-            assert!(!root.0.join(".positron-volume-probe").exists());
+            assert!(!root.0.join(".positron-volume-probe").exists(), "{event:?}");
         }
         Ok(())
     }
 
     #[test]
     fn every_cleanup_boundary_fails_closed_with_residue_truth() -> Result<(), Box<dyn Error>> {
-        for occurrence in [1, 3, 4] {
+        let cases = [
+            (
+                VolumeEvent::CleanupProbeCandidate,
+                VolumeCompletionState::ProbeResiduePresent,
+                true,
+            ),
+            (
+                VolumeEvent::CleanupProbeDirectory,
+                VolumeCompletionState::ProbeResiduePresent,
+                true,
+            ),
+            (
+                VolumeEvent::SynchronizeRootAfterCleanup,
+                VolumeCompletionState::ProbeCleanupDurabilityUncertain,
+                false,
+            ),
+        ];
+        for (event, completion_state, residue_exists) in cases {
             let root = TestRoot::new()?;
-            let failure = with_operation_fault_at(
-                VolumeOperation::CleanupProbe,
-                occurrence,
-                io::ErrorKind::PermissionDenied,
-                || PrimaryDataVolume::acquire(&root.0),
-            )
+            let failure = with_event_fault(event, io::ErrorKind::PermissionDenied, || {
+                PrimaryDataVolume::acquire(&root.0)
+            })
             .expect_err("scheduled cleanup fault must fail closed");
 
             assert_eq!(failure.code(), VolumeFailureCode::Inconsistent);
             assert_eq!(failure.operation(), VolumeOperation::CleanupProbe);
-            assert_eq!(
-                failure.completion_state(),
-                VolumeCompletionState::ProbeCleanupIncomplete
-            );
+            assert_eq!(failure.completion_state(), completion_state);
             assert_eq!(
                 root.0.join(".positron-volume-probe").exists(),
-                occurrence != 4
+                residue_exists
             );
         }
         Ok(())
