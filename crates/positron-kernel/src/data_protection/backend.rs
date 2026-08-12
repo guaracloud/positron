@@ -113,6 +113,10 @@ impl CryptoBackend for RustCryptoBackend {
     }
 
     fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32], CryptoBackendFailure> {
+        // The pinned sha2 `zeroize` feature makes the concrete SHA-256
+        // context zeroize its internal state, length, and private block-buffer
+        // bytes and position on drop. This does not make a claim about caller
+        // input custody or copies outside that reviewed context.
         Ok(Sha256::digest(bytes).into())
     }
 
