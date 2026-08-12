@@ -1,18 +1,28 @@
 //! Positron's shared Storage Kernel boundary.
 //!
-//! This slice owns the concrete Release 1 Primary Data Volume. Catalog,
-//! encryption, active-segment, durability-frontier, and bootstrap behavior are
-//! intentionally outside this crate's current implemented surface.
+//! This slice owns the concrete Release 1 Primary Data Volume and authenticated
+//! encrypted-frame protection. Authoritative frame context, object keys, and
+//! frame protection remain private to the Storage Kernel until the Active
+//! Segment Ledger can issue sequence-owned capabilities.
+//!
+//! Provider bootstrap, Key Envelopes, the Envelope Catalog, key lifecycle, and
+//! durable frame-sequence allocation remain outside this crate's implemented
+//! surface.
+//!
+//! Frame authority is deliberately unavailable to dependent crates:
+//!
+//! ```compile_fail
+//! use positron_kernel::{DataProtection, FrameObjectContext, ObjectDataKey};
+//! ```
 
 #![forbid(unsafe_code)]
 
+#[allow(dead_code)]
 mod data_protection;
 
-pub use data_protection::{
-    DataProtection, EncryptedFrame, FormatEpoch, FrameContext, FrameFailure, FrameFailureCode,
-    FrameLimits, FrameObjectContext, FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey,
-    SecretKeyInput, SegmentFramePurpose, SystemObjectKind, VerifiedFrame,
-};
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use data_protection::fuzz_authenticated_frame;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
