@@ -1,8 +1,8 @@
 use super::codec::{
-    CodecSecretRelease, CodecSecretReleaseObservation, EncodedLocalKeyFile, SecretRootKey,
-    encode_file_v1, encode_file_v1_with_backend, fuzz_local_root_key_file, parse_file_v1,
-    parse_file_v1_with_backend, parse_local_key_file, with_codec_secret_release_observer,
-    with_secret_release_observer,
+    CodecSecretRelease, CodecSecretReleaseObservation, EncodedLocalKeyFile, FuzzLocalKeyOutcome,
+    SecretRootKey, encode_file_v1, encode_file_v1_with_backend, fuzz_local_root_key_file,
+    parse_file_v1, parse_file_v1_with_backend, parse_local_key_file,
+    with_codec_secret_release_observer, with_secret_release_observer,
 };
 use super::*;
 
@@ -542,34 +542,156 @@ fn parsed_root_key_custody_zeroizes_before_release_on_success_and_fingerprint_fa
 }
 
 #[test]
-fn local_key_fuzz_boundary_accepts_bounded_raw_and_independent_hex_seeds() {
-    fuzz_local_root_key_file(b"short");
+fn semantic_local_key_records_are_not_fuzz_mutation_programs() {
     let hex_seed = local_key_hex_seed(VALID_V1);
-    fuzz_local_root_key_file(hex_seed.as_slice());
+    assert!(
+        fuzz_local_root_key_file(hex_seed.as_slice()) == FuzzLocalKeyOutcome::InvalidProgram,
+        "semantic Local Root Key File hex was accepted as a fuzz mutation program"
+    );
 }
 
 #[test]
-fn local_key_fuzz_boundary_zeroizes_decoded_artifact_custody() {
+fn compact_fuzz_selector_reaches_the_valid_baseline() {
+    assert!(
+        fuzz_local_root_key_file(b"V")
+            == FuzzLocalKeyOutcome::Accepted {
+                warning:
+                    LocalCustodyWarning::FilesystemCustodyDoesNotProtectCombinedKeyAndDataTheft,
+                recovery: LocalRecoveryReadiness::IndependentRecoveryRequired,
+            },
+        "valid fuzz selector did not reach the published local-key baseline"
+    );
+}
+
+#[test]
+fn compact_fuzz_mutations_reach_structural_integrity_and_fingerprint_failures() {
+    for (program, expected) in [
+        (
+            &[b'V', b'W', 9, 2][..],
+            LocalKeyFailureCode::UnsupportedVersion,
+        ),
+        (&[b'V', b'X', 11, 1][..], LocalKeyFailureCode::MalformedFile),
+        (&[b'V', b'W', 13, 2][..], LocalKeyFailureCode::MalformedFile),
+        (
+            &[b'V', b'T', 133, 0][..],
+            LocalKeyFailureCode::MalformedFile,
+        ),
+        (
+            &[b'V', b'A', 1, 0xa5][..],
+            LocalKeyFailureCode::MalformedFile,
+        ),
+        (
+            &[b'V', b'R', 135, 0][..],
+            LocalKeyFailureCode::MalformedFile,
+        ),
+        (
+            &[b'V', b'X', 133, 1][..],
+            LocalKeyFailureCode::IntegrityMismatch,
+        ),
+        (
+            &[b'V', b'W', 38, 0x4d, b'C', b'0', 0][..],
+            LocalKeyFailureCode::FingerprintMismatch,
+        ),
+        (
+            &[b'V', b'W', 70, 0x21, b'C', b'0', 0][..],
+            LocalKeyFailureCode::FingerprintMismatch,
+        ),
+    ] {
+        assert!(
+            fuzz_local_root_key_file(program) == FuzzLocalKeyOutcome::Rejected(expected),
+            "compact local-key mutation did not reach its expected parser outcome"
+        );
+    }
+}
+
+#[test]
+fn compact_corpus_programs_cover_valid_truncated_and_substituted_key_paths() {
+    let valid = include_bytes!("../../../../../fuzz/corpus/local_root_key_file/valid");
+    let truncated = include_bytes!("../../../../../fuzz/corpus/local_root_key_file/truncated");
+    let substituted_key =
+        include_bytes!("../../../../../fuzz/corpus/local_root_key_file/substituted_key");
+
+    assert!(
+        matches!(
+            fuzz_local_root_key_file(valid),
+            FuzzLocalKeyOutcome::Accepted { .. }
+        ),
+        "valid compact corpus program did not reach acceptance"
+    );
+    assert!(
+        fuzz_local_root_key_file(truncated)
+            == FuzzLocalKeyOutcome::Rejected(LocalKeyFailureCode::MalformedFile),
+        "truncated compact corpus program did not reach malformed-file rejection"
+    );
+    assert!(
+        fuzz_local_root_key_file(substituted_key)
+            == FuzzLocalKeyOutcome::Rejected(LocalKeyFailureCode::FingerprintMismatch),
+        "substituted-key compact corpus program did not reach fingerprint rejection"
+    );
+}
+
+#[test]
+fn every_local_key_file_offset_is_reachable_by_compact_overwrite_and_xor_commands() {
+    for offset in 0_u8..134_u8 {
+        for opcode in [b'W', b'X'] {
+            assert!(
+                fuzz_local_root_key_file(&[b'V', opcode, offset, 0xa5])
+                    != FuzzLocalKeyOutcome::InvalidProgram,
+                "valid indexed local-key mutation was rejected"
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_or_oversized_fuzz_programs_are_rejected() {
+    let oversized = [b'V'; 65];
+    for program in [
+        &[][..],
+        b"Q",
+        b"VW",
+        &[b'V', 0xff, 0, 0][..],
+        &[b'V', b'W', 200, 0][..],
+        &[b'V', b'T', 200, 0][..],
+        &[b'V', b'A', 17, 0][..],
+        &[b'V', b'R', 151, 0][..],
+        &[b'V', b'C', 1, 0][..],
+        oversized.as_slice(),
+    ] {
+        assert!(
+            fuzz_local_root_key_file(program) == FuzzLocalKeyOutcome::InvalidProgram,
+            "invalid local-key fuzz mutation program was accepted"
+        );
+    }
+}
+
+#[test]
+fn local_key_fuzz_boundary_zeroizes_internally_synthesized_candidate() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
     let temporary_observer = Rc::new(RefCell::new(Vec::new()));
-    let hex_seed = local_key_hex_seed(VALID_V1);
-    with_codec_secret_release_observer(Rc::clone(&temporary_observer), || {
-        fuzz_local_root_key_file(hex_seed.as_slice());
+    let outcome = with_codec_secret_release_observer(Rc::clone(&temporary_observer), || {
+        fuzz_local_root_key_file(b"V")
     });
+    let observed = temporary_observer.borrow();
 
-    assert!(released_zeroized_once(
-        temporary_observer.borrow().as_slice(),
-        &[
-            CodecSecretRelease::ChecksumInput,
-            CodecSecretRelease::ChecksumDigest,
-            CodecSecretRelease::FingerprintInput,
-            CodecSecretRelease::FingerprintDigest,
-            CodecSecretRelease::EncodedFile,
-            CodecSecretRelease::FuzzCandidate,
-        ]
-    ));
+    assert!(
+        matches!(outcome, FuzzLocalKeyOutcome::Accepted { .. }),
+        "valid compact fuzz selector did not reach the parser"
+    );
+    assert!(
+        observed.iter().all(|release| release.zeroized),
+        "local-key fuzz harness released non-zeroized secret custody"
+    );
+    assert!(
+        observed.iter().any(|release| {
+            release.kind == CodecSecretRelease::FuzzCandidate
+                && release.observed_len == LOCAL_KEY_FILE_BYTES
+                && release.zeroized
+        }),
+        "internally synthesized local-key candidate was not observed as nonempty and zeroized"
+    );
 }
 
 fn local_key_hex_seed(encoded: &str) -> Zeroizing<Vec<u8>> {

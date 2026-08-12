@@ -11,6 +11,11 @@ use super::{
     LocalKeyFingerprint, LocalKeyId, LocalRecoveryReadiness, ROOT_KEK_PURPOSE, VerifiedLocalKey,
 };
 
+#[cfg(any(test, fuzzing))]
+const MAX_LOCAL_KEY_FUZZ_INPUT_BYTES: usize = 64;
+#[cfg(any(test, fuzzing))]
+const MAX_LOCAL_KEY_FUZZ_CANDIDATE_BYTES: usize = LOCAL_KEY_FILE_BYTES + 16;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodecSecretRelease {
     FingerprintInput,
@@ -282,57 +287,158 @@ pub(super) fn parse_local_key_file(bytes: &[u8]) -> Result<VerifiedLocalKey, Loc
 }
 
 #[cfg(any(test, fuzzing))]
-pub(super) fn fuzz_local_root_key_file(data: &[u8]) {
-    const HEX_PREFIX: &[u8] = b"hex:";
-    const MAX_FUZZ_INPUT_BYTES: usize = HEX_PREFIX.len() + (LOCAL_KEY_FILE_BYTES * 2);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FuzzLocalKeyOutcome {
+    InvalidProgram,
+    Accepted {
+        warning: LocalCustodyWarning,
+        recovery: LocalRecoveryReadiness,
+    },
+    Rejected(LocalKeyFailureCode),
+}
 
-    let bounded = data
-        .get(..data.len().min(MAX_FUZZ_INPUT_BYTES))
-        .unwrap_or_default();
-    let candidate = bounded
-        .strip_prefix(HEX_PREFIX)
-        .and_then(decode_bounded_hex)
-        .unwrap_or_else(|| {
-            SecretTemporary::new(bounded.to_vec(), CodecSecretRelease::FuzzCandidate)
-        });
-    if let Ok(verified) = parse_local_key_file(&candidate) {
-        let evidence = verified.evidence();
-        assert_eq!(candidate.len(), LOCAL_KEY_FILE_BYTES);
-        assert_eq!(
-            evidence.warning,
-            LocalCustodyWarning::FilesystemCustodyDoesNotProtectCombinedKeyAndDataTheft
-        );
-        assert_eq!(
-            evidence.recovery,
-            LocalRecoveryReadiness::IndependentRecoveryRequired
-        );
+#[cfg(any(test, fuzzing))]
+pub(super) fn fuzz_local_root_key_file(data: &[u8]) -> FuzzLocalKeyOutcome {
+    const VALID_BASELINE_SELECTOR: u8 = b'V';
+    const COMMAND_BYTES: usize = 3;
+
+    let Some((&selector, commands)) = data.split_first() else {
+        return FuzzLocalKeyOutcome::InvalidProgram;
+    };
+    if selector != VALID_BASELINE_SELECTOR
+        || data.len() > MAX_LOCAL_KEY_FUZZ_INPUT_BYTES
+        || !commands.len().is_multiple_of(COMMAND_BYTES)
+    {
+        return FuzzLocalKeyOutcome::InvalidProgram;
+    }
+    let mut candidate = match synthesize_fuzz_candidate() {
+        Ok(candidate) => candidate,
+        Err(failure) => return FuzzLocalKeyOutcome::Rejected(failure.code),
+    };
+    for command in commands.chunks_exact(COMMAND_BYTES) {
+        if !apply_fuzz_command(&mut candidate, command) {
+            return FuzzLocalKeyOutcome::InvalidProgram;
+        }
+    }
+    match parse_local_key_file(&candidate) {
+        Ok(verified) => {
+            let evidence = verified.evidence();
+            assert!(
+                candidate.len() == LOCAL_KEY_FILE_BYTES,
+                "accepted local-key fuzz candidate had an unexpected length"
+            );
+            assert!(
+                evidence.warning
+                    == LocalCustodyWarning::FilesystemCustodyDoesNotProtectCombinedKeyAndDataTheft,
+                "accepted local-key fuzz candidate changed its custody warning"
+            );
+            assert!(
+                evidence.recovery == LocalRecoveryReadiness::IndependentRecoveryRequired,
+                "accepted local-key fuzz candidate changed its recovery readiness"
+            );
+            FuzzLocalKeyOutcome::Accepted {
+                warning: evidence.warning,
+                recovery: evidence.recovery,
+            }
+        },
+        Err(failure) => FuzzLocalKeyOutcome::Rejected(failure.code),
     }
 }
 
 #[cfg(any(test, fuzzing))]
-fn decode_bounded_hex(source: &[u8]) -> Option<SecretTemporary<Vec<u8>>> {
-    if source.len() != LOCAL_KEY_FILE_BYTES * 2 {
-        return None;
+fn synthesize_fuzz_candidate() -> Result<SecretTemporary<Vec<u8>>, LocalKeyFailure> {
+    let key_id = LocalKeyId::new([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])?;
+    let mut root_key = SecretRootKey::from_owned(Box::new([0_u8; 32]));
+    for (value, byte) in (0x20_u8..0x40).zip(root_key.0.expose_to_backend_mut()) {
+        *byte = value;
     }
-    let mut decoded = SecretTemporary::new(
-        Vec::with_capacity(LOCAL_KEY_FILE_BYTES),
+    let encoded = encode_file_v1(
+        key_id,
+        LocalKeyCreationTime::from_unix_seconds(1_800_000_000),
+        root_key,
+    )?;
+    let mut candidate = SecretTemporary::new(
+        Vec::with_capacity(MAX_LOCAL_KEY_FUZZ_CANDIDATE_BYTES),
         CodecSecretRelease::FuzzCandidate,
     );
-    for pair in source.chunks_exact(2) {
-        let high = fuzz_hex_nibble(*pair.first()?)?;
-        let low = fuzz_hex_nibble(*pair.get(1)?)?;
-        decoded.push((high << 4) | low);
-    }
-    Some(decoded)
+    candidate.extend_from_slice(encoded.as_bytes());
+    Ok(candidate)
 }
 
 #[cfg(any(test, fuzzing))]
-fn fuzz_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
+fn apply_fuzz_command(candidate: &mut SecretTemporary<Vec<u8>>, command: &[u8]) -> bool {
+    const NO_OPERATION: u8 = b'N';
+    const OVERWRITE: u8 = b'W';
+    const XOR: u8 = b'X';
+    const TRUNCATE: u8 = b'T';
+    const APPEND: u8 = b'A';
+    const RESIZE: u8 = b'R';
+    const RECOMPUTE_CHECKSUM: u8 = b'C';
+    const MAX_APPEND_BYTES: usize = 16;
+
+    let Some((&opcode, operands)) = command.split_first() else {
+        return false;
+    };
+    let Some((&index_or_size, values)) = operands.split_first() else {
+        return false;
+    };
+    let Some(&value) = values.first() else {
+        return false;
+    };
+    match opcode {
+        NO_OPERATION => true,
+        OVERWRITE => candidate
+            .get_mut(usize::from(index_or_size))
+            .map(|byte| *byte = value)
+            .is_some(),
+        XOR => candidate
+            .get_mut(usize::from(index_or_size))
+            .map(|byte| *byte ^= value)
+            .is_some(),
+        TRUNCATE => {
+            let new_len = usize::from(index_or_size);
+            if new_len > candidate.len() {
+                return false;
+            }
+            candidate.truncate(new_len);
+            true
+        },
+        APPEND => {
+            let additional = usize::from(index_or_size);
+            let Some(new_len) = candidate.len().checked_add(additional) else {
+                return false;
+            };
+            if additional > MAX_APPEND_BYTES || new_len > MAX_LOCAL_KEY_FUZZ_CANDIDATE_BYTES {
+                return false;
+            }
+            candidate.resize(new_len, value);
+            true
+        },
+        RESIZE => {
+            let new_len = usize::from(index_or_size);
+            if new_len > MAX_LOCAL_KEY_FUZZ_CANDIDATE_BYTES {
+                return false;
+            }
+            candidate.resize(new_len, value);
+            true
+        },
+        RECOMPUTE_CHECKSUM => {
+            if index_or_size != b'0' || candidate.len() != LOCAL_KEY_FILE_BYTES {
+                return false;
+            }
+            let Some(content) = candidate.get(..102) else {
+                return false;
+            };
+            let Ok(checksum) = compute_checksum(&RustCryptoBackend, content) else {
+                return false;
+            };
+            let Some(destination) = candidate.get_mut(102..LOCAL_KEY_FILE_BYTES) else {
+                return false;
+            };
+            destination.copy_from_slice(checksum.as_bytes());
+            true
+        },
+        _ => false,
     }
 }
 

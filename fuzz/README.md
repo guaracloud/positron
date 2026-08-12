@@ -32,3 +32,19 @@ Current Local Root Key File parser target:
 ```console
 cargo +nightly fuzz run local_root_key_file
 ```
+
+This target accepts only a bounded structured mutation program, never raw or
+hex-encoded Local Root Key File bytes. The first byte is the `V` baseline
+selector. Each remaining command is exactly three bytes: opcode, bounded index
+or size, and value. The opcodes are `W` for overwrite, `X` for XOR, `T` for
+truncate, `A` for append, `R` for resize, `C` for checksum recomputation, and
+`N` for the no-op used by text corpus seeds. Append is limited to 16 bytes and
+the candidate is limited to 150 bytes. Inputs are limited to 64 bytes and
+incomplete or unknown commands are rejected.
+
+The harness synthesizes the published known-answer file internally into
+zeroizing custody before interpreting commands. Corpus entries and any
+libFuzzer crash or reproducer artifacts therefore contain only selectors,
+opcodes, indices, sizes, and mutation values; they must never contain a complete
+134-byte Local Root Key File, its 268-character hexadecimal representation, or
+Root KEK material.

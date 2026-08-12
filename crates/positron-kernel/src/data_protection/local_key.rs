@@ -24,7 +24,7 @@ use codec::SecretRootKey;
 
 #[cfg(fuzzing)]
 pub fn fuzz_local_root_key_file(data: &[u8]) {
-    codec::fuzz_local_root_key_file(data);
+    let _ = codec::fuzz_local_root_key_file(data);
 }
 
 const LOCAL_KEY_FILE_MAGIC: [u8; 8] = *b"POSLKEY1";
