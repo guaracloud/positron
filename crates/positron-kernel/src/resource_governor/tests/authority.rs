@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 use positron_domain::identity::TenantId;
 use positron_kernel::{
-    DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceGovernorConfiguration, ResourceInventory, StorageKernelResourceAuthority, TenantQuota,
-    VolumeFailureCode,
+    DiskObservation, DiskPressureThresholds, GovernorFailure, GovernorPolicy,
+    InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment, OperatorLimits,
+    OrdinaryPoolPolicy, PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    StorageKernelResourceAuthority, TenantQuota, VolumeFailureCode,
 };
 
 use super::resource_governor_test_support as resource_governor_support;
@@ -15,10 +15,10 @@ use super::resource_governor_test_support as resource_governor_support;
 struct TemporaryRoot(PathBuf);
 
 impl TemporaryRoot {
-    fn new() -> Result<Self, std::io::Error> {
+    fn new(suffix: &str) -> Result<Self, std::io::Error> {
         let path = std::env::temp_dir().join(format!(
-            "positron-resource-authority-test-{}",
-            std::process::id()
+            "positron-resource-authority-test-{}-{suffix}",
+            std::process::id(),
         ));
         fs::create_dir(&path)?;
         Ok(Self(path))
@@ -42,17 +42,10 @@ fn configuration(
     tenant: TenantId,
 ) -> Result<ResourceGovernorConfiguration, Box<dyn std::error::Error>> {
     let operator = resource_governor_support::raw_capacity_for_governed_work(uniform(29), 6)?;
-    let observed = ObservedResourceEnvironment::observe(
+    let observed = ObservedResourceEnvironment::for_test(
         volume,
-        RegisteredResourceBounds::new([
-            operator.get(positron_kernel::ResourceDimension::QueueSlots),
-            operator.get(positron_kernel::ResourceDimension::TaskSlots),
-            operator.get(positron_kernel::ResourceDimension::BufferCacheBytes),
-            operator.get(positron_kernel::ResourceDimension::BatchItems),
-            operator.get(positron_kernel::ResourceDimension::LeaseSlots),
-            operator.get(positron_kernel::ResourceDimension::RetrySlots),
-            operator.get(positron_kernel::ResourceDimension::IoPermits),
-        ])?,
+        operator,
+        DiskObservation::new(operator.get(ResourceDimension::DiskHeadroomBytes)),
     )?;
     let inventory = ResourceInventory::new_observed(
         observed,
@@ -81,7 +74,7 @@ fn configuration(
 fn root_authority_owns_the_volume_lock_for_its_complete_lifetime()
 -> Result<(), Box<dyn std::error::Error>> {
     let tenant = TenantId::from_bytes([91; 16])?;
-    let root = TemporaryRoot::new()?;
+    let root = TemporaryRoot::new("lifetime")?;
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
     let configuration = configuration(&volume, tenant)?;
     let authority = StorageKernelResourceAuthority::establish(volume, configuration)?;
@@ -93,5 +86,28 @@ fn root_authority_owns_the_volume_lock_for_its_complete_lifetime()
 
     let reacquired = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
     drop(reacquired);
+    Ok(())
+}
+
+#[test]
+fn deterministic_environment_remains_bound_to_its_exact_volume()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = TenantId::from_bytes([92; 16])?;
+    let observed_root = TemporaryRoot::new("observed")?;
+    let substitute_root = TemporaryRoot::new("substitute")?;
+    let observed_volume =
+        PrimaryDataVolume::acquire(&observed_root.0, MountQualification::LocalHost)?;
+    let substitute_volume =
+        PrimaryDataVolume::acquire(&substitute_root.0, MountQualification::LocalHost)?;
+    let configuration = configuration(&observed_volume, tenant)?;
+
+    let mismatch = StorageKernelResourceAuthority::establish(substitute_volume, configuration)
+        .expect_err("deterministic observation must reject a different volume");
+    assert_eq!(mismatch.failure(), GovernorFailure::ObservedVolumeMismatch);
+    let (substitute_volume, configuration) = mismatch.into_parts();
+    let authority = StorageKernelResourceAuthority::establish(observed_volume, configuration)?;
+
+    drop(authority);
+    drop(substitute_volume);
     Ok(())
 }

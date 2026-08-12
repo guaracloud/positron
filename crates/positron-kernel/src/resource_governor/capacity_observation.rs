@@ -127,6 +127,19 @@ impl ObservedVolumeBinding {
 }
 
 impl ObservedResourceEnvironment {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        volume: &crate::OwnedPrimaryDataVolume,
+        detected: ResourceAmounts,
+        initial_disk: DiskObservation,
+    ) -> Result<Self, super::GovernorFailure> {
+        Ok(Self {
+            detected_capacity: DetectedCapacity::new(detected)?,
+            initial_disk,
+            volume_binding: ObservedVolumeBinding::capture(volume),
+        })
+    }
+
     pub fn observe(
         volume: &crate::OwnedPrimaryDataVolume,
         registered: RegisteredResourceBounds,
