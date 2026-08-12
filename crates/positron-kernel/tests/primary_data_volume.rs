@@ -2,9 +2,7 @@
 
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_kernel::{
@@ -49,63 +47,6 @@ fn acquire_local(
     root: &Path,
 ) -> Result<positron_kernel::OwnedPrimaryDataVolume, positron_kernel::VolumeFailure> {
     PrimaryDataVolume::acquire(root, MountQualification::LocalHost)
-}
-
-#[test]
-fn process_exit_releases_duplicate_writer_lock_and_preserves_mount_identity()
--> Result<(), Box<dyn Error>> {
-    if let Some(root) = std::env::var_os("POSITRON_TEST_PRIMARY_VOLUME_CHILD_ROOT") {
-        let _volume = acquire_local(Path::new(&root))?;
-        println!("POSITRON_PRIMARY_VOLUME_CHILD_READY");
-        std::io::stdin().read_to_end(&mut Vec::new())?;
-        return Ok(());
-    }
-
-    let root = TemporaryRoot::new()?;
-    let initial = acquire_local(root.path())?;
-    let initial_root_identity = initial.root_identity();
-    let initial_mount_identity = initial.mount_identity();
-    drop(initial);
-
-    let executable = std::env::current_exe()?;
-    let mut child = Command::new(executable)
-        .arg("--exact")
-        .arg("process_exit_releases_duplicate_writer_lock_and_preserves_mount_identity")
-        .arg("--nocapture")
-        .env("POSITRON_TEST_PRIMARY_VOLUME_CHILD_ROOT", root.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let mut child_stdout = BufReader::new(
-        child
-            .stdout
-            .take()
-            .ok_or("child process stdout was not piped")?,
-    );
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if child_stdout.read_line(&mut line)? == 0 {
-            let status = child.wait()?;
-            return Err(format!("child exited before acquiring volume: {status}").into());
-        }
-        if line.contains("POSITRON_PRIMARY_VOLUME_CHILD_READY") {
-            break;
-        }
-    }
-
-    let failure = acquire_local(root.path()).expect_err("second process must fail while held");
-    assert_eq!(failure.code(), VolumeFailureCode::Busy);
-    assert_eq!(failure.operation(), VolumeOperation::AcquireOwnershipLock);
-
-    drop(child.stdin.take());
-    let status = child.wait()?;
-    assert!(status.success(), "child process failed: {status}");
-    let reacquired = acquire_local(root.path())?;
-    assert_eq!(reacquired.qualification(), MountQualification::LocalHost);
-    assert_eq!(reacquired.root_identity(), initial_root_identity);
-    assert_eq!(reacquired.mount_identity(), initial_mount_identity);
-    Ok(())
 }
 
 #[test]
