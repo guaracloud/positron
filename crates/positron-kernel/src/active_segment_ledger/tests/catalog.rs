@@ -74,8 +74,14 @@ fn duplicate_segment_publication_is_rejected_by_the_catalog_contract() -> Result
             state: SegmentState::Active,
             base_position: CommitPosition::origin(),
         };
-        let failure = publish_segments(catalog, &storage, scope, &[metadata, metadata])
-            .expect_err("duplicate metadata objects cannot form a catalog proposal");
+        let failure = publish_segments(
+            catalog,
+            &catalog.pin()?,
+            &storage,
+            scope,
+            &[metadata, metadata],
+        )
+        .expect_err("duplicate metadata objects cannot form a catalog proposal");
         assert_eq!(failure.code(), LedgerFailureCode::InvalidInput);
         Ok(())
     })
@@ -123,6 +129,48 @@ fn ledger_catalog_publication_preserves_stale_and_idempotency_conflict_fencing()
     })
 }
 
+#[test]
+fn segment_publication_uses_one_exact_catalog_generation_as_proposal_and_precondition()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(0xa5, |authority, catalog, scope| {
+        drop(open(authority, catalog, scope)?);
+        let basis = catalog.pin()?;
+        let storage = LedgerStorage::open(
+            authority
+                .primary_data_volume()
+                .expect("fixture retains volume"),
+        )?;
+        let metadata = storage.catalog_segments(&basis, scope)?;
+        let unrelated = CatalogObject::new(b"unrelated-control-state".to_vec())?;
+        let unrelated_id = unrelated.identity();
+        let mut objects = basis
+            .plaintext_objects()
+            .map(|bytes| CatalogObject::new(bytes.to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        objects.push(unrelated);
+        catalog.commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([0xb7; 16])?,
+                FormatEpoch::new(1)?,
+                objects,
+            )?,
+            Some(AuditIntent::new(b"unrelated-audit".to_vec())?),
+        )?;
+
+        let failure = publish_segments(catalog, &basis, &storage, scope, &metadata)
+            .expect_err("a segment proposal cannot overwrite an intervening generation");
+        assert_eq!(failure.code(), LedgerFailureCode::StaleGeneration);
+        let current = catalog.pin()?;
+        assert_eq!(
+            current.object(unrelated_id)?,
+            Some(b"unrelated-control-state".as_slice())
+        );
+        assert_eq!(catalog.governance_audit_records()?.len(), 1);
+        Ok(())
+    })
+}
+
 fn open<'authority, 'catalog>(
     authority: &'authority crate::StorageKernelResourceAuthority,
     catalog: &'catalog Catalog<'authority>,
@@ -148,12 +196,17 @@ fn publish_metadata(
             .primary_data_volume()
             .expect("fixture retains the volume"),
     )?;
-    let mut objects = catalog.proposal_objects(|bytes| !storage.is_scope_metadata(bytes, scope))?;
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .plaintext_objects()
+        .filter(|bytes| !storage.is_scope_metadata(bytes, scope))
+        .map(|bytes| CatalogObject::new(bytes.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
     for segment in metadata {
         objects.push(CatalogObject::new(storage.metadata_object(*segment))?);
     }
     catalog.commit(
-        catalog.pin()?.identity(),
+        basis.identity(),
         CatalogProposal::new(
             TransactionId::new([transaction; 16])?,
             FormatEpoch::new(1)?,

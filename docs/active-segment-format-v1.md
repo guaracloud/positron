@@ -1,4 +1,4 @@
-# Active Segment and Durability Frontier Format v1
+# Active Segment and Durability Frontier Format v2
 
 This document is the Release 1 byte-level authority for the files written by
 the Storage Kernel Active Segment Ledger. The Catalog publishes segment
@@ -44,21 +44,30 @@ version, or fields fails closed.
 
 ## Segment header
 
-The segment starts with:
+Format v2 replaces the rejected plaintext-metadata v1 bootstrap. The segment
+starts with only the fields needed to select the format and recover the DEK:
 
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
-| 8 | magic | ASCII `PSEGACT1` |
+| 8 | magic | ASCII `PSEGACT2` |
 | 2 | version | `1` |
-| 64 | metadata | the encoding above |
+| 2 | frame algorithm | `1`, AES-256-GCM |
+| 2 | wrapping algorithm | `1`, AES-256-KWP |
+| 16 | provider key reference | opaque, nonzero |
+| 8 | provider key epoch | nonzero |
 | 4 | wrapped-key length | `1..=256` |
 | variable | wrapped segment DEK | authenticated AES-KWP envelope |
+| 4 | encrypted-metadata-frame length | `1..=256` |
+| variable | encrypted segment metadata | AES-256-GCM frame over the exact 56-byte Catalog encoding above |
 
 Each physical segment receives a fresh 256-bit data-encryption key. The
 caller-provided protection key wraps that DEK; it is not used for frame
-encryption. The wrapped-key context binds the Positron instance, key kind,
+encryption. The opaque provider reference and epoch must match the supplied
+recovery capability before unwrap. The wrapped-key context binds the Positron instance, key kind,
 segment object and key epoch, segment scope, tenant, signal, shard, and format
-epoch. A wrong protection key or substituted context fails authentication.
+epoch. The encrypted metadata independently binds scope, segment identity,
+creation lifecycle, and base Commit Position. A wrong protection key,
+substituted route, or substituted context fails authentication.
 
 The header is written once, synchronized, then made reachable by synchronizing
 the active directory. A partial header is never usable.
@@ -70,30 +79,39 @@ Immediately after the header, each canonical Store Block is encoded as:
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
 | 4 | encrypted-frame length | at most 1,048,960 |
-| variable | encrypted frame | existing encrypted-frame format |
+| variable | encrypted frame | existing encrypted-frame format; plaintext is the 16-byte stable Store Block identity followed by canonical block bytes |
 
 Plaintext blocks are nonempty and at most 1,048,576 bytes. Frame context binds
-the segment object, `StoreBlock` purpose, format and key epochs, and zero-based
-sequence. Commit Position is `base_position + sequence + 1`. This sole ledger
+the segment object, `StoreBlock` purpose, format and key epochs, and the
+one-based frame sequence reserved after metadata sequence zero. Commit Position
+is `base_position + frame_sequence`. This sole ledger
 authority owns allocation. Recovery never appends to the predecessor: it seals
 it and creates a fresh successor with a fresh DEK, preventing nonce reuse.
 
-Appending the same canonical Store Block is idempotent within the retained
-ledger: it returns the existing position and does not append a duplicate.
+Retrying the same stable Store Block identity with the same canonical bytes is
+idempotent within the retained ledger. Reusing an identity with different
+bytes fails closed. Equal canonical bytes under distinct identities are
+legitimate separate appends.
 
 ## Durability Frontier
 
-The frontier is a fixed 82-byte authenticated object:
+Format v2 encrypts frontier metadata as one independent frame:
 
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
-| 8 | magic | ASCII `PFRONT01` |
+| 8 | magic | ASCII `PFRONT02` |
 | 2 | version | `1` |
-| 16 | segment ID | matches path and header |
-| 8 | durable segment bytes | header through last acknowledged frame |
-| 8 | next sequence | acknowledged frame count |
-| 8 | Commit Position | base plus next sequence |
-| 32 | authenticator | HMAC under segment DEK over prior fields |
+| 2 | frame algorithm | `1`, AES-256-GCM |
+| 4 | encrypted-frame length | at most 512 |
+| variable | encrypted frontier frame | plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64` |
+
+The frontier frame purpose is `DurabilityFrontier`; its nonce sequence is
+`u64::MAX - encrypted_next_sequence`, disjoint from metadata and Store Block
+sequences. Recovery tries only the bounded Release 1 sequence
+domain and requires the authenticated plaintext to agree with the successful
+sequence. No segment identity, Commit Position, or sequence is plaintext in
+the frontier artifact. The receipt authenticator is an HMAC of the complete
+encoded encrypted frontier and is not persisted as additional plaintext.
 
 Acknowledgment is permitted only after this order completes:
 
@@ -130,6 +148,14 @@ Recovery and append require Resource Governor reservations. Cancellation is
 observed before admission; admitted durability work runs to a typed terminal
 outcome. Any post-write append failure poisons the live ledger so no retry can
 reuse an AEAD sequence before recovery creates a fresh segment and DEK.
+
+## Migration policy
+
+There is no released v1 data contract to migrate. Readers explicitly refuse
+the old `PSEGACT1` and `PFRONT01` plaintext-metadata formats as unsupported;
+they do not guess, partially import, or silently rewrite them. A future
+released-format migration requires an accepted ADR and an explicit bounded
+migration path.
 
 ## Sealing
 

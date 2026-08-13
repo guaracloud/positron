@@ -1,7 +1,9 @@
 //! Atomic, hierarchical resource admission for the Storage Kernel.
 
 mod accounting;
+mod active_segment_leases;
 mod admission;
+mod authority;
 mod bootstrap;
 mod capacity_observation;
 mod claim;
@@ -22,6 +24,7 @@ mod pressure;
 mod recovery_admission;
 mod recovery_policy;
 mod release;
+mod reservation;
 mod resize;
 mod resize_recovery;
 mod resize_types;
@@ -32,9 +35,11 @@ mod telemetry_tests;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use accounting::{GovernorConfiguration, GovernorInner, GovernorSetupInput, KernelOwnership};
+pub(crate) use active_segment_leases::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
 use bootstrap::{BootstrapAllocationStage, BootstrapInventoryLayout};
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -133,24 +138,14 @@ pub struct ResourceGovernor<'authority> {
 pub struct StorageKernelResourceAuthority {
     inner: GovernorInner,
     catalog_writer_held: AtomicBool,
-    active_segment_ledger_held: AtomicBool,
+    active_segment_scopes: Mutex<[Option<[u8; 22]>; MAX_TENANT_QUOTAS]>,
 }
 
 pub(crate) struct CatalogWriterLease<'authority> {
     held: &'authority AtomicBool,
 }
 
-pub(crate) struct ActiveSegmentLedgerLease<'authority> {
-    held: &'authority AtomicBool,
-}
-
 impl Drop for CatalogWriterLease<'_> {
-    fn drop(&mut self) {
-        self.held.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for ActiveSegmentLedgerLease<'_> {
     fn drop(&mut self) {
         self.held.store(false, Ordering::Release);
     }
@@ -327,168 +322,6 @@ impl ResourceGovernorConfiguration {
     }
 }
 
-impl StorageKernelResourceAuthority {
-    #[cfg(test)]
-    fn establish_for_test(
-        inventory: ResourceInventory,
-        policy: GovernorPolicy,
-        recovery_pools: RecoveryPoolCapacities,
-    ) -> Result<Self, GovernorFailure> {
-        let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_ledger_held: AtomicBool::new(false),
-        })
-    }
-
-    /// Establishes an isolated complete authority for the fuzz harness.
-    #[cfg(fuzzing)]
-    #[doc(hidden)]
-    pub fn establish_for_fuzz(
-        inventory: ResourceInventory,
-        policy: GovernorPolicy,
-        recovery_pools: RecoveryPoolCapacities,
-    ) -> Result<Self, GovernorFailure> {
-        let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_ledger_held: AtomicBool::new(false),
-        })
-    }
-
-    /// Establishes fuzz-only authority while retaining a real owned test volume.
-    #[cfg(fuzzing)]
-    #[doc(hidden)]
-    pub fn establish_for_fuzz_with_volume(
-        volume: crate::OwnedPrimaryDataVolume,
-        inventory: ResourceInventory,
-        policy: GovernorPolicy,
-        recovery_pools: RecoveryPoolCapacities,
-    ) -> Result<Self, GovernorFailure> {
-        let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_ledger_held: AtomicBool::new(false),
-        })
-    }
-    /// Establishes the sole governor after earlier private bootstrap/recovery steps.
-    #[expect(
-        clippy::result_large_err,
-        reason = "the recoverable mismatch must return both non-allocating move-only capabilities"
-    )]
-    pub fn establish(
-        volume: crate::OwnedPrimaryDataVolume,
-        configuration: ResourceGovernorConfiguration,
-    ) -> Result<Self, EstablishmentFailure> {
-        if configuration
-            .volume_binding
-            .as_ref()
-            .is_none_or(|binding| !binding.matches(&volume))
-        {
-            return Err(EstablishmentFailure {
-                failure: GovernorFailure::ObservedVolumeMismatch,
-                volume,
-                configuration,
-            });
-        }
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_ledger_held: AtomicBool::new(false),
-        })
-    }
-
-    /// Borrows ordinary admission authority without permitting duplication.
-    #[must_use]
-    pub const fn governor(&self) -> ResourceGovernor<'_> {
-        ResourceGovernor { inner: &self.inner }
-    }
-
-    /// Borrows the governor-bound protected recovery authority.
-    #[must_use]
-    pub const fn recovery(&self) -> RecoveryAuthority<'_> {
-        RecoveryAuthority { inner: &self.inner }
-    }
-
-    pub(crate) const fn primary_data_volume(&self) -> Option<&crate::OwnedPrimaryDataVolume> {
-        match &self.inner.ownership {
-            KernelOwnership::Owned { volume } => Some(volume),
-            #[cfg(any(test, fuzzing))]
-            KernelOwnership::TestOnly => None,
-        }
-    }
-
-    pub(crate) fn acquire_catalog_writer(&self) -> Option<CatalogWriterLease<'_>> {
-        self.catalog_writer_held
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| CatalogWriterLease {
-                held: &self.catalog_writer_held,
-            })
-    }
-
-    pub(crate) fn acquire_active_segment_ledger(&self) -> Option<ActiveSegmentLedgerLease<'_>> {
-        self.active_segment_ledger_held
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| ActiveSegmentLedgerLease {
-                held: &self.active_segment_ledger_held,
-            })
-    }
-
-    #[cfg(test)]
-    fn reserve(&self, claim: WorkClaim) -> Result<ResourceReservation<'_>, AdmissionFailure> {
-        self.governor().reserve(claim)
-    }
-
-    #[cfg(test)]
-    fn inspect(&self) -> Result<ResourceSnapshot, GovernorFailure> {
-        self.governor().inspect()
-    }
-
-    /// Re-observes the retained Primary Data Volume and applies disk pressure.
-    pub fn observe_disk(&self) -> Result<DiskPressureState, GovernorFailure> {
-        let volume = match &self.inner.ownership {
-            KernelOwnership::Owned { volume } => volume,
-            #[cfg(any(test, fuzzing))]
-            KernelOwnership::TestOnly => {
-                return Err(GovernorFailure::PrimaryVolumeObservationUnavailable);
-            },
-        };
-        let usable_bytes = capacity_observation::observe_disk_bytes(volume)
-            .map_err(|_| GovernorFailure::PrimaryVolumeObservationUnavailable)?;
-        self.inner
-            .apply_disk_observation(DiskObservation::from_observed(usable_bytes))
-    }
-
-    #[cfg(test)]
-    fn observe_disk_for_test(
-        &self,
-        observation: DiskObservation,
-    ) -> Result<DiskPressureState, GovernorFailure> {
-        self.inner.apply_disk_observation(observation)
-    }
-
-    #[cfg(fuzzing)]
-    #[doc(hidden)]
-    pub fn observe_disk_for_fuzz(
-        &self,
-        observation: DiskObservation,
-    ) -> Result<DiskPressureState, GovernorFailure> {
-        self.inner.apply_disk_observation(observation)
-    }
-
-    /// Closes new work without waiting and returns bounded reconciliation state.
-    pub fn begin_shutdown(&self) -> Result<ShutdownReconciliation, GovernorFailure> {
-        Ok(ShutdownReconciliation {
-            snapshot: ResourceSnapshot::from_accounting(self.inner.begin_shutdown()?),
-        })
-    }
-}
-
 impl<'authority> RecoveryAuthority<'authority> {
     /// Reserves protected capacity for a closed recovery-safe work kind.
     pub fn reserve(
@@ -496,103 +329,6 @@ impl<'authority> RecoveryAuthority<'authority> {
         claim: RecoveryWorkClaim,
     ) -> Result<ResourceReservation<'authority>, AdmissionFailure> {
         self.inner.reserve_recovery(claim)
-    }
-}
-
-impl<'authority> ResourceReservation<'authority> {
-    fn new(
-        governor: &'authority GovernorInner,
-        owner: accounting::ChargeOwner,
-        identity: ReservationIdentity,
-        amounts: ResourceAmounts,
-        slot: u16,
-    ) -> Self {
-        Self {
-            governor,
-            owner,
-            identity,
-            amounts,
-            slot,
-            active: true,
-        }
-    }
-
-    /// Releases the reservation immediately. Dropping has identical accounting semantics.
-    pub fn cancel(&mut self) -> Result<ReleaseOutcome, GovernorFailure> {
-        if !self.active {
-            return Ok(ReleaseOutcome::AlreadyInactive);
-        }
-        let status = self
-            .governor
-            .try_release(self.slot, self.owner, self.identity, self.amounts);
-        if status.applied {
-            self.active = false;
-        }
-        status.result
-    }
-
-    /// Atomically replaces the grant while preserving immutable work identity.
-    pub fn try_resize(
-        &mut self,
-        new_amounts: ResourceAmounts,
-    ) -> Result<ResizeOutcome, ResizeFailure> {
-        if !self.active {
-            return Err(ResizeFailure::inactive(
-                self.identity.class(),
-                self.governor.pressure_for_failure(),
-            ));
-        }
-        if new_amounts.is_empty() {
-            return Err(ResizeFailure::invalid(
-                self.identity.class(),
-                self.governor.pressure_for_failure(),
-            ));
-        }
-        match self.governor.resize(resize::ResizeRequest {
-            slot: self.slot,
-            owner: self.owner,
-            identity: self.identity,
-            old: self.amounts,
-            new: new_amounts,
-        }) {
-            Ok(commit) => {
-                self.owner = commit.owner;
-                self.amounts = new_amounts;
-                Ok(commit.outcome)
-            },
-            Err(failure)
-                if failure.existing_capacity()
-                    == ExistingCapacityDisposition::CancelledBeforeLimit =>
-            {
-                self.active = false;
-                self.amounts = ResourceAmounts::zero();
-                Err(failure)
-            },
-            Err(failure) => Err(failure),
-        }
-    }
-
-    #[must_use]
-    pub const fn is_active(&self) -> bool {
-        self.active
-    }
-
-    #[must_use]
-    pub const fn granted(&self) -> ResourceAmounts {
-        self.amounts
-    }
-
-    fn release(&mut self) {
-        if self.active {
-            self.governor.mark_drop_pending(self.slot);
-            self.active = false;
-        }
-    }
-}
-
-impl Drop for ResourceReservation<'_> {
-    fn drop(&mut self) {
-        self.release();
     }
 }
 

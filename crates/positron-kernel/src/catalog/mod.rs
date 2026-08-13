@@ -117,24 +117,6 @@ impl<'authority> Catalog<'authority> {
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
     }
 
-    pub(crate) fn proposal_objects(
-        &self,
-        retain: impl Fn(&[u8]) -> bool,
-    ) -> Result<Vec<CatalogObject>, CatalogFailure> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-        state
-            .current
-            .0
-            .objects
-            .values()
-            .filter(|plaintext| retain(plaintext))
-            .map(|plaintext| CatalogObject::new(plaintext.to_vec()))
-            .collect()
-    }
-
     /// Publishes one complete Catalog Proposal and optional Administration-owned audit intent.
     pub fn commit(
         &self,

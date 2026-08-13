@@ -8,13 +8,14 @@ use super::support::TemporaryRoot;
 use crate::active_segment_ledger::format::{SegmentMetadata, SegmentState};
 use crate::active_segment_ledger::recovery::{frontier_name, segment_name};
 use crate::active_segment_ledger::storage::{LedgerStorage, entry_exists, recognized_ledger_name};
-use crate::active_segment_ledger::{LedgerFailureCode, SegmentId, SegmentScope};
+use crate::active_segment_ledger::{
+    LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
+};
 use crate::catalog::InstanceId;
-use crate::data_protection::SecretKeyBytes;
 use crate::{MountQualification, PrimaryDataVolume};
 
 #[test]
-fn creation_rejects_sealed_metadata_and_header_identity_mismatch() -> Result<(), Box<dyn Error>> {
+fn creation_rejects_sealed_metadata_and_wrapped_context_mismatch() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let mut storage = LedgerStorage::open(&fixture.volume)?;
     let mut sealed = metadata(CommitPosition::origin());
@@ -33,8 +34,8 @@ fn creation_rejects_sealed_metadata_and_header_identity_mismatch() -> Result<(),
     let failure = storage
         .recover_segment(mismatched, &wrapping_key(), instance()?)
         .err()
-        .expect("catalog and segment headers must identify the same range");
-    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        .expect("catalog context must authenticate the wrapped key");
+    assert_eq!(failure.code(), LedgerFailureCode::AuthenticationFailed);
     Ok(())
 }
 
@@ -126,8 +127,8 @@ fn metadata(base_position: CommitPosition) -> SegmentMetadata {
     }
 }
 
-fn wrapping_key() -> SecretKeyBytes {
-    SecretKeyBytes::from_owned(Box::new([0x92; 32]))
+fn wrapping_key() -> SegmentProtectionKey {
+    SegmentProtectionKey::from_owned(Box::new([0x92; 32]))
 }
 
 fn instance() -> Result<InstanceId, Box<dyn Error>> {

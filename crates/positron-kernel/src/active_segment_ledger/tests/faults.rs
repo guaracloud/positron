@@ -4,15 +4,18 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use super::support::{TemporaryRoot, establish_authority};
-use crate::active_segment_ledger::fault::{
-    LedgerFileEvent, with_ledger_fault, with_ledger_fault_code,
-};
+use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_errno, with_ledger_fault};
 use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, LedgerCompletionState,
     LedgerFailureCode, MountQualification, PreparedStoreBlock, PrimaryDataVolume,
-    SegmentProtectionKey, SegmentScope,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
+
+fn prepared(payload: &[u8]) -> Result<PreparedStoreBlock, crate::LedgerFailure> {
+    let marker = payload.first().copied().unwrap_or(1).max(1);
+    PreparedStoreBlock::new(StoreBlockIdentity::new([marker; 16])?, payload.to_vec())
+}
 
 #[test]
 fn failed_frame_synchronization_never_acknowledges_and_recovery_discards_its_tail()
@@ -32,10 +35,10 @@ fn failed_frame_synchronization_never_acknowledges_and_recovery_discards_its_tai
     );
     let wrapping_key = || SegmentProtectionKey::from_owned(Box::new([0x65; 32]));
     let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, wrapping_key())?;
-    let acknowledged = ledger.append(PreparedStoreBlock::new(b"acknowledged".to_vec())?)?;
+    let acknowledged = ledger.append(prepared(b"acknowledged")?)?;
 
     let failure = with_ledger_fault(LedgerFileEvent::SynchronizeFrame, || {
-        ledger.append(PreparedStoreBlock::new(b"unacknowledged".to_vec())?)
+        ledger.append(prepared(b"unacknowledged")?)
     })
     .expect_err("frame synchronization failure cannot return a receipt");
     assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
@@ -45,7 +48,7 @@ fn failed_frame_synchronization_never_acknowledges_and_recovery_discards_its_tai
     );
     assert_eq!(
         ledger
-            .append(PreparedStoreBlock::new(b"must-reopen".to_vec())?)
+            .append(prepared(b"must-reopen")?)
             .expect_err("a possibly mutated live segment is poisoned")
             .code(),
         LedgerFailureCode::RecoveryRequired
@@ -67,7 +70,7 @@ fn recovery_discards_a_partial_first_frame_without_a_frontier() -> Result<(), Bo
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
         let failure = with_ledger_fault(LedgerFileEvent::PartialFrameWrite, || {
-            ledger.append(PreparedStoreBlock::new(b"partial-first".to_vec())?)
+            ledger.append(prepared(b"partial-first")?)
         })
         .expect_err("partial first frame cannot publish a frontier");
         assert_eq!(
@@ -119,11 +122,9 @@ fn append_fault_matrix_never_overstates_the_authenticated_frontier() -> Result<(
         with_fixture(|authority, catalog, scope| {
             let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
             let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-            let first = ledger.append(PreparedStoreBlock::new(b"first".to_vec())?)?;
-            let failure = with_ledger_fault(event, || {
-                ledger.append(PreparedStoreBlock::new(b"second".to_vec())?)
-            })
-            .expect_err("injected boundary cannot acknowledge");
+            let first = ledger.append(prepared(b"first")?)?;
+            let failure = with_ledger_fault(event, || ledger.append(prepared(b"second")?))
+                .expect_err("injected boundary cannot acknowledge");
             assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
             assert_eq!(failure.completion_state(), completion);
             drop(ledger);
@@ -142,16 +143,22 @@ fn frontier_directory_sync_failure_is_typed_as_commit_ambiguity() -> Result<(), 
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        ledger.append(PreparedStoreBlock::new(b"first".to_vec())?)?;
+        ledger.append(prepared(b"first")?)?;
         let failure = with_ledger_fault(LedgerFileEvent::SynchronizeFrontierDirectory, || {
-            ledger.append(PreparedStoreBlock::new(b"ambiguous".to_vec())?)
+            ledger.append(prepared(b"ambiguous")?)
         })
         .expect_err("directory synchronization cannot acknowledge");
         assert_eq!(
             failure.completion_state(),
             LedgerCompletionState::CommitAmbiguous
         );
-        drop(ledger);
+        let seal_failure = with_ledger_fault(LedgerFileEvent::RenameSealSegment, || ledger.seal())
+            .expect_err("an ambiguous append must be recovered before sealing");
+        assert_eq!(seal_failure.code(), LedgerFailureCode::RecoveryRequired);
+        assert_eq!(
+            seal_failure.completion_state(),
+            LedgerCompletionState::RejectedBeforeMutation
+        );
 
         let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
         assert_eq!(reopened.snapshot()?.blocks().len(), 2);
@@ -162,25 +169,60 @@ fn frontier_directory_sync_failure_is_typed_as_commit_ambiguity() -> Result<(), 
 
 #[test]
 fn full_disk_is_a_stable_typed_failure_without_a_receipt() -> Result<(), Box<dyn Error>> {
+    for error in [rustix::io::Errno::NOSPC, rustix::io::Errno::DQUOT] {
+        with_fixture(|authority, catalog, scope| {
+            let ledger = ActiveSegmentLedger::open(
+                authority,
+                catalog,
+                scope,
+                SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+            )?;
+            let failure = with_ledger_errno(LedgerFileEvent::WriteFrame, error, || {
+                ledger.append(prepared(b"no-space")?)
+            })
+            .expect_err("exhausted storage cannot acknowledge");
+            assert_eq!(failure.code(), LedgerFailureCode::StorageExhausted);
+            assert_eq!(
+                failure.completion_state(),
+                LedgerCompletionState::RejectedBeforeMutation
+            );
+            assert_eq!(ledger.snapshot()?.blocks().len(), 0);
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exhausted_scope_lease_inventory_refuses_before_storage_mutation() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
-        let ledger = ActiveSegmentLedger::open(
+        let mut leases = Vec::new();
+        for value in 0..crate::MAX_TENANT_QUOTAS {
+            let mut key = [0_u8; 22];
+            key[..2].copy_from_slice(&u16::try_from(value)?.to_be_bytes());
+            let lease = authority
+                .acquire_active_segment_ledger(key)
+                .ok()
+                .expect("unique bounded scope lease");
+            leases.push(lease);
+        }
+        let failure = ActiveSegmentLedger::open(
             authority,
             catalog,
             scope,
             SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
-        )?;
-        let failure = with_ledger_fault_code(
-            LedgerFileEvent::WriteFrame,
-            LedgerFailureCode::StorageExhausted,
-            || ledger.append(PreparedStoreBlock::new(b"no-space".to_vec())?),
         )
-        .expect_err("full disk cannot acknowledge");
-        assert_eq!(failure.code(), LedgerFailureCode::StorageExhausted);
-        assert_eq!(
-            failure.completion_state(),
-            LedgerCompletionState::RejectedBeforeMutation
+        .expect_err("bounded scope inventory cannot grow");
+        assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
+        assert!(
+            authority
+                .primary_data_volume()
+                .expect("fixture volume")
+                ._root
+                .metadata()
+                .is_ok()
         );
-        assert_eq!(ledger.snapshot()?.blocks().len(), 0);
+        drop(leases);
         Ok(())
     })
 }
@@ -190,7 +232,7 @@ fn recovery_reconciles_a_crash_between_the_two_seal_renames() -> Result<(), Box<
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        let committed = ledger.append(PreparedStoreBlock::new(b"survives-seal".to_vec())?)?;
+        let committed = ledger.append(prepared(b"survives-seal")?)?;
         let failure = with_ledger_fault(LedgerFileEvent::RenameSealFrontier, || ledger.seal())
             .expect_err("the interrupted seal cannot publish success");
         assert_eq!(
@@ -215,7 +257,7 @@ fn recovery_reconciles_physical_seal_before_catalog_publication() -> Result<(), 
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        let committed = ledger.append(PreparedStoreBlock::new(b"catalog-atomic".to_vec())?)?;
+        let committed = ledger.append(prepared(b"catalog-atomic")?)?;
         let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || ledger.seal())
             .expect_err("catalog publication failure cannot report a sealed segment");
         assert_eq!(
@@ -318,7 +360,7 @@ fn seal_directory_sync_faults_remain_restartable() -> Result<(), Box<dyn Error>>
         with_fixture(|authority, catalog, scope| {
             let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
             let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-            let committed = ledger.append(PreparedStoreBlock::new(b"sync-seal".to_vec())?)?;
+            let committed = ledger.append(prepared(b"sync-seal")?)?;
             let failure = with_ledger_fault(event, || ledger.seal())
                 .expect_err("failed directory synchronization cannot publish success");
             assert_eq!(

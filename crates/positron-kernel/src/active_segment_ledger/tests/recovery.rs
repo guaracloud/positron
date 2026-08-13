@@ -73,11 +73,11 @@ fn block_reader_rejects_oversized_lengths_overflow_and_record_overrun() -> Resul
 
     let context = key
         .object
-        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(0))?;
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(1))?;
     let frame = DataProtection::protect_frame(
         &key,
         context,
-        b"one",
+        &identity_payload(0, b"one"),
         FrameLimits::new(MAX_ENCODED_FRAME_BYTES)?,
     )?;
     let mut record = Vec::new();
@@ -169,12 +169,12 @@ fn block_reader_enforces_the_bounded_recovery_cardinality() -> Result<(), Box<dy
     for sequence in 0..1_024_u64 {
         let context = key.object.frame(
             SegmentFramePurpose::StoreBlock,
-            FrameSequence::new(sequence),
+            FrameSequence::new(sequence + 1),
         )?;
         let frame = DataProtection::protect_frame(
             &key,
             context,
-            b"x",
+            &identity_payload(sequence, b"x"),
             FrameLimits::new(MAX_ENCODED_FRAME_BYTES)?,
         )?;
         encoded.extend_from_slice(&u32::try_from(frame.as_bytes().len())?.to_be_bytes());
@@ -214,4 +214,11 @@ fn key(metadata: SegmentMetadata) -> Result<crate::data_protection::ObjectDataKe
         metadata.scope,
         metadata.id,
     )?)?)
+}
+
+fn identity_payload(sequence: u64, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0; 16];
+    bytes[8..16].copy_from_slice(&sequence.saturating_add(1).to_be_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
 }

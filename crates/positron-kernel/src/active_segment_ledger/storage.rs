@@ -5,21 +5,25 @@ use rustix::fs::{self as unix_fs, AtFlags, Dir, Mode, OFlags};
 
 use crate::OwnedPrimaryDataVolume;
 use crate::catalog::{CatalogSnapshot, InstanceId};
-use crate::data_protection::{DataProtection, ObjectDataKey, SecretKeyBytes};
+use crate::data_protection::{
+    DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SegmentFramePurpose,
+};
 
 use super::fault::{LedgerFileEvent, emit_event, injected_partial_write_length};
 use super::format::{
     SegmentMetadata, SegmentState, decode_header, decode_metadata, encode_header, encode_metadata,
 };
-use super::io::{open_or_create_directory, open_regular, synchronize};
+use super::io::{map_errno, map_io_error, open_or_create_directory, open_regular, synchronize};
 use super::recovery::frontier_temporary_name;
 use super::recovery::{RecoveryState, frontier_name, publish_frontier, recover, segment_name};
 use super::{
-    LedgerFailure, LedgerFailureCode, SegmentId, SegmentScope, map_frame_failure, object_context,
+    LedgerFailure, LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
+    map_frame_failure, object_context,
 };
 
 const MAX_SEGMENTS: usize = 1_024;
 const MAX_HEADER_BYTES: usize = 512;
+const MAX_ENCRYPTED_METADATA_BYTES: u32 = 256;
 
 pub(super) struct LedgerStorage {
     active: File,
@@ -74,13 +78,11 @@ impl LedgerStorage {
         metadata: &[SegmentMetadata],
     ) -> Result<(), LedgerFailure> {
         for (directory, active_namespace) in [(&self.active, true), (&self.sealed, false)] {
-            let mut entries = Dir::read_from(directory)
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+            let mut entries = Dir::read_from(directory).map_err(map_errno)?;
             let mut count = 0_usize;
             let mut removed = false;
             while let Some(entry) = entries.read() {
-                let entry =
-                    entry.map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+                let entry = entry.map_err(map_errno)?;
                 let name = entry.file_name().to_bytes();
                 if name == b"." || name == b".." {
                     continue;
@@ -98,9 +100,7 @@ impl LedgerStorage {
                 });
                 if !published {
                     if active_namespace && recognized_ledger_name(name) {
-                        unix_fs::unlinkat(directory, name, AtFlags::empty()).map_err(|_| {
-                            LedgerFailure::new(LedgerFailureCode::StorageUnavailable)
-                        })?;
+                        unix_fs::unlinkat(directory, name, AtFlags::empty()).map_err(map_errno)?;
                         removed = true;
                     } else {
                         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
@@ -117,7 +117,7 @@ impl LedgerStorage {
     pub(super) fn create_active(
         &mut self,
         metadata: SegmentMetadata,
-        wrapping_key: &SecretKeyBytes,
+        protection: &SegmentProtectionKey,
         instance: InstanceId,
     ) -> Result<ObjectDataKey, LedgerFailure> {
         if metadata.state != SegmentState::Active {
@@ -125,9 +125,19 @@ impl LedgerStorage {
         }
         let object = object_context(metadata.scope, metadata.id)?;
         let key = DataProtection::random_key(object).map_err(map_frame_failure)?;
-        let wrapped = DataProtection::wrap_segment_key(wrapping_key, &key, instance.to_bytes())
+        let wrapped = DataProtection::wrap_segment_key(&protection.key, &key, instance.to_bytes())
             .map_err(map_frame_failure)?;
-        let header = encode_header(metadata, &wrapped)?;
+        let metadata_context = object
+            .frame(SegmentFramePurpose::SegmentMetadata, FrameSequence::new(0))
+            .map_err(map_frame_failure)?;
+        let encrypted_metadata = DataProtection::protect_frame(
+            &key,
+            metadata_context,
+            &encode_metadata(metadata),
+            FrameLimits::new(MAX_ENCRYPTED_METADATA_BYTES).map_err(map_frame_failure)?,
+        )
+        .map_err(map_frame_failure)?;
+        let header = encode_header(protection.route, &wrapped, encrypted_metadata.as_bytes())?;
         emit_event(LedgerFileEvent::CreateSegment)?;
         let mut file = unix_fs::openat(
             &self.active,
@@ -136,20 +146,20 @@ impl LedgerStorage {
             Mode::RUSR | Mode::WUSR,
         )
         .map(File::from)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+        .map_err(map_errno)?;
         emit_event(LedgerFileEvent::WriteSegmentHeader)
             .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         if let Some(length) =
             injected_partial_write_length(LedgerFileEvent::PartialSegmentHeaderWrite, header.len())
         {
             file.write_all(&header[..length])
-                .map_err(|_| LedgerFailure::post_mutation(LedgerFailureCode::StorageUnavailable))?;
+                .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
             return Err(LedgerFailure::post_mutation(
                 LedgerFailureCode::StorageUnavailable,
             ));
         }
         file.write_all(&header)
-            .map_err(|_| LedgerFailure::post_mutation(LedgerFailureCode::StorageUnavailable))?;
+            .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
         emit_event(LedgerFileEvent::SynchronizeSegmentHeader)
             .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         synchronize(&file).map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
@@ -164,7 +174,7 @@ impl LedgerStorage {
     pub(super) fn recover_segment(
         &self,
         metadata: SegmentMetadata,
-        wrapping_key: &SecretKeyBytes,
+        protection: &SegmentProtectionKey,
         instance: InstanceId,
     ) -> Result<(ObjectDataKey, RecoveryState), LedgerFailure> {
         let catalog_active = metadata.state == SegmentState::Active;
@@ -176,9 +186,7 @@ impl LedgerStorage {
             ) {
                 Ok(()) => synchronize(&self.active)?,
                 Err(rustix::io::Errno::NOENT) => {},
-                Err(_) => {
-                    return Err(LedgerFailure::new(LedgerFailureCode::StorageUnavailable));
-                },
+                Err(error) => return Err(map_errno(error)),
             }
         }
         let active_exists = entry_exists(&self.active, &segment_name(metadata.id))?;
@@ -199,25 +207,39 @@ impl LedgerStorage {
         };
         let mut file = open_regular(directory, &segment_name(metadata.id), recoverable_tail)?;
         let mut header = vec![0_u8; MAX_HEADER_BYTES];
-        let bytes = file
-            .read(&mut header)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+        let bytes = file.read(&mut header).map_err(map_io_error)?;
         header.truncate(bytes);
         let decoded = decode_header(&header)?;
-        if decoded.metadata.scope != metadata.scope
-            || decoded.metadata.id != metadata.id
-            || decoded.metadata.base_position != metadata.base_position
-        {
-            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        if decoded.route != protection.route {
+            return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
         }
         let object = object_context(metadata.scope, metadata.id)?;
         let key = DataProtection::unwrap_segment_key(
-            wrapping_key,
+            &protection.key,
             decoded.wrapped_key,
             instance.to_bytes(),
             object,
         )
         .map_err(map_frame_failure)?;
+        let metadata_context = object
+            .frame(SegmentFramePurpose::SegmentMetadata, FrameSequence::new(0))
+            .map_err(map_frame_failure)?;
+        let verified_metadata = DataProtection::open_frame(
+            &key,
+            metadata_context,
+            decoded.encrypted_metadata,
+            FrameLimits::new(MAX_ENCRYPTED_METADATA_BYTES).map_err(map_frame_failure)?,
+        )
+        .map_err(map_frame_failure)?;
+        let physical_metadata = decode_metadata(verified_metadata.as_plaintext())?
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::AuthenticationFailed))?;
+        if physical_metadata.state != SegmentState::Active
+            || physical_metadata.scope != metadata.scope
+            || physical_metadata.id != metadata.id
+            || physical_metadata.base_position != metadata.base_position
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
+        }
         let state = recover(
             directory,
             frontier_directory,
@@ -241,7 +263,7 @@ impl LedgerStorage {
                     &self.sealed,
                     segment_name(metadata.id),
                 )
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+                .map_err(map_errno)?;
             },
             (false, true) => {},
             _ => return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
@@ -258,7 +280,7 @@ impl LedgerStorage {
                     &self.sealed,
                     frontier_name(metadata.id),
                 )
-                .map_err(|_| LedgerFailure::post_mutation(LedgerFailureCode::StorageUnavailable))?;
+                .map_err(|error| LedgerFailure::post_mutation(map_errno(error).code()))?;
             },
             (false, true) | (false, false) => {},
             (true, true) => {
@@ -311,8 +333,7 @@ impl LedgerStorage {
             .current
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
         let mut file = open_regular(&self.active, &segment_name(metadata.id), true)?;
-        file.seek(SeekFrom::End(0))
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+        file.seek(SeekFrom::End(0)).map_err(map_io_error)?;
         let length = u32::try_from(frame.len())
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         let mut record = Vec::with_capacity(4 + frame.len());
@@ -323,20 +344,17 @@ impl LedgerStorage {
             injected_partial_write_length(LedgerFileEvent::PartialFrameWrite, record.len())
         {
             file.write_all(&record[..partial])
-                .map_err(|_| LedgerFailure::post_mutation(LedgerFailureCode::StorageUnavailable))?;
+                .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
             return Err(LedgerFailure::post_mutation(
                 LedgerFailureCode::StorageUnavailable,
             ));
         }
         file.write_all(&record)
-            .map_err(|_| LedgerFailure::post_mutation(LedgerFailureCode::StorageUnavailable))?;
+            .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
         emit_event(LedgerFileEvent::SynchronizeFrame)
             .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         synchronize(&file).map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
-        let durable_bytes = file
-            .metadata()
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?
-            .len();
+        let durable_bytes = file.metadata().map_err(map_io_error)?.len();
         publish_frontier(
             &self.active,
             metadata.id,
@@ -361,6 +379,6 @@ pub(super) fn entry_exists(directory: &File, name: &str) -> Result<bool, LedgerF
     match unix_fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => Ok(true),
         Err(rustix::io::Errno::NOENT) => Ok(false),
-        Err(_) => Err(LedgerFailure::new(LedgerFailureCode::StorageUnavailable)),
+        Err(error) => Err(map_errno(error)),
     }
 }

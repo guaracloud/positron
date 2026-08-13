@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
 use positron_domain::identity::TenantId;
@@ -8,8 +9,8 @@ use crate::resource_governor::accounting::{GovernorInner, KernelOwnership};
 use crate::resource_governor::ledger::GrantRecord;
 use crate::resource_governor::{
     DetectedCapacity, DiskObservation, DiskPressureThresholds, GovernorPolicy,
-    InventoryCardinalityLimits, OperatorLimits, OrdinaryPoolPolicy, RecoveryPoolCapacities,
-    RecoveryReserve, ResourceGovernorConfiguration, ResourceInventory,
+    InventoryCardinalityLimits, MAX_TENANT_QUOTAS, OperatorLimits, OrdinaryPoolPolicy,
+    RecoveryPoolCapacities, RecoveryReserve, ResourceGovernorConfiguration, ResourceInventory,
 };
 
 fn uniform(value: u64) -> ResourceAmounts {
@@ -165,7 +166,7 @@ fn establishment_moves_every_retained_payload_without_reallocation() {
     let authority = StorageKernelResourceAuthority {
         inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
         catalog_writer_held: AtomicBool::new(false),
-        active_segment_ledger_held: AtomicBool::new(false),
+        active_segment_scopes: Mutex::new([None; MAX_TENANT_QUOTAS]),
     };
     let after = authority.inner.payload_addresses_for_test();
     assert_eq!(after, before);

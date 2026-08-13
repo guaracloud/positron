@@ -4,10 +4,30 @@ use rustix::fs::{self as unix_fs, Mode, OFlags};
 
 use super::{LedgerFailure, LedgerFailureCode};
 
+pub(super) fn map_errno(error: rustix::io::Errno) -> LedgerFailure {
+    if matches!(error, rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT) {
+        LedgerFailure::new(LedgerFailureCode::StorageExhausted)
+    } else {
+        LedgerFailure::new(LedgerFailureCode::StorageUnavailable)
+    }
+}
+
+pub(super) fn map_io_error(error: std::io::Error) -> LedgerFailure {
+    match error.raw_os_error() {
+        Some(raw)
+            if raw == rustix::io::Errno::NOSPC.raw_os_error()
+                || raw == rustix::io::Errno::DQUOT.raw_os_error() =>
+        {
+            LedgerFailure::new(LedgerFailureCode::StorageExhausted)
+        },
+        _ => LedgerFailure::new(LedgerFailureCode::StorageUnavailable),
+    }
+}
+
 pub(super) fn open_or_create_directory(parent: &File, name: &str) -> Result<File, LedgerFailure> {
     match unix_fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {},
-        Err(_) => return Err(LedgerFailure::new(LedgerFailureCode::StorageUnavailable)),
+        Err(error) => return Err(map_errno(error)),
     }
     let directory = unix_fs::openat(
         parent,
@@ -16,7 +36,7 @@ pub(super) fn open_or_create_directory(parent: &File, name: &str) -> Result<File
         Mode::empty(),
     )
     .map(File::from)
-    .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+    .map_err(map_errno)?;
     synchronize(parent)?;
     Ok(directory)
 }
@@ -38,12 +58,10 @@ pub(super) fn open_regular(
         if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) {
             LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
         } else {
-            LedgerFailure::new(LedgerFailureCode::StorageUnavailable)
+            map_errno(error)
         }
     })?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+    let metadata = file.metadata().map_err(map_io_error)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -55,8 +73,7 @@ pub(super) fn open_regular(
 }
 
 pub(super) fn synchronize(file: &File) -> Result<(), LedgerFailure> {
-    file.sync_all()
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))
+    file.sync_all().map_err(map_io_error)
 }
 
 pub(super) fn hex<const N: usize>(bytes: [u8; N]) -> String {

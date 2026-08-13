@@ -71,6 +71,8 @@ pub(crate) enum SegmentFramePurpose {
     Statistics,
     /// Segment metadata.
     SegmentMetadata,
+    /// The acknowledged local durability bound of an active segment.
+    DurabilityFrontier,
 }
 
 impl SegmentFramePurpose {
@@ -80,6 +82,7 @@ impl SegmentFramePurpose {
             Self::Index => 2,
             Self::Statistics => 3,
             Self::SegmentMetadata => 4,
+            Self::DurabilityFrontier => 5,
         }
     }
 }

@@ -9,7 +9,10 @@ use crate::catalog::fuzz_authority;
 use crate::{Catalog, CatalogSecret, InstanceId, MountQualification, PrimaryDataVolume};
 
 use super::fault::{LedgerFileEvent, with_ledger_fault};
-use super::{ActiveSegmentLedger, PreparedStoreBlock, SegmentProtectionKey, SegmentScope};
+use super::{
+    ActiveSegmentLedger, LedgerFailureCode, PreparedStoreBlock, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
+};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -63,31 +66,71 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     let mut ledger = open(&authority, &catalog, scope).expect("fresh ledger opens");
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
-        match selector % 4 {
+        match selector % 7 {
             0 => {
-                let payload = vec![selector, u8::try_from(index).unwrap_or(u8::MAX)];
-                let _ = ledger
-                    .append(PreparedStoreBlock::new(payload).expect("bounded nonempty fuzz block"));
+                ledger
+                    .append(block(index, selector))
+                    .expect("ordinary bounded fuzz append succeeds");
             },
             1 => {
-                let payload = vec![selector, u8::try_from(index).unwrap_or(u8::MAX)];
                 let result = with_ledger_fault(fault_event(selector), || {
-                    ledger.append(
-                        PreparedStoreBlock::new(payload).expect("bounded nonempty fuzz block"),
-                    )
+                    ledger.append(block(index, selector))
                 });
-                if result.is_err() {
-                    drop(ledger);
-                    ledger = open(&authority, &catalog, scope).expect("fault recovery opens");
-                }
+                result.expect_err("an injected filesystem boundary cannot acknowledge");
+                drop(ledger);
+                ledger = open(&authority, &catalog, scope).expect("fault recovery opens");
             },
             2 => {
                 drop(ledger);
                 ledger = open(&authority, &catalog, scope).expect("restart recovery opens");
             },
-            _ => {
-                let _ = ledger.seal();
+            3 => {
+                ledger.seal().expect("bounded seal succeeds");
                 ledger = open(&authority, &catalog, scope).expect("sealed ledger reopens");
+            },
+            4 => {
+                let snapshot = ledger.snapshot().expect("snapshot for retry");
+                if let Some(existing) = snapshot.blocks().first() {
+                    let retry =
+                        PreparedStoreBlock::new(existing.identity(), existing.payload().to_vec())
+                            .expect("existing block remains bounded");
+                    let receipt = ledger.append(retry).expect("same identity and bytes retry");
+                    assert_eq!(receipt.position(), existing.position());
+                }
+            },
+            5 => {
+                let snapshot = ledger.snapshot().expect("snapshot for conflict");
+                if let Some(existing) = snapshot.blocks().first() {
+                    let conflict =
+                        PreparedStoreBlock::new(existing.identity(), vec![selector, 0xff])
+                            .expect("bounded conflict");
+                    assert_eq!(
+                        ledger
+                            .append(conflict)
+                            .expect_err("identity reuse must conflict")
+                            .code(),
+                        LedgerFailureCode::IdempotencyConflict
+                    );
+                }
+            },
+            _ => {
+                let snapshot = ledger.snapshot().expect("snapshot for duplicate bytes");
+                if let Some(existing) = snapshot.blocks().first() {
+                    let identity = identity(index);
+                    if identity != existing.identity()
+                        && snapshot
+                            .blocks()
+                            .iter()
+                            .all(|block| block.identity() != identity)
+                    {
+                        ledger
+                            .append(
+                                PreparedStoreBlock::new(identity, existing.payload().to_vec())
+                                    .expect("bounded distinct identity"),
+                            )
+                            .expect("equal bytes under distinct identity append");
+                    }
+                }
             },
         }
         assert_snapshot_invariants(&ledger);
@@ -100,11 +143,38 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
 
 fn assert_snapshot_invariants(ledger: &ActiveSegmentLedger<'_, '_>) {
     let snapshot = ledger.snapshot().expect("fuzz snapshot is available");
-    assert_eq!(snapshot.frontier().value(), snapshot.blocks().len() as u64);
+    assert_eq!(
+        snapshot.frontier().value(),
+        u64::try_from(snapshot.blocks().len()).expect("bounded snapshot length")
+    );
     for (index, block) in snapshot.blocks().iter().enumerate() {
-        assert_eq!(block.position().value(), index as u64 + 1);
+        assert_eq!(
+            block.position().value(),
+            u64::try_from(index).expect("bounded block index") + 1
+        );
         assert!(!block.payload().is_empty());
+        assert_eq!(
+            snapshot
+                .blocks()
+                .iter()
+                .filter(|candidate| candidate.identity() == block.identity())
+                .count(),
+            1
+        );
     }
+}
+
+fn block(index: usize, selector: u8) -> PreparedStoreBlock {
+    PreparedStoreBlock::new(
+        identity(index),
+        vec![selector, u8::try_from(index).expect("fuzz operation bound")],
+    )
+    .expect("bounded fuzz block")
+}
+
+fn identity(index: usize) -> StoreBlockIdentity {
+    StoreBlockIdentity::new([u8::try_from(index + 1).expect("fuzz operation identity bound"); 16])
+        .expect("nonzero fuzz identity")
 }
 
 fn open<'authority, 'catalog>(

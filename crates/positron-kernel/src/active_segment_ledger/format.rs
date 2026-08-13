@@ -1,14 +1,17 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 
-use super::{LedgerFailure, LedgerFailureCode, SegmentId, SegmentScope};
+use super::{LedgerFailure, LedgerFailureCode, SegmentId, SegmentKeyRoute, SegmentScope};
 
 const METADATA_MAGIC: &[u8; 8] = b"PSEGMET1";
-const SEGMENT_MAGIC: &[u8; 8] = b"PSEGACT1";
+const SEGMENT_MAGIC: &[u8; 8] = b"PSEGACT2";
 const VERSION: u16 = 1;
 pub(super) const METADATA_BYTES: usize = 8 + 2 + 1 + 16 + 1 + 4 + 16 + 8;
-const HEADER_PREFIX_BYTES: usize = 8 + 2 + METADATA_BYTES + 4;
+const FRAME_ALGORITHM_AES_256_GCM: u16 = 1;
+const WRAPPING_ALGORITHM_AES_256_KWP: u16 = 1;
+const HEADER_PREFIX_BYTES: usize = 8 + 2 + 2 + 2 + 16 + 8 + 4;
 const MAX_WRAPPED_KEY_BYTES: usize = 256;
+const MAX_ENCRYPTED_METADATA_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SegmentState {
@@ -25,8 +28,9 @@ pub(super) struct SegmentMetadata {
 }
 
 pub(super) struct SegmentHeader<'a> {
-    pub(super) metadata: SegmentMetadata,
+    pub(super) route: SegmentKeyRoute,
     pub(super) wrapped_key: &'a [u8],
+    pub(super) encrypted_metadata: &'a [u8],
     pub(super) encoded_bytes: usize,
 }
 
@@ -85,20 +89,33 @@ pub(super) fn decode_metadata(bytes: &[u8]) -> Result<Option<SegmentMetadata>, L
 }
 
 pub(super) fn encode_header(
-    metadata: SegmentMetadata,
+    route: SegmentKeyRoute,
     wrapped_key: &[u8],
+    encrypted_metadata: &[u8],
 ) -> Result<Vec<u8>, LedgerFailure> {
-    if wrapped_key.is_empty() || wrapped_key.len() > MAX_WRAPPED_KEY_BYTES {
+    if wrapped_key.is_empty()
+        || wrapped_key.len() > MAX_WRAPPED_KEY_BYTES
+        || encrypted_metadata.is_empty()
+        || encrypted_metadata.len() > MAX_ENCRYPTED_METADATA_BYTES
+    {
         return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
     }
-    let length = u32::try_from(wrapped_key.len())
+    let wrapped_length = u32::try_from(wrapped_key.len())
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let mut bytes = Vec::with_capacity(HEADER_PREFIX_BYTES + wrapped_key.len());
+    let metadata_length = u32::try_from(encrypted_metadata.len())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut bytes =
+        Vec::with_capacity(HEADER_PREFIX_BYTES + wrapped_key.len() + 4 + encrypted_metadata.len());
     bytes.extend_from_slice(SEGMENT_MAGIC);
     bytes.extend_from_slice(&VERSION.to_be_bytes());
-    bytes.extend_from_slice(&encode_metadata(metadata));
-    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(&FRAME_ALGORITHM_AES_256_GCM.to_be_bytes());
+    bytes.extend_from_slice(&WRAPPING_ALGORITHM_AES_256_KWP.to_be_bytes());
+    bytes.extend_from_slice(&route.provider_reference);
+    bytes.extend_from_slice(&route.provider_key_epoch.to_be_bytes());
+    bytes.extend_from_slice(&wrapped_length.to_be_bytes());
     bytes.extend_from_slice(wrapped_key);
+    bytes.extend_from_slice(&metadata_length.to_be_bytes());
+    bytes.extend_from_slice(encrypted_metadata);
     Ok(bytes)
 }
 
@@ -108,26 +125,49 @@ pub(super) fn decode_header(bytes: &[u8]) -> Result<SegmentHeader<'_>, LedgerFai
     {
         return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
     }
-    let metadata = decode_metadata(
-        bytes
-            .get(10..10 + METADATA_BYTES)
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
-    )?
-    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
-    let wrapped_length = usize::try_from(u32::from_be_bytes(exact(bytes, 10 + METADATA_BYTES, 4)?))
+    if bytes.get(10..12) != Some(FRAME_ALGORITHM_AES_256_GCM.to_be_bytes().as_slice())
+        || bytes.get(12..14) != Some(WRAPPING_ALGORITHM_AES_256_KWP.to_be_bytes().as_slice())
+    {
+        return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+    }
+    let provider_reference = exact(bytes, 14, 16)?;
+    let provider_key_epoch = u64::from_be_bytes(exact(bytes, 30, 8)?);
+    if provider_reference.iter().all(|byte| *byte == 0) || provider_key_epoch == 0 {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+    }
+    let wrapped_length = usize::try_from(u32::from_be_bytes(exact(bytes, 38, 4)?))
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     if wrapped_length == 0 || wrapped_length > MAX_WRAPPED_KEY_BYTES {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    let encoded_bytes = HEADER_PREFIX_BYTES
+    let metadata_length_offset = HEADER_PREFIX_BYTES
         .checked_add(wrapped_length)
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let metadata_offset = metadata_length_offset
+        .checked_add(4)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let metadata_length =
+        usize::try_from(u32::from_be_bytes(exact(bytes, metadata_length_offset, 4)?))
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    if metadata_length == 0 || metadata_length > MAX_ENCRYPTED_METADATA_BYTES {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+    }
+    let encoded_bytes = metadata_offset
+        .checked_add(metadata_length)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let wrapped_key = bytes
-        .get(HEADER_PREFIX_BYTES..encoded_bytes)
+        .get(HEADER_PREFIX_BYTES..metadata_length_offset)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+    let encrypted_metadata = bytes
+        .get(metadata_offset..encoded_bytes)
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
     Ok(SegmentHeader {
-        metadata,
+        route: SegmentKeyRoute {
+            provider_reference,
+            provider_key_epoch,
+        },
         wrapped_key,
+        encrypted_metadata,
         encoded_bytes,
     })
 }

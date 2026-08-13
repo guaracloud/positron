@@ -3,7 +3,7 @@ use std::fs::File;
 
 use super::support::TemporaryRoot;
 use crate::active_segment_ledger::LedgerFailureCode;
-use crate::active_segment_ledger::io::{open_or_create_directory, open_regular};
+use crate::active_segment_ledger::io::{map_io_error, open_or_create_directory, open_regular};
 
 #[test]
 fn directory_creation_and_regular_open_map_filesystem_failures() -> Result<(), Box<dyn Error>> {
@@ -22,5 +22,15 @@ fn directory_creation_and_regular_open_map_filesystem_failures() -> Result<(), B
     let failure = open_regular(&directory, &overlong_name, false)
         .expect_err("an invalid component is an unavailable storage path");
     assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+    for error in [rustix::io::Errno::NOSPC, rustix::io::Errno::DQUOT] {
+        assert_eq!(
+            map_io_error(std::io::Error::from_raw_os_error(error.raw_os_error())).code(),
+            LedgerFailureCode::StorageExhausted
+        );
+    }
+    assert_eq!(
+        map_io_error(std::io::Error::other("test-only failure")).code(),
+        LedgerFailureCode::StorageUnavailable
+    );
     Ok(())
 }

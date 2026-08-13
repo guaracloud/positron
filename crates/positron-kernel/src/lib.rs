@@ -83,7 +83,7 @@ pub use catalog::{
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
     LedgerFailure, LedgerFailureCode, LedgerSnapshot, PreparedStoreBlock, SealedSegment, SegmentId,
-    SegmentProtectionKey, SegmentScope,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 
 pub use resource_governor::{

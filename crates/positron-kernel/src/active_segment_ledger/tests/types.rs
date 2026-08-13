@@ -3,8 +3,8 @@ use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 
 use crate::active_segment_ledger::{
     AppendCancellation, CommitReceipt, CommittedBlock, LedgerFailure, LedgerFailureCode,
-    LedgerSnapshot, PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey,
-    SegmentScope,
+    PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
 };
 use crate::catalog::{CatalogFailure, CatalogFailureCode};
 use crate::data_protection::{FrameFailure, FrameFailureCode};
@@ -16,22 +16,42 @@ fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
         LedgerFailureCode::InvalidInput
     );
     assert_eq!(
-        PreparedStoreBlock::new(Vec::new())
-            .err()
-            .expect("empty block")
-            .code(),
+        PreparedStoreBlock::new(
+            StoreBlockIdentity::new([1; 16]).expect("identity"),
+            Vec::new()
+        )
+        .err()
+        .expect("empty block")
+        .code(),
         LedgerFailureCode::LimitExceeded
     );
     assert_eq!(
-        PreparedStoreBlock::new(vec![0; 1_048_577])
-            .err()
-            .expect("oversized block")
-            .code(),
+        PreparedStoreBlock::new(
+            StoreBlockIdentity::new([1; 16]).expect("identity"),
+            vec![0; 1_048_577],
+        )
+        .err()
+        .expect("oversized block")
+        .code(),
         LedgerFailureCode::LimitExceeded
     );
     assert_eq!(
         format!("{:?}", SegmentProtectionKey::from_owned(Box::new([1; 32]))),
         "SegmentProtectionKey { <redacted> }"
+    );
+    for (reference, epoch) in [([0; 16], 1), ([1; 16], 0)] {
+        assert_eq!(
+            SegmentProtectionKey::from_owned_with_route(Box::new([1; 32]), reference, epoch)
+                .expect_err("invalid route")
+                .code(),
+            LedgerFailureCode::InvalidInput
+        );
+    }
+    assert_eq!(
+        StoreBlockIdentity::new([0; 16])
+            .expect_err("zero block identity")
+            .code(),
+        LedgerFailureCode::InvalidInput
     );
 
     let cancellation = AppendCancellation::default();
@@ -48,18 +68,14 @@ fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
     assert_eq!(receipt.segment_id(), segment);
     assert_eq!(receipt.frontier_authenticator(), [3; 32]);
     let block = CommittedBlock {
+        identity: StoreBlockIdentity::new([1; 16]).expect("identity"),
         position: receipt.position(),
         payload: b"block".to_vec(),
         segment,
         frontier_authenticator: [3; 32],
     };
-    let snapshot = LedgerSnapshot {
-        frontier: receipt.position(),
-        blocks: vec![block],
-    };
-    assert_eq!(snapshot.frontier(), receipt.position());
-    assert_eq!(snapshot.blocks()[0].position(), receipt.position());
-    assert_eq!(snapshot.blocks()[0].payload(), b"block");
+    assert_eq!(block.position(), receipt.position());
+    assert_eq!(block.payload(), b"block");
     let sealed = SealedSegment {
         segment,
         frontier: receipt.position(),
@@ -72,6 +88,7 @@ fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
         VirtualShardId::new(8).expect("fixed shard"),
     );
     assert_eq!(scope.signal, SignalKind::Traces);
+    assert_eq!(scope.lease_key()[16], 2);
 
     let failure = LedgerFailure::new(LedgerFailureCode::StorageUnavailable);
     assert_eq!(
@@ -147,11 +164,11 @@ fn internal_failures_map_to_the_closed_ledger_outcomes() {
         ),
         (
             CatalogFailureCode::IdempotencyConflict,
-            LedgerFailureCode::InvalidInput,
+            LedgerFailureCode::IdempotencyConflict,
         ),
         (
             CatalogFailureCode::StaleGeneration,
-            LedgerFailureCode::InvalidInput,
+            LedgerFailureCode::StaleGeneration,
         ),
         (
             CatalogFailureCode::LimitExceeded,

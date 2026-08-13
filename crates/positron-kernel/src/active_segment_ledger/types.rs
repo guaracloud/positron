@@ -10,6 +10,7 @@ use crate::catalog::CatalogFailure;
 use crate::data_protection::SecretKeyBytes;
 
 use super::MAX_STORE_BLOCK_BYTES;
+use crate::ResourceReservation;
 
 /// The immutable tenant, Signal Store, and Virtual Shard boundary of one active segment.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -27,6 +28,30 @@ impl SegmentScope {
             signal,
             shard,
         }
+    }
+
+    pub(super) fn lease_key(self) -> [u8; 22] {
+        let mut key = [0_u8; 22];
+        for (destination, source) in key.iter_mut().zip(self.tenant.to_bytes()) {
+            *destination = source;
+        }
+        if let Some(signal) = key.get_mut(16) {
+            *signal = match self.signal {
+                SignalKind::Logs => 1,
+                SignalKind::Traces => 2,
+            };
+        }
+        for (destination, source) in key
+            .iter_mut()
+            .skip(17)
+            .zip(self.shard.value().to_be_bytes())
+        {
+            *destination = source;
+        }
+        if let Some(lifecycle) = key.last_mut() {
+            *lifecycle = 1;
+        }
+        key
     }
 }
 
@@ -48,13 +73,63 @@ impl SegmentId {
     }
 }
 
-/// A one-shot secret capability used to wrap per-segment data-encryption keys.
-pub struct SegmentProtectionKey(pub(super) SecretKeyBytes);
+/// Stable caller-supplied identity of one canonical Store Block append operation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct StoreBlockIdentity(pub(super) [u8; 16]);
+
+impl StoreBlockIdentity {
+    pub fn new(bytes: [u8; 16]) -> Result<Self, LedgerFailure> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SegmentKeyRoute {
+    pub(super) provider_reference: [u8; 16],
+    pub(super) provider_key_epoch: u64,
+}
+
+/// A one-shot secret capability and its non-secret provider recovery route.
+pub struct SegmentProtectionKey {
+    pub(super) key: SecretKeyBytes,
+    pub(super) route: SegmentKeyRoute,
+}
 
 impl SegmentProtectionKey {
     #[must_use]
     pub fn from_owned(bytes: Box<[u8; 32]>) -> Self {
-        Self(SecretKeyBytes::from_owned(bytes))
+        Self {
+            key: SecretKeyBytes::from_owned(bytes),
+            route: SegmentKeyRoute {
+                provider_reference: [1; 16],
+                provider_key_epoch: 1,
+            },
+        }
+    }
+
+    pub fn from_owned_with_route(
+        bytes: Box<[u8; 32]>,
+        provider_reference: [u8; 16],
+        provider_key_epoch: u64,
+    ) -> Result<Self, LedgerFailure> {
+        if provider_reference.iter().all(|byte| *byte == 0) || provider_key_epoch == 0 {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        Ok(Self {
+            key: SecretKeyBytes::from_owned(bytes),
+            route: SegmentKeyRoute {
+                provider_reference,
+                provider_key_epoch,
+            },
+        })
     }
 }
 
@@ -64,15 +139,21 @@ impl std::fmt::Debug for SegmentProtectionKey {
     }
 }
 
-/// Opaque canonical Store Block bytes prepared by the owning Signal Store.
-pub struct PreparedStoreBlock(pub(super) Vec<u8>);
+/// Opaque canonical Store Block bytes and their caller-owned stable identity.
+pub struct PreparedStoreBlock {
+    pub(super) identity: StoreBlockIdentity,
+    pub(super) payload: Vec<u8>,
+}
 
 impl PreparedStoreBlock {
-    pub fn new(bytes: Vec<u8>) -> Result<Self, LedgerFailure> {
+    pub fn new(identity: StoreBlockIdentity, bytes: Vec<u8>) -> Result<Self, LedgerFailure> {
         if bytes.is_empty() || bytes.len() > MAX_STORE_BLOCK_BYTES {
             return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
         }
-        Ok(Self(bytes))
+        Ok(Self {
+            identity,
+            payload: bytes,
+        })
     }
 }
 
@@ -129,6 +210,7 @@ impl CommitReceipt {
 /// One authenticated committed Store Block visible through a stable snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedBlock {
+    pub(super) identity: StoreBlockIdentity,
     pub(super) position: CommitPosition,
     pub(super) payload: Vec<u8>,
     pub(super) segment: SegmentId,
@@ -136,6 +218,11 @@ pub struct CommittedBlock {
 }
 
 impl CommittedBlock {
+    #[must_use]
+    pub const fn identity(&self) -> StoreBlockIdentity {
+        self.identity
+    }
+
     #[must_use]
     pub const fn position(&self) -> CommitPosition {
         self.position
@@ -148,13 +235,13 @@ impl CommittedBlock {
 }
 
 /// A verified immutable view bounded by the published Durability Frontier.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LedgerSnapshot {
+pub struct LedgerSnapshot<'kernel> {
+    pub(super) _capacity: ResourceReservation<'kernel>,
     pub(super) frontier: CommitPosition,
     pub(super) blocks: Vec<CommittedBlock>,
 }
 
-impl LedgerSnapshot {
+impl LedgerSnapshot<'_> {
     #[must_use]
     pub const fn frontier(&self) -> CommitPosition {
         self.frontier
@@ -197,6 +284,8 @@ pub enum LedgerFailureCode {
     ConcurrentWriter,
     UnsupportedFormat,
     StorageExhausted,
+    IdempotencyConflict,
+    StaleGeneration,
     RecoveryRequired,
     Cancelled,
 }
@@ -261,9 +350,9 @@ impl From<CatalogFailure> for LedgerFailure {
     fn from(failure: CatalogFailure) -> Self {
         use crate::CatalogFailureCode as Code;
         let code = match failure.code() {
-            Code::InvalidInput | Code::IdempotencyConflict | Code::StaleGeneration => {
-                LedgerFailureCode::InvalidInput
-            },
+            Code::InvalidInput => LedgerFailureCode::InvalidInput,
+            Code::IdempotencyConflict => LedgerFailureCode::IdempotencyConflict,
+            Code::StaleGeneration => LedgerFailureCode::StaleGeneration,
             Code::LimitExceeded => LedgerFailureCode::LimitExceeded,
             Code::StorageUnavailable => LedgerFailureCode::StorageUnavailable,
             Code::IntegrityCorruption => LedgerFailureCode::IntegrityCorruption,

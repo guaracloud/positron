@@ -1,10 +1,13 @@
 //! Direct encrypted active-segment append and authenticated durability frontiers.
 
+mod capacity;
 mod fault;
 mod format;
 #[cfg(fuzzing)]
 mod fuzzing;
 mod io;
+mod protection;
+mod publication;
 mod recovery;
 mod storage;
 mod types;
@@ -17,18 +20,20 @@ use std::sync::Mutex;
 
 use positron_domain::routing::CommitPosition;
 
-use crate::catalog::{Catalog, CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
+use crate::catalog::Catalog;
 use crate::data_protection::{
-    DataProtection, FrameFormatEpoch, FrameLimits, FrameObjectContext, FrameObjectId,
-    FrameSequence, KeyEpoch, ObjectDataKey, SegmentFramePurpose,
+    DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SegmentFramePurpose,
 };
-use crate::resource_governor::ActiveSegmentLedgerLease;
+use crate::resource_governor::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
 use crate::{
-    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceReservation,
-    StorageKernelResourceAuthority,
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceReservation, StorageKernelResourceAuthority,
+    WorkClaim, WorkKind,
 };
 
+use capacity::{append_claim, recovery_claim, retained_claim, snapshot_claim};
 use format::{SegmentMetadata, SegmentState};
+use protection::{map_frame_failure, object_context};
+use publication::{fresh_metadata, publish_segments};
 use storage::LedgerStorage;
 pub use types::*;
 
@@ -46,6 +51,7 @@ pub fn fuzz_active_segment_stateful(data: &[u8]) {
 
 struct LedgerState<'kernel> {
     _capacity: ResourceReservation<'kernel>,
+    retained_reservations: Vec<ResourceReservation<'kernel>>,
     frontier: CommitPosition,
     blocks: Vec<CommittedBlock>,
     retained_bytes: usize,
@@ -78,14 +84,27 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         protection: SegmentProtectionKey,
     ) -> Result<Self, LedgerFailure> {
         let writer = authority
-            .acquire_active_segment_ledger()
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+            .acquire_active_segment_ledger(scope.lease_key())
+            .map_err(|failure| match failure {
+                ActiveSegmentLeaseFailure::Duplicate | ActiveSegmentLeaseFailure::Unavailable => {
+                    LedgerFailure::new(LedgerFailureCode::ConcurrentWriter)
+                },
+                ActiveSegmentLeaseFailure::Capacity => {
+                    LedgerFailure::new(LedgerFailureCode::LimitExceeded)
+                },
+            })?;
         let claim =
             RecoveryWorkClaim::tenant(scope.tenant, RecoveryWorkKind::Repair, recovery_claim())
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let reservation = authority
+        let _recovery = authority
             .recovery()
             .reserve(claim)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let base_claim = WorkClaim::tenant(scope.tenant, WorkKind::Ingest, retained_claim(0, 0)?)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let reservation = authority
+            .governor()
+            .reserve(base_claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let volume = authority
             .primary_data_volume()
@@ -102,7 +121,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
             }
             let (key, recovered) =
-                storage.recover_segment(segment, &protection.0, catalog.instance())?;
+                storage.recover_segment(segment, &protection, catalog.instance())?;
             let block_count = blocks
                 .len()
                 .checked_add(recovered.blocks.len())
@@ -126,8 +145,24 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
         }
 
+        let recovered_capacity = if blocks.is_empty() {
+            None
+        } else {
+            let claim = WorkClaim::tenant(
+                scope.tenant,
+                WorkKind::Ingest,
+                retained_claim(retained_bytes, blocks.len())?,
+            )
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+            Some(
+                authority
+                    .governor()
+                    .reserve(claim)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?,
+            )
+        };
         let successor = fresh_metadata(scope, frontier)?;
-        let key = storage.create_active(successor, &protection.0, catalog.instance())?;
+        let key = storage.create_active(successor, &protection, catalog.instance())?;
         if let Some((predecessor, _recovered_key)) = recovered_active {
             storage
                 .seal(predecessor)
@@ -139,7 +174,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             });
         }
         metadata.push(successor);
-        publish_segments(catalog, &storage, scope, &metadata)
+        publish_segments(catalog, &snapshot, &storage, scope, &metadata)
             .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         storage.set_current(successor);
         Ok(Self {
@@ -151,6 +186,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             key,
             state: Mutex::new(LedgerState {
                 _capacity: reservation,
+                retained_reservations: recovered_capacity.into_iter().collect(),
                 frontier,
                 blocks,
                 retained_bytes,
@@ -184,7 +220,25 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if cancellation.is_some_and(AppendCancellation::is_cancelled) {
             return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
         }
-        let amounts = append_claim(block.0.len())?;
+        let amounts = append_claim(block.payload.len())?;
+        let ordinary_claim = WorkClaim::tenant(self.scope.tenant, WorkKind::Ingest, amounts)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let _ordinary_work = self
+            .authority
+            .governor()
+            .reserve(ordinary_claim)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let retained = WorkClaim::tenant(
+            self.scope.tenant,
+            WorkKind::Ingest,
+            retained_claim(block.payload.len(), 1)?,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let retained_reservation = self
+            .authority
+            .governor()
+            .reserve(retained)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let claim = RecoveryWorkClaim::tenant(
             self.scope.tenant,
             RecoveryWorkKind::DurabilityCompletion,
@@ -206,13 +260,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if let Some(committed) = state
             .blocks
             .iter()
-            .find(|committed| committed.payload == block.0)
+            .find(|item| item.identity == block.identity)
         {
-            return Ok(CommitReceipt {
-                segment: committed.segment,
-                position: committed.position,
-                frontier_authenticator: committed.frontier_authenticator,
-            });
+            if committed.payload != block.payload {
+                return Err(LedgerFailure::new(LedgerFailureCode::IdempotencyConflict));
+            }
+            return Ok(receipt_for(committed));
         }
         let block_count = state
             .blocks
@@ -221,7 +274,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         let retained_bytes = state
             .retained_bytes
-            .checked_add(block.0.len())
+            .checked_add(block.payload.len())
             .filter(|bytes| {
                 *bytes <= MAX_RETAINED_BLOCK_BYTES && block_count <= MAX_RETAINED_BLOCKS
             })
@@ -235,11 +288,19 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .object
             .frame(
                 SegmentFramePurpose::StoreBlock,
-                FrameSequence::new(state.next_sequence),
+                FrameSequence::new(
+                    state
+                        .next_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+                ),
             )
             .map_err(map_frame_failure)?;
         let limits = FrameLimits::new(MAX_ENCODED_FRAME_BYTES).map_err(map_frame_failure)?;
-        let encrypted = DataProtection::protect_frame(&self.key, context, &block.0, limits)
+        let mut frame_plaintext = Vec::with_capacity(16 + block.payload.len());
+        frame_plaintext.extend_from_slice(&block.identity.to_bytes());
+        frame_plaintext.extend_from_slice(&block.payload);
+        let encrypted = DataProtection::protect_frame(&self.key, context, &frame_plaintext, limits)
             .map_err(map_frame_failure)?;
         let authenticator = match self.storage.append_and_commit(
             &self.key,
@@ -254,11 +315,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             },
         };
         state.blocks.push(CommittedBlock {
+            identity: block.identity,
             position,
-            payload: block.0,
+            payload: block.payload,
             segment: self.storage.segment_id()?,
             frontier_authenticator: authenticator,
         });
+        state.retained_reservations.push(retained_reservation);
         state.frontier = position;
         state.retained_bytes = retained_bytes;
         state.next_sequence = state
@@ -272,12 +335,24 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         })
     }
 
-    pub fn snapshot(&self) -> Result<LedgerSnapshot, LedgerFailure> {
+    pub fn snapshot(&self) -> Result<LedgerSnapshot<'kernel>, LedgerFailure> {
         let state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        let claim = WorkClaim::tenant(
+            self.scope.tenant,
+            WorkKind::InteractiveQueryTail,
+            snapshot_claim(state.retained_bytes, state.blocks.len())?,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let reservation = self
+            .authority
+            .governor()
+            .reserve(claim)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         Ok(LedgerSnapshot {
+            _capacity: reservation,
             frontier: state.frontier,
             blocks: state.blocks.clone(),
         })
@@ -289,18 +364,26 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        if state.poisoned {
+            return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
+        }
         let current = self.storage.current_metadata()?;
+        let basis = self.catalog.pin()?;
+        let mut metadata = self.storage.catalog_segments(&basis, current.scope)?;
         self.storage.seal(current)?;
-        let mut metadata = self
-            .storage
-            .catalog_segments(&self.catalog.pin()?, current.scope)?;
         let published = metadata
             .iter_mut()
             .find(|candidate| candidate.id == current.id)
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
         published.state = SegmentState::Sealed;
-        publish_segments(self.catalog, &self.storage, current.scope, &metadata)
-            .map_err(|failure| LedgerFailure::ambiguous(failure.code()))?;
+        publish_segments(
+            self.catalog,
+            &basis,
+            &self.storage,
+            current.scope,
+            &metadata,
+        )
+        .map_err(|failure| LedgerFailure::ambiguous(failure.code()))?;
         Ok(SealedSegment {
             segment: current.id,
             frontier: state.frontier,
@@ -308,92 +391,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     }
 }
 
-fn fresh_metadata(
-    scope: SegmentScope,
-    base_position: CommitPosition,
-) -> Result<SegmentMetadata, LedgerFailure> {
-    let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(
-        random
-            .get(..16)
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
-    );
-    Ok(SegmentMetadata {
-        scope,
-        id: SegmentId::new(bytes)?,
-        state: SegmentState::Active,
-        base_position,
-    })
-}
-
-fn publish_segments(
-    catalog: &Catalog<'_>,
-    storage: &LedgerStorage,
-    scope: SegmentScope,
-    metadata: &[SegmentMetadata],
-) -> Result<(), LedgerFailure> {
-    let mut objects = catalog.proposal_objects(|bytes| !storage.is_scope_metadata(bytes, scope))?;
-    for segment in metadata {
-        objects.push(CatalogObject::new(storage.metadata_object(*segment))?);
+fn receipt_for(block: &CommittedBlock) -> CommitReceipt {
+    CommitReceipt {
+        segment: block.segment,
+        position: block.position,
+        frontier_authenticator: block.frontier_authenticator,
     }
-    let transaction_random = DataProtection::random_identifier().map_err(map_frame_failure)?;
-    let mut transaction = [0_u8; 16];
-    transaction.copy_from_slice(
-        transaction_random
-            .get(..16)
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
-    );
-    let _commit = catalog.commit(
-        catalog.pin()?.identity(),
-        CatalogProposal::new(
-            TransactionId::new(transaction)?,
-            FormatEpoch::new(FORMAT_EPOCH)?,
-            objects,
-        )?,
-        None,
-    )?;
-    Ok(())
-}
-
-fn object_context(scope: SegmentScope, id: SegmentId) -> Result<FrameObjectContext, LedgerFailure> {
-    Ok(FrameObjectContext::tenant_segment(
-        scope.tenant,
-        scope.signal,
-        scope.shard,
-        FrameObjectId::new(id.0).map_err(map_frame_failure)?,
-        KeyEpoch::new(1),
-        FrameFormatEpoch::new(FORMAT_EPOCH).map_err(map_frame_failure)?,
-    ))
-}
-
-fn map_frame_failure(failure: crate::data_protection::FrameFailure) -> LedgerFailure {
-    use crate::data_protection::FrameFailureCode as Code;
-    let code = match failure.code() {
-        Code::InvalidContext | Code::InvalidLimit => LedgerFailureCode::InvalidInput,
-        Code::LimitExceeded => LedgerFailureCode::LimitExceeded,
-        Code::SealFailed | Code::HashFailed | Code::EntropyUnavailable => {
-            LedgerFailureCode::StorageUnavailable
-        },
-        Code::OpenFailed | Code::AuthenticationFailed => LedgerFailureCode::AuthenticationFailed,
-        Code::MalformedFrame | Code::ChecksumMismatch => LedgerFailureCode::IntegrityCorruption,
-        Code::UnsupportedVersion | Code::UnsupportedAlgorithm => {
-            LedgerFailureCode::UnsupportedFormat
-        },
-    };
-    LedgerFailure::new(code)
-}
-
-fn recovery_claim() -> ResourceAmounts {
-    ResourceAmounts::new([2_500_000, 1, 1, 2_500_000, 1_024, 0, 1, 1, 1, 6, 0])
-}
-fn append_claim(block_bytes: usize) -> Result<ResourceAmounts, LedgerFailure> {
-    let bytes = u64::try_from(block_bytes)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let frame = bytes
-        .checked_add(384)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    Ok(ResourceAmounts::new([
-        frame, 1, 1, frame, 1, 0, 1, 1, 1, 4, frame,
-    ]))
 }

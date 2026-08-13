@@ -5,7 +5,14 @@ use crate::active_segment_ledger::format::{
     METADATA_BYTES, SegmentMetadata, SegmentState, decode_header, decode_metadata, encode_header,
     encode_metadata, position_from_value,
 };
-use crate::active_segment_ledger::{LedgerFailureCode, SegmentId, SegmentScope};
+use crate::active_segment_ledger::{LedgerFailureCode, SegmentId, SegmentKeyRoute, SegmentScope};
+
+fn route() -> SegmentKeyRoute {
+    SegmentKeyRoute {
+        provider_reference: [5; 16],
+        provider_key_epoch: 7,
+    }
+}
 
 fn metadata(state: SegmentState, signal: SignalKind) -> SegmentMetadata {
     SegmentMetadata {
@@ -21,7 +28,7 @@ fn metadata(state: SegmentState, signal: SignalKind) -> SegmentMetadata {
 }
 
 #[test]
-fn metadata_and_header_v1_round_trip_every_closed_tag() {
+fn metadata_and_header_v2_round_trip_every_closed_tag() {
     for (state, signal) in [
         (SegmentState::Active, SignalKind::Logs),
         (SegmentState::Sealed, SignalKind::Traces),
@@ -34,10 +41,11 @@ fn metadata_and_header_v1_round_trip_every_closed_tag() {
             Some(expected)
         );
 
-        let header = encode_header(expected, &[3; 40]).expect("bounded wrapped key");
+        let header = encode_header(route(), &[3; 40], &[4; 80]).expect("bounded header");
         let decoded = decode_header(&header).expect("header decodes");
-        assert_eq!(decoded.metadata, expected);
+        assert_eq!(decoded.route, route());
         assert_eq!(decoded.wrapped_key, &[3; 40]);
+        assert_eq!(decoded.encrypted_metadata, &[4; 80]);
         assert_eq!(decoded.encoded_bytes, header.len());
     }
     assert_eq!(
@@ -80,18 +88,18 @@ fn metadata_and_header_decoders_fail_closed_at_format_and_shape_boundaries() {
     }
 
     assert_eq!(
-        encode_header(expected, &[])
+        encode_header(route(), &[], &[4; 80])
             .expect_err("empty envelope")
             .code(),
         LedgerFailureCode::LimitExceeded
     );
     assert_eq!(
-        encode_header(expected, &[0; 257])
+        encode_header(route(), &[0; 257], &[4; 80])
             .expect_err("oversized envelope")
             .code(),
         LedgerFailureCode::LimitExceeded
     );
-    let header = encode_header(expected, &[4; 32]).expect("valid header");
+    let header = encode_header(route(), &[4; 32], &[5; 80]).expect("valid header");
     for candidate in [&header[..9], &header[..header.len() - 1]] {
         assert!(matches!(
             decode_header(candidate)
@@ -102,7 +110,7 @@ fn metadata_and_header_decoders_fail_closed_at_format_and_shape_boundaries() {
         ));
     }
     let mut bad_length = header;
-    bad_length[10 + METADATA_BYTES..10 + METADATA_BYTES + 4].copy_from_slice(&0_u32.to_be_bytes());
+    bad_length[38..42].copy_from_slice(&0_u32.to_be_bytes());
     assert_eq!(
         decode_header(&bad_length)
             .err()
@@ -110,13 +118,33 @@ fn metadata_and_header_decoders_fail_closed_at_format_and_shape_boundaries() {
             .code(),
         LedgerFailureCode::IntegrityCorruption
     );
-    let mut bad_nested_metadata = encode_header(expected, &[4; 32]).expect("valid header");
-    bad_nested_metadata[10 + 27] = 9;
+    let mut bad_algorithm = encode_header(route(), &[4; 32], &[5; 80]).expect("valid header");
+    bad_algorithm[11] = 9;
     assert_eq!(
-        decode_header(&bad_nested_metadata)
+        decode_header(&bad_algorithm)
             .err()
-            .expect("invalid nested metadata")
+            .expect("unknown algorithm")
             .code(),
-        LedgerFailureCode::IntegrityCorruption
+        LedgerFailureCode::UnsupportedFormat
     );
+    let mut retired_v1 = encode_header(route(), &[4; 32], &[5; 80]).expect("valid header");
+    retired_v1[..8].copy_from_slice(b"PSEGACT1");
+    assert_eq!(
+        decode_header(&retired_v1)
+            .err()
+            .expect("plaintext-metadata v1 has no implicit migration")
+            .code(),
+        LedgerFailureCode::UnsupportedFormat
+    );
+    for range in [14..30, 30..38, 74..78] {
+        let mut invalid = encode_header(route(), &[4; 32], &[5; 80]).expect("valid header");
+        invalid[range].fill(0);
+        assert_eq!(
+            decode_header(&invalid)
+                .err()
+                .expect("zero routing or encrypted metadata length")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+    }
 }
