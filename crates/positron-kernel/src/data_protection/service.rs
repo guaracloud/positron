@@ -33,6 +33,13 @@ impl DataProtection {
         Self::release().protect_frame(key, context, plaintext, limits)
     }
 
+    pub(crate) fn protected_frame_length(
+        plaintext_bytes: usize,
+        limits: FrameLimits,
+    ) -> Result<u32, FrameFailure> {
+        BackendDataProtection::<RustCryptoBackend>::protected_frame_length(plaintext_bytes, limits)
+    }
+
     /// Authenticates a bounded frame before exposing its plaintext.
     pub fn open_frame(
         key: &ObjectDataKey,
@@ -217,6 +224,23 @@ pub(super) struct BackendDataProtection<B> {
 }
 
 impl<B: CryptoBackend> BackendDataProtection<B> {
+    fn protected_frame_length(
+        plaintext_bytes: usize,
+        limits: FrameLimits,
+    ) -> Result<u32, FrameFailure> {
+        let ciphertext_bytes = plaintext_bytes
+            .checked_add(AES_256_GCM_TAG_BYTES as usize)
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
+        let encoded_bytes = FRAME_HEADER_BYTES
+            .checked_add(ciphertext_bytes)
+            .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
+        if encoded_bytes > limits.max_encoded_bytes {
+            return Err(FrameFailure::new(FrameFailureCode::LimitExceeded));
+        }
+        Ok(encoded_bytes)
+    }
+
     pub(super) fn import_object_key(
         &self,
         input: SecretKeyInput,
@@ -249,17 +273,10 @@ impl<B: CryptoBackend> BackendDataProtection<B> {
         if key.object != context.object {
             return Err(FrameFailure::new(FrameFailureCode::InvalidContext));
         }
-        let ciphertext_bytes = plaintext
-            .len()
-            .checked_add(AES_256_GCM_TAG_BYTES as usize)
-            .and_then(|length| u32::try_from(length).ok())
+        let encoded_bytes = Self::protected_frame_length(plaintext.len(), limits)?;
+        let ciphertext_bytes = encoded_bytes
+            .checked_sub(FRAME_HEADER_BYTES)
             .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
-        let encoded_bytes = FRAME_HEADER_BYTES
-            .checked_add(ciphertext_bytes)
-            .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
-        if encoded_bytes > limits.max_encoded_bytes {
-            return Err(FrameFailure::new(FrameFailureCode::LimitExceeded));
-        }
 
         let header = encode_authenticated_header(context.sequence, ciphertext_bytes);
         let associated_data = encode_associated_data(&header, context);

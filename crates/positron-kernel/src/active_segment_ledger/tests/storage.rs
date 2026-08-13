@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fs::{self, File};
+use std::io::{self, Write};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
@@ -7,9 +8,12 @@ use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use super::support::TemporaryRoot;
 use crate::active_segment_ledger::format::{SegmentMetadata, SegmentState};
 use crate::active_segment_ledger::recovery::{frontier_name, segment_name};
-use crate::active_segment_ledger::storage::{LedgerStorage, entry_exists, recognized_ledger_name};
+use crate::active_segment_ledger::storage::{
+    AppendFailure, LedgerStorage, SegmentMutation, entry_exists, recognized_ledger_name,
+    write_segment_bytes,
+};
 use crate::active_segment_ledger::{
-    LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
+    LedgerCompletionState, LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
 };
 use crate::catalog::InstanceId;
 use crate::{MountQualification, PrimaryDataVolume};
@@ -98,6 +102,108 @@ fn only_canonical_ledger_artifact_names_are_recovery_owned() {
         "0123456789abcdef.segment",
     ] {
         assert!(!recognized_ledger_name(name.as_bytes()));
+    }
+}
+
+#[test]
+fn segment_write_tracks_the_exact_first_successful_byte_boundary() {
+    let mut zero = ZeroWriter;
+    let zero_failure = match write_segment_bytes(&mut zero, b"frame", SegmentMutation::NotStarted) {
+        Err(AppendFailure::RejectedBeforeMutation(failure)) => failure,
+        _ => panic!("zero progress must be rejected before mutation"),
+    };
+    assert_eq!(zero_failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        zero_failure.completion_state(),
+        LedgerCompletionState::RejectedBeforeMutation
+    );
+
+    let mut partial = PartialThenExhausted(false);
+    let partial_failure =
+        match write_segment_bytes(&mut partial, b"frame", SegmentMutation::NotStarted) {
+            Err(AppendFailure::SegmentMutated(failure)) => failure,
+            _ => panic!("an error after one byte must require recovery"),
+        };
+    assert_eq!(partial_failure.code(), LedgerFailureCode::StorageExhausted);
+    assert_eq!(
+        partial_failure.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+
+    let mut interrupted = InterruptedThenComplete(false);
+    assert!(matches!(
+        write_segment_bytes(&mut interrupted, b"frame", SegmentMutation::NotStarted),
+        Ok(SegmentMutation::BytesWritten)
+    ));
+
+    let mut overflowing = PartialThenOverflow(false);
+    let overflow_failure =
+        match write_segment_bytes(&mut overflowing, b"frame", SegmentMutation::NotStarted) {
+            Err(AppendFailure::SegmentMutated(failure)) => failure,
+            _ => panic!("invalid writer progress must fail closed after mutation"),
+        };
+    assert_eq!(overflow_failure.code(), LedgerFailureCode::LimitExceeded);
+}
+
+struct ZeroWriter;
+
+impl Write for ZeroWriter {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PartialThenExhausted(bool);
+
+impl Write for PartialThenExhausted {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        if std::mem::replace(&mut self.0, true) {
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSPC.raw_os_error(),
+            ))
+        } else {
+            Ok(1)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct InterruptedThenComplete(bool);
+
+impl Write for InterruptedThenComplete {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if std::mem::replace(&mut self.0, true) {
+            Ok(buffer.len())
+        } else {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PartialThenOverflow(bool);
+
+impl Write for PartialThenOverflow {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        if std::mem::replace(&mut self.0, true) {
+            Ok(usize::MAX)
+        } else {
+            Ok(1)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

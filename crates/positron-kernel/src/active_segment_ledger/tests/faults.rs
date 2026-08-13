@@ -143,6 +143,18 @@ fn append_fault_matrix_never_overstates_the_authenticated_frontier() -> Result<(
             LedgerCompletionState::RecoveryRequired,
         ),
         (
+            LedgerFileEvent::InspectSegmentMetadata,
+            LedgerCompletionState::RecoveryRequired,
+        ),
+        (
+            LedgerFileEvent::RemoveFrontierTemporary,
+            LedgerCompletionState::RecoveryRequired,
+        ),
+        (
+            LedgerFileEvent::CreateFrontierTemporary,
+            LedgerCompletionState::RecoveryRequired,
+        ),
+        (
             LedgerFileEvent::WriteFrontier,
             LedgerCompletionState::RecoveryRequired,
         ),
@@ -168,15 +180,54 @@ fn append_fault_matrix_never_overstates_the_authenticated_frontier() -> Result<(
                 .expect_err("injected boundary cannot acknowledge");
             assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
             assert_eq!(failure.completion_state(), completion);
-            drop(ledger);
+            if completion == LedgerCompletionState::RecoveryRequired {
+                let append_failure = ledger
+                    .append(prepared(b"blocked-append")?)
+                    .expect_err("a mutated segment refuses another append until reopen");
+                assert_eq!(append_failure.code(), LedgerFailureCode::RecoveryRequired);
+                let seal_failure = ledger
+                    .seal()
+                    .expect_err("a mutated segment refuses sealing until reopen");
+                assert_eq!(seal_failure.code(), LedgerFailureCode::RecoveryRequired);
+            } else {
+                drop(ledger);
+            }
 
             let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
             assert_eq!(reopened.snapshot()?.frontier(), first.position());
             assert_eq!(reopened.snapshot()?.blocks().len(), 1);
+            let retried = reopened.append(prepared(b"second")?)?;
+            assert_eq!(retried.position().value(), first.position().value() + 1);
+            assert_eq!(reopened.snapshot()?.blocks().len(), 2);
             Ok(())
         })?;
     }
     Ok(())
+}
+
+#[test]
+fn pre_write_refusal_keeps_the_live_ledger_retryable_without_nonce_reuse()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let failure = with_ledger_fault(LedgerFileEvent::WriteFrame, || {
+            ledger.append(prepared(b"retry-in-place")?)
+        })
+        .expect_err("pre-write fault cannot acknowledge");
+        assert_eq!(
+            failure.completion_state(),
+            LedgerCompletionState::RejectedBeforeMutation
+        );
+        let committed = ledger.append(prepared(b"retry-in-place")?)?;
+        assert_eq!(committed.position().value(), 1);
+        assert_eq!(ledger.snapshot()?.blocks().len(), 1);
+        Ok(())
+    })
 }
 
 #[test]
@@ -192,6 +243,13 @@ fn frontier_directory_sync_failure_is_typed_as_commit_ambiguity() -> Result<(), 
         assert_eq!(
             failure.completion_state(),
             LedgerCompletionState::CommitAmbiguous
+        );
+        assert_eq!(
+            ledger
+                .append(prepared(b"blocked-after-ambiguity")?)
+                .expect_err("an ambiguous append must refuse further mutation")
+                .code(),
+            LedgerFailureCode::RecoveryRequired
         );
         let seal_failure = with_ledger_fault(LedgerFileEvent::RenameSealSegment, || ledger.seal())
             .expect_err("an ambiguous append must be recovered before sealing");
@@ -228,6 +286,7 @@ fn full_disk_is_a_stable_typed_failure_without_a_receipt() -> Result<(), Box<dyn
                 LedgerCompletionState::RejectedBeforeMutation
             );
             assert_eq!(ledger.snapshot()?.blocks().len(), 0);
+            assert_eq!(ledger.append(prepared(b"no-space")?)?.position().value(), 1);
             Ok(())
         })?;
     }

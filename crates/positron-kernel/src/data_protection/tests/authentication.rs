@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn object_authenticator_verifies_only_the_exact_evidence() -> Result<(), &'static str> {
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameObjectContext, FrameObjectId, KeyEpoch,
+        ObjectDataKey, SecretKeyInput,
+    };
+
+    let object = FrameObjectContext::tenant_segment(
+        TenantId::from_bytes([0x11; 16]).map_err(|_| "invalid tenant")?,
+        SignalKind::Logs,
+        VirtualShardId::new(1).map_err(|_| "invalid shard")?,
+        FrameObjectId::new([0x12; 16]).map_err(|_| "invalid object")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "invalid format")?,
+    );
+    let key = ObjectDataKey::import(SecretKeyInput::from_test_bytes([0x13; 32]), object);
+    let authenticator = DataProtection::authenticate_object_key(&key, b"receipt-evidence")
+        .map_err(|_| "authentication failed")?;
+    DataProtection::verify_object_authentication(&key, b"receipt-evidence", &authenticator)
+        .map_err(|_| "exact evidence did not verify")?;
+    let failure = DataProtection::verify_object_authentication(
+        &key,
+        b"different-receipt-evidence",
+        &authenticator,
+    )
+    .expect_err("different evidence must not verify");
+    if failure.code() == FrameFailureCode::AuthenticationFailed {
+        Ok(())
+    } else {
+        Err("wrong authenticator failure classification")
+    }
+}
+
+#[test]
 fn wrong_key_returns_no_plaintext() -> Result<(), &'static str> {
     use super::{
         DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,

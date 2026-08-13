@@ -120,15 +120,18 @@ per-block evidence; a later frontier never replaces an earlier receipt.
 
 Acknowledgment is permitted only after this order completes:
 
-1. write the complete length-prefixed encrypted frame;
+1. write the frame-length prefix, protect the frame, and complete its bytes;
 2. synchronize the segment file;
 3. write and synchronize a new temporary frontier;
 4. rename it over the published frontier;
 5. synchronize the frontier directory.
 
 The receipt contains segment ID, Commit Position, and frontier authenticator.
-Failure before mutation is retryable. Failure after segment mutation requires
-reopen. Failure after frontier rename but before directory synchronization is
+The first successfully written length-prefix byte is the segment-mutation
+boundary; protection occurs only after that boundary so a pre-write refusal
+does not consume a nonce. Failure before mutation is retryable. Failure after
+segment mutation, including segment metadata inspection and temporary-frontier
+cleanup or creation, requires reopen. Failure after frontier rename but before directory synchronization is
 commit-ambiguous: no receipt is returned and reopen determines whether the
 authenticated frontier became reachable.
 

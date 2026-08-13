@@ -194,10 +194,13 @@ fn scope() -> SegmentScope {
 }
 
 fn fault_event(selector: u8) -> LedgerFileEvent {
-    const EVENTS: [LedgerFileEvent; 8] = [
+    const EVENTS: [LedgerFileEvent; 11] = [
         LedgerFileEvent::WriteFrame,
         LedgerFileEvent::PartialFrameWrite,
         LedgerFileEvent::SynchronizeFrame,
+        LedgerFileEvent::InspectSegmentMetadata,
+        LedgerFileEvent::RemoveFrontierTemporary,
+        LedgerFileEvent::CreateFrontierTemporary,
         LedgerFileEvent::WriteFrontier,
         LedgerFileEvent::PartialFrontierWrite,
         LedgerFileEvent::SynchronizeFrontier,

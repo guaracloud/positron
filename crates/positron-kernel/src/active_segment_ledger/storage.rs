@@ -6,7 +6,7 @@ use rustix::fs::{self as unix_fs, AtFlags, Dir, Mode, OFlags};
 use crate::OwnedPrimaryDataVolume;
 use crate::catalog::{CatalogSnapshot, InstanceId};
 use crate::data_protection::{
-    DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SegmentFramePurpose,
+    DataProtection, EncryptedFrame, FrameLimits, FrameSequence, ObjectDataKey, SegmentFramePurpose,
 };
 
 use super::fault::{LedgerFileEvent, emit_event, injected_partial_write_length};
@@ -24,6 +24,35 @@ use super::{
 const MAX_SEGMENTS: usize = 1_024;
 const MAX_HEADER_BYTES: usize = 512;
 const MAX_ENCRYPTED_METADATA_BYTES: u32 = 256;
+
+pub(super) enum AppendFailure {
+    RejectedBeforeMutation(LedgerFailure),
+    SegmentMutated(LedgerFailure),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SegmentMutation {
+    NotStarted,
+    BytesWritten,
+}
+
+impl SegmentMutation {
+    fn failure(self, failure: LedgerFailure) -> AppendFailure {
+        match self {
+            Self::NotStarted => AppendFailure::RejectedBeforeMutation(failure),
+            Self::BytesWritten => {
+                let failure = match failure.completion_state() {
+                    super::LedgerCompletionState::CommitAmbiguous => failure,
+                    super::LedgerCompletionState::RejectedBeforeMutation
+                    | super::LedgerCompletionState::RecoveryRequired => {
+                        LedgerFailure::post_mutation(failure.code())
+                    },
+                };
+                AppendFailure::SegmentMutated(failure)
+            },
+        }
+    }
+}
 
 pub(super) struct LedgerStorage {
     active: File,
@@ -333,37 +362,41 @@ impl LedgerStorage {
         key: &ObjectDataKey,
         sequence: u64,
         position: positron_domain::routing::CommitPosition,
-        frame: &[u8],
+        frame_bytes: u32,
+        protect_frame: impl FnOnce() -> Result<EncryptedFrame, LedgerFailure>,
         admit_durability: impl FnOnce() -> Result<R, LedgerFailure>,
-    ) -> Result<[u8; 32], LedgerFailure> {
+    ) -> Result<[u8; 32], AppendFailure> {
+        let unchanged = SegmentMutation::NotStarted;
         let metadata = self
             .current
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
-        let mut file = open_regular(&self.active, &segment_name(metadata.id), true)?;
-        file.seek(SeekFrom::End(0)).map_err(map_io_error)?;
-        let length = u32::try_from(frame.len())
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let mut record = Vec::with_capacity(4 + frame.len());
-        record.extend_from_slice(&length.to_be_bytes());
-        record.extend_from_slice(frame);
-        emit_event(LedgerFileEvent::WriteFrame)?;
-        if let Some(partial) =
-            injected_partial_write_length(LedgerFileEvent::PartialFrameWrite, record.len())
-        {
-            file.write_all(&record[..partial])
-                .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
-            return Err(LedgerFailure::post_mutation(
-                LedgerFailureCode::StorageUnavailable,
-            ));
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            .map_err(|failure| unchanged.failure(failure))?;
+        let mut file = open_regular(&self.active, &segment_name(metadata.id), true)
+            .map_err(|failure| unchanged.failure(failure))?;
+        file.seek(SeekFrom::End(0))
+            .map_err(map_io_error)
+            .map_err(|failure| unchanged.failure(failure))?;
+        emit_event(LedgerFileEvent::WriteFrame).map_err(|failure| unchanged.failure(failure))?;
+        let prefix = frame_bytes.to_be_bytes();
+        let partial = injected_partial_write_length(LedgerFileEvent::PartialFrameWrite, 4);
+        let prefix_bytes = partial.map_or(prefix.as_slice(), |length| &prefix[..length]);
+        let mutation = write_segment_bytes(&mut file, prefix_bytes, SegmentMutation::NotStarted)?;
+        if partial.is_some() {
+            return Err(mutation.failure(LedgerFailure::new(LedgerFailureCode::StorageUnavailable)));
         }
-        file.write_all(&record)
-            .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
-        let _durability =
-            admit_durability().map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
+        let encrypted = protect_frame().map_err(|failure| mutation.failure(failure))?;
+        write_segment_bytes(&mut file, encrypted.as_bytes(), mutation)?;
+        let _durability = admit_durability().map_err(|failure| mutation.failure(failure))?;
         emit_event(LedgerFileEvent::SynchronizeFrame)
-            .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
-        synchronize(&file).map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
-        let durable_bytes = file.metadata().map_err(map_io_error)?.len();
+            .map_err(|failure| mutation.failure(failure))?;
+        synchronize(&file).map_err(|failure| mutation.failure(failure))?;
+        emit_event(LedgerFileEvent::InspectSegmentMetadata)
+            .map_err(|failure| mutation.failure(failure))?;
+        let durable_bytes = file
+            .metadata()
+            .map_err(map_io_error)
+            .map_err(|failure| mutation.failure(failure))?
+            .len();
         publish_frontier(
             &self.active,
             metadata.id,
@@ -371,10 +404,38 @@ impl LedgerStorage {
             durable_bytes,
             sequence
                 .checked_add(1)
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+                .map_err(|failure| mutation.failure(failure))?,
             position,
         )
+        .map_err(|failure| mutation.failure(failure))
     }
+}
+
+pub(super) fn write_segment_bytes(
+    file: &mut impl Write,
+    bytes: &[u8],
+    mut mutation: SegmentMutation,
+) -> Result<SegmentMutation, AppendFailure> {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        match file.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(mutation.failure(map_io_error(std::io::Error::from(
+                    std::io::ErrorKind::WriteZero,
+                ))));
+            },
+            Ok(count) => {
+                written = written.checked_add(count).ok_or_else(|| {
+                    mutation.failure(LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+                })?;
+                mutation = SegmentMutation::BytesWritten;
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(mutation.failure(map_io_error(error))),
+        }
+    }
+    Ok(mutation)
 }
 
 pub(super) fn recognized_ledger_name(name: &[u8]) -> bool {

@@ -298,13 +298,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let mut frame_plaintext = Vec::with_capacity(16 + block.payload.len());
         frame_plaintext.extend_from_slice(&block.identity.to_bytes());
         frame_plaintext.extend_from_slice(&block.payload);
-        let encrypted = DataProtection::protect_frame(&self.key, context, &frame_plaintext, limits)
+        let frame_bytes = DataProtection::protected_frame_length(frame_plaintext.len(), limits)
             .map_err(map_frame_failure)?;
         let authenticator = match self.storage.append_and_commit(
             &self.key,
             state.next_sequence,
             position,
-            encrypted.as_bytes(),
+            frame_bytes,
+            || {
+                DataProtection::protect_frame(&self.key, context, &frame_plaintext, limits)
+                    .map_err(map_frame_failure)
+            },
             || {
                 self.authority
                     .recovery()
@@ -313,7 +317,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             },
         ) {
             Ok(authenticator) => authenticator,
-            Err(failure) => {
+            Err(storage::AppendFailure::RejectedBeforeMutation(failure)) => return Err(failure),
+            Err(storage::AppendFailure::SegmentMutated(failure)) => {
                 state.poisoned = true;
                 return Err(failure);
             },

@@ -248,12 +248,14 @@ pub(super) fn publish_frontier(
     encoded.extend_from_slice(frame.as_bytes());
     let authenticator = receipt_authenticator(key, durable_bytes, next_sequence, position)?;
     let temporary = frontier_temporary_name(id);
+    emit_event(LedgerFileEvent::RemoveFrontierTemporary)?;
     match unix_fs::unlinkat(directory, &temporary, rustix::fs::AtFlags::empty()) {
         Ok(()) | Err(rustix::io::Errno::NOENT) => {},
         Err(error) => return Err(map_errno(error)),
     }
     emit_event(LedgerFileEvent::WriteFrontier)
         .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
+    emit_event(LedgerFileEvent::CreateFrontierTemporary)?;
     let mut file = unix_fs::openat(
         directory,
         &temporary,
