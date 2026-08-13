@@ -124,6 +124,43 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    /// Applies the Log Store's authoritative semantic Value Limits to a
+    /// receiver-native candidate after Ingest Policy evaluation.
+    pub fn checked_receiver_candidate(
+        event_time_unix_nanos: Option<i64>,
+        observed_time_unix_nanos: Option<i64>,
+        body: Option<CandidateAttributeValue>,
+        attributes: Vec<AttributeOccurrenceSetCandidate>,
+        policy: PolicyProvenance,
+    ) -> Result<Self, LogStoreFailure> {
+        let event_time = checked_event_time(event_time_unix_nanos)?;
+        let observed_time = observed_time_unix_nanos
+            .map(|value| {
+                let quality = if value == 0 {
+                    SourceTimeQuality::Zero
+                } else {
+                    SourceTimeQuality::Usable
+                };
+                ObservedTime::received(UnixNanoseconds::new(value), quality)
+                    .map_err(|_| LogStoreFailure::invalid_input())
+            })
+            .transpose()?;
+        let body = body
+            .map(|body| validated_value(body_value_profile()?, body))
+            .transpose()?;
+        let profile = value_profile()?;
+        let attributes = attributes
+            .into_iter()
+            .map(|attribute| {
+                attribute
+                    .validate(profile)
+                    .map(StoredLogAttribute::generic)
+                    .map_err(|_| LogStoreFailure::limit_exceeded())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::checked_native(event_time, observed_time, body, attributes, policy)
+    }
+
     pub fn checked_minimal(
         event_time_unix_nanos: Option<i64>,
         body: Option<String>,
@@ -131,14 +168,7 @@ impl LogRecord {
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
         let profile = value_profile()?;
-        let event_time = match event_time_unix_nanos {
-            Some(0) => EventTime::received(UnixNanoseconds::new(0), SourceTimeQuality::Zero),
-            Some(value) => {
-                EventTime::received(UnixNanoseconds::new(value), SourceTimeQuality::Usable)
-            },
-            None => Ok(EventTime::missing()),
-        }
-        .map_err(|_| LogStoreFailure::invalid_input())?;
+        let event_time = checked_event_time(event_time_unix_nanos)?;
         let body_profile = body_value_profile()?;
         let body = body
             .map(|body| validated_value(body_profile, CandidateAttributeValue::string(body)))
@@ -207,6 +237,15 @@ impl LogRecord {
     pub const fn policy_provenance(&self) -> &PolicyProvenance {
         &self.policy
     }
+}
+
+fn checked_event_time(value: Option<i64>) -> Result<EventTime, LogStoreFailure> {
+    match value {
+        Some(0) => EventTime::received(UnixNanoseconds::new(0), SourceTimeQuality::Zero),
+        Some(value) => EventTime::received(UnixNanoseconds::new(value), SourceTimeQuality::Usable),
+        None => Ok(EventTime::missing()),
+    }
+    .map_err(|_| LogStoreFailure::invalid_input())
 }
 
 /// One immutable accepted log after the kernel assigned Ingest Time.

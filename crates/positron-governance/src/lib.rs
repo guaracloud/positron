@@ -23,7 +23,7 @@ pub use identity::{
     IdentityFailure, PresentedCredential, RequestedIntent,
 };
 
-const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV01";
+const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV02";
 const GOVERNANCE_AUDIT_MAGIC: [u8; 8] = *b"POSAUD01";
 
 /// Administration-owned semantic proposal for the initial governance state.
@@ -40,6 +40,9 @@ pub struct InitialTenantIntent {
     principal: PrincipalId,
     api_key_salt: [u8; 32],
     api_key_hash: [u8; 32],
+    ingest_principal: PrincipalId,
+    ingest_api_key_salt: [u8; 32],
+    ingest_api_key_hash: [u8; 32],
     integrity_public_key: [u8; 32],
     integrity_key_fingerprint: [u8; 32],
     protected_integrity_key: Vec<u8>,
@@ -90,6 +93,9 @@ impl InitialTenantIntent {
         principal: PrincipalId,
         api_key_salt: [u8; 32],
         api_key_hash: [u8; 32],
+        ingest_principal: PrincipalId,
+        ingest_api_key_salt: [u8; 32],
+        ingest_api_key_hash: [u8; 32],
         integrity_public_key: [u8; 32],
         integrity_key_fingerprint: [u8; 32],
         protected_integrity_key: Vec<u8>,
@@ -120,6 +126,9 @@ impl InitialTenantIntent {
             principal,
             api_key_salt,
             api_key_hash,
+            ingest_principal,
+            ingest_api_key_salt,
+            ingest_api_key_hash,
             integrity_public_key,
             integrity_key_fingerprint,
             protected_integrity_key,
@@ -143,6 +152,9 @@ impl InitialGovernanceIntent {
             principal,
             api_key_salt,
             api_key_hash,
+            ingest_principal,
+            ingest_api_key_salt,
+            ingest_api_key_hash,
             integrity_public_key,
             integrity_key_fingerprint,
             protected_integrity_key,
@@ -189,6 +201,9 @@ impl InitialGovernanceIntent {
         object.extend_from_slice(&principal.to_bytes());
         object.extend_from_slice(&api_key_salt);
         object.extend_from_slice(&api_key_hash);
+        object.extend_from_slice(&ingest_principal.to_bytes());
+        object.extend_from_slice(&ingest_api_key_salt);
+        object.extend_from_slice(&ingest_api_key_hash);
         object.extend_from_slice(&integrity_public_key);
         object.extend_from_slice(&integrity_key_fingerprint);
         object.extend_from_slice(&integrity_length.to_be_bytes());
