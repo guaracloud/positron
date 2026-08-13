@@ -114,6 +114,7 @@ fn encode_key_value_list(
 pub(super) fn decode(
     input: &mut Input<'_>,
     depth: u8,
+    value_bytes: usize,
 ) -> Result<CandidateAttributeValue, LogStoreFailure> {
     Ok(match input.u8()? {
         0 => CandidateAttributeValue::null(),
@@ -124,10 +125,14 @@ pub(super) fn decode(
         }),
         2 => CandidateAttributeValue::signed_integer(input.i64()?),
         3 => CandidateAttributeValue::floating_point_bits(input.u64()?),
-        4 => CandidateAttributeValue::string(input.string(65_536)?),
-        5 => CandidateAttributeValue::bytes(input.bytes(65_536)?),
-        6 => CandidateAttributeValue::array(decode_array(input, depth)?),
-        7 => CandidateAttributeValue::key_value_list(decode_key_value_list(input, depth)?),
+        4 => CandidateAttributeValue::string(input.string(value_bytes)?),
+        5 => CandidateAttributeValue::bytes(input.bytes(value_bytes)?),
+        6 => CandidateAttributeValue::array(decode_array(input, depth, value_bytes)?),
+        7 => CandidateAttributeValue::key_value_list(decode_key_value_list(
+            input,
+            depth,
+            value_bytes,
+        )?),
         _ => return Err(LogStoreFailure::malformed_block()),
     })
 }
@@ -135,6 +140,7 @@ pub(super) fn decode(
 fn decode_array(
     input: &mut Input<'_>,
     depth: u8,
+    value_bytes: usize,
 ) -> Result<Vec<CandidateAttributeValue>, LogStoreFailure> {
     let next = depth
         .checked_sub(1)
@@ -142,7 +148,7 @@ fn decode_array(
     let count = input.count(MAX_COLLECTION)?;
     let mut values = bounded_vec(count)?;
     for _ in 0..count {
-        values.push(decode(input, next)?);
+        values.push(decode(input, next, value_bytes)?);
     }
     Ok(values)
 }
@@ -150,6 +156,7 @@ fn decode_array(
 fn decode_key_value_list(
     input: &mut Input<'_>,
     depth: u8,
+    value_bytes: usize,
 ) -> Result<Vec<CandidateKeyValue>, LogStoreFailure> {
     let next = depth
         .checked_sub(1)
@@ -159,7 +166,7 @@ fn decode_key_value_list(
     for _ in 0..count {
         values.push(CandidateKeyValue::new(
             input.string(65_536)?,
-            decode(input, next)?,
+            decode(input, next, value_bytes)?,
         ));
     }
     Ok(values)

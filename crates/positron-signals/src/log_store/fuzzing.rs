@@ -11,6 +11,6 @@ pub fn fuzz_log_store_block(data: &[u8]) {
     let bounded = data.get(..bounded_end).unwrap_or_default();
     let tenant = TenantId::from_bytes([0x41; 16]);
     if let Ok(tenant) = tenant {
-        let _ = codec::decode_block(tenant, bounded);
+        let _ = codec::fuzz_decode_block(tenant, bounded);
     }
 }

@@ -12,6 +12,8 @@ pub enum LogStoreFailureCode {
     PhysicalScopeMismatch,
     Kernel,
     ResourceExhausted,
+    ClockUnavailable,
+    ResourceAdmissionRefused,
 }
 
 /// Redacted Log Store failure that never contains telemetry values.
@@ -48,6 +50,18 @@ impl LogStoreFailure {
     pub(super) const fn resource_exhausted() -> Self {
         Self {
             code: LogStoreFailureCode::ResourceExhausted,
+        }
+    }
+
+    pub(super) const fn clock_unavailable() -> Self {
+        Self {
+            code: LogStoreFailureCode::ClockUnavailable,
+        }
+    }
+
+    pub(super) const fn resource_admission_refused() -> Self {
+        Self {
+            code: LogStoreFailureCode::ResourceAdmissionRefused,
         }
     }
 

@@ -152,16 +152,6 @@ impl ObservedTime {
 pub struct IngestTime(UnixNanoseconds);
 
 impl IngestTime {
-    /// Assigns a checked kernel candidate as the accepted record's Ingest Time.
-    ///
-    /// The Storage Kernel time owner performs this transition after acceptance;
-    /// keeping it distinct from `UnixNanoseconds` prevents Signal Stores from
-    /// confusing producer and lifecycle time.
-    #[must_use]
-    pub const fn assign(candidate: IngestTimeCandidate) -> Self {
-        Self::from_candidate(candidate)
-    }
-
     const fn from_candidate(candidate: IngestTimeCandidate) -> Self {
         Self(candidate.instant)
     }
@@ -187,12 +177,6 @@ impl IngestTimeCandidate {
     #[must_use]
     pub const fn new(instant: UnixNanoseconds) -> Self {
         Self { instant }
-    }
-
-    /// Returns the exact candidate instant without assigning it.
-    #[must_use]
-    pub const fn instant(self) -> UnixNanoseconds {
-        self.instant
     }
 }
 

@@ -2,9 +2,11 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification, PrimaryDataVolume,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
+    LifecycleClock, MountQualification, PrimaryDataVolume, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
 };
 use positron_signals::{LogRecord, LogScan, LogStore, PolicyProvenance, ScanLimit};
 
@@ -28,7 +30,6 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
     let store = LogStore::new();
     let record = LogRecord::checked_minimal(
         None,
-        100,
         Some("public outcome".to_owned()),
         vec![
             ("record", "duplicate", "first"),
@@ -45,7 +46,9 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
     ledger.append(
         store
             .prepare(
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
                 tenant,
+                VirtualShardId::new(8)?,
                 StoreBlockIdentity::new([0x68; 16])?,
                 vec![record.clone()],
             )?
@@ -53,11 +56,12 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
     )?;
 
     let result = store.scan(
+        authority.governor(),
         tenant,
         &ledger.snapshot()?,
         LogScan::all(ScanLimit::new(1)?),
     )?;
-    assert_eq!(result.records(), &[record]);
+    assert_eq!(result.records()[0].record(), &record);
     assert!(result.complete());
     Ok(())
 }

@@ -14,9 +14,16 @@ use crate::{
 
 mod sealing_faults;
 
-fn prepared(payload: &[u8]) -> Result<PreparedStoreBlock, crate::LedgerFailure> {
+fn prepared(
+    scope: SegmentScope,
+    payload: &[u8],
+) -> Result<PreparedStoreBlock, crate::LedgerFailure> {
     let marker = payload.first().copied().unwrap_or(1).max(1);
-    PreparedStoreBlock::new(StoreBlockIdentity::new([marker; 16])?, payload.to_vec())
+    PreparedStoreBlock::new(
+        scope,
+        StoreBlockIdentity::new([marker; 16])?,
+        payload.to_vec(),
+    )
 }
 
 #[test]
@@ -37,10 +44,10 @@ fn failed_frame_synchronization_never_acknowledges_and_recovery_discards_its_tai
     );
     let wrapping_key = || SegmentProtectionKey::from_owned(Box::new([0x65; 32]));
     let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, wrapping_key())?;
-    let acknowledged = ledger.append(prepared(b"acknowledged")?)?;
+    let acknowledged = ledger.append(prepared(scope, b"acknowledged")?)?;
 
     let failure = with_ledger_fault(LedgerFileEvent::SynchronizeFrame, || {
-        ledger.append(prepared(b"unacknowledged")?)
+        ledger.append(prepared(scope, b"unacknowledged")?)
     })
     .expect_err("frame synchronization failure cannot return a receipt");
     assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
@@ -50,7 +57,7 @@ fn failed_frame_synchronization_never_acknowledges_and_recovery_discards_its_tai
     );
     assert_eq!(
         ledger
-            .append(prepared(b"must-reopen")?)
+            .append(prepared(scope, b"must-reopen")?)
             .expect_err("a possibly mutated live segment is poisoned")
             .code(),
         LedgerFailureCode::RecoveryRequired
@@ -72,7 +79,7 @@ fn recovery_discards_a_partial_first_frame_without_a_frontier() -> Result<(), Bo
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
         let failure = with_ledger_fault(LedgerFileEvent::PartialFrameWrite, || {
-            ledger.append(prepared(b"partial-first")?)
+            ledger.append(prepared(scope, b"partial-first")?)
         })
         .expect_err("partial first frame cannot publish a frontier");
         assert_eq!(
@@ -99,12 +106,13 @@ fn repeated_empty_seals_and_an_interrupted_successor_append_remain_restartable()
             ActiveSegmentLedger::open(authority, catalog, scope, key())?.seal()?;
 
             let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-            let acknowledged = ledger.append(prepared(b"acknowledged-after-empty-seals")?)?;
+            let acknowledged =
+                ledger.append(prepared(scope, b"acknowledged-after-empty-seals")?)?;
             drop(ledger);
 
             let recovered = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
             let failure = with_ledger_fault(LedgerFileEvent::SynchronizeFrame, || {
-                recovered.append(prepared(b"interrupted-successor")?)
+                recovered.append(prepared(scope, b"interrupted-successor")?)
             })
             .expect_err("an interrupted successor append cannot acknowledge");
             assert_eq!(
@@ -175,14 +183,14 @@ fn append_fault_matrix_never_overstates_the_authenticated_frontier() -> Result<(
         with_fixture(|authority, catalog, scope| {
             let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
             let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-            let first = ledger.append(prepared(b"first")?)?;
-            let failure = with_ledger_fault(event, || ledger.append(prepared(b"second")?))
+            let first = ledger.append(prepared(scope, b"first")?)?;
+            let failure = with_ledger_fault(event, || ledger.append(prepared(scope, b"second")?))
                 .expect_err("injected boundary cannot acknowledge");
             assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
             assert_eq!(failure.completion_state(), completion);
             if completion == LedgerCompletionState::RecoveryRequired {
                 let append_failure = ledger
-                    .append(prepared(b"blocked-append")?)
+                    .append(prepared(scope, b"blocked-append")?)
                     .expect_err("a mutated segment refuses another append until reopen");
                 assert_eq!(append_failure.code(), LedgerFailureCode::RecoveryRequired);
                 let seal_failure = ledger
@@ -196,7 +204,7 @@ fn append_fault_matrix_never_overstates_the_authenticated_frontier() -> Result<(
             let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
             assert_eq!(reopened.snapshot()?.frontier(), first.position());
             assert_eq!(reopened.snapshot()?.blocks().len(), 1);
-            let retried = reopened.append(prepared(b"second")?)?;
+            let retried = reopened.append(prepared(scope, b"second")?)?;
             assert_eq!(retried.position().value(), first.position().value() + 1);
             assert_eq!(reopened.snapshot()?.blocks().len(), 2);
             Ok(())
@@ -216,14 +224,14 @@ fn pre_write_refusal_keeps_the_live_ledger_retryable_without_nonce_reuse()
             SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
         )?;
         let failure = with_ledger_fault(LedgerFileEvent::WriteFrame, || {
-            ledger.append(prepared(b"retry-in-place")?)
+            ledger.append(prepared(scope, b"retry-in-place")?)
         })
         .expect_err("pre-write fault cannot acknowledge");
         assert_eq!(
             failure.completion_state(),
             LedgerCompletionState::RejectedBeforeMutation
         );
-        let committed = ledger.append(prepared(b"retry-in-place")?)?;
+        let committed = ledger.append(prepared(scope, b"retry-in-place")?)?;
         assert_eq!(committed.position().value(), 1);
         assert_eq!(ledger.snapshot()?.blocks().len(), 1);
         Ok(())
@@ -235,9 +243,9 @@ fn frontier_directory_sync_failure_is_typed_as_commit_ambiguity() -> Result<(), 
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        ledger.append(prepared(b"first")?)?;
+        ledger.append(prepared(scope, b"first")?)?;
         let failure = with_ledger_fault(LedgerFileEvent::SynchronizeFrontierDirectory, || {
-            ledger.append(prepared(b"ambiguous")?)
+            ledger.append(prepared(scope, b"ambiguous")?)
         })
         .expect_err("directory synchronization cannot acknowledge");
         assert_eq!(
@@ -246,7 +254,7 @@ fn frontier_directory_sync_failure_is_typed_as_commit_ambiguity() -> Result<(), 
         );
         assert_eq!(
             ledger
-                .append(prepared(b"blocked-after-ambiguity")?)
+                .append(prepared(scope, b"blocked-after-ambiguity")?)
                 .expect_err("an ambiguous append must refuse further mutation")
                 .code(),
             LedgerFailureCode::RecoveryRequired
@@ -277,7 +285,7 @@ fn full_disk_is_a_stable_typed_failure_without_a_receipt() -> Result<(), Box<dyn
                 SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
             )?;
             let failure = with_ledger_errno(LedgerFileEvent::WriteFrame, error, || {
-                ledger.append(prepared(b"no-space")?)
+                ledger.append(prepared(scope, b"no-space")?)
             })
             .expect_err("exhausted storage cannot acknowledge");
             assert_eq!(failure.code(), LedgerFailureCode::StorageExhausted);
@@ -286,7 +294,13 @@ fn full_disk_is_a_stable_typed_failure_without_a_receipt() -> Result<(), Box<dyn
                 LedgerCompletionState::RejectedBeforeMutation
             );
             assert_eq!(ledger.snapshot()?.blocks().len(), 0);
-            assert_eq!(ledger.append(prepared(b"no-space")?)?.position().value(), 1);
+            assert_eq!(
+                ledger
+                    .append(prepared(scope, b"no-space")?)?
+                    .position()
+                    .value(),
+                1
+            );
             Ok(())
         })?;
     }
@@ -303,7 +317,7 @@ fn hard_pressure_resolves_replay_and_conflict_before_refusing_new_work()
             scope,
             SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
         )?;
-        let committed = ledger.append(prepared(b"hard-pressure-committed")?)?;
+        let committed = ledger.append(prepared(scope, b"hard-pressure-committed")?)?;
         let snapshot = ledger.snapshot()?;
         let usage = authority.governor().inspect()?.outstanding_total();
         assert_eq!(
@@ -312,19 +326,19 @@ fn hard_pressure_resolves_replay_and_conflict_before_refusing_new_work()
         );
 
         assert_eq!(
-            ledger.append(prepared(b"hard-pressure-committed")?)?,
+            ledger.append(prepared(scope, b"hard-pressure-committed")?)?,
             committed
         );
         assert_eq!(
             ledger
-                .append(prepared(b"hard-pressure-conflict")?)
+                .append(prepared(scope, b"hard-pressure-conflict")?)
                 .expect_err("conflict is resolved before new-work admission")
                 .code(),
             LedgerFailureCode::IdempotencyConflict
         );
         assert_eq!(
             ledger
-                .append(prepared(b"new-work")?)
+                .append(prepared(scope, b"new-work")?)
                 .expect_err("hard pressure refuses new work")
                 .code(),
             LedgerFailureCode::ResourceAdmissionRefused

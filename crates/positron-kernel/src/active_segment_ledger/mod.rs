@@ -220,6 +220,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         block: PreparedStoreBlock,
         cancellation: Option<&AppendCancellation>,
     ) -> Result<CommitReceipt, LedgerFailure> {
+        if block.scope != self.scope {
+            return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
+        }
         let mut state = self
             .state
             .lock()

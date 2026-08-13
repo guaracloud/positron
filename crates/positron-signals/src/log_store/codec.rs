@@ -1,14 +1,13 @@
 use positron_domain::identity::TenantId;
-use positron_domain::time::{
-    EventTime, IngestTime, IngestTimeCandidate, ObservedTime, SourceTimeQuality, UnixNanoseconds,
-};
+use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{AttributeNamespace, AttributeOccurrenceSetCandidate};
 
 use super::LogStoreFailure;
 use super::types::{
-    AttributeRepresentation, LogRecord, PolicyProvenance, StoredLogAttribute, body_value_profile,
-    validated_value, value_profile,
+    AttributeRepresentation, PolicyProvenance, StoredLogAttribute, StoredLogRecord,
+    body_value_profile, validated_value, value_profile,
 };
+use positron_kernel::LedgerSnapshot;
 
 const MAGIC: &[u8; 8] = b"PLOGBL01";
 const VERSION: u16 = 1;
@@ -20,7 +19,7 @@ mod value;
 
 pub(super) fn encode_block(
     tenant: TenantId,
-    records: &[LogRecord],
+    records: &[StoredLogRecord],
 ) -> Result<Vec<u8>, LogStoreFailure> {
     if records.is_empty() || records.len() > MAX_RECORDS {
         return Err(LogStoreFailure::limit_exceeded());
@@ -39,7 +38,7 @@ pub(super) fn encode_block(
     Ok(output)
 }
 
-fn encode_record(output: &mut Vec<u8>, record: &LogRecord) -> Result<(), LogStoreFailure> {
+fn encode_record(output: &mut Vec<u8>, record: &StoredLogRecord) -> Result<(), LogStoreFailure> {
     encode_event_time(output, record.event_time());
     if let Some(observed) = record.observed_time() {
         output.push(1);
@@ -100,8 +99,10 @@ fn encode_observed_time(output: &mut Vec<u8>, time: ObservedTime) {
 
 pub(super) fn decode_block(
     expected_tenant: TenantId,
+    snapshot: &LedgerSnapshot<'_>,
     bytes: &[u8],
-) -> Result<Vec<LogRecord>, LogStoreFailure> {
+    limit: usize,
+) -> Result<DecodedBlock, LogStoreFailure> {
     let mut input = Input::new(bytes);
     if input.take(MAGIC.len())? != MAGIC || input.u16()? != VERSION {
         return Err(LogStoreFailure::malformed_block());
@@ -117,30 +118,50 @@ pub(super) fn decode_block(
     if count == 0 {
         return Err(LogStoreFailure::malformed_block());
     }
-    let mut records = bounded_vec(count)?;
-    for _ in 0..count {
-        records.push(decode_record(&mut input)?);
+    let decoded_count = count.min(limit);
+    let mut records = bounded_vec(decoded_count)?;
+    for _ in 0..decoded_count {
+        records.push(decode_record(snapshot, &mut input)?);
     }
-    if !input.is_empty() {
+    let truncated = decoded_count < count;
+    if !truncated && !input.is_empty() {
         return Err(LogStoreFailure::malformed_block());
     }
-    Ok(records)
+    Ok(DecodedBlock { records, truncated })
 }
 
-fn decode_record(input: &mut Input<'_>) -> Result<LogRecord, LogStoreFailure> {
+pub(super) struct DecodedBlock {
+    pub(super) records: Vec<StoredLogRecord>,
+    pub(super) truncated: bool,
+}
+
+#[cfg(fuzzing)]
+pub(super) fn fuzz_decode_block(
+    expected_tenant: TenantId,
+    bytes: &[u8],
+) -> Result<(), LogStoreFailure> {
+    let _ = expected_tenant;
+    let mut input = Input::new(bytes);
+    let _ = value::decode(&mut input, MAX_NESTING, 262_144)?;
+    Ok(())
+}
+
+fn decode_record(
+    snapshot: &LedgerSnapshot<'_>,
+    input: &mut Input<'_>,
+) -> Result<StoredLogRecord, LogStoreFailure> {
     let event_time = decode_event_time(input)?;
     let observed_time = match input.u8()? {
         0 => None,
         1 => Some(decode_observed_time(input)?),
         _ => return Err(LogStoreFailure::malformed_block()),
     };
-    let ingest_time =
-        IngestTime::assign(IngestTimeCandidate::new(UnixNanoseconds::new(input.i64()?)));
+    let ingest_time = snapshot.reconstruct_ingest_time(UnixNanoseconds::new(input.i64()?));
     let body_profile = body_value_profile()?;
     let body = match input.u8()? {
         0 => None,
         1 => Some(
-            validated_value(body_profile, value::decode(input, MAX_NESTING)?)
+            validated_value(body_profile, value::decode(input, MAX_NESTING, 262_144)?)
                 .map_err(|_| LogStoreFailure::malformed_block())?,
         ),
         _ => return Err(LogStoreFailure::malformed_block()),
@@ -162,7 +183,7 @@ fn decode_record(input: &mut Input<'_>) -> Result<LogRecord, LogStoreFailure> {
         }
         let mut occurrences = bounded_vec(occurrence_count)?;
         for _ in 0..occurrence_count {
-            occurrences.push(value::decode(input, MAX_NESTING)?);
+            occurrences.push(value::decode(input, MAX_NESTING, 65_536)?);
         }
         let occurrences = AttributeOccurrenceSetCandidate::new(namespace, key, occurrences)
             .validate(profile)
@@ -183,7 +204,7 @@ fn decode_record(input: &mut Input<'_>) -> Result<LogRecord, LogStoreFailure> {
     }
     let policy = PolicyProvenance::new(generation, digest, rules)
         .map_err(|_| LogStoreFailure::malformed_block())?;
-    LogRecord::from_decoded(
+    StoredLogRecord::from_decoded(
         event_time,
         observed_time,
         ingest_time,

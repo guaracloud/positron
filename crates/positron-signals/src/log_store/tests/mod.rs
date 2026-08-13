@@ -2,9 +2,7 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::{
-    EventTime, IngestTime, IngestTimeCandidate, ObservedTime, SourceTimeQuality, UnixNanoseconds,
-};
+use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSet, AttributeOccurrenceSetCandidate, ByteLimit,
     CandidateAttributeValue, CandidateKeyValue, CollectionLimit, DynamicValueLimits, NestingLimit,
@@ -12,171 +10,22 @@ use positron_domain::value::{
     ValueLimitProfileCandidate, ValueLimitSet,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification,
-    PreparedStoreBlock, PrimaryDataVolume, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
+    LifecycleClock, MountQualification, PreparedStoreBlock, PrimaryDataVolume,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 
 use super::{
     AttributeRepresentation, LogRecord, LogScan, LogStore, LogStoreFailureCode, PolicyProvenance,
-    ScanLimit, StoredLogAttribute,
+    ScanLimit, StoredLogAttribute, StoredLogRecord,
 };
 use crate::log_store::tests::support::{TemporaryRoot, establish_kernel_authority};
 
+mod body;
+mod codec;
+mod scan;
 mod support;
-
-#[test]
-fn committed_native_log_survives_reopen_and_bounded_scan() -> Result<(), Box<dyn Error>> {
-    let root = TemporaryRoot::new()?;
-    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    let authority = establish_kernel_authority(volume)?;
-    let catalog = Catalog::open(
-        &authority,
-        InstanceId::new([0x11; 16])?,
-        CatalogSecret::from_owned(Box::new([0x21; 32]), Box::new([0x31; 32])),
-    )?;
-    let tenant = TenantId::from_bytes([0x41; 16])?;
-    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(1)?);
-    let key = || SegmentProtectionKey::from_owned(Box::new([0x51; 32]));
-    let store = LogStore::new();
-    let record = LogRecord::checked_minimal(
-        None,
-        1_723_456_789_000_000_000,
-        Some("".to_owned()),
-        vec![
-            ("resource", "service.name", "api"),
-            ("scope", "version", ""),
-            ("record", "attempt", "first"),
-            ("record", "attempt", "second"),
-        ],
-        PolicyProvenance::new(7, [0x71; 32], vec!["redact-password".to_owned()])?,
-    )?;
-    let prepared = store.prepare(
-        tenant,
-        StoreBlockIdentity::new([0x61; 16])?,
-        vec![record.clone()],
-    )?;
-
-    let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, key())?;
-    ledger.append(prepared.into_store_block())?;
-    drop(ledger);
-
-    let reopened = ActiveSegmentLedger::open(&authority, &catalog, scope, key())?;
-    let result = store.scan(
-        tenant,
-        &reopened.snapshot()?,
-        LogScan::all(ScanLimit::new(1)?),
-    )?;
-
-    assert_eq!(result.records(), &[record]);
-    assert!(result.complete());
-    Ok(())
-}
-
-#[test]
-fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
--> Result<(), Box<dyn Error>> {
-    let profile = value_profile()?;
-    let attributes = vec![
-        StoredLogAttribute::generic(occurrences(
-            profile,
-            AttributeNamespace::Resource,
-            "same-key",
-            vec![CandidateAttributeValue::string("resource".to_owned())],
-        )?),
-        StoredLogAttribute::schema_overflow(occurrences(
-            profile,
-            AttributeNamespace::InstrumentationScope,
-            "same-key",
-            vec![CandidateAttributeValue::bytes(vec![])],
-        )?),
-        StoredLogAttribute::generic(occurrences(
-            profile,
-            AttributeNamespace::Record,
-            "same-key",
-            vec![
-                CandidateAttributeValue::null(),
-                CandidateAttributeValue::boolean(false),
-                CandidateAttributeValue::signed_integer(-42),
-                CandidateAttributeValue::floating_point_bits(f64::NAN.to_bits()),
-                CandidateAttributeValue::string(String::new()),
-                CandidateAttributeValue::bytes(vec![0, 255]),
-                CandidateAttributeValue::array(vec![
-                    CandidateAttributeValue::signed_integer(7),
-                    CandidateAttributeValue::string("seven".to_owned()),
-                ]),
-                CandidateAttributeValue::key_value_list(vec![
-                    CandidateKeyValue::new(
-                        "duplicate".to_owned(),
-                        CandidateAttributeValue::boolean(true),
-                    ),
-                    CandidateKeyValue::new(
-                        "duplicate".to_owned(),
-                        CandidateAttributeValue::signed_integer(9),
-                    ),
-                ]),
-            ],
-        )?),
-    ];
-    let body = value(
-        profile,
-        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
-            "message".to_owned(),
-            CandidateAttributeValue::string(String::new()),
-        )]),
-    )?;
-    let event_time = EventTime::received(UnixNanoseconds::new(-55), SourceTimeQuality::Outlier)?;
-    let observed_time =
-        ObservedTime::received(UnixNanoseconds::new(88), SourceTimeQuality::Usable)?;
-    let ingest_time = IngestTime::assign(IngestTimeCandidate::new(UnixNanoseconds::new(1_000)));
-    let record = LogRecord::checked_native(
-        event_time,
-        Some(observed_time),
-        ingest_time,
-        Some(body),
-        attributes,
-        PolicyProvenance::new(9, [0x79; 32], vec![])?,
-    )?;
-    let tenant = TenantId::from_bytes([0x41; 16])?;
-    let store = LogStore::new();
-    let prepared = store.prepare(
-        tenant,
-        StoreBlockIdentity::new([0x62; 16])?,
-        vec![record.clone()],
-    )?;
-
-    let root = TemporaryRoot::new()?;
-    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    let authority = establish_kernel_authority(volume)?;
-    let catalog = Catalog::open(
-        &authority,
-        InstanceId::new([0x12; 16])?,
-        CatalogSecret::from_owned(Box::new([0x22; 32]), Box::new([0x32; 32])),
-    )?;
-    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(2)?);
-    let ledger = ActiveSegmentLedger::open(
-        &authority,
-        &catalog,
-        scope,
-        SegmentProtectionKey::from_owned(Box::new([0x52; 32])),
-    )?;
-    ledger.append(prepared.into_store_block())?;
-    let result = store.scan(
-        tenant,
-        &ledger.snapshot()?,
-        LogScan::all(ScanLimit::new(1)?),
-    )?;
-
-    assert_eq!(result.records(), &[record]);
-    assert_eq!(
-        result.records()[0].attributes()[1].representation(),
-        AttributeRepresentation::SchemaOverflow
-    );
-    assert_eq!(
-        StoredLogAttribute::generic(result.records()[0].attributes()[1].occurrences().clone()),
-        result.records()[0].attributes()[1]
-    );
-    Ok(())
-}
+mod time;
 
 #[test]
 fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Error>> {
@@ -201,18 +50,26 @@ fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Er
     ledger.append(
         store
             .prepare(
+                &clock(1),
                 tenant,
+                VirtualShardId::new(3)?,
                 StoreBlockIdentity::new([0x63; 16])?,
                 vec![record.clone(), second],
             )?
             .into_store_block(),
     )?;
     let snapshot = ledger.snapshot()?;
-    let bounded = store.scan(tenant, &snapshot, LogScan::all(ScanLimit::new(1)?))?;
-    assert_eq!(bounded.records(), &[record]);
+    let bounded = store.scan(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+    )?;
+    assert_eq!(bounded.records()[0].record(), &record);
     assert!(!bounded.complete());
     let wrong_tenant = store
         .scan(
+            authority.governor(),
             TenantId::from_bytes([0x42; 16])?,
             &snapshot,
             LogScan::all(ScanLimit::new(1)?),
@@ -230,17 +87,14 @@ fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Er
         SegmentScope::new(tenant, SignalKind::Traces, VirtualShardId::new(4)?),
         SegmentProtectionKey::from_owned(Box::new([0x54; 32])),
     )?;
-    trace_ledger.append(
-        store
-            .prepare(
-                tenant,
-                StoreBlockIdentity::new([0x64; 16])?,
-                vec![minimal_record("trace-scope", 3)?],
-            )?
-            .into_store_block(),
-    )?;
+    trace_ledger.append(PreparedStoreBlock::new(
+        SegmentScope::new(tenant, SignalKind::Traces, VirtualShardId::new(4)?),
+        StoreBlockIdentity::new([0x64; 16])?,
+        b"opaque-trace-block".to_vec(),
+    )?)?;
     let wrong_signal = store
         .scan(
+            authority.governor(),
             tenant,
             &trace_ledger.snapshot()?,
             LogScan::all(ScanLimit::new(1)?),
@@ -273,7 +127,9 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
     ledger.append(
         store
             .prepare(
+                &clock(10),
                 tenant,
+                VirtualShardId::new(5)?,
                 StoreBlockIdentity::new([0x65; 16])?,
                 vec![sealed_record.clone()],
             )?
@@ -284,7 +140,9 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
     successor.append(
         store
             .prepare(
+                &clock(11),
                 tenant,
+                VirtualShardId::new(5)?,
                 StoreBlockIdentity::new([0x66; 16])?,
                 vec![active_record.clone()],
             )?
@@ -292,11 +150,13 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
     )?;
 
     let result = store.scan(
+        authority.governor(),
         tenant,
         &successor.snapshot()?,
         LogScan::all(ScanLimit::new(2)?),
     )?;
-    assert_eq!(result.records(), &[sealed_record, active_record]);
+    assert_eq!(result.records()[0].record(), &sealed_record);
+    assert_eq!(result.records()[1].record(), &active_record);
     assert!(result.complete());
     Ok(())
 }
@@ -319,11 +179,13 @@ fn authenticated_malformed_block_is_rejected_without_observation() -> Result<(),
         SegmentProtectionKey::from_owned(Box::new([0x56; 32])),
     )?;
     ledger.append(PreparedStoreBlock::new(
+        SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(6)?),
         StoreBlockIdentity::new([0x67; 16])?,
         b"not-a-log-store-block".to_vec(),
     )?)?;
     let failure = LogStore::new()
         .scan(
+            authority.governor(),
             tenant,
             &ledger.snapshot()?,
             LogScan::all(ScanLimit::new(1)?),
@@ -367,14 +229,12 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     let policy = PolicyProvenance::new(1, [0x70; 32], vec![])?;
     let zero_time = LogRecord::checked_minimal(
         Some(0),
-        10,
         None,
         vec![("scope", "name", "value")],
         policy.clone(),
     )?;
     let positive_time = LogRecord::checked_minimal(
         Some(11),
-        12,
         None,
         vec![("instrumentation-scope", "name", "value")],
         policy.clone(),
@@ -388,7 +248,6 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     assert_eq!(
         LogRecord::checked_minimal(
             None,
-            1,
             None,
             vec![("unknown", "key", "value")],
             policy.clone(),
@@ -410,7 +269,6 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
         LogRecord::checked_native(
             EventTime::missing(),
             None,
-            IngestTime::assign(IngestTimeCandidate::new(UnixNanoseconds::new(1))),
             None,
             too_many_attributes,
             policy.clone(),
@@ -423,15 +281,22 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let store = LogStore::new();
     let empty_failure = store
-        .prepare(tenant, StoreBlockIdentity::new([0x69; 16])?, vec![])
+        .prepare(
+            &clock(1),
+            tenant,
+            VirtualShardId::new(9)?,
+            StoreBlockIdentity::new([0x69; 16])?,
+            vec![],
+        )
         .err()
         .ok_or("an empty canonical block unexpectedly prepared")?;
     assert_eq!(empty_failure.code(), LogStoreFailureCode::LimitExceeded);
-    let large_record =
-        LogRecord::checked_minimal(None, 1, Some("x".repeat(262_144)), vec![], policy)?;
+    let large_record = LogRecord::checked_minimal(None, Some("x".repeat(262_144)), vec![], policy)?;
     let kernel_bound = store
         .prepare(
+            &clock(1),
             tenant,
+            VirtualShardId::new(10)?,
             StoreBlockIdentity::new([0x6a; 16])?,
             vec![large_record; 5],
         )
@@ -442,14 +307,19 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     Ok(())
 }
 
-fn minimal_record(body: &str, ingest_time: i64) -> Result<LogRecord, Box<dyn Error>> {
+fn minimal_record(body: &str, _ingest_time: i64) -> Result<LogRecord, Box<dyn Error>> {
     Ok(LogRecord::checked_minimal(
         None,
-        ingest_time,
         Some(body.to_owned()),
         vec![],
         PolicyProvenance::new(1, [0x70; 32], vec![])?,
     )?)
+}
+
+fn clock(instant: i64) -> LifecycleClock<FixedLifecycleClockSource> {
+    LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+        instant,
+    )))
 }
 
 fn occurrences(

@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
 use crate::catalog::CatalogFailure;
 use crate::data_protection::{SecretKeyBytes, SegmentEnvelopeRoute};
 
 use super::MAX_STORE_BLOCK_BYTES;
+use crate::IngestTime;
 use crate::ResourceReservation;
 
 /// The immutable tenant, Signal Store, and Virtual Shard boundary of one active segment.
@@ -154,16 +156,22 @@ impl std::fmt::Debug for SegmentProtectionKey {
 
 /// Opaque canonical Store Block bytes and their caller-owned stable identity.
 pub struct PreparedStoreBlock {
+    pub(super) scope: SegmentScope,
     pub(super) identity: StoreBlockIdentity,
     pub(super) payload: Vec<u8>,
 }
 
 impl PreparedStoreBlock {
-    pub fn new(identity: StoreBlockIdentity, bytes: Vec<u8>) -> Result<Self, LedgerFailure> {
+    pub fn new(
+        scope: SegmentScope,
+        identity: StoreBlockIdentity,
+        bytes: Vec<u8>,
+    ) -> Result<Self, LedgerFailure> {
         if bytes.is_empty() || bytes.len() > MAX_STORE_BLOCK_BYTES {
             return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
         }
         Ok(Self {
+            scope,
             identity,
             payload: bytes,
         })
@@ -262,6 +270,12 @@ impl LedgerSnapshot<'_> {
         self.scope
     }
 
+    /// Reconstructs Ingest Time only inside an authenticated durable snapshot.
+    #[must_use]
+    pub const fn reconstruct_ingest_time(&self, instant: UnixNanoseconds) -> IngestTime {
+        IngestTime::from_authenticated_durable(instant)
+    }
+
     #[must_use]
     pub const fn frontier(&self) -> CommitPosition {
         self.frontier
@@ -296,6 +310,7 @@ impl SealedSegment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LedgerFailureCode {
     InvalidInput,
+    PhysicalScopeMismatch,
     LimitExceeded,
     ResourceAdmissionRefused,
     StorageUnavailable,

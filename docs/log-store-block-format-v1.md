@@ -77,7 +77,9 @@ promoted or demoted representation.
 | `6` | array | `u16 count || ordered native values` |
 | `7` | key/value list | `u16 count || (u32 key length || UTF-8 key || native value)*` |
 
-Individual strings, bytes, and keys are at most 65,536 bytes. Arrays and
+Body strings and byte values are at most 262,144 bytes. Attribute strings,
+attribute byte values, and every key are at most 65,536 bytes. The body and
+attribute readers apply those distinct bounds recursively. Arrays and
 key/value lists contain at most 1,024 entries and nest at most 16 levels.
 Duplicate key/value-list keys remain ordered. Numeric and textual kinds are
 never coerced.

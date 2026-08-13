@@ -1,13 +1,11 @@
-use positron_domain::time::{
-    EventTime, IngestTime, IngestTimeCandidate, ObservedTime, SourceTimeQuality, UnixNanoseconds,
-};
+use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSet, AttributeOccurrenceSetCandidate, ByteLimit,
     CandidateAttributeValue, CollectionLimit, DynamicValueLimits, NestingLimit, RecordLimits,
     RequestLimits, ValidatedAttributeValue, ValueLimitProfile, ValueLimitProfileCandidate,
     ValueLimitSet,
 };
-use positron_kernel::PreparedStoreBlock;
+use positron_kernel::{IngestTime, PreparedStoreBlock};
 
 use super::failure::LogStoreFailure;
 
@@ -16,7 +14,6 @@ const MAX_RULE_ID_BYTES: usize = 256;
 const MAX_ATTRIBUTES: usize = 1_024;
 const MAX_ATTRIBUTE_BYTES: usize = 65_536;
 const MAX_BODY_BYTES: usize = 262_144;
-const MAX_SCAN_RECORDS: usize = 1_024;
 
 /// Immutable evidence identifying the Ingest Policy applied before persistence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,7 +118,6 @@ impl StoredLogAttribute {
 pub struct LogRecord {
     event_time: EventTime,
     observed_time: Option<ObservedTime>,
-    ingest_time: IngestTime,
     body: Option<ValidatedAttributeValue>,
     attributes: Vec<StoredLogAttribute>,
     policy: PolicyProvenance,
@@ -130,7 +126,6 @@ pub struct LogRecord {
 impl LogRecord {
     pub fn checked_minimal(
         event_time_unix_nanos: Option<i64>,
-        ingest_time_unix_nanos: i64,
         body: Option<String>,
         attributes: Vec<(&str, &str, &str)>,
         policy: PolicyProvenance,
@@ -166,22 +161,12 @@ impl LogRecord {
                 .map_err(|_| LogStoreFailure::limit_exceeded())?,
             ));
         }
-        Self::checked_native(
-            event_time,
-            None,
-            IngestTime::assign(IngestTimeCandidate::new(UnixNanoseconds::new(
-                ingest_time_unix_nanos,
-            ))),
-            body,
-            checked,
-            policy,
-        )
+        Self::checked_native(event_time, None, body, checked, policy)
     }
 
     pub fn checked_native(
         event_time: EventTime,
         observed_time: Option<ObservedTime>,
-        ingest_time: IngestTime,
         body: Option<ValidatedAttributeValue>,
         attributes: Vec<StoredLogAttribute>,
         policy: PolicyProvenance,
@@ -192,7 +177,6 @@ impl LogRecord {
         Ok(Self {
             event_time,
             observed_time,
-            ingest_time,
             body,
             attributes,
             policy,
@@ -210,11 +194,6 @@ impl LogRecord {
     }
 
     #[must_use]
-    pub const fn ingest_time(&self) -> IngestTime {
-        self.ingest_time
-    }
-
-    #[must_use]
     pub const fn body(&self) -> Option<&ValidatedAttributeValue> {
         self.body.as_ref()
     }
@@ -228,6 +207,62 @@ impl LogRecord {
     pub const fn policy_provenance(&self) -> &PolicyProvenance {
         &self.policy
     }
+}
+
+/// One immutable accepted log after the kernel assigned Ingest Time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredLogRecord {
+    record: LogRecord,
+    ingest_time: IngestTime,
+}
+
+impl StoredLogRecord {
+    pub(super) const fn new(record: LogRecord, ingest_time: IngestTime) -> Self {
+        Self {
+            record,
+            ingest_time,
+        }
+    }
+
+    #[must_use]
+    pub const fn record(&self) -> &LogRecord {
+        &self.record
+    }
+
+    #[must_use]
+    pub const fn event_time(&self) -> EventTime {
+        self.record.event_time()
+    }
+
+    #[must_use]
+    pub const fn observed_time(&self) -> Option<ObservedTime> {
+        self.record.observed_time()
+    }
+
+    #[must_use]
+    pub const fn ingest_time(&self) -> IngestTime {
+        self.ingest_time
+    }
+
+    #[must_use]
+    pub const fn retention_time(&self) -> UnixNanoseconds {
+        self.ingest_time.instant()
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> Option<&ValidatedAttributeValue> {
+        self.record.body()
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &[StoredLogAttribute] {
+        self.record.attributes()
+    }
+
+    #[must_use]
+    pub const fn policy_provenance(&self) -> &PolicyProvenance {
+        self.record.policy_provenance()
+    }
 
     pub(super) fn from_decoded(
         event_time: EventTime,
@@ -237,15 +272,9 @@ impl LogRecord {
         attributes: Vec<StoredLogAttribute>,
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
-        Self::checked_native(
-            event_time,
-            observed_time,
-            ingest_time,
-            body,
-            attributes,
-            policy,
-        )
-        .map_err(|_| LogStoreFailure::malformed_block())
+        let record = LogRecord::checked_native(event_time, observed_time, body, attributes, policy)
+            .map_err(|_| LogStoreFailure::malformed_block())?;
+        Ok(Self::new(record, ingest_time))
     }
 }
 
@@ -313,64 +342,5 @@ impl PreparedLogBlock {
     #[must_use]
     pub fn into_store_block(self) -> PreparedStoreBlock {
         self.block
-    }
-}
-
-/// Explicit finite record bound for one logical scan result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScanLimit(usize);
-
-impl ScanLimit {
-    pub fn new(value: usize) -> Result<Self, LogStoreFailure> {
-        if value == 0 || value > MAX_SCAN_RECORDS {
-            return Err(LogStoreFailure::limit_exceeded());
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub const fn value(self) -> usize {
-        self.0
-    }
-}
-
-/// The minimal M1 full logical scan request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogScan {
-    limit: ScanLimit,
-}
-
-impl LogScan {
-    #[must_use]
-    pub const fn all(limit: ScanLimit) -> Self {
-        Self { limit }
-    }
-
-    #[must_use]
-    pub const fn limit(self) -> ScanLimit {
-        self.limit
-    }
-}
-
-/// A bounded logical record result with explicit completion truth.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LogScanResult {
-    records: Vec<LogRecord>,
-    complete: bool,
-}
-
-impl LogScanResult {
-    pub(super) const fn new(records: Vec<LogRecord>, complete: bool) -> Self {
-        Self { records, complete }
-    }
-
-    #[must_use]
-    pub fn records(&self) -> &[LogRecord] {
-        &self.records
-    }
-
-    #[must_use]
-    pub const fn complete(&self) -> bool {
-        self.complete
     }
 }
