@@ -54,5 +54,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "active_segment_ledger_stateful"
+path = "fuzz_targets/active_segment_ledger_stateful.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

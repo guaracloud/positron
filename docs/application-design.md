@@ -641,6 +641,10 @@ truncate only an incomplete frame strictly after the authenticated frontier.
 An interrupted encrypted active segment is sealed and a new segment and DEK
 are used.
 
+The normative byte layout, frontier publication order, recovery rules, and
+bounds are defined in
+[`active-segment-format-v1.md`](active-segment-format-v1.md).
+
 #### Catalog
 
 The Catalog internal interface has three operations:

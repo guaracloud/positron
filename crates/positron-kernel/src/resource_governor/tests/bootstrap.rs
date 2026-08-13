@@ -165,6 +165,7 @@ fn establishment_moves_every_retained_payload_without_reallocation() {
     let authority = StorageKernelResourceAuthority {
         inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
         catalog_writer_held: AtomicBool::new(false),
+        active_segment_ledger_held: AtomicBool::new(false),
     };
     let after = authority.inner.payload_addresses_for_test();
     assert_eq!(after, before);

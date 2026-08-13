@@ -257,10 +257,9 @@ impl CatalogProposal {
         }
         objects.sort_by_key(CatalogObject::identity);
         if objects.windows(2).any(|pair| {
-            let [left, right] = pair else {
-                return false;
-            };
-            left.identity == right.identity
+            pair.first()
+                .zip(pair.get(1))
+                .is_some_and(|(left, right)| left.identity == right.identity)
         }) {
             return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
         }
@@ -322,6 +321,10 @@ impl CatalogSnapshot {
 
     pub fn object(&self, identity: CatalogObjectId) -> Result<Option<&[u8]>, CatalogFailure> {
         Ok(self.0.objects.get(&identity).map(AsRef::as_ref))
+    }
+
+    pub(crate) fn plaintext_objects(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.objects.values().map(AsRef::as_ref)
     }
 
     #[must_use]
@@ -467,7 +470,7 @@ pub struct CatalogFailure {
 }
 
 impl CatalogFailure {
-    pub(super) const fn new(code: CatalogFailureCode) -> Self {
+    pub(crate) const fn new(code: CatalogFailureCode) -> Self {
         Self {
             code,
             current: None,

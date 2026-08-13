@@ -28,10 +28,10 @@ pub use types::{
     TransactionId,
 };
 
-#[cfg(fuzzing)]
+#[cfg(any(test, fuzzing))]
 pub(crate) use storage::with_catalog_fault;
 
-#[cfg(fuzzing)]
+#[cfg(any(test, fuzzing))]
 pub(crate) use storage::fault::CatalogFileEvent;
 
 const MAX_RECOVERED_AUDIT_BYTES: usize = 16_777_216;
@@ -73,6 +73,10 @@ impl std::fmt::Debug for Catalog<'_> {
 }
 
 impl<'authority> Catalog<'authority> {
+    pub(crate) const fn instance(&self) -> InstanceId {
+        self.instance
+    }
+
     /// Opens and recovers the Catalog under the sole Storage Kernel resource authority.
     pub fn open(
         authority: &'authority StorageKernelResourceAuthority,
@@ -111,6 +115,24 @@ impl<'authority> Catalog<'authority> {
             .lock()
             .map(|state| state.current.clone())
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
+    }
+
+    pub(crate) fn proposal_objects(
+        &self,
+        retain: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<CatalogObject>, CatalogFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        state
+            .current
+            .0
+            .objects
+            .values()
+            .filter(|plaintext| retain(plaintext))
+            .map(|plaintext| CatalogObject::new(plaintext.to_vec()))
+            .collect()
     }
 
     /// Publishes one complete Catalog Proposal and optional Administration-owned audit intent.
@@ -159,11 +181,8 @@ impl<'authority> Catalog<'authority> {
             .iter()
             .map(CatalogObject::identity)
             .collect();
-        let digest = transaction_digest(
-            proposal.format_epoch,
-            &object_ids,
-            audit.as_ref().map(|intent| intent.0.as_slice()),
-        )?;
+        let audit_intent = audit.as_ref().map(|intent| intent.0.as_slice());
+        let digest = transaction_digest(proposal.format_epoch, &object_ids, audit_intent)?;
         // Resolve an earlier acknowledgement-ambiguous marker publication before
         // evaluating idempotency or the expected-generation precondition.
         let recovered = recover(&self.storage, &secret, self.instance)?;
@@ -796,3 +815,6 @@ pub fn fuzz_catalog_stateful(data: &[u8]) {
 
 #[cfg(fuzzing)]
 mod fuzzing;
+
+#[cfg(fuzzing)]
+pub(crate) use fuzzing::fuzz_authority;

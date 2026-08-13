@@ -133,13 +133,24 @@ pub struct ResourceGovernor<'authority> {
 pub struct StorageKernelResourceAuthority {
     inner: GovernorInner,
     catalog_writer_held: AtomicBool,
+    active_segment_ledger_held: AtomicBool,
 }
 
 pub(crate) struct CatalogWriterLease<'authority> {
     held: &'authority AtomicBool,
 }
 
+pub(crate) struct ActiveSegmentLedgerLease<'authority> {
+    held: &'authority AtomicBool,
+}
+
 impl Drop for CatalogWriterLease<'_> {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for ActiveSegmentLedgerLease<'_> {
     fn drop(&mut self) {
         self.held.store(false, Ordering::Release);
     }
@@ -327,6 +338,7 @@ impl StorageKernelResourceAuthority {
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
             catalog_writer_held: AtomicBool::new(false),
+            active_segment_ledger_held: AtomicBool::new(false),
         })
     }
 
@@ -342,6 +354,7 @@ impl StorageKernelResourceAuthority {
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
             catalog_writer_held: AtomicBool::new(false),
+            active_segment_ledger_held: AtomicBool::new(false),
         })
     }
 
@@ -358,6 +371,7 @@ impl StorageKernelResourceAuthority {
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
             catalog_writer_held: AtomicBool::new(false),
+            active_segment_ledger_held: AtomicBool::new(false),
         })
     }
     /// Establishes the sole governor after earlier private bootstrap/recovery steps.
@@ -383,6 +397,7 @@ impl StorageKernelResourceAuthority {
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
             catalog_writer_held: AtomicBool::new(false),
+            active_segment_ledger_held: AtomicBool::new(false),
         })
     }
 
@@ -412,6 +427,15 @@ impl StorageKernelResourceAuthority {
             .ok()
             .map(|_| CatalogWriterLease {
                 held: &self.catalog_writer_held,
+            })
+    }
+
+    pub(crate) fn acquire_active_segment_ledger(&self) -> Option<ActiveSegmentLedgerLease<'_>> {
+        self.active_segment_ledger_held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| ActiveSegmentLedgerLease {
+                held: &self.active_segment_ledger_held,
             })
     }
 

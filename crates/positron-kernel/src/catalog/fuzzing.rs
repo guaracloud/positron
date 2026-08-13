@@ -212,17 +212,27 @@ fn corrupt_persisted_byte(root: &std::path::Path, selector: Option<u8>) -> bool 
     corrupted
 }
 
-fn fuzz_authority(volume: OwnedPrimaryDataVolume) -> Option<StorageKernelResourceAuthority> {
-    let cardinality = InventoryCardinalityLimits::new(1, 16).ok()?;
+pub(crate) fn fuzz_authority(
+    volume: OwnedPrimaryDataVolume,
+) -> Option<StorageKernelResourceAuthority> {
+    fuzz_authority_with_policy(volume)
+}
+
+fn fuzz_authority_with_policy(
+    volume: OwnedPrimaryDataVolume,
+) -> Option<StorageKernelResourceAuthority> {
+    let tenant_count = 1;
+    let cardinality = InventoryCardinalityLimits::new(tenant_count, 16).ok()?;
     let large = ResourceAmounts::new([
-        70_000_001, 2, 2, 70_000_001, 65_541, 2, 2, 2, 2, 9, 20_000_001,
+        90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);
-    let small = uniform(1);
-    let dual = uniform(2);
-    let recovery = add(add(add(large, large)?, large)?, uniform(6))?;
+    let small = uniform(2);
+    let durability = add(add(large, large)?, large)?;
+    let recovery = add(add(add(durability, large)?, large)?, uniform(8))?;
+    let tenant_capacity = large;
     let raw = add(
-        add(recovery, uniform(16))?,
-        cardinality.governor_bootstrap_overhead(1).ok()?,
+        add(recovery, tenant_capacity)?,
+        cardinality.governor_bootstrap_overhead(tenant_count).ok()?,
     )?;
     let inventory = ResourceInventory::new(
         DetectedCapacity::new(raw).ok()?,
@@ -240,12 +250,14 @@ fn fuzz_authority(volume: OwnedPrimaryDataVolume) -> Option<StorageKernelResourc
     )
     .ok()?;
     let tenant = TenantId::from_bytes([0x43; 16]).ok()?;
+    let ordinary = OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2)).ok()?;
     let policy = GovernorPolicy::new(
-        [TenantQuota::new(tenant, 1, uniform(16)).ok()?],
-        OrdinaryPoolPolicy::new(uniform(4), uniform(3), uniform(2), uniform(1)).ok()?,
+        [TenantQuota::new(tenant, 1, tenant_capacity).ok()?],
+        ordinary,
     )
     .ok()?;
-    let pools = RecoveryPoolCapacities::new(large, small, dual, small, large, small, small).ok()?;
+    let pools =
+        RecoveryPoolCapacities::new(durability, small, small, large, large, small, small).ok()?;
     StorageKernelResourceAuthority::establish_for_fuzz_with_volume(volume, inventory, policy, pools)
         .ok()
 }

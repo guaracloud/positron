@@ -66,6 +66,16 @@ fn recovery_pools() -> RecoveryPoolCapacities {
 }
 
 #[test]
+fn test_only_authority_exposes_no_primary_volume_observation() {
+    let (governor, _) = governor();
+    assert!(governor.primary_data_volume().is_none());
+    assert_eq!(
+        governor.observe_disk(),
+        Err(GovernorFailure::PrimaryVolumeObservationUnavailable)
+    );
+}
+
+#[test]
 fn mutex_poison_fences_all_mutation_but_drop_releases_exactly() {
     let (governor, tenant) = governor();
     let mut grant = governor

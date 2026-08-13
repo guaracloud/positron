@@ -38,6 +38,50 @@ fn wrong_key_returns_no_plaintext() -> Result<(), &'static str> {
 }
 
 #[test]
+fn frame_open_rejects_a_key_bound_to_a_different_object_before_parsing() -> Result<(), &'static str>
+{
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,
+        FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput, SegmentFramePurpose,
+    };
+
+    let tenant = TenantId::from_bytes([0x25; 16]).map_err(|_| "invalid tenant")?;
+    let shard = VirtualShardId::new(2).map_err(|_| "invalid shard")?;
+    let object = FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        FrameObjectId::new([0x35; 16]).map_err(|_| "invalid object")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "invalid format")?,
+    );
+    let other = FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        FrameObjectId::new([0x36; 16]).map_err(|_| "invalid other object")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "invalid format")?,
+    );
+    let key = ObjectDataKey::import(SecretKeyInput::from_test_bytes([0x45; 32]), object);
+    let expected = other
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(0))
+        .map_err(|_| "invalid frame context")?;
+    let failure = DataProtection::open_frame(
+        &key,
+        expected,
+        b"not-even-a-frame",
+        FrameLimits::new(256).map_err(|_| "invalid limits")?,
+    )
+    .expect_err("object mismatch must be rejected before parsing");
+    if failure.code() == FrameFailureCode::AuthenticationFailed {
+        Ok(())
+    } else {
+        Err("object mismatch was misclassified")
+    }
+}
+
+#[test]
 fn frames_are_rereadable_only_at_the_exact_authoritative_context() -> Result<(), &'static str> {
     use super::{
         DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,
