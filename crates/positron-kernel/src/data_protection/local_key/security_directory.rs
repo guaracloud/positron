@@ -4,9 +4,11 @@ use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
-use rustix::fs::{self as unix_fs, Dir, Mode, OFlags};
+use rustix::fs::{self as unix_fs, AtFlags, Dir, Mode, OFlags};
 
-use super::{LocalKeyFailure, LocalKeyFailureCode};
+use super::{
+    LOCAL_KEY_FILE_NAME, LOCAL_KEY_STAGING_FILE_NAME, LocalKeyFailure, LocalKeyFailureCode,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LocalObjectIdentity {
@@ -14,11 +16,18 @@ struct LocalObjectIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalKeyRootState {
+    final_key: Option<LocalObjectIdentity>,
+    staging_key: Option<LocalObjectIdentity>,
+}
+
 pub(super) struct FreshInitializationRootProof {
     directory: File,
     expected_owner: u32,
     expected_link_count: u64,
     identity: LocalObjectIdentity,
+    root_state: LocalKeyRootState,
 }
 
 impl FreshInitializationRootProof {
@@ -44,9 +53,10 @@ impl FreshInitializationRootProof {
         let metadata = directory
             .metadata()
             .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
-        if !metadata.file_type().is_dir() || !contains_only_key_entries(&directory)? {
+        if !metadata.file_type().is_dir() {
             return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation));
         }
+        let root_state = local_key_root_state(&directory, LocalKeyFailureCode::InvalidLocation)?;
         Ok(Self {
             directory,
             expected_owner: metadata.uid(),
@@ -55,6 +65,7 @@ impl FreshInitializationRootProof {
                 device: metadata.dev(),
                 inode: metadata.ino(),
             },
+            root_state,
         })
     }
 
@@ -78,7 +89,11 @@ impl FreshInitializationRootProof {
             && LocalObjectIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            } == self.identity;
+            } == self.identity
+            && local_key_root_state(
+                &self.directory,
+                LocalKeyFailureCode::UnsafeSecurityDirectory,
+            )? == self.root_state;
         if safe {
             Ok(())
         } else {
@@ -94,21 +109,37 @@ impl FreshInitializationRootProof {
     }
 }
 
-fn contains_only_key_entries(directory: &File) -> Result<bool, LocalKeyFailure> {
-    let mut entries = Dir::read_from(directory)
-        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
+fn local_key_root_state(
+    directory: &File,
+    failure: LocalKeyFailureCode,
+) -> Result<LocalKeyRootState, LocalKeyFailure> {
+    let invalid = || LocalKeyFailure::new(failure);
+    let mut state = LocalKeyRootState {
+        final_key: None,
+        staging_key: None,
+    };
+    let mut entries = Dir::read_from(directory).map_err(|_| invalid())?;
     while let Some(entry) = entries.read() {
-        let entry =
-            entry.map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
+        let entry = entry.map_err(|_| invalid())?;
         let name = entry.file_name().to_bytes();
-        if !matches!(
-            name,
-            b"." | b".." | b"local-root-key.v1" | b"local-root-key.v1.new"
-        ) {
-            return Ok(false);
+        if matches!(name, b"." | b"..") {
+            continue;
         }
+        let slot = if name == LOCAL_KEY_FILE_NAME.as_bytes() {
+            &mut state.final_key
+        } else if name == LOCAL_KEY_STAGING_FILE_NAME.as_bytes() {
+            &mut state.staging_key
+        } else {
+            return Err(invalid());
+        };
+        let metadata = unix_fs::statat(directory, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| invalid())?;
+        *slot = Some(LocalObjectIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino,
+        });
     }
-    Ok(true)
+    Ok(state)
 }
 
 pub(super) fn open_absolute_directory(location: &Path) -> Result<File, LocalKeyFailure> {

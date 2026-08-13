@@ -62,13 +62,11 @@ fn stale_fresh_root_proof_refuses_without_changing_the_existing_key()
     let (second, events) = capture_initialization_events(|| initialize_local_key(stale_proof));
     let after = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
 
-    #[cfg(target_os = "macos")]
-    let expected_failure = LocalKeyFailureCode::UnsafeSecurityDirectory;
-    #[cfg(target_os = "linux")]
-    let expected_failure = LocalKeyFailureCode::KeyAlreadyExists;
     assert_eq!(
         second.map(|_| ()),
-        Err(LocalKeyFailure::new(expected_failure))
+        Err(LocalKeyFailure::new(
+            LocalKeyFailureCode::UnsafeSecurityDirectory
+        ))
     );
     assert!(!events.contains(&LocalKeyInitializationEvent::RequestEntropy));
     assert!(
@@ -82,6 +80,45 @@ fn stale_fresh_root_proof_refuses_without_changing_the_existing_key()
     assert_eq!(
         open_local_key(&root.path, expected_directory, expected)?.evidence(),
         first.evidence()
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_fresh_root_proof_refuses_same_name_key_replacement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = SecurityRoot::create()?;
+    initialize_local_key(FreshInitializationRootProof::for_test(&root.path)?)?;
+    let stale_proof = FreshInitializationRootProof::for_test(&root.path)?;
+    let replacement_root = SecurityRoot::create()?;
+    let replacement = initialize_local_key(FreshInitializationRootProof::for_test(
+        &replacement_root.path,
+    )?)?;
+    std::fs::rename(
+        replacement_root.path.join(LOCAL_KEY_FILE_NAME),
+        root.path.join(LOCAL_KEY_FILE_NAME),
+    )?;
+    let expected = ExpectedLocalKeyIdentity::from_evidence(replacement.evidence());
+    let expected_directory = ExpectedSecurityDirectory::for_test(&root.path)?;
+    let before = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
+
+    let (observed, events) = capture_initialization_events(|| initialize_local_key(stale_proof));
+    let after = Zeroizing::new(std::fs::read(root.path.join(LOCAL_KEY_FILE_NAME))?);
+
+    assert_eq!(
+        observed.map(|_| ()),
+        Err(LocalKeyFailure::new(
+            LocalKeyFailureCode::UnsafeSecurityDirectory
+        ))
+    );
+    assert!(!events.contains(&LocalKeyInitializationEvent::RequestEntropy));
+    assert!(
+        after.as_slice() == before.as_slice(),
+        "stale initialization changed the replacement local key file"
+    );
+    assert_eq!(
+        open_local_key(&root.path, expected_directory, expected)?.evidence(),
+        replacement.evidence()
     );
     Ok(())
 }
