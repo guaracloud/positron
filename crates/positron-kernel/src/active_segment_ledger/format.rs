@@ -4,12 +4,13 @@ use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use super::{LedgerFailure, LedgerFailureCode, SegmentId, SegmentKeyRoute, SegmentScope};
 
 const METADATA_MAGIC: &[u8; 8] = b"PSEGMET1";
-const SEGMENT_MAGIC: &[u8; 8] = b"PSEGACT2";
-const VERSION: u16 = 1;
+const SEGMENT_MAGIC: &[u8; 8] = b"PSEGACT3";
+const METADATA_VERSION: u16 = 1;
+const SEGMENT_VERSION: u16 = 2;
 pub(super) const METADATA_BYTES: usize = 8 + 2 + 1 + 16 + 1 + 4 + 16 + 8;
 const FRAME_ALGORITHM_AES_256_GCM: u16 = 1;
 const WRAPPING_ALGORITHM_AES_256_KWP: u16 = 1;
-pub(super) const HEADER_PREFIX_BYTES: usize = 8 + 2 + 2 + 2 + 16 + 8 + 4;
+pub(super) const HEADER_PREFIX_BYTES: usize = 8 + 2 + 2 + 2 + 2 + 16 + 8 + 4;
 const MAX_WRAPPED_KEY_BYTES: usize = 256;
 const MAX_ENCRYPTED_METADATA_BYTES: usize = 256;
 
@@ -37,7 +38,7 @@ pub(super) struct SegmentHeader<'a> {
 pub(super) fn encode_metadata(metadata: SegmentMetadata) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(METADATA_BYTES);
     bytes.extend_from_slice(METADATA_MAGIC);
-    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes.extend_from_slice(&METADATA_VERSION.to_be_bytes());
     bytes.push(match metadata.state {
         SegmentState::Active => 1,
         SegmentState::Sealed => 2,
@@ -57,7 +58,9 @@ pub(super) fn decode_metadata(bytes: &[u8]) -> Result<Option<SegmentMetadata>, L
     if !bytes.starts_with(METADATA_MAGIC) {
         return Ok(None);
     }
-    if bytes.len() != METADATA_BYTES || bytes.get(8..10) != Some(VERSION.to_be_bytes().as_slice()) {
+    if bytes.len() != METADATA_BYTES
+        || bytes.get(8..10) != Some(METADATA_VERSION.to_be_bytes().as_slice())
+    {
         return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
     }
     let state = match bytes.get(10).copied() {
@@ -107,9 +110,10 @@ pub(super) fn encode_header(
     let mut bytes =
         Vec::with_capacity(HEADER_PREFIX_BYTES + wrapped_key.len() + 4 + encrypted_metadata.len());
     bytes.extend_from_slice(SEGMENT_MAGIC);
-    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes.extend_from_slice(&SEGMENT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&FRAME_ALGORITHM_AES_256_GCM.to_be_bytes());
     bytes.extend_from_slice(&WRAPPING_ALGORITHM_AES_256_KWP.to_be_bytes());
+    bytes.extend_from_slice(&route.provider_family.to_be_bytes());
     bytes.extend_from_slice(&route.provider_reference);
     bytes.extend_from_slice(&route.provider_key_epoch.to_be_bytes());
     bytes.extend_from_slice(&wrapped_length.to_be_bytes());
@@ -121,7 +125,7 @@ pub(super) fn encode_header(
 
 pub(super) fn decode_header(bytes: &[u8]) -> Result<SegmentHeader<'_>, LedgerFailure> {
     if bytes.get(..8) != Some(SEGMENT_MAGIC.as_slice())
-        || bytes.get(8..10) != Some(VERSION.to_be_bytes().as_slice())
+        || bytes.get(8..10) != Some(SEGMENT_VERSION.to_be_bytes().as_slice())
     {
         return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
     }
@@ -130,12 +134,16 @@ pub(super) fn decode_header(bytes: &[u8]) -> Result<SegmentHeader<'_>, LedgerFai
     {
         return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
     }
-    let provider_reference = exact(bytes, 14, 16)?;
-    let provider_key_epoch = u64::from_be_bytes(exact(bytes, 30, 8)?);
-    if provider_reference.iter().all(|byte| *byte == 0) || provider_key_epoch == 0 {
+    let provider_family = u16::from_be_bytes(exact(bytes, 14, 2)?);
+    let provider_reference = exact(bytes, 16, 16)?;
+    let provider_key_epoch = u64::from_be_bytes(exact(bytes, 32, 8)?);
+    if provider_family == 0
+        || provider_reference.iter().all(|byte| *byte == 0)
+        || provider_key_epoch == 0
+    {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    let wrapped_length = usize::try_from(u32::from_be_bytes(exact(bytes, 38, 4)?))
+    let wrapped_length = usize::try_from(u32::from_be_bytes(exact(bytes, 40, 4)?))
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     if wrapped_length == 0 || wrapped_length > MAX_WRAPPED_KEY_BYTES {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
@@ -163,6 +171,7 @@ pub(super) fn decode_header(bytes: &[u8]) -> Result<SegmentHeader<'_>, LedgerFai
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
     Ok(SegmentHeader {
         route: SegmentKeyRoute {
+            provider_family,
             provider_reference,
             provider_key_epoch,
         },

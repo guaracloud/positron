@@ -9,6 +9,7 @@ use crate::active_segment_ledger::{LedgerFailureCode, SegmentId, SegmentKeyRoute
 
 fn route() -> SegmentKeyRoute {
     SegmentKeyRoute {
+        provider_family: 1,
         provider_reference: [5; 16],
         provider_key_epoch: 7,
     }
@@ -28,7 +29,7 @@ fn metadata(state: SegmentState, signal: SignalKind) -> SegmentMetadata {
 }
 
 #[test]
-fn metadata_and_header_v2_round_trip_every_closed_tag() {
+fn metadata_and_header_v3_round_trip_every_closed_tag() {
     for (state, signal) in [
         (SegmentState::Active, SignalKind::Logs),
         (SegmentState::Sealed, SignalKind::Traces),
@@ -110,7 +111,7 @@ fn metadata_and_header_decoders_fail_closed_at_format_and_shape_boundaries() {
         ));
     }
     let mut bad_length = header;
-    bad_length[38..42].copy_from_slice(&0_u32.to_be_bytes());
+    bad_length[40..44].copy_from_slice(&0_u32.to_be_bytes());
     assert_eq!(
         decode_header(&bad_length)
             .err()
@@ -128,15 +129,15 @@ fn metadata_and_header_decoders_fail_closed_at_format_and_shape_boundaries() {
         LedgerFailureCode::UnsupportedFormat
     );
     let mut retired_v1 = encode_header(route(), &[4; 32], &[5; 80]).expect("valid header");
-    retired_v1[..8].copy_from_slice(b"PSEGACT1");
+    retired_v1[..8].copy_from_slice(b"PSEGACT2");
     assert_eq!(
         decode_header(&retired_v1)
             .err()
-            .expect("plaintext-metadata v1 has no implicit migration")
+            .expect("route-unbound draft v2 has no implicit migration")
             .code(),
         LedgerFailureCode::UnsupportedFormat
     );
-    for range in [14..30, 30..38, 74..78] {
+    for range in [14..16, 16..32, 32..40, 76..80] {
         let mut invalid = encode_header(route(), &[4; 32], &[5; 80]).expect("valid header");
         invalid[range].fill(0);
         assert_eq!(

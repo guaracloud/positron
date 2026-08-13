@@ -125,8 +125,13 @@ impl LedgerStorage {
         }
         let object = object_context(metadata.scope, metadata.id)?;
         let key = DataProtection::random_key(object).map_err(map_frame_failure)?;
-        let wrapped = DataProtection::wrap_segment_key(&protection.key, &key, instance.to_bytes())
-            .map_err(map_frame_failure)?;
+        let wrapped = DataProtection::wrap_segment_key_with_route(
+            &protection.key,
+            &key,
+            instance.to_bytes(),
+            protection.route,
+        )
+        .map_err(map_frame_failure)?;
         let metadata_context = object
             .frame(SegmentFramePurpose::SegmentMetadata, FrameSequence::new(0))
             .map_err(map_frame_failure)?;
@@ -214,11 +219,12 @@ impl LedgerStorage {
             return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
         }
         let object = object_context(metadata.scope, metadata.id)?;
-        let key = DataProtection::unwrap_segment_key(
+        let key = DataProtection::unwrap_segment_key_with_route(
             &protection.key,
             decoded.wrapped_key,
             instance.to_bytes(),
             object,
+            decoded.route,
         )
         .map_err(map_frame_failure)?;
         let metadata_context = object
@@ -322,12 +328,13 @@ impl LedgerStorage {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
     }
 
-    pub(super) fn append_and_commit(
+    pub(super) fn append_and_commit<R>(
         &self,
         key: &ObjectDataKey,
         sequence: u64,
         position: positron_domain::routing::CommitPosition,
         frame: &[u8],
+        admit_durability: impl FnOnce() -> Result<R, LedgerFailure>,
     ) -> Result<[u8; 32], LedgerFailure> {
         let metadata = self
             .current
@@ -351,6 +358,8 @@ impl LedgerStorage {
         }
         file.write_all(&record)
             .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
+        let _durability =
+            admit_durability().map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         emit_event(LedgerFileEvent::SynchronizeFrame)
             .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         synchronize(&file).map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;

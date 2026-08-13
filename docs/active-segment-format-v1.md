@@ -1,4 +1,4 @@
-# Active Segment and Durability Frontier Format v2
+# Active Segment and Durability Frontier Format v3
 
 This document is the Release 1 byte-level authority for the files written by
 the Storage Kernel Active Segment Ledger. The Catalog publishes segment
@@ -44,15 +44,16 @@ version, or fields fails closed.
 
 ## Segment header
 
-Format v2 replaces the rejected plaintext-metadata v1 bootstrap. The segment
+Format v3 replaces the rejected route-unbound draft v2 bootstrap. The segment
 starts with only the fields needed to select the format and recover the DEK:
 
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
-| 8 | magic | ASCII `PSEGACT2` |
-| 2 | version | `1` |
+| 8 | magic | ASCII `PSEGACT3` |
+| 2 | version | `2` |
 | 2 | frame algorithm | `1`, AES-256-GCM |
 | 2 | wrapping algorithm | `1`, AES-256-KWP |
+| 2 | provider family | `1`, local/provider-neutral Release 1 route |
 | 16 | provider key reference | opaque, nonzero |
 | 8 | provider key epoch | nonzero |
 | 4 | wrapped-key length | `1..=256` |
@@ -63,9 +64,11 @@ starts with only the fields needed to select the format and recover the DEK:
 Each physical segment receives a fresh 256-bit data-encryption key. The
 caller-provided protection key wraps that DEK; it is not used for frame
 encryption. The opaque provider reference and epoch must match the supplied
-recovery capability before unwrap. The wrapped-key context binds the Positron instance, key kind,
-segment object and key epoch, segment scope, tenant, signal, shard, and format
-epoch. The encrypted metadata independently binds scope, segment identity,
+recovery capability before unwrap. Provider family, reference, and epoch are
+also embedded in the canonical wrapped payload and its context digest. The
+wrapped-key context binds the Positron instance, key kind, segment object and
+key epoch, segment scope, tenant, signal, shard, format epoch, and exact provider
+route. The encrypted metadata independently binds scope, segment identity,
 creation lifecycle, and base Commit Position. A wrong protection key,
 substituted route, or substituted context fails authentication.
 
@@ -110,8 +113,10 @@ The frontier frame purpose is `DurabilityFrontier`; its nonce sequence is
 sequences. Recovery tries only the bounded Release 1 sequence
 domain and requires the authenticated plaintext to agree with the successful
 sequence. No segment identity, Commit Position, or sequence is plaintext in
-the frontier artifact. The receipt authenticator is an HMAC of the complete
-encoded encrypted frontier and is not persisted as additional plaintext.
+the frontier artifact. Each historical receipt authenticator is an HMAC under
+the segment object key over a domain separator plus that commit's authenticated
+`durable_bytes`, sequence, and Commit Position. Recovery derives the same exact
+per-block evidence; a later frontier never replaces an earlier receipt.
 
 Acknowledgment is permitted only after this order completes:
 
@@ -152,7 +157,8 @@ reuse an AEAD sequence before recovery creates a fresh segment and DEK.
 ## Migration policy
 
 There is no released v1 data contract to migrate. Readers explicitly refuse
-the old `PSEGACT1` and `PFRONT01` plaintext-metadata formats as unsupported;
+the old `PSEGACT1` plaintext-metadata and route-unbound `PSEGACT2` draft formats,
+as well as the `PFRONT01` plaintext frontier, as unsupported;
 they do not guess, partially import, or silently rewrite them. A future
 released-format migration requires an accepted ADR and an explicit bounded
 migration path.

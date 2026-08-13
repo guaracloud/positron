@@ -11,7 +11,7 @@ use crate::{
     PrimaryDataVolume,
 };
 
-use super::{FuzzRoot, block, catalog_secret, open, scope};
+use super::{FuzzRoot, block_parts, catalog_secret, open, prepared, scope};
 use crate::active_segment_ledger::format::{HEADER_PREFIX_BYTES, decode_header};
 
 const AUTHENTICATION_TAG_BYTES: usize = 16;
@@ -103,8 +103,9 @@ fn prepare_fixture(root: &Path, artifact: PersistedArtifact) -> PersistedState {
     .expect("persisted fixture catalog opens");
     let ledger = open(&authority, &catalog, scope()).expect("persisted fixture ledger opens");
     if artifact.requires_block() {
+        let (identity, payload) = block_parts(0, 0xa5);
         ledger
-            .append(block(0, 0xa5))
+            .append(prepared(identity, payload))
             .expect("persisted fixture block commits");
     }
     let snapshot = ledger.snapshot().expect("persisted fixture snapshots");

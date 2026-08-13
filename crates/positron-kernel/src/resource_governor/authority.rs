@@ -133,7 +133,7 @@ impl StorageKernelResourceAuthority {
     }
 
     #[cfg(test)]
-    pub(super) fn observe_disk_for_test(
+    pub(crate) fn observe_disk_for_test(
         &self,
         observation: DiskObservation,
     ) -> Result<DiskPressureState, GovernorFailure> {

@@ -10,6 +10,34 @@ const SEGMENT_SCOPE: u64 = 2;
 const KEY_BYTES_OFFSET: usize = 4;
 const KEY_BYTES: usize = 32;
 
+/// The non-secret provider route bound inside a segment's wrapped-key authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentEnvelopeRoute {
+    pub(crate) provider_family: u16,
+    pub(crate) provider_reference: [u8; 16],
+    pub(crate) provider_key_epoch: u64,
+}
+
+impl SegmentEnvelopeRoute {
+    pub(crate) fn new(
+        provider_family: u16,
+        provider_reference: [u8; 16],
+        provider_key_epoch: u64,
+    ) -> Result<Self, FrameFailure> {
+        if provider_family == 0
+            || provider_reference.iter().all(|byte| *byte == 0)
+            || provider_key_epoch == 0
+        {
+            return Err(FrameFailure::new(FrameFailureCode::InvalidContext));
+        }
+        Ok(Self {
+            provider_family,
+            provider_reference,
+            provider_key_epoch,
+        })
+    }
+}
+
 /// The authoritative, caller-independent binding embedded inside one wrapped key payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WrappedKeyContext {
@@ -92,6 +120,14 @@ pub(crate) fn segment_context_encoding(
     instance: [u8; 16],
     object: FrameObjectContext,
 ) -> Result<Vec<u8>, FrameFailure> {
+    segment_context_encoding_with_route(instance, object, default_segment_route())
+}
+
+pub(crate) fn segment_context_encoding_with_route(
+    instance: [u8; 16],
+    object: FrameObjectContext,
+    route: SegmentEnvelopeRoute,
+) -> Result<Vec<u8>, FrameFailure> {
     let (tenant, signal, shard) = match (object.scope, object.class) {
         (FrameScope::Tenant(tenant), FrameObjectClass::Segment { signal, shard }) => {
             (tenant, signal, shard)
@@ -99,7 +135,7 @@ pub(crate) fn segment_context_encoding(
         _ => return Err(FrameFailure::new(FrameFailureCode::InvalidContext)),
     };
     let mut encoded = Vec::with_capacity(96);
-    encoded.extend_from_slice(b"positron-segment-envelope-context-v1\0");
+    encoded.extend_from_slice(b"positron-segment-envelope-context-v2\0");
     encoded.extend_from_slice(&instance);
     encoded.extend_from_slice(&tenant.to_bytes());
     encoded.push(match signal {
@@ -110,6 +146,9 @@ pub(crate) fn segment_context_encoding(
     encoded.extend_from_slice(&object.object_id.0);
     encoded.extend_from_slice(&object.key_epoch.0.to_be_bytes());
     encoded.extend_from_slice(&object.format_epoch.0.to_be_bytes());
+    encoded.extend_from_slice(&route.provider_family.to_be_bytes());
+    encoded.extend_from_slice(&route.provider_reference);
+    encoded.extend_from_slice(&route.provider_key_epoch.to_be_bytes());
     Ok(encoded)
 }
 
@@ -117,6 +156,20 @@ pub(crate) fn encode_segment_wrapped_key_payload(
     key: &ObjectDataKey,
     instance: [u8; 16],
     context_digest: [u8; 32],
+) -> Result<SecretPlaintext, FrameFailure> {
+    encode_segment_wrapped_key_payload_with_route(
+        key,
+        instance,
+        context_digest,
+        default_segment_route(),
+    )
+}
+
+pub(crate) fn encode_segment_wrapped_key_payload_with_route(
+    key: &ObjectDataKey,
+    instance: [u8; 16],
+    context_digest: [u8; 32],
+    route: SegmentEnvelopeRoute,
 ) -> Result<SecretPlaintext, FrameFailure> {
     let (tenant, signal, shard) = match (key.object.scope, key.object.class) {
         (FrameScope::Tenant(tenant), FrameObjectClass::Segment { signal, shard }) => {
@@ -144,14 +197,18 @@ pub(crate) fn encode_segment_wrapped_key_payload(
     );
     encode_varint_field(11, u64::from(shard.value()), &mut encoded);
     encode_varint_field(12, u64::from(key.object.format_epoch.0), &mut encoded);
+    encode_varint_field(13, u64::from(route.provider_family), &mut encoded);
+    encode_bytes_field(14, &route.provider_reference, &mut encoded);
+    encode_varint_field(15, route.provider_key_epoch, &mut encoded);
     Ok(SecretPlaintext::new(encoded))
 }
 
-pub(crate) fn verify_segment_wrapped_key_payload(
+pub(crate) fn verify_segment_wrapped_key_payload_with_route(
     payload: SecretPlaintext,
     instance: [u8; 16],
     object: FrameObjectContext,
     context_digest: [u8; 32],
+    route: SegmentEnvelopeRoute,
 ) -> Result<SecretKeyBytes, FrameFailure> {
     let key_bytes = Zeroizing::new(
         payload
@@ -165,7 +222,8 @@ pub(crate) fn verify_segment_wrapped_key_payload(
         key: SecretKeyBytes::from_owned(Box::new(*key_bytes)),
         object,
     };
-    let expected = encode_segment_wrapped_key_payload(&candidate, instance, context_digest)?;
+    let expected =
+        encode_segment_wrapped_key_payload_with_route(&candidate, instance, context_digest, route)?;
     let difference = payload.bytes.iter().zip(&expected.bytes).fold(
         (payload.bytes.len() ^ expected.bytes.len()) as u8,
         |difference, (actual, expected)| difference | (*actual ^ *expected),
@@ -174,6 +232,14 @@ pub(crate) fn verify_segment_wrapped_key_payload(
         return Err(FrameFailure::new(FrameFailureCode::AuthenticationFailed));
     }
     Ok(candidate.key)
+}
+
+const fn default_segment_route() -> SegmentEnvelopeRoute {
+    SegmentEnvelopeRoute {
+        provider_family: 1,
+        provider_reference: [1; 16],
+        provider_key_epoch: 1,
+    }
 }
 
 fn encode_varint_field(field: u8, value: u64, destination: &mut Vec<u8>) {

@@ -7,7 +7,7 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 
 use crate::catalog::CatalogFailure;
-use crate::data_protection::SecretKeyBytes;
+use crate::data_protection::{SecretKeyBytes, SegmentEnvelopeRoute};
 
 use super::MAX_STORE_BLOCK_BYTES;
 use crate::ResourceReservation;
@@ -91,11 +91,7 @@ impl StoreBlockIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SegmentKeyRoute {
-    pub(super) provider_reference: [u8; 16],
-    pub(super) provider_key_epoch: u64,
-}
+pub(super) type SegmentKeyRoute = SegmentEnvelopeRoute;
 
 /// A one-shot secret capability and its non-secret provider recovery route.
 pub struct SegmentProtectionKey {
@@ -109,6 +105,7 @@ impl SegmentProtectionKey {
         Self {
             key: SecretKeyBytes::from_owned(bytes),
             route: SegmentKeyRoute {
+                provider_family: 1,
                 provider_reference: [1; 16],
                 provider_key_epoch: 1,
             },
@@ -126,6 +123,7 @@ impl SegmentProtectionKey {
         Ok(Self {
             key: SecretKeyBytes::from_owned(bytes),
             route: SegmentKeyRoute {
+                provider_family: 1,
                 provider_reference,
                 provider_key_epoch,
             },

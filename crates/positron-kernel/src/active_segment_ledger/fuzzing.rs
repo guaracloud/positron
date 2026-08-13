@@ -14,8 +14,10 @@ use super::{
     StoreBlockIdentity,
 };
 
+mod oracle;
 mod persisted_corruption;
 
+use oracle::Oracle;
 use persisted_corruption::{PersistedArtifact, run_persisted_corruption_case};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -64,21 +66,33 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     .expect("fuzz catalog opens");
     let scope = scope();
     let mut ledger = open(&authority, &catalog, scope).expect("fresh ledger opens");
+    let mut oracle = Oracle::new();
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
         match selector % 13 {
             0 => {
-                ledger
-                    .append(block(index, selector))
+                let (identity, payload) = block_parts(index, selector);
+                let receipt = ledger
+                    .append(prepared(identity, payload.clone()))
                     .expect("ordinary bounded fuzz append succeeds");
+                oracle.record(identity, payload, receipt);
             },
             1 => {
-                let result = with_ledger_fault(fault_event(selector), || {
-                    ledger.append(block(index, selector))
-                });
-                result.expect_err("an injected filesystem boundary cannot acknowledge");
+                let event = fault_event(selector);
+                let (identity, payload) = block_parts(index, selector);
+                let result =
+                    with_ledger_fault(event, || ledger.append(prepared(identity, payload.clone())));
+                let failure =
+                    result.expect_err("an injected filesystem boundary cannot acknowledge");
+                assert_eq!(failure.completion_state(), fault_completion(event));
                 drop(ledger);
                 ledger = open(&authority, &catalog, scope).expect("fault recovery opens");
+                if fault_commits(event) {
+                    let receipt = ledger
+                        .append(prepared(identity, payload.clone()))
+                        .expect("ambiguous successor replays exactly");
+                    oracle.record(identity, payload, receipt);
+                }
             },
             2 => {
                 drop(ledger);
@@ -86,24 +100,19 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             },
             3 => {
                 ledger.seal().expect("bounded seal succeeds");
+                oracle.record_seal();
                 ledger = open(&authority, &catalog, scope).expect("sealed ledger reopens");
             },
             4 => {
-                let snapshot = ledger.snapshot().expect("snapshot for retry");
-                if let Some(existing) = snapshot.blocks().first() {
-                    let retry =
-                        PreparedStoreBlock::new(existing.identity(), existing.payload().to_vec())
-                            .expect("existing block remains bounded");
-                    let receipt = ledger.append(retry).expect("same identity and bytes retry");
-                    assert_eq!(receipt.position(), existing.position());
+                if let Some((identity, payload, receipt)) = oracle.first() {
+                    let retry = prepared(identity, payload.to_vec());
+                    let actual = ledger.append(retry).expect("same identity and bytes retry");
+                    assert_eq!(actual, receipt);
                 }
             },
             5 => {
-                let snapshot = ledger.snapshot().expect("snapshot for conflict");
-                if let Some(existing) = snapshot.blocks().first() {
-                    let conflict =
-                        PreparedStoreBlock::new(existing.identity(), vec![selector, 0xff])
-                            .expect("bounded conflict");
+                if let Some((identity, _, _)) = oracle.first() {
+                    let conflict = prepared(identity, vec![selector, 0xff]);
                     assert_eq!(
                         ledger
                             .append(conflict)
@@ -114,21 +123,14 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                 }
             },
             6 => {
-                let snapshot = ledger.snapshot().expect("snapshot for duplicate bytes");
-                if let Some(existing) = snapshot.blocks().first() {
+                if let Some((_, existing_payload, _)) = oracle.first() {
                     let identity = identity(index);
-                    if identity != existing.identity()
-                        && snapshot
-                            .blocks()
-                            .iter()
-                            .all(|block| block.identity() != identity)
-                    {
-                        ledger
-                            .append(
-                                PreparedStoreBlock::new(identity, existing.payload().to_vec())
-                                    .expect("bounded distinct identity"),
-                            )
+                    if !oracle.contains(identity) {
+                        let payload = existing_payload.to_vec();
+                        let receipt = ledger
+                            .append(prepared(identity, payload.clone()))
                             .expect("equal bytes under distinct identity append");
+                        oracle.record(identity, payload, receipt);
                     }
                 }
             },
@@ -136,46 +138,29 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                 let artifact = PersistedArtifact::from_operation(operation)
                     .expect("the corruption operation is in range");
                 assert_eq!(run_persisted_corruption_case(artifact, selector), artifact);
-                return;
             },
         }
-        assert_snapshot_invariants(&ledger);
+        oracle.assert_ledger(&ledger);
     }
 
     drop(ledger);
     let recovered = open(&authority, &catalog, scope).expect("final recovery opens");
-    assert_snapshot_invariants(&recovered);
-}
-
-fn assert_snapshot_invariants(ledger: &ActiveSegmentLedger<'_, '_>) {
-    let snapshot = ledger.snapshot().expect("fuzz snapshot is available");
+    oracle.assert_ledger(&recovered);
     assert_eq!(
-        snapshot.frontier().value(),
-        u64::try_from(snapshot.blocks().len()).expect("bounded snapshot length")
+        recovered.snapshot().expect("final frontier").frontier(),
+        oracle.frontier()
     );
-    for (index, block) in snapshot.blocks().iter().enumerate() {
-        assert_eq!(
-            block.position().value(),
-            u64::try_from(index).expect("bounded block index") + 1
-        );
-        assert!(!block.payload().is_empty());
-        assert_eq!(
-            snapshot
-                .blocks()
-                .iter()
-                .filter(|candidate| candidate.identity() == block.identity())
-                .count(),
-            1
-        );
-    }
 }
 
-fn block(index: usize, selector: u8) -> PreparedStoreBlock {
-    PreparedStoreBlock::new(
+fn block_parts(index: usize, selector: u8) -> (StoreBlockIdentity, Vec<u8>) {
+    (
         identity(index),
         vec![selector, u8::try_from(index).expect("fuzz operation bound")],
     )
-    .expect("bounded fuzz block")
+}
+
+fn prepared(identity: StoreBlockIdentity, payload: Vec<u8>) -> PreparedStoreBlock {
+    PreparedStoreBlock::new(identity, payload).expect("bounded fuzz block")
 }
 
 fn identity(index: usize) -> StoreBlockIdentity {
@@ -220,4 +205,17 @@ fn fault_event(selector: u8) -> LedgerFileEvent {
         LedgerFileEvent::SynchronizeFrontierDirectory,
     ];
     EVENTS[usize::from(selector) % EVENTS.len()]
+}
+
+fn fault_commits(event: LedgerFileEvent) -> bool {
+    event == LedgerFileEvent::SynchronizeFrontierDirectory
+}
+
+fn fault_completion(event: LedgerFileEvent) -> super::LedgerCompletionState {
+    use super::LedgerCompletionState;
+    match event {
+        LedgerFileEvent::WriteFrame => LedgerCompletionState::RejectedBeforeMutation,
+        LedgerFileEvent::SynchronizeFrontierDirectory => LedgerCompletionState::CommitAmbiguous,
+        _ => LedgerCompletionState::RecoveryRequired,
+    }
 }

@@ -65,7 +65,7 @@ fn block_reader_rejects_oversized_lengths_overflow_and_record_overrun() -> Resul
         4,
         CommitPosition::origin(),
         metadata.id,
-        [0; 32],
+        0,
         &key,
     )
     .expect_err("oversized record");
@@ -89,7 +89,7 @@ fn block_reader_rejects_oversized_lengths_overflow_and_record_overrun() -> Resul
         u64::try_from(record.len() - 1)?,
         CommitPosition::origin(),
         metadata.id,
-        [0; 32],
+        0,
         &key,
     )
     .expect_err("record cannot overrun frontier bytes");
@@ -102,7 +102,7 @@ fn block_reader_rejects_oversized_lengths_overflow_and_record_overrun() -> Resul
         u64::try_from(record.len())?,
         maximum,
         metadata.id,
-        [0; 32],
+        0,
         &key,
     )
     .expect_err("commit position cannot wrap");
@@ -188,7 +188,7 @@ fn block_reader_enforces_the_bounded_recovery_cardinality() -> Result<(), Box<dy
         u64::try_from(encoded.len())?,
         CommitPosition::origin(),
         metadata.id,
-        [0; 32],
+        0,
         &key,
     )
     .expect_err("recovery cannot retain an unbounded block set");

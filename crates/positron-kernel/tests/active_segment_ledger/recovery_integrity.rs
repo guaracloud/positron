@@ -13,6 +13,8 @@ use positron_kernel::{
 
 use super::support::{TemporaryRoot, establish_kernel_authority};
 
+mod artifact_shapes;
+
 fn prepared(
     marker: u8,
     payload: &[u8],
@@ -77,6 +79,22 @@ fn physical_bootstrap_and_frontier_expose_only_opaque_key_routing_metadata()
     let failure =
         ActiveSegmentLedger::open(&fixture.authority, &catalog, fixture.scope, wrong_route)
             .expect_err("a substituted provider reference must fail closed");
+    assert_eq!(failure.code(), LedgerFailureCode::AuthenticationFailed);
+
+    let path = active_segment(fixture.root.path(), receipt.segment_id());
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.seek(SeekFrom::Start(16))?;
+    file.write_all(&[0xa2; 16])?;
+    file.sync_all()?;
+    let substituted_header_and_caller =
+        SegmentProtectionKey::from_owned_with_route(Box::new([0x70; 32]), [0xa2; 16], 7)?;
+    let failure = ActiveSegmentLedger::open(
+        &fixture.authority,
+        &catalog,
+        fixture.scope,
+        substituted_header_and_caller,
+    )
+    .expect_err("the wrapped payload must reject a matching substituted clear route");
     assert_eq!(failure.code(), LedgerFailureCode::AuthenticationFailed);
     Ok(())
 }
@@ -221,151 +239,13 @@ fn recovery_rejects_an_unknown_segment_header_version() -> Result<(), Box<dyn Er
     let path = active_segment(fixture.root.path(), receipt.segment_id());
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.seek(SeekFrom::Start(9))?;
-    file.write_all(&[2])?;
+    file.write_all(&[u8::MAX])?;
     file.sync_all()?;
 
     let failure = fixture
         .open(&catalog, [0x79; 32])
         .expect_err("unknown segment versions fail closed");
     assert_eq!(failure.code(), LedgerFailureCode::UnsupportedFormat);
-    Ok(())
-}
-
-#[test]
-fn sealed_segments_reject_bytes_beyond_their_frontier() -> Result<(), Box<dyn Error>> {
-    let fixture = Fixture::new(0x6a)?;
-    let catalog = fixture.catalog()?;
-    let ledger = fixture.open(&catalog, [0x7a; 32])?;
-    let receipt = ledger.append(prepared(7, b"sealed-exact")?)?;
-    ledger.seal()?;
-    let path = sealed_segment(fixture.root.path(), receipt.segment_id());
-    let mut file = OpenOptions::new().append(true).open(path)?;
-    file.write_all(b"forbidden-tail")?;
-    file.sync_all()?;
-
-    let failure = fixture
-        .open(&catalog, [0x7a; 32])
-        .expect_err("sealed segments are immutable");
-    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
-    Ok(())
-}
-
-#[test]
-fn recovery_rejects_missing_multiply_linked_and_duplicated_segment_artifacts()
--> Result<(), Box<dyn Error>> {
-    for mutation in 0..3 {
-        let fixture = Fixture::new(0x6b + mutation)?;
-        let catalog = fixture.catalog()?;
-        let ledger = fixture.open(&catalog, [0x7b; 32])?;
-        let receipt = ledger.append(prepared(8, b"safe-path")?)?;
-        drop(ledger);
-        let active = active_segment(fixture.root.path(), receipt.segment_id());
-        match mutation {
-            0 => fs::remove_file(&active)?,
-            1 => fs::hard_link(&active, fixture.root.path().join("extra-hard-link"))?,
-            _ => {
-                let sealed = sealed_segment(fixture.root.path(), receipt.segment_id());
-                fs::copy(&active, sealed)?;
-            },
-        }
-        let failure = fixture
-            .open(&catalog, [0x7b; 32])
-            .expect_err("unsafe artifact topology fails closed");
-        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
-    }
-    Ok(())
-}
-
-#[test]
-fn recovery_rejects_a_frontier_present_in_both_lifecycle_directories() -> Result<(), Box<dyn Error>>
-{
-    let fixture = Fixture::new(0x6e)?;
-    let catalog = fixture.catalog()?;
-    let ledger = fixture.open(&catalog, [0x7e; 32])?;
-    let receipt = ledger.append(prepared(9, b"one-frontier")?)?;
-    drop(ledger);
-    let source = active_frontier(fixture.root.path(), receipt.segment_id());
-    let duplicate = sealed_frontier(fixture.root.path(), receipt.segment_id());
-    fs::copy(source, duplicate)?;
-
-    let failure = fixture
-        .open(&catalog, [0x7e; 32])
-        .expect_err("duplicate lifecycle frontiers fail closed");
-    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
-    Ok(())
-}
-
-#[test]
-fn an_empty_sealed_segment_rejects_unpublished_tail_bytes() -> Result<(), Box<dyn Error>> {
-    let fixture = Fixture::new(0x6f)?;
-    let catalog = fixture.catalog()?;
-    let ledger = fixture.open(&catalog, [0x7f; 32])?;
-    let segment = ledger.seal()?.segment_id();
-    let path = sealed_segment(fixture.root.path(), segment);
-    let mut file = OpenOptions::new().append(true).open(path)?;
-    file.write_all(b"no-frontier-tail")?;
-    file.sync_all()?;
-
-    let failure = fixture
-        .open(&catalog, [0x7f; 32])
-        .expect_err("sealed no-frontier tail fails closed");
-    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
-    Ok(())
-}
-
-#[test]
-fn recovery_rejects_unsafe_temporary_and_unpublished_artifact_shapes() -> Result<(), Box<dyn Error>>
-{
-    let temporary_fixture = Fixture::new(0x70)?;
-    let temporary_catalog = temporary_fixture.catalog()?;
-    let temporary_ledger = temporary_fixture.open(&temporary_catalog, [0x80; 32])?;
-    let segment = temporary_ledger
-        .append(prepared(10, b"temporary-shape")?)?
-        .segment_id();
-    drop(temporary_ledger);
-    fs::create_dir(
-        temporary_fixture
-            .root
-            .path()
-            .join("segments/active")
-            .join(format!("{}.frontier.tmp", hex(segment.to_bytes()))),
-    )?;
-    let failure = temporary_fixture
-        .open(&temporary_catalog, [0x80; 32])
-        .expect_err("a frontier temporary directory cannot be reconciled as a file");
-    assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
-
-    for (seed, directory, name, expected) in [
-        (
-            0x71,
-            "active",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.segment",
-            LedgerFailureCode::StorageUnavailable,
-        ),
-        (
-            0x72,
-            "sealed",
-            "unknown-artifact",
-            LedgerFailureCode::IntegrityCorruption,
-        ),
-    ] {
-        let fixture = Fixture::new(seed)?;
-        let catalog = fixture.catalog()?;
-        let ledger = fixture.open(&catalog, [0x81; 32])?;
-        drop(ledger);
-        fs::create_dir(
-            fixture
-                .root
-                .path()
-                .join("segments")
-                .join(directory)
-                .join(name),
-        )?;
-        let failure = fixture
-            .open(&catalog, [0x81; 32])
-            .expect_err("unsafe unpublished topology must fail closed");
-        assert_eq!(failure.code(), expected);
-    }
     Ok(())
 }
 

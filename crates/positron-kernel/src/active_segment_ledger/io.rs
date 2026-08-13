@@ -24,6 +24,15 @@ pub(super) fn map_io_error(error: std::io::Error) -> LedgerFailure {
     }
 }
 
+pub(super) fn map_integrity_read(error: std::io::Error) -> LedgerFailure {
+    let storage = map_io_error(error);
+    if storage.code() == LedgerFailureCode::StorageExhausted {
+        storage
+    } else {
+        LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
+    }
+}
+
 pub(super) fn open_or_create_directory(parent: &File, name: &str) -> Result<File, LedgerFailure> {
     match unix_fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {},

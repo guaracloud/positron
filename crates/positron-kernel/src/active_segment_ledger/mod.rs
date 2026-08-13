@@ -8,7 +8,9 @@ mod fuzzing;
 mod io;
 mod protection;
 mod publication;
+mod receipt;
 mod recovery;
+mod state;
 mod storage;
 mod types;
 
@@ -26,14 +28,14 @@ use crate::data_protection::{
 };
 use crate::resource_governor::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
 use crate::{
-    RecoveryWorkClaim, RecoveryWorkKind, ResourceReservation, StorageKernelResourceAuthority,
-    WorkClaim, WorkKind,
+    RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority, WorkClaim, WorkKind,
 };
 
 use capacity::{append_claim, recovery_claim, retained_claim, snapshot_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
+use state::{LedgerState, receipt_for, retain_recovered};
 use storage::LedgerStorage;
 pub use types::*;
 
@@ -47,16 +49,6 @@ const FORMAT_EPOCH: u32 = 1;
 #[doc(hidden)]
 pub fn fuzz_active_segment_stateful(data: &[u8]) {
     fuzzing::fuzz_active_segment_stateful(data);
-}
-
-struct LedgerState<'kernel> {
-    _capacity: ResourceReservation<'kernel>,
-    retained_reservations: Vec<ResourceReservation<'kernel>>,
-    frontier: CommitPosition,
-    blocks: Vec<CommittedBlock>,
-    retained_bytes: usize,
-    next_sequence: u64,
-    poisoned: bool,
 }
 
 /// The Storage Kernel-owned active segment for one physical tenant/signal/shard scope.
@@ -228,8 +220,25 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         block: PreparedStoreBlock,
         cancellation: Option<&AppendCancellation>,
     ) -> Result<CommitReceipt, LedgerFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        if let Some(committed) = state
+            .blocks
+            .iter()
+            .find(|item| item.identity == block.identity)
+        {
+            if committed.payload != block.payload {
+                return Err(LedgerFailure::new(LedgerFailureCode::IdempotencyConflict));
+            }
+            return Ok(receipt_for(committed));
+        }
         if cancellation.is_some_and(AppendCancellation::is_cancelled) {
             return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
+        }
+        if state.poisoned {
+            return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
         }
         let amounts = append_claim(block.payload.len())?;
         let ordinary_claim = WorkClaim::tenant(self.scope.tenant, WorkKind::Ingest, amounts)
@@ -256,28 +265,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             amounts,
         )
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let _reservation = self
-            .authority
-            .recovery()
-            .reserve(claim)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
-        if state.poisoned {
-            return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
-        }
-        if let Some(committed) = state
-            .blocks
-            .iter()
-            .find(|item| item.identity == block.identity)
-        {
-            if committed.payload != block.payload {
-                return Err(LedgerFailure::new(LedgerFailureCode::IdempotencyConflict));
-            }
-            return Ok(receipt_for(committed));
-        }
         let block_count = state
             .blocks
             .len()
@@ -318,6 +305,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             state.next_sequence,
             position,
             encrypted.as_bytes(),
+            || {
+                self.authority
+                    .recovery()
+                    .reserve(claim)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))
+            },
         ) {
             Ok(authenticator) => authenticator,
             Err(failure) => {
@@ -400,38 +393,4 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             frontier: state.frontier,
         })
     }
-}
-
-fn receipt_for(block: &CommittedBlock) -> CommitReceipt {
-    CommitReceipt {
-        segment: block.segment,
-        position: block.position,
-        frontier_authenticator: block.frontier_authenticator,
-    }
-}
-
-fn retain_recovered(
-    recovered: recovery::RecoveryState,
-    blocks: &mut Vec<CommittedBlock>,
-    retained_bytes: &mut usize,
-    frontier: &mut CommitPosition,
-) -> Result<(), LedgerFailure> {
-    let block_count = blocks
-        .len()
-        .checked_add(recovered.blocks.len())
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let recovered_bytes = recovered
-        .blocks
-        .iter()
-        .try_fold(0_usize, |total, block| {
-            total.checked_add(block.payload.len())
-        })
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    *retained_bytes = retained_bytes
-        .checked_add(recovered_bytes)
-        .filter(|bytes| *bytes <= MAX_RETAINED_BLOCK_BYTES && block_count <= MAX_RETAINED_BLOCKS)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    *frontier = recovered.frontier;
-    blocks.extend(recovered.blocks);
-    Ok(())
 }

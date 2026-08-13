@@ -7,10 +7,12 @@ use super::support::{TemporaryRoot, establish_authority};
 use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_errno, with_ledger_fault};
 use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, LedgerCompletionState,
-    LedgerFailureCode, MountQualification, PreparedStoreBlock, PrimaryDataVolume,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureState, InstanceId,
+    LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
+    PrimaryDataVolume, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
+
+mod sealing_faults;
 
 fn prepared(payload: &[u8]) -> Result<PreparedStoreBlock, crate::LedgerFailure> {
     let marker = payload.first().copied().unwrap_or(1).max(1);
@@ -233,6 +235,49 @@ fn full_disk_is_a_stable_typed_failure_without_a_receipt() -> Result<(), Box<dyn
 }
 
 #[test]
+fn hard_pressure_resolves_replay_and_conflict_before_refusing_new_work()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let committed = ledger.append(prepared(b"hard-pressure-committed")?)?;
+        let snapshot = ledger.snapshot()?;
+        let usage = authority.governor().inspect()?.outstanding_total();
+        assert_eq!(
+            authority.observe_disk_for_test(DiskObservation::new(0))?,
+            DiskPressureState::HardPressure
+        );
+
+        assert_eq!(
+            ledger.append(prepared(b"hard-pressure-committed")?)?,
+            committed
+        );
+        assert_eq!(
+            ledger
+                .append(prepared(b"hard-pressure-conflict")?)
+                .expect_err("conflict is resolved before new-work admission")
+                .code(),
+            LedgerFailureCode::IdempotencyConflict
+        );
+        assert_eq!(
+            ledger
+                .append(prepared(b"new-work")?)
+                .expect_err("hard pressure refuses new work")
+                .code(),
+            LedgerFailureCode::ResourceAdmissionRefused
+        );
+        assert_eq!(authority.governor().inspect()?.outstanding_total(), usage);
+        assert_eq!(snapshot.blocks().len(), 1);
+        assert_eq!(snapshot.blocks()[0].payload(), b"hard-pressure-committed");
+        Ok(())
+    })
+}
+
+#[test]
 fn exhausted_scope_lease_inventory_refuses_before_storage_mutation() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let mut leases = Vec::new();
@@ -264,154 +309,6 @@ fn exhausted_scope_lease_inventory_refuses_before_storage_mutation() -> Result<(
         drop(leases);
         Ok(())
     })
-}
-
-#[test]
-fn recovery_reconciles_a_crash_between_the_two_seal_renames() -> Result<(), Box<dyn Error>> {
-    with_fixture(|authority, catalog, scope| {
-        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
-        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        let committed = ledger.append(prepared(b"survives-seal")?)?;
-        let failure = with_ledger_fault(LedgerFileEvent::RenameSealFrontier, || ledger.seal())
-            .expect_err("the interrupted seal cannot publish success");
-        assert_eq!(
-            failure.completion_state(),
-            LedgerCompletionState::RecoveryRequired
-        );
-
-        let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        assert_eq!(reopened.snapshot()?.frontier(), committed.position());
-        assert_eq!(reopened.snapshot()?.blocks().len(), 1);
-        assert_eq!(reopened.snapshot()?.blocks()[0].payload(), b"survives-seal");
-        drop(reopened);
-
-        let verified_again = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        assert_eq!(verified_again.snapshot()?.blocks().len(), 1);
-        Ok(())
-    })
-}
-
-#[test]
-fn recovery_reconciles_physical_seal_before_catalog_publication() -> Result<(), Box<dyn Error>> {
-    with_fixture(|authority, catalog, scope| {
-        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
-        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        let committed = ledger.append(prepared(b"catalog-atomic")?)?;
-        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || ledger.seal())
-            .expect_err("catalog publication failure cannot report a sealed segment");
-        assert_eq!(
-            failure.completion_state(),
-            LedgerCompletionState::CommitAmbiguous
-        );
-
-        let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        assert_eq!(reopened.snapshot()?.frontier(), committed.position());
-        assert_eq!(
-            reopened.snapshot()?.blocks()[0].payload(),
-            b"catalog-atomic"
-        );
-        drop(reopened);
-
-        let verified_again = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        assert_eq!(verified_again.snapshot()?.blocks().len(), 1);
-        Ok(())
-    })
-}
-
-#[test]
-fn active_segment_creation_faults_never_return_a_live_ledger() -> Result<(), Box<dyn Error>> {
-    for (event, completion) in [
-        (
-            LedgerFileEvent::CreateSegment,
-            LedgerCompletionState::RejectedBeforeMutation,
-        ),
-        (
-            LedgerFileEvent::WriteSegmentHeader,
-            LedgerCompletionState::RecoveryRequired,
-        ),
-        (
-            LedgerFileEvent::PartialSegmentHeaderWrite,
-            LedgerCompletionState::RecoveryRequired,
-        ),
-        (
-            LedgerFileEvent::SynchronizeSegmentHeader,
-            LedgerCompletionState::RecoveryRequired,
-        ),
-        (
-            LedgerFileEvent::SynchronizeSegmentDirectory,
-            LedgerCompletionState::RecoveryRequired,
-        ),
-    ] {
-        with_fixture(|authority, catalog, scope| {
-            let failure = with_ledger_fault(event, || {
-                ActiveSegmentLedger::open(
-                    authority,
-                    catalog,
-                    scope,
-                    SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
-                )
-            })
-            .expect_err("a failed create cannot expose an append authority");
-            assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
-            assert_eq!(failure.completion_state(), completion);
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
-#[test]
-fn failed_initial_catalog_publication_is_reconciled_before_its_successor()
--> Result<(), Box<dyn Error>> {
-    with_fixture(|authority, catalog, scope| {
-        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
-            ActiveSegmentLedger::open(
-                authority,
-                catalog,
-                scope,
-                SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
-            )
-        })
-        .expect_err("failed catalog publication cannot expose a live ledger");
-        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
-        assert_eq!(
-            failure.completion_state(),
-            LedgerCompletionState::RecoveryRequired
-        );
-
-        let reopened = ActiveSegmentLedger::open(
-            authority,
-            catalog,
-            scope,
-            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
-        )?;
-        assert!(reopened.snapshot()?.blocks().is_empty());
-        Ok(())
-    })
-}
-
-#[test]
-fn seal_directory_sync_faults_remain_restartable() -> Result<(), Box<dyn Error>> {
-    for event in [
-        LedgerFileEvent::SynchronizeSealedDirectory,
-        LedgerFileEvent::SynchronizeActiveDirectory,
-    ] {
-        with_fixture(|authority, catalog, scope| {
-            let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
-            let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-            let committed = ledger.append(prepared(b"sync-seal")?)?;
-            let failure = with_ledger_fault(event, || ledger.seal())
-                .expect_err("failed directory synchronization cannot publish success");
-            assert_eq!(
-                failure.completion_state(),
-                LedgerCompletionState::RecoveryRequired
-            );
-            let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-            assert_eq!(reopened.snapshot()?.frontier(), committed.position());
-            Ok(())
-        })?;
-    }
-    Ok(())
 }
 
 fn with_fixture<T>(

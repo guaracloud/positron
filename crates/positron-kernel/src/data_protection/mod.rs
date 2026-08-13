@@ -31,10 +31,13 @@ pub(crate) use context::{
     SystemObjectKind,
 };
 pub(crate) use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
-pub(crate) use key_envelope::WrappedKeyContext;
+pub(crate) use key_envelope::{SegmentEnvelopeRoute, WrappedKeyContext};
+#[cfg(test)]
+use key_envelope::{encode_segment_wrapped_key_payload, segment_context_encoding};
 use key_envelope::{
-    encode_segment_wrapped_key_payload, encode_wrapped_key_payload, segment_context_encoding,
-    verify_segment_wrapped_key_payload, verify_wrapped_key_payload,
+    encode_segment_wrapped_key_payload_with_route, encode_wrapped_key_payload,
+    segment_context_encoding_with_route, verify_segment_wrapped_key_payload_with_route,
+    verify_wrapped_key_payload,
 };
 pub(crate) use service::DataProtection;
 

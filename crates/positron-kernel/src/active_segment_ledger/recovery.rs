@@ -12,7 +12,8 @@ use crate::data_protection::{
 
 use super::fault::{LedgerFileEvent, emit_event, injected_partial_write_length};
 use super::format::{SegmentMetadata, position_from_value};
-use super::io::{map_errno, map_io_error, open_regular, synchronize};
+use super::io::{map_errno, map_integrity_read, map_io_error, open_regular, synchronize};
+use super::receipt::receipt_authenticator;
 use super::{
     CommittedBlock, LedgerFailure, LedgerFailureCode, MAX_ENCODED_FRAME_BYTES,
     MAX_RETAINED_BLOCK_BYTES, SegmentId, StoreBlockIdentity, map_frame_failure,
@@ -31,7 +32,6 @@ struct PublishedFrontier {
     durable_bytes: u64,
     next_sequence: u64,
     position: CommitPosition,
-    authenticator: [u8; 32],
 }
 
 pub(super) fn recover(
@@ -55,7 +55,6 @@ pub(super) fn recover(
         durable_bytes,
         next_sequence,
         position,
-        authenticator,
     }) = frontier
     else {
         if file_length < header_length {
@@ -92,7 +91,7 @@ pub(super) fn recover(
         durable_bytes - header_length,
         metadata.base_position,
         metadata.id,
-        authenticator,
+        header_length,
         key,
     )?;
     let expected_blocks = usize::try_from(next_sequence)
@@ -118,7 +117,7 @@ pub(super) fn read_blocks(
     encoded_bytes: u64,
     base: CommitPosition,
     segment: SegmentId,
-    frontier_authenticator: [u8; 32],
+    header_bytes: u64,
     key: &ObjectDataKey,
 ) -> Result<Vec<CommittedBlock>, LedgerFailure> {
     let mut blocks = Vec::new();
@@ -180,13 +179,6 @@ pub(super) fn read_blocks(
         let position = base
             .advance_by(increment)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        blocks.push(CommittedBlock {
-            identity,
-            position,
-            payload: payload.to_vec(),
-            segment,
-            frontier_authenticator,
-        });
         consumed = consumed
             .checked_add(4)
             .and_then(|value| value.checked_add(frame_bytes as u64))
@@ -194,6 +186,24 @@ pub(super) fn read_blocks(
         if consumed > encoded_bytes {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
+        let durable_bytes = header_bytes
+            .checked_add(consumed)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let frontier_authenticator = receipt_authenticator(
+            key,
+            durable_bytes,
+            sequence
+                .checked_add(1)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            position,
+        )?;
+        blocks.push(CommittedBlock {
+            identity,
+            position,
+            payload: payload.to_vec(),
+            segment,
+            frontier_authenticator,
+        });
     }
     Ok(blocks)
 }
@@ -236,8 +246,7 @@ pub(super) fn publish_frontier(
     encoded.extend_from_slice(&1_u16.to_be_bytes());
     encoded.extend_from_slice(&frame_length.to_be_bytes());
     encoded.extend_from_slice(frame.as_bytes());
-    let authenticator =
-        DataProtection::authenticate_object_key(key, &encoded).map_err(map_frame_failure)?;
+    let authenticator = receipt_authenticator(key, durable_bytes, next_sequence, position)?;
     let temporary = frontier_temporary_name(id);
     match unix_fs::unlinkat(directory, &temporary, rustix::fs::AtFlags::empty()) {
         Ok(()) | Err(rustix::io::Errno::NOENT) => {},
@@ -351,11 +360,6 @@ fn read_frontier(
     if plaintext.len() != FRONTIER_PLAINTEXT_BYTES {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    let mut authenticated = Vec::with_capacity(FRONTIER_PREFIX_BYTES + frame.len());
-    authenticated.extend_from_slice(&prefix);
-    authenticated.extend_from_slice(&frame);
-    let authenticator =
-        DataProtection::authenticate_object_key(key, &authenticated).map_err(map_frame_failure)?;
     let durable_bytes = read_u64(plaintext, 0)?;
     let next_sequence = read_u64(plaintext, 8)?;
     if next_sequence != frame_sequence {
@@ -366,7 +370,6 @@ fn read_frontier(
         durable_bytes,
         next_sequence,
         position,
-        authenticator,
     }))
 }
 
@@ -388,13 +391,4 @@ fn read_u64(bytes: &[u8], start: usize) -> Result<u64, LedgerFailure> {
         .and_then(|value| value.try_into().ok())
         .map(u64::from_be_bytes)
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
-}
-
-fn map_integrity_read(error: std::io::Error) -> LedgerFailure {
-    let storage = map_io_error(error);
-    if storage.code() == LedgerFailureCode::StorageExhausted {
-        storage
-    } else {
-        LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
-    }
 }

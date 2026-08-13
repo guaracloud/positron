@@ -1,10 +1,11 @@
 use super::{
     AES_256_GCM_TAG_BYTES, CryptoBackend, CryptoBackendFailure, EncryptedFrame, FRAME_HEADER_BYTES,
     FrameContext, FrameFailure, FrameFailureCode, FrameLimits, FrameObjectContext, ObjectDataKey,
-    RustCryptoBackend, SecretKeyBytes, SecretKeyInput, VerifiedFrame, WrappedKeyContext,
-    encode_associated_data, encode_authenticated_header, encode_segment_wrapped_key_payload,
-    encode_wrapped_key_payload, nonce_for, parse_frame, segment_context_encoding,
-    verify_segment_wrapped_key_payload, verify_wrapped_key_payload,
+    RustCryptoBackend, SecretKeyBytes, SecretKeyInput, SegmentEnvelopeRoute, VerifiedFrame,
+    WrappedKeyContext, encode_associated_data, encode_authenticated_header,
+    encode_segment_wrapped_key_payload_with_route, encode_wrapped_key_payload, nonce_for,
+    parse_frame, segment_context_encoding_with_route,
+    verify_segment_wrapped_key_payload_with_route, verify_wrapped_key_payload,
 };
 
 /// The Storage Kernel's authenticated encrypted-frame entry point.
@@ -144,9 +145,28 @@ impl DataProtection {
         object_key: &ObjectDataKey,
         instance: [u8; 16],
     ) -> Result<Vec<u8>, FrameFailure> {
-        let context = segment_context_encoding(instance, object_key.object)?;
+        Self::wrap_segment_key_with_route(
+            wrapping_key,
+            object_key,
+            instance,
+            SegmentEnvelopeRoute {
+                provider_family: 1,
+                provider_reference: [1; 16],
+                provider_key_epoch: 1,
+            },
+        )
+    }
+
+    pub(crate) fn wrap_segment_key_with_route(
+        wrapping_key: &SecretKeyBytes,
+        object_key: &ObjectDataKey,
+        instance: [u8; 16],
+        route: SegmentEnvelopeRoute,
+    ) -> Result<Vec<u8>, FrameFailure> {
+        let context = segment_context_encoding_with_route(instance, object_key.object, route)?;
         let digest = Self::hash(&context)?;
-        let payload = encode_segment_wrapped_key_payload(object_key, instance, digest)?;
+        let payload =
+            encode_segment_wrapped_key_payload_with_route(object_key, instance, digest, route)?;
         Self::release()
             .backend
             .wrap_key_aes_256_kwp(wrapping_key, &payload.bytes)
@@ -159,13 +179,35 @@ impl DataProtection {
         instance: [u8; 16],
         object: FrameObjectContext,
     ) -> Result<ObjectDataKey, FrameFailure> {
-        let context = segment_context_encoding(instance, object)?;
+        Self::unwrap_segment_key_with_route(
+            wrapping_key,
+            wrapped_payload,
+            instance,
+            object,
+            SegmentEnvelopeRoute {
+                provider_family: 1,
+                provider_reference: [1; 16],
+                provider_key_epoch: 1,
+            },
+        )
+    }
+
+    pub(crate) fn unwrap_segment_key_with_route(
+        wrapping_key: &SecretKeyBytes,
+        wrapped_payload: &[u8],
+        instance: [u8; 16],
+        object: FrameObjectContext,
+        route: SegmentEnvelopeRoute,
+    ) -> Result<ObjectDataKey, FrameFailure> {
+        let context = segment_context_encoding_with_route(instance, object, route)?;
         let digest = Self::hash(&context)?;
         let payload = Self::release()
             .backend
             .unwrap_key_aes_256_kwp(wrapping_key, wrapped_payload)
             .map_err(|_| FrameFailure::new(FrameFailureCode::AuthenticationFailed))?;
-        let key = verify_segment_wrapped_key_payload(payload, instance, object, digest)?;
+        let key = verify_segment_wrapped_key_payload_with_route(
+            payload, instance, object, digest, route,
+        )?;
         Ok(ObjectDataKey { key, object })
     }
 }
