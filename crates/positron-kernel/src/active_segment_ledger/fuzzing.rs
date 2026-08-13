@@ -159,7 +159,7 @@ fn block_parts(index: usize, selector: u8) -> (StoreBlockIdentity, Vec<u8>) {
     )
 }
 
-fn prepared(identity: StoreBlockIdentity, payload: Vec<u8>) -> PreparedStoreBlock {
+fn prepared(identity: StoreBlockIdentity, payload: Vec<u8>) -> PreparedStoreBlock<'static> {
     PreparedStoreBlock::new(scope(), identity, payload).expect("bounded fuzz block")
 }
 

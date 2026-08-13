@@ -2,8 +2,69 @@ use positron_domain::value::{
     AttributeValueKind, CandidateAttributeValue, CandidateKeyValue, ValidatedAttributeValue,
 };
 
+use super::size::bounded_add;
 use super::{Input, MAX_COLLECTION, bounded_vec, put_bytes, put_count};
 use crate::log_store::LogStoreFailure;
+
+pub(super) fn encoded_length(
+    value: &ValidatedAttributeValue,
+    depth: u8,
+) -> Result<usize, LogStoreFailure> {
+    Ok(match value.kind() {
+        AttributeValueKind::Null => 1,
+        AttributeValueKind::Boolean => 2,
+        AttributeValueKind::SignedInteger | AttributeValueKind::FloatingPoint => 9,
+        AttributeValueKind::String => bounded_add(
+            5,
+            value
+                .as_str()
+                .ok_or_else(LogStoreFailure::invalid_input)?
+                .len(),
+        )?,
+        AttributeValueKind::Bytes => bounded_add(
+            5,
+            value
+                .as_bytes()
+                .ok_or_else(LogStoreFailure::invalid_input)?
+                .len(),
+        )?,
+        AttributeValueKind::Array => {
+            let next = depth
+                .checked_sub(1)
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+            let count = value
+                .array_len()
+                .ok_or_else(LogStoreFailure::invalid_input)?;
+            (0..count).try_fold(3_usize, |total, index| {
+                bounded_add(
+                    total,
+                    encoded_length(
+                        value
+                            .array_entry(index)
+                            .ok_or_else(LogStoreFailure::invalid_input)?,
+                        next,
+                    )?,
+                )
+            })?
+        },
+        AttributeValueKind::KeyValueList => {
+            let next = depth
+                .checked_sub(1)
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+            let count = value
+                .key_value_list_len()
+                .ok_or_else(LogStoreFailure::invalid_input)?;
+            (0..count).try_fold(3_usize, |total, index| {
+                let entry = value
+                    .key_value_entry(index)
+                    .ok_or_else(LogStoreFailure::invalid_input)?;
+                let total = bounded_add(total, 4)?;
+                let total = bounded_add(total, entry.key().len())?;
+                bounded_add(total, encoded_length(entry.value(), next)?)
+            })?
+        },
+    })
+}
 
 pub(super) fn encode(
     output: &mut Vec<u8>,

@@ -26,6 +26,7 @@ fn committed_native_log_survives_reopen_and_bounded_scan() -> Result<(), Box<dyn
         PolicyProvenance::new(7, [0x71; 32], vec!["redact-password".to_owned()])?,
     )?;
     let prepared = store.prepare(
+        preparation_capacity(&authority, tenant)?,
         &clock(1_723_456_789_000_000_000),
         tenant,
         VirtualShardId::new(1)?,
@@ -110,17 +111,18 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         PolicyProvenance::new(9, [0x79; 32], vec![])?,
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
     let store = LogStore::new();
     let prepared = store.prepare(
+        preparation_capacity(&authority, tenant)?,
         &clock(1_000),
         tenant,
         VirtualShardId::new(2)?,
         StoreBlockIdentity::new([0x62; 16])?,
         vec![record.clone()],
     )?;
-    let root = TemporaryRoot::new()?;
-    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    let authority = establish_kernel_authority(volume)?;
     let catalog = Catalog::open(
         &authority,
         InstanceId::new([0x12; 16])?,

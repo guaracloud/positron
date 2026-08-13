@@ -27,6 +27,7 @@ fn bounded_scan_holds_query_capacity_and_decodes_only_the_result_limit()
     ledger.append(
         LogStore::new()
             .prepare(
+                preparation_capacity(&authority, tenant)?,
                 &clock(123),
                 tenant,
                 shard,

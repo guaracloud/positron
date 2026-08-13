@@ -14,7 +14,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
     LedgerSnapshot, LifecycleClock, LifecycleClockSource, PreparedStoreBlock, ResourceAmounts,
-    ResourceDimension, ResourceGovernor, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
+    ResourceDimension, ResourceGovernor, ResourceReservation, SegmentScope, StoreBlockIdentity,
+    WorkClaim, WorkKind,
 };
 
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
@@ -36,14 +37,19 @@ impl LogStore {
     }
 
     /// Prepares one canonical, checked Log Store Block for kernel durability.
-    pub fn prepare<S: LifecycleClockSource>(
+    pub fn prepare<'capacity, S: LifecycleClockSource>(
         &self,
+        capacity: ResourceReservation<'capacity>,
         clock: &LifecycleClock<S>,
         tenant: TenantId,
         shard: VirtualShardId,
         identity: StoreBlockIdentity,
         records: Vec<LogRecord>,
-    ) -> Result<PreparedLogBlock, LogStoreFailure> {
+    ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
+        if !capacity.authorizes_ingest_preparation(tenant, 1_048_576) {
+            return Err(LogStoreFailure::resource_admission_refused());
+        }
+        let encoded_bytes = codec::encoded_block_length(&records)?;
         let stored = records
             .into_iter()
             .map(|record| {
@@ -53,10 +59,11 @@ impl LogStore {
                     .map_err(|_| LogStoreFailure::clock_unavailable())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bytes = codec::encode_block(tenant, &stored)?;
+        let bytes = codec::encode_block(tenant, &stored, encoded_bytes)?;
         let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
         let block =
-            PreparedStoreBlock::new(scope, identity, bytes).map_err(LogStoreFailure::kernel)?;
+            PreparedStoreBlock::new_with_preparation_capacity(scope, identity, bytes, capacity)
+                .map_err(LogStoreFailure::kernel)?;
         Ok(PreparedLogBlock::new(block))
     }
 

@@ -16,7 +16,7 @@ fn prepared(
     scope: SegmentScope,
     marker: u8,
     payload: Vec<u8>,
-) -> Result<PreparedStoreBlock, positron_kernel::LedgerFailure> {
+) -> Result<PreparedStoreBlock<'static>, positron_kernel::LedgerFailure> {
     PreparedStoreBlock::new(scope, StoreBlockIdentity::new([marker; 16])?, payload)
 }
 

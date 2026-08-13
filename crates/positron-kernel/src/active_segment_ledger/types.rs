@@ -10,9 +10,11 @@ use positron_domain::time::UnixNanoseconds;
 use crate::catalog::CatalogFailure;
 use crate::data_protection::{SecretKeyBytes, SegmentEnvelopeRoute};
 
-use super::MAX_STORE_BLOCK_BYTES;
 use crate::IngestTime;
 use crate::ResourceReservation;
+
+mod prepared;
+pub use prepared::PreparedStoreBlock;
 
 /// The immutable tenant, Signal Store, and Virtual Shard boundary of one active segment.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -151,30 +153,6 @@ impl SegmentProtectionKey {
 impl std::fmt::Debug for SegmentProtectionKey {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SegmentProtectionKey { <redacted> }")
-    }
-}
-
-/// Opaque canonical Store Block bytes and their caller-owned stable identity.
-pub struct PreparedStoreBlock {
-    pub(super) scope: SegmentScope,
-    pub(super) identity: StoreBlockIdentity,
-    pub(super) payload: Vec<u8>,
-}
-
-impl PreparedStoreBlock {
-    pub fn new(
-        scope: SegmentScope,
-        identity: StoreBlockIdentity,
-        bytes: Vec<u8>,
-    ) -> Result<Self, LedgerFailure> {
-        if bytes.is_empty() || bytes.len() > MAX_STORE_BLOCK_BYTES {
-            return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
-        }
-        Ok(Self {
-            scope,
-            identity,
-            payload: bytes,
-        })
     }
 }
 

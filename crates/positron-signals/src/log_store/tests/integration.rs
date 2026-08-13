@@ -13,7 +13,7 @@ use positron_signals::{LogRecord, LogScan, LogStore, PolicyProvenance, ScanLimit
 #[path = "support.rs"]
 mod support;
 
-use support::{TemporaryRoot, establish_kernel_authority};
+use support::{TemporaryRoot, establish_kernel_authority, preparation_capacity};
 
 #[test]
 fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(), Box<dyn Error>> {
@@ -46,6 +46,7 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
     ledger.append(
         store
             .prepare(
+                preparation_capacity(&authority, tenant)?,
                 &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
                 tenant,
                 VirtualShardId::new(8)?,

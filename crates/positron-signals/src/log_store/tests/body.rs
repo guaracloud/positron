@@ -83,6 +83,7 @@ fn round_trip_record(record: LogRecord, marker: u8) -> Result<StoredLogRecord, B
     ledger.append(
         LogStore::new()
             .prepare(
+                preparation_capacity(&authority, tenant)?,
                 &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1))),
                 tenant,
                 shard,

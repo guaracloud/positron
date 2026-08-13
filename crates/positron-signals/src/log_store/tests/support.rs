@@ -8,8 +8,8 @@ use positron_kernel::{
     DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits,
     ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume,
     RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
-    StorageKernelResourceAuthority, TenantQuota,
+    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, ResourceReservation,
+    StorageKernelResourceAuthority, TenantQuota, WorkClaim, WorkKind,
 };
 
 const DIMENSIONS: usize = 11;
@@ -31,6 +31,16 @@ impl TemporaryRoot {
     pub fn path(&self) -> &Path {
         &self.0
     }
+}
+
+pub fn preparation_capacity(
+    authority: &StorageKernelResourceAuthority,
+    tenant: TenantId,
+) -> Result<ResourceReservation<'_>, Box<dyn Error>> {
+    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?;
+    Ok(authority
+        .governor()
+        .reserve(WorkClaim::tenant(tenant, WorkKind::Ingest, amounts)?)?)
 }
 
 impl Drop for TemporaryRoot {

@@ -17,7 +17,7 @@ mod sealing_faults;
 fn prepared(
     scope: SegmentScope,
     payload: &[u8],
-) -> Result<PreparedStoreBlock, crate::LedgerFailure> {
+) -> Result<PreparedStoreBlock<'static>, crate::LedgerFailure> {
     let marker = payload.first().copied().unwrap_or(1).max(1);
     PreparedStoreBlock::new(
         scope,

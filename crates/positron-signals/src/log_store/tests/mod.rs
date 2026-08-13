@@ -19,9 +19,12 @@ use super::{
     AttributeRepresentation, LogRecord, LogScan, LogStore, LogStoreFailureCode, PolicyProvenance,
     ScanLimit, StoredLogAttribute, StoredLogRecord,
 };
-use crate::log_store::tests::support::{TemporaryRoot, establish_kernel_authority};
+use crate::log_store::tests::support::{
+    TemporaryRoot, establish_kernel_authority, preparation_capacity,
+};
 
 mod body;
+mod capacity;
 mod codec;
 mod scan;
 mod support;
@@ -50,6 +53,7 @@ fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Er
     ledger.append(
         store
             .prepare(
+                preparation_capacity(&authority, tenant)?,
                 &clock(1),
                 tenant,
                 VirtualShardId::new(3)?,
@@ -127,6 +131,7 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
     ledger.append(
         store
             .prepare(
+                preparation_capacity(&authority, tenant)?,
                 &clock(10),
                 tenant,
                 VirtualShardId::new(5)?,
@@ -140,6 +145,7 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
     successor.append(
         store
             .prepare(
+                preparation_capacity(&authority, tenant)?,
                 &clock(11),
                 tenant,
                 VirtualShardId::new(5)?,
@@ -196,7 +202,105 @@ fn authenticated_malformed_block_is_rejected_without_observation() -> Result<(),
 }
 
 #[test]
+fn authenticated_malformed_record_shapes_fail_closed_at_their_exact_boundaries()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x16; 16])?,
+        CatalogSecret::from_owned(Box::new([0x26; 32]), Box::new([0x36; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let valid = encoded_log_fixture(tenant);
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    let cases = vec![
+        (
+            "wrong tenant",
+            encoded_log_fixture(TenantId::from_bytes([0x42; 16])?),
+            LogStoreFailureCode::PhysicalScopeMismatch,
+        ),
+        (
+            "zero records",
+            replaced_byte(&valid, 27, 0)?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "too many records",
+            replaced_bytes(&valid, 26, [4, 1])?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "unknown event quality",
+            replaced_byte(&valid, 28, 9)?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "unknown observed-time tag",
+            replaced_byte(&valid, 29, 9)?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "unknown body tag",
+            replaced_byte(&valid, 38, 9)?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "unknown attribute representation",
+            replaced_byte(&valid, 41, 9)?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "unknown attribute namespace",
+            replaced_byte(&valid, 42, 9)?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "empty occurrence set",
+            replaced_bytes(&valid, 48, [0, 0])?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
+            "trailing bytes",
+            trailing,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+    ];
+
+    for (index, (description, bytes, expected)) in cases.into_iter().enumerate() {
+        let shard = VirtualShardId::new(u32::try_from(index + 20)?)?;
+        let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+        let ledger = ActiveSegmentLedger::open(
+            &authority,
+            &catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([u8::try_from(index + 0x60)?; 32])),
+        )?;
+        ledger.append(PreparedStoreBlock::new(
+            scope,
+            StoreBlockIdentity::new([u8::try_from(index + 0x70)?; 16])?,
+            bytes,
+        )?)?;
+        let failure = LogStore::new()
+            .scan(
+                authority.governor(),
+                tenant,
+                &ledger.snapshot()?,
+                LogScan::all(ScanLimit::new(1)?),
+            )
+            .expect_err(description);
+        assert_eq!(failure.code(), expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
     let invalid_policy = PolicyProvenance::new(0, [0x70; 32], vec![])
         .expect_err("policy generation zero is not immutable provenance");
     assert_eq!(invalid_policy.code(), LogStoreFailureCode::InvalidInput);
@@ -282,6 +386,7 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     let store = LogStore::new();
     let empty_failure = store
         .prepare(
+            preparation_capacity(&authority, tenant)?,
             &clock(1),
             tenant,
             VirtualShardId::new(9)?,
@@ -292,8 +397,9 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
         .ok_or("an empty canonical block unexpectedly prepared")?;
     assert_eq!(empty_failure.code(), LogStoreFailureCode::LimitExceeded);
     let large_record = LogRecord::checked_minimal(None, Some("x".repeat(262_144)), vec![], policy)?;
-    let kernel_bound = store
+    let block_bound = store
         .prepare(
+            preparation_capacity(&authority, tenant)?,
             &clock(1),
             tenant,
             VirtualShardId::new(10)?,
@@ -302,8 +408,8 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
         )
         .err()
         .ok_or("an oversized canonical Store Block unexpectedly prepared")?;
-    assert_eq!(kernel_bound.code(), LogStoreFailureCode::Kernel);
-    assert_eq!(kernel_bound.to_string(), "log store failure: Kernel");
+    assert_eq!(block_bound.code(), LogStoreFailureCode::LimitExceeded);
+    assert_eq!(block_bound.to_string(), "log store failure: LimitExceeded");
     Ok(())
 }
 
@@ -320,6 +426,45 @@ fn clock(instant: i64) -> LifecycleClock<FixedLifecycleClockSource> {
     LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
         instant,
     )))
+}
+
+fn encoded_log_fixture(tenant: TenantId) -> Vec<u8> {
+    let mut bytes = b"PLOGBL01".to_vec();
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&tenant.to_bytes());
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.push(2);
+    bytes.push(0);
+    bytes.extend_from_slice(&1_i64.to_be_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.push(1);
+    bytes.push(1);
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.push(b'k');
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&1_u64.to_be_bytes());
+    bytes.extend_from_slice(&[1; 32]);
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+    bytes
+}
+
+fn replaced_byte(bytes: &[u8], offset: usize, value: u8) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut replaced = bytes.to_vec();
+    *replaced
+        .get_mut(offset)
+        .ok_or("malformed fixture replacement offset")? = value;
+    Ok(replaced)
+}
+
+fn replaced_bytes(bytes: &[u8], offset: usize, values: [u8; 2]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut replaced = bytes.to_vec();
+    replaced
+        .get_mut(offset..offset + values.len())
+        .ok_or("malformed fixture replacement range")?
+        .copy_from_slice(&values);
+    Ok(replaced)
 }
 
 fn occurrences(

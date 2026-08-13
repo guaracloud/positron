@@ -14,19 +14,21 @@ const VERSION: u16 = 1;
 const MAX_RECORDS: usize = 1_024;
 const MAX_COLLECTION: usize = 1_024;
 const MAX_NESTING: u8 = 16;
-
+mod size;
 mod value;
+pub(super) use size::encoded_block_length;
 
 pub(super) fn encode_block(
     tenant: TenantId,
     records: &[StoredLogRecord],
+    encoded_bytes: usize,
 ) -> Result<Vec<u8>, LogStoreFailure> {
     if records.is_empty() || records.len() > MAX_RECORDS {
         return Err(LogStoreFailure::limit_exceeded());
     }
     let mut output = Vec::new();
     output
-        .try_reserve(28)
+        .try_reserve_exact(encoded_bytes)
         .map_err(|_| LogStoreFailure::resource_exhausted())?;
     output.extend_from_slice(MAGIC);
     put_u16(&mut output, VERSION);
@@ -34,6 +36,9 @@ pub(super) fn encode_block(
     put_count(&mut output, records.len())?;
     for record in records {
         encode_record(&mut output, record)?;
+    }
+    if output.len() != encoded_bytes {
+        return Err(LogStoreFailure::invalid_input());
     }
     Ok(output)
 }

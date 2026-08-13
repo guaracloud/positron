@@ -27,6 +27,7 @@ fn kernel_clock_assigns_ingest_and_retention_time_while_event_time_remains_untru
     ledger.append(
         LogStore::new()
             .prepare(
+                preparation_capacity(&authority, tenant)?,
                 &clock,
                 tenant,
                 shard,

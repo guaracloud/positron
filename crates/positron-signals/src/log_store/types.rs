@@ -330,17 +330,17 @@ pub(super) fn validated_value(
 }
 
 /// Opaque checked Log Store output accepted by the Storage Kernel ledger.
-pub struct PreparedLogBlock {
-    block: PreparedStoreBlock,
+pub struct PreparedLogBlock<'capacity> {
+    block: PreparedStoreBlock<'capacity>,
 }
 
-impl PreparedLogBlock {
-    pub(super) const fn new(block: PreparedStoreBlock) -> Self {
+impl<'capacity> PreparedLogBlock<'capacity> {
+    pub(super) const fn new(block: PreparedStoreBlock<'capacity>) -> Self {
         Self { block }
     }
 
     #[must_use]
-    pub fn into_store_block(self) -> PreparedStoreBlock {
+    pub fn into_store_block(self) -> PreparedStoreBlock<'capacity> {
         self.block
     }
 }
