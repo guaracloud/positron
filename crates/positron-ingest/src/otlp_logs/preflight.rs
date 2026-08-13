@@ -1,38 +1,151 @@
 use super::ReceiveFailure;
 
+const MAX_RESOURCE_LOGS: usize = 1_024;
+const MAX_SCOPE_LOGS: usize = 1_024;
 const MAX_RECORDS: usize = 1_024;
+const MAX_KEY_VALUES: usize = 4_096;
+const MAX_COLLECTION_VALUES: usize = 4_096;
+const MAX_NESTING_DEPTH: usize = 16;
 const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
 const MAX_GROUP_DEPTH: usize = 64;
 
 pub(super) fn validate_record_count(protobuf: &[u8]) -> Result<(), ReceiveFailure> {
-    let mut records = 0_usize;
-    visit_request(protobuf, &mut records)
+    Counters::default().visit_request(protobuf)
 }
 
-fn visit_request(message: &[u8], records: &mut usize) -> Result<(), ReceiveFailure> {
-    visit_fields(message, 1, |resource_logs| {
-        visit_fields(resource_logs, 2, |scope_logs| {
-            visit_fields(scope_logs, 2, |_| {
-                *records = records
-                    .checked_add(1)
-                    .filter(|count| *count <= MAX_RECORDS)
-                    .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-                Ok(())
-            })
+#[derive(Default)]
+struct Counters {
+    resource_logs: usize,
+    scope_logs: usize,
+    records: usize,
+    key_values: usize,
+    collection_values: usize,
+}
+
+impl Counters {
+    fn visit_request(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        visit_fields(message, |field, value| {
+            if field == 1 {
+                increment(&mut self.resource_logs, MAX_RESOURCE_LOGS)?;
+                self.visit_resource_logs(value)?;
+            }
+            Ok(())
         })
-    })
+    }
+
+    fn visit_resource_logs(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        visit_fields(message, |field, value| match field {
+            1 => self.visit_resource(value),
+            2 => {
+                increment(&mut self.scope_logs, MAX_SCOPE_LOGS)?;
+                self.visit_scope_logs(value)
+            },
+            _ => Ok(()),
+        })
+    }
+
+    fn visit_resource(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        visit_fields(message, |field, value| {
+            if field == 1 {
+                self.visit_key_value(value, 0)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn visit_scope_logs(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        visit_fields(message, |field, value| match field {
+            1 => self.visit_scope(value),
+            2 => {
+                increment(&mut self.records, MAX_RECORDS)?;
+                self.visit_log_record(value)
+            },
+            _ => Ok(()),
+        })
+    }
+
+    fn visit_scope(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        visit_fields(message, |field, value| {
+            if field == 3 {
+                self.visit_key_value(value, 0)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn visit_log_record(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        visit_fields(message, |field, value| match field {
+            5 => self.visit_any_value(value, 0),
+            6 => self.visit_key_value(value, 0),
+            _ => Ok(()),
+        })
+    }
+
+    fn visit_key_value(&mut self, message: &[u8], depth: usize) -> Result<(), ReceiveFailure> {
+        increment(&mut self.key_values, MAX_KEY_VALUES)?;
+        visit_fields(message, |field, value| {
+            if field == 2 {
+                self.visit_any_value(value, depth)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn visit_any_value(&mut self, message: &[u8], depth: usize) -> Result<(), ReceiveFailure> {
+        visit_fields(message, |field, value| match field {
+            5 => self.visit_array(value, depth),
+            6 => self.visit_key_value_list(value, depth),
+            _ => Ok(()),
+        })
+    }
+
+    fn visit_array(&mut self, message: &[u8], depth: usize) -> Result<(), ReceiveFailure> {
+        let next = next_depth(depth)?;
+        visit_fields(message, |field, value| {
+            if field == 1 {
+                increment(&mut self.collection_values, MAX_COLLECTION_VALUES)?;
+                self.visit_any_value(value, next)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn visit_key_value_list(&mut self, message: &[u8], depth: usize) -> Result<(), ReceiveFailure> {
+        let next = next_depth(depth)?;
+        visit_fields(message, |field, value| {
+            if field == 1 {
+                increment(&mut self.collection_values, MAX_COLLECTION_VALUES)?;
+                self.visit_key_value(value, next)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+fn next_depth(depth: usize) -> Result<usize, ReceiveFailure> {
+    depth
+        .checked_add(1)
+        .filter(|next| *next <= MAX_NESTING_DEPTH)
+        .ok_or(ReceiveFailure::ValueLimitExceeded)
+}
+
+fn increment(value: &mut usize, limit: usize) -> Result<(), ReceiveFailure> {
+    *value = value
+        .checked_add(1)
+        .filter(|next| *next <= limit)
+        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+    Ok(())
 }
 
 fn visit_fields(
     message: &[u8],
-    nested_field: u64,
-    mut visit: impl FnMut(&[u8]) -> Result<(), ReceiveFailure>,
+    mut visit: impl FnMut(u64, &[u8]) -> Result<(), ReceiveFailure>,
 ) -> Result<(), ReceiveFailure> {
     let mut cursor = Cursor::new(message);
     while !cursor.is_empty() {
         let (field, wire) = cursor.take_key()?;
-        if field == nested_field && wire == 2 {
-            visit(cursor.take_length_delimited()?)?;
+        if wire == 2 {
+            visit(field, cursor.take_length_delimited()?)?;
         } else {
             cursor.skip_value(field, wire)?;
         }
@@ -145,115 +258,5 @@ impl<'message> Cursor<'message> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::validate_record_count;
-    use crate::ReceiveFailure;
-
-    #[test]
-    fn exact_record_limit_is_accepted_and_the_next_record_is_rejected() {
-        assert_eq!(
-            validate_record_count(&request_with_empty_records(1_024)),
-            Ok(())
-        );
-        assert_eq!(
-            validate_record_count(&request_with_empty_records(1_025)),
-            Err(ReceiveFailure::ValueLimitExceeded),
-        );
-    }
-
-    #[test]
-    fn a_huge_empty_record_fanout_is_rejected_without_decoding() {
-        let request = request_with_empty_records(100_000);
-        assert!(request.len() < 1_048_576);
-        assert_eq!(
-            validate_record_count(&request),
-            Err(ReceiveFailure::ValueLimitExceeded),
-        );
-    }
-
-    #[test]
-    fn unrelated_length_delimited_fields_do_not_count_as_log_records() {
-        let log_like_bytes = request_with_empty_records(1_025);
-        let mut request = Vec::new();
-        push_length_delimited(9, &log_like_bytes, &mut request);
-        push_length_delimited(1, &[0x0a, 0x02, 0x12, 0x00], &mut request);
-
-        assert_eq!(validate_record_count(&request), Ok(()));
-    }
-
-    #[test]
-    fn malformed_nested_wire_is_rejected() {
-        for request in [
-            vec![0x0a, 0x02, 0x12],
-            vec![0x0a, 0x03, 0x12, 0x01, 0x80],
-            vec![
-                0x0a, 0x0b, 0x12, 0x09, 0x12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            ],
-        ] {
-            assert_eq!(
-                validate_record_count(&request),
-                Err(ReceiveFailure::MalformedPayload),
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_wire_types_are_skipped_and_group_hazards_fail_closed() {
-        let valid_unknowns = [
-            0x10, 0x01, // varint
-            0x19, 0, 0, 0, 0, 0, 0, 0, 0, // fixed64
-            0x25, 0, 0, 0, 0, // fixed32
-            0x2b, 0x30, 0x01, 0x2c, // matching group
-        ];
-        assert_eq!(validate_record_count(&valid_unknowns), Ok(()));
-
-        for malformed in [
-            vec![0x00],
-            vec![0x0e],
-            vec![0x0c],
-            vec![0x0a, 0x80, 0x00],
-            vec![0x11, 0, 0, 0],
-            vec![0x1d, 0, 0],
-            vec![0x0b, 0x14],
-        ] {
-            assert_eq!(
-                validate_record_count(&malformed),
-                Err(ReceiveFailure::MalformedPayload),
-            );
-        }
-
-        let mut too_deep = Vec::new();
-        too_deep.extend(std::iter::repeat_n(0x0b, 65));
-        too_deep.extend(std::iter::repeat_n(0x0c, 65));
-        assert_eq!(
-            validate_record_count(&too_deep),
-            Err(ReceiveFailure::MalformedPayload),
-        );
-    }
-
-    fn request_with_empty_records(count: usize) -> Vec<u8> {
-        let mut scope_logs = Vec::with_capacity(count.saturating_mul(2));
-        for _ in 0..count {
-            scope_logs.extend_from_slice(&[0x12, 0x00]);
-        }
-        let mut resource_logs = Vec::new();
-        push_length_delimited(2, &scope_logs, &mut resource_logs);
-        let mut request = Vec::new();
-        push_length_delimited(1, &resource_logs, &mut request);
-        request
-    }
-
-    fn push_length_delimited(field: u64, value: &[u8], output: &mut Vec<u8>) {
-        push_varint((field << 3) | 2, output);
-        push_varint(value.len() as u64, output);
-        output.extend_from_slice(value);
-    }
-
-    fn push_varint(mut value: u64, output: &mut Vec<u8>) {
-        while value >= 0x80 {
-            output.push((value as u8) | 0x80);
-            value >>= 7;
-        }
-        output.push(value as u8);
-    }
-}
+#[path = "preflight/tests.rs"]
+mod tests;
