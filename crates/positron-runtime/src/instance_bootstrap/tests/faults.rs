@@ -41,6 +41,74 @@ fn every_bootstrap_publication_fault_resumes_without_ambiguous_state()
 }
 
 #[test]
+fn synchronized_pending_replacement_resumes_after_pre_rename_crash()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+
+    let failure = with_fault(BootstrapFileEvent::ReplacePendingAfterSync, || {
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
+    })
+    .expect_err("fault after replacement sync must interrupt initialization");
+
+    assert_eq!(failure.code(), BootstrapFailureCode::StorageUnavailable);
+    assert!(
+        paths
+            .data_root()
+            .join(".positron-bootstrap.pending.replacement")
+            .is_file()
+    );
+    assert_eq!(
+        InstanceBootstrap::classify(&paths)?,
+        BootstrapState::Incomplete
+    );
+    let completed = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    drop(completed);
+    assert_eq!(
+        InstanceBootstrap::classify(&paths)?,
+        BootstrapState::Initialized
+    );
+    assert!(
+        !paths
+            .data_root()
+            .join(".positron-bootstrap.pending.replacement")
+            .exists()
+    );
+    Ok(())
+}
+
+#[test]
+fn corrupt_pending_replacement_is_inconsistent_and_never_published()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    with_fault(BootstrapFileEvent::ReplacePendingAfterSync, || {
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
+    })
+    .expect_err("fault must leave synchronized replacement");
+    let replacement = paths
+        .data_root()
+        .join(".positron-bootstrap.pending.replacement");
+    let mut bytes = std::fs::read(&replacement)?;
+    let last = bytes.last_mut().ok_or("replacement must not be empty")?;
+    *last ^= 0x80;
+    std::fs::write(&replacement, bytes)?;
+
+    assert_eq!(
+        InstanceBootstrap::classify(&paths)?,
+        BootstrapState::Inconsistent
+    );
+    assert_eq!(
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
+            .expect_err("unauthenticated replacement must not publish")
+            .code(),
+        BootstrapFailureCode::InconsistentRoots
+    );
+    assert!(replacement.is_file());
+    Ok(())
+}
+
+#[test]
 fn claim_removal_failure_returns_no_secret_and_remains_claimable()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;

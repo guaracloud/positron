@@ -9,17 +9,14 @@ use rustix::fs::{self as unix_fs, AtFlags, Mode, OFlags, RenameFlags};
 
 use crate::{
     BootstrapKeyCustody, BootstrapKeyFailure, CatalogFailureCode, CatalogSecret, InstanceId,
-    MountQualification, OwnedPrimaryDataVolume, PrimaryDataVolume,
+    MountQualification, OwnedPrimaryDataVolume, PrimaryDataVolume, VolumeOperation,
 };
 
 mod io;
 #[cfg(test)]
 mod tests;
 
-use io::{
-    canonical_root, map_open_error, open_verified_root, path_identity, scan, synchronize,
-    write_named_new,
-};
+use io::{canonical_root, map_open_error, open_verified_root, path_identity, scan, synchronize};
 
 const MAX_ARTIFACT_BYTES: u64 = 2_097_152;
 
@@ -27,6 +24,7 @@ const MAX_ARTIFACT_BYTES: u64 = 2_097_152;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapArtifact {
     Pending,
+    PendingReplacement,
     InitializedStaging,
     Initialized,
     Claim,
@@ -36,6 +34,7 @@ impl BootstrapArtifact {
     const fn name(self) -> &'static str {
         match self {
             Self::Pending => ".positron-bootstrap.pending",
+            Self::PendingReplacement => ".positron-bootstrap.pending.replacement",
             Self::InitializedStaging => ".positron-bootstrap.initialized.new",
             Self::Initialized => ".positron-bootstrap.initialized",
             Self::Claim => "bootstrap-claim.v1",
@@ -45,7 +44,10 @@ impl BootstrapArtifact {
     const fn root(self) -> BootstrapRoot {
         match self {
             Self::Claim => BootstrapRoot::Secrets,
-            Self::Pending | Self::InitializedStaging | Self::Initialized => BootstrapRoot::Data,
+            Self::Pending
+            | Self::PendingReplacement
+            | Self::InitializedStaging
+            | Self::Initialized => BootstrapRoot::Data,
         }
     }
 }
@@ -61,6 +63,7 @@ pub(super) enum BootstrapRoot {
 pub enum BootstrapEntry {
     VolumeLock,
     Pending,
+    PendingReplacement,
     InitializedStaging,
     Initialized,
     Catalog,
@@ -118,6 +121,7 @@ pub enum BootstrapStorageFailure {
     InvalidRoots,
     Unavailable,
     UnsafeOrCorrupt,
+    BoundIdentityMismatch,
     AlreadyExists,
 }
 
@@ -170,8 +174,18 @@ impl InstanceBootstrapStorage {
     pub fn acquire(
         &self,
     ) -> Result<(OwnedPrimaryDataVolume, BootstrapArtifactAccess), BootstrapStorageFailure> {
-        let volume = PrimaryDataVolume::acquire(&self.data, self.qualification)
-            .map_err(|_| BootstrapStorageFailure::Unavailable)?;
+        let expected = crate::VolumeRootIdentity {
+            device: self.data_identity.device,
+            inode: self.data_identity.inode,
+        };
+        let volume = PrimaryDataVolume::acquire_bound(&self.data, self.qualification, expected)
+            .map_err(|failure| {
+                if failure.operation() == VolumeOperation::VerifyRootIdentity {
+                    BootstrapStorageFailure::BoundIdentityMismatch
+                } else {
+                    BootstrapStorageFailure::Unavailable
+                }
+            })?;
         let data = volume
             ._root
             .try_clone()
@@ -290,13 +304,11 @@ impl BootstrapArtifactAccess {
         synchronize(directory)
     }
 
-    /// Replaces the pending intent through a private, exclusive temporary.
-    pub fn replace_pending(&self, bytes: &[u8]) -> Result<(), BootstrapStorageFailure> {
-        const TEMP: &str = ".positron-bootstrap.pending.replacement";
-        write_named_new(&self.data, TEMP, bytes)?;
+    /// Publishes a synchronized pending replacement over the raw intent.
+    pub fn publish_pending_replacement(&self) -> Result<(), BootstrapStorageFailure> {
         unix_fs::renameat(
             &self.data,
-            TEMP,
+            BootstrapArtifact::PendingReplacement.name(),
             &self.data,
             BootstrapArtifact::Pending.name(),
         )

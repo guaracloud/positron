@@ -1,4 +1,7 @@
-use positron_kernel::{BootstrapArtifactAccess, BootstrapKeyIdentity, OwnedPrimaryDataVolume};
+use positron_kernel::{
+    BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody, BootstrapKeyIdentity,
+    BootstrapObjectPurpose, OwnedPrimaryDataVolume,
+};
 
 use super::super::codec::BootstrapRecord;
 use super::super::{BootstrapFailure, BootstrapFailureCode, BootstrapPaths};
@@ -9,6 +12,26 @@ pub(super) fn acquire(
     paths
         .storage
         .acquire()
+        .map_err(super::super::storage::storage_failure)
+}
+
+pub(super) fn recover_pending_replacement(
+    access: &BootstrapArtifactAccess,
+    key: &BootstrapKeyCustody,
+) -> Result<(), BootstrapFailure> {
+    if !super::super::storage::exists(access, BootstrapArtifact::PendingReplacement)? {
+        return Ok(());
+    }
+    let replacement = super::super::storage::read(access, BootstrapArtifact::PendingReplacement)?;
+    let record = super::decode_record(key, BootstrapObjectPurpose::Pending, &replacement)?;
+    require_key_identity(&record, key.identity())?;
+    if super::super::storage::read(access, BootstrapArtifact::Pending)?
+        != super::super::storage::INTENT
+    {
+        return Err(inconsistent());
+    }
+    access
+        .publish_pending_replacement()
         .map_err(super::super::storage::storage_failure)
 }
 

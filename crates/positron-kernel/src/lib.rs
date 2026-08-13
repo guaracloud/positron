@@ -603,6 +603,22 @@ impl PrimaryDataVolume {
         root: &Path,
         qualification: MountQualification,
     ) -> Result<OwnedPrimaryDataVolume, VolumeFailure> {
+        Self::acquire_with_identity(root, qualification, None)
+    }
+
+    pub(crate) fn acquire_bound(
+        root: &Path,
+        qualification: MountQualification,
+        expected: VolumeRootIdentity,
+    ) -> Result<OwnedPrimaryDataVolume, VolumeFailure> {
+        Self::acquire_with_identity(root, qualification, Some(expected))
+    }
+
+    fn acquire_with_identity(
+        root: &Path,
+        qualification: MountQualification,
+        expected: Option<VolumeRootIdentity>,
+    ) -> Result<OwnedPrimaryDataVolume, VolumeFailure> {
         if qualification == MountQualification::UnverifiedExternalOrPvc {
             return Err(VolumeFailure::from_io(
                 VolumeOperation::ClassifyMount,
@@ -650,6 +666,15 @@ impl PrimaryDataVolume {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "primary data volume root changed while being acquired",
+                ),
+            ));
+        }
+        if expected.is_some_and(|expected| expected != handle_identity) {
+            return Err(VolumeFailure::from_io(
+                VolumeOperation::VerifyRootIdentity,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "primary data volume root differs from its bound identity",
                 ),
             ));
         }

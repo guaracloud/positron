@@ -16,6 +16,7 @@ pub(super) enum BootstrapFileEvent {
     RemovePending,
     PublishInitialized,
     RemoveClaim,
+    ReplacePendingAfterSync,
     SynchronizeDirectory,
 }
 
@@ -69,6 +70,7 @@ pub(super) fn classify_with(
     }
     let has_key = layout.contains(BootstrapEntry::LocalKey);
     let has_pending = layout.contains(BootstrapEntry::Pending)
+        || layout.contains(BootstrapEntry::PendingReplacement)
         || layout.contains(BootstrapEntry::InitializedStaging);
     let has_initialized = layout.contains(BootstrapEntry::Initialized);
     if has_initialized && has_pending {
@@ -102,7 +104,18 @@ pub(super) fn classify_with(
                 BootstrapState::Inconsistent
             });
         }
-        let pending_valid = !layout.contains(BootstrapEntry::Pending)
+        let has_replacement = layout.contains(BootstrapEntry::PendingReplacement);
+        let replacement_valid = !has_replacement
+            || (layout.contains(BootstrapEntry::Pending)
+                && !layout.contains(BootstrapEntry::InitializedStaging)
+                && access.read(BootstrapArtifact::Pending).ok().as_deref() == Some(INTENT)
+                && authenticated_record(
+                    access,
+                    BootstrapArtifact::PendingReplacement,
+                    BootstrapObjectPurpose::Pending,
+                ));
+        let pending_valid = has_replacement
+            || !layout.contains(BootstrapEntry::Pending)
             || authenticated_record(
                 access,
                 BootstrapArtifact::Pending,
@@ -114,7 +127,7 @@ pub(super) fn classify_with(
                 BootstrapArtifact::InitializedStaging,
                 BootstrapObjectPurpose::Initialized,
             );
-        return Ok(if pending_valid && staged_valid {
+        return Ok(if replacement_valid && pending_valid && staged_valid {
             BootstrapState::Incomplete
         } else {
             BootstrapState::Inconsistent
@@ -153,6 +166,7 @@ pub(super) fn write_new(
 ) -> Result<(), BootstrapFailure> {
     event(match artifact {
         BootstrapArtifact::Pending => BootstrapFileEvent::WritePending,
+        BootstrapArtifact::PendingReplacement => BootstrapFileEvent::SynchronizeDirectory,
         BootstrapArtifact::Claim => BootstrapFileEvent::WriteClaim,
         BootstrapArtifact::InitializedStaging => BootstrapFileEvent::WriteInitialized,
         BootstrapArtifact::Initialized => BootstrapFileEvent::SynchronizeDirectory,
@@ -164,8 +178,13 @@ pub(super) fn replace_pending(
     access: &BootstrapArtifactAccess,
     bytes: &[u8],
 ) -> Result<(), BootstrapFailure> {
-    event(BootstrapFileEvent::SynchronizeDirectory)?;
-    access.replace_pending(bytes).map_err(storage_failure)
+    access
+        .write_new(BootstrapArtifact::PendingReplacement, bytes)
+        .map_err(storage_failure)?;
+    event(BootstrapFileEvent::ReplacePendingAfterSync)?;
+    access
+        .publish_pending_replacement()
+        .map_err(storage_failure)
 }
 
 pub(super) fn read(
@@ -204,6 +223,7 @@ pub(super) fn exists(
 pub(super) fn storage_failure(failure: BootstrapStorageFailure) -> BootstrapFailure {
     let code = match failure {
         BootstrapStorageFailure::InvalidRoots => BootstrapFailureCode::InvalidRoots,
+        BootstrapStorageFailure::BoundIdentityMismatch => BootstrapFailureCode::InconsistentRoots,
         BootstrapStorageFailure::UnsafeOrCorrupt | BootstrapStorageFailure::AlreadyExists => {
             BootstrapFailureCode::CorruptState
         },

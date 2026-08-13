@@ -204,8 +204,37 @@ fn invalid_replaced_and_unsafe_roots_fail_closed() {
     fs::create_dir(&data).expect("replacement data root");
     assert!(matches!(
         storage.inspect(),
-        Err(BootstrapStorageFailure::UnsafeOrCorrupt)
+        Err(BootstrapStorageFailure::BoundIdentityMismatch)
     ));
+}
+
+#[test]
+fn bound_data_root_swap_fails_before_touching_the_replacement() {
+    let roots = Roots::new();
+    let storage = roots.storage();
+    let detached = roots.parent.join("detached-data");
+    fs::rename(roots.data(), &detached).expect("detach bound data root");
+    fs::create_dir(roots.data()).expect("replacement data root");
+    fs::write(roots.data().join("operator-owned"), b"preserve").expect("replacement fixture");
+
+    assert_eq!(
+        storage.acquire().map(|_| ()),
+        Err(BootstrapStorageFailure::BoundIdentityMismatch)
+    );
+    assert_eq!(
+        fs::read(roots.data().join("operator-owned")).expect("replacement preserved"),
+        b"preserve"
+    );
+    assert_eq!(
+        fs::read_dir(roots.data())
+            .expect("replacement readable")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(detached).expect("original readable").count(),
+        0
+    );
 }
 
 #[test]

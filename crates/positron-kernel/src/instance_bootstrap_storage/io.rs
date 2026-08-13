@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -67,7 +66,7 @@ pub(super) fn open_verified_root(
         inode: metadata.ino(),
     }) != expected
     {
-        return Err(BootstrapStorageFailure::UnsafeOrCorrupt);
+        return Err(BootstrapStorageFailure::BoundIdentityMismatch);
     }
     Ok(current)
 }
@@ -109,6 +108,9 @@ fn recognized_entry(root: BootstrapRoot, name: &[u8]) -> Option<BootstrapEntry> 
     match (root, name) {
         (BootstrapRoot::Data, b".positron-volume.lock") => Some(BootstrapEntry::VolumeLock),
         (BootstrapRoot::Data, b".positron-bootstrap.pending") => Some(BootstrapEntry::Pending),
+        (BootstrapRoot::Data, b".positron-bootstrap.pending.replacement") => {
+            Some(BootstrapEntry::PendingReplacement)
+        },
         (BootstrapRoot::Data, b".positron-bootstrap.initialized.new") => {
             Some(BootstrapEntry::InitializedStaging)
         },
@@ -122,25 +124,6 @@ fn recognized_entry(root: BootstrapRoot, name: &[u8]) -> Option<BootstrapEntry> 
         (BootstrapRoot::Secrets, b"bootstrap-claim.v1") => Some(BootstrapEntry::Claim),
         _ => None,
     }
-}
-
-pub(super) fn write_named_new(
-    directory: &File,
-    name: &str,
-    bytes: &[u8],
-) -> Result<(), BootstrapStorageFailure> {
-    let mut file = unix_fs::openat(
-        directory,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map(File::from)
-    .map_err(map_open_error)?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|_| BootstrapStorageFailure::Unavailable)?;
-    synchronize(directory)
 }
 
 pub(super) fn synchronize(directory: &File) -> Result<(), BootstrapStorageFailure> {

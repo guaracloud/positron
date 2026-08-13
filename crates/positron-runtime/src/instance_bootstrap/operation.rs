@@ -19,7 +19,7 @@ use super::{
 pub(super) mod support;
 use support::{
     acquire, catalog_failure, entropy_failure, format_secret, inconsistent, key_failure,
-    require_key_identity,
+    recover_pending_replacement, require_key_identity,
 };
 
 pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
@@ -102,6 +102,7 @@ fn resume(
     } else {
         access.initialize_key().map_err(key_failure)?
     };
+    recover_pending_replacement(&access, &key)?;
     let pending_bytes = storage::read(&access, BootstrapArtifact::Pending)?;
     let record = if pending_bytes == INTENT {
         let generated = generate_record(&key)?;
