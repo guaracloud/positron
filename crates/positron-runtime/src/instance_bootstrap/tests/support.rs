@@ -33,6 +33,10 @@ impl Roots {
         )
         .expect("test roots are distinct")
     }
+
+    pub(super) fn parent(&self) -> &Path {
+        &self.parent
+    }
 }
 
 impl Drop for Roots {

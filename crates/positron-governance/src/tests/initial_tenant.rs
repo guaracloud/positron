@@ -1,6 +1,8 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 
-use super::{GovernanceIntentFailure, InitialGovernanceIntent, InitialTenantIntent};
+use super::{
+    GovernanceIntentFailure, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
+};
 
 fn intent(
     display: &str,
@@ -22,6 +24,7 @@ fn intent(
         1,
         1,
         [10; 11],
+        InitialAuditContext::new(1_725_000_001, [11; 16], true)?,
     )
 }
 
@@ -40,6 +43,7 @@ fn tenant_creation_encodes_every_authority_and_closed_audit() {
             .windows(19)
             .any(|bytes| bytes == b"instance.initialize")
     );
+    assert!(audit.windows(16).any(|bytes| bytes == [11; 16]));
 }
 
 #[test]

@@ -357,18 +357,6 @@ impl BootstrapKeyCustody {
         .map_err(map_frame)
     }
 
-    pub fn salted_secret_hash(
-        &self,
-        salt: &[u8; 32],
-        secret: &[u8; 32],
-    ) -> Result<[u8; 32], BootstrapKeyFailure> {
-        let mut input = Zeroizing::new(Vec::with_capacity(96));
-        input.extend_from_slice(b"positron-bootstrap-api-key-hash-v1\0");
-        input.extend_from_slice(salt);
-        input.extend_from_slice(secret);
-        DataProtection::hash(&input).map_err(map_frame)
-    }
-
     pub fn integrity_identity(
         &self,
         private_seed: &[u8; 32],

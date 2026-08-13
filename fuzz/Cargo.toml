@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 positron-kernel = { path = "../crates/positron-kernel" }
 positron-domain = { path = "../crates/positron-domain" }
+positron-governance = { path = "../crates/positron-governance" }
 positron-runtime = { path = "../crates/positron-runtime" }
 
 [[bin]]

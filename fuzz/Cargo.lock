@@ -361,6 +361,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "positron-domain",
+ "positron-governance",
  "positron-kernel",
  "positron-runtime",
 ]
@@ -370,6 +371,8 @@ name = "positron-governance"
 version = "0.0.0"
 dependencies = [
  "positron-domain",
+ "positron-kernel",
+ "zeroize",
 ]
 
 [[package]]
@@ -386,6 +389,7 @@ dependencies = [
  "ring",
  "rustix",
  "sha2",
+ "subtle",
  "zeroize",
 ]
 
