@@ -118,12 +118,12 @@ impl InitializationPlan {
 }
 
 pub struct InitializedInstance {
-    pub(super) key: BootstrapKeyCustody,
+    pub(crate) key: BootstrapKeyCustody,
     pub(super) identity: positron_governance::Identity,
     pub(super) audit: Vec<positron_governance::GovernanceAuditEntry>,
-    pub(super) _authority: StorageKernelResourceAuthority,
-    pub(super) instance: InstanceId,
-    pub(super) tenant: TenantId,
+    pub(crate) _authority: StorageKernelResourceAuthority,
+    pub(crate) instance: InstanceId,
+    pub(crate) tenant: TenantId,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,
     pub(super) integrity_key_fingerprint: [u8; 32],
@@ -145,6 +145,13 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
+    pub(crate) fn begin_shutdown(&self) -> Result<(), BootstrapFailure> {
+        self._authority
+            .begin_shutdown()
+            .map(|_| ())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
+    }
+
     pub fn attribute(
         &self,
         credential: positron_governance::PresentedCredential,

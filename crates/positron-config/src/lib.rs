@@ -573,6 +573,18 @@ impl EffectiveConfiguration {
         self.control_bind_address
     }
 
+    /// Returns the checked absolute Primary Data Volume path.
+    #[must_use]
+    pub fn data_directory(&self) -> &str {
+        &self.data_directory
+    }
+
+    /// Returns the checked absolute secrets root path.
+    #[must_use]
+    pub fn secrets_directory(&self) -> &str {
+        &self.secrets_directory
+    }
+
     /// Returns the typed protected local-key reference without diagnostic formatting.
     #[must_use]
     pub fn local_key_file(&self) -> &ProtectedFileReference {

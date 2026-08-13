@@ -1,0 +1,299 @@
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+
+use crate::{
+    BoundEndpoint, BoundListener, HealthState, ListenerFactory, ListenerFailure, ListenerRequest,
+    ListenerRole, RegisteredTask, RunningTask, ServiceHandle, TaskCancellation, TaskFailure,
+    TaskJoinOutcome, TaskRegistrar, TaskRole,
+};
+
+mod native_http;
+
+#[derive(Clone, Debug)]
+pub struct NativeBindings {
+    control: PathBuf,
+    operations: SocketAddr,
+    api: SocketAddr,
+    otlp_http: SocketAddr,
+}
+
+impl NativeBindings {
+    pub fn new(
+        control: PathBuf,
+        operations: SocketAddr,
+        api: SocketAddr,
+        otlp_http: SocketAddr,
+    ) -> Result<Self, NativeHostFailure> {
+        BoundEndpoint::control(control.clone()).map_err(|_| NativeHostFailure::InvalidBinding)?;
+        for (role, address) in [
+            (ListenerRole::Operations, operations),
+            (ListenerRole::Api, api),
+            (ListenerRole::OtlpHttp, otlp_http),
+        ] {
+            BoundEndpoint::tcp(role, address).map_err(|_| NativeHostFailure::InvalidBinding)?;
+        }
+        Ok(Self {
+            control,
+            operations,
+            api,
+            otlp_http,
+        })
+    }
+
+    fn address(&self, role: ListenerRole) -> Option<SocketAddr> {
+        match role {
+            ListenerRole::Operations => Some(self.operations),
+            ListenerRole::Api => Some(self.api),
+            ListenerRole::OtlpHttp => Some(self.otlp_http),
+            ListenerRole::Control | ListenerRole::OtlpGrpc => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeHostFailure {
+    InvalidBinding,
+}
+
+impl Display for NativeHostFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("native host configuration is invalid")
+    }
+}
+
+impl Error for NativeHostFailure {}
+
+pub struct NativeHost {
+    bindings: NativeBindings,
+    admissions: AdmissionRegistry,
+}
+
+impl NativeHost {
+    #[must_use]
+    pub fn new(bindings: NativeBindings) -> Self {
+        Self {
+            bindings,
+            admissions: Arc::new(Mutex::new(Vec::with_capacity(4))),
+        }
+    }
+}
+
+enum NativeListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+struct Admission {
+    listener: NativeListener,
+    accepting: AtomicBool,
+    control_path: Option<PathBuf>,
+}
+
+type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
+
+impl Admission {
+    fn stop(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if let Some(path) = &self.control_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+struct NativeBoundListener {
+    endpoint: BoundEndpoint,
+    admission: Arc<Admission>,
+}
+
+impl BoundListener for NativeBoundListener {
+    fn endpoint(&self) -> &BoundEndpoint {
+        &self.endpoint
+    }
+}
+
+impl Drop for NativeBoundListener {
+    fn drop(&mut self) {
+        self.admission.stop();
+    }
+}
+
+impl ListenerFactory for NativeHost {
+    fn bind(&self, request: ListenerRequest) -> Result<Box<dyn BoundListener>, ListenerFailure> {
+        let role = request.role();
+        let (endpoint, listener, control_path) = if role == ListenerRole::Control {
+            #[cfg(unix)]
+            {
+                if let Some(parent) = self.bindings.control.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|_| ListenerFailure::BindUnavailable)?;
+                }
+                let listener = UnixListener::bind(&self.bindings.control)
+                    .map_err(|_| ListenerFailure::BindUnavailable)?;
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|_| ListenerFailure::BindUnavailable)?;
+                (
+                    BoundEndpoint::control(self.bindings.control.clone())?,
+                    NativeListener::Unix(listener),
+                    Some(self.bindings.control.clone()),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(ListenerFailure::BindUnavailable);
+            }
+        } else {
+            let address = self
+                .bindings
+                .address(role)
+                .ok_or(ListenerFailure::InvalidEndpoint)?;
+            let listener =
+                TcpListener::bind(address).map_err(|_| ListenerFailure::BindUnavailable)?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|_| ListenerFailure::BindUnavailable)?;
+            let local = listener
+                .local_addr()
+                .map_err(|_| ListenerFailure::BindUnavailable)?;
+            (
+                BoundEndpoint::tcp(role, local)?,
+                NativeListener::Tcp(listener),
+                None,
+            )
+        };
+        let admission = Arc::new(Admission {
+            listener,
+            accepting: AtomicBool::new(true),
+            control_path,
+        });
+        self.admissions
+            .lock()
+            .map_err(|_| ListenerFailure::BindUnavailable)?
+            .push((role, Arc::clone(&admission)));
+        Ok(Box::new(NativeBoundListener {
+            endpoint,
+            admission,
+        }))
+    }
+}
+
+impl TaskRegistrar for NativeHost {
+    fn register(&self, role: TaskRole) -> Result<Box<dyn RegisteredTask>, TaskFailure> {
+        Ok(Box::new(NativeRegisteredTask {
+            role,
+            admissions: Arc::clone(&self.admissions),
+        }))
+    }
+}
+
+struct NativeRegisteredTask {
+    role: TaskRole,
+    admissions: AdmissionRegistry,
+}
+
+impl RegisteredTask for NativeRegisteredTask {
+    fn spawn(
+        self: Box<Self>,
+        cancellation: TaskCancellation,
+        health: HealthState,
+        services: ServiceHandle,
+    ) -> Result<Box<dyn RunningTask>, TaskFailure> {
+        let listener_role = match self.role {
+            TaskRole::Operations => ListenerRole::Operations,
+            TaskRole::Api => ListenerRole::Api,
+            TaskRole::OtlpHttp => ListenerRole::OtlpHttp,
+        };
+        let mut admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| TaskFailure::SpawnUnavailable)?;
+        let index = admissions
+            .iter()
+            .position(|(role, _)| *role == listener_role)
+            .ok_or(TaskFailure::SpawnUnavailable)?;
+        let admission = admissions.remove(index).1;
+        drop(admissions);
+        let task_cancellation = cancellation.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("positron-{listener_role:?}"))
+            .spawn(move || {
+                serve(admission, task_cancellation, health, services);
+            })
+            .map_err(|_| TaskFailure::SpawnUnavailable)?;
+        Ok(Box::new(NativeRunningTask {
+            cancellation,
+            handle: Some(handle),
+        }))
+    }
+}
+
+struct NativeRunningTask {
+    cancellation: TaskCancellation,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RunningTask for NativeRunningTask {
+    fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure> {
+        join_thread(&mut self.handle)?;
+        Ok(TaskJoinOutcome::Joined)
+    }
+
+    fn abort(&mut self) -> Result<(), TaskFailure> {
+        self.cancellation.cancel();
+        join_thread(&mut self.handle)
+    }
+}
+
+fn join_thread(handle: &mut Option<JoinHandle<()>>) -> Result<(), TaskFailure> {
+    if handle.take().is_some_and(|handle| handle.join().is_err()) {
+        return Err(TaskFailure::JoinUnavailable);
+    }
+    Ok(())
+}
+
+fn serve(
+    admission: Arc<Admission>,
+    cancellation: TaskCancellation,
+    health: HealthState,
+    services: ServiceHandle,
+) {
+    while admission.accepting.load(Ordering::Acquire) && !cancellation.is_cancelled() {
+        let accepted = match &admission.listener {
+            NativeListener::Tcp(listener) => listener.accept().map(|(stream, _)| stream),
+            #[cfg(unix)]
+            NativeListener::Unix(listener) => match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = std::io::Write::write_all(&mut stream, b"positron-control-v1\n");
+                    continue;
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                },
+                Err(_) => break,
+            },
+        };
+        match accepted {
+            Ok(mut stream) => native_http::serve_connection(&mut stream, &health, &services),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            },
+            Err(_) => break,
+        }
+    }
+}

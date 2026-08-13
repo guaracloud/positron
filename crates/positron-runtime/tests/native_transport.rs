@@ -1,0 +1,394 @@
+//! Real loopback transport integration tests.
+
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use positron_kernel::MountQualification;
+use positron_query::QueryBudget;
+use positron_runtime::{
+    ApplicationRuntime, BootstrapPaths, HostInputs, InitializationMode, InstanceBootstrap,
+    NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
+};
+use prost::Message;
+
+#[test]
+fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("loopback")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let first_bindings = bindings(&roots, "first")?;
+    let first_host = NativeHost::new(first_bindings);
+    let first = ApplicationRuntime::start(
+        ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly),
+        HostInputs::new(&first_host, &first_host),
+    )?;
+    let endpoints = first.bound_endpoints();
+    let operations = address(&endpoints, positron_runtime::ListenerRole::Operations)?;
+    let api = address(&endpoints, positron_runtime::ListenerRole::Api)?;
+    let otlp = address(&endpoints, positron_runtime::ListenerRole::OtlpHttp)?;
+
+    assert_status(http(operations, "GET", "/health/ready", &[], &[])?, 200);
+    let capability = http(
+        api,
+        "POST",
+        "/v1/capabilities:negotiate",
+        &[],
+        br#"{"api_major":1,"capability":1}"#,
+    )?;
+    assert_status(capability.clone(), 200);
+    assert!(capability.contains("\"availability\":1"));
+
+    let unauthorized = http(otlp, "POST", "/v1/logs", &[], &[0xff])?;
+    assert_status(unauthorized, 401);
+    let body = otlp_body("durable-loopback");
+    let authorization = format!(
+        "Bearer {}",
+        claim.ingest_secret().ok_or("ingest secret missing")?
+    );
+    let accepted = http(
+        otlp,
+        "POST",
+        "/v1/logs",
+        &[("Authorization", &authorization)],
+        &body,
+    )?;
+    assert_status(accepted.clone(), 200);
+    assert!(accepted.contains("\"accepted\":1"));
+
+    let query_secret = claim
+        .query_secret()
+        .ok_or("query secret missing")?
+        .to_owned();
+    let ingest_secret = claim
+        .ingest_secret()
+        .ok_or("ingest secret missing")?
+        .to_owned();
+    drop(first);
+    assert!(TcpStream::connect_timeout(&otlp, Duration::from_millis(100)).is_err());
+
+    let second_bindings = bindings(&roots, "second")?;
+    let second_host = NativeHost::new(second_bindings);
+    let second = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&second_host, &second_host),
+    )?;
+    let bodies = second
+        .services()
+        .ok_or("serving process omitted services")?
+        .query_log_bodies(
+            &query_secret,
+            "logs | range query_time 0 100 | limit 16",
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        )?;
+    assert_eq!(bodies, ["durable-loopback"]);
+    assert!(matches!(
+        second.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    assert!(!ingest_secret.is_empty());
+    Ok(())
+}
+
+#[test]
+fn loopback_transport_enforces_bounded_http_and_typed_statuses()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("bounds")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let host = NativeHost::new(bindings(&roots, "bounds")?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let endpoints = process.bound_endpoints();
+    let operations = address(&endpoints, positron_runtime::ListenerRole::Operations)?;
+    let api = address(&endpoints, positron_runtime::ListenerRole::Api)?;
+    let otlp = address(&endpoints, positron_runtime::ListenerRole::OtlpHttp)?;
+
+    assert_status(http(operations, "GET", "/health/live", &[], &[])?, 200);
+    assert_status(http(operations, "GET", "/health/ready", &[], &[])?, 200);
+    assert_status(http(operations, "GET", "/missing", &[], &[])?, 404);
+    assert_status_raw(
+        operations,
+        b"GET /health/live HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+        400,
+    )?;
+    assert_status_raw(
+        operations,
+        b"GET /health/live HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        400,
+    )?;
+    assert_status_raw(
+        operations,
+        b"GET /health/live HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        400,
+    )?;
+    assert_status(
+        http(api, "POST", "/v1/capabilities:negotiate", &[], &[b'x'; 65])?,
+        413,
+    );
+    assert_status(
+        http(api, "POST", "/v1/capabilities:negotiate", &[], b"not-json")?,
+        400,
+    );
+    let refused = http(
+        api,
+        "POST",
+        "/v1/capabilities:negotiate",
+        &[],
+        br#"{"api_major":2,"capability":1}"#,
+    )?;
+    assert_status(refused.clone(), 200);
+    assert!(refused.contains("\"refusal\":{"));
+    assert_status_raw(
+        operations,
+        b"GET /health/live HTTP/1.1\r\ninvalid-header\r\n\r\n",
+        400,
+    )?;
+    assert_status_raw(
+        operations,
+        b"GET /health/live HTTP/1.1\r\nContent-Length: invalid\r\n\r\n",
+        400,
+    )?;
+    assert_status_raw(
+        api,
+        b"POST /v1/capabilities:negotiate HTTP/1.1\r\nContent-Length: 5\r\n\r\nx",
+        400,
+    )?;
+    let mut invalid_utf8 = b"GET /health/live HTTP/1.1\r\nX: ".to_vec();
+    invalid_utf8.push(0xff);
+    invalid_utf8.extend_from_slice(b"\r\n\r\n");
+    assert_status_raw(operations, &invalid_utf8, 400)?;
+    let mut oversized_header = vec![b'x'; 8 * 1024];
+    oversized_header[..27].copy_from_slice(b"GET /health/live HTTP/1.1\r\n");
+    assert_status_raw(operations, &oversized_header, 431)?;
+    let authorization = format!(
+        "Bearer {}",
+        claim.ingest_secret().ok_or("ingest secret missing")?
+    );
+    assert_status(
+        http(
+            otlp,
+            "POST",
+            "/v1/logs",
+            &[("Authorization", &authorization)],
+            &[0xff],
+        )?,
+        400,
+    );
+    assert_status(
+        http(
+            otlp,
+            "POST",
+            "/v1/logs",
+            &[("Authorization", "Bearer invalid")],
+            &[0xff],
+        )?,
+        401,
+    );
+    assert_status_raw(operations, b"GET /health/live HTTP/1.1\r\n", 400)?;
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn std::error::Error>>
+{
+    let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let wildcard = "0.0.0.0:1".parse()?;
+    assert!(
+        NativeBindings::new(PathBuf::from("relative.sock"), loopback, loopback, loopback).is_err()
+    );
+    assert!(
+        NativeBindings::new(
+            PathBuf::from("/tmp/control.sock"),
+            wildcard,
+            loopback,
+            loopback
+        )
+        .is_err()
+    );
+
+    let roots = TestRoots::new("collision")?;
+    let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let occupied_address = occupied.local_addr()?;
+    let bindings = NativeBindings::new(
+        roots.parent.join("collision.sock"),
+        occupied_address,
+        loopback,
+        loopback,
+    )?;
+    let host = NativeHost::new(bindings);
+    let paths = roots.paths()?;
+    let result = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty),
+        HostInputs::new(&host, &host),
+    );
+    assert!(matches!(
+        result,
+        Err(positron_runtime::ExitOutcome::ListenerUnavailable(
+            positron_runtime::ListenerRole::Operations
+        ))
+    ));
+    Ok(())
+}
+
+fn bindings(roots: &TestRoots, label: &str) -> Result<NativeBindings, Box<dyn std::error::Error>> {
+    let ephemeral = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    Ok(NativeBindings::new(
+        roots.parent.join(format!("{label}.sock")),
+        ephemeral,
+        ephemeral,
+        ephemeral,
+    )?)
+}
+
+fn address(
+    endpoints: &[positron_runtime::BoundEndpoint],
+    role: positron_runtime::ListenerRole,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.role() == role)
+        .and_then(positron_runtime::BoundEndpoint::socket_address)
+        .ok_or_else(|| format!("{role:?} endpoint missing").into())
+}
+
+fn http(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn assert_status(response: String, status: u16) {
+    assert!(
+        response.starts_with(&format!("HTTP/1.1 {status} ")),
+        "unexpected response: {response}"
+    );
+}
+
+fn assert_status_raw(
+    address: SocketAddr,
+    request: &[u8],
+    status: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.write_all(request)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    assert_status(response, status);
+    Ok(())
+}
+
+fn otlp_body(body: &str) -> Vec<u8> {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 42,
+                    observed_time_unix_nano: 84,
+                    body: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(body.to_owned())),
+                    }),
+                    ..LogRecord::default()
+                }],
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
+struct TestRoots {
+    parent: PathBuf,
+    data: PathBuf,
+    secrets: PathBuf,
+}
+
+impl TestRoots {
+    fn new(label: &str) -> Result<Self, std::io::Error> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let parent =
+            PathBuf::from("/tmp").join(format!("p-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&parent)?;
+        let data = parent.join("data");
+        let secrets = parent.join("secrets");
+        fs::create_dir_all(&data)?;
+        fs::create_dir_all(&secrets)?;
+        set_owner_only(&secrets)?;
+        Ok(Self {
+            parent,
+            data,
+            secrets,
+        })
+    }
+
+    fn paths(&self) -> Result<BootstrapPaths, positron_runtime::BootstrapFailure> {
+        BootstrapPaths::new(&self.data, &self.secrets, MountQualification::LocalHost)
+    }
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+impl Drop for TestRoots {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.parent);
+    }
+}
