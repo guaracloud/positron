@@ -9,7 +9,7 @@ const VERSION: u16 = 1;
 pub(super) const METADATA_BYTES: usize = 8 + 2 + 1 + 16 + 1 + 4 + 16 + 8;
 const FRAME_ALGORITHM_AES_256_GCM: u16 = 1;
 const WRAPPING_ALGORITHM_AES_256_KWP: u16 = 1;
-const HEADER_PREFIX_BYTES: usize = 8 + 2 + 2 + 2 + 16 + 8 + 4;
+pub(super) const HEADER_PREFIX_BYTES: usize = 8 + 2 + 2 + 2 + 16 + 8 + 4;
 const MAX_WRAPPED_KEY_BYTES: usize = 256;
 const MAX_ENCRYPTED_METADATA_BYTES: usize = 256;
 

@@ -112,35 +112,46 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
+        let mut segments = metadata.iter().copied().peekable();
         let mut blocks = Vec::new();
         let mut retained_bytes = 0_usize;
         let mut frontier = CommitPosition::origin();
         let mut recovered_active = None;
-        for segment in metadata.iter().copied() {
-            if segment.base_position != frontier {
+        while let Some(first) = segments.peek().copied() {
+            let base = first.base_position;
+            if base != frontier {
                 return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
             }
-            let (key, recovered) =
-                storage.recover_segment(segment, &protection, catalog.instance())?;
-            let block_count = blocks
-                .len()
-                .checked_add(recovered.blocks.len())
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            let recovered_bytes = recovered.blocks.iter().try_fold(0_usize, |total, block| {
-                total.checked_add(block.payload.len())
-            });
-            retained_bytes = retained_bytes
-                .checked_add(
-                    recovered_bytes
-                        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
-                )
-                .filter(|bytes| {
-                    *bytes <= MAX_RETAINED_BLOCK_BYTES && block_count <= MAX_RETAINED_BLOCKS
-                })
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            frontier = recovered.frontier;
-            blocks.extend(recovered.blocks);
-            if segment.state == SegmentState::Active {
+
+            let mut advancing_sealed = None;
+            let mut active = None;
+            while let Some(segment) = segments.next_if(|candidate| candidate.base_position == base)
+            {
+                let (key, recovered) =
+                    storage.recover_segment(segment, &protection, catalog.instance())?;
+                if segment.state == SegmentState::Active {
+                    active = Some((segment, key, recovered));
+                } else if recovered.frontier == base {
+                    retain_recovered(recovered, &mut blocks, &mut retained_bytes, &mut frontier)?;
+                } else if advancing_sealed
+                    .replace((segment, key, recovered))
+                    .is_some()
+                {
+                    return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+                }
+            }
+
+            if advancing_sealed.is_some() && active.is_some() {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            }
+            if let Some((_segment, _key, recovered)) = advancing_sealed {
+                retain_recovered(recovered, &mut blocks, &mut retained_bytes, &mut frontier)?;
+            }
+            if let Some((segment, key, recovered)) = active {
+                if segments.peek().is_some() {
+                    return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+                }
+                retain_recovered(recovered, &mut blocks, &mut retained_bytes, &mut frontier)?;
                 recovered_active = Some((segment, key));
             }
         }
@@ -397,4 +408,30 @@ fn receipt_for(block: &CommittedBlock) -> CommitReceipt {
         position: block.position,
         frontier_authenticator: block.frontier_authenticator,
     }
+}
+
+fn retain_recovered(
+    recovered: recovery::RecoveryState,
+    blocks: &mut Vec<CommittedBlock>,
+    retained_bytes: &mut usize,
+    frontier: &mut CommitPosition,
+) -> Result<(), LedgerFailure> {
+    let block_count = blocks
+        .len()
+        .checked_add(recovered.blocks.len())
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let recovered_bytes = recovered
+        .blocks
+        .iter()
+        .try_fold(0_usize, |total, block| {
+            total.checked_add(block.payload.len())
+        })
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    *retained_bytes = retained_bytes
+        .checked_add(recovered_bytes)
+        .filter(|bytes| *bytes <= MAX_RETAINED_BLOCK_BYTES && block_count <= MAX_RETAINED_BLOCKS)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    *frontier = recovered.frontier;
+    blocks.extend(recovered.blocks);
+    Ok(())
 }

@@ -14,6 +14,10 @@ use super::{
     StoreBlockIdentity,
 };
 
+mod persisted_corruption;
+
+use persisted_corruption::{PersistedArtifact, run_persisted_corruption_case};
+
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
 struct FuzzRoot(PathBuf);
@@ -58,15 +62,11 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
         catalog_secret(),
     )
     .expect("fuzz catalog opens");
-    let scope = SegmentScope::new(
-        TenantId::from_bytes([0x43; 16]).expect("fixed tenant identity"),
-        SignalKind::Logs,
-        VirtualShardId::new(1).expect("fixed shard identity"),
-    );
+    let scope = scope();
     let mut ledger = open(&authority, &catalog, scope).expect("fresh ledger opens");
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
-        match selector % 7 {
+        match selector % 13 {
             0 => {
                 ledger
                     .append(block(index, selector))
@@ -113,7 +113,7 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     );
                 }
             },
-            _ => {
+            6 => {
                 let snapshot = ledger.snapshot().expect("snapshot for duplicate bytes");
                 if let Some(existing) = snapshot.blocks().first() {
                     let identity = identity(index);
@@ -131,6 +131,12 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                             .expect("equal bytes under distinct identity append");
                     }
                 }
+            },
+            operation => {
+                let artifact = PersistedArtifact::from_operation(operation)
+                    .expect("the corruption operation is in range");
+                assert_eq!(run_persisted_corruption_case(artifact, selector), artifact);
+                return;
             },
         }
         assert_snapshot_invariants(&ledger);
@@ -192,6 +198,14 @@ fn open<'authority, 'catalog>(
 
 fn catalog_secret() -> CatalogSecret {
     CatalogSecret::from_owned(Box::new([0x82; 32]), Box::new([0x83; 32]))
+}
+
+fn scope() -> SegmentScope {
+    SegmentScope::new(
+        TenantId::from_bytes([0x43; 16]).expect("fixed tenant identity"),
+        SignalKind::Logs,
+        VirtualShardId::new(1).expect("fixed shard identity"),
+    )
 }
 
 fn fault_event(selector: u8) -> LedgerFileEvent {

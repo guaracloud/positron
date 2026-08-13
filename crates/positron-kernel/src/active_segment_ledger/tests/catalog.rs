@@ -7,8 +7,8 @@ use super::support::{TemporaryRoot, establish_authority};
 use crate::active_segment_ledger::format::{SegmentMetadata, SegmentState};
 use crate::active_segment_ledger::storage::LedgerStorage;
 use crate::active_segment_ledger::{
-    ActiveSegmentLedger, LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
-    publish_segments,
+    ActiveSegmentLedger, LedgerFailureCode, PreparedStoreBlock, SegmentId, SegmentProtectionKey,
+    SegmentScope, StoreBlockIdentity, publish_segments,
 };
 use crate::catalog::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSecret,
@@ -54,6 +54,49 @@ fn catalog_continuity_gaps_and_multiple_active_segments_fail_closed() -> Result<
         publish_metadata(catalog, authority, scope, &[first, second], 0xb2)?;
         let failure = open(authority, catalog, scope)
             .expect_err("one scope cannot publish two active segments");
+        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        Ok(())
+    })
+}
+
+#[test]
+fn catalog_rejects_an_active_segment_that_overlaps_committed_sealed_bytes()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(0xa6, |authority, catalog, scope| {
+        let ledger = open(authority, catalog, scope)?;
+        ledger.append(PreparedStoreBlock::new(
+            StoreBlockIdentity::new([0xc6; 16])?,
+            b"committed".to_vec(),
+        )?)?;
+        ledger.seal()?;
+
+        let mut storage = LedgerStorage::open(
+            authority
+                .primary_data_volume()
+                .expect("fixture retains the volume"),
+        )?;
+        let sealed = storage.catalog_segments(&catalog.pin()?, scope)?[0];
+        let overlapping_active = SegmentMetadata {
+            id: SegmentId::new([0xd6; 16])?,
+            state: SegmentState::Active,
+            base_position: CommitPosition::origin(),
+            scope,
+        };
+        storage.create_active(
+            overlapping_active,
+            &SegmentProtectionKey::from_owned(Box::new([0xd1; 32])),
+            catalog.instance(),
+        )?;
+        publish_metadata(
+            catalog,
+            authority,
+            scope,
+            &[sealed, overlapping_active],
+            0xb6,
+        )?;
+
+        let failure = open(authority, catalog, scope)
+            .expect_err("active bytes cannot overlap an advancing sealed range");
         assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
         Ok(())
     })

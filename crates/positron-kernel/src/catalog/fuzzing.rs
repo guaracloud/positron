@@ -222,9 +222,9 @@ fn fuzz_authority_with_policy(
     volume: OwnedPrimaryDataVolume,
 ) -> Option<StorageKernelResourceAuthority> {
     let tenant_count = 1;
-    let cardinality = InventoryCardinalityLimits::new(tenant_count, 16).ok()?;
+    let cardinality = InventoryCardinalityLimits::new(tenant_count, 64).ok()?;
     let large = ResourceAmounts::new([
-        90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
+        90_000_000, 64, 64, 90_000_000, 70_000, 64, 64, 64, 64, 64, 40_000_000,
     ]);
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;

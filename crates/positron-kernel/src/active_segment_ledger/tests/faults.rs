@@ -87,6 +87,45 @@ fn recovery_discards_a_partial_first_frame_without_a_frontier() -> Result<(), Bo
 }
 
 #[test]
+fn repeated_empty_seals_and_an_interrupted_successor_append_remain_restartable()
+-> Result<(), Box<dyn Error>> {
+    for _ in 0..8 {
+        with_fixture(|authority, catalog, scope| {
+            let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+
+            ActiveSegmentLedger::open(authority, catalog, scope, key())?.seal()?;
+            ActiveSegmentLedger::open(authority, catalog, scope, key())?.seal()?;
+
+            let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+            let acknowledged = ledger.append(prepared(b"acknowledged-after-empty-seals")?)?;
+            drop(ledger);
+
+            let recovered = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+            let failure = with_ledger_fault(LedgerFileEvent::SynchronizeFrame, || {
+                recovered.append(prepared(b"interrupted-successor")?)
+            })
+            .expect_err("an interrupted successor append cannot acknowledge");
+            assert_eq!(
+                failure.completion_state(),
+                LedgerCompletionState::RecoveryRequired
+            );
+            drop(recovered);
+
+            let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+            let snapshot = reopened.snapshot()?;
+            assert_eq!(snapshot.frontier(), acknowledged.position());
+            assert_eq!(snapshot.blocks().len(), 1);
+            assert_eq!(
+                snapshot.blocks()[0].payload(),
+                b"acknowledged-after-empty-seals"
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
 fn append_fault_matrix_never_overstates_the_authenticated_frontier() -> Result<(), Box<dyn Error>> {
     let before_frontier = [
         (
