@@ -5,7 +5,7 @@ use positron_kernel::{
     BootstrapObjectPurpose, Catalog, SegmentScope, StorageKernelResourceAuthority,
 };
 
-use super::super::codec::{BootstrapRecord, encode_claim};
+use super::super::codec::{BootstrapRecord, encode_claim, encode_legacy_claim};
 use super::super::storage;
 use super::super::{BootstrapFailure, BootstrapFailureCode, InitializedInstance};
 use super::support::{catalog_failure, key_failure};
@@ -35,15 +35,20 @@ pub(super) fn ensure_claim(
     key: &BootstrapKeyCustody,
     record: &BootstrapRecord,
     secret: &[u8; 32],
-    ingest_secret: &[u8; 32],
 ) -> Result<(), BootstrapFailure> {
-    let plaintext = encode_claim(
-        record.instance,
-        record.administrator,
-        secret,
-        record.ingest_principal,
-        ingest_secret,
-    );
+    let plaintext = match &record.ingest {
+        Some(ingest) => encode_claim(
+            record.instance,
+            record.administrator,
+            secret,
+            ingest.principal,
+            ingest
+                .api_key_secret
+                .as_ref()
+                .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
+        ),
+        None => encode_legacy_claim(record.instance, record.administrator, secret),
+    };
     let encrypted = key
         .protect(record.instance, BootstrapObjectPurpose::Claim, &plaintext)
         .map_err(key_failure)?;

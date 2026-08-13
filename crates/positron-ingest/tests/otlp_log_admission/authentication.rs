@@ -38,7 +38,7 @@ fn bearer_authentication_precedes_malformed_gzip_and_protobuf() -> Result<(), Bo
     assert!(
         instance
             .attribute(
-                PresentedCredential::parse(claim.ingest_secret())?,
+                PresentedCredential::parse(claim.ingest_secret().expect("ingest credential"))?,
                 RequestedIntent::Ingest,
                 CompatibilityHints::external_tenant_alias("other-tenant")?,
             )
@@ -47,7 +47,7 @@ fn bearer_authentication_precedes_malformed_gzip_and_protobuf() -> Result<(), Bo
     );
 
     let authorized = instance.attribute(
-        PresentedCredential::parse(claim.ingest_secret())?,
+        PresentedCredential::parse(claim.ingest_secret().expect("ingest credential"))?,
         RequestedIntent::Ingest,
         CompatibilityHints::none(),
     )?;

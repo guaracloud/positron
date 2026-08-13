@@ -216,8 +216,7 @@ impl InitializedInstance {
 pub struct BootstrapClaim {
     pub(super) principal: PrincipalId,
     pub(super) secret: Zeroizing<String>,
-    pub(super) ingest_principal: PrincipalId,
-    pub(super) ingest_secret: Zeroizing<String>,
+    pub(super) ingest: Option<(PrincipalId, Zeroizing<String>)>,
 }
 
 impl BootstrapClaim {
@@ -232,13 +231,13 @@ impl BootstrapClaim {
     }
 
     #[must_use]
-    pub const fn ingest_principal_id(&self) -> PrincipalId {
-        self.ingest_principal
+    pub fn ingest_principal_id(&self) -> Option<PrincipalId> {
+        self.ingest.as_ref().map(|(principal, _)| *principal)
     }
 
     #[must_use]
-    pub fn ingest_secret(&self) -> &str {
-        self.ingest_secret.as_str()
+    pub fn ingest_secret(&self) -> Option<&str> {
+        self.ingest.as_ref().map(|(_, secret)| secret.as_str())
     }
 }
 

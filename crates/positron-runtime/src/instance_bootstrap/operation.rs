@@ -8,13 +8,14 @@ use positron_kernel::{
 };
 use zeroize::Zeroizing;
 
-use super::codec::{BootstrapRecord, decode_claim};
+use super::codec::{BootstrapIngestIdentity, BootstrapRecord, decode_claim};
 use super::storage::{self, INTENT};
 use super::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
     InitializationPlan, InitializedInstance, resources,
 };
 
+mod compatibility;
 mod completion;
 pub(super) mod support;
 pub(super) use completion::governance_audit_records;
@@ -106,7 +107,7 @@ fn resume(
     };
     recover_pending_replacement(&access, &key)?;
     let pending_bytes = storage::read(&access, BootstrapArtifact::Pending)?;
-    let record = if pending_bytes == INTENT {
+    let mut record = if pending_bytes == INTENT {
         let generated = generate_record(&key)?;
         let protected = key
             .protect(
@@ -128,12 +129,9 @@ fn resume(
         key.catalog_secret(record.instance).map_err(key_failure)?,
     )
     .map_err(catalog_failure)?;
+    compatibility::migrate_pending_v1(&access, &key, &catalog, &mut record)?;
     let api_secret = record
         .api_key_secret
-        .as_ref()
-        .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-    let ingest_api_secret = record
-        .ingest_api_key_secret
         .as_ref()
         .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let integrity_secret = record
@@ -154,52 +152,60 @@ fn resume(
     let tenant_key_envelope = key
         .tenant_key_envelope(record.instance, record.tenant)
         .map_err(key_failure)?;
-    let tenant_intent = InitialTenantIntent::new(
-        record.instance.to_bytes(),
-        record.tenant,
-        BootstrapRecord::tenant_slug()?,
-        "Default tenant",
-        record.administrator,
-        record.api_key_salt,
-        record.api_key_hash,
-        record.ingest_principal,
-        record.ingest_api_key_salt,
-        record.ingest_api_key_hash,
-        integrity_identity.public_key(),
-        record.integrity_fingerprint,
-        protected_integrity,
-        tenant_key_envelope,
-        2_592_000,
-        1,
-        1,
-        resources::initial_tenant_quota(),
-        InitialAuditContext::new(
-            key.identity().created_at_unix_seconds(),
-            record.transaction.to_bytes(),
-            plan.creates_claim(),
-        )
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
-    )
-    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-    let governance = InitialGovernanceIntent::create_tenant(tenant_intent)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-    let (governance_object, audit_intent) = governance.into_parts();
-    let initial = catalog
-        .commit(
-            catalog.pin().map_err(catalog_failure)?.identity(),
-            CatalogProposal::new(
-                record.transaction,
-                FormatEpoch::CATALOG_V1,
-                vec![CatalogObject::new(governance_object).map_err(catalog_failure)?],
+    let before = catalog.pin().map_err(catalog_failure)?;
+    let initial = if before.number() == 0 {
+        let ingest = compatibility::require_new_ingest(&record)?;
+        let tenant_intent = InitialTenantIntent::new(
+            record.instance.to_bytes(),
+            record.tenant,
+            BootstrapRecord::tenant_slug()?,
+            "Default tenant",
+            record.administrator,
+            record.api_key_salt,
+            record.api_key_hash,
+            ingest.principal,
+            ingest.api_key_salt,
+            ingest.api_key_hash,
+            integrity_identity.public_key(),
+            record.integrity_fingerprint,
+            protected_integrity,
+            tenant_key_envelope,
+            2_592_000,
+            1,
+            1,
+            resources::initial_tenant_quota(),
+            InitialAuditContext::new(
+                key.identity().created_at_unix_seconds(),
+                record.transaction.to_bytes(),
+                plan.creates_claim(),
             )
-            .map_err(catalog_failure)?,
-            Some(AuditIntent::new(audit_intent).map_err(catalog_failure)?),
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
         )
-        .map_err(catalog_failure)?;
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let governance = InitialGovernanceIntent::create_tenant(tenant_intent)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let (governance_object, audit_intent) = governance.into_parts();
+        Some(
+            catalog
+                .commit(
+                    before.identity(),
+                    CatalogProposal::new(
+                        record.transaction,
+                        FormatEpoch::CATALOG_V1,
+                        vec![CatalogObject::new(governance_object).map_err(catalog_failure)?],
+                    )
+                    .map_err(catalog_failure)?,
+                    Some(AuditIntent::new(audit_intent).map_err(catalog_failure)?),
+                )
+                .map_err(catalog_failure)?,
+        )
+    } else {
+        None
+    };
     open_initial_ledgers(&authority, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
     if plan.creates_claim() {
-        ensure_claim(&access, &key, &record, api_secret, ingest_api_secret)?;
+        ensure_claim(&access, &key, &record, api_secret)?;
     }
     let initialized_record = record.initialized();
     let initialized = key
@@ -216,7 +222,8 @@ fn resume(
     storage::publish_initialized(&access)?;
     let generation = current.number();
     let audit = initial
-        .governance_audit_record()
+        .as_ref()
+        .and_then(|commit| commit.governance_audit_record())
         .map_or(current.governance_audit_frontier(), |audit| {
             audit.position()
         });
@@ -297,22 +304,26 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
             &encrypted_claim,
         )
         .map_err(key_failure)?;
-    let (principal, secret, ingest_principal, ingest_secret) =
-        decode_claim(record.instance, &plaintext)?;
-    if principal != record.administrator || ingest_principal != record.ingest_principal {
+    let decoded = decode_claim(record.instance, &plaintext)?;
+    let expected_ingest = record.ingest.as_ref().map(|ingest| ingest.principal);
+    if decoded.principal != record.administrator
+        || decoded.ingest.as_ref().map(|(principal, _)| *principal) != expected_ingest
+    {
         return Err(BootstrapFailure::new(
             BootstrapFailureCode::IdentityMismatch,
         ));
     }
-    let secret = Zeroizing::new(format_secret(&secret));
-    let ingest_secret = Zeroizing::new(format_secret(&ingest_secret));
+    let secret = Zeroizing::new(format_secret(&decoded.secret));
+    let principal = decoded.principal;
+    let ingest = decoded
+        .ingest
+        .map(|(principal, secret)| (principal, Zeroizing::new(format_secret(&secret))));
     storage::remove(&access, BootstrapArtifact::Claim)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ClaimDestructionFailed))?;
     Ok(BootstrapClaim {
         principal,
         secret,
-        ingest_principal,
-        ingest_secret,
+        ingest,
     })
 }
 
@@ -350,12 +361,14 @@ fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, Bootstr
         transaction,
         api_key_salt: *api_key_salt,
         api_key_hash,
-        ingest_principal,
-        ingest_api_key_salt: *ingest_api_key_salt,
-        ingest_api_key_hash,
+        ingest: Some(BootstrapIngestIdentity {
+            principal: ingest_principal,
+            api_key_salt: *ingest_api_key_salt,
+            api_key_hash: ingest_api_key_hash,
+            api_key_secret: Some(Zeroizing::new(*ingest_api_key_secret)),
+        }),
         integrity_fingerprint,
         api_key_secret: Some(Zeroizing::new(*api_key_secret)),
-        ingest_api_key_secret: Some(Zeroizing::new(*ingest_api_key_secret)),
         integrity_key_secret: Some(Zeroizing::new(*integrity_secret)),
     })
 }

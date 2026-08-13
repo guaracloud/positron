@@ -15,7 +15,13 @@ use zeroize::Zeroizing;
 
 use crate::GovernanceAuditEntry;
 
-use codec::{GOVERNANCE_OBJECT_MAGIC, decode_initial_identity};
+use codec::{GOVERNANCE_OBJECT_MAGIC_V1, GOVERNANCE_OBJECT_MAGIC_V2, decode_initial_identity};
+
+struct IngestIdentity {
+    principal: PrincipalId,
+    salt: [u8; 32],
+    hash: [u8; 32],
+}
 
 /// The sole immutable identity view reconstructed from one Catalog Generation.
 pub struct Identity {
@@ -25,9 +31,7 @@ pub struct Identity {
     tenant_slug: TenantSlug,
     salt: [u8; 32],
     hash: [u8; 32],
-    ingest_principal: PrincipalId,
-    ingest_salt: [u8; 32],
-    ingest_hash: [u8; 32],
+    ingest: Option<IngestIdentity>,
 }
 
 impl Identity {
@@ -39,7 +43,9 @@ impl Identity {
                 .object(object_id)
                 .map_err(|_| IdentityFailure)?
                 .ok_or(IdentityFailure)?;
-            if !object.starts_with(&GOVERNANCE_OBJECT_MAGIC) {
+            if !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V1)
+                && !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V2)
+            {
                 continue;
             }
             if identity.is_some() {
@@ -75,27 +81,25 @@ impl Identity {
                     authority: self.instance,
                 })
             },
-            RequestedIntent::Ingest
-                if keys
-                    .verify_salted_secret_hash(
-                        &self.ingest_salt,
-                        credential.secret(),
-                        &self.ingest_hash,
-                    )
-                    .map_err(|_| AttributionFailure)? =>
-            {
+            RequestedIntent::Ingest => {
+                let ingest = self.ingest.as_ref().ok_or(AttributionFailure)?;
+                if !keys
+                    .verify_salted_secret_hash(&ingest.salt, credential.secret(), &ingest.hash)
+                    .map_err(|_| AttributionFailure)?
+                {
+                    return Err(AttributionFailure);
+                }
                 Ok(AuthorizedContext {
-                    principal: self.ingest_principal,
+                    principal: ingest.principal,
                     scope: Scope::Ingest,
                     tenant: Some(
-                        TenantAttribution::new(self.ingest_principal, Scope::Ingest, self.tenant)
+                        TenantAttribution::new(ingest.principal, Scope::Ingest, self.tenant)
                             .map_err(|_| AttributionFailure)?,
                     ),
                     authority: self.instance,
                 })
             },
-            RequestedIntent::Ingest
-            | RequestedIntent::Query
+            RequestedIntent::Query
             | RequestedIntent::TenantAdministration
             | RequestedIntent::SystemAdministration => Err(AttributionFailure),
         }

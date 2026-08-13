@@ -71,7 +71,7 @@ fn pinned_opentelemetry_sdk_producer_reaches_public_receiver_path() -> Result<()
     let claim = InstanceBootstrap::claim(&paths)?;
     let instance = InstanceBootstrap::reopen(&paths)?;
     let context = instance.attribute(
-        PresentedCredential::parse(claim.ingest_secret())?,
+        PresentedCredential::parse(claim.ingest_secret().expect("ingest credential"))?,
         RequestedIntent::Ingest,
         CompatibilityHints::none(),
     )?;

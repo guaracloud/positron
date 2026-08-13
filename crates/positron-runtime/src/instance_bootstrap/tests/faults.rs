@@ -142,11 +142,12 @@ fn resumed_bootstrap_rejects_a_substituted_existing_claim() -> Result<(), Box<dy
     let instance = BootstrapKeyCustody::routed_instance(BootstrapObjectPurpose::Pending, &pending)?;
     let plaintext = key.open_object(instance, BootstrapObjectPurpose::Pending, &pending)?;
     let record = super::super::codec::BootstrapRecord::decode(&plaintext)?;
+    let ingest = record.ingest.as_ref().expect("current ingest identity");
     let substituted = super::super::codec::encode_claim(
         instance,
         record.administrator,
         &[0x44; 32],
-        record.ingest_principal,
+        ingest.principal,
         &[0x45; 32],
     );
     let encrypted = key.protect(instance, BootstrapObjectPurpose::Claim, &substituted)?;

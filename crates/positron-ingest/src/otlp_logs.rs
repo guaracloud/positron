@@ -12,9 +12,11 @@ use positron_kernel::{
 use prost::Message;
 
 mod bounds;
+mod preflight;
 mod transport;
 
 use bounds::{MAX_DECODED_BATCH_BYTES, decoded_record_bytes};
+use preflight::validate_record_count;
 use transport::bounded_protobuf;
 
 const MAX_REQUEST_BYTES: usize = 1_048_576;
@@ -244,6 +246,7 @@ impl OtlpLogsReceiver {
         } = request;
         let _capacity = capacity;
         let protobuf = bounded_protobuf(payload)?;
+        validate_record_count(&protobuf)?;
         let decoded = ExportLogsServiceRequest::decode(protobuf.as_slice())
             .map_err(|_| ReceiveFailure::MalformedPayload)?;
         let mut records = Vec::new();

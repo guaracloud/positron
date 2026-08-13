@@ -23,7 +23,7 @@ pub use identity::{
     IdentityFailure, PresentedCredential, RequestedIntent,
 };
 
-const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV01";
+const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV02";
 const GOVERNANCE_AUDIT_MAGIC: [u8; 8] = *b"POSAUD01";
 
 /// Administration-owned semantic proposal for the initial governance state.
