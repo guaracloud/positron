@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use positron_kernel::{LifecycleClockFailure, LifecycleClockSource, ResourceDimension, WorkClass};
+use positron_kernel::{
+    LifecycleClockFailure, LifecycleClockSource, ReleaseOutcome, ResourceDimension, WorkClass,
+};
 
 use super::*;
 
@@ -68,6 +70,41 @@ fn preparation_accepts_exact_block_maximum_and_rejects_the_next_byte_without_clo
         positron_domain::routing::CommitPosition::origin()
     );
     assert!(snapshot.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
+fn cancelled_preparation_capacity_is_refused_before_clock_or_allocation()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let reads = AtomicUsize::new(0);
+    let clock = LifecycleClock::new(CountingClock { reads: &reads });
+    let baseline = authority.governor().inspect()?;
+
+    for marker in [0x91, 0x92] {
+        let mut capacity = preparation_capacity(&authority, tenant)?;
+        assert_eq!(capacity.cancel()?, ReleaseOutcome::Released);
+        let failure = LogStore::new()
+            .prepare(
+                capacity,
+                &clock,
+                tenant,
+                VirtualShardId::new(u32::from(marker))?,
+                StoreBlockIdentity::new([marker; 16])?,
+                sized_records(261_876)?,
+            )
+            .err()
+            .ok_or("cancelled capacity unexpectedly prepared a Store Block")?;
+        assert_eq!(
+            failure.code(),
+            LogStoreFailureCode::ResourceAdmissionRefused
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert_accounting(&authority, baseline)?;
+    }
     Ok(())
 }
 

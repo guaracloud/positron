@@ -91,13 +91,15 @@ impl<'authority> ResourceReservation<'authority> {
         tenant: positron_domain::identity::TenantId,
         memory_bytes: u64,
     ) -> bool {
-        matches!(
-            self.identity,
-            ReservationIdentity::Ordinary {
-                tenant: reserved_tenant,
-                kind: WorkKind::Ingest,
-            } if reserved_tenant == tenant
-        ) && self.amounts.get(ResourceDimension::MemoryBytes) >= memory_bytes
+        self.active
+            && matches!(
+                self.identity,
+                ReservationIdentity::Ordinary {
+                    tenant: reserved_tenant,
+                    kind: WorkKind::Ingest,
+                } if reserved_tenant == tenant
+            )
+            && self.amounts.get(ResourceDimension::MemoryBytes) >= memory_bytes
     }
 
     pub(crate) fn belongs_to(&self, governor: ResourceGovernor<'_>) -> bool {
