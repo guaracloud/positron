@@ -223,6 +223,7 @@ fn repeated_classification_is_strictly_read_only() -> Result<(), Box<dyn Error>>
         &paths,
         InitializationPlan::non_interactive(),
     )?);
+    fs::remove_file(roots.data.join(".positron-volume.lock"))?;
     let before = durable_tree(&roots.data)?;
 
     assert_eq!(
@@ -235,6 +236,44 @@ fn repeated_classification_is_strictly_read_only() -> Result<(), Box<dyn Error>>
     );
 
     assert_eq!(durable_tree(&roots.data)?, before);
+    assert!(!roots.data.join(".positron-volume.lock").exists());
+    Ok(())
+}
+
+#[test]
+fn live_owned_initialized_root_is_classified_truthfully() -> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+
+    assert_eq!(
+        InstanceBootstrap::classify(&paths)?,
+        BootstrapState::Initialized
+    );
+    drop(initialized);
+    Ok(())
+}
+
+#[test]
+fn inspection_permission_failure_is_operational_not_corruption() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    fs::set_permissions(&roots.secrets, fs::Permissions::from_mode(0o000))?;
+    let classified = InstanceBootstrap::classify(&paths);
+    fs::set_permissions(&roots.secrets, fs::Permissions::from_mode(0o700))?;
+
+    assert_eq!(
+        classified
+            .expect_err("unreadable inspection root must be operational failure")
+            .code(),
+        BootstrapFailureCode::StorageUnavailable
+    );
     Ok(())
 }
 
@@ -251,7 +290,7 @@ fn durable_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>, std::io::Erro
             if entry.file_type()?.is_dir() {
                 observed.insert(relative.clone(), Vec::new());
                 visit(root, &path, observed)?;
-            } else if entry.file_name() != ".positron-volume.lock" {
+            } else {
                 observed.insert(relative, fs::read(path)?);
             }
         }

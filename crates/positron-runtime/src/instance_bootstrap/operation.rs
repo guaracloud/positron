@@ -23,33 +23,43 @@ use support::{
 };
 
 pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
-    let state = storage::classify(paths)?;
+    let access = paths.storage.inspect().map_err(storage::storage_failure)?;
+    let state = storage::classify_with(paths, &access)?;
     if state != BootstrapState::Initialized {
         return Ok(state);
     }
-    match validate_initialized(paths) {
+    match validate_initialized(paths, &access) {
         Ok(()) => Ok(BootstrapState::Initialized),
-        Err(_) => Ok(BootstrapState::Inconsistent),
+        Err(failure)
+            if matches!(
+                failure.code(),
+                BootstrapFailureCode::CorruptState | BootstrapFailureCode::IdentityMismatch
+            ) =>
+        {
+            Ok(BootstrapState::Inconsistent)
+        },
+        Err(failure) => Err(failure),
     }
 }
 
-fn validate_initialized(paths: &BootstrapPaths) -> Result<(), BootstrapFailure> {
-    let (volume, access) = acquire(paths)?;
-    if storage::classify_with(paths, &access)? != BootstrapState::Initialized {
+fn validate_initialized(
+    paths: &BootstrapPaths,
+    access: &BootstrapArtifactAccess,
+) -> Result<(), BootstrapFailure> {
+    if storage::classify_with(paths, access)? != BootstrapState::Initialized {
         return Err(inconsistent());
     }
     let key = paths.storage.open_key().map_err(key_failure)?;
-    let encoded = storage::read(&access, BootstrapArtifact::Initialized)?;
+    let encoded = storage::read(access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
     require_key_identity(&record, key.identity())?;
-    let authority = resources::establish(volume, record.tenant)?;
-    let catalog = Catalog::open(
-        &authority,
-        record.instance,
-        key.catalog_secret(record.instance).map_err(key_failure)?,
-    )
-    .map_err(catalog_failure)?;
-    if catalog.pin().map_err(catalog_failure)?.number() == 0 {
+    let generation = access
+        .inspect_catalog(
+            record.instance,
+            key.catalog_secret(record.instance).map_err(key_failure)?,
+        )
+        .map_err(storage::storage_failure)?;
+    if generation == 0 {
         return Err(BootstrapFailure::new(BootstrapFailureCode::CorruptState));
     }
     Ok(())

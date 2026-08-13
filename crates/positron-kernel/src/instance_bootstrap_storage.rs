@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{self as unix_fs, AtFlags, Mode, OFlags, RenameFlags};
 
 use crate::{
-    BootstrapKeyCustody, BootstrapKeyFailure, MountQualification, OwnedPrimaryDataVolume,
-    PrimaryDataVolume,
+    BootstrapKeyCustody, BootstrapKeyFailure, CatalogFailureCode, CatalogSecret, InstanceId,
+    MountQualification, OwnedPrimaryDataVolume, PrimaryDataVolume,
 };
 
 mod io;
@@ -214,6 +214,21 @@ impl BootstrapArtifactAccess {
             data,
             secrets,
             unknown_or_unsafe: data_unsafe || secrets_unsafe,
+        })
+    }
+
+    /// Authenticates the complete visible Catalog chain without recovery mutation.
+    pub fn inspect_catalog(
+        &self,
+        instance: InstanceId,
+        secret: CatalogSecret,
+    ) -> Result<u64, BootstrapStorageFailure> {
+        crate::catalog::inspect_read_only(&self.data, instance, secret).map_err(|failure| {
+            if failure.code() == CatalogFailureCode::StorageUnavailable {
+                BootstrapStorageFailure::Unavailable
+            } else {
+                BootstrapStorageFailure::UnsafeOrCorrupt
+            }
         })
     }
 

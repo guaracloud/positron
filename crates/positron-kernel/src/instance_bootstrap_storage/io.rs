@@ -48,7 +48,13 @@ pub(super) fn open_verified_root(
                     Mode::empty(),
                 )
                 .map(File::from)
-                .map_err(|_| BootstrapStorageFailure::UnsafeOrCorrupt)?;
+                .map_err(|error| {
+                    if matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM) {
+                        BootstrapStorageFailure::Unavailable
+                    } else {
+                        BootstrapStorageFailure::UnsafeOrCorrupt
+                    }
+                })?;
             },
             _ => return Err(BootstrapStorageFailure::InvalidRoots),
         }
