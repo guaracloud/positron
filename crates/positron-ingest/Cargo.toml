@@ -1,6 +1,6 @@
 [package]
 name = "positron-ingest"
-description = "Positron native ingest and receiver-adapter scaffold"
+description = "Positron native ingest and receiver adapters"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,11 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+flate2 = { version = "=1.0.24", default-features = false, features = ["rust_backend"] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "logs"] }
+positron-domain = { path = "../positron-domain" }
+positron-kernel = { path = "../positron-kernel" }
+positron-signals = { path = "../positron-signals" }
+prost = "=0.14.3"

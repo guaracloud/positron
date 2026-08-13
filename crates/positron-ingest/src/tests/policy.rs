@@ -1,0 +1,163 @@
+use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
+use positron_kernel::{
+    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
+    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+};
+use positron_signals::{LogScan, LogStore, ScanLimit};
+
+use crate::{IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
+
+use super::support::{fixture, protobuf_with_bodies};
+
+#[test]
+fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x71; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x72; 32]), Box::new([0x73; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(71).expect("shard");
+    let ledger = ActiveSegmentLedger::open(
+        &fixture.authority,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x74; 32])),
+    )
+    .expect("ledger");
+    let oversized_rejected = "x".repeat(262_145);
+    let request = protobuf_with_bodies(&[oversized_rejected.as_str(), "accepted"]);
+    let batch = OtlpLogsReceiver::new()
+        .decode(request)
+        .expect("structural decode");
+    let policy = IngestPolicy::reject_exact_text_body(
+        7,
+        [0x75; 32],
+        "reject-oversized",
+        &oversized_rejected,
+    )
+    .expect("policy");
+    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
+
+    let partial = match LogIngest::new(
+        &fixture.authority,
+        &ledger,
+        &clock,
+        &policy,
+        fixture.tenant,
+        shard,
+    )
+    .accept(
+        batch,
+        StoreBlockIdentity::new([0x76; 16]).expect("identity"),
+    ) {
+        IngestOutcome::Partial(partial) => partial,
+        other => panic!("expected partial result, got {other:?}"),
+    };
+    assert_eq!(partial.committed().records(), 1);
+    assert_eq!(partial.permanently_rejected(), 1);
+    assert_eq!(partial.committed().receipt().position().value(), 1);
+
+    let result = LogStore::new()
+        .scan(
+            fixture.authority.governor(),
+            fixture.tenant,
+            &ledger.snapshot().expect("snapshot"),
+            LogScan::all(ScanLimit::new(2).expect("limit")),
+        )
+        .expect("scan");
+    assert_eq!(result.records().len(), 1);
+    assert_eq!(
+        result.records()[0].body().and_then(|body| body.as_str()),
+        Some("accepted")
+    );
+    assert_eq!(result.records()[0].policy_provenance().generation(), 7);
+    assert_eq!(
+        result.records()[0].policy_provenance().applied_rules(),
+        &["reject-oversized"]
+    );
+}
+
+#[test]
+fn value_limit_rejection_never_claims_durability() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x77; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x78; 32]), Box::new([0x79; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(72).expect("shard");
+    let ledger = ActiveSegmentLedger::open(
+        &fixture.authority,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x7a; 32])),
+    )
+    .expect("ledger");
+    let oversized = "x".repeat(262_145);
+    let batch = OtlpLogsReceiver::new()
+        .decode(protobuf_with_bodies(&[oversized.as_str()]))
+        .expect("structural decode");
+    let policy = IngestPolicy::preserving(1, [0x7b; 32]).expect("policy");
+    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
+    assert!(matches!(
+        LogIngest::new(
+            &fixture.authority,
+            &ledger,
+            &clock,
+            &policy,
+            fixture.tenant,
+            shard,
+        )
+        .accept(
+            batch,
+            StoreBlockIdentity::new([0x7c; 16]).expect("identity")
+        ),
+        IngestOutcome::Permanent(crate::IngestFailureCode::ValueLimitExceeded)
+    ));
+    assert!(ledger.snapshot().expect("snapshot").blocks().is_empty());
+}
+
+#[test]
+fn complete_policy_rejection_is_permanent_and_has_no_receipt() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x7d; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x7e; 32]), Box::new([0x7f; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(73).expect("shard");
+    let ledger = ActiveSegmentLedger::open(
+        &fixture.authority,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x80; 32])),
+    )
+    .expect("ledger");
+    let batch = OtlpLogsReceiver::new()
+        .decode(protobuf_with_bodies(&["reject-me"]))
+        .expect("decode");
+    let policy =
+        IngestPolicy::reject_exact_text_body(2, [0x81; 32], "reject", "reject-me").expect("policy");
+    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
+    assert_eq!(
+        LogIngest::new(
+            &fixture.authority,
+            &ledger,
+            &clock,
+            &policy,
+            fixture.tenant,
+            shard,
+        )
+        .accept(
+            batch,
+            StoreBlockIdentity::new([0x82; 16]).expect("identity"),
+        ),
+        IngestOutcome::Permanent(crate::IngestFailureCode::PolicyRejected)
+    );
+    assert!(ledger.snapshot().expect("snapshot").blocks().is_empty());
+}

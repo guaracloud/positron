@@ -1,7 +1,19 @@
-//! @positron-scaffold-only
-//! Native ingest orchestration and receiver-adapter scaffold.
-//!
-//! No protocol decoding, admission, routing, persistence, or acknowledgment
-//! behavior is present.
+//! Native ingest orchestration and Receiver Adapters.
 
 #![forbid(unsafe_code)]
+
+mod ingest;
+mod otlp_logs;
+mod policy;
+
+pub use ingest::{
+    CommittedAdmission, IngestFailureCode, IngestOutcome, LogIngest, PartialAdmission,
+};
+pub use otlp_logs::{
+    AuthenticatedOtlpLogsRequest, NativeLogAttribute, NativeLogBatch, NativeLogCandidate,
+    OtlpLogsReceiver, ReceiveFailure,
+};
+pub use policy::IngestPolicy;
+
+#[cfg(test)]
+mod tests;

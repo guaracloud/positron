@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 positron-kernel = { path = "../crates/positron-kernel" }
 positron-domain = { path = "../crates/positron-domain" }
 positron-governance = { path = "../crates/positron-governance" }
+positron-ingest = { path = "../crates/positron-ingest" }
 positron-runtime = { path = "../crates/positron-runtime" }
 positron-signals = { path = "../crates/positron-signals" }
 
@@ -74,6 +75,13 @@ bench = false
 [[bin]]
 name = "log_store_block_decode"
 path = "fuzz_targets/log_store_block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp_logs_decode"
+path = "fuzz_targets/otlp_logs_decode.rs"
 test = false
 doc = false
 bench = false
