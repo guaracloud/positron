@@ -85,12 +85,12 @@ pub use catalog::{
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
     LedgerFailure, LedgerFailureCode, LedgerSnapshot, PreparedStoreBlock, SealedSegment, SegmentId,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseGrant, SnapshotLeaseId, StoreBlockIdentity,
 };
 
 pub use data_protection::{
     BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
-    BootstrapObjectPurpose,
+    BootstrapObjectPurpose, ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector,
 };
 
 pub use instance_bootstrap_storage::{

@@ -11,6 +11,8 @@ mod protection;
 mod publication;
 mod receipt;
 mod recovery;
+mod snapshot_lease;
+mod snapshot_lease_codec;
 mod state;
 mod storage;
 mod types;
@@ -34,6 +36,7 @@ use capacity::{recovery_claim, retained_claim, snapshot_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
+pub use snapshot_lease::{SnapshotLeaseGrant, SnapshotLeaseId};
 use state::{LedgerState, retain_recovered};
 use storage::LedgerStorage;
 pub use types::*;
@@ -68,6 +71,11 @@ impl std::fmt::Debug for ActiveSegmentLedger<'_, '_> {
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    /// Returns the Data Protection-owned bounded control-token operation.
+    #[must_use]
+    pub fn control_tokens(&self) -> crate::ControlTokenProtector<'_> {
+        self.catalog.control_tokens()
+    }
     pub fn open(
         authority: &'kernel StorageKernelResourceAuthority,
         catalog: &'catalog Catalog<'kernel>,
@@ -102,6 +110,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
+        let lease_reservations = snapshot_lease::recover_reservations(authority, scope, &snapshot)?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
         let mut segments = metadata.iter().copied().peekable();
         let mut blocks = Vec::new();
@@ -194,6 +203,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 retained_bytes,
                 next_sequence: 0,
                 poisoned: false,
+                lease_reservations,
             }),
         })
     }

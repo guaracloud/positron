@@ -18,8 +18,6 @@ positron-domain = { path = "../positron-domain" }
 positron-governance = { path = "../positron-governance" }
 positron-kernel = { path = "../positron-kernel" }
 positron-signals = { path = "../positron-signals" }
-hmac = { version = "=0.13.0", default-features = false }
-sha2 = { version = "=0.11.0", default-features = false }
 
 [dev-dependencies]
 positron-runtime = { path = "../positron-runtime" }

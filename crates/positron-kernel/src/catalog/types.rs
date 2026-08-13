@@ -60,6 +60,10 @@ impl CatalogGenerationId {
     pub const fn to_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    pub(crate) const fn from_authenticated_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,9 +95,9 @@ impl FormatEpoch {
 }
 
 pub struct CatalogWrappingKey {
-    pub(super) key: SecretKeyBytes,
+    pub(crate) key: SecretKeyBytes,
     pub(super) provider_key_reference: [u8; 16],
-    pub(super) key_epoch: u64,
+    pub(crate) key_epoch: u64,
 }
 
 impl CatalogWrappingKey {
@@ -125,8 +129,8 @@ impl std::fmt::Debug for CatalogWrappingKey {
 }
 
 pub struct CatalogSecret {
-    pub(super) marker_key: SecretKeyBytes,
-    pub(super) wrapping: CatalogWrappingKey,
+    pub(crate) marker_key: SecretKeyBytes,
+    pub(crate) wrapping: CatalogWrappingKey,
     pub(super) predecessor: Option<CatalogWrappingKey>,
 }
 

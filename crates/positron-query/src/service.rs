@@ -4,26 +4,14 @@ use positron_kernel::{
     ActiveSegmentLedger, ResourceAmounts, ResourceGovernor, WorkClaim, WorkKind,
 };
 
-use crate::{LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode};
-
-pub struct CursorKey {
-    pub(crate) epoch: u32,
-    pub(crate) key: [u8; 32],
-}
-
-impl CursorKey {
-    pub fn new(epoch: u32, key: [u8; 32]) -> Result<Self, QueryFailure> {
-        if epoch == 0 || key.iter().all(|byte| *byte == 0) {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
-        }
-        Ok(Self { epoch, key })
-    }
-}
+use crate::{
+    LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis,
+    TemporalRange,
+};
 
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
     pub(crate) ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-    pub(crate) cursor_key: CursorKey,
     pub(crate) batch_limit: u16,
 }
 
@@ -31,13 +19,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub const fn new(
         governor: ResourceGovernor<'kernel>,
         ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-        cursor_key: CursorKey,
         batch_limit: u16,
     ) -> Self {
         Self {
             governor,
             ledger,
-            cursor_key,
             batch_limit,
         }
     }
@@ -65,7 +51,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
         source: &str,
         budget: QueryBudget,
-        parser: fn(&str) -> Result<u16, QueryFailure>,
+        parser: fn(&str) -> Result<LogicalPlan, QueryFailure>,
     ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
         let tenant = context
             .tenant_attribution()
@@ -73,13 +59,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .map(|attribution| attribution.tenant_id())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
         let reservation = self.reserve_query(tenant, budget)?;
-        let limit = parser(source)?;
-        if limit == 0 || limit > 1_024 || u64::from(limit) > budget.output_rows() {
+        let plan = parser(source)?;
+        if plan.limit() == 0
+            || plan.limit() > 1_024
+            || u64::from(plan.limit()) > budget.output_rows()
+            || plan
+                .temporal_range()
+                .duration()
+                .is_none_or(|duration| duration > budget.maximum_time_range_nanoseconds())
+        {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
         Ok(PlannedQuery {
             context,
-            plan: LogicalPlan::logs(limit),
+            plan,
             budget,
             _reservation: reservation,
         })
@@ -99,24 +92,69 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     }
 }
 
-pub(crate) fn parse_pipeline(source: &str) -> Result<u16, QueryFailure> {
+pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let tokens = source.split_ascii_whitespace().collect::<Vec<_>>();
     match tokens.as_slice() {
-        ["logs", "|", "limit", limit] => parse_limit(limit),
+        ["logs", "|", "range", axis, start, end, "|", "limit", limit] => {
+            plan(axis, start, end, limit)
+        },
         _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
     }
 }
 
-pub(crate) fn parse_sql(source: &str) -> Result<u16, QueryFailure> {
+pub(crate) fn parse_sql(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let normalized = source.trim().to_ascii_lowercase();
-    let ordered = "select body from logs order by query_time, commit_position limit ";
-    let minimal = "select body from logs limit ";
-    normalized
-        .strip_prefix(ordered)
-        .or_else(|| normalized.strip_prefix(minimal))
-        .filter(|limit| !limit.is_empty() && !limit.contains(char::is_whitespace))
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
-        .and_then(parse_limit)
+    let tokens = normalized.split_ascii_whitespace().collect::<Vec<_>>();
+    match tokens.as_slice() {
+        [
+            "select",
+            "body",
+            "from",
+            "logs",
+            "where",
+            axis,
+            ">=",
+            start,
+            "and",
+            upper_axis,
+            "<",
+            end,
+            "order",
+            "by",
+            ordered_axis,
+            "commit_position",
+            "limit",
+            limit,
+        ] if *upper_axis == *axis && ordered_axis.strip_suffix(',') == Some(axis) => {
+            plan(axis, start, end, limit)
+        },
+        _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+    }
+}
+
+fn plan(axis: &str, start: &str, end: &str, limit: &str) -> Result<LogicalPlan, QueryFailure> {
+    let axis = match axis {
+        "query_time" => TemporalAxis::QueryTime,
+        "event_time" => TemporalAxis::EventTime,
+        _ => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+    };
+    let start = parse_timestamp(start)?;
+    let end = parse_timestamp(end)?;
+    let range = TemporalRange::new(start, end)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
+    Ok(LogicalPlan::logs(axis, range, parse_limit(limit)?))
+}
+
+fn parse_timestamp(source: &str) -> Result<i64, QueryFailure> {
+    if source.starts_with('+')
+        || (source.starts_with('0') && source.len() > 1)
+        || (source.starts_with("-0") && source.len() > 2)
+    {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    source
+        .parse()
+        .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
 }
 
 fn parse_limit(source: &str) -> Result<u16, QueryFailure> {

@@ -17,6 +17,7 @@ use codec::{
 };
 use storage::{CatalogStorage, FRAME_OVERHEAD_BYTES, MAX_GENERATIONS};
 
+use crate::data_protection::ControlTokenProtector;
 use crate::data_protection::DataProtection;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority};
@@ -74,6 +75,9 @@ impl std::fmt::Debug for Catalog<'_> {
 }
 
 impl<'authority> Catalog<'authority> {
+    pub(crate) const fn control_tokens(&self) -> ControlTokenProtector<'_> {
+        ControlTokenProtector::new(&self.secret)
+    }
     pub(crate) const fn instance(&self) -> InstanceId {
         self.instance
     }

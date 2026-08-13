@@ -50,6 +50,14 @@ pub(super) fn snapshot_claim(
     ]))
 }
 
+pub(super) fn lease_claim(encoded_bytes: usize) -> Result<ResourceAmounts, LedgerFailure> {
+    let memory = u64::try_from(encoded_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    Ok(ResourceAmounts::new([memory, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0]))
+}
+
 fn retained_memory(bytes: usize, blocks: usize) -> Result<u64, LedgerFailure> {
     u64::try_from(bytes)
         .ok()
@@ -68,6 +76,7 @@ mod tests {
             append_claim(usize::MAX).expect_err("frame arithmetic overflow"),
             retained_claim(usize::MAX, usize::MAX).expect_err("retained arithmetic overflow"),
             snapshot_claim(usize::MAX, usize::MAX).expect_err("snapshot arithmetic overflow"),
+            lease_claim(usize::MAX).expect_err("lease arithmetic overflow"),
         ] {
             assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
         }

@@ -313,6 +313,7 @@ pub enum LedgerFailureCode {
     StaleGeneration,
     RecoveryRequired,
     Cancelled,
+    SnapshotExpired,
 }
 
 /// Whether the failed call is safe to retry in place or requires recovery.

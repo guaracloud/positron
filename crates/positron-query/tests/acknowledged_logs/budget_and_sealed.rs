@@ -1,9 +1,7 @@
 use std::error::Error;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_query::{
-    CursorKey, QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
-};
+use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
 use super::support::{KernelFixture, TemporaryRoots};
@@ -22,15 +20,10 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
     )?;
     let fixture = KernelFixture::new(instance.default_tenant_id(), "budget-kernel")?;
     fixture.append_log("larger-than-the-scan-budget", 20, 1)?;
-    let service = QueryService::new(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        CursorKey::new(1, [0x81; 32])?,
-        100,
-    );
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
     let planned = service.plan_pipeline(
         context,
-        "logs | limit 1",
+        "logs | range query_time -100 100 | limit 1",
         QueryBudget::new(1, 16, 16, 1_048_576, 4, 60)?,
     )?;
     let events = service.execute(planned)?.collect::<Vec<_>>();
@@ -66,15 +59,10 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     fixture.append_log("sealed", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active", 21, 2)?;
-    let service = QueryService::new(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        CursorKey::new(1, [0x82; 32])?,
-        100,
-    );
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
     let query = service.plan_sql(
         context,
-        "SELECT body FROM logs ORDER BY query_time, commit_position LIMIT 2",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
     )?;
     let first = service
@@ -95,15 +83,10 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     assert_eq!(first, ["sealed", "active"]);
 
     fixture.seal_and_reopen()?;
-    let restarted = QueryService::new(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        CursorKey::new(1, [0x82; 32])?,
-        100,
-    );
+    let restarted = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
     let query = restarted.plan_sql(
         context,
-        "SELECT body FROM logs LIMIT 2",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
     )?;
     let after_restart = restarted

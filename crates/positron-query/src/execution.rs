@@ -2,51 +2,55 @@ use std::num::NonZeroU64;
 
 use positron_domain::identity::{Scope, TenantId};
 use positron_domain::routing::CommitPosition;
-use positron_domain::time::{IngestTimeCandidate, QueryTime};
 use positron_governance::AuthorizedContext;
-use positron_kernel::LedgerSnapshot;
+use positron_kernel::{LedgerSnapshot, SnapshotLeaseId};
 use positron_signals::{LogScan, LogStore, ScanLimit};
-use sha2::{Digest, Sha256};
 
 use crate::cursor::{self, CursorState};
+use crate::execution_support::{
+    batch_digest, charge, exhausted, map_ledger_failure, map_store_failure, query_record,
+};
 use crate::{
     PlannedQuery, QueryBatch, QueryCursor, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader,
-    QueryRecord, QueryService, QueryStats, QueryStream, QueryTerminal,
+    QueryIncomplete, QueryRecord, QueryService, QueryStats, QueryStream, QueryTerminal,
+    ResultLease, ResultSnapshot,
 };
 
 const MAX_SCAN_RECORDS: usize = 1_024;
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
-    pub fn execute(&self, query: PlannedQuery<'kernel>) -> Result<QueryStream, QueryFailure> {
-        let snapshot = self.snapshot()?;
+    pub fn execute(
+        &self,
+        query: PlannedQuery<'kernel>,
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        let expiry = query.budget.wall_seconds();
+        let lease = self
+            .ledger
+            .create_snapshot_lease(expiry)
+            .map_err(map_ledger_failure)?;
         let tenant = query_tenant(query.context)?;
-        let state = initial_state(&query, &snapshot, tenant, 0, [0; 16]);
-        self.run_page(state, &snapshot, query.plan.limit(), false)
+        let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
+        self.run_page(state, lease.snapshot(), query.plan.limit(), false)
     }
 
     pub fn execute_page(
         &self,
         query: PlannedQuery<'kernel>,
         now_seconds: u64,
-    ) -> Result<QueryStream, QueryFailure> {
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
         if self.batch_limit == 0 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
         let expiry = now_seconds
             .checked_add(query.budget.wall_seconds())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
-        let snapshot = self.snapshot()?;
+        let lease = self
+            .ledger
+            .create_snapshot_lease(expiry)
+            .map_err(map_ledger_failure)?;
         let tenant = query_tenant(query.context)?;
-        let lease = cursor::lease_identity(
-            &self.cursor_key.key,
-            query.context.principal_id(),
-            tenant,
-            snapshot.catalog_identity().to_bytes(),
-            snapshot.frontier().value(),
-            expiry,
-        )?;
-        let state = initial_state(&query, &snapshot, tenant, expiry, lease);
-        self.run_page(state, &snapshot, self.batch_limit, true)
+        let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
+        self.run_page(state, lease.snapshot(), self.batch_limit, true)
     }
 
     pub fn resume(
@@ -54,9 +58,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
         cursor: &QueryCursor,
         now_seconds: u64,
-    ) -> Result<QueryStream, QueryFailure> {
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let tenant = query_tenant(context)?;
-        let state = cursor::decode(&self.cursor_key.key, self.cursor_key.epoch, cursor)?;
+        let state = cursor::decode(&self.ledger.control_tokens(), cursor)?;
         validate_authorization(
             state.principal,
             state.tenant,
@@ -69,17 +73,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
         let _reservation = self.reserve_query(tenant, state.budget)?;
-        let snapshot = self.snapshot()?;
-        if snapshot.frontier().value() < state.frontier {
-            return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
+        let lease_id = SnapshotLeaseId::new(state.lease_identity)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        let lease = self
+            .ledger
+            .resume_snapshot_lease(lease_id, now_seconds)
+            .map_err(map_ledger_failure)?;
+        if lease.snapshot().catalog_identity().to_bytes() != state.catalog_identity
+            || lease.snapshot().catalog_generation() != state.catalog_generation
+            || lease.snapshot().frontier().value() != state.frontier
+            || lease.expiry() != state.expiry
+        {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
-        self.run_page(state, &snapshot, self.batch_limit, true)
-    }
-
-    fn snapshot(&self) -> Result<LedgerSnapshot<'kernel>, QueryFailure> {
-        self.ledger
-            .snapshot()
-            .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))
+        self.run_page(state, lease.snapshot(), self.batch_limit, true)
     }
 
     fn run_page(
@@ -88,9 +95,22 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         snapshot: &LedgerSnapshot<'kernel>,
         batch_limit: u16,
         pagination: bool,
-    ) -> Result<QueryStream, QueryFailure> {
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let frontier = commit_position(state.frontier)?;
-        let header = QueryEvent::Header(QueryHeader::new(state.plan, state.budget));
+        let initial_cursor = (state.expiry != 0)
+            .then(|| cursor::encode(&self.ledger.control_tokens(), state))
+            .transpose()?;
+        let header = QueryEvent::Header(QueryHeader::new(
+            state.plan,
+            state.budget,
+            ResultSnapshot::new(
+                state.catalog_identity,
+                state.catalog_generation,
+                state.frontier,
+            ),
+            ResultLease::new(state.lease_identity, state.expiry),
+            initial_cursor,
+        ));
         let result = match LogStore::new().scan(
             self.governor,
             state.tenant,
@@ -103,16 +123,22 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         ) {
             Ok(result) => result,
             Err(failure) => {
-                return Ok(QueryStream::new(vec![
-                    header,
-                    QueryEvent::Terminal(QueryTerminal::Incomplete(map_store_failure(failure))),
-                ]));
+                return Ok(self.stream(
+                    vec![
+                        header,
+                        QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
+                            map_store_failure(failure),
+                            &state,
+                        ))),
+                    ],
+                    state.lease_identity,
+                ));
             },
         };
         let mut records = result
             .records()
             .iter()
-            .map(query_record)
+            .filter_map(|record| query_record(record, state.plan))
             .collect::<Vec<_>>();
         records.sort_by_key(QueryRecord::order_key);
         let wanted = usize::from(state.plan.limit()).min(records.len());
@@ -127,24 +153,38 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .to_vec();
         charge(&mut state, &result, &page)?;
         if exhausted(&state) || !result.complete() {
-            return Ok(QueryStream::new(vec![
-                header,
-                QueryEvent::Terminal(QueryTerminal::Incomplete(QueryFailure::new(
-                    QueryFailureCode::BudgetExhausted,
-                ))),
-            ]));
+            return Ok(self.stream(
+                vec![
+                    header,
+                    QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
+                        QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                        &state,
+                    ))),
+                ],
+                state.lease_identity,
+            ));
         }
         if page.is_empty() {
-            return Ok(QueryStream::new(vec![
-                header,
-                QueryEvent::Terminal(QueryTerminal::Complete(QueryStats::new(
-                    state.output_rows,
-                    state.scanned_bytes,
-                ))),
-            ]));
+            return Ok(self.stream(
+                vec![
+                    header,
+                    QueryEvent::Terminal(QueryTerminal::Complete(stats_before_current(&state))),
+                ],
+                state.lease_identity,
+            ));
         }
-        let digest = batch_digest(state.sequence, &page)?;
-        let batch = QueryEvent::Batch(QueryBatch::new(state.sequence, page, digest));
+        let digest = batch_digest(
+            &self.ledger.control_tokens(),
+            state.prior_digest,
+            state.sequence,
+            &page,
+        )?;
+        let batch = QueryEvent::Batch(QueryBatch::new(
+            state.sequence,
+            page,
+            state.prior_digest,
+            digest,
+        ));
         let terminal = if pagination && end < wanted {
             state.offset =
                 u16::try_from(end).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
@@ -153,20 +193,54 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .checked_add(1)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
             state.prior_digest = digest;
-            QueryTerminal::Continued(cursor::encode(
-                &self.cursor_key.key,
-                self.cursor_key.epoch,
-                state,
-            )?)
+            QueryTerminal::Continued(cursor::encode(&self.ledger.control_tokens(), state)?)
         } else {
-            QueryTerminal::Complete(QueryStats::new(state.output_rows, state.scanned_bytes))
+            state.prior_digest = digest;
+            QueryTerminal::Complete(stats_with_current(&state))
         };
-        Ok(QueryStream::new(vec![
-            header,
-            batch,
-            QueryEvent::Terminal(terminal),
-        ]))
+        Ok(self.stream(
+            vec![header, batch, QueryEvent::Terminal(terminal)],
+            state.lease_identity,
+        ))
     }
+
+    fn stream(&self, events: Vec<QueryEvent>, identity: [u8; 16]) -> QueryStream<'ledger> {
+        let ledger = self.ledger;
+        QueryStream::new(
+            events,
+            Box::new(move || {
+                let identity = SnapshotLeaseId::new(identity)
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                ledger
+                    .release_snapshot_lease(identity)
+                    .map_err(map_ledger_failure)
+            }),
+        )
+    }
+}
+
+fn stats_before_current(state: &CursorState) -> QueryStats {
+    QueryStats::new(
+        state.output_rows,
+        state.scanned_bytes,
+        (state.prior_digest != [0; 32])
+            .then(|| state.sequence.checked_sub(1))
+            .flatten(),
+        state.prior_digest,
+    )
+}
+
+fn stats_with_current(state: &CursorState) -> QueryStats {
+    QueryStats::new(
+        state.output_rows,
+        state.scanned_bytes,
+        Some(state.sequence),
+        state.prior_digest,
+    )
+}
+
+fn incomplete(failure: QueryFailure, state: &CursorState) -> QueryIncomplete {
+    QueryIncomplete::new(failure, stats_before_current(state))
 }
 
 fn initial_state(
@@ -174,7 +248,7 @@ fn initial_state(
     snapshot: &LedgerSnapshot<'_>,
     tenant: TenantId,
     expiry: u64,
-    lease_identity: [u8; 16],
+    lease_identity: SnapshotLeaseId,
 ) -> CursorState {
     CursorState {
         principal: query.context.principal_id(),
@@ -187,7 +261,7 @@ fn initial_state(
         offset: 0,
         sequence: 0,
         prior_digest: [0; 32],
-        lease_identity,
+        lease_identity: lease_identity.to_bytes(),
         expiry,
         budget: query.budget,
         scanned_bytes: 0,
@@ -211,104 +285,6 @@ fn commit_position(value: u64) -> Result<CommitPosition, QueryFailure> {
             .advance_by(value)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor)),
         None => Ok(CommitPosition::origin()),
-    }
-}
-
-fn query_record(record: &positron_signals::ScannedLogRecord) -> QueryRecord {
-    let observed = record.observed_time();
-    let query_time = QueryTime::for_log(
-        &record.event_time(),
-        observed.as_ref(),
-        IngestTimeCandidate::new(record.ingest_time().instant()),
-    )
-    .instant();
-    QueryRecord::new(
-        record
-            .body()
-            .and_then(|body| body.as_str())
-            .map(str::to_owned),
-        query_time,
-        record.commit_position(),
-    )
-}
-
-fn charge(
-    state: &mut CursorState,
-    result: &positron_signals::LogScanResult<'_>,
-    page: &[QueryRecord],
-) -> Result<(), QueryFailure> {
-    state.scanned_bytes = state
-        .scanned_bytes
-        .checked_add(result.scanned_bytes())
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-    state.decoded_records = state
-        .decoded_records
-        .checked_add(
-            u64::try_from(result.records().len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
-        )
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-    state.output_rows = state
-        .output_rows
-        .checked_add(
-            u64::try_from(page.len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
-        )
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-    let page_bytes = page.iter().try_fold(0_u64, |total, record| {
-        total.checked_add(u64::try_from(record.body_text().map_or(0, str::len)).ok()?)
-    });
-    state.output_bytes = state
-        .output_bytes
-        .checked_add(page_bytes.ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-    Ok(())
-}
-
-fn exhausted(state: &CursorState) -> bool {
-    state.scanned_bytes > state.budget.scanned_bytes()
-        || state.decoded_records > state.budget.decoded_records()
-        || state.output_rows > state.budget.output_rows()
-        || state.output_bytes > state.budget.output_bytes()
-}
-
-fn batch_digest(sequence: u64, records: &[QueryRecord]) -> Result<[u8; 32], QueryFailure> {
-    let mut digest = Sha256::new();
-    digest.update(b"positron-query-batch-v1\0");
-    digest.update(sequence.to_be_bytes());
-    digest.update(
-        u64::try_from(records.len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
-            .to_be_bytes(),
-    );
-    for record in records {
-        let (query_time, position) = record.order_key();
-        digest.update(query_time.value().to_be_bytes());
-        digest.update(position.value().to_be_bytes());
-        let body = record.body_text().unwrap_or_default().as_bytes();
-        digest.update(
-            u64::try_from(body.len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
-                .to_be_bytes(),
-        );
-        digest.update(body);
-    }
-    Ok(digest.finalize().into())
-}
-
-fn map_store_failure(failure: positron_signals::LogStoreFailure) -> QueryFailure {
-    match failure.code() {
-        positron_signals::LogStoreFailureCode::MalformedBlock => {
-            QueryFailure::new(QueryFailureCode::MalformedPersistentData)
-        },
-        positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
-            QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused)
-        },
-        positron_signals::LogStoreFailureCode::LimitExceeded
-        | positron_signals::LogStoreFailureCode::ResourceExhausted => {
-            QueryFailure::new(QueryFailureCode::BudgetExhausted)
-        },
-        _ => QueryFailure::new(QueryFailureCode::StoreUnavailable),
     }
 }
 

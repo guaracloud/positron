@@ -1,11 +1,13 @@
-use hmac::{Hmac, KeyInit, Mac};
 use positron_domain::identity::{PrincipalId, TenantId};
-use sha2::Sha256;
+use positron_kernel::{ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector};
 
-use crate::{LogicalPlan, QueryBudget, QueryFailure, QueryFailureCode};
+use crate::{
+    LogicalPlan, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange,
+};
 
 const MAGIC: [u8; 8] = *b"POSQCR01";
-const PAYLOAD_BYTES: usize = 280;
+const CURSOR_PURPOSE: &[u8] = b"query-cursor-v1";
+const PAYLOAD_BYTES: usize = 309;
 const CURSOR_BYTES: usize = PAYLOAD_BYTES + 32;
 
 /// Opaque authenticated continuation with one fixed bounded representation.
@@ -54,21 +56,33 @@ pub(crate) struct CursorState {
 }
 
 pub(crate) fn encode(
-    key: &[u8; 32],
-    epoch: u32,
+    protector: &ControlTokenProtector<'_>,
     state: CursorState,
 ) -> Result<QueryCursor, QueryFailure> {
     let mut bytes = Vec::with_capacity(CURSOR_BYTES);
     bytes.extend_from_slice(&MAGIC);
-    bytes.extend_from_slice(&epoch.to_be_bytes());
+    let epoch_offset = bytes.len();
+    bytes.extend_from_slice(&0_u64.to_be_bytes());
     bytes.extend_from_slice(&state.principal.to_bytes());
     bytes.extend_from_slice(&state.tenant.to_bytes());
     bytes.extend_from_slice(&state.authorization_generation.to_be_bytes());
     bytes.extend_from_slice(&state.catalog_identity);
     bytes.extend_from_slice(&state.catalog_generation.to_be_bytes());
     bytes.extend_from_slice(&state.frontier.to_be_bytes());
+    bytes.push(match state.plan.temporal_axis() {
+        TemporalAxis::QueryTime => 1,
+        TemporalAxis::EventTime => 2,
+    });
+    bytes.extend_from_slice(
+        &state
+            .plan
+            .temporal_range()
+            .start_nanoseconds()
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(&state.plan.temporal_range().end_nanoseconds().to_be_bytes());
     bytes.extend_from_slice(&state.plan.limit().to_be_bytes());
-    bytes.extend_from_slice(&plan_digest(state.plan));
+    bytes.extend_from_slice(&plan_digest(protector, state.plan)?);
     bytes.extend_from_slice(&state.offset.to_be_bytes());
     bytes.extend_from_slice(&state.sequence.to_be_bytes());
     bytes.extend_from_slice(&state.prior_digest);
@@ -81,6 +95,7 @@ pub(crate) fn encode(
         state.budget.output_bytes(),
         state.budget.memory_bytes(),
         state.budget.wall_seconds(),
+        state.budget.maximum_time_range_nanoseconds(),
         state.scanned_bytes,
         state.decoded_records,
         state.output_rows,
@@ -88,51 +103,43 @@ pub(crate) fn encode(
     ] {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    mac.update(&bytes);
-    bytes.extend_from_slice(&mac.finalize().into_bytes());
+    let authentication = protector
+        .authenticate(CURSOR_PURPOSE, &bytes)
+        .map_err(map_protection_failure)?;
+    bytes
+        .get_mut(epoch_offset..epoch_offset + 8)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+        .copy_from_slice(&authentication.epoch().to_be_bytes());
+    let authentication = protector
+        .authenticate(CURSOR_PURPOSE, &bytes)
+        .map_err(map_protection_failure)?;
+    bytes.extend_from_slice(&authentication.tag());
     Ok(QueryCursor(bytes))
 }
 
-pub(crate) fn lease_identity(
-    key: &[u8; 32],
-    principal: PrincipalId,
-    tenant: TenantId,
-    catalog_identity: [u8; 32],
-    frontier: u64,
-    expiry: u64,
-) -> Result<[u8; 16], QueryFailure> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    mac.update(b"positron-snapshot-lease-v1\0");
-    mac.update(&principal.to_bytes());
-    mac.update(&tenant.to_bytes());
-    mac.update(&catalog_identity);
-    mac.update(&frontier.to_be_bytes());
-    mac.update(&expiry.to_be_bytes());
-    let authentication = mac.finalize().into_bytes();
-    let mut identity = [0_u8; 16];
-    identity.copy_from_slice(&authentication[..16]);
-    Ok(identity)
-}
-
 pub(crate) fn decode(
-    key: &[u8; 32],
-    epoch: u32,
+    protector: &ControlTokenProtector<'_>,
     cursor: &QueryCursor,
 ) -> Result<CursorState, QueryFailure> {
     let (payload, authentication) = cursor
         .as_bytes()
         .split_at_checked(PAYLOAD_BYTES)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    mac.update(payload);
-    mac.verify_slice(authentication)
+    let epoch = payload
+        .get(8..16)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let tag = authentication
+        .try_into()
+        .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let authentication = ControlTokenAuthentication::new(epoch, tag)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    protector
+        .verify(CURSOR_PURPOSE, payload, authentication)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let mut reader = Reader::new(payload);
-    if reader.array::<8>()? != MAGIC || reader.u32()? != epoch {
+    if reader.array::<8>()? != MAGIC || reader.u64()? != epoch {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let principal = PrincipalId::from_bytes(reader.array()?)
@@ -143,8 +150,15 @@ pub(crate) fn decode(
     let catalog_identity = reader.array()?;
     let catalog_generation = reader.u64()?;
     let frontier = reader.u64()?;
-    let plan = LogicalPlan::logs(reader.u16()?);
-    if reader.array::<32>()? != plan_digest(plan) {
+    let axis = match reader.array::<1>()?[0] {
+        1 => TemporalAxis::QueryTime,
+        2 => TemporalAxis::EventTime,
+        _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
+    };
+    let range = TemporalRange::new(reader.i64()?, reader.i64()?)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let plan = LogicalPlan::logs(axis, range, reader.u16()?);
+    if reader.array::<32>()? != plan_digest(protector, plan)? {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let offset = reader.u16()?;
@@ -160,6 +174,7 @@ pub(crate) fn decode(
         reader.u64()?,
         reader.u64()?,
     )
+    .and_then(|budget| budget.with_maximum_time_range_nanoseconds(reader.u64()?))
     .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let state = CursorState {
         principal,
@@ -189,12 +204,32 @@ pub(crate) fn decode(
     Ok(state)
 }
 
-fn plan_digest(plan: LogicalPlan) -> [u8; 32] {
-    use sha2::Digest;
-    let mut digest = Sha256::new();
-    digest.update(b"positron-query-plan-v1\0logs\0");
-    digest.update(plan.limit().to_be_bytes());
-    digest.finalize().into()
+fn plan_digest(
+    protector: &ControlTokenProtector<'_>,
+    plan: LogicalPlan,
+) -> Result<[u8; 32], QueryFailure> {
+    let mut encoding = Vec::with_capacity(19);
+    encoding.push(match plan.temporal_axis() {
+        TemporalAxis::QueryTime => 1,
+        TemporalAxis::EventTime => 2,
+    });
+    encoding.extend_from_slice(&plan.temporal_range().start_nanoseconds().to_be_bytes());
+    encoding.extend_from_slice(&plan.temporal_range().end_nanoseconds().to_be_bytes());
+    encoding.extend_from_slice(&plan.limit().to_be_bytes());
+    protector
+        .digest(b"query-plan-v1", &encoding)
+        .map_err(map_protection_failure)
+}
+
+fn map_protection_failure(failure: ControlTokenFailure) -> QueryFailure {
+    match failure {
+        ControlTokenFailure::InvalidInput | ControlTokenFailure::LimitExceeded => {
+            QueryFailure::new(QueryFailureCode::InvalidCursor)
+        },
+        ControlTokenFailure::Authentication | ControlTokenFailure::Custody => {
+            QueryFailure::new(QueryFailureCode::Internal)
+        },
+    }
 }
 
 struct Reader<'a> {
@@ -221,65 +256,15 @@ impl<'a> Reader<'a> {
         self.array().map(u16::from_be_bytes)
     }
 
-    fn u32(&mut self) -> Result<u32, QueryFailure> {
-        self.array().map(u32::from_be_bytes)
-    }
-
     fn u64(&mut self) -> Result<u64, QueryFailure> {
         self.array().map(u64::from_be_bytes)
     }
 
+    fn i64(&mut self) -> Result<i64, QueryFailure> {
+        self.array().map(i64::from_be_bytes)
+    }
+
     const fn empty(&self) -> bool {
         self.bytes.is_empty()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use positron_domain::identity::{PrincipalId, TenantId};
-
-    use super::{CursorState, decode, encode};
-    use crate::{LogicalPlan, QueryBudget, QueryFailureCode};
-
-    #[test]
-    fn authenticated_cursor_rejects_zero_plan_and_lease_invariants() {
-        let key = [0xC1; 32];
-        let mut state = valid_state();
-        state.lease_identity = [0; 16];
-        let cursor = encode(&key, 1, state).expect("authenticated cursor");
-        assert!(matches!(
-            decode(&key, 1, &cursor),
-            Err(failure) if failure.code() == QueryFailureCode::InvalidCursor
-        ));
-
-        state = valid_state();
-        state.plan = LogicalPlan::logs(0);
-        let cursor = encode(&key, 1, state).expect("authenticated cursor");
-        assert!(matches!(
-            decode(&key, 1, &cursor),
-            Err(failure) if failure.code() == QueryFailureCode::InvalidCursor
-        ));
-    }
-
-    fn valid_state() -> CursorState {
-        CursorState {
-            principal: PrincipalId::from_bytes([1; 16]).expect("principal"),
-            tenant: TenantId::from_bytes([2; 16]).expect("tenant"),
-            authorization_generation: 1,
-            catalog_identity: [3; 32],
-            catalog_generation: 1,
-            frontier: 0,
-            plan: LogicalPlan::logs(1),
-            offset: 0,
-            sequence: 0,
-            prior_digest: [0; 32],
-            lease_identity: [4; 16],
-            expiry: 60,
-            budget: QueryBudget::new(1, 1, 1, 1, 1, 1).expect("budget"),
-            scanned_bytes: 0,
-            decoded_records: 0,
-            output_rows: 0,
-            output_bytes: 0,
-        }
     }
 }

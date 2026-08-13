@@ -1,9 +1,7 @@
 use std::error::Error;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_query::{
-    CursorKey, QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
-};
+use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
 use super::support::{KernelFixture, TemporaryRoots};
@@ -28,16 +26,10 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
     let fixture = KernelFixture::new(instance.default_tenant_id(), "cursor-kernel")?;
     fixture.append_log("first", 20, 1)?;
     fixture.append_log("second", 21, 2)?;
-    let key = [0x93; 32];
-    let service = QueryService::new(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        CursorKey::new(7, key)?,
-        1,
-    );
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 1);
     let plan = service.plan_pipeline(
         context,
-        "logs | limit 2",
+        "logs | range query_time -100 100 | limit 2",
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
     )?;
     let first = service.execute_page(plan, 100)?.collect::<Vec<_>>();
@@ -45,14 +37,9 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
     let first_batch = batch_identity(&first)?;
 
     fixture.append_log("future", 22, 3)?;
-    let resumed = QueryService::new(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        CursorKey::new(7, key)?,
-        1,
-    )
-    .resume(context, &cursor, 101)?
-    .collect::<Vec<_>>();
+    let resumed = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 1)
+        .resume(context, &cursor, 101)?
+        .collect::<Vec<_>>();
     assert_eq!(bodies(&resumed), ["second"]);
     assert!(matches!(
         resumed.last(),
@@ -61,6 +48,46 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
     let repeated = service.resume(context, &cursor, 101)?.collect::<Vec<_>>();
     assert_eq!(batch_identity(&resumed)?, batch_identity(&repeated)?);
     assert_ne!(first_batch, batch_identity(&resumed)?);
+    Ok(())
+}
+
+#[test]
+fn result_envelope_identifies_snapshot_schema_budget_order_lease_and_digest_chain()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let first = fixture
+        .service()
+        .resume(fixture.context, &fixture.cursor, 101)?
+        .collect::<Vec<_>>();
+    let header = match first.first() {
+        Some(QueryEvent::Header(header)) => header,
+        _ => return Err("result header missing".into()),
+    };
+    assert_eq!(header.schema().columns(), ["body"]);
+    assert_eq!(header.snapshot().frontier(), 2);
+    assert_eq!(
+        header.ordering().columns(),
+        ["query_time", "commit_position"]
+    );
+    assert_eq!(header.budget().output_rows(), 16);
+    assert_ne!(header.lease().identity(), [0; 16]);
+    assert!(header.initial_cursor().is_some());
+
+    let batch = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("result batch missing")?;
+    assert_ne!(batch.prior_digest(), [0; 32]);
+    assert_ne!(batch.digest(), batch.prior_digest());
+    let terminal = first.last().ok_or("terminal missing")?;
+    assert!(matches!(
+        terminal,
+        QueryEvent::Terminal(QueryTerminal::Complete(stats))
+            if stats.result_digest() == batch.digest()
+    ));
     Ok(())
 }
 
@@ -98,19 +125,6 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
             .code(),
         QueryFailureCode::Unauthorized
     );
-    let wrong_epoch = QueryService::new(
-        fixture.kernel.authority.governor(),
-        fixture.kernel.ledger()?,
-        CursorKey::new(8, [0x93; 32])?,
-        1,
-    );
-    assert_eq!(
-        wrong_epoch
-            .resume(fixture.context, &fixture.cursor, 101)
-            .expect_err("cursor epoch mismatch")
-            .code(),
-        QueryFailureCode::InvalidCursor
-    );
     let empty = KernelFixture::new(
         fixture
             .context
@@ -119,12 +133,7 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
             .tenant_id(),
         "cursor-frontier-regression",
     )?;
-    let behind = QueryService::new(
-        empty.authority.governor(),
-        empty.ledger()?,
-        CursorKey::new(7, [0x93; 32])?,
-        1,
-    );
+    let behind = QueryService::new(empty.authority.governor(), empty.ledger()?, 1);
     assert_eq!(
         behind
             .resume(fixture.context, &fixture.cursor, 101)
@@ -167,15 +176,10 @@ impl CursorFixture {
         let kernel = KernelFixture::new(instance.default_tenant_id(), "cursor-failure-kernel")?;
         kernel.append_log("first", 20, 1)?;
         kernel.append_log("second", 21, 2)?;
-        let service = QueryService::new(
-            kernel.authority.governor(),
-            kernel.ledger()?,
-            CursorKey::new(7, [0x93; 32])?,
-            1,
-        );
+        let service = QueryService::new(kernel.authority.governor(), kernel.ledger()?, 1);
         let plan = service.plan_pipeline(
             context,
-            "logs | limit 2",
+            "logs | range query_time -100 100 | limit 2",
             QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
         )?;
         let events = service.execute_page(plan, 100)?.collect::<Vec<_>>();
@@ -193,7 +197,6 @@ impl CursorFixture {
         QueryService::new(
             self.kernel.authority.governor(),
             self.kernel.ledger().expect("fixture ledger"),
-            CursorKey::new(7, [0x93; 32]).expect("fixture key"),
             1,
         )
     }
