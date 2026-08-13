@@ -1,7 +1,13 @@
-//! @positron-scaffold-only
-//! Process runtime, listeners, health, and operational-state scaffold.
+//! Positron process runtime boundaries.
 //!
-//! This crate spawns no tasks, binds no listeners, and publishes no process or
-//! health state.
+//! The implemented slice owns transactional Instance Bootstrap. Process
+//! lifecycle and listeners remain outside this slice.
 
 #![forbid(unsafe_code)]
+
+mod instance_bootstrap;
+
+pub use instance_bootstrap::{
+    BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
+    InitializationPlan, InitializedInstance, InstanceBootstrap,
+};

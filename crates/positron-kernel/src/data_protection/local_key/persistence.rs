@@ -9,8 +9,9 @@ use std::os::unix::fs::MetadataExt;
 use rustix::fs::{self as unix_fs, Mode, OFlags};
 
 use super::acl::{verify_directory_acl, verify_file_acl};
-use super::bootstrap::{open_absolute_directory, verify_key_file};
+use super::bootstrap::verify_key_file;
 use super::codec::{EncodedLocalKeyFile, parse_file_v1};
+use super::security_directory::open_absolute_directory;
 use super::{
     LOCAL_KEY_FILE_NAME, LocalKeyCreationTime, LocalKeyEvidence, LocalKeyFailure,
     LocalKeyFailureCode, LocalKeyFingerprint, LocalKeyId, VerifiedLocalKey,
@@ -127,6 +128,53 @@ pub(super) fn open_local_key(
     } else {
         Err(LocalKeyFailure::new(LocalKeyFailureCode::IdentityMismatch))
     }
+}
+
+pub(super) fn open_existing_local_key(
+    location: &Path,
+) -> Result<VerifiedLocalKey, LocalKeyFailure> {
+    let directory = open_absolute_directory(location)?;
+    open_existing_local_key_in(&directory)
+}
+
+pub(super) fn open_existing_local_key_in(
+    directory: &File,
+) -> Result<VerifiedLocalKey, LocalKeyFailure> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
+    let expected_directory = ExpectedSecurityDirectory {
+        owner: metadata.uid(),
+        link_count: metadata.nlink(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    verify_opened_security_directory(directory, expected_directory)?;
+    verify_directory_acl(directory)?;
+    let mut file = unix_fs::openat(
+        directory,
+        LOCAL_KEY_FILE_NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::OpenKeyFileFailed))?;
+    verify_key_file(directory, &file, expected_directory.owner)?;
+    verify_file_acl(&file)?;
+    let mut encoded = EncodedLocalKeyFile::zeroed();
+    file.read_exact(encoded.bytes.as_mut())
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::MalformedFile))?;
+    let mut trailing = [0_u8; 1];
+    let trailing_bytes = file
+        .read(&mut trailing)
+        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::MalformedFile))?;
+    trailing.fill(0);
+    if trailing_bytes != 0 {
+        return Err(LocalKeyFailure::new(LocalKeyFailureCode::MalformedFile));
+    }
+    verify_key_file(directory, &file, expected_directory.owner)?;
+    verify_file_acl(&file)?;
+    parse_file_v1(encoded)
 }
 
 fn verify_opened_security_directory(

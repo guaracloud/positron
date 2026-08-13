@@ -108,5 +108,6 @@ fn publish_record(
 }
 
 mod artifact;
+mod inspection;
 mod io;
 mod marker;

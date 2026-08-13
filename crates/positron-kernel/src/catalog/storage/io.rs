@@ -36,6 +36,37 @@ pub(super) fn open_or_create_directory(parent: &File, name: &str) -> Result<File
     Ok(directory)
 }
 
+pub(super) fn open_existing_directory(parent: &File, name: &str) -> Result<File, CatalogFailure> {
+    let directory = unix_fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) {
+            CatalogFailure::new(CatalogFailureCode::IntegrityCorruption)
+        } else {
+            CatalogFailure::new(CatalogFailureCode::StorageUnavailable)
+        }
+    })?;
+    let metadata = directory
+        .metadata()
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+    let parent_metadata = parent
+        .metadata()
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !metadata.file_type().is_dir() || metadata.dev() != parent_metadata.dev() {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+    }
+    Ok(directory)
+}
+
 pub(super) fn write_new_file(
     directory: &File,
     name: &str,

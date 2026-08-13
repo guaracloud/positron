@@ -1,6 +1,7 @@
 //! Immutable encrypted Catalog Generations and their single publication authority.
 
 mod codec;
+mod inspection;
 mod storage;
 mod types;
 
@@ -480,6 +481,8 @@ impl<'authority> Catalog<'authority> {
         CatalogProposal::new(transaction, epoch, objects)
     }
 }
+
+pub(crate) use inspection::inspect_read_only;
 
 fn rotation_transactions(base: TransactionId) -> Result<[TransactionId; 3], CatalogFailure> {
     fn derive(base: TransactionId, stage: u8) -> Result<TransactionId, CatalogFailure> {

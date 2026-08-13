@@ -30,6 +30,21 @@ impl SegmentScope {
         }
     }
 
+    #[must_use]
+    pub const fn tenant_id(self) -> TenantId {
+        self.tenant
+    }
+
+    #[must_use]
+    pub const fn signal_kind(self) -> SignalKind {
+        self.signal
+    }
+
+    #[must_use]
+    pub const fn shard_id(self) -> VirtualShardId {
+        self.shard
+    }
+
     pub(super) fn lease_key(self) -> [u8; 22] {
         let mut key = [0_u8; 22];
         for (destination, source) in key.iter_mut().zip(self.tenant.to_bytes()) {

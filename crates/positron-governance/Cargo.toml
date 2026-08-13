@@ -10,5 +10,8 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[dependencies]
+positron-domain = { path = "../positron-domain" }
+
 [lints]
 workspace = true

@@ -16,6 +16,7 @@ use super::types::{
 
 mod artifact;
 pub(crate) mod fault;
+mod inspection;
 mod io;
 mod marker;
 

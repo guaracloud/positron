@@ -8,6 +8,8 @@ mod bootstrap;
 mod codec;
 mod initialization_io;
 mod persistence;
+mod runtime_bootstrap;
+mod security_directory;
 
 #[cfg(test)]
 mod acl_tests;
@@ -18,9 +20,17 @@ mod initialization_tests;
 #[cfg(test)]
 mod persistence_tests;
 #[cfg(test)]
+#[path = "local_key/tests/runtime_bootstrap.rs"]
+mod runtime_bootstrap_tests;
+#[cfg(test)]
 mod test_support;
 
 use codec::SecretRootKey;
+
+pub use runtime_bootstrap::{
+    BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
+    BootstrapObjectPurpose,
+};
 
 #[cfg(fuzzing)]
 pub fn fuzz_local_root_key_file(data: &[u8]) {
@@ -35,6 +45,7 @@ const LOCAL_KEY_FILE_BYTES: usize = 134;
 const LOCAL_KEY_FINGERPRINT_DOMAIN: &[u8] = b"positron-local-root-key-fingerprint-v1";
 const LOCAL_KEY_CHECKSUM_DOMAIN: &[u8] = b"positron-local-root-key-file-checksum-v1";
 const LOCAL_KEY_FILE_NAME: &str = "local-root-key.v1";
+const LOCAL_KEY_STAGING_FILE_NAME: &str = "local-root-key.v1.new";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalKeyFailureCode {

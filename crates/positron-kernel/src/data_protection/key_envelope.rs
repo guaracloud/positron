@@ -267,5 +267,6 @@ const fn key_kind(kind: SystemObjectKind) -> u64 {
         SystemObjectKind::Manifest => 2,
         SystemObjectKind::GovernanceAudit => 3,
         SystemObjectKind::BackupMetadata => 4,
+        SystemObjectKind::InstanceBootstrap => 5,
     }
 }

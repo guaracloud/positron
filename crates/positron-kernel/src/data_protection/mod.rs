@@ -39,6 +39,10 @@ use key_envelope::{
     segment_context_encoding_with_route, verify_segment_wrapped_key_payload_with_route,
     verify_wrapped_key_payload,
 };
+pub use local_key::{
+    BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
+    BootstrapObjectPurpose,
+};
 pub(crate) use service::DataProtection;
 
 #[cfg(any(test, fuzzing))]
