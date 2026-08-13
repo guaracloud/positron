@@ -1,9 +1,14 @@
-use std::collections::BTreeMap;
-use std::error::Error;
-use std::fmt::{Display, Formatter};
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 use crate::data_protection::{DataProtection, SecretKeyBytes};
+
+mod failure;
+mod snapshot;
+
+pub use failure::{CatalogFailure, CatalogFailureCode};
+pub use snapshot::CatalogSnapshot;
+pub(super) use snapshot::{AuditFrontier, SnapshotData};
 
 pub(super) const MAX_CATALOG_OBJECTS: usize = 1_024;
 pub(super) const MAX_CATALOG_OBJECT_BYTES: usize = 1_048_576;
@@ -282,92 +287,6 @@ impl std::fmt::Debug for CatalogProposal {
     }
 }
 
-#[derive(Clone)]
-pub struct CatalogSnapshot(pub(super) Arc<SnapshotData>);
-
-pub(super) struct SnapshotData {
-    pub(super) identity: CatalogGenerationId,
-    pub(super) number: u64,
-    pub(super) format_epoch: Option<FormatEpoch>,
-    pub(super) objects: BTreeMap<CatalogObjectId, Arc<[u8]>>,
-    pub(super) audit_frontier: AuditFrontier,
-}
-
-impl CatalogSnapshot {
-    pub(super) fn origin() -> Self {
-        Self(Arc::new(SnapshotData {
-            identity: CatalogGenerationId::ORIGIN,
-            number: 0,
-            format_epoch: None,
-            objects: BTreeMap::new(),
-            audit_frontier: AuditFrontier::ORIGIN,
-        }))
-    }
-
-    #[must_use]
-    pub fn identity(&self) -> CatalogGenerationId {
-        self.0.identity
-    }
-
-    #[must_use]
-    pub fn number(&self) -> u64 {
-        self.0.number
-    }
-
-    #[must_use]
-    pub fn format_epoch(&self) -> Option<FormatEpoch> {
-        self.0.format_epoch
-    }
-
-    pub fn object(&self, identity: CatalogObjectId) -> Result<Option<&[u8]>, CatalogFailure> {
-        Ok(self.0.objects.get(&identity).map(AsRef::as_ref))
-    }
-
-    /// Returns the bounded identities reachable from this immutable generation.
-    ///
-    /// Semantic owners use these identities with [`Self::object`] to rebuild
-    /// their generation-pinned read views. Mutation remains exclusive to the
-    /// Catalog Writer.
-    pub fn object_identities(&self) -> impl Iterator<Item = CatalogObjectId> + '_ {
-        self.0.objects.keys().copied()
-    }
-
-    pub(crate) fn plaintext_objects(&self) -> impl Iterator<Item = &[u8]> {
-        self.0.objects.values().map(AsRef::as_ref)
-    }
-
-    #[must_use]
-    pub fn governance_audit_frontier(&self) -> u64 {
-        self.0.audit_frontier.position
-    }
-}
-
-impl std::fmt::Debug for CatalogSnapshot {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CatalogSnapshot")
-            .field("identity", &self.0.identity)
-            .field("number", &self.0.number)
-            .field("format_epoch", &self.0.format_epoch)
-            .field("object_count", &self.0.objects.len())
-            .field("audit_frontier", &self.0.audit_frontier.position)
-            .finish()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct AuditFrontier {
-    pub(super) position: u64,
-    pub(super) hash: [u8; 32],
-}
-
-impl AuditFrontier {
-    pub(super) const ORIGIN: Self = Self {
-        position: 0,
-        hash: [0_u8; 32],
-    };
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceAuditRecord {
     pub(super) position: u64,
@@ -456,73 +375,3 @@ impl CatalogCommit {
         self.audit.as_ref()
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CatalogFailureCode {
-    InvalidInput,
-    LimitExceeded,
-    StaleGeneration,
-    IdempotencyConflict,
-    StorageUnavailable,
-    IntegrityCorruption,
-    AuthenticationFailed,
-    ConcurrentWriter,
-    ResourceAdmissionRefused,
-    UnsupportedFormat,
-}
-
-#[derive(Debug)]
-pub struct CatalogFailure {
-    pub(super) code: CatalogFailureCode,
-    pub(super) current: Option<CatalogGenerationId>,
-    pub(super) admission: Option<crate::AdmissionFailure>,
-}
-
-impl CatalogFailure {
-    pub(crate) const fn new(code: CatalogFailureCode) -> Self {
-        Self {
-            code,
-            current: None,
-            admission: None,
-        }
-    }
-
-    pub(super) const fn stale(current: CatalogGenerationId) -> Self {
-        Self {
-            code: CatalogFailureCode::StaleGeneration,
-            current: Some(current),
-            admission: None,
-        }
-    }
-
-    pub(super) const fn admission(admission: crate::AdmissionFailure) -> Self {
-        Self {
-            code: CatalogFailureCode::ResourceAdmissionRefused,
-            current: None,
-            admission: Some(admission),
-        }
-    }
-
-    #[must_use]
-    pub const fn code(&self) -> CatalogFailureCode {
-        self.code
-    }
-
-    #[must_use]
-    pub const fn current_generation(&self) -> Option<CatalogGenerationId> {
-        self.current
-    }
-
-    #[must_use]
-    pub const fn admission_failure(&self) -> Option<crate::AdmissionFailure> {
-        self.admission
-    }
-}
-
-impl Display for CatalogFailure {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("catalog operation failed")
-    }
-}
-
-impl Error for CatalogFailure {}

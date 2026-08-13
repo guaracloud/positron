@@ -2,7 +2,6 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
-use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::catalog::{CatalogSecret, InstanceId};
@@ -356,30 +355,6 @@ impl BootstrapKeyCustody {
         )
         .map(|verified| Zeroizing::new(verified.as_plaintext().to_vec()))
         .map_err(map_frame)
-    }
-
-    pub fn salted_secret_hash(
-        &self,
-        salt: &[u8; 32],
-        secret: &[u8; 32],
-    ) -> Result<[u8; 32], BootstrapKeyFailure> {
-        let mut input = Zeroizing::new(Vec::with_capacity(96));
-        input.extend_from_slice(b"positron-bootstrap-api-key-hash-v1\0");
-        input.extend_from_slice(salt);
-        input.extend_from_slice(secret);
-        DataProtection::hash(&input).map_err(map_frame)
-    }
-
-    /// Verifies a bootstrap API credential without exposing the hash backend
-    /// or using an ordinary early-exit byte comparison.
-    pub fn verify_salted_secret_hash(
-        &self,
-        salt: &[u8; 32],
-        secret: &[u8; 32],
-        expected: &[u8; 32],
-    ) -> Result<bool, BootstrapKeyFailure> {
-        let actual = self.salted_secret_hash(salt, secret)?;
-        Ok(bool::from(actual.ct_eq(expected)))
     }
 
     pub fn integrity_identity(

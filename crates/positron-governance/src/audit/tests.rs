@@ -1,7 +1,7 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 
 use super::GovernanceAuditEntry;
-use crate::{InitialGovernanceIntent, InitialTenantIntent};
+use crate::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 
 fn audit_intent() -> Vec<u8> {
     InitialGovernanceIntent::create_tenant(
@@ -21,6 +21,7 @@ fn audit_intent() -> Vec<u8> {
             1,
             1,
             [1; 11],
+            InitialAuditContext::new(1_725_000_001, [11; 16], true).expect("audit context"),
         )
         .expect("intent"),
     )
@@ -37,6 +38,11 @@ fn committed_initial_audit_has_typed_redacted_meaning() {
     assert_eq!(entry.tenant_id().map(TenantId::to_bytes), Some([2; 16]));
     assert_eq!(entry.action(), "instance.initialize");
     assert_eq!(entry.outcome(), "succeeded");
+    assert_eq!(entry.ingest_time_unix_seconds(), 1_725_000_001);
+    assert_eq!(entry.target(), [1; 16]);
+    assert_eq!(entry.request_id(), [11; 16]);
+    assert_eq!(entry.metadata().initialization_mode(), "non-interactive");
+    assert_eq!(entry.metadata().tenant_slug(), "default");
 }
 
 #[test]
@@ -51,4 +57,15 @@ fn audit_decoder_rejects_truncation_corruption_and_trailing_data() {
     let mut trailing = intent;
     trailing.push(0);
     assert!(GovernanceAuditEntry::decode_intent(1, &trailing).is_err());
+
+    for range in [8..16, 70..86, 96..112] {
+        let mut zeroed = audit_intent();
+        zeroed[range].fill(0);
+        assert!(GovernanceAuditEntry::decode_intent(1, &zeroed).is_err());
+    }
+    for (offset, value) in [(32, 2), (69, 2), (112, 2)] {
+        let mut invalid_tag = audit_intent();
+        invalid_tag[offset] = value;
+        assert!(GovernanceAuditEntry::decode_intent(1, &invalid_tag).is_err());
+    }
 }

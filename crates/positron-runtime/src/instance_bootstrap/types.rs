@@ -156,14 +156,14 @@ impl InitializedInstance {
             .attribute(&self.key, credential, intent, hints)
     }
 
-    #[must_use]
-    pub fn governance_audit_records(&self) -> Vec<positron_governance::GovernanceAuditEntry> {
-        self.audit.clone()
-    }
-
-    #[must_use]
-    pub fn identity_reservations(&self) -> positron_governance::IdentityReservations<'_, '_> {
-        self.identity.reservations(&self.key)
+    pub fn inspect_governance(
+        &self,
+        context: positron_governance::AuthorizedContext,
+    ) -> Result<
+        positron_governance::GovernanceInspection<'_, '_>,
+        positron_governance::AttributionFailure,
+    > {
+        self.identity.inspect(context, &self.audit)
     }
 
     #[must_use]

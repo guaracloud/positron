@@ -14,10 +14,10 @@ use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 mod audit;
 mod identity;
 
-pub use audit::GovernanceAuditEntry;
+pub use audit::{GovernanceAuditEntry, InitialAuditMetadata};
 pub use identity::{
-    AttributionFailure, AuthorizedContext, CompatibilityHints, Identity, IdentityFailure,
-    IdentityReservations, PresentedCredential, RequestedIntent,
+    AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
+    IdentityFailure, PresentedCredential, RequestedIntent,
 };
 
 const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV01";
@@ -45,6 +45,33 @@ pub struct InitialTenantIntent {
     quota_generation: u64,
     quota_weight: u32,
     quota_resources: [u64; 11],
+    audit: InitialAuditContext,
+}
+
+/// Deterministic, non-secret evidence assigned by Instance Bootstrap before
+/// the joint Catalog and governance-audit commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitialAuditContext {
+    ingest_time_unix_seconds: u64,
+    request_id: [u8; 16],
+    non_interactive: bool,
+}
+
+impl InitialAuditContext {
+    pub fn new(
+        ingest_time_unix_seconds: u64,
+        request_id: [u8; 16],
+        non_interactive: bool,
+    ) -> Result<Self, GovernanceIntentFailure> {
+        if ingest_time_unix_seconds == 0 || request_id.iter().all(|byte| *byte == 0) {
+            return Err(GovernanceIntentFailure);
+        }
+        Ok(Self {
+            ingest_time_unix_seconds,
+            request_id,
+            non_interactive,
+        })
+    }
 }
 
 impl InitialTenantIntent {
@@ -68,6 +95,7 @@ impl InitialTenantIntent {
         quota_generation: u64,
         quota_weight: u32,
         quota_resources: [u64; 11],
+        audit: InitialAuditContext,
     ) -> Result<Self, GovernanceIntentFailure> {
         if instance.iter().all(|byte| *byte == 0)
             || display_name.is_empty()
@@ -97,6 +125,7 @@ impl InitialTenantIntent {
             quota_generation,
             quota_weight,
             quota_resources,
+            audit,
         })
     }
 }
@@ -119,6 +148,7 @@ impl InitialGovernanceIntent {
             quota_generation,
             quota_weight,
             quota_resources,
+            audit: audit_context,
         } = intent;
         if protected_integrity_key.is_empty() || protected_integrity_key.len() > u16::MAX as usize {
             return Err(GovernanceIntentFailure);
@@ -171,14 +201,22 @@ impl InitialGovernanceIntent {
         // Active lifecycle, system-administration scope, policy generation 1,
         // and independent local-key recovery required.
         object.extend_from_slice(&[1, 4, 0, 1, 1]);
-        let mut audit = Vec::with_capacity(74);
+        let mut audit = Vec::with_capacity(128);
         audit.extend_from_slice(&GOVERNANCE_AUDIT_MAGIC);
+        audit.extend_from_slice(&audit_context.ingest_time_unix_seconds.to_be_bytes());
         audit.extend_from_slice(&principal.to_bytes());
+        audit.push(1);
         audit.extend_from_slice(&tenant.to_bytes());
         audit.push(19);
         audit.extend_from_slice(b"instance.initialize");
+        audit.push(1);
+        audit.extend_from_slice(&instance);
         audit.push(9);
         audit.extend_from_slice(b"succeeded");
+        audit.extend_from_slice(&audit_context.request_id);
+        audit.push(u8::from(audit_context.non_interactive));
+        audit.push(slug_length);
+        audit.extend_from_slice(slug_bytes);
         Ok(Self { object, audit })
     }
 
@@ -198,6 +236,14 @@ impl Display for GovernanceIntentFailure {
 }
 
 impl Error for GovernanceIntentFailure {}
+
+/// Narrow parser entry point used only by the fuzz build. Product callers use
+/// generation-pinned [`Identity`] and committed [`GovernanceAuditEntry`] values.
+#[cfg(fuzzing)]
+pub fn fuzz_parse_governance(identity: &[u8], audit: &[u8]) {
+    let _ = identity::codec::decode_initial_identity(identity);
+    let _ = GovernanceAuditEntry::decode_intent(1, audit);
+}
 
 #[cfg(test)]
 #[path = "tests/initial_tenant.rs"]

@@ -1,18 +1,45 @@
-use positron_domain::identity::{PrincipalId, TenantId};
+use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
 
 const MAGIC: [u8; 8] = *b"POSAUD01";
 
+/// Bounded, non-secret metadata for the initial instance operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialAuditMetadata {
+    non_interactive: bool,
+    tenant_slug: TenantSlug,
+}
+
+impl InitialAuditMetadata {
+    #[must_use]
+    pub const fn initialization_mode(&self) -> &'static str {
+        if self.non_interactive {
+            "non-interactive"
+        } else {
+            "interactive"
+        }
+    }
+
+    #[must_use]
+    pub fn tenant_slug(&self) -> &str {
+        self.tenant_slug.as_str()
+    }
+}
+
 /// Administration-owned meaning reconstructed from one committed kernel audit entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceAuditEntry {
     position: u64,
+    ingest_time_unix_seconds: u64,
     principal: PrincipalId,
     tenant: Option<TenantId>,
     action: String,
+    target: [u8; 16],
     outcome: String,
+    request_id: [u8; 16],
+    metadata: InitialAuditMetadata,
 }
 
 impl GovernanceAuditEntry {
@@ -20,36 +47,58 @@ impl GovernanceAuditEntry {
         Self::decode_intent(record.position(), record.intent())
     }
 
-    fn decode_intent(position: u64, encoded: &[u8]) -> Result<Self, IdentityFailure> {
-        if encoded.get(..8) != Some(MAGIC.as_slice()) {
+    pub(crate) fn decode_intent(position: u64, encoded: &[u8]) -> Result<Self, IdentityFailure> {
+        let mut cursor = Cursor::new(encoded);
+        if cursor.take_array::<8>()? != MAGIC {
+            return Err(IdentityFailure);
+        }
+        let ingest_time_unix_seconds = cursor.take_u64()?;
+        if ingest_time_unix_seconds == 0 {
             return Err(IdentityFailure);
         }
         let principal =
-            PrincipalId::from_bytes(take_array(encoded, 8)?).map_err(|_| IdentityFailure)?;
-        let tenant = TenantId::from_bytes(take_array(encoded, 24)?)
-            .map(Some)
-            .map_err(|_| IdentityFailure)?;
-        let action_length = usize::from(*encoded.get(40).ok_or(IdentityFailure)?);
-        let action_start = 41_usize;
-        let action_end = action_start
-            .checked_add(action_length)
-            .ok_or(IdentityFailure)?;
-        let action = take_text(encoded, action_start, action_end)?;
-        let outcome_length = usize::from(*encoded.get(action_end).ok_or(IdentityFailure)?);
-        let outcome_start = action_end.checked_add(1).ok_or(IdentityFailure)?;
-        let outcome_end = outcome_start
-            .checked_add(outcome_length)
-            .ok_or(IdentityFailure)?;
-        let outcome = take_text(encoded, outcome_start, outcome_end)?;
-        if outcome_end != encoded.len() {
+            PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+        let tenant = match cursor.take_u8()? {
+            0 => None,
+            1 => Some(TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?),
+            _ => return Err(IdentityFailure),
+        };
+        let action = cursor.take_text_u8(128)?.to_owned();
+        if action.is_empty() || cursor.take_u8()? != 1 {
+            return Err(IdentityFailure);
+        }
+        let target = cursor.take_array()?;
+        if target.iter().all(|byte| *byte == 0) {
+            return Err(IdentityFailure);
+        }
+        let outcome = cursor.take_text_u8(64)?.to_owned();
+        let request_id = cursor.take_array()?;
+        if outcome.is_empty() || request_id.iter().all(|byte| *byte == 0) {
+            return Err(IdentityFailure);
+        }
+        let non_interactive = match cursor.take_u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(IdentityFailure),
+        };
+        let tenant_slug =
+            TenantSlug::parse_canonical(cursor.take_text_u8(63)?).map_err(|_| IdentityFailure)?;
+        if !cursor.is_empty() {
             return Err(IdentityFailure);
         }
         Ok(Self {
             position,
+            ingest_time_unix_seconds,
             principal,
             tenant,
-            action: action.to_owned(),
-            outcome: outcome.to_owned(),
+            action,
+            target,
+            outcome,
+            request_id,
+            metadata: InitialAuditMetadata {
+                non_interactive,
+                tenant_slug,
+            },
         })
     }
 
@@ -57,42 +106,76 @@ impl GovernanceAuditEntry {
     pub const fn position(&self) -> u64 {
         self.position
     }
-
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
     #[must_use]
     pub const fn principal_id(&self) -> PrincipalId {
         self.principal
     }
-
     #[must_use]
     pub const fn tenant_id(&self) -> Option<TenantId> {
         self.tenant
     }
-
     #[must_use]
     pub fn action(&self) -> &str {
         &self.action
     }
-
+    #[must_use]
+    pub const fn target(&self) -> [u8; 16] {
+        self.target
+    }
     #[must_use]
     pub fn outcome(&self) -> &str {
         &self.outcome
+    }
+    #[must_use]
+    pub const fn request_id(&self) -> [u8; 16] {
+        self.request_id
+    }
+    #[must_use]
+    pub const fn metadata(&self) -> &InitialAuditMetadata {
+        &self.metadata
+    }
+}
+
+struct Cursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(remaining: &'a [u8]) -> Self {
+        Self { remaining }
+    }
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], IdentityFailure> {
+        let (value, rest) = self.remaining.split_at_checked(N).ok_or(IdentityFailure)?;
+        self.remaining = rest;
+        value.try_into().map_err(|_| IdentityFailure)
+    }
+    fn take_u8(&mut self) -> Result<u8, IdentityFailure> {
+        Ok(self.take_array::<1>()?[0])
+    }
+    fn take_u64(&mut self) -> Result<u64, IdentityFailure> {
+        self.take_array().map(u64::from_be_bytes)
+    }
+    fn take_text_u8(&mut self, maximum: usize) -> Result<&'a str, IdentityFailure> {
+        let length = usize::from(self.take_u8()?);
+        if length > maximum {
+            return Err(IdentityFailure);
+        }
+        let (value, rest) = self
+            .remaining
+            .split_at_checked(length)
+            .ok_or(IdentityFailure)?;
+        self.remaining = rest;
+        std::str::from_utf8(value).map_err(|_| IdentityFailure)
+    }
+    const fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
     }
 }
 
 #[cfg(test)]
 #[path = "audit/tests.rs"]
 mod tests;
-
-fn take_array<const N: usize>(encoded: &[u8], start: usize) -> Result<[u8; N], IdentityFailure> {
-    encoded
-        .get(start..start.saturating_add(N))
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or(IdentityFailure)
-}
-
-fn take_text(encoded: &[u8], start: usize, end: usize) -> Result<&str, IdentityFailure> {
-    encoded
-        .get(start..end)
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .ok_or(IdentityFailure)
-}

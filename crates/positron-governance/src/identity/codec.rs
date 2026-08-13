@@ -4,12 +4,13 @@ use super::{Identity, IdentityFailure};
 
 pub(super) const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV01";
 
-pub(super) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, IdentityFailure> {
+pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, IdentityFailure> {
     let mut cursor = Cursor::new(encoded);
     if cursor.take_array::<8>()? != GOVERNANCE_OBJECT_MAGIC {
         return Err(IdentityFailure);
     }
-    require_nonzero(cursor.take_array::<16>()?)?;
+    let instance = cursor.take_array::<16>()?;
+    require_nonzero(instance)?;
     let tenant = TenantId::from_bytes(cursor.take_array::<16>()?).map_err(|_| IdentityFailure)?;
     let slug = cursor.take_text_u8(63)?;
     let tenant_slug = TenantSlug::parse_canonical(slug).map_err(|_| IdentityFailure)?;
@@ -37,6 +38,7 @@ pub(super) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
         return Err(IdentityFailure);
     }
     Ok(Identity {
+        instance,
         principal,
         tenant,
         tenant_slug,

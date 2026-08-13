@@ -80,28 +80,49 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
     let slug = initialized.default_tenant_slug().clone();
     let administrator = initialized.system_administrator_id();
     let first_generation = initialized.catalog_generation();
-    let audit = initialized.governance_audit_records();
+    drop(initialized);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let administrator_context = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let inspection = initialized.inspect_governance(administrator_context)?;
+    let audit = inspection.audit_records().to_vec();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].position(), 1);
     assert_eq!(audit[0].principal_id(), administrator);
     assert_eq!(audit[0].tenant_id(), Some(tenant));
     assert_eq!(audit[0].action(), "instance.initialize");
     assert_eq!(audit[0].outcome(), "succeeded");
+    assert!(audit[0].ingest_time_unix_seconds() > 0);
+    assert_eq!(audit[0].target(), initialized.instance_id().to_bytes());
+    assert_ne!(audit[0].request_id(), [0; 16]);
+    assert_eq!(audit[0].metadata().initialization_mode(), "non-interactive");
+    assert_eq!(audit[0].metadata().tenant_slug(), slug.as_str());
+    assert!(inspection.contains_tenant_id(tenant));
+    assert!(inspection.contains_tenant_slug(&slug));
     drop(initialized);
 
-    let claim = InstanceBootstrap::claim(&paths)?;
     let reopened = InstanceBootstrap::reopen(&paths)?;
     assert!(reopened.catalog_generation() >= first_generation);
-    assert_eq!(reopened.governance_audit_records(), audit);
-    let reservations = reopened.identity_reservations();
-    assert!(reservations.contains_tenant_id(tenant));
-    assert!(reservations.contains_tenant_slug(&slug));
-    assert!(reservations.contains_credential(PresentedCredential::parse(claim.secret())?)?);
+    let context = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(reopened.inspect_governance(context)?.audit_records(), audit);
     drop(reopened);
 
     let retried = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
     assert!(retried.catalog_generation() >= first_generation);
-    assert_eq!(retried.governance_audit_records(), audit);
+    let context = retried.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(retried.inspect_governance(context)?.audit_records(), audit);
     Ok(())
 }
 

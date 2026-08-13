@@ -1,8 +1,10 @@
-use positron_domain::identity::{PrincipalId, Scope, TenantId, TenantSlug};
+use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug};
 
 use super::codec::decode_initial_identity;
-use super::{AttributionFailure, CompatibilityHints, PresentedCredential, RequestedIntent};
-use crate::{InitialGovernanceIntent, InitialTenantIntent};
+use super::{
+    AttributionFailure, AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
+};
+use crate::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 
 fn encoded_identity() -> Vec<u8> {
     let intent = InitialTenantIntent::new(
@@ -21,6 +23,7 @@ fn encoded_identity() -> Vec<u8> {
         1,
         1,
         [10; 11],
+        InitialAuditContext::new(1_725_000_001, [11; 16], true).expect("audit context"),
     )
     .expect("intent");
     InitialGovernanceIntent::create_tenant(intent)
@@ -100,4 +103,41 @@ fn credential_and_alias_parsers_are_bounded_canonical_and_redacted() {
     }
     assert_eq!(CompatibilityHints::none().external_alias, None);
     assert_eq!(RequestedIntent::Query, RequestedIntent::Query);
+}
+
+#[test]
+fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape() {
+    let identity = decode_initial_identity(&encoded_identity()).expect("identity");
+    let expected = AttributionFailure.to_string();
+    for context in [
+        AuthorizedContext {
+            principal: identity.principal,
+            scope: Scope::Ingest,
+            tenant: Some(
+                TenantAttribution::new(identity.principal, Scope::Ingest, identity.tenant)
+                    .expect("tenant context"),
+            ),
+            authority: identity.instance,
+        },
+        AuthorizedContext {
+            principal: identity.principal,
+            scope: Scope::SystemAdministration,
+            tenant: None,
+            authority: [99; 16],
+        },
+        AuthorizedContext {
+            principal: PrincipalId::from_bytes([99; 16]).expect("forged principal"),
+            scope: Scope::SystemAdministration,
+            tenant: None,
+            authority: identity.instance,
+        },
+    ] {
+        assert_eq!(
+            identity
+                .inspect(context, &[])
+                .expect_err("invalid authority")
+                .to_string(),
+            expected
+        );
+    }
 }

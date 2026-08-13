@@ -72,6 +72,14 @@ fn corrupt(path: &Path, selector: usize) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    let split = data.len() / 2;
+    positron_governance::fuzz_parse_governance(&data[..split], &data[split..]);
+    if let Ok(text) = std::str::from_utf8(data) {
+        if let Ok(credential) = PresentedCredential::parse(text) {
+            assert!(!format!("{credential:?}").contains(text));
+        }
+        let _ = CompatibilityHints::external_tenant_alias(text);
+    }
     if data.is_empty() || data.len() > 24 || data[0] & 7 != 0 {
         return;
     }
@@ -142,6 +150,10 @@ fuzz_target!(|data: &[u8]| {
                         )
                         .expect("the claimed bootstrap principal remains authoritative");
                     assert_eq!(authorized.tenant_attribution(), None);
+                    let audit = instance
+                        .inspect_governance(authorized)
+                        .expect("system administration authorizes governance inspection");
+                    assert_eq!(audit.audit_records().len(), 1);
                     let presented = PresentedCredential::parse(secret)
                         .expect("a claimed credential retains canonical syntax");
                     assert!(
@@ -153,6 +165,41 @@ fuzz_target!(|data: &[u8]| {
                             )
                             .is_err()
                     );
+                    let hinted = PresentedCredential::parse(secret)
+                        .expect("a claimed credential retains canonical syntax");
+                    assert!(
+                        instance
+                            .attribute(
+                                hinted,
+                                RequestedIntent::SystemAdministration,
+                                CompatibilityHints::external_tenant_alias("forged")
+                                    .expect("bounded fuzz hint"),
+                            )
+                            .is_err()
+                    );
+                }
+            },
+            7 => {
+                if let (Some(secret), Ok(instance)) =
+                    (credential.as_deref(), InstanceBootstrap::reopen(&paths))
+                {
+                    let context = instance
+                        .attribute(
+                            PresentedCredential::parse(secret)
+                                .expect("claimed credential remains canonical"),
+                            RequestedIntent::SystemAdministration,
+                            CompatibilityHints::none(),
+                        )
+                        .expect("claimed credential remains authoritative");
+                    if let Some(other) = FuzzRoots::new()
+                        && let Some(other_paths) = other.paths()
+                        && let Ok(other_instance) = InstanceBootstrap::initialize(
+                            &other_paths,
+                            InitializationPlan::non_interactive(),
+                        )
+                    {
+                        assert!(other_instance.inspect_governance(context).is_err());
+                    }
                 }
             },
             _ => {

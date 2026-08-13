@@ -1,6 +1,6 @@
 //! Generation-pinned identity and Tenant Attribution for the M1 bootstrap state.
 
-mod codec;
+pub(super) mod codec;
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]
@@ -13,28 +13,18 @@ use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId,
 use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot};
 use zeroize::Zeroizing;
 
+use crate::GovernanceAuditEntry;
+
 use codec::{GOVERNANCE_OBJECT_MAGIC, decode_initial_identity};
 
 /// The sole immutable identity view reconstructed from one Catalog Generation.
 pub struct Identity {
+    instance: [u8; 16],
     principal: PrincipalId,
     tenant: TenantId,
     tenant_slug: TenantSlug,
     salt: [u8; 32],
     hash: [u8; 32],
-}
-
-impl Identity {
-    #[must_use]
-    pub fn reservations<'identity, 'keys>(
-        &'identity self,
-        keys: &'keys BootstrapKeyCustody,
-    ) -> IdentityReservations<'identity, 'keys> {
-        IdentityReservations {
-            identity: self,
-            keys,
-        }
-    }
 }
 
 impl Identity {
@@ -78,11 +68,32 @@ impl Identity {
                 principal: self.principal,
                 scope: Scope::SystemAdministration,
                 tenant: None,
+                authority: self.instance,
             }),
             RequestedIntent::Ingest
             | RequestedIntent::Query
             | RequestedIntent::TenantAdministration => Err(AttributionFailure),
         }
+    }
+
+    /// Authorizes the narrow read-only governance view without introducing a
+    /// general administration API.
+    pub fn inspect<'identity, 'audit>(
+        &'identity self,
+        context: AuthorizedContext,
+        audit: &'audit [GovernanceAuditEntry],
+    ) -> Result<GovernanceInspection<'identity, 'audit>, AttributionFailure> {
+        if context.principal != self.principal
+            || context.scope != Scope::SystemAdministration
+            || context.tenant.is_some()
+            || context.authority != self.instance
+        {
+            return Err(AttributionFailure);
+        }
+        Ok(GovernanceInspection {
+            identity: self,
+            audit,
+        })
     }
 }
 
@@ -184,6 +195,7 @@ pub struct AuthorizedContext {
     principal: PrincipalId,
     scope: Scope,
     tenant: Option<TenantAttribution>,
+    authority: [u8; 16],
 }
 
 impl AuthorizedContext {
@@ -227,14 +239,20 @@ impl Display for IdentityFailure {
 
 impl Error for IdentityFailure {}
 
-/// A generation-pinned permanent reservation view. M1 creates only the
-/// initialization identities; it does not expose later lifecycle mutation.
-pub struct IdentityReservations<'identity, 'keys> {
+/// A closed, read-only governance capability created only from an authorized
+/// system-administration context bound to this identity authority.
+#[derive(Debug)]
+pub struct GovernanceInspection<'identity, 'audit> {
     identity: &'identity Identity,
-    keys: &'keys BootstrapKeyCustody,
+    audit: &'audit [GovernanceAuditEntry],
 }
 
-impl IdentityReservations<'_, '_> {
+impl GovernanceInspection<'_, '_> {
+    #[must_use]
+    pub const fn audit_records(&self) -> &[GovernanceAuditEntry] {
+        self.audit
+    }
+
     #[must_use]
     pub fn contains_tenant_id(&self, candidate: TenantId) -> bool {
         self.identity.tenant == candidate
@@ -243,14 +261,5 @@ impl IdentityReservations<'_, '_> {
     #[must_use]
     pub fn contains_tenant_slug(&self, candidate: &TenantSlug) -> bool {
         &self.identity.tenant_slug == candidate
-    }
-
-    pub fn contains_credential(
-        &self,
-        candidate: PresentedCredential,
-    ) -> Result<bool, AttributionFailure> {
-        self.keys
-            .verify_salted_secret_hash(&self.identity.salt, candidate.secret(), &self.identity.hash)
-            .map_err(|_| AttributionFailure)
     }
 }

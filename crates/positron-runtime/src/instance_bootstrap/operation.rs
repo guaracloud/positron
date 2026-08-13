@@ -1,6 +1,6 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_governance::Identity;
-use positron_governance::{InitialGovernanceIntent, InitialTenantIntent};
+use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
     AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
     BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal, FormatEpoch, InstanceId,
@@ -165,6 +165,12 @@ fn resume(
         1,
         1,
         resources::initial_tenant_quota(),
+        InitialAuditContext::new(
+            key.identity().created_at_unix_seconds(),
+            record.transaction.to_bytes(),
+            plan.creates_claim(),
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
     )
     .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let governance = InitialGovernanceIntent::create_tenant(tenant_intent)
