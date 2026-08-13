@@ -323,6 +323,15 @@ impl CatalogSnapshot {
         Ok(self.0.objects.get(&identity).map(AsRef::as_ref))
     }
 
+    /// Returns the bounded identities reachable from this immutable generation.
+    ///
+    /// Semantic owners use these identities with [`Self::object`] to rebuild
+    /// their generation-pinned read views. Mutation remains exclusive to the
+    /// Catalog Writer.
+    pub fn object_identities(&self) -> impl Iterator<Item = CatalogObjectId> + '_ {
+        self.0.objects.keys().copied()
+    }
+
     pub(crate) fn plaintext_objects(&self) -> impl Iterator<Item = &[u8]> {
         self.0.objects.values().map(AsRef::as_ref)
     }

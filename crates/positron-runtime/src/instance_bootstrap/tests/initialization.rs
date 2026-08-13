@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{MountQualification, PrimaryDataVolume};
 use positron_runtime::{
     BootstrapFailureCode, BootstrapPaths, BootstrapState, InitializationPlan, InstanceBootstrap,
@@ -54,6 +55,36 @@ fn set_owner_only(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[test]
+fn reopened_identity_authenticates_the_hash_only_administrator_without_impersonation()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let administrator = initialized.system_administrator_id();
+    drop(initialized);
+
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let authorized = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+
+    assert_eq!(authorized.principal_id(), administrator);
+    assert_eq!(authorized.tenant_attribution(), None);
+    let rejected = reopened
+        .attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::Ingest,
+            CompatibilityHints::none(),
+        )
+        .expect_err("a system administrator cannot impersonate a tenant principal");
+    assert_eq!(rejected.to_string(), "credential or authority was rejected");
+    Ok(())
 }
 
 #[test]

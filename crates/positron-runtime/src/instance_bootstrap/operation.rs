@@ -1,22 +1,23 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_governance::Identity;
 use positron_governance::{InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
-    ActiveSegmentLedger, AuditIntent, BootstrapArtifact, BootstrapArtifactAccess,
-    BootstrapKeyCustody, BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal,
-    FormatEpoch, InstanceId, OwnedPrimaryDataVolume, SegmentScope, StorageKernelResourceAuthority,
-    TransactionId,
+    AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
+    BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal, FormatEpoch, InstanceId,
+    OwnedPrimaryDataVolume, TransactionId,
 };
 use zeroize::Zeroizing;
 
-use super::codec::{BootstrapRecord, decode_claim, encode_claim};
+use super::codec::{BootstrapRecord, decode_claim};
 use super::storage::{self, INTENT};
 use super::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
     InitializationPlan, InitializedInstance, resources,
 };
 
+mod completion;
 pub(super) mod support;
+use completion::{ensure_claim, governance_audit_records, open_initial_ledgers, outcome};
 use support::{
     acquire, catalog_failure, entropy_failure, format_secret, inconsistent, key_failure,
     recover_pending_replacement, require_key_identity,
@@ -206,8 +207,20 @@ fn resume(
             audit.position()
         });
     let claim_available = storage::exists(&access, BootstrapArtifact::Claim)?;
+    let identity = Identity::open(&current)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let audit_records = governance_audit_records(&catalog)?;
     drop(catalog);
-    outcome(&record, key, authority, generation, audit, claim_available)
+    outcome(
+        &record,
+        key,
+        identity,
+        audit_records,
+        authority,
+        generation,
+        audit,
+        claim_available,
+    )
 }
 
 pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, BootstrapFailure> {
@@ -234,8 +247,20 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let generation = current.number();
     let audit = current.governance_audit_frontier();
     let claim_available = storage::exists(&access, BootstrapArtifact::Claim)?;
+    let identity = Identity::open(&current)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let audit_records = governance_audit_records(&catalog)?;
     drop(catalog);
-    outcome(&record, key, authority, generation, audit, claim_available)
+    outcome(
+        &record,
+        key,
+        identity,
+        audit_records,
+        authority,
+        generation,
+        audit,
+        claim_available,
+    )
 }
 
 pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapFailure> {
@@ -319,72 +344,4 @@ pub(super) fn decode_record(
         ));
     }
     Ok(record)
-}
-
-fn open_initial_ledgers(
-    authority: &positron_kernel::StorageKernelResourceAuthority,
-    catalog: &Catalog<'_>,
-    key: &BootstrapKeyCustody,
-    record: &BootstrapRecord,
-) -> Result<(), BootstrapFailure> {
-    let shard = VirtualShardId::new(1)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-    for signal in [SignalKind::Logs, SignalKind::Traces] {
-        let scope = SegmentScope::new(record.tenant, signal, shard);
-        let protection = key
-            .segment_key(record.instance, scope)
-            .map_err(key_failure)?;
-        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, protection)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable))?;
-        drop(ledger);
-    }
-    Ok(())
-}
-
-fn ensure_claim(
-    access: &BootstrapArtifactAccess,
-    key: &BootstrapKeyCustody,
-    record: &BootstrapRecord,
-    secret: &[u8; 32],
-) -> Result<(), BootstrapFailure> {
-    let plaintext = encode_claim(record.instance, record.administrator, secret);
-    let encrypted = key
-        .protect(record.instance, BootstrapObjectPurpose::Claim, &plaintext)
-        .map_err(key_failure)?;
-    if storage::exists(access, BootstrapArtifact::Claim)? {
-        let existing = storage::read(access, BootstrapArtifact::Claim)?;
-        let opened = key
-            .open_object(record.instance, BootstrapObjectPurpose::Claim, &existing)
-            .map_err(key_failure)?;
-        if opened != plaintext {
-            return Err(BootstrapFailure::new(
-                BootstrapFailureCode::IdentityMismatch,
-            ));
-        }
-        Ok(())
-    } else {
-        storage::write_new(access, BootstrapArtifact::Claim, &encrypted)
-    }
-}
-
-fn outcome(
-    record: &BootstrapRecord,
-    key: BootstrapKeyCustody,
-    authority: StorageKernelResourceAuthority,
-    generation: u64,
-    audit: u64,
-    claim_available: bool,
-) -> Result<InitializedInstance, BootstrapFailure> {
-    Ok(InitializedInstance {
-        _key: key,
-        _authority: authority,
-        instance: record.instance,
-        tenant: record.tenant,
-        tenant_slug: BootstrapRecord::tenant_slug()?,
-        administrator: record.administrator,
-        integrity_key_fingerprint: record.integrity_fingerprint,
-        catalog_generation: generation,
-        governance_audit_frontier: audit,
-        claim_available,
-    })
 }

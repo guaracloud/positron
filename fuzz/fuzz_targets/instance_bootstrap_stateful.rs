@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use libfuzzer_sys::fuzz_target;
+use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_runtime::{
     BootstrapFailureCode, BootstrapPaths, InitializationPlan, InstanceBootstrap,
 };
@@ -83,6 +84,7 @@ fuzz_target!(|data: &[u8]| {
     let mut identity = None;
     let mut integrity = None;
     let mut claim_released = false;
+    let mut credential = None;
     for (index, command) in data.iter().copied().enumerate() {
         match command & 7 {
             0 | 1 => {
@@ -117,6 +119,7 @@ fuzz_target!(|data: &[u8]| {
                     assert!(claim.secret().starts_with("pos_"));
                     assert_eq!(claim.secret().len(), 68);
                     claim_released = true;
+                    credential = Some(claim.secret().to_owned());
                 },
                 Err(failure) if claim_released => {
                     assert_eq!(failure.code(), BootstrapFailureCode::ClaimUnavailable);
@@ -126,9 +129,35 @@ fuzz_target!(|data: &[u8]| {
             4 => corrupt(&roots.secrets.join("bootstrap-claim.v1"), index),
             5 => corrupt(&roots.data.join(".positron-bootstrap.initialized"), index),
             6 => {
+                if let (Some(secret), Ok(instance)) =
+                    (credential.as_deref(), InstanceBootstrap::reopen(&paths))
+                {
+                    let presented = PresentedCredential::parse(secret)
+                        .expect("a claimed credential retains canonical syntax");
+                    let authorized = instance
+                        .attribute(
+                            presented,
+                            RequestedIntent::SystemAdministration,
+                            CompatibilityHints::none(),
+                        )
+                        .expect("the claimed bootstrap principal remains authoritative");
+                    assert_eq!(authorized.tenant_attribution(), None);
+                    let presented = PresentedCredential::parse(secret)
+                        .expect("a claimed credential retains canonical syntax");
+                    assert!(
+                        instance
+                            .attribute(
+                                presented,
+                                RequestedIntent::Ingest,
+                                CompatibilityHints::none(),
+                            )
+                            .is_err()
+                    );
+                }
+            },
+            _ => {
                 let _ = InstanceBootstrap::classify(&paths);
             },
-            _ => {},
         }
     }
 });

@@ -12,6 +12,8 @@ publish = false
 
 [dependencies]
 positron-domain = { path = "../positron-domain" }
+positron-kernel = { path = "../positron-kernel" }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true

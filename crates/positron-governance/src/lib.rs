@@ -11,9 +11,17 @@ use std::fmt::{Display, Formatter};
 
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 
+mod audit;
+mod identity;
+
+pub use audit::GovernanceAuditEntry;
+pub use identity::{
+    AttributionFailure, AuthorizedContext, CompatibilityHints, Identity, IdentityFailure,
+    IdentityReservations, PresentedCredential, RequestedIntent,
+};
+
 const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV01";
-const GOVERNANCE_AUDIT_INTENT: &[u8] =
-    b"principal=bootstrap;action=instance.initialize;target=default-tenant;outcome=succeeded";
+const GOVERNANCE_AUDIT_MAGIC: [u8; 8] = *b"POSAUD01";
 
 /// Administration-owned semantic proposal for the initial governance state.
 pub struct InitialGovernanceIntent {
@@ -163,10 +171,15 @@ impl InitialGovernanceIntent {
         // Active lifecycle, system-administration scope, policy generation 1,
         // and independent local-key recovery required.
         object.extend_from_slice(&[1, 4, 0, 1, 1]);
-        Ok(Self {
-            object,
-            audit: GOVERNANCE_AUDIT_INTENT.to_vec(),
-        })
+        let mut audit = Vec::with_capacity(74);
+        audit.extend_from_slice(&GOVERNANCE_AUDIT_MAGIC);
+        audit.extend_from_slice(&principal.to_bytes());
+        audit.extend_from_slice(&tenant.to_bytes());
+        audit.push(19);
+        audit.extend_from_slice(b"instance.initialize");
+        audit.push(9);
+        audit.extend_from_slice(b"succeeded");
+        Ok(Self { object, audit })
     }
 
     #[must_use]

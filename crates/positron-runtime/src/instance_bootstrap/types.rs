@@ -118,7 +118,9 @@ impl InitializationPlan {
 }
 
 pub struct InitializedInstance {
-    pub(super) _key: BootstrapKeyCustody,
+    pub(super) key: BootstrapKeyCustody,
+    pub(super) identity: positron_governance::Identity,
+    pub(super) audit: Vec<positron_governance::GovernanceAuditEntry>,
     pub(super) _authority: StorageKernelResourceAuthority,
     pub(super) instance: InstanceId,
     pub(super) tenant: TenantId,
@@ -143,6 +145,27 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
+    pub fn attribute(
+        &self,
+        credential: positron_governance::PresentedCredential,
+        intent: positron_governance::RequestedIntent,
+        hints: positron_governance::CompatibilityHints,
+    ) -> Result<positron_governance::AuthorizedContext, positron_governance::AttributionFailure>
+    {
+        self.identity
+            .attribute(&self.key, credential, intent, hints)
+    }
+
+    #[must_use]
+    pub fn governance_audit_records(&self) -> Vec<positron_governance::GovernanceAuditEntry> {
+        self.audit.clone()
+    }
+
+    #[must_use]
+    pub fn identity_reservations(&self) -> positron_governance::IdentityReservations<'_, '_> {
+        self.identity.reservations(&self.key)
+    }
+
     #[must_use]
     pub const fn instance_id(&self) -> InstanceId {
         self.instance
