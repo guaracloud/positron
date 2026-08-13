@@ -1,0 +1,333 @@
+use std::error::Error;
+
+use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
+use positron_query::{
+    QueryBudget, QueryCursor, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+};
+use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
+
+use super::support::{KernelFixture, TemporaryRoots, TestClock};
+
+#[test]
+fn cancellation_replaces_unsent_events_with_one_non_complete_terminal() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("cancel")?;
+    fixture.kernel.append_log("accepted", 20, 1)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let mut stream = service.execute(query)?;
+    assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+
+    stream.cancel()?;
+    let remaining = stream.collect::<Vec<_>>();
+    assert!(matches!(
+        remaining.as_slice(),
+        [QueryEvent::Terminal(QueryTerminal::Incomplete(failure))]
+            if failure.code() == QueryFailureCode::Cancelled
+    ));
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let mut disconnected = service.execute(query)?;
+    assert!(matches!(disconnected.next(), Some(QueryEvent::Header(_))));
+    drop(disconnected);
+    Ok(())
+}
+
+#[test]
+fn malformed_acknowledged_data_is_one_typed_terminal_not_a_partial_success()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("malformed")?;
+    fixture.kernel.append_malformed_log_block(1)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_sql(fixture.context, "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1", budget())?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::MalformedPersistentData
+    ));
+    assert_eq!(terminal_count(&events), 1);
+    Ok(())
+}
+
+#[test]
+fn empty_snapshot_completes_once_without_a_batch_and_terminal_cancel_is_idempotent()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("empty")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let mut stream = service.execute(query)?;
+    assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        stream.next(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    stream.cancel()?;
+    assert!(stream.next().is_none());
+    Ok(())
+}
+
+#[test]
+fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("page-bounds")?;
+    let service = fixture.service(0)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    assert_eq!(
+        service
+            .execute_page(query)
+            .expect_err("zero batch limit")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(u64::MAX),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    assert_eq!(
+        service
+            .execute_page(query)
+            .expect_err("lease expiry overflow")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+    Ok(())
+}
+
+#[test]
+fn scan_capacity_refusal_is_one_typed_non_complete_terminal() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("scan-capacity")?;
+    fixture.kernel.append_log("accepted", 20, 1)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let tenant = fixture
+        .context
+        .tenant_attribution()
+        .ok_or("query attribution missing")?
+        .tenant_id();
+    let held = fixture
+        .kernel
+        .authority
+        .governor()
+        .reserve(WorkClaim::tenant(
+            tenant,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 7_900_000)?,
+        )?)?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    drop(held);
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::ResourceAdmissionRefused
+    ));
+    assert_eq!(terminal_count(&events), 1);
+    Ok(())
+}
+
+#[test]
+fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result<(), Box<dyn Error>>
+{
+    assert_eq!(
+        QueryBudget::new(1, 1_025, 1, 1, 1, 1)
+            .expect_err("decoded record bound")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+    assert_eq!(
+        QueryBudget::new(1, 1, 1_025, 1, 1, 1)
+            .expect_err("output row bound")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+    assert_eq!(
+        QueryBudget::new(1, 1, 1, 1, 1, 1)?
+            .with_cpu_work_units(0)
+            .expect_err("zero cpu budget")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+    assert_eq!(
+        QueryBudget::new(1, 1, 1, 1, 1, 1)?
+            .with_maximum_time_range_nanoseconds(0)
+            .expect_err("zero temporal bound")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+    assert!(QueryCursor::from_bytes(&[0; 340]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 341]).is_ok());
+    assert!(QueryCursor::from_bytes(&[0; 342]).is_err());
+    assert_eq!(
+        format!("{:?}", QueryCursor::from_bytes(&[0; 341])?),
+        "QueryCursor { <opaque> }"
+    );
+    assert_eq!(
+        QueryBudget::new(0, 1, 1, 1, 1, 1)
+            .expect_err("zero budget")
+            .to_string(),
+        "query request failed"
+    );
+
+    let fixture = QueryFixture::new("bounds")?;
+    let service = fixture.service(16)?;
+    let pipeline = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1024",
+        budget(),
+    )?;
+    let sql = service.plan_sql(
+        fixture.context,
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1024",
+        budget(),
+    )?;
+    assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+    drop((pipeline, sql));
+    for source in [
+        "logs | range query_time -100 100 | limit 0",
+        "logs | range query_time -100 100 | limit 1025",
+        "logs | range query_time -100 100 | limit 01",
+        "logs | range query_time -100 100 | limit 1 trailing",
+    ] {
+        assert_eq!(
+            failure_code(service.plan_pipeline(fixture.context, source, budget()))?,
+            if source.ends_with(" 0") || source.ends_with("1025") {
+                QueryFailureCode::InvalidBudget
+            } else {
+                QueryFailureCode::UnsupportedQuery
+            }
+        );
+    }
+    for source in [
+        "logs | range unsupported -100 100 | limit 1",
+        "logs | range query_time +1 100 | limit 1",
+        "logs | range query_time 01 100 | limit 1",
+        "logs | range query_time -01 100 | limit 1",
+    ] {
+        assert_eq!(
+            failure_code(service.plan_pipeline(fixture.context, source, budget()))?,
+            QueryFailureCode::UnsupportedQuery
+        );
+    }
+    assert_eq!(
+        failure_code(service.plan_sql(fixture.context, "SELECT * FROM logs LIMIT 1", budget()))?,
+        QueryFailureCode::UnsupportedQuery
+    );
+    assert_eq!(
+        failure_code(service.plan_pipeline(fixture.administrator, "malformed", budget()))?,
+        QueryFailureCode::Unauthorized
+    );
+    assert_eq!(
+        failure_code(service.plan_pipeline(
+            fixture.context,
+            "malformed",
+            QueryBudget::new(1, 1, 1, 1, 9_000_000, 1)?,
+        ))?,
+        QueryFailureCode::ResourceAdmissionRefused
+    );
+    Ok(())
+}
+
+pub(crate) struct QueryFixture {
+    _roots: TemporaryRoots,
+    pub(crate) kernel: KernelFixture,
+    pub(crate) context: positron_governance::AuthorizedContext,
+    administrator: positron_governance::AuthorizedContext,
+}
+
+impl QueryFixture {
+    pub(crate) fn new(label: &str) -> Result<Self, Box<dyn Error>> {
+        let roots = TemporaryRoots::new(label)?;
+        let paths = BootstrapPaths::new(
+            &roots.data(),
+            &roots.secrets(),
+            positron_kernel::MountQualification::LocalHost,
+        )?;
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+        let claim = InstanceBootstrap::claim(&paths)?;
+        let instance = InstanceBootstrap::reopen(&paths)?;
+        let context = instance.attribute(
+            PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+            RequestedIntent::Query,
+            CompatibilityHints::none(),
+        )?;
+        let administrator = instance.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?;
+        let kernel = KernelFixture::new(instance.default_tenant_id(), label)?;
+        Ok(Self {
+            _roots: roots,
+            kernel,
+            context,
+            administrator,
+        })
+    }
+
+    fn service(
+        &self,
+        batch_limit: u16,
+    ) -> Result<QueryService<'static, 'static, '_>, Box<dyn Error>> {
+        Ok(QueryService::new(
+            self.kernel.authority.governor(),
+            self.kernel.ledger()?,
+            batch_limit,
+        ))
+    }
+}
+
+fn budget() -> QueryBudget {
+    QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 4, 60).expect("fixture budget")
+}
+
+fn terminal_count(events: &[QueryEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+        .count()
+}
+
+fn failure_code<T>(
+    result: Result<T, positron_query::QueryFailure>,
+) -> Result<QueryFailureCode, Box<dyn Error>> {
+    match result {
+        Ok(_) => Err("query unexpectedly planned".into()),
+        Err(failure) => Ok(failure.code()),
+    }
+}

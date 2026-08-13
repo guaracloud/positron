@@ -14,6 +14,7 @@
 mod backend;
 mod codec;
 mod context;
+mod control_token;
 mod frame;
 mod key_envelope;
 mod local_key;
@@ -30,6 +31,7 @@ pub(crate) use context::{
     FrameObjectContext, FrameObjectId, FrameScope, FrameSequence, KeyEpoch, SegmentFramePurpose,
     SystemObjectKind,
 };
+pub use control_token::{ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector};
 pub(crate) use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
 pub(crate) use key_envelope::{SegmentEnvelopeRoute, WrappedKeyContext};
 #[cfg(test)]

@@ -351,6 +351,7 @@ fn map_ledger_failure(failure: &LedgerFailure) -> IngestOutcome {
         | LedgerFailureCode::ConcurrentWriter
         | LedgerFailureCode::UnsupportedFormat
         | LedgerFailureCode::StaleGeneration
+        | LedgerFailureCode::SnapshotExpired
         | LedgerFailureCode::RecoveryRequired => IngestFailureCode::StorageUnavailable,
     };
     match failure.completion_state() {

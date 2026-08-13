@@ -101,6 +101,6 @@ fn round_trip_record(record: LogRecord, marker: u8) -> Result<StoredLogRecord, B
     result
         .records()
         .first()
-        .cloned()
+        .map(|record| record.stored().clone())
         .ok_or_else(|| "committed body missing".into())
 }

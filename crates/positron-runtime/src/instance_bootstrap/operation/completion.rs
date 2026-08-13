@@ -46,6 +46,16 @@ pub(super) fn ensure_claim(
                 .api_key_secret
                 .as_ref()
                 .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
+            record
+                .query
+                .as_ref()
+                .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?
+                .principal,
+            record
+                .query
+                .as_ref()
+                .and_then(|query| query.api_key_secret.as_ref())
+                .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
         ),
         None => encode_legacy_claim(record.instance, record.administrator, secret),
     };

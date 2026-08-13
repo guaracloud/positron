@@ -615,6 +615,13 @@ version = "0.0.0"
 [[package]]
 name = "positron-query"
 version = "0.0.0"
+dependencies = [
+ "positron-domain",
+ "positron-governance",
+ "positron-kernel",
+ "positron-runtime",
+ "positron-signals",
+]
 
 [[package]]
 name = "positron-release"

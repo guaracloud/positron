@@ -85,6 +85,12 @@ fn record_key_identity_mismatch_is_closed() {
             api_key_hash: [18; 32],
             api_key_secret: Some(Zeroizing::new([19; 32])),
         }),
+        query: Some(super::super::codec::BootstrapQueryIdentity {
+            principal: PrincipalId::from_bytes([20; 16]).expect("query principal"),
+            api_key_salt: [21; 32],
+            api_key_hash: [22; 32],
+            api_key_secret: Some(Zeroizing::new([23; 32])),
+        }),
         integrity_fingerprint: [10; 32],
         api_key_secret: Some(Zeroizing::new([11; 32])),
         integrity_key_secret: Some(Zeroizing::new([12; 32])),

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use positron_domain::time::UnixNanoseconds;
 
@@ -22,6 +23,19 @@ impl IngestTime {
 /// Trusted wall-clock adapter used only by the Storage Kernel Lifecycle Clock.
 pub trait LifecycleClockSource: Send + Sync {
     fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure>;
+}
+
+pub(crate) struct SystemLifecycleClockSource;
+
+impl LifecycleClockSource for SystemLifecycleClockSource {
+    fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        let nanoseconds =
+            i64::try_from(elapsed.as_nanos()).map_err(|_| LifecycleClockFailure::Unavailable)?;
+        Ok(UnixNanoseconds::new(nanoseconds))
+    }
 }
 
 /// Deterministic clock adapter for kernel integration tests and replay fixtures.

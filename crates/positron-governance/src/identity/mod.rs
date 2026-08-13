@@ -15,9 +15,18 @@ use zeroize::Zeroizing;
 
 use crate::GovernanceAuditEntry;
 
-use codec::{GOVERNANCE_OBJECT_MAGIC_V1, GOVERNANCE_OBJECT_MAGIC_V2, decode_initial_identity};
+use codec::{
+    GOVERNANCE_OBJECT_MAGIC_V1, GOVERNANCE_OBJECT_MAGIC_V2, GOVERNANCE_OBJECT_MAGIC_V3,
+    decode_initial_identity,
+};
 
 struct IngestIdentity {
+    principal: PrincipalId,
+    salt: [u8; 32],
+    hash: [u8; 32],
+}
+
+struct QueryIdentity {
     principal: PrincipalId,
     salt: [u8; 32],
     hash: [u8; 32],
@@ -26,12 +35,14 @@ struct IngestIdentity {
 /// The sole immutable identity view reconstructed from one Catalog Generation.
 pub struct Identity {
     instance: [u8; 16],
+    generation: u64,
     principal: PrincipalId,
     tenant: TenantId,
     tenant_slug: TenantSlug,
     salt: [u8; 32],
     hash: [u8; 32],
     ingest: Option<IngestIdentity>,
+    query: Option<QueryIdentity>,
 }
 
 impl Identity {
@@ -45,13 +56,16 @@ impl Identity {
                 .ok_or(IdentityFailure)?;
             if !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V1)
                 && !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V2)
+                && !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V3)
             {
                 continue;
             }
             if identity.is_some() {
                 return Err(IdentityFailure);
             }
-            identity = Some(decode_initial_identity(object)?);
+            let mut decoded = decode_initial_identity(object)?;
+            decoded.generation = snapshot.number();
+            identity = Some(decoded);
         }
         identity.ok_or(IdentityFailure)
     }
@@ -79,6 +93,7 @@ impl Identity {
                     scope: Scope::SystemAdministration,
                     tenant: None,
                     authority: self.instance,
+                    generation: self.generation,
                 })
             },
             RequestedIntent::Ingest => {
@@ -97,11 +112,31 @@ impl Identity {
                             .map_err(|_| AttributionFailure)?,
                     ),
                     authority: self.instance,
+                    generation: self.generation,
                 })
             },
-            RequestedIntent::Query
-            | RequestedIntent::TenantAdministration
-            | RequestedIntent::SystemAdministration => Err(AttributionFailure),
+            RequestedIntent::Query => {
+                let query = self.query.as_ref().ok_or(AttributionFailure)?;
+                if !keys
+                    .verify_salted_secret_hash(&query.salt, credential.secret(), &query.hash)
+                    .map_err(|_| AttributionFailure)?
+                {
+                    return Err(AttributionFailure);
+                }
+                Ok(AuthorizedContext {
+                    principal: query.principal,
+                    scope: Scope::Query,
+                    tenant: Some(
+                        TenantAttribution::new(query.principal, Scope::Query, self.tenant)
+                            .map_err(|_| AttributionFailure)?,
+                    ),
+                    authority: self.instance,
+                    generation: self.generation,
+                })
+            },
+            RequestedIntent::TenantAdministration | RequestedIntent::SystemAdministration => {
+                Err(AttributionFailure)
+            },
         }
     }
 
@@ -271,6 +306,7 @@ pub struct AuthorizedContext {
     scope: Scope,
     tenant: Option<TenantAttribution>,
     authority: [u8; 16],
+    generation: u64,
 }
 
 impl AuthorizedContext {
@@ -287,6 +323,11 @@ impl AuthorizedContext {
     #[must_use]
     pub const fn tenant_attribution(self) -> Option<TenantAttribution> {
         self.tenant
+    }
+
+    #[must_use]
+    pub const fn authorization_generation(self) -> u64 {
+        self.generation
     }
 }
 

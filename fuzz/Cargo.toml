@@ -15,6 +15,7 @@ positron-governance = { path = "../crates/positron-governance" }
 positron-ingest = { path = "../crates/positron-ingest" }
 positron-runtime = { path = "../crates/positron-runtime" }
 positron-signals = { path = "../crates/positron-signals" }
+positron-query = { path = "../crates/positron-query" }
 
 [[bin]]
 name = "primary_data_volume_stateful"
@@ -82,6 +83,13 @@ bench = false
 [[bin]]
 name = "otlp_logs_decode"
 path = "fuzz_targets/otlp_logs_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_inputs"
+path = "fuzz_targets/query_inputs.rs"
 test = false
 doc = false
 bench = false

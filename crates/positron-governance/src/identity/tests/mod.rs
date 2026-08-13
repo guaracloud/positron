@@ -18,6 +18,9 @@ fn encoded_identity() -> Vec<u8> {
         PrincipalId::from_bytes([12; 16]).expect("ingest principal"),
         [13; 32],
         [14; 32],
+        PrincipalId::from_bytes([15; 16]).expect("query principal"),
+        [16; 32],
+        [17; 32],
         [6; 32],
         [7; 32],
         vec![8; 64],
@@ -43,14 +46,28 @@ fn literal_v1_governance_identity_remains_readable() {
 }
 
 #[test]
-fn current_governance_identity_uses_v2_magic() {
-    assert!(encoded_identity().starts_with(b"POSGOV02"));
+fn literal_v2_governance_identity_remains_readable_without_query_authority() {
+    let identity = decode_initial_identity(&literal_v2_identity()).expect("v2 identity");
+    assert_eq!(identity.principal.to_bytes(), [3; 16]);
+    assert_eq!(
+        identity
+            .ingest
+            .as_ref()
+            .map(|value| value.principal.to_bytes()),
+        Some([12; 16])
+    );
+    assert!(identity.query.is_none());
+}
+
+#[test]
+fn current_governance_identity_uses_v3_magic() {
+    assert!(encoded_identity().starts_with(b"POSGOV03"));
 }
 
 #[test]
 fn unknown_or_layout_mismatched_governance_versions_fail_closed() {
     let mut unknown = literal_v1_identity();
-    unknown[..8].copy_from_slice(b"POSGOV03");
+    unknown[..8].copy_from_slice(b"POSGOV04");
     assert!(decode_initial_identity(&unknown).is_err());
 
     let mut mismatched = literal_v1_identity();
@@ -95,7 +112,7 @@ fn initial_identity_decoder_rejects_truncation_corruption_and_trailing_data() {
     trailing.push(0);
     assert!(decode_initial_identity(&trailing).is_err());
 
-    for range in [8..24, 403..411, 423..431] {
+    for range in [8..24, 483..491, 503..511] {
         let mut zeroed = encoded_identity();
         zeroed[range].fill(0);
         assert!(decode_initial_identity(&zeroed).is_err());
@@ -104,7 +121,7 @@ fn initial_identity_decoder_rejects_truncation_corruption_and_trailing_data() {
     oversized_slug[40] = 64;
     assert!(decode_initial_identity(&oversized_slug).is_err());
     let mut missing_integrity = encoded_identity();
-    missing_integrity[287..289].fill(0);
+    missing_integrity[367..369].fill(0);
     assert!(decode_initial_identity(&missing_integrity).is_err());
     let mut empty_display = encoded_identity();
     empty_display.drain(49..63);
@@ -136,6 +153,16 @@ fn literal_v1_identity() -> Vec<u8> {
         encoded.extend_from_slice(&10_u64.to_be_bytes());
     }
     encoded.extend_from_slice(&[1, 4, 0, 1, 1]);
+    encoded
+}
+
+fn literal_v2_identity() -> Vec<u8> {
+    let mut encoded = literal_v1_identity();
+    encoded[..8].copy_from_slice(b"POSGOV02");
+    encoded.splice(
+        143..143,
+        [12; 16].into_iter().chain([13; 32]).chain([14; 32]),
+    );
     encoded
 }
 
@@ -179,6 +206,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
                     .expect("tenant context"),
             ),
             authority: identity.instance,
+            generation: 0,
         },
         AuthorizedContext {
             principal: identity.principal,
@@ -192,18 +220,21 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
                 .expect("tenant-administration context"),
             ),
             authority: identity.instance,
+            generation: 0,
         },
         AuthorizedContext {
             principal: identity.principal,
             scope: Scope::SystemAdministration,
             tenant: None,
             authority: [99; 16],
+            generation: 0,
         },
         AuthorizedContext {
             principal: PrincipalId::from_bytes([99; 16]).expect("forged principal"),
             scope: Scope::SystemAdministration,
             tenant: None,
             authority: identity.instance,
+            generation: 0,
         },
     ] {
         assert_eq!(

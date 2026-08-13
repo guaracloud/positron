@@ -7,13 +7,14 @@ use super::support::{TemporaryRoot, establish_authority};
 use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_errno, with_ledger_fault};
 use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, LedgerCompletionState,
-    LedgerFailureCode, MountQualification, PreparedStoreBlock, PrimaryDataVolume,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
+    InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
+    PrimaryDataVolume, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, TransactionId,
 };
 
 mod admission_faults;
 mod sealing_faults;
+mod snapshot_leases;
 
 fn prepared(
     scope: SegmentScope,

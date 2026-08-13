@@ -1,6 +1,6 @@
 [package]
 name = "positron-query"
-description = "Positron query, cursor, tail, and export scaffold"
+description = "Positron native bounded query execution"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,12 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+positron-domain = { path = "../positron-domain" }
+positron-governance = { path = "../positron-governance" }
+positron-kernel = { path = "../positron-kernel" }
+positron-signals = { path = "../positron-signals" }
+
+[dev-dependencies]
+positron-runtime = { path = "../positron-runtime" }

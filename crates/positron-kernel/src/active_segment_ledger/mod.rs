@@ -11,6 +11,9 @@ mod protection;
 mod publication;
 mod receipt;
 mod recovery;
+mod snapshot_lease;
+mod snapshot_lease_codec;
+mod snapshot_lease_recovery;
 mod state;
 mod storage;
 mod types;
@@ -34,6 +37,7 @@ use capacity::{recovery_claim, retained_claim, snapshot_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
+pub use snapshot_lease::{SnapshotLeaseGrant, SnapshotLeaseId};
 use state::{LedgerState, retain_recovered};
 use storage::LedgerStorage;
 pub use types::*;
@@ -68,11 +72,50 @@ impl std::fmt::Debug for ActiveSegmentLedger<'_, '_> {
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    /// Returns the Data Protection-owned bounded control-token operation.
+    #[must_use]
+    pub fn control_tokens(&self) -> crate::ControlTokenProtector<'_> {
+        self.catalog.control_tokens()
+    }
     pub fn open(
         authority: &'kernel StorageKernelResourceAuthority,
         catalog: &'catalog Catalog<'kernel>,
         scope: SegmentScope,
         protection: SegmentProtectionKey,
+    ) -> Result<Self, LedgerFailure> {
+        Self::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            protection,
+            &crate::LifecycleClock::new(crate::lifecycle_clock::SystemLifecycleClockSource),
+        )
+    }
+
+    pub fn open_with_clock<S: crate::LifecycleClockSource>(
+        authority: &'kernel StorageKernelResourceAuthority,
+        catalog: &'catalog Catalog<'kernel>,
+        scope: SegmentScope,
+        protection: SegmentProtectionKey,
+        clock: &crate::LifecycleClock<S>,
+    ) -> Result<Self, LedgerFailure> {
+        let now = clock
+            .assign_ingest_time()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?
+            .instant()
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+        Self::open_at(authority, catalog, scope, protection, now)
+    }
+
+    fn open_at(
+        authority: &'kernel StorageKernelResourceAuthority,
+        catalog: &'catalog Catalog<'kernel>,
+        scope: SegmentScope,
+        protection: SegmentProtectionKey,
+        now: u64,
     ) -> Result<Self, LedgerFailure> {
         let writer = authority
             .acquire_active_segment_ledger(scope.lease_key())
@@ -101,6 +144,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .primary_data_volume()
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         let mut storage = LedgerStorage::open(volume)?;
+        let snapshot = catalog.pin()?;
+        let recovered_leases = snapshot_lease_recovery::recover_reservations(
+            authority, catalog, scope, &snapshot, now,
+        )?;
         let snapshot = catalog.pin()?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
         let mut segments = metadata.iter().copied().peekable();
@@ -194,6 +241,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 retained_bytes,
                 next_sequence: 0,
                 poisoned: false,
+                lease_reservations: recovered_leases.reservations,
+                last_snapshot_lease_time: recovered_leases.last_observed,
             }),
         })
     }
@@ -214,10 +263,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let catalog = self.catalog.pin()?;
         Ok(LedgerSnapshot {
             _capacity: reservation,
             scope: self.scope,
             frontier: state.frontier,
+            catalog_generation: catalog.number(),
+            catalog_identity: catalog.identity(),
             blocks: state.blocks.clone(),
         })
     }

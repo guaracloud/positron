@@ -1,4 +1,5 @@
 use positron_domain::routing::CommitPosition;
+use std::collections::BTreeMap;
 
 use crate::ResourceReservation;
 
@@ -15,6 +16,8 @@ pub(super) struct LedgerState<'kernel> {
     pub(super) retained_bytes: usize,
     pub(super) next_sequence: u64,
     pub(super) poisoned: bool,
+    pub(super) lease_reservations: BTreeMap<super::SnapshotLeaseId, ResourceReservation<'kernel>>,
+    pub(super) last_snapshot_lease_time: u64,
 }
 
 pub(super) fn receipt_for(block: &CommittedBlock) -> CommitReceipt {

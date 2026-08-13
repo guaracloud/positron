@@ -238,6 +238,8 @@ pub struct LedgerSnapshot<'kernel> {
     pub(super) _capacity: ResourceReservation<'kernel>,
     pub(super) scope: SegmentScope,
     pub(super) frontier: CommitPosition,
+    pub(super) catalog_generation: u64,
+    pub(super) catalog_identity: crate::CatalogGenerationId,
     pub(super) blocks: Vec<CommittedBlock>,
 }
 
@@ -257,6 +259,16 @@ impl LedgerSnapshot<'_> {
     #[must_use]
     pub const fn frontier(&self) -> CommitPosition {
         self.frontier
+    }
+
+    #[must_use]
+    pub const fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
+    #[must_use]
+    pub const fn catalog_identity(&self) -> crate::CatalogGenerationId {
+        self.catalog_identity
     }
 
     #[must_use]
@@ -301,6 +313,7 @@ pub enum LedgerFailureCode {
     StaleGeneration,
     RecoveryRequired,
     Cancelled,
+    SnapshotExpired,
 }
 
 /// Whether the failed call is safe to retry in place or requires recovery.
