@@ -643,7 +643,7 @@ are used.
 
 #### Catalog
 
-The Catalog internal interface has two operations:
+The Catalog internal interface has three operations:
 
 ```rust
 fn pin() -> CatalogSnapshot;
@@ -652,6 +652,11 @@ async fn commit(
     proposal: CatalogProposal,
     audit: Option<AuditIntent>,
 ) -> Result<CatalogCommit, CatalogFailure>;
+fn rewrap(
+    transaction: TransactionId,
+    replacement: CatalogWrappingKey,
+    intent: AuditIntent,
+) -> Result<CatalogRotation, CatalogFailure>;
 ```
 
 The Catalog Writer is the only publication authority. It writes immutable
@@ -661,6 +666,21 @@ authenticated marker. Readers pin immutable generations.
 
 Telemetry Store Block append does not perform a Catalog Transaction. Catalog
 publication covers segment and control-plane lifecycle transitions.
+
+The canonical Catalog durable layouts, bounds, compatibility set, and crash
+rules are defined only in [Catalog durable format v1](catalog-format-v1.md).
+This application design owns the flow: a commit jointly publishes one complete
+state generation and its optional Governance Audit Record through the sole
+Catalog Writer.
+
+Root rotation is one governed durability-completion operation. The supplied
+Administration transaction deterministically publishes audited `started`,
+`verified`, and `completed` Catalog transactions. Rewrap changes only verified
+artifact envelope headers and leaves marker authentication and content-derived
+identities stable. The successor route remains overlapped with its predecessor
+through verification; only the durable completed generation authorizes
+predecessor retirement. Restart supplies both routes for a partial pass and
+retries the same operation idempotently.
 
 #### Resource Governor
 

@@ -1,7 +1,9 @@
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_kw::{KeyInit as KeyWrapInit, KwpAes256};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use std::fmt::Formatter;
 
@@ -12,14 +14,14 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::rc::Rc;
 
-pub(super) struct SecretKeyBytes {
+pub(crate) struct SecretKeyBytes {
     bytes: Box<[u8; 32]>,
     #[cfg(test)]
     zeroized_before_release: Option<Rc<Cell<bool>>>,
 }
 
 impl SecretKeyBytes {
-    pub(super) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
+    pub(crate) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
         Self {
             bytes,
             #[cfg(test)]
@@ -38,11 +40,11 @@ impl SecretKeyBytes {
         }
     }
 
-    pub(super) fn expose_to_backend(&self) -> &[u8] {
+    pub(crate) fn expose_to_backend(&self) -> &[u8; 32] {
         self.bytes.as_ref()
     }
 
-    pub(super) fn expose_to_backend_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn expose_to_backend_mut(&mut self) -> &mut [u8; 32] {
         self.bytes.as_mut()
     }
 }
@@ -65,6 +67,8 @@ pub(super) enum CryptoBackendFailure {
     EntropyUnavailable,
     HashFailed,
     OpenFailed,
+    WrapFailed,
+    UnwrapFailed,
 }
 
 pub(super) trait CryptoBackend {
@@ -87,6 +91,39 @@ pub(super) trait CryptoBackend {
     fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32], CryptoBackendFailure>;
 
     fn fill_random(&self, destination: &mut [u8]) -> Result<(), CryptoBackendFailure>;
+
+    fn hmac_sha256(
+        &self,
+        key: &SecretKeyBytes,
+        bytes: &[u8],
+    ) -> Result<[u8; 32], CryptoBackendFailure> {
+        RustCryptoBackend.hmac_sha256(key, bytes)
+    }
+
+    fn verify_hmac_sha256(
+        &self,
+        key: &SecretKeyBytes,
+        bytes: &[u8],
+        expected: &[u8; 32],
+    ) -> Result<(), CryptoBackendFailure> {
+        RustCryptoBackend.verify_hmac_sha256(key, bytes, expected)
+    }
+
+    fn wrap_key_aes_256_kwp(
+        &self,
+        key: &SecretKeyBytes,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoBackendFailure> {
+        RustCryptoBackend.wrap_key_aes_256_kwp(key, plaintext)
+    }
+
+    fn unwrap_key_aes_256_kwp(
+        &self,
+        key: &SecretKeyBytes,
+        wrapped: &[u8],
+    ) -> Result<SecretPlaintext, CryptoBackendFailure> {
+        RustCryptoBackend.unwrap_key_aes_256_kwp(key, wrapped)
+    }
 }
 
 pub(super) struct RustCryptoBackend;
@@ -144,13 +181,102 @@ impl CryptoBackend for RustCryptoBackend {
     fn fill_random(&self, destination: &mut [u8]) -> Result<(), CryptoBackendFailure> {
         getrandom::fill(destination).map_err(|_| CryptoBackendFailure::EntropyUnavailable)
     }
+
+    fn hmac_sha256(
+        &self,
+        key: &SecretKeyBytes,
+        bytes: &[u8],
+    ) -> Result<[u8; 32], CryptoBackendFailure> {
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key.expose_to_backend())
+            .map_err(|_| CryptoBackendFailure::InvalidKey)?;
+        mac.update(bytes);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
+    fn verify_hmac_sha256(
+        &self,
+        key: &SecretKeyBytes,
+        bytes: &[u8],
+        expected: &[u8; 32],
+    ) -> Result<(), CryptoBackendFailure> {
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key.expose_to_backend())
+            .map_err(|_| CryptoBackendFailure::InvalidKey)?;
+        mac.update(bytes);
+        mac.verify_slice(expected)
+            .map_err(|_| CryptoBackendFailure::AuthenticationFailed)
+    }
+
+    fn wrap_key_aes_256_kwp(
+        &self,
+        key: &SecretKeyBytes,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoBackendFailure> {
+        aes_kwp_wrap(key, plaintext)
+    }
+
+    fn unwrap_key_aes_256_kwp(
+        &self,
+        key: &SecretKeyBytes,
+        wrapped: &[u8],
+    ) -> Result<SecretPlaintext, CryptoBackendFailure> {
+        aes_kwp_unwrap(key, wrapped)
+    }
+}
+
+const MAX_KWP_PLAINTEXT_BYTES: usize = 4_096;
+
+fn aes_kwp_wrap(
+    wrapping_key: &SecretKeyBytes,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoBackendFailure> {
+    if plaintext.is_empty() || plaintext.len() > MAX_KWP_PLAINTEXT_BYTES {
+        return Err(CryptoBackendFailure::WrapFailed);
+    }
+    let wrapped_bytes = plaintext
+        .len()
+        .div_ceil(aes_kw::IV_LEN)
+        .checked_add(1)
+        .and_then(|blocks| blocks.checked_mul(aes_kw::IV_LEN))
+        .ok_or(CryptoBackendFailure::WrapFailed)?;
+    let wrapper = KwpAes256::new_from_slice(wrapping_key.expose_to_backend())
+        .map_err(|_| CryptoBackendFailure::InvalidKey)?;
+    let mut wrapped = vec![0_u8; wrapped_bytes];
+    wrapper
+        .wrap_key(plaintext, &mut wrapped)
+        .map_err(|_| CryptoBackendFailure::WrapFailed)?;
+    Ok(wrapped)
+}
+
+fn aes_kwp_unwrap(
+    wrapping_key: &SecretKeyBytes,
+    wrapped: &[u8],
+) -> Result<SecretPlaintext, CryptoBackendFailure> {
+    if wrapped.len() < 16
+        || !wrapped.len().is_multiple_of(8)
+        || wrapped.len() > MAX_KWP_PLAINTEXT_BYTES + 8
+    {
+        return Err(CryptoBackendFailure::UnwrapFailed);
+    }
+    let wrapper = KwpAes256::new_from_slice(wrapping_key.expose_to_backend())
+        .map_err(|_| CryptoBackendFailure::InvalidKey)?;
+    let plaintext_capacity = wrapped
+        .len()
+        .checked_sub(aes_kw::IV_LEN)
+        .ok_or(CryptoBackendFailure::UnwrapFailed)?;
+    let mut plaintext = Zeroizing::new(vec![0_u8; plaintext_capacity]);
+    let plaintext_bytes = wrapper
+        .unwrap_key(wrapped, &mut plaintext)
+        .map_err(|_| CryptoBackendFailure::UnwrapFailed)?
+        .len();
+    plaintext.truncate(plaintext_bytes);
+    Ok(SecretPlaintext::new(std::mem::take(&mut plaintext)))
 }
 
 /// An explicitly secret 256-bit input transferred into an object data key.
 ///
 /// This type intentionally implements neither `Clone`, `Debug`, nor `Display`
 /// and exposes no byte accessor. Its memory is zeroized when custody ends.
-pub(super) struct SecretKeyInput(pub(super) SecretKeyBytes);
+pub(crate) struct SecretKeyInput(pub(super) SecretKeyBytes);
 
 impl SecretKeyInput {
     /// Takes ownership of exactly one AES-256 key buffer.
@@ -158,7 +284,7 @@ impl SecretKeyInput {
     /// Positron zeroizes this owned buffer before releasing it. This makes no
     /// claim about copies created before ownership transfer.
     #[must_use]
-    pub(super) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
+    pub(crate) fn from_owned(bytes: Box<[u8; 32]>) -> Self {
         Self(SecretKeyBytes::from_owned(bytes))
     }
 
@@ -180,7 +306,7 @@ impl SecretKeyInput {
 }
 
 /// A per-object data key bound to its authoritative identity and epochs.
-pub(super) struct ObjectDataKey {
+pub(crate) struct ObjectDataKey {
     pub(super) key: SecretKeyBytes,
     pub(super) object: FrameObjectContext,
 }

@@ -100,6 +100,10 @@ impl ResourceAmounts {
         self.zip_map(other, u64::min)
     }
 
+    pub(crate) fn maximum(self, other: Self) -> Self {
+        self.zip_map(other, u64::max)
+    }
+
     pub(super) fn checked_add(self, other: Self) -> Option<Self> {
         self.try_zip_map(other, u64::checked_add)
     }

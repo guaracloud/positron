@@ -5,7 +5,7 @@ use super::{FrameFailure, FrameFailureCode, MINIMUM_ENCODED_FRAME_BYTES};
 
 /// The immutable identity of one encrypted persistent object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FrameObjectId([u8; 16]);
+pub(crate) struct FrameObjectId([u8; 16]);
 
 impl FrameObjectId {
     /// Creates a non-sentinel persistent object identity.
@@ -20,7 +20,7 @@ impl FrameObjectId {
 
 /// The immutable generation of key material protecting an object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct KeyEpoch(u64);
+pub(crate) struct KeyEpoch(u64);
 
 impl KeyEpoch {
     /// Creates an exact immutable key epoch.
@@ -32,7 +32,7 @@ impl KeyEpoch {
 
 /// The independently versioned persistent format generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FormatEpoch(u32);
+pub(crate) struct FormatEpoch(u32);
 
 impl FormatEpoch {
     /// Creates a non-zero Format Epoch.
@@ -47,7 +47,7 @@ impl FormatEpoch {
 
 /// The immutable sequence of one frame under its object data key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FrameSequence(pub(super) u64);
+pub(crate) struct FrameSequence(pub(super) u64);
 
 impl FrameSequence {
     /// Creates an exact frame sequence selected by the object's sequence owner.
@@ -86,7 +86,7 @@ impl SegmentFramePurpose {
 
 /// The kernel-owned non-telemetry persistent object protected by one DEK.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SystemObjectKind {
+pub(crate) enum SystemObjectKind {
     /// An immutable Catalog Object.
     Catalog,
     /// An immutable manifest.
@@ -149,7 +149,7 @@ impl FramePurpose {
 
 /// The authoritative identity and epoch binding for one encrypted object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FrameObjectContext {
+pub(crate) struct FrameObjectContext {
     pub(super) scope: FrameScope,
     pub(super) class: FrameObjectClass,
     pub(super) object_id: FrameObjectId,
@@ -195,7 +195,7 @@ impl FrameObjectContext {
     }
 
     /// Creates the authoritative context for one segment frame.
-    pub const fn frame(
+    pub(super) const fn frame(
         self,
         purpose: SegmentFramePurpose,
         sequence: FrameSequence,
@@ -259,7 +259,7 @@ impl FrameObjectContext {
 
 /// The complete authoritative context for one independently encrypted frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FrameContext {
+pub(crate) struct FrameContext {
     pub(super) object: FrameObjectContext,
     pub(super) purpose: FramePurpose,
     pub(super) sequence: FrameSequence,
@@ -267,7 +267,7 @@ pub(super) struct FrameContext {
 
 /// A finite caller-owned encoded-frame policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FrameLimits {
+pub(crate) struct FrameLimits {
     pub(super) max_encoded_bytes: u32,
 }
 

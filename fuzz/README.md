@@ -61,3 +61,15 @@ shutdown; and recovery-safe completion. It retains at most eight handles and
 checks conservation, fixed pool accounting, capacity observations, bounded
 reason telemetry, reserve consumption, lifecycle counts, and final drainage
 after every transition.
+
+Current Catalog Generation state-machine target:
+
+```console
+cargo +nightly fuzz run catalog_generation_stateful
+```
+
+This harness uses the real Primary Data Volume and the Catalog's deterministic
+file-operation fault seam. It publishes one bounded governance-sensitive
+proposal at every object, audit, commit, marker, rename, and directory-sync
+boundary, then reopens storage and asserts complete predecessor-or-successor
+catalog and audit visibility.
