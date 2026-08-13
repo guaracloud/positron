@@ -90,6 +90,8 @@ impl SegmentFramePurpose {
 /// The kernel-owned non-telemetry persistent object protected by one DEK.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemObjectKind {
+    /// Transactional instance-bootstrap state.
+    InstanceBootstrap,
     /// An immutable Catalog Object.
     Catalog,
     /// An immutable manifest.
@@ -107,6 +109,7 @@ impl SystemObjectKind {
             Self::Manifest => 3,
             Self::GovernanceAudit => 4,
             Self::BackupMetadata => 5,
+            Self::InstanceBootstrap => 6,
         }
     }
 
@@ -116,6 +119,7 @@ impl SystemObjectKind {
             Self::Manifest => 6,
             Self::GovernanceAudit => 7,
             Self::BackupMetadata => 8,
+            Self::InstanceBootstrap => 9,
         }
     }
 }

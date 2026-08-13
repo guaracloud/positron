@@ -86,6 +86,11 @@ pub use active_segment_ledger::{
     SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 
+pub use data_protection::{
+    BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
+    BootstrapObjectPurpose,
+};
+
 pub use resource_governor::{
     AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,
     CAPACITY_OBSERVATION_TRANSIENT_MEMORY_BYTES, CPU_WORK_UNITS_PER_LOGICAL_CPU,

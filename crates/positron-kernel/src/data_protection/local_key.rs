@@ -8,6 +8,7 @@ mod bootstrap;
 mod codec;
 mod initialization_io;
 mod persistence;
+mod runtime_bootstrap;
 
 #[cfg(test)]
 mod acl_tests;
@@ -21,6 +22,11 @@ mod persistence_tests;
 mod test_support;
 
 use codec::SecretRootKey;
+
+pub use runtime_bootstrap::{
+    BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
+    BootstrapObjectPurpose,
+};
 
 #[cfg(fuzzing)]
 pub fn fuzz_local_root_key_file(data: &[u8]) {

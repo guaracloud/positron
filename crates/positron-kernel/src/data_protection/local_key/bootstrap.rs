@@ -28,8 +28,7 @@ pub(super) struct FreshInitializationRootProof {
 }
 
 impl FreshInitializationRootProof {
-    #[cfg(test)]
-    pub(super) fn for_test(location: &Path) -> Result<Self, LocalKeyFailure> {
+    pub(super) fn new(location: &Path) -> Result<Self, LocalKeyFailure> {
         let canonical = std::fs::canonicalize(location)
             .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
         validate_absolute_normalized_location(&canonical)?;
@@ -46,6 +45,11 @@ impl FreshInitializationRootProof {
                 inode: metadata.ino(),
             },
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(location: &Path) -> Result<Self, LocalKeyFailure> {
+        Self::new(location)
     }
 }
 

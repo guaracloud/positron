@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 positron-kernel = { path = "../crates/positron-kernel" }
 positron-domain = { path = "../crates/positron-domain" }
+positron-runtime = { path = "../crates/positron-runtime" }
 
 [[bin]]
 name = "primary_data_volume_stateful"
@@ -57,6 +58,13 @@ bench = false
 [[bin]]
 name = "active_segment_ledger_stateful"
 path = "fuzz_targets/active_segment_ledger_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "instance_bootstrap_stateful"
+path = "fuzz_targets/instance_bootstrap_stateful.rs"
 test = false
 doc = false
 bench = false
