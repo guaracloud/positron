@@ -34,6 +34,8 @@ fn legacy_initialized_instance_reopens_and_preserves_its_one_time_admin_claim()
     assert_eq!(claim.principal_id(), expected_administrator);
     assert_eq!(claim.ingest_principal_id(), None);
     assert_eq!(claim.ingest_secret(), None);
+    assert_eq!(claim.query_principal_id(), None);
+    assert_eq!(claim.query_secret(), None);
 
     let reopened = InstanceBootstrap::reopen(&paths)?;
     let administrator = reopened.attribute(
@@ -57,12 +59,21 @@ fn legacy_initialized_instance_reopens_and_preserves_its_one_time_admin_claim()
             )
             .is_err()
     );
+    assert!(
+        reopened
+            .attribute(
+                PresentedCredential::parse(claim.secret())?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
     assert!(!reopened.claim_available());
     Ok(())
 }
 
 #[test]
-fn legacy_pending_before_catalog_commit_migrates_to_v2_and_claims_fresh_ingest_authority()
+fn legacy_pending_before_catalog_commit_migrates_to_v3_and_claims_fresh_data_authorities()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;
     let paths = roots.paths();
@@ -83,6 +94,12 @@ fn legacy_pending_before_catalog_commit_migrates_to_v2_and_claims_fresh_ingest_a
     let ingest_principal = claim
         .ingest_principal_id()
         .ok_or("migrated ingest principal missing")?;
+    let query_secret = claim
+        .query_secret()
+        .ok_or("migrated query secret missing")?;
+    let query_principal = claim
+        .query_principal_id()
+        .ok_or("migrated query principal missing")?;
     let reopened = InstanceBootstrap::reopen(&paths)?;
     let context = reopened.attribute(
         PresentedCredential::parse(ingest_secret)?,
@@ -94,6 +111,12 @@ fn legacy_pending_before_catalog_commit_migrates_to_v2_and_claims_fresh_ingest_a
         context.tenant_attribution().map(|value| value.tenant_id()),
         Some(reopened.default_tenant_id())
     );
+    let query = reopened.attribute(
+        PresentedCredential::parse(query_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(query.principal_id(), query_principal);
     Ok(())
 }
 
@@ -110,7 +133,7 @@ fn publish_legacy_governance(
     let mut objects = Vec::new();
     for identity in current.object_identities() {
         let object = current.object(identity)?.ok_or("missing catalog object")?;
-        let plaintext = if object.starts_with(b"POSGOV02") {
+        let plaintext = if object.starts_with(b"POSGOV03") {
             replaced = true;
             legacy_governance(object)?
         } else {
@@ -148,6 +171,7 @@ fn rewrite_bootstrap_and_claim_as_v1(
     )?;
     let mut record = BootstrapRecord::decode(&plaintext)?;
     record.ingest = None;
+    record.query = None;
     let protected = initialized.key.protect(
         initialized.instance,
         BootstrapObjectPurpose::Initialized,
@@ -200,6 +224,7 @@ fn rewrite_pending_replacement_as_v1(
     let plaintext = key.open_object(instance, BootstrapObjectPurpose::Pending, &encrypted)?;
     let mut record = BootstrapRecord::decode(&plaintext)?;
     record.ingest = None;
+    record.query = None;
     let legacy = key.protect(instance, BootstrapObjectPurpose::Pending, &record.encode())?;
     access
         .remove(BootstrapArtifact::PendingReplacement)
@@ -211,12 +236,12 @@ fn rewrite_pending_replacement_as_v1(
 }
 
 fn legacy_governance(current: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if current.len() < 223 {
+    if current.len() < 303 {
         return Err("truncated current governance object".into());
     }
     let mut legacy = current.to_vec();
     legacy[..8].copy_from_slice(b"POSGOV01");
-    legacy.drain(143..223);
+    legacy.drain(143..303);
     Ok(legacy)
 }
 

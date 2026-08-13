@@ -8,7 +8,9 @@ use positron_kernel::{
 };
 use zeroize::Zeroizing;
 
-use super::codec::{BootstrapIngestIdentity, BootstrapRecord, decode_claim};
+use super::codec::{
+    BootstrapIngestIdentity, BootstrapQueryIdentity, BootstrapRecord, decode_claim,
+};
 use super::storage::{self, INTENT};
 use super::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
@@ -20,6 +22,7 @@ mod completion;
 pub(super) mod support;
 pub(super) use completion::governance_audit_records;
 use completion::{ensure_claim, open_initial_ledgers, outcome};
+pub(super) use support::decode_record;
 use support::{
     acquire, catalog_failure, entropy_failure, format_secret, inconsistent, key_failure,
     recover_pending_replacement, require_key_identity,
@@ -155,6 +158,7 @@ fn resume(
     let before = catalog.pin().map_err(catalog_failure)?;
     let initial = if before.number() == 0 {
         let ingest = compatibility::require_new_ingest(&record)?;
+        let query = compatibility::require_new_query(&record)?;
         let tenant_intent = InitialTenantIntent::new(
             record.instance.to_bytes(),
             record.tenant,
@@ -166,6 +170,9 @@ fn resume(
             ingest.principal,
             ingest.api_key_salt,
             ingest.api_key_hash,
+            query.principal,
+            query.api_key_salt,
+            query.api_key_hash,
             integrity_identity.public_key(),
             record.integrity_fingerprint,
             protected_integrity,
@@ -306,8 +313,10 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
         .map_err(key_failure)?;
     let decoded = decode_claim(record.instance, &plaintext)?;
     let expected_ingest = record.ingest.as_ref().map(|ingest| ingest.principal);
+    let expected_query = record.query.as_ref().map(|query| query.principal);
     if decoded.principal != record.administrator
         || decoded.ingest.as_ref().map(|(principal, _)| *principal) != expected_ingest
+        || decoded.query.as_ref().map(|(principal, _)| *principal) != expected_query
     {
         return Err(BootstrapFailure::new(
             BootstrapFailureCode::IdentityMismatch,
@@ -318,12 +327,16 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
     let ingest = decoded
         .ingest
         .map(|(principal, secret)| (principal, Zeroizing::new(format_secret(&secret))));
+    let query = decoded
+        .query
+        .map(|(principal, secret)| (principal, Zeroizing::new(format_secret(&secret))));
     storage::remove(&access, BootstrapArtifact::Claim)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ClaimDestructionFailed))?;
     Ok(BootstrapClaim {
         principal,
         secret,
         ingest,
+        query,
     })
 }
 
@@ -348,6 +361,13 @@ fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, Bootstr
     let ingest_api_key_hash = key
         .salted_secret_hash(ingest_api_key_salt.as_ref(), ingest_api_key_secret.as_ref())
         .map_err(key_failure)?;
+    let query_principal = PrincipalId::from_bytes(key.random_identifier().map_err(key_failure)?)
+        .map_err(|_| entropy_failure())?;
+    let query_api_key_salt = key.random_secret().map_err(key_failure)?;
+    let query_api_key_secret = key.random_secret().map_err(key_failure)?;
+    let query_api_key_hash = key
+        .salted_secret_hash(query_api_key_salt.as_ref(), query_api_key_secret.as_ref())
+        .map_err(key_failure)?;
     let integrity_secret = key.random_secret().map_err(key_failure)?;
     let integrity_fingerprint = key
         .integrity_identity(integrity_secret.as_ref())
@@ -367,26 +387,14 @@ fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, Bootstr
             api_key_hash: ingest_api_key_hash,
             api_key_secret: Some(Zeroizing::new(*ingest_api_key_secret)),
         }),
+        query: Some(BootstrapQueryIdentity {
+            principal: query_principal,
+            api_key_salt: *query_api_key_salt,
+            api_key_hash: query_api_key_hash,
+            api_key_secret: Some(Zeroizing::new(*query_api_key_secret)),
+        }),
         integrity_fingerprint,
         api_key_secret: Some(Zeroizing::new(*api_key_secret)),
         integrity_key_secret: Some(Zeroizing::new(*integrity_secret)),
     })
-}
-
-pub(super) fn decode_record(
-    key: &BootstrapKeyCustody,
-    purpose: BootstrapObjectPurpose,
-    encoded: &[u8],
-) -> Result<BootstrapRecord, BootstrapFailure> {
-    let instance = BootstrapKeyCustody::routed_instance(purpose, encoded).map_err(key_failure)?;
-    let plaintext = key
-        .open_object(instance, purpose, encoded)
-        .map_err(key_failure)?;
-    let record = BootstrapRecord::decode(&plaintext)?;
-    if record.instance != instance {
-        return Err(BootstrapFailure::new(
-            BootstrapFailureCode::IdentityMismatch,
-        ));
-    }
-    Ok(record)
 }

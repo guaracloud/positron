@@ -143,12 +143,15 @@ fn resumed_bootstrap_rejects_a_substituted_existing_claim() -> Result<(), Box<dy
     let plaintext = key.open_object(instance, BootstrapObjectPurpose::Pending, &pending)?;
     let record = super::super::codec::BootstrapRecord::decode(&plaintext)?;
     let ingest = record.ingest.as_ref().expect("current ingest identity");
+    let query = record.query.as_ref().expect("current query identity");
     let substituted = super::super::codec::encode_claim(
         instance,
         record.administrator,
         &[0x44; 32],
         ingest.principal,
         &[0x45; 32],
+        query.principal,
+        &[0x46; 32],
     );
     let encrypted = key.protect(instance, BootstrapObjectPurpose::Claim, &substituted)?;
     std::fs::write(paths.secrets_root().join("bootstrap-claim.v1"), encrypted)?;
@@ -273,6 +276,8 @@ fn claim_rejects_a_valid_envelope_for_another_principal() -> Result<(), Box<dyn 
         &[0x44; 32],
         positron_domain::identity::PrincipalId::from_bytes([0x34; 16])?,
         &[0x45; 32],
+        positron_domain::identity::PrincipalId::from_bytes([0x35; 16])?,
+        &[0x46; 32],
     );
     let encrypted = key.protect(
         initialized.instance_id(),

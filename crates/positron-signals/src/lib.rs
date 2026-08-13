@@ -9,8 +9,8 @@ mod log_store;
 
 pub use log_store::{
     AttributeRepresentation, LogRecord, LogScan, LogScanResult, LogStore, LogStoreFailure,
-    LogStoreFailureCode, PolicyProvenance, PreparedLogBlock, ScanLimit, StoredLogAttribute,
-    StoredLogRecord,
+    LogStoreFailureCode, PolicyProvenance, PreparedLogBlock, ScanLimit, ScannedLogRecord,
+    StoredLogAttribute, StoredLogRecord,
 };
 
 #[cfg(fuzzing)]

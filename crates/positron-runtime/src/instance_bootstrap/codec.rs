@@ -10,14 +10,27 @@ const PENDING_MAGIC_V2: [u8; 8] = *b"POSIPN02";
 const INITIALIZED_MAGIC_V2: [u8; 8] = *b"POSINI02";
 const CLAIM_MAGIC_V1: [u8; 8] = *b"POSCLM01";
 const CLAIM_MAGIC_V2: [u8; 8] = *b"POSCLM02";
+const PENDING_MAGIC_V3: [u8; 8] = *b"POSIPN03";
+const INITIALIZED_MAGIC_V3: [u8; 8] = *b"POSINI03";
+const CLAIM_MAGIC_V3: [u8; 8] = *b"POSCLM03";
 const RECORD_V1_INITIALIZED_BYTES: usize = 224;
 const RECORD_V1_PENDING_BYTES: usize = 288;
 const RECORD_V2_INITIALIZED_BYTES: usize = 304;
 const RECORD_V2_PENDING_BYTES: usize = 400;
 const CLAIM_V1_BYTES: usize = 72;
 const CLAIM_V2_BYTES: usize = 120;
+const RECORD_V3_INITIALIZED_BYTES: usize = 384;
+const RECORD_V3_PENDING_BYTES: usize = 512;
+const CLAIM_V3_BYTES: usize = 168;
 
 pub(super) struct BootstrapIngestIdentity {
+    pub(super) principal: PrincipalId,
+    pub(super) api_key_salt: [u8; 32],
+    pub(super) api_key_hash: [u8; 32],
+    pub(super) api_key_secret: Option<Zeroizing<[u8; 32]>>,
+}
+
+pub(super) struct BootstrapQueryIdentity {
     pub(super) principal: PrincipalId,
     pub(super) api_key_salt: [u8; 32],
     pub(super) api_key_hash: [u8; 32],
@@ -34,6 +47,7 @@ pub(super) struct BootstrapRecord {
     pub(super) api_key_hash: [u8; 32],
     pub(super) integrity_fingerprint: [u8; 32],
     pub(super) ingest: Option<BootstrapIngestIdentity>,
+    pub(super) query: Option<BootstrapQueryIdentity>,
     pub(super) api_key_secret: Option<Zeroizing<[u8; 32]>>,
     pub(super) integrity_key_secret: Option<Zeroizing<[u8; 32]>>,
 }
@@ -41,19 +55,30 @@ pub(super) struct BootstrapRecord {
 impl BootstrapRecord {
     pub(super) fn encode(&self) -> Zeroizing<Vec<u8>> {
         let pending = self.api_key_secret.is_some();
-        let current = self.ingest.is_some();
-        let capacity = match (current, pending) {
-            (false, false) => RECORD_V1_INITIALIZED_BYTES,
-            (false, true) => RECORD_V1_PENDING_BYTES,
-            (true, false) => RECORD_V2_INITIALIZED_BYTES,
-            (true, true) => RECORD_V2_PENDING_BYTES,
+        let version = match (self.ingest.is_some(), self.query.is_some()) {
+            (false, false) => 1,
+            (true, false) => 2,
+            (true, true) => 3,
+            (false, true) => 0,
+        };
+        let capacity = match (version, pending) {
+            (1, false) => RECORD_V1_INITIALIZED_BYTES,
+            (1, true) => RECORD_V1_PENDING_BYTES,
+            (2, false) => RECORD_V2_INITIALIZED_BYTES,
+            (2, true) => RECORD_V2_PENDING_BYTES,
+            (3, false) => RECORD_V3_INITIALIZED_BYTES,
+            (3, true) => RECORD_V3_PENDING_BYTES,
+            _ => 0,
         };
         let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
-        bytes.extend_from_slice(match (current, pending) {
-            (false, false) => &INITIALIZED_MAGIC_V1,
-            (false, true) => &PENDING_MAGIC_V1,
-            (true, false) => &INITIALIZED_MAGIC_V2,
-            (true, true) => &PENDING_MAGIC_V2,
+        bytes.extend_from_slice(match (version, pending) {
+            (1, false) => &INITIALIZED_MAGIC_V1,
+            (1, true) => &PENDING_MAGIC_V1,
+            (2, false) => &INITIALIZED_MAGIC_V2,
+            (2, true) => &PENDING_MAGIC_V2,
+            (3, false) => &INITIALIZED_MAGIC_V3,
+            (3, true) => &PENDING_MAGIC_V3,
+            _ => &INITIALIZED_MAGIC_V3,
         });
         bytes.extend_from_slice(&self.instance.to_bytes());
         bytes.extend_from_slice(&self.key.key_id());
@@ -70,6 +95,11 @@ impl BootstrapRecord {
             bytes.extend_from_slice(&ingest.api_key_salt);
             bytes.extend_from_slice(&ingest.api_key_hash);
         }
+        if let Some(query) = &self.query {
+            bytes.extend_from_slice(&query.principal.to_bytes());
+            bytes.extend_from_slice(&query.api_key_salt);
+            bytes.extend_from_slice(&query.api_key_hash);
+        }
         if let Some(secret) = &self.api_key_secret {
             bytes.extend_from_slice(secret.as_ref());
         }
@@ -77,6 +107,13 @@ impl BootstrapRecord {
             .ingest
             .as_ref()
             .and_then(|ingest| ingest.api_key_secret.as_ref())
+        {
+            bytes.extend_from_slice(secret.as_ref());
+        }
+        if let Some(secret) = self
+            .query
+            .as_ref()
+            .and_then(|query| query.api_key_secret.as_ref())
         {
             bytes.extend_from_slice(secret.as_ref());
         }
@@ -88,11 +125,13 @@ impl BootstrapRecord {
 
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, BootstrapFailure> {
         let magic = bytes.get(..8).ok_or_else(corrupt)?;
-        let (current, pending, expected) = match magic {
-            value if value == PENDING_MAGIC_V1 => (false, true, RECORD_V1_PENDING_BYTES),
-            value if value == INITIALIZED_MAGIC_V1 => (false, false, RECORD_V1_INITIALIZED_BYTES),
-            value if value == PENDING_MAGIC_V2 => (true, true, RECORD_V2_PENDING_BYTES),
-            value if value == INITIALIZED_MAGIC_V2 => (true, false, RECORD_V2_INITIALIZED_BYTES),
+        let (version, pending, expected) = match magic {
+            value if value == PENDING_MAGIC_V1 => (1, true, RECORD_V1_PENDING_BYTES),
+            value if value == INITIALIZED_MAGIC_V1 => (1, false, RECORD_V1_INITIALIZED_BYTES),
+            value if value == PENDING_MAGIC_V2 => (2, true, RECORD_V2_PENDING_BYTES),
+            value if value == INITIALIZED_MAGIC_V2 => (2, false, RECORD_V2_INITIALIZED_BYTES),
+            value if value == PENDING_MAGIC_V3 => (3, true, RECORD_V3_PENDING_BYTES),
+            value if value == INITIALIZED_MAGIC_V3 => (3, false, RECORD_V3_INITIALIZED_BYTES),
             _ => return Err(corrupt()),
         };
         if bytes.len() != expected {
@@ -118,14 +157,30 @@ impl BootstrapRecord {
             api_key_salt: array(bytes, 128, 160)?,
             api_key_hash: array(bytes, 160, 192)?,
             integrity_fingerprint: array(bytes, 192, 224)?,
-            ingest: if current {
+            ingest: if version >= 2 {
                 Some(BootstrapIngestIdentity {
                     principal: PrincipalId::from_bytes(array(bytes, 224, 240)?)
                         .map_err(|_| corrupt())?,
                     api_key_salt: array(bytes, 240, 272)?,
                     api_key_hash: array(bytes, 272, 304)?,
                     api_key_secret: if pending {
-                        Some(Zeroizing::new(array(bytes, 336, 368)?))
+                        let start = if version == 2 { 336 } else { 416 };
+                        Some(Zeroizing::new(array(bytes, start, start + 32)?))
+                    } else {
+                        None
+                    },
+                })
+            } else {
+                None
+            },
+            query: if version >= 3 {
+                Some(BootstrapQueryIdentity {
+                    principal: PrincipalId::from_bytes(array(bytes, 304, 320)?)
+                        .map_err(|_| corrupt())?,
+                    api_key_salt: array(bytes, 320, 352)?,
+                    api_key_hash: array(bytes, 352, 384)?,
+                    api_key_secret: if pending {
+                        Some(Zeroizing::new(array(bytes, 448, 480)?))
                     } else {
                         None
                     },
@@ -134,13 +189,21 @@ impl BootstrapRecord {
                 None
             },
             api_key_secret: if pending {
-                let start = if current { 304 } else { 224 };
+                let start = match version {
+                    1 => 224,
+                    2 => 304,
+                    _ => 384,
+                };
                 Some(Zeroizing::new(array(bytes, start, start + 32)?))
             } else {
                 None
             },
             integrity_key_secret: if pending {
-                let start = if current { 368 } else { 256 };
+                let start = match version {
+                    1 => 256,
+                    2 => 368,
+                    _ => 480,
+                };
                 Some(Zeroizing::new(array(bytes, start, start + 32)?))
             } else {
                 None
@@ -164,6 +227,12 @@ impl BootstrapRecord {
                 api_key_hash: ingest.api_key_hash,
                 api_key_secret: None,
             }),
+            query: self.query.as_ref().map(|query| BootstrapQueryIdentity {
+                principal: query.principal,
+                api_key_salt: query.api_key_salt,
+                api_key_hash: query.api_key_hash,
+                api_key_secret: None,
+            }),
             api_key_secret: None,
             integrity_key_secret: None,
         }
@@ -180,14 +249,18 @@ pub(super) fn encode_claim(
     secret: &[u8; 32],
     ingest_principal: PrincipalId,
     ingest_secret: &[u8; 32],
+    query_principal: PrincipalId,
+    query_secret: &[u8; 32],
 ) -> Zeroizing<Vec<u8>> {
-    let mut bytes = Zeroizing::new(Vec::with_capacity(CLAIM_V2_BYTES));
-    bytes.extend_from_slice(&CLAIM_MAGIC_V2);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(CLAIM_V3_BYTES));
+    bytes.extend_from_slice(&CLAIM_MAGIC_V3);
     bytes.extend_from_slice(&instance.to_bytes());
     bytes.extend_from_slice(&principal.to_bytes());
     bytes.extend_from_slice(secret);
     bytes.extend_from_slice(&ingest_principal.to_bytes());
     bytes.extend_from_slice(ingest_secret);
+    bytes.extend_from_slice(&query_principal.to_bytes());
+    bytes.extend_from_slice(query_secret);
     bytes
 }
 
@@ -208,6 +281,7 @@ pub(super) struct DecodedBootstrapClaim {
     pub(super) principal: PrincipalId,
     pub(super) secret: Zeroizing<[u8; 32]>,
     pub(super) ingest: Option<(PrincipalId, Zeroizing<[u8; 32]>)>,
+    pub(super) query: Option<(PrincipalId, Zeroizing<[u8; 32]>)>,
 }
 
 impl std::fmt::Debug for DecodedBootstrapClaim {
@@ -220,20 +294,12 @@ pub(super) fn decode_claim(
     expected_instance: InstanceId,
     bytes: &[u8],
 ) -> Result<DecodedBootstrapClaim, BootstrapFailure> {
-    let current = match bytes.get(..8) {
-        Some(magic) if magic == CLAIM_MAGIC_V1 && bytes.len() == CLAIM_V1_BYTES => false,
-        Some(magic) if magic == CLAIM_MAGIC_V2 && bytes.len() == CLAIM_V2_BYTES => true,
+    let version = match bytes.get(..8) {
+        Some(magic) if magic == CLAIM_MAGIC_V1 && bytes.len() == CLAIM_V1_BYTES => 1,
+        Some(magic) if magic == CLAIM_MAGIC_V2 && bytes.len() == CLAIM_V2_BYTES => 2,
+        Some(magic) if magic == CLAIM_MAGIC_V3 && bytes.len() == CLAIM_V3_BYTES => 3,
         _ => return Err(corrupt()),
     };
-    if bytes.len()
-        != if current {
-            CLAIM_V2_BYTES
-        } else {
-            CLAIM_V1_BYTES
-        }
-    {
-        return Err(corrupt());
-    }
     if array::<16>(bytes, 8, 24)? != expected_instance.to_bytes() {
         return Err(BootstrapFailure::new(
             BootstrapFailureCode::IdentityMismatch,
@@ -242,10 +308,18 @@ pub(super) fn decode_claim(
     Ok(DecodedBootstrapClaim {
         principal: PrincipalId::from_bytes(array(bytes, 24, 40)?).map_err(|_| corrupt())?,
         secret: Zeroizing::new(array(bytes, 40, 72)?),
-        ingest: if current {
+        ingest: if version >= 2 {
             Some((
                 PrincipalId::from_bytes(array(bytes, 72, 88)?).map_err(|_| corrupt())?,
                 Zeroizing::new(array(bytes, 88, 120)?),
+            ))
+        } else {
+            None
+        },
+        query: if version >= 3 {
+            Some((
+                PrincipalId::from_bytes(array(bytes, 120, 136)?).map_err(|_| corrupt())?,
+                Zeroizing::new(array(bytes, 136, 168)?),
             ))
         } else {
             None

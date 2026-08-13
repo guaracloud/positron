@@ -557,6 +557,7 @@ dependencies = [
  "positron-governance",
  "positron-ingest",
  "positron-kernel",
+ "positron-query",
  "positron-runtime",
  "positron-signals",
 ]
@@ -599,6 +600,18 @@ dependencies = [
  "sha2",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "positron-query"
+version = "0.0.0"
+dependencies = [
+ "hmac",
+ "positron-domain",
+ "positron-governance",
+ "positron-kernel",
+ "positron-signals",
+ "sha2",
 ]
 
 [[package]]

@@ -15,6 +15,24 @@ pub(super) fn acquire(
         .map_err(super::super::storage::storage_failure)
 }
 
+pub(crate) fn decode_record(
+    key: &BootstrapKeyCustody,
+    purpose: BootstrapObjectPurpose,
+    encoded: &[u8],
+) -> Result<BootstrapRecord, BootstrapFailure> {
+    let instance = BootstrapKeyCustody::routed_instance(purpose, encoded).map_err(key_failure)?;
+    let plaintext = key
+        .open_object(instance, purpose, encoded)
+        .map_err(key_failure)?;
+    let record = BootstrapRecord::decode(&plaintext)?;
+    if record.instance != instance {
+        return Err(BootstrapFailure::new(
+            BootstrapFailureCode::IdentityMismatch,
+        ));
+    }
+    Ok(record)
+}
+
 pub(super) fn recover_pending_replacement(
     access: &BootstrapArtifactAccess,
     key: &BootstrapKeyCustody,
@@ -23,7 +41,7 @@ pub(super) fn recover_pending_replacement(
         return Ok(());
     }
     let replacement = super::super::storage::read(access, BootstrapArtifact::PendingReplacement)?;
-    let record = super::decode_record(key, BootstrapObjectPurpose::Pending, &replacement)?;
+    let record = decode_record(key, BootstrapObjectPurpose::Pending, &replacement)?;
     require_key_identity(&record, key.identity())?;
     if super::super::storage::read(access, BootstrapArtifact::Pending)?
         != super::super::storage::INTENT

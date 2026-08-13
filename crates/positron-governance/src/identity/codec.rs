@@ -4,11 +4,15 @@ use super::{Identity, IdentityFailure};
 
 pub(super) const GOVERNANCE_OBJECT_MAGIC_V1: [u8; 8] = *b"POSGOV01";
 pub(super) const GOVERNANCE_OBJECT_MAGIC_V2: [u8; 8] = *b"POSGOV02";
+pub(super) const GOVERNANCE_OBJECT_MAGIC_V3: [u8; 8] = *b"POSGOV03";
 
 pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, IdentityFailure> {
     let mut cursor = Cursor::new(encoded);
     let magic = cursor.take_array::<8>()?;
-    if magic != GOVERNANCE_OBJECT_MAGIC_V1 && magic != GOVERNANCE_OBJECT_MAGIC_V2 {
+    if magic != GOVERNANCE_OBJECT_MAGIC_V1
+        && magic != GOVERNANCE_OBJECT_MAGIC_V2
+        && magic != GOVERNANCE_OBJECT_MAGIC_V3
+    {
         return Err(IdentityFailure);
     }
     let instance = cursor.take_array::<16>()?;
@@ -26,7 +30,7 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
     let hash = cursor.take_array::<32>()?;
     require_nonzero(salt)?;
     require_nonzero(hash)?;
-    let ingest = if magic == GOVERNANCE_OBJECT_MAGIC_V2 {
+    let ingest = if magic == GOVERNANCE_OBJECT_MAGIC_V2 || magic == GOVERNANCE_OBJECT_MAGIC_V3 {
         let ingest_principal =
             PrincipalId::from_bytes(cursor.take_array::<16>()?).map_err(|_| IdentityFailure)?;
         if ingest_principal == principal {
@@ -38,6 +42,28 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
         require_nonzero(hash)?;
         Some(super::IngestIdentity {
             principal: ingest_principal,
+            salt,
+            hash,
+        })
+    } else {
+        None
+    };
+    let query = if magic == GOVERNANCE_OBJECT_MAGIC_V3 {
+        let query_principal =
+            PrincipalId::from_bytes(cursor.take_array::<16>()?).map_err(|_| IdentityFailure)?;
+        if query_principal == principal
+            || ingest
+                .as_ref()
+                .is_some_and(|ingest| ingest.principal == query_principal)
+        {
+            return Err(IdentityFailure);
+        }
+        let salt = cursor.take_array::<32>()?;
+        let hash = cursor.take_array::<32>()?;
+        require_nonzero(salt)?;
+        require_nonzero(hash)?;
+        Some(super::QueryIdentity {
+            principal: query_principal,
             salt,
             hash,
         })
@@ -61,12 +87,14 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
     }
     Ok(Identity {
         instance,
+        generation: 0,
         principal,
         tenant,
         tenant_slug,
         salt,
         hash,
         ingest,
+        query,
     })
 }
 

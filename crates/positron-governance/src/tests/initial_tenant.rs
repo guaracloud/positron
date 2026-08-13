@@ -19,6 +19,9 @@ fn intent(
         PrincipalId::from_bytes([12; 16]).expect("ingest principal"),
         [13; 32],
         [14; 32],
+        PrincipalId::from_bytes([15; 16]).expect("query principal"),
+        [16; 32],
+        [17; 32],
         [6; 32],
         [7; 32],
         integrity,
@@ -38,7 +41,7 @@ fn tenant_creation_encodes_every_authority_and_closed_audit() {
     )
     .expect("encodable intent")
     .into_parts();
-    assert!(object.starts_with(b"POSGOV02"));
+    assert!(object.starts_with(b"POSGOV03"));
     assert!(object.windows(14).any(|bytes| bytes == b"Default tenant"));
     assert!(object.windows(48).any(|bytes| bytes == [9; 48]));
     assert!(

@@ -217,6 +217,7 @@ pub struct BootstrapClaim {
     pub(super) principal: PrincipalId,
     pub(super) secret: Zeroizing<String>,
     pub(super) ingest: Option<(PrincipalId, Zeroizing<String>)>,
+    pub(super) query: Option<(PrincipalId, Zeroizing<String>)>,
 }
 
 impl BootstrapClaim {
@@ -238,6 +239,16 @@ impl BootstrapClaim {
     #[must_use]
     pub fn ingest_secret(&self) -> Option<&str> {
         self.ingest.as_ref().map(|(_, secret)| secret.as_str())
+    }
+
+    #[must_use]
+    pub fn query_principal_id(&self) -> Option<PrincipalId> {
+        self.query.as_ref().map(|(principal, _)| *principal)
+    }
+
+    #[must_use]
+    pub fn query_secret(&self) -> Option<&str> {
+        self.query.as_ref().map(|(_, secret)| secret.as_str())
     }
 }
 

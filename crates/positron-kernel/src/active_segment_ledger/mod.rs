@@ -214,10 +214,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let catalog = self.catalog.pin()?;
         Ok(LedgerSnapshot {
             _capacity: reservation,
             scope: self.scope,
             frontier: state.frontier,
+            catalog_generation: catalog.number(),
+            catalog_identity: catalog.identity(),
             blocks: state.blocks.clone(),
         })
     }

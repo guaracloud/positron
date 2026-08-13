@@ -19,7 +19,7 @@ use positron_kernel::{
 };
 
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
-pub use scan::{LogScan, LogScanResult, ScanLimit};
+pub use scan::{LogScan, LogScanResult, ScanLimit, ScannedLogRecord};
 pub use types::{
     AttributeRepresentation, LogRecord, PolicyProvenance, PreparedLogBlock, StoredLogAttribute,
     StoredLogRecord,
@@ -82,6 +82,10 @@ impl LogStore {
         let encoded_bytes = snapshot
             .blocks()
             .iter()
+            .filter(|block| {
+                scan.frontier()
+                    .is_none_or(|frontier| block.position() <= frontier)
+            })
             .try_fold(0_u64, |total, block| {
                 total.checked_add(u64::try_from(block.payload().len()).ok()?)
             })
@@ -102,9 +106,22 @@ impl LogStore {
             .reserve(claim)
             .map_err(|_| LogStoreFailure::resource_admission_refused())?;
         let mut records = Vec::new();
+        let mut scanned_bytes = 0_u64;
         let limit = scan.limit().value();
         let mut complete = true;
         for block in snapshot.blocks() {
+            if scan
+                .frontier()
+                .is_some_and(|frontier| block.position() > frontier)
+            {
+                continue;
+            }
+            scanned_bytes = scanned_bytes
+                .checked_add(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
             let remaining = limit.saturating_sub(records.len());
             let decoded = codec::decode_block(tenant, snapshot, block.payload(), remaining)?;
             if decoded.truncated {
@@ -115,13 +132,18 @@ impl LogStore {
                     complete = false;
                     break;
                 }
-                records.push(record);
+                records.push(ScannedLogRecord::new(record, block.position()));
             }
             if !complete {
                 break;
             }
         }
-        Ok(LogScanResult::new(records, complete, capacity))
+        Ok(LogScanResult::new(
+            records,
+            complete,
+            scanned_bytes,
+            capacity,
+        ))
     }
 }
 
