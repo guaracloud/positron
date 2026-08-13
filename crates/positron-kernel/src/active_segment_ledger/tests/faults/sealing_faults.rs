@@ -5,7 +5,7 @@ fn recovery_reconciles_a_crash_between_the_two_seal_renames() -> Result<(), Box<
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        let committed = ledger.append(prepared(b"survives-seal")?)?;
+        let committed = ledger.append(prepared(scope, b"survives-seal")?)?;
         let failure = with_ledger_fault(LedgerFileEvent::RenameSealFrontier, || ledger.seal())
             .expect_err("the interrupted seal cannot publish success");
         assert_eq!(
@@ -32,7 +32,7 @@ fn recovery_reconciles_physical_seal_before_catalog_publication() -> Result<(), 
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        let committed = ledger.append(prepared(b"catalog-atomic")?)?;
+        let committed = ledger.append(prepared(scope, b"catalog-atomic")?)?;
         let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || ledger.seal())
             .expect_err("catalog publication failure cannot report a sealed segment");
         assert_eq!(
@@ -136,7 +136,7 @@ fn seal_directory_sync_faults_remain_restartable() -> Result<(), Box<dyn Error>>
         with_fixture(|authority, catalog, scope| {
             let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
             let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-            let committed = ledger.append(prepared(b"sync-seal")?)?;
+            let committed = ledger.append(prepared(scope, b"sync-seal")?)?;
             let failure = with_ledger_fault(event, || ledger.seal())
                 .expect_err("failed sync cannot publish success");
             assert_eq!(

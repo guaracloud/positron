@@ -13,6 +13,7 @@ positron-kernel = { path = "../crates/positron-kernel" }
 positron-domain = { path = "../crates/positron-domain" }
 positron-governance = { path = "../crates/positron-governance" }
 positron-runtime = { path = "../crates/positron-runtime" }
+positron-signals = { path = "../crates/positron-signals" }
 
 [[bin]]
 name = "primary_data_volume_stateful"
@@ -66,6 +67,13 @@ bench = false
 [[bin]]
 name = "instance_bootstrap_stateful"
 path = "fuzz_targets/instance_bootstrap_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_store_block_decode"
+path = "fuzz_targets/log_store_block_decode.rs"
 test = false
 doc = false
 bench = false

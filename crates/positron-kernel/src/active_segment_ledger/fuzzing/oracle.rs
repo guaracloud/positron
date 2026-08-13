@@ -71,8 +71,9 @@ impl Oracle {
         }
         drop(snapshot);
         for expected in &self.records {
-            let retry = PreparedStoreBlock::new(expected.identity, expected.payload.clone())
-                .expect("oracle record remains bounded");
+            let retry =
+                PreparedStoreBlock::new(ledger.scope, expected.identity, expected.payload.clone())
+                    .expect("oracle record remains bounded");
             assert_eq!(
                 ledger.append(retry).expect("oracle replay succeeds"),
                 expected.receipt

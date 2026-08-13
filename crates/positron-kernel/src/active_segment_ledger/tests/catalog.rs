@@ -65,6 +65,7 @@ fn catalog_rejects_an_active_segment_that_overlaps_committed_sealed_bytes()
     with_fixture(0xa6, |authority, catalog, scope| {
         let ledger = open(authority, catalog, scope)?;
         ledger.append(PreparedStoreBlock::new(
+            scope,
             StoreBlockIdentity::new([0xc6; 16])?,
             b"committed".to_vec(),
         )?)?;

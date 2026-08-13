@@ -11,12 +11,18 @@ use crate::data_protection::{FrameFailure, FrameFailureCode};
 
 #[test]
 fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
+    let prepared_scope = SegmentScope::new(
+        TenantId::from_bytes([4; 16]).expect("fixed tenant"),
+        SignalKind::Logs,
+        VirtualShardId::new(7).expect("fixed shard"),
+    );
     assert_eq!(
         SegmentId::new([0; 16]).expect_err("zero identity").code(),
         LedgerFailureCode::InvalidInput
     );
     assert_eq!(
         PreparedStoreBlock::new(
+            prepared_scope,
             StoreBlockIdentity::new([1; 16]).expect("identity"),
             Vec::new()
         )
@@ -27,6 +33,7 @@ fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
     );
     assert_eq!(
         PreparedStoreBlock::new(
+            prepared_scope,
             StoreBlockIdentity::new([1; 16]).expect("identity"),
             vec![0; 1_048_577],
         )

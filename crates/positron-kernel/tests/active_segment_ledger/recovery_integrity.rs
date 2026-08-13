@@ -16,10 +16,15 @@ use super::support::{TemporaryRoot, establish_kernel_authority};
 mod artifact_shapes;
 
 fn prepared(
+    scope: SegmentScope,
     marker: u8,
     payload: &[u8],
-) -> Result<PreparedStoreBlock, positron_kernel::LedgerFailure> {
-    PreparedStoreBlock::new(StoreBlockIdentity::new([marker; 16])?, payload.to_vec())
+) -> Result<PreparedStoreBlock<'static>, positron_kernel::LedgerFailure> {
+    PreparedStoreBlock::new(
+        scope,
+        StoreBlockIdentity::new([marker; 16])?,
+        payload.to_vec(),
+    )
 }
 
 #[test]
@@ -27,7 +32,7 @@ fn recovery_rejects_the_wrong_segment_wrapping_key() -> Result<(), Box<dyn Error
     let fixture = Fixture::new(0x61)?;
     let catalog = fixture.catalog()?;
     let ledger = fixture.open(&catalog, [0x71; 32])?;
-    ledger.append(prepared(1, b"protected")?)?;
+    ledger.append(prepared(fixture.scope, 1, b"protected")?)?;
     drop(ledger);
 
     let failure = fixture
@@ -49,7 +54,7 @@ fn physical_bootstrap_and_frontier_expose_only_opaque_key_routing_metadata()
         fixture.scope,
         SegmentProtectionKey::from_owned_with_route(Box::new([0x70; 32]), provider_reference, 7)?,
     )?;
-    let receipt = ledger.append(prepared(1, b"opaque-bootstrap")?)?;
+    let receipt = ledger.append(prepared(fixture.scope, 1, b"opaque-bootstrap")?)?;
     drop(ledger);
 
     let segment = fs::read(active_segment(fixture.root.path(), receipt.segment_id()))?;
@@ -105,7 +110,7 @@ fn recovery_rejects_committed_frame_corruption_and_truncation() -> Result<(), Bo
         let fixture = Fixture::new(if truncate { 0x62 } else { 0x63 })?;
         let catalog = fixture.catalog()?;
         let ledger = fixture.open(&catalog, [0x73; 32])?;
-        let receipt = ledger.append(prepared(2, b"durable")?)?;
+        let receipt = ledger.append(prepared(fixture.scope, 2, b"durable")?)?;
         drop(ledger);
         let path = active_segment(fixture.root.path(), receipt.segment_id());
         let length = fs::metadata(&path)?.len();
@@ -137,7 +142,7 @@ fn recovery_discards_only_bytes_after_the_authenticated_frontier() -> Result<(),
     let fixture = Fixture::new(0x64)?;
     let catalog = fixture.catalog()?;
     let ledger = fixture.open(&catalog, [0x74; 32])?;
-    let receipt = ledger.append(prepared(3, b"frontier-bounded")?)?;
+    let receipt = ledger.append(prepared(fixture.scope, 3, b"frontier-bounded")?)?;
     drop(ledger);
     let path = active_segment(fixture.root.path(), receipt.segment_id());
     let durable_length = fs::metadata(&path)?.len();
@@ -161,7 +166,7 @@ fn recovery_rejects_frontier_authenticator_corruption() -> Result<(), Box<dyn Er
     let fixture = Fixture::new(0x65)?;
     let catalog = fixture.catalog()?;
     let ledger = fixture.open(&catalog, [0x75; 32])?;
-    let receipt = ledger.append(prepared(4, b"authenticated")?)?;
+    let receipt = ledger.append(prepared(fixture.scope, 4, b"authenticated")?)?;
     drop(ledger);
     let path = active_frontier(fixture.root.path(), receipt.segment_id());
     let mut file = OpenOptions::new().write(true).open(path)?;
@@ -186,7 +191,7 @@ fn recovery_rejects_truncated_trailing_and_structurally_corrupt_frontiers()
         let fixture = Fixture::new(0x66 + mutation)?;
         let catalog = fixture.catalog()?;
         let ledger = fixture.open(&catalog, [0x76; 32])?;
-        let receipt = ledger.append(prepared(5, b"frontier-shape")?)?;
+        let receipt = ledger.append(prepared(fixture.scope, 5, b"frontier-shape")?)?;
         drop(ledger);
         let path = active_frontier(fixture.root.path(), receipt.segment_id());
         match mutation {
@@ -234,7 +239,7 @@ fn recovery_rejects_an_unknown_segment_header_version() -> Result<(), Box<dyn Er
     let fixture = Fixture::new(0x69)?;
     let catalog = fixture.catalog()?;
     let ledger = fixture.open(&catalog, [0x79; 32])?;
-    let receipt = ledger.append(prepared(6, b"versioned")?)?;
+    let receipt = ledger.append(prepared(fixture.scope, 6, b"versioned")?)?;
     drop(ledger);
     let path = active_segment(fixture.root.path(), receipt.segment_id());
     let mut file = OpenOptions::new().write(true).open(path)?;

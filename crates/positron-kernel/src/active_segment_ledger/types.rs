@@ -5,12 +5,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
 use crate::catalog::CatalogFailure;
 use crate::data_protection::{SecretKeyBytes, SegmentEnvelopeRoute};
 
-use super::MAX_STORE_BLOCK_BYTES;
+use crate::IngestTime;
 use crate::ResourceReservation;
+
+mod prepared;
+pub use prepared::PreparedStoreBlock;
 
 /// The immutable tenant, Signal Store, and Virtual Shard boundary of one active segment.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -152,24 +156,6 @@ impl std::fmt::Debug for SegmentProtectionKey {
     }
 }
 
-/// Opaque canonical Store Block bytes and their caller-owned stable identity.
-pub struct PreparedStoreBlock {
-    pub(super) identity: StoreBlockIdentity,
-    pub(super) payload: Vec<u8>,
-}
-
-impl PreparedStoreBlock {
-    pub fn new(identity: StoreBlockIdentity, bytes: Vec<u8>) -> Result<Self, LedgerFailure> {
-        if bytes.is_empty() || bytes.len() > MAX_STORE_BLOCK_BYTES {
-            return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
-        }
-        Ok(Self {
-            identity,
-            payload: bytes,
-        })
-    }
-}
-
 /// Cooperative cancellation observed only before durability work is admitted.
 #[derive(Clone, Debug)]
 pub struct AppendCancellation(Arc<AtomicBool>);
@@ -250,11 +236,24 @@ impl CommittedBlock {
 /// A verified immutable view bounded by the published Durability Frontier.
 pub struct LedgerSnapshot<'kernel> {
     pub(super) _capacity: ResourceReservation<'kernel>,
+    pub(super) scope: SegmentScope,
     pub(super) frontier: CommitPosition,
     pub(super) blocks: Vec<CommittedBlock>,
 }
 
 impl LedgerSnapshot<'_> {
+    /// Returns the authenticated physical tenant, signal, and shard scope.
+    #[must_use]
+    pub const fn scope(&self) -> SegmentScope {
+        self.scope
+    }
+
+    /// Reconstructs Ingest Time only inside an authenticated durable snapshot.
+    #[must_use]
+    pub const fn reconstruct_ingest_time(&self, instant: UnixNanoseconds) -> IngestTime {
+        IngestTime::from_authenticated_durable(instant)
+    }
+
     #[must_use]
     pub const fn frontier(&self) -> CommitPosition {
         self.frontier
@@ -289,6 +288,7 @@ impl SealedSegment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LedgerFailureCode {
     InvalidInput,
+    PhysicalScopeMismatch,
     LimitExceeded,
     ResourceAdmissionRefused,
     StorageUnavailable,

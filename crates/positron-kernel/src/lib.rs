@@ -72,6 +72,7 @@ mod catalog;
 #[allow(dead_code)]
 mod data_protection;
 mod instance_bootstrap_storage;
+mod lifecycle_clock;
 mod resource_governor;
 
 pub use catalog::{
@@ -95,6 +96,11 @@ pub use data_protection::{
 pub use instance_bootstrap_storage::{
     BootstrapArtifact, BootstrapArtifactAccess, BootstrapEntry, BootstrapLayout,
     BootstrapStorageFailure, InstanceBootstrapStorage,
+};
+
+pub use lifecycle_clock::{
+    FixedLifecycleClockSource, IngestTime, LifecycleClock, LifecycleClockFailure,
+    LifecycleClockSource,
 };
 
 pub use resource_governor::{

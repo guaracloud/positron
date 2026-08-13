@@ -5,7 +5,7 @@ fn sealed_segments_reject_bytes_beyond_their_frontier() -> Result<(), Box<dyn Er
     let fixture = Fixture::new(0x6a)?;
     let catalog = fixture.catalog()?;
     let ledger = fixture.open(&catalog, [0x7a; 32])?;
-    let receipt = ledger.append(prepared(7, b"sealed-exact")?)?;
+    let receipt = ledger.append(prepared(fixture.scope, 7, b"sealed-exact")?)?;
     ledger.seal()?;
     let mut file = OpenOptions::new()
         .append(true)
@@ -29,7 +29,7 @@ fn recovery_rejects_missing_multiply_linked_and_duplicated_segment_artifacts()
         let fixture = Fixture::new(0x6b + mutation)?;
         let catalog = fixture.catalog()?;
         let ledger = fixture.open(&catalog, [0x7b; 32])?;
-        let receipt = ledger.append(prepared(8, b"safe-path")?)?;
+        let receipt = ledger.append(prepared(fixture.scope, 8, b"safe-path")?)?;
         drop(ledger);
         let active = active_segment(fixture.root.path(), receipt.segment_id());
         match mutation {
@@ -59,7 +59,7 @@ fn recovery_rejects_a_frontier_present_in_both_lifecycle_directories() -> Result
     let fixture = Fixture::new(0x6e)?;
     let catalog = fixture.catalog()?;
     let ledger = fixture.open(&catalog, [0x7e; 32])?;
-    let receipt = ledger.append(prepared(9, b"one-frontier")?)?;
+    let receipt = ledger.append(prepared(fixture.scope, 9, b"one-frontier")?)?;
     drop(ledger);
     fs::copy(
         active_frontier(fixture.root.path(), receipt.segment_id()),
@@ -102,7 +102,7 @@ fn recovery_rejects_unsafe_temporary_and_unpublished_artifact_shapes() -> Result
     let catalog = fixture.catalog()?;
     let ledger = fixture.open(&catalog, [0x80; 32])?;
     let segment = ledger
-        .append(prepared(10, b"temporary-shape")?)?
+        .append(prepared(fixture.scope, 10, b"temporary-shape")?)?
         .segment_id();
     drop(ledger);
     fs::create_dir(
