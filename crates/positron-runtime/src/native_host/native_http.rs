@@ -5,7 +5,7 @@ use std::time::Duration;
 use positron_api::generated::{ApiError, CapabilityResponse};
 use positron_ingest::IngestOutcome;
 
-use crate::{HealthState, Liveness, Readiness, ServiceFailure, ServiceHandle};
+use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceFailure, ServiceHandle};
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_OTLP_BODY_BYTES: usize = 1_048_576;
@@ -13,40 +13,70 @@ const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BY
 
 pub(super) fn serve_connection(
     stream: &mut TcpStream,
+    role: ListenerRole,
     health: &HealthState,
-    services: &ServiceHandle,
-) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let result = serve_checked(stream, health, services);
-    if let Err(response) = result {
-        let _ = write_response(stream, response);
+    services: Option<&ServiceHandle>,
+) -> Result<(), ConnectionFailure> {
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .is_err()
+    {
+        return Err(ConnectionFailure);
     }
+    let result = serve_checked(stream, role, health, services);
+    if let Err(response) = result {
+        write_response(stream, response).map_err(|_| ConnectionFailure)?;
+    }
+    Ok(())
 }
+
+pub(super) struct ConnectionFailure;
 
 fn serve_checked(
     stream: &mut TcpStream,
+    role: ListenerRole,
     health: &HealthState,
-    services: &ServiceHandle,
+    services: Option<&ServiceHandle>,
 ) -> Result<(), Response> {
     let head = read_head(stream)?;
-    let response = match (head.method.as_str(), head.path.as_str()) {
-        ("GET", "/health/live") => health_response(health.liveness() == Liveness::Live, "live"),
-        ("GET", "/health/ready") => {
-            health_response(health.readiness() == Readiness::Ready, "ready")
+    let response = route(stream, role, head, health, services)?;
+    write_response(stream, response).map_err(|_| Response::empty(500))
+}
+
+fn route(
+    stream: &mut TcpStream,
+    role: ListenerRole,
+    head: RequestHead,
+    health: &HealthState,
+    services: Option<&ServiceHandle>,
+) -> Result<Response, Response> {
+    match (role, head.method.as_str(), head.path.as_str()) {
+        (ListenerRole::Operations, "GET", "/health/live") => {
+            Ok(health_response(health.liveness() == Liveness::Live, "live"))
         },
-        ("POST", "/v1/capabilities:negotiate") => {
+        (ListenerRole::Operations, "GET", "/health/ready") => Ok(health_response(
+            health.readiness() == Readiness::Ready,
+            "ready",
+        )),
+        (ListenerRole::Api, "POST", "/v1/capabilities:negotiate") => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
             let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
-            capability_response(services.negotiate_capability(&body))
+            Ok(capability_response(services.negotiate_capability(&body)))
         },
-        ("POST", "/v1/logs") => {
+        (ListenerRole::OtlpHttp, "POST", "/v1/logs") => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
             let bearer = head.bearer.ok_or_else(|| Response::empty(401))?;
             let body = read_body(stream, head.content_length, MAX_OTLP_BODY_BYTES)?;
-            ingest_response(services.ingest_otlp_logs(&bearer, body))
+            Ok(ingest_response(services.ingest_otlp_logs(&bearer, body)))
         },
-        _ => Response::empty(404),
-    };
-    write_response(stream, response).map_err(|_| Response::empty(500))
+        (ListenerRole::Operations, _, "/health/live" | "/health/ready")
+        | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
+        | (ListenerRole::OtlpHttp, _, "/v1/logs") => Ok(Response::empty(405)),
+        (ListenerRole::Control, _, _) | (_, _, _) => Ok(Response::empty(404)),
+    }
 }
 
 struct RequestHead {
@@ -206,6 +236,7 @@ fn write_response(stream: &mut TcpStream, response: Response) -> Result<(), std:
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         413 => "Content Too Large",
         422 => "Unprocessable Content",
         431 => "Request Header Fields Too Large",

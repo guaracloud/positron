@@ -22,8 +22,8 @@ pub use listener::{
 };
 pub use native_host::{NativeBindings, NativeHost, NativeHostFailure};
 pub use process::{
-    ApplicationRuntime, ExitOutcome, HostInputs, InitializationMode, RunningProcess,
-    ServeConfiguration, ShutdownTrigger,
+    ApplicationRuntime, DrainingProcess, ExitOutcome, HostInputs, InitializationMode,
+    RunningProcess, ServeConfiguration, ShutdownTrigger,
 };
 pub use services::{ServiceFailure, ServiceHandle};
 pub use task::{
@@ -42,7 +42,6 @@ pub fn fuzz_process_inputs(data: &[u8]) {
             0 => ListenerRole::Control,
             1 => ListenerRole::Operations,
             2 => ListenerRole::Api,
-            3 => ListenerRole::OtlpGrpc,
             _ => ListenerRole::OtlpHttp,
         };
         let address = SocketAddr::V4(SocketAddrV4::new(

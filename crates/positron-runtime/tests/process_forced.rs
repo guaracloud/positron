@@ -51,7 +51,7 @@ impl RegisteredTask for Task {
         self: Box<Self>,
         cancellation: TaskCancellation,
         _health: positron_runtime::HealthState,
-        _services: positron_runtime::ServiceHandle,
+        _services: Option<positron_runtime::ServiceHandle>,
     ) -> Result<Box<dyn RunningTask>, TaskFailure> {
         Ok(Box::new(TaskHandle(cancellation)))
     }
@@ -60,6 +60,10 @@ impl RegisteredTask for Task {
 struct TaskHandle(TaskCancellation);
 
 impl RunningTask for TaskHandle {
+    fn poll_join(&mut self) -> Result<Option<TaskJoinOutcome>, TaskFailure> {
+        Ok(Some(TaskJoinOutcome::Joined))
+    }
+
     fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure> {
         Ok(TaskJoinOutcome::Joined)
     }
@@ -83,6 +87,30 @@ fn second_signal_forces_abort_and_releases_ownership() -> Result<(), Box<dyn std
     )?;
     assert_eq!(
         process.shutdown(ShutdownTrigger::SecondSignal),
+        positron_runtime::ExitOutcome::Forced
+    );
+    assert!(roots.acquire_volume_again().is_ok());
+    Ok(())
+}
+
+#[test]
+fn deadline_escalates_without_calling_a_blocking_join() -> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("deadline-preempt")?;
+    let host = Host;
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&host, &host),
+    )?;
+    let draining = process.begin_shutdown();
+    assert_eq!(
+        draining.health().phase(),
+        positron_runtime::ProcessPhase::Draining
+    );
+    assert_eq!(
+        draining.finish(ShutdownTrigger::DeadlineExpired),
         positron_runtime::ExitOutcome::Forced
     );
     assert!(roots.acquire_volume_again().is_ok());

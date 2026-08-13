@@ -20,6 +20,7 @@ pub struct ObservingListeners {
     pub bound: RefCell<Vec<ListenerRole>>,
     pub health: RefCell<Vec<positron_runtime::HealthState>>,
     fail_role: Option<ListenerRole>,
+    fail_close: Option<ListenerRole>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +37,7 @@ pub struct ObservingTasks {
     fail_registration: Option<TaskRole>,
     fail_spawn: Option<TaskRole>,
     fail_join: Option<TaskRole>,
+    fail_abort: Option<TaskRole>,
 }
 
 impl ObservingTasks {
@@ -71,7 +73,10 @@ impl ListenerFactory for ObservingListeners {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, role.test_port())),
             )?
         };
-        Ok(Box::new(ObservedListener { endpoint }))
+        Ok(Box::new(ObservedListener {
+            endpoint,
+            fail_close: self.fail_close == Some(role),
+        }))
     }
 }
 
@@ -111,11 +116,20 @@ fn listener_bind_failure_is_typed_and_releases_the_volume_claim()
 
 struct ObservedListener {
     endpoint: BoundEndpoint,
+    fail_close: bool,
 }
 
 impl BoundListener for ObservedListener {
     fn endpoint(&self) -> &BoundEndpoint {
         &self.endpoint
+    }
+
+    fn close(&mut self) -> Result<(), ListenerFailure> {
+        if self.fail_close {
+            Err(ListenerFailure::BindUnavailable)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -130,6 +144,7 @@ impl TaskRegistrar for ObservingTasks {
             events: Rc::clone(&self.events),
             fail_spawn: self.fail_spawn == Some(role),
             fail_join: self.fail_join == Some(role),
+            fail_abort: self.fail_abort == Some(role),
         }))
     }
 }
@@ -139,6 +154,7 @@ struct ObservedRegisteredTask {
     events: Rc<RefCell<Vec<TaskEvent>>>,
     fail_spawn: bool,
     fail_join: bool,
+    fail_abort: bool,
 }
 
 impl RegisteredTask for ObservedRegisteredTask {
@@ -146,7 +162,7 @@ impl RegisteredTask for ObservedRegisteredTask {
         self: Box<Self>,
         cancellation: TaskCancellation,
         health: positron_runtime::HealthState,
-        _services: positron_runtime::ServiceHandle,
+        _services: Option<positron_runtime::ServiceHandle>,
     ) -> Result<Box<dyn RunningTask>, TaskFailure> {
         self.events.borrow_mut().push(TaskEvent::Spawned(self.role));
         if self.fail_spawn {
@@ -158,6 +174,7 @@ impl RegisteredTask for ObservedRegisteredTask {
             cancellation,
             health,
             fail_join: self.fail_join,
+            fail_abort: self.fail_abort,
         }))
     }
 }
@@ -203,15 +220,52 @@ fn partial_task_spawn_failure_aborts_started_tasks_and_releases_ownership()
     Ok(())
 }
 
+#[test]
+fn fenced_partial_task_spawn_failure_aborts_started_tasks_and_releases_ownership()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("fenced-spawn-fault")?;
+    std::fs::write(roots.data.join("foreign"), b"ambiguous")?;
+    let listeners = ObservingListeners::default();
+    let tasks = ObservingTasks {
+        fail_spawn: Some(TaskRole::Operations),
+        ..ObservingTasks::default()
+    };
+
+    let failure = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&listeners, &tasks),
+    )
+    .expect_err("fenced task spawn failure must fail startup");
+
+    assert_eq!(
+        failure,
+        positron_runtime::ExitOutcome::TaskUnavailable(TaskRole::Operations)
+    );
+    assert!(roots.acquire_volume_again().is_ok());
+    assert!(tasks.events.borrow().iter().any(|event| matches!(
+        event,
+        TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Fenced, true)
+    )));
+    Ok(())
+}
+
 struct ObservedRunningTask {
     role: TaskRole,
     events: Rc<RefCell<Vec<TaskEvent>>>,
     cancellation: TaskCancellation,
     health: positron_runtime::HealthState,
     fail_join: bool,
+    fail_abort: bool,
 }
 
 impl RunningTask for ObservedRunningTask {
+    fn poll_join(&mut self) -> Result<Option<TaskJoinOutcome>, TaskFailure> {
+        self.join().map(Some)
+    }
+
     fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure> {
         self.events.borrow_mut().push(TaskEvent::Joined(
             self.role,
@@ -231,167 +285,14 @@ impl RunningTask for ObservedRunningTask {
             self.health.phase(),
             self.cancellation.is_cancelled(),
         ));
-        Ok(())
-    }
-}
-
-#[test]
-fn deadline_aborts_every_task_and_never_reports_graceful_completion()
--> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("deadline")?;
-    let listeners = ObservingListeners::default();
-    let tasks = ObservingTasks::default();
-    let process = ApplicationRuntime::start(
-        ServeConfiguration::new(
-            roots.bootstrap_paths()?,
-            InitializationMode::InitializeIfEmpty,
-        ),
-        HostInputs::new(&listeners, &tasks),
-    )?;
-    let health = process.health();
-
-    let outcome = process.shutdown(ShutdownTrigger::DeadlineExpired);
-
-    assert_eq!(outcome, positron_runtime::ExitOutcome::Forced);
-    assert_eq!(health.phase(), ProcessPhase::Stopped);
-    assert_eq!(health.readiness(), Readiness::NotReady);
-    assert!(roots.acquire_volume_again().is_ok());
-    assert_eq!(
-        tasks
-            .events
-            .borrow()
-            .iter()
-            .filter(|event| matches!(event, TaskEvent::Aborted(..)))
-            .cloned()
-            .collect::<Vec<_>>(),
-        [
-            TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Stopping, true),
-            TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
-            TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn task_join_failure_reconciles_with_abort_and_forced_exit()
--> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("join-fault")?;
-    let listeners = ObservingListeners::default();
-    let tasks = ObservingTasks {
-        fail_join: Some(TaskRole::Api),
-        ..ObservingTasks::default()
-    };
-    let process = ApplicationRuntime::start(
-        ServeConfiguration::new(
-            roots.bootstrap_paths()?,
-            InitializationMode::InitializeIfEmpty,
-        ),
-        HostInputs::new(&listeners, &tasks),
-    )?;
-    let health = process.health();
-
-    assert_eq!(
-        process.shutdown(ShutdownTrigger::FirstSignal),
-        positron_runtime::ExitOutcome::Forced
-    );
-    assert_eq!(health.phase(), ProcessPhase::Stopped);
-    assert!(roots.acquire_volume_again().is_ok());
-    assert!(tasks.events.borrow().iter().any(|event| matches!(
-        event,
-        TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true)
-    )));
-    Ok(())
-}
-
-#[test]
-fn missing_instance_is_a_typed_dependency_outage_without_data_admission()
--> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("missing")?;
-    let listeners = ObservingListeners::default();
-    let tasks = ObservingTasks::default();
-
-    let failure = ApplicationRuntime::start(
-        ServeConfiguration::new(roots.bootstrap_paths()?, InitializationMode::ExistingOnly),
-        HostInputs::new(&listeners, &tasks),
-    )
-    .expect_err("missing instance must fail closed");
-
-    assert_eq!(
-        failure,
-        positron_runtime::ExitOutcome::StartupUnavailable(
-            positron_runtime::BootstrapFailureCode::InconsistentRoots
-        )
-    );
-    assert_eq!(listeners.bound.borrow().as_slice(), control_plane());
-    Ok(())
-}
-
-#[test]
-fn ambiguous_bootstrap_fences_without_exposing_a_data_endpoint()
--> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("fenced")?;
-    std::fs::write(roots.data.join("foreign"), b"ambiguous")?;
-    let listeners = ObservingListeners::default();
-    let tasks = ObservingTasks::default();
-    let process = ApplicationRuntime::start(
-        ServeConfiguration::new(
-            roots.bootstrap_paths()?,
-            InitializationMode::InitializeIfEmpty,
-        ),
-        HostInputs::new(&listeners, &tasks),
-    )?;
-    assert_eq!(process.health().phase(), ProcessPhase::Fenced);
-    assert_eq!(process.health().readiness(), Readiness::NotReady);
-    assert_eq!(listeners.bound.borrow().as_slice(), control_plane());
-    Ok(())
-}
-
-#[test]
-fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_last()
--> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("graceful")?;
-    let listeners = ObservingListeners::default();
-    let tasks = ObservingTasks::default();
-    let configuration = ServeConfiguration::new(
-        roots.bootstrap_paths()?,
-        InitializationMode::InitializeIfEmpty,
-    );
-    let process = ApplicationRuntime::start(configuration, HostInputs::new(&listeners, &tasks))?;
-    let health = process.health();
-    assert!(format!("{process:?}").contains("RunningProcess"));
-
-    let outcome = process.shutdown(ShutdownTrigger::FirstSignal);
-
-    assert_eq!(outcome, positron_runtime::ExitOutcome::Graceful);
-    assert_eq!(health.phase(), ProcessPhase::Stopped);
-    assert_eq!(health.readiness(), Readiness::NotReady);
-    assert!(roots.acquire_volume_again().is_ok());
-    let events = tasks.events.borrow();
-    assert_eq!(events.len(), 9);
-    assert!(matches!(
-        events.last(),
-        Some(TaskEvent::Joined(TaskRole::OtlpHttp, ..))
-    ));
-    Ok(())
-}
-
-trait TestPort {
-    fn test_port(self) -> u16;
-}
-
-const fn control_plane() -> &'static [ListenerRole] {
-    &[ListenerRole::Control, ListenerRole::Operations]
-}
-
-impl TestPort for ListenerRole {
-    fn test_port(self) -> u16 {
-        match self {
-            ListenerRole::Control => 42_399,
-            ListenerRole::Operations => 42_400,
-            ListenerRole::Api => 42_401,
-            ListenerRole::OtlpGrpc => 42_402,
-            ListenerRole::OtlpHttp => 42_403,
+        if self.fail_abort {
+            Err(TaskFailure::AbortUnavailable)
+        } else {
+            Ok(())
         }
     }
 }
+
+#[path = "process_lifecycle/outcomes.rs"]
+mod outcomes;
+use outcomes::TestPort;

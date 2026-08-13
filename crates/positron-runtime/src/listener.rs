@@ -11,14 +11,13 @@ pub enum ListenerRole {
     Control,
     Operations,
     Api,
-    OtlpGrpc,
     OtlpHttp,
 }
 
 impl ListenerRole {
     #[must_use]
     pub const fn is_data(self) -> bool {
-        matches!(self, Self::Api | Self::OtlpGrpc | Self::OtlpHttp)
+        matches!(self, Self::Api | Self::OtlpHttp)
     }
 }
 
@@ -100,6 +99,9 @@ impl ListenerRequest {
 /// One owned listener. Dropping it must synchronously close new admission.
 pub trait BoundListener {
     fn endpoint(&self) -> &BoundEndpoint;
+    fn close(&mut self) -> Result<(), ListenerFailure> {
+        Ok(())
+    }
 }
 
 /// Host boundary for binding control, operational, and data endpoints.

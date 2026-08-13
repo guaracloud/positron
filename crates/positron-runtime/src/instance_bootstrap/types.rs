@@ -5,7 +5,7 @@ use std::path::Path;
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
     BootstrapKeyCustody, InstanceBootstrapStorage, InstanceId, MountQualification,
-    StorageKernelResourceAuthority,
+    OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
 
@@ -83,6 +83,19 @@ impl BootstrapPaths {
         })
     }
 
+    /// Binds bootstrap custody to the exact effective local-key reference.
+    pub fn with_local_key(
+        data: &Path,
+        secrets: &Path,
+        local_key_file: &Path,
+        qualification: MountQualification,
+    ) -> Result<Self, BootstrapFailure> {
+        if local_key_file != secrets.join("local-root-key.v1") {
+            return Err(BootstrapFailure::new(BootstrapFailureCode::InvalidRoots));
+        }
+        Self::new(data, secrets, qualification)
+    }
+
     #[cfg(test)]
     pub(super) fn data_root(&self) -> &Path {
         &self.data
@@ -96,6 +109,13 @@ impl BootstrapPaths {
     #[must_use]
     pub const fn mount_qualification(&self) -> MountQualification {
         self.storage.qualification()
+    }
+
+    pub(crate) fn retain_volume(&self) -> Result<OwnedPrimaryDataVolume, BootstrapFailure> {
+        self.storage
+            .acquire()
+            .map(|(volume, _)| volume)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
     }
 }
 

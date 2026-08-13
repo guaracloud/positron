@@ -7,6 +7,7 @@ use crate::{HealthState, ServiceHandle};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskRole {
+    Control,
     Operations,
     Api,
     OtlpHttp,
@@ -46,11 +47,12 @@ pub trait RegisteredTask {
         self: Box<Self>,
         cancellation: TaskCancellation,
         health: HealthState,
-        services: ServiceHandle,
+        services: Option<ServiceHandle>,
     ) -> Result<Box<dyn RunningTask>, TaskFailure>;
 }
 
 pub trait RunningTask {
+    fn poll_join(&mut self) -> Result<Option<TaskJoinOutcome>, TaskFailure>;
     fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure>;
     fn abort(&mut self) -> Result<(), TaskFailure>;
 }

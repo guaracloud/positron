@@ -209,6 +209,34 @@ fn identical_roots_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn explicit_local_key_must_match_descriptor_relative_custody()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let data = roots.0.join("data");
+    let secrets = roots.0.join("secrets");
+    let rejected = BootstrapPaths::with_local_key(
+        &data,
+        &secrets,
+        &secrets.join("different-key"),
+        MountQualification::LocalHost,
+    );
+    assert_eq!(
+        rejected.expect_err("key path must be exact").code(),
+        super::super::BootstrapFailureCode::InvalidRoots
+    );
+    assert!(
+        BootstrapPaths::with_local_key(
+            &data,
+            &secrets,
+            &secrets.join("local-root-key.v1"),
+            MountQualification::LocalHost,
+        )
+        .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
 fn unbound_local_key_is_inconsistent() -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;
     let paths = roots.paths();

@@ -49,7 +49,16 @@ fn event(event: BootstrapFileEvent) -> Result<(), BootstrapFailure> {
         ));
     }
     #[cfg(not(test))]
-    let _ = event;
+    match event {
+        BootstrapFileEvent::WritePending
+        | BootstrapFileEvent::WriteClaim
+        | BootstrapFileEvent::WriteInitialized
+        | BootstrapFileEvent::RemovePending
+        | BootstrapFileEvent::PublishInitialized
+        | BootstrapFileEvent::RemoveClaim
+        | BootstrapFileEvent::ReplacePendingAfterSync
+        | BootstrapFileEvent::SynchronizeDirectory => {},
+    }
     Ok(())
 }
 

@@ -2,7 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -56,18 +55,18 @@ fn run(
     let inputs = ConfigurationInputs::try_new(document.as_deref(), environment, command_line)
         .map_err(|_| LaunchFailure::Configuration)?;
     let effective = resolve(inputs).map_err(|_| LaunchFailure::Configuration)?;
-    let paths = BootstrapPaths::new(
+    let paths = BootstrapPaths::with_local_key(
         Path::new(effective.data_directory()),
         Path::new(effective.secrets_directory()),
+        effective.local_key_file().as_path(),
         MountQualification::LocalHost,
     )
     .map_err(|_| LaunchFailure::Configuration)?;
-    let base = effective.control_bind_address();
     let bindings = NativeBindings::new(
-        std::env::temp_dir().join(format!("positron-{}.sock", std::process::id())),
-        base,
-        next_address(base, 1)?,
-        next_address(base, 2)?,
+        PathBuf::from(effective.control_path()),
+        effective.operations_bind_address(),
+        effective.api_bind_address(),
+        effective.otlp_http_bind_address(),
     )
     .map_err(|_| LaunchFailure::Configuration)?;
     let host = NativeHost::new(bindings);
@@ -76,9 +75,6 @@ fn run(
         HostInputs::new(&host, &host),
     )
     .map_err(LaunchFailure::Startup)?;
-    if process.health().phase() == positron_runtime::ProcessPhase::Fenced {
-        return Ok(ExitOutcome::Fenced);
-    }
     let signals = Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?;
     let deadline = Duration::from_secs(u64::from(effective.shutdown_grace_seconds()));
     wait_for_shutdown(process, signals, deadline)
@@ -92,36 +88,21 @@ fn wait_for_shutdown(
     let Some(_) = signals.forever().next() else {
         return Err(LaunchFailure::Signal);
     };
-    let handle = signals.handle();
-    let second = std::thread::Builder::new()
-        .name("positron-second-signal".into())
-        .spawn(move || {
-            let signalled = signals.forever().next().is_some();
-            handle.close();
-            signalled
-        })
-        .map_err(|_| LaunchFailure::Signal)?;
-    let started = Instant::now();
-    let outcome = process.shutdown(ShutdownTrigger::FirstSignal);
-    if second.is_finished() {
-        let _ = second.join();
-        return Ok(ExitOutcome::Forced);
+    let mut draining = process.begin_shutdown();
+    let deadline_at = Instant::now() + deadline;
+    loop {
+        if signals.pending().next().is_some() {
+            return Ok(draining.finish(ShutdownTrigger::SecondSignal));
+        }
+        if Instant::now() >= deadline_at {
+            return Ok(draining.finish(ShutdownTrigger::DeadlineExpired));
+        }
+        match draining.poll() {
+            Ok(true) => return Ok(draining.finish(ShutdownTrigger::FirstSignal)),
+            Ok(false) => std::thread::yield_now(),
+            Err(_) => return Ok(draining.finish(ShutdownTrigger::DeadlineExpired)),
+        }
     }
-    if started.elapsed() > deadline {
-        return Ok(ExitOutcome::Forced);
-    }
-    Ok(outcome)
-}
-
-fn next_address(base: SocketAddr, increment: u16) -> Result<SocketAddr, LaunchFailure> {
-    let port = base
-        .port()
-        .checked_add(increment)
-        .ok_or(LaunchFailure::Configuration)?;
-    if !base.ip().is_loopback() {
-        return Err(LaunchFailure::Configuration);
-    }
-    Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)))
 }
 
 #[derive(Debug)]

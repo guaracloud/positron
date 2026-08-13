@@ -54,7 +54,7 @@ impl NativeBindings {
             ListenerRole::Operations => Some(self.operations),
             ListenerRole::Api => Some(self.api),
             ListenerRole::OtlpHttp => Some(self.otlp_http),
-            ListenerRole::Control | ListenerRole::OtlpGrpc => None,
+            ListenerRole::Control => None,
         }
     }
 }
@@ -94,6 +94,7 @@ enum NativeListener {
 }
 
 struct Admission {
+    role: ListenerRole,
     listener: NativeListener,
     accepting: AtomicBool,
     control_path: Option<PathBuf>,
@@ -110,7 +111,11 @@ impl Admission {
 impl Drop for Admission {
     fn drop(&mut self) {
         if let Some(path) = &self.control_path {
-            let _ = std::fs::remove_file(path);
+            match std::fs::remove_file(path) {
+                Ok(()) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(_) => {},
+            }
         }
     }
 }
@@ -124,11 +129,18 @@ impl BoundListener for NativeBoundListener {
     fn endpoint(&self) -> &BoundEndpoint {
         &self.endpoint
     }
+
+    fn close(&mut self) -> Result<(), ListenerFailure> {
+        self.admission.stop();
+        Ok(())
+    }
 }
 
 impl Drop for NativeBoundListener {
     fn drop(&mut self) {
-        self.admission.stop();
+        match self.close() {
+            Ok(()) | Err(_) => {},
+        }
     }
 }
 
@@ -177,6 +189,7 @@ impl ListenerFactory for NativeHost {
             )
         };
         let admission = Arc::new(Admission {
+            role,
             listener,
             accepting: AtomicBool::new(true),
             control_path,
@@ -211,9 +224,10 @@ impl RegisteredTask for NativeRegisteredTask {
         self: Box<Self>,
         cancellation: TaskCancellation,
         health: HealthState,
-        services: ServiceHandle,
+        services: Option<ServiceHandle>,
     ) -> Result<Box<dyn RunningTask>, TaskFailure> {
         let listener_role = match self.role {
+            TaskRole::Control => ListenerRole::Control,
             TaskRole::Operations => ListenerRole::Operations,
             TaskRole::Api => ListenerRole::Api,
             TaskRole::OtlpHttp => ListenerRole::OtlpHttp,
@@ -248,6 +262,15 @@ struct NativeRunningTask {
 }
 
 impl RunningTask for NativeRunningTask {
+    fn poll_join(&mut self) -> Result<Option<TaskJoinOutcome>, TaskFailure> {
+        if self.handle.as_ref().is_none_or(JoinHandle::is_finished) {
+            join_thread(&mut self.handle)?;
+            Ok(Some(TaskJoinOutcome::Joined))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure> {
         join_thread(&mut self.handle)?;
         Ok(TaskJoinOutcome::Joined)
@@ -270,7 +293,7 @@ fn serve(
     admission: Arc<Admission>,
     cancellation: TaskCancellation,
     health: HealthState,
-    services: ServiceHandle,
+    services: Option<ServiceHandle>,
 ) {
     while admission.accepting.load(Ordering::Acquire) && !cancellation.is_cancelled() {
         let accepted = match &admission.listener {
@@ -278,8 +301,10 @@ fn serve(
             #[cfg(unix)]
             NativeListener::Unix(listener) => match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let _ = std::io::Write::write_all(&mut stream, b"positron-control-v1\n");
-                    continue;
+                    match std::io::Write::write_all(&mut stream, b"positron-control-v1\n") {
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
                 },
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -289,7 +314,16 @@ fn serve(
             },
         };
         match accepted {
-            Ok(mut stream) => native_http::serve_connection(&mut stream, &health, &services),
+            Ok(mut stream) => {
+                match native_http::serve_connection(
+                    &mut stream,
+                    admission.role,
+                    &health,
+                    services.as_ref(),
+                ) {
+                    Ok(()) | Err(_) => {},
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(5));
             },
