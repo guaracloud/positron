@@ -65,7 +65,7 @@ fn resumed_bootstrap_rejects_a_substituted_existing_claim() -> Result<(), Box<dy
         InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
     })
     .expect_err("fault must leave a resumable claim");
-    let key = BootstrapKeyCustody::open(paths.secrets_root())?;
+    let key = paths.storage.open_key()?;
     let pending = std::fs::read(paths.data_root().join(".positron-bootstrap.pending"))?;
     let instance = BootstrapKeyCustody::routed_instance(BootstrapObjectPurpose::Pending, &pending)?;
     let plaintext = key.open_object(instance, BootstrapObjectPurpose::Pending, &pending)?;
@@ -93,7 +93,7 @@ fn authenticated_record_rejects_substituted_routed_instance()
         InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
     })
     .expect_err("fault must leave pending state");
-    let key = BootstrapKeyCustody::open(paths.secrets_root())?;
+    let key = paths.storage.open_key()?;
     let pending_path = paths.data_root().join(".positron-bootstrap.pending");
     let pending = std::fs::read(&pending_path)?;
     let routed = BootstrapKeyCustody::routed_instance(BootstrapObjectPurpose::Pending, &pending)?;
@@ -101,12 +101,96 @@ fn authenticated_record_rejects_substituted_routed_instance()
     let mut record = super::super::codec::BootstrapRecord::decode(&plaintext)?;
     record.instance = InstanceId::new([0x55; 16])?;
     let substituted = key.protect(routed, BootstrapObjectPurpose::Pending, &record.encode())?;
+    let mismatch =
+        super::super::operation::decode_record(&key, BootstrapObjectPurpose::Pending, &substituted);
+    assert!(matches!(
+        mismatch,
+        Err(failure) if failure.code() == BootstrapFailureCode::IdentityMismatch
+    ));
     std::fs::write(pending_path, substituted)?;
     assert_eq!(
         InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
             .expect_err("record and envelope routes must agree")
             .code(),
         BootstrapFailureCode::InconsistentRoots
+    );
+    Ok(())
+}
+
+#[test]
+fn authenticated_pending_rejects_non_record_plaintext() -> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    with_fault(BootstrapFileEvent::WriteInitialized, || {
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
+    })
+    .expect_err("fault must leave pending state");
+    let key = paths.storage.open_key()?;
+    let pending_path = paths.data_root().join(".positron-bootstrap.pending");
+    let pending = std::fs::read(&pending_path)?;
+    let instance = BootstrapKeyCustody::routed_instance(BootstrapObjectPurpose::Pending, &pending)?;
+    let malformed = key.protect(instance, BootstrapObjectPurpose::Pending, b"not-a-record")?;
+    std::fs::write(pending_path, malformed)?;
+
+    assert_eq!(
+        InstanceBootstrap::classify(&paths)?,
+        BootstrapState::Inconsistent
+    );
+    Ok(())
+}
+
+#[test]
+fn resumed_bootstrap_rejects_integrity_identity_drift() -> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    with_fault(BootstrapFileEvent::WriteInitialized, || {
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
+    })
+    .expect_err("fault must leave pending state");
+    let key = paths.storage.open_key()?;
+    let pending_path = paths.data_root().join(".positron-bootstrap.pending");
+    let pending = std::fs::read(&pending_path)?;
+    let instance = BootstrapKeyCustody::routed_instance(BootstrapObjectPurpose::Pending, &pending)?;
+    let plaintext = key.open_object(instance, BootstrapObjectPurpose::Pending, &pending)?;
+    let mut record = super::super::codec::BootstrapRecord::decode(&plaintext)?;
+    record.integrity_fingerprint = [0x77; 32];
+    let substituted = key.protect(instance, BootstrapObjectPurpose::Pending, &record.encode())?;
+    std::fs::write(pending_path, substituted)?;
+
+    assert_eq!(
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
+            .expect_err("integrity identity drift must fail closed")
+            .code(),
+        BootstrapFailureCode::IdentityMismatch
+    );
+    Ok(())
+}
+
+#[test]
+fn claim_rejects_a_valid_envelope_for_another_principal() -> Result<(), Box<dyn std::error::Error>>
+{
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let key = paths.storage.open_key()?;
+    let substituted = super::super::codec::encode_claim(
+        initialized.instance_id(),
+        positron_domain::identity::PrincipalId::from_bytes([0x33; 16])?,
+        &[0x44; 32],
+    );
+    let encrypted = key.protect(
+        initialized.instance_id(),
+        BootstrapObjectPurpose::Claim,
+        &substituted,
+    )?;
+    std::fs::write(paths.secrets_root().join("bootstrap-claim.v1"), encrypted)?;
+    drop(initialized);
+
+    assert_eq!(
+        InstanceBootstrap::claim(&paths)
+            .expect_err("claim principal must match bootstrap administrator")
+            .code(),
+        BootstrapFailureCode::IdentityMismatch
     );
     Ok(())
 }

@@ -1,11 +1,15 @@
-use positron_kernel::{BootstrapKeyIdentity, OwnedPrimaryDataVolume, PrimaryDataVolume};
+use positron_kernel::{BootstrapArtifactAccess, BootstrapKeyIdentity, OwnedPrimaryDataVolume};
 
 use super::super::codec::BootstrapRecord;
 use super::super::{BootstrapFailure, BootstrapFailureCode, BootstrapPaths};
 
-pub(super) fn acquire(paths: &BootstrapPaths) -> Result<OwnedPrimaryDataVolume, BootstrapFailure> {
-    PrimaryDataVolume::acquire(&paths.data, paths.qualification)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::StorageUnavailable))
+pub(super) fn acquire(
+    paths: &BootstrapPaths,
+) -> Result<(OwnedPrimaryDataVolume, BootstrapArtifactAccess), BootstrapFailure> {
+    paths
+        .storage
+        .acquire()
+        .map_err(super::super::storage::storage_failure)
 }
 
 pub(crate) fn require_key_identity(

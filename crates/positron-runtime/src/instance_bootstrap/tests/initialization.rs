@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -212,4 +213,52 @@ fn classification_rejects_corrupt_catalog_authority() -> Result<(), Box<dyn Erro
         BootstrapState::Inconsistent
     );
     Ok(())
+}
+
+#[test]
+fn repeated_classification_is_strictly_read_only() -> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let before = durable_tree(&roots.data)?;
+
+    assert_eq!(
+        InstanceBootstrap::classify(&paths)?,
+        BootstrapState::Initialized
+    );
+    assert_eq!(
+        InstanceBootstrap::classify(&paths)?,
+        BootstrapState::Initialized
+    );
+
+    assert_eq!(durable_tree(&roots.data)?, before);
+    Ok(())
+}
+
+fn durable_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>, std::io::Error> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        observed: &mut BTreeMap<PathBuf, Vec<u8>>,
+    ) -> Result<(), std::io::Error> {
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            if entry.file_type()?.is_dir() {
+                observed.insert(relative.clone(), Vec::new());
+                visit(root, &path, observed)?;
+            } else if entry.file_name() != ".positron-volume.lock" {
+                observed.insert(relative, fs::read(path)?);
+            }
+        }
+        Ok(())
+    }
+
+    let mut observed = BTreeMap::new();
+    visit(root, root, &mut observed)?;
+    Ok(observed)
 }

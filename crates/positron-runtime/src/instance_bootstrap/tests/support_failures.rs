@@ -1,6 +1,8 @@
 use super::super::BootstrapFailureCode;
 use super::super::operation::support::{entropy_failure, format_secret, inconsistent, key_failure};
-use positron_kernel::{BootstrapKeyFailure, BootstrapKeyIdentity};
+use positron_kernel::{
+    BootstrapArtifact, BootstrapKeyFailure, BootstrapKeyIdentity, BootstrapStorageFailure,
+};
 
 #[test]
 fn operation_support_maps_every_closed_key_failure() {
@@ -36,6 +38,23 @@ fn operation_support_maps_every_closed_key_failure() {
         entropy_failure().code(),
         BootstrapFailureCode::EntropyUnavailable
     );
+    assert_eq!(
+        super::super::storage::storage_failure(BootstrapStorageFailure::InvalidRoots).code(),
+        BootstrapFailureCode::InvalidRoots
+    );
+}
+
+#[test]
+fn initialized_artifact_write_fault_maps_before_storage() {
+    let roots = super::support::Roots::new().expect("roots");
+    let paths = roots.paths();
+    let access = paths.storage.inspect().expect("inspect");
+    let failure = super::super::storage::with_fault(
+        super::super::storage::BootstrapFileEvent::SynchronizeDirectory,
+        || super::super::storage::write_new(&access, BootstrapArtifact::Initialized, b"marker"),
+    )
+    .expect_err("injected write fault");
+    assert_eq!(failure.code(), BootstrapFailureCode::StorageUnavailable);
 }
 
 #[test]

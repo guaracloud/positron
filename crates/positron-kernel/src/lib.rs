@@ -71,6 +71,7 @@ mod active_segment_ledger;
 mod catalog;
 #[allow(dead_code)]
 mod data_protection;
+mod instance_bootstrap_storage;
 mod resource_governor;
 
 pub use catalog::{
@@ -89,6 +90,11 @@ pub use active_segment_ledger::{
 pub use data_protection::{
     BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
     BootstrapObjectPurpose,
+};
+
+pub use instance_bootstrap_storage::{
+    BootstrapArtifact, BootstrapArtifactAccess, BootstrapEntry, BootstrapLayout,
+    BootstrapStorageFailure, InstanceBootstrapStorage,
 };
 
 pub use resource_governor::{

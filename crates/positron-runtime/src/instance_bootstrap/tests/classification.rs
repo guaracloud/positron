@@ -162,6 +162,7 @@ fn raw_intent_with_partial_local_key_staging_is_resumable() -> Result<(), Box<dy
 #[test]
 fn unsafe_and_empty_storage_artifacts_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
     use super::super::storage;
+    use positron_kernel::BootstrapArtifact;
 
     let roots = Roots::new()?;
     let paths = roots.paths();
@@ -171,16 +172,20 @@ fn unsafe_and_empty_storage_artifacts_fail_closed() -> Result<(), Box<dyn std::e
         BootstrapState::Inconsistent
     );
     fs::remove_file(paths.data_root().join("foreign"))?;
-    fs::write(paths.data_root().join("empty"), b"")?;
+    fs::write(paths.data_root().join(".positron-bootstrap.pending"), b"")?;
+    let access = paths
+        .storage
+        .inspect()
+        .expect("test roots remain available");
     assert_eq!(
-        storage::read(paths.data_root(), "empty")
+        storage::read(&access, BootstrapArtifact::Pending)
             .expect_err("empty artifact")
             .code(),
         super::super::BootstrapFailureCode::CorruptState
     );
-    fs::remove_file(paths.data_root().join("empty"))?;
-    let failure = with_fault(BootstrapFileEvent::SynchronizeDirectory, || {
-        storage::write_new(paths.data_root(), "test-artifact", b"bounded")
+    fs::remove_file(paths.data_root().join(".positron-bootstrap.pending"))?;
+    let failure = with_fault(BootstrapFileEvent::WritePending, || {
+        storage::write_new(&access, BootstrapArtifact::Pending, b"bounded")
     })
     .expect_err("directory synchronization fault");
     assert_eq!(
@@ -212,5 +217,35 @@ fn unbound_local_key_is_inconsistent() -> Result<(), Box<dyn std::error::Error>>
         InstanceBootstrap::classify(&paths)?,
         BootstrapState::Inconsistent
     );
+    Ok(())
+}
+
+#[test]
+fn pending_authentication_fails_closed_at_key_file_and_envelope_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    for pending in [
+        super::super::storage::INTENT,
+        b"x".as_slice(),
+        b"".as_slice(),
+    ] {
+        let roots = Roots::new()?;
+        let paths = roots.paths();
+        if pending == super::super::storage::INTENT {
+            fs::write(
+                paths.secrets_root().join("local-root-key.v1"),
+                b"invalid-key",
+            )?;
+        } else {
+            paths.storage.initialize_key()?;
+        }
+        fs::write(
+            paths.data_root().join(".positron-bootstrap.pending"),
+            pending,
+        )?;
+        assert_eq!(
+            InstanceBootstrap::classify(&paths)?,
+            BootstrapState::Inconsistent
+        );
+    }
     Ok(())
 }

@@ -2,14 +2,15 @@ use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_governance::{InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
-    ActiveSegmentLedger, AuditIntent, BootstrapKeyCustody, BootstrapObjectPurpose, Catalog,
-    CatalogObject, CatalogProposal, FormatEpoch, InstanceId, OwnedPrimaryDataVolume, SegmentScope,
-    StorageKernelResourceAuthority, TransactionId,
+    ActiveSegmentLedger, AuditIntent, BootstrapArtifact, BootstrapArtifactAccess,
+    BootstrapKeyCustody, BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal,
+    FormatEpoch, InstanceId, OwnedPrimaryDataVolume, SegmentScope, StorageKernelResourceAuthority,
+    TransactionId,
 };
 use zeroize::Zeroizing;
 
 use super::codec::{BootstrapRecord, decode_claim, encode_claim};
-use super::storage::{self, CLAIM, INITIALIZED, INITIALIZED_TEMP, INTENT, LOCAL_KEY, PENDING};
+use super::storage::{self, INTENT};
 use super::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
     InitializationPlan, InitializedInstance, resources,
@@ -26,13 +27,32 @@ pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, Bootstr
     if state != BootstrapState::Initialized {
         return Ok(state);
     }
-    match reopen(paths) {
-        Ok(initialized) => {
-            drop(initialized);
-            Ok(BootstrapState::Initialized)
-        },
+    match validate_initialized(paths) {
+        Ok(()) => Ok(BootstrapState::Initialized),
         Err(_) => Ok(BootstrapState::Inconsistent),
     }
+}
+
+fn validate_initialized(paths: &BootstrapPaths) -> Result<(), BootstrapFailure> {
+    let (volume, access) = acquire(paths)?;
+    if storage::classify_with(paths, &access)? != BootstrapState::Initialized {
+        return Err(inconsistent());
+    }
+    let key = paths.storage.open_key().map_err(key_failure)?;
+    let encoded = storage::read(&access, BootstrapArtifact::Initialized)?;
+    let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
+    require_key_identity(&record, key.identity())?;
+    let authority = resources::establish(volume, record.tenant)?;
+    let catalog = Catalog::open(
+        &authority,
+        record.instance,
+        key.catalog_secret(record.instance).map_err(key_failure)?,
+    )
+    .map_err(catalog_failure)?;
+    if catalog.pin().map_err(catalog_failure)?.number() == 0 {
+        return Err(BootstrapFailure::new(BootstrapFailureCode::CorruptState));
+    }
+    Ok(())
 }
 
 pub(super) fn initialize(
@@ -41,33 +61,41 @@ pub(super) fn initialize(
 ) -> Result<InitializedInstance, BootstrapFailure> {
     match storage::classify(paths)? {
         BootstrapState::Empty => {
-            let volume = acquire(paths)?;
-            storage::write_new(&paths.data, PENDING, INTENT)?;
-            return resume(paths, plan, volume);
+            let (volume, access) = acquire(paths)?;
+            storage::write_new(&access, BootstrapArtifact::Pending, INTENT)?;
+            return resume(paths, plan, volume, access);
         },
         BootstrapState::Incomplete => {},
         BootstrapState::Initialized => return reopen(paths),
         BootstrapState::Inconsistent => return Err(inconsistent()),
     }
-    resume(paths, plan, acquire(paths)?)
+    let (volume, access) = acquire(paths)?;
+    resume(paths, plan, volume, access)
 }
 
 fn resume(
     paths: &BootstrapPaths,
     plan: InitializationPlan,
     volume: OwnedPrimaryDataVolume,
+    access: BootstrapArtifactAccess,
 ) -> Result<InitializedInstance, BootstrapFailure> {
-    if storage::exists(&paths.data, INITIALIZED_TEMP) && !storage::exists(&paths.data, PENDING) {
-        storage::publish_initialized(&paths.data)?;
+    if storage::exists(&access, BootstrapArtifact::InitializedStaging)?
+        && !storage::exists(&access, BootstrapArtifact::Pending)?
+    {
+        storage::publish_initialized(&access)?;
         drop(volume);
         return reopen(paths);
     }
-    let key = if storage::exists(&paths.secrets, LOCAL_KEY) {
-        BootstrapKeyCustody::open(&paths.secrets).map_err(key_failure)?
+    let key = if access
+        .layout()
+        .map_err(storage::storage_failure)?
+        .contains(positron_kernel::BootstrapEntry::LocalKey)
+    {
+        paths.storage.open_key().map_err(key_failure)?
     } else {
-        BootstrapKeyCustody::initialize(&paths.secrets).map_err(key_failure)?
+        paths.storage.initialize_key().map_err(key_failure)?
     };
-    let pending_bytes = storage::read(&paths.data, PENDING)?;
+    let pending_bytes = storage::read(&access, BootstrapArtifact::Pending)?;
     let record = if pending_bytes == INTENT {
         let generated = generate_record(&key)?;
         let protected = key
@@ -77,7 +105,7 @@ fn resume(
                 &generated.encode(),
             )
             .map_err(key_failure)?;
-        storage::replace(&paths.data, PENDING, &protected)?;
+        storage::replace_pending(&access, &protected)?;
         generated
     } else {
         decode_record(&key, BootstrapObjectPurpose::Pending, &pending_bytes)?
@@ -148,7 +176,7 @@ fn resume(
     open_initial_ledgers(&authority, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
     if plan.creates_claim() {
-        ensure_claim(paths, &key, &record, api_secret)?;
+        ensure_claim(&access, &key, &record, api_secret)?;
     }
     let initialized_record = record.initialized();
     let initialized = key
@@ -158,31 +186,31 @@ fn resume(
             &initialized_record.encode(),
         )
         .map_err(key_failure)?;
-    if !storage::exists(&paths.data, INITIALIZED_TEMP) {
-        storage::write_new(&paths.data, INITIALIZED_TEMP, &initialized)?;
+    if !storage::exists(&access, BootstrapArtifact::InitializedStaging)? {
+        storage::write_new(&access, BootstrapArtifact::InitializedStaging, &initialized)?;
     }
-    storage::remove(&paths.data, PENDING)?;
-    storage::publish_initialized(&paths.data)?;
+    storage::remove(&access, BootstrapArtifact::Pending)?;
+    storage::publish_initialized(&access)?;
     let generation = current.number();
     let audit = initial
         .governance_audit_record()
         .map_or(current.governance_audit_frontier(), |audit| {
             audit.position()
         });
-    let claim_available = storage::exists(&paths.secrets, CLAIM);
+    let claim_available = storage::exists(&access, BootstrapArtifact::Claim)?;
     drop(catalog);
     outcome(&record, key, authority, generation, audit, claim_available)
 }
 
 pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, BootstrapFailure> {
-    if storage::classify(paths)? != BootstrapState::Initialized {
+    let (volume, access) = acquire(paths)?;
+    if storage::classify_with(paths, &access)? != BootstrapState::Initialized {
         return Err(inconsistent());
     }
-    let key = BootstrapKeyCustody::open(&paths.secrets).map_err(key_failure)?;
-    let encoded = storage::read(&paths.data, INITIALIZED)?;
+    let key = paths.storage.open_key().map_err(key_failure)?;
+    let encoded = storage::read(&access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
     require_key_identity(&record, key.identity())?;
-    let volume = acquire(paths)?;
     let authority = resources::establish(volume, record.tenant)?;
     let catalog = Catalog::open(
         &authority,
@@ -197,23 +225,24 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let current = catalog.pin().map_err(catalog_failure)?;
     let generation = current.number();
     let audit = current.governance_audit_frontier();
-    let claim_available = storage::exists(&paths.secrets, CLAIM);
+    let claim_available = storage::exists(&access, BootstrapArtifact::Claim)?;
     drop(catalog);
     outcome(&record, key, authority, generation, audit, claim_available)
 }
 
 pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapFailure> {
-    if storage::classify(paths)? != BootstrapState::Initialized
-        || !storage::exists(&paths.secrets, CLAIM)
+    let (_volume, access) = acquire(paths)?;
+    if storage::classify_with(paths, &access)? != BootstrapState::Initialized
+        || !storage::exists(&access, BootstrapArtifact::Claim)?
     {
         return Err(BootstrapFailure::new(
             BootstrapFailureCode::ClaimUnavailable,
         ));
     }
-    let key = BootstrapKeyCustody::open(&paths.secrets).map_err(key_failure)?;
-    let initialized = storage::read(&paths.data, INITIALIZED)?;
+    let key = paths.storage.open_key().map_err(key_failure)?;
+    let initialized = storage::read(&access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &initialized)?;
-    let encrypted_claim = storage::read(&paths.secrets, CLAIM)?;
+    let encrypted_claim = storage::read(&access, BootstrapArtifact::Claim)?;
     let plaintext = key
         .open_object(
             record.instance,
@@ -228,7 +257,7 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
         ));
     }
     let secret = Zeroizing::new(format_secret(&secret));
-    storage::remove(&paths.secrets, CLAIM)
+    storage::remove(&access, BootstrapArtifact::Claim)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ClaimDestructionFailed))?;
     Ok(BootstrapClaim { principal, secret })
 }
@@ -266,7 +295,7 @@ fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, Bootstr
     })
 }
 
-fn decode_record(
+pub(super) fn decode_record(
     key: &BootstrapKeyCustody,
     purpose: BootstrapObjectPurpose,
     encoded: &[u8],
@@ -305,7 +334,7 @@ fn open_initial_ledgers(
 }
 
 fn ensure_claim(
-    paths: &BootstrapPaths,
+    access: &BootstrapArtifactAccess,
     key: &BootstrapKeyCustody,
     record: &BootstrapRecord,
     secret: &[u8; 32],
@@ -314,8 +343,8 @@ fn ensure_claim(
     let encrypted = key
         .protect(record.instance, BootstrapObjectPurpose::Claim, &plaintext)
         .map_err(key_failure)?;
-    if storage::exists(&paths.secrets, CLAIM) {
-        let existing = storage::read(&paths.secrets, CLAIM)?;
+    if storage::exists(access, BootstrapArtifact::Claim)? {
+        let existing = storage::read(access, BootstrapArtifact::Claim)?;
         let opened = key
             .open_object(record.instance, BootstrapObjectPurpose::Claim, &existing)
             .map_err(key_failure)?;
@@ -326,7 +355,7 @@ fn ensure_claim(
         }
         Ok(())
     } else {
-        storage::write_new(&paths.secrets, CLAIM, &encrypted)
+        storage::write_new(access, BootstrapArtifact::Claim, &encrypted)
     }
 }
 

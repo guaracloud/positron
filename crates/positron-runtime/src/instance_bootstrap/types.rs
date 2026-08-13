@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
-    BootstrapKeyCustody, InstanceId, MountQualification, StorageKernelResourceAuthority,
+    BootstrapKeyCustody, InstanceBootstrapStorage, InstanceId, MountQualification,
+    StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
 
@@ -59,9 +60,11 @@ impl Error for BootstrapFailure {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapPaths {
-    pub(super) data: PathBuf,
-    pub(super) secrets: PathBuf,
-    pub(super) qualification: MountQualification,
+    pub(super) storage: InstanceBootstrapStorage,
+    #[cfg(test)]
+    data: std::path::PathBuf,
+    #[cfg(test)]
+    secrets: std::path::PathBuf,
 }
 
 impl BootstrapPaths {
@@ -70,38 +73,29 @@ impl BootstrapPaths {
         secrets: &Path,
         qualification: MountQualification,
     ) -> Result<Self, BootstrapFailure> {
-        let data = std::fs::canonicalize(data)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::InvalidRoots))?;
-        let secrets = std::fs::canonicalize(secrets)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::InvalidRoots))?;
-        let separate = data != secrets
-            && !data.starts_with(&secrets)
-            && !secrets.starts_with(&data)
-            && data.is_absolute()
-            && secrets.is_absolute();
-        if !separate {
-            return Err(BootstrapFailure::new(BootstrapFailureCode::InvalidRoots));
-        }
         Ok(Self {
-            data,
-            secrets,
-            qualification,
+            storage: InstanceBootstrapStorage::new(data, secrets, qualification)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::InvalidRoots))?,
+            #[cfg(test)]
+            data: data.to_owned(),
+            #[cfg(test)]
+            secrets: secrets.to_owned(),
         })
     }
 
-    #[must_use]
-    pub fn data_root(&self) -> &Path {
+    #[cfg(test)]
+    pub(super) fn data_root(&self) -> &Path {
         &self.data
     }
 
-    #[must_use]
-    pub fn secrets_root(&self) -> &Path {
+    #[cfg(test)]
+    pub(super) fn secrets_root(&self) -> &Path {
         &self.secrets
     }
 
     #[must_use]
     pub const fn mount_qualification(&self) -> MountQualification {
-        self.qualification
+        self.storage.qualification()
     }
 }
 
