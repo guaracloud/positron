@@ -13,6 +13,7 @@ mod receipt;
 mod recovery;
 mod snapshot_lease;
 mod snapshot_lease_codec;
+mod snapshot_lease_recovery;
 mod state;
 mod storage;
 mod types;
@@ -82,6 +83,40 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         scope: SegmentScope,
         protection: SegmentProtectionKey,
     ) -> Result<Self, LedgerFailure> {
+        Self::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            protection,
+            &crate::LifecycleClock::new(crate::lifecycle_clock::SystemLifecycleClockSource),
+        )
+    }
+
+    pub fn open_with_clock<S: crate::LifecycleClockSource>(
+        authority: &'kernel StorageKernelResourceAuthority,
+        catalog: &'catalog Catalog<'kernel>,
+        scope: SegmentScope,
+        protection: SegmentProtectionKey,
+        clock: &crate::LifecycleClock<S>,
+    ) -> Result<Self, LedgerFailure> {
+        let now = clock
+            .assign_ingest_time()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?
+            .instant()
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+        Self::open_at(authority, catalog, scope, protection, now)
+    }
+
+    fn open_at(
+        authority: &'kernel StorageKernelResourceAuthority,
+        catalog: &'catalog Catalog<'kernel>,
+        scope: SegmentScope,
+        protection: SegmentProtectionKey,
+        now: u64,
+    ) -> Result<Self, LedgerFailure> {
         let writer = authority
             .acquire_active_segment_ledger(scope.lease_key())
             .map_err(|failure| match failure {
@@ -110,7 +145,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
-        let recovered_leases = snapshot_lease::recover_reservations(authority, scope, &snapshot)?;
+        let recovered_leases = snapshot_lease_recovery::recover_reservations(
+            authority, catalog, scope, &snapshot, now,
+        )?;
+        let snapshot = catalog.pin()?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
         let mut segments = metadata.iter().copied().peekable();
         let mut blocks = Vec::new();

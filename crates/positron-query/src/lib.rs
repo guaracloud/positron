@@ -12,6 +12,7 @@ mod plan;
 mod runtime;
 mod service;
 mod stream;
+mod stream_lifecycle;
 
 pub use budget::QueryBudget;
 pub use cursor::QueryCursor;
@@ -22,9 +23,10 @@ pub use runtime::{
 };
 pub use service::QueryService;
 pub use stream::{
-    QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryStream,
-    QueryTerminal, ResultLease, ResultOrdering, ResultSchema, ResultSnapshot,
+    QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryTerminal,
+    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot,
 };
+pub use stream_lifecycle::QueryStream;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]

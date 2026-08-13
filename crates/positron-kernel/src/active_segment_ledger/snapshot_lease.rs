@@ -1,11 +1,10 @@
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use positron_domain::routing::CommitPosition;
 
 use crate::catalog::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
 use crate::data_protection::DataProtection;
-use crate::{ResourceReservation, WorkClaim, WorkKind};
+use crate::{WorkClaim, WorkKind};
 
 use super::capacity::{lease_claim, snapshot_claim};
 use super::snapshot_lease_codec::{decode, encode};
@@ -210,49 +209,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     }
 }
 
-pub(super) struct RecoveredLeases<'kernel> {
-    pub(super) reservations: BTreeMap<SnapshotLeaseId, ResourceReservation<'kernel>>,
-    pub(super) last_observed: u64,
-}
-
-pub(super) fn recover_reservations<'kernel>(
-    ledger_authority: &'kernel crate::StorageKernelResourceAuthority,
-    scope: SegmentScope,
-    snapshot: &crate::CatalogSnapshot,
-) -> Result<RecoveredLeases<'kernel>, LedgerFailure> {
-    let all = records(snapshot)?;
-    if all.iter().filter(|record| record.scope == scope).count() > MAX_SNAPSHOT_LEASES {
-        return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
-    }
-    let last_observed = all
-        .iter()
-        .filter(|record| record.scope == scope)
-        .map(|record| record.observed_at)
-        .max()
-        .unwrap_or(0);
-    let mut retained = BTreeMap::new();
-    for record in all.into_iter().filter(|record| record.scope == scope) {
-        let encoded = encode(&record)?;
-        let claim = WorkClaim::tenant(
-            scope.tenant,
-            WorkKind::InteractiveQueryTail,
-            lease_claim(encoded.len())?,
-        )
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let reservation = ledger_authority
-            .governor()
-            .reserve(claim)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        if retained.insert(record.identity, reservation).is_some() {
-            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-        }
-    }
-    Ok(RecoveredLeases {
-        reservations: retained,
-        last_observed,
-    })
-}
-
 fn snapshot_from_record<'kernel>(
     ledger: &ActiveSegmentLedger<'kernel, '_>,
     state: &super::state::LedgerState<'kernel>,
@@ -309,6 +265,15 @@ fn publish(
     remove: &BTreeSet<SnapshotLeaseId>,
     add: Option<Vec<u8>>,
 ) -> Result<(), LedgerFailure> {
+    publish_many(catalog, basis, remove, add.into_iter().collect())
+}
+
+pub(super) fn publish_many(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    remove: &BTreeSet<SnapshotLeaseId>,
+    add: Vec<Vec<u8>>,
+) -> Result<(), LedgerFailure> {
     let mut objects = basis
         .plaintext_objects()
         .filter(|bytes| {
@@ -319,7 +284,7 @@ fn publish(
         })
         .map(|bytes| CatalogObject::new(bytes.to_vec()))
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(encoded) = add {
+    for encoded in add {
         objects.push(CatalogObject::new(encoded)?);
     }
     let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
@@ -331,7 +296,7 @@ fn publish(
     Ok(())
 }
 
-fn expired_in_scope(
+pub(super) fn expired_in_scope(
     records: &[LeaseRecord],
     scope: SegmentScope,
     now: u64,
@@ -362,7 +327,9 @@ fn remove_reservations(
     }
 }
 
-fn records(snapshot: &crate::CatalogSnapshot) -> Result<Vec<LeaseRecord>, LedgerFailure> {
+pub(super) fn records(
+    snapshot: &crate::CatalogSnapshot,
+) -> Result<Vec<LeaseRecord>, LedgerFailure> {
     let mut records = Vec::new();
     for bytes in snapshot.plaintext_objects() {
         if let Some(record) = decode(bytes)? {

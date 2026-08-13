@@ -30,7 +30,13 @@ fn snapshot_lease_pins_exact_visibility_across_append_restart_release_and_expiry
         drop(resumed);
         drop(ledger);
 
-        let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(102),
+        )?;
         let restarted = reopened.resume_snapshot_lease(identity, 102)?;
         assert_eq!(restarted.snapshot().catalog_identity(), source_identity);
         assert_eq!(restarted.snapshot().catalog_generation(), source_generation);
@@ -78,7 +84,13 @@ fn snapshot_lease_public_time_and_signal_boundaries_are_typed_and_restartable()
         let traces = ActiveSegmentLedger::open(authority, catalog, trace_scope, key())?;
         let identity = traces.create_snapshot_lease(100, 200)?.identity();
         drop(traces);
-        let reopened = ActiveSegmentLedger::open(authority, catalog, trace_scope, key())?;
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            trace_scope,
+            key(),
+            &lease_clock(101),
+        )?;
         assert_eq!(
             reopened.resume_snapshot_lease(identity, 101)?.identity(),
             identity
@@ -119,14 +131,37 @@ fn snapshot_lease_pruning_is_restart_safe_atomic_and_rejects_time_regression()
         let _expired = ledger.create_snapshot_lease(101, 102)?;
         drop(ledger);
 
-        let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let regressed = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(100),
+        )
+        .err()
+        .ok_or("restart accepted a regressed durable lease clock")?;
+        assert_eq!(regressed.code(), LedgerFailureCode::InvalidInput);
         let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
-            reopened.create_snapshot_lease(102, 200)
+            ActiveSegmentLedger::open_with_clock(
+                authority,
+                catalog,
+                scope,
+                key(),
+                &lease_clock(102),
+            )
         })
-        .expect_err("failed pruning cannot publish a partial lease set");
+        .err()
+        .ok_or("failed restart pruning unexpectedly opened the ledger")?;
         assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(103),
+        )?;
         assert_eq!(
-            reopened.resume_snapshot_lease(active, 102)?.identity(),
+            reopened.resume_snapshot_lease(active, 103)?.identity(),
             active
         );
         let replacement = reopened.create_snapshot_lease(103, 200)?.identity();
@@ -146,6 +181,76 @@ fn snapshot_lease_pruning_is_restart_safe_atomic_and_rejects_time_regression()
 }
 
 #[test]
+fn restart_prunes_expired_leases_before_reduced_capacity_reservation() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let expired = ledger.create_snapshot_lease(100, 150)?.identity();
+        let active = ledger.create_snapshot_lease(101, 1_000)?.identity();
+        drop(ledger);
+
+        let held = authority.governor().reserve(crate::WorkClaim::tenant(
+            scope.tenant,
+            crate::WorkKind::InteractiveQueryTail,
+            crate::ResourceAmounts::only(crate::ResourceDimension::LeaseSlots, 5)?,
+        )?)?;
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(200),
+        )?;
+        assert_eq!(
+            reopened.resume_snapshot_lease(active, 200)?.identity(),
+            active
+        );
+        assert_eq!(
+            reopened
+                .resume_snapshot_lease(expired, 200)
+                .expect_err("restart prunes the expired lease")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        drop(held);
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_release_fault_retains_retryable_idempotent_truth() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            ledger.release_snapshot_lease(identity)
+        })
+        .expect_err("failed release cannot erase durable resume truth");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            ledger.resume_snapshot_lease(identity, 101)?.identity(),
+            identity
+        );
+        ledger.release_snapshot_lease(identity)?;
+        ledger.release_snapshot_lease(identity)?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 102)
+                .expect_err("idempotent release remains terminal")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_v1_catalog_record_remains_restart_resumable() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
@@ -157,7 +262,13 @@ fn snapshot_lease_v1_catalog_record_remains_restart_resumable() -> Result<(), Bo
         })?;
         drop(ledger);
 
-        let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )?;
         let resumed = reopened.resume_snapshot_lease(identity, 101)?;
         assert_eq!(resumed.identity(), identity);
         assert_eq!(resumed.expiry(), 200);
@@ -236,4 +347,10 @@ fn truncate_lease_header(bytes: &mut Vec<u8>) {
 
 fn append_lease_trailing_byte(bytes: &mut Vec<u8>) {
     bytes.push(0);
+}
+
+fn lease_clock(seconds: i64) -> crate::LifecycleClock<crate::FixedLifecycleClockSource> {
+    crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(
+        positron_domain::time::UnixNanoseconds::new(seconds * 1_000_000_000),
+    ))
 }

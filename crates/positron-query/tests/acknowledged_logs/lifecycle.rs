@@ -101,6 +101,138 @@ fn paged_drop_before_header_delivery_reclaims_every_snapshot_lease() -> Result<(
 }
 
 #[test]
+fn observed_paged_completion_reclaims_every_snapshot_lease() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("paged-complete-reclaim")?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    for _ in 0..65 {
+        let query = service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 1",
+            budget(),
+        )?;
+        let events = service.execute_page(query)?.collect::<Vec<_>>();
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn paged_drop_after_batch_before_terminal_replays_the_same_batch() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("paged-batch-ambiguity")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let mut stream = service.execute_page(query)?;
+    let cursor = match stream.next() {
+        Some(QueryEvent::Header(header)) => header
+            .initial_cursor()
+            .ok_or("paged header omitted resume cursor")?
+            .clone(),
+        _ => return Err("paged header missing".into()),
+    };
+    let original = match stream.next() {
+        Some(QueryEvent::Batch(batch)) => (batch.sequence(), batch.digest()),
+        _ => return Err("paged batch missing".into()),
+    };
+    drop(stream);
+
+    let replayed = service
+        .resume(fixture.context, &cursor)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some((batch.sequence(), batch.digest())),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("replayed batch missing")?;
+    assert_eq!(replayed, original);
+    Ok(())
+}
+
+#[test]
+fn observed_paged_completion_makes_its_cursor_unavailable() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("paged-complete-terminal")?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    let cursor = match events.first() {
+        Some(QueryEvent::Header(header)) => header
+            .initial_cursor()
+            .ok_or("paged header omitted resume cursor")?,
+        _ => return Err("paged header missing".into()),
+    };
+    assert_eq!(
+        service
+            .resume(fixture.context, cursor)
+            .expect_err("observed completion releases its snapshot lease")
+            .code(),
+        QueryFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_paged_incomplete_is_terminal_and_not_resumable() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("paged-incomplete-terminal")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget().with_cpu_work_units(2)?,
+    )?;
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    let cursor = match events.first() {
+        Some(QueryEvent::Header(header)) => header
+            .initial_cursor()
+            .ok_or("paged header omitted resume cursor")?,
+        _ => return Err("paged header missing".into()),
+    };
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+    ));
+    assert_eq!(
+        service
+            .resume(fixture.context, cursor)
+            .expect_err("incomplete terminal releases its snapshot lease")
+            .code(),
+        QueryFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
 fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("cancel-truth")?;

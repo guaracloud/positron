@@ -8,6 +8,9 @@ use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
 use super::support::{KernelFixture, TemporaryRoots, TestClock};
 
+#[path = "cursor/event_time.rs"]
+mod event_time;
+
 #[test]
 fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically()
 -> Result<(), Box<dyn Error>> {
@@ -52,14 +55,15 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
         1,
         clock.clone(),
     )
-    .resume(context, &cursor)?
-    .collect::<Vec<_>>();
+    .resume(context, &cursor)?;
+    let repeated = service.resume(context, &cursor)?;
+    let resumed = resumed.collect::<Vec<_>>();
     assert_eq!(bodies(&resumed), ["second"]);
     assert!(matches!(
         resumed.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
     ));
-    let repeated = service.resume(context, &cursor)?.collect::<Vec<_>>();
+    let repeated = repeated.collect::<Vec<_>>();
     assert_eq!(batch_identity(&resumed)?, batch_identity(&repeated)?);
     assert_ne!(first_batch, batch_identity(&resumed)?);
     Ok(())
@@ -216,29 +220,6 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
     Ok(())
 }
 
-#[test]
-fn event_time_cursor_preserves_its_temporal_axis_across_resume() -> Result<(), Box<dyn Error>> {
-    let fixture = QueryFixtureForAxis::new()?;
-    let first = fixture
-        .service
-        .execute_page(fixture.plan)?
-        .collect::<Vec<_>>();
-    let resumed = fixture
-        .service
-        .resume(fixture.context, continuation(&first)?)?
-        .collect::<Vec<_>>();
-    let header = match resumed.first() {
-        Some(QueryEvent::Header(header)) => header,
-        _ => return Err("resumed result header missing".into()),
-    };
-    assert_eq!(
-        header.ordering().columns(),
-        ["event_time", "commit_position"]
-    );
-    assert_eq!(bodies(&resumed), ["second"]);
-    Ok(())
-}
-
 fn rewritten_cursor(
     fixture: &CursorFixture,
     rewrite: impl FnOnce(&mut Vec<u8>),
@@ -252,55 +233,6 @@ fn rewritten_cursor(
     let authentication = protector.authenticate(purpose, &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
-}
-
-struct QueryFixtureForAxis {
-    _roots: TemporaryRoots,
-    context: positron_governance::AuthorizedContext,
-    service: QueryService<'static, 'static, 'static>,
-    plan: positron_query::PlannedQuery<'static>,
-}
-
-impl QueryFixtureForAxis {
-    fn new() -> Result<Self, Box<dyn Error>> {
-        let roots = TemporaryRoots::new("event-time-cursor")?;
-        let paths = BootstrapPaths::new(
-            &roots.data(),
-            &roots.secrets(),
-            positron_kernel::MountQualification::LocalHost,
-        )?;
-        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
-        let claim = InstanceBootstrap::claim(&paths)?;
-        let instance = InstanceBootstrap::reopen(&paths)?;
-        let context = instance.attribute(
-            PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
-            RequestedIntent::Query,
-            CompatibilityHints::none(),
-        )?;
-        let kernel = Box::leak(Box::new(KernelFixture::new(
-            instance.default_tenant_id(),
-            "event-time-cursor-kernel",
-        )?));
-        kernel.append_log("first", 20, 1)?;
-        kernel.append_log("second", 21, 2)?;
-        let service = QueryService::with_clock(
-            kernel.authority.governor(),
-            kernel.ledger()?,
-            1,
-            TestClock::shared(100),
-        );
-        let plan = service.plan_pipeline(
-            context,
-            "logs | range event_time -100 100 | limit 2",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
-        )?;
-        Ok(Self {
-            _roots: roots,
-            context,
-            service,
-            plan,
-        })
-    }
 }
 
 struct CursorFixture {
