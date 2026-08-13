@@ -25,6 +25,9 @@ pub struct Identity {
     tenant_slug: TenantSlug,
     salt: [u8; 32],
     hash: [u8; 32],
+    ingest_principal: PrincipalId,
+    ingest_salt: [u8; 32],
+    ingest_hash: [u8; 32],
 }
 
 impl Identity {
@@ -56,24 +59,45 @@ impl Identity {
         intent: RequestedIntent,
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, AttributionFailure> {
-        if hints.external_alias.is_some()
-            || hints.has_untrusted_authority_claims()
-            || !keys
-                .verify_salted_secret_hash(&self.salt, credential.secret(), &self.hash)
-                .map_err(|_| AttributionFailure)?
-        {
+        if hints.external_alias.is_some() || hints.has_untrusted_authority_claims() {
             return Err(AttributionFailure);
         }
         match intent {
-            RequestedIntent::SystemAdministration => Ok(AuthorizedContext {
-                principal: self.principal,
-                scope: Scope::SystemAdministration,
-                tenant: None,
-                authority: self.instance,
-            }),
+            RequestedIntent::SystemAdministration
+                if keys
+                    .verify_salted_secret_hash(&self.salt, credential.secret(), &self.hash)
+                    .map_err(|_| AttributionFailure)? =>
+            {
+                Ok(AuthorizedContext {
+                    principal: self.principal,
+                    scope: Scope::SystemAdministration,
+                    tenant: None,
+                    authority: self.instance,
+                })
+            },
+            RequestedIntent::Ingest
+                if keys
+                    .verify_salted_secret_hash(
+                        &self.ingest_salt,
+                        credential.secret(),
+                        &self.ingest_hash,
+                    )
+                    .map_err(|_| AttributionFailure)? =>
+            {
+                Ok(AuthorizedContext {
+                    principal: self.ingest_principal,
+                    scope: Scope::Ingest,
+                    tenant: Some(
+                        TenantAttribution::new(self.ingest_principal, Scope::Ingest, self.tenant)
+                            .map_err(|_| AttributionFailure)?,
+                    ),
+                    authority: self.instance,
+                })
+            },
             RequestedIntent::Ingest
             | RequestedIntent::Query
-            | RequestedIntent::TenantAdministration => Err(AttributionFailure),
+            | RequestedIntent::TenantAdministration
+            | RequestedIntent::SystemAdministration => Err(AttributionFailure),
         }
     }
 

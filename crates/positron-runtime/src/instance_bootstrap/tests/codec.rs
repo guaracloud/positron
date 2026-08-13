@@ -9,10 +9,11 @@ fn claim_codec_rejects_malformed_and_substituted_authority() {
     let instance = InstanceId::new([1; 16]).expect("nonzero instance");
     let other = InstanceId::new([2; 16]).expect("nonzero instance");
     let principal = PrincipalId::from_bytes([3; 16]).expect("nonzero principal");
-    let encoded = encode_claim(instance, principal, &[4; 32]);
+    let ingest = PrincipalId::from_bytes([5; 16]).expect("ingest principal");
+    let encoded = encode_claim(instance, principal, &[4; 32], ingest, &[6; 32]);
 
     assert_eq!(
-        decode_claim(instance, &encoded[..71])
+        decode_claim(instance, &encoded[..119])
             .expect_err("truncated claim")
             .code(),
         BootstrapFailureCode::CorruptState

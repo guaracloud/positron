@@ -8,6 +8,7 @@ mod policy;
 
 pub use ingest::{
     CommittedAdmission, IngestFailureCode, IngestOutcome, LogIngest, PartialAdmission,
+    RejectionDetail,
 };
 pub use otlp_logs::{
     AuthenticatedOtlpLogsRequest, NativeLogAttribute, NativeLogBatch, NativeLogCandidate,

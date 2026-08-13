@@ -22,6 +22,17 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
         PrincipalId::from_bytes(cursor.take_array::<16>()?).map_err(|_| IdentityFailure)?;
     let salt = cursor.take_array::<32>()?;
     let hash = cursor.take_array::<32>()?;
+    require_nonzero(salt)?;
+    require_nonzero(hash)?;
+    let ingest_principal =
+        PrincipalId::from_bytes(cursor.take_array::<16>()?).map_err(|_| IdentityFailure)?;
+    if ingest_principal == principal {
+        return Err(IdentityFailure);
+    }
+    let ingest_salt = cursor.take_array::<32>()?;
+    let ingest_hash = cursor.take_array::<32>()?;
+    require_nonzero(ingest_salt)?;
+    require_nonzero(ingest_hash)?;
     require_nonzero(cursor.take_array::<32>()?)?;
     require_nonzero(cursor.take_array::<32>()?)?;
     cursor.skip_u16_bytes()?;
@@ -44,6 +55,9 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
         tenant_slug,
         salt,
         hash,
+        ingest_principal,
+        ingest_salt,
+        ingest_hash,
     })
 }
 

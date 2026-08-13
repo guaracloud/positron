@@ -577,6 +577,7 @@ dependencies = [
  "flate2",
  "opentelemetry-proto",
  "positron-domain",
+ "positron-governance",
  "positron-kernel",
  "positron-signals",
  "prost",

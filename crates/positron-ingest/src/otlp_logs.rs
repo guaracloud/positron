@@ -1,17 +1,28 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::fmt::{Display, Formatter};
 
-use flate2::read::MultiGzDecoder;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use positron_domain::identity::TenantAttribution;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
+use positron_governance::AuthorizedContext;
+use positron_kernel::{
+    ResourceAmounts, ResourceGovernor, ResourceReservation, WorkClaim, WorkKind,
+};
 use prost::Message;
+
+mod bounds;
+mod transport;
+
+use bounds::{MAX_DECODED_BATCH_BYTES, decoded_record_bytes};
+use transport::bounded_protobuf;
 
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_RECORDS: usize = 1_024;
 const MAX_ATTRIBUTES: usize = 4_096;
 const MAX_NESTING_DEPTH: u16 = 16;
+const RECEIVER_CAPACITY: ResourceAmounts =
+    ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 0, 0]);
 
 enum OtlpPayload {
     Protobuf(Vec<u8>),
@@ -27,25 +38,70 @@ enum OtlpPayload {
 /// // Tenant Attribution created by the identity boundary.
 /// let _ = AuthenticatedOtlpLogsRequest::new(vec![0_u8]);
 /// ```
-pub struct AuthenticatedOtlpLogsRequest {
+pub struct AuthenticatedOtlpLogsRequest<'authority> {
     attribution: TenantAttribution,
     payload: OtlpPayload,
+    capacity: Option<ResourceReservation<'authority>>,
 }
 
-impl AuthenticatedOtlpLogsRequest {
+impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
+    pub fn protobuf(
+        context: AuthorizedContext,
+        governor: ResourceGovernor<'authority>,
+        protobuf: Vec<u8>,
+    ) -> Result<Self, ReceiveFailure> {
+        Self::admit(context, governor, OtlpPayload::Protobuf(protobuf))
+    }
+
+    pub fn gzip_protobuf(
+        context: AuthorizedContext,
+        governor: ResourceGovernor<'authority>,
+        gzip_protobuf: Vec<u8>,
+    ) -> Result<Self, ReceiveFailure> {
+        Self::admit(context, governor, OtlpPayload::GzipProtobuf(gzip_protobuf))
+    }
+
+    fn admit(
+        context: AuthorizedContext,
+        governor: ResourceGovernor<'authority>,
+        payload: OtlpPayload,
+    ) -> Result<Self, ReceiveFailure> {
+        let attribution = context
+            .tenant_attribution()
+            .filter(|attribution| attribution.scope() == positron_domain::identity::Scope::Ingest)
+            .ok_or(ReceiveFailure::AuthenticationRejected)?;
+        if payload.encoded_len() > MAX_REQUEST_BYTES {
+            return Err(ReceiveFailure::TransportLimitExceeded);
+        }
+        let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
+            .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+        let capacity = governor
+            .reserve(claim)
+            .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+        Ok(Self {
+            attribution,
+            payload,
+            capacity: Some(capacity),
+        })
+    }
+
+    #[cfg(any(test, fuzzing))]
     #[must_use]
-    pub fn new(attribution: TenantAttribution, protobuf: Vec<u8>) -> Self {
+    pub fn test_only_protobuf(attribution: TenantAttribution, protobuf: Vec<u8>) -> Self {
         Self {
             attribution,
             payload: OtlpPayload::Protobuf(protobuf),
+            capacity: None,
         }
     }
 
+    #[cfg(any(test, fuzzing))]
     #[must_use]
-    pub fn gzip(attribution: TenantAttribution, gzip_protobuf: Vec<u8>) -> Self {
+    pub fn test_only_gzip(attribution: TenantAttribution, gzip_protobuf: Vec<u8>) -> Self {
         Self {
             attribution,
             payload: OtlpPayload::GzipProtobuf(gzip_protobuf),
+            capacity: None,
         }
     }
 }
@@ -53,11 +109,23 @@ impl AuthenticatedOtlpLogsRequest {
 /// Stable receiver-side rejection classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiveFailure {
+    AuthenticationRejected,
+    CapacityUnavailable,
     MalformedPayload,
     MalformedCompression,
     TransportLimitExceeded,
     ValueLimitExceeded,
+    TimestampOutOfRange,
+    UnsupportedValue,
 }
+
+impl Display for ReceiveFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OTLP Logs request was rejected")
+    }
+}
+
+impl std::error::Error for ReceiveFailure {}
 
 /// One native dynamic attribute before policy and semantic Value Limits.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +165,11 @@ impl NativeLogCandidate {
     #[must_use]
     pub const fn event_time_unix_nanos(&self) -> Option<i64> {
         self.event_time_unix_nanos
+    }
+
+    #[must_use]
+    pub const fn observed_time_unix_nanos(&self) -> Option<i64> {
+        self.observed_time_unix_nanos
     }
 
     #[must_use]
@@ -167,12 +240,15 @@ impl OtlpLogsReceiver {
         let AuthenticatedOtlpLogsRequest {
             attribution,
             payload,
+            capacity,
         } = request;
+        let _capacity = capacity;
         let protobuf = bounded_protobuf(payload)?;
         let decoded = ExportLogsServiceRequest::decode(protobuf.as_slice())
             .map_err(|_| ReceiveFailure::MalformedPayload)?;
         let mut records = Vec::new();
         let mut attribute_count = 0_usize;
+        let mut decoded_batch_bytes = 0_usize;
         for resource_logs in decoded.resource_logs {
             let resource = resource_logs
                 .resource
@@ -185,6 +261,11 @@ impl OtlpLogsReceiver {
                     if records.len() == MAX_RECORDS || log.encoded_len() > MAX_REQUEST_BYTES {
                         return Err(ReceiveFailure::ValueLimitExceeded);
                     }
+                    let decoded_record_bytes = decoded_record_bytes(&resource, &scope, &log)?;
+                    decoded_batch_bytes = decoded_batch_bytes
+                        .checked_add(decoded_record_bytes)
+                        .filter(|bytes| *bytes <= MAX_DECODED_BATCH_BYTES)
+                        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
                     attribute_count = attribute_count
                         .checked_add(resource.len())
                         .and_then(|count| count.checked_add(scope.len()))
@@ -196,12 +277,9 @@ impl OtlpLogsReceiver {
                         .map(|value| candidate_value(value, MAX_NESTING_DEPTH))
                         .transpose()?;
                     let attributes = grouped_attributes(&resource, &scope, &log.attributes)?;
-                    let event_time = i64::try_from(log.time_unix_nano)
-                        .ok()
-                        .filter(|value| *value != 0);
-                    let observed_time_unix_nanos = i64::try_from(log.observed_time_unix_nano)
-                        .ok()
-                        .filter(|value| *value != 0);
+                    let event_time = Some(checked_timestamp(log.time_unix_nano)?);
+                    let observed_time_unix_nanos =
+                        Some(checked_timestamp(log.observed_time_unix_nano)?);
                     records.push(NativeLogCandidate {
                         event_time_unix_nanos: event_time,
                         observed_time_unix_nanos,
@@ -218,29 +296,15 @@ impl OtlpLogsReceiver {
     }
 }
 
-fn bounded_protobuf(payload: OtlpPayload) -> Result<Vec<u8>, ReceiveFailure> {
-    match payload {
-        OtlpPayload::Protobuf(bytes) => {
-            if bytes.len() > MAX_REQUEST_BYTES {
-                return Err(ReceiveFailure::TransportLimitExceeded);
-            }
-            Ok(bytes)
-        },
-        OtlpPayload::GzipProtobuf(bytes) => {
-            if bytes.len() > MAX_REQUEST_BYTES {
-                return Err(ReceiveFailure::TransportLimitExceeded);
-            }
-            let mut decoded =
-                Vec::with_capacity(bytes.len().saturating_mul(4).min(MAX_REQUEST_BYTES));
-            MultiGzDecoder::new(bytes.as_slice())
-                .take((MAX_REQUEST_BYTES + 1) as u64)
-                .read_to_end(&mut decoded)
-                .map_err(|_| ReceiveFailure::MalformedCompression)?;
-            if decoded.len() > MAX_REQUEST_BYTES {
-                return Err(ReceiveFailure::TransportLimitExceeded);
-            }
-            Ok(decoded)
-        },
+fn checked_timestamp(value: u64) -> Result<i64, ReceiveFailure> {
+    i64::try_from(value).map_err(|_| ReceiveFailure::TimestampOutOfRange)
+}
+
+impl OtlpPayload {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Protobuf(bytes) | Self::GzipProtobuf(bytes) => bytes.len(),
+        }
     }
 }
 
@@ -291,7 +355,7 @@ fn candidate_value(
             value.to_bits(),
         )),
         any_value::Value::BytesValue(value) => Ok(CandidateAttributeValue::bytes(value)),
-        any_value::Value::StringValueStrindex(_) => Ok(CandidateAttributeValue::null()),
+        any_value::Value::StringValueStrindex(_) => Err(ReceiveFailure::UnsupportedValue),
         any_value::Value::ArrayValue(value) => {
             let next = remaining_depth
                 .checked_sub(1)

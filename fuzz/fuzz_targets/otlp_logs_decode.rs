@@ -12,9 +12,15 @@ fuzz_target!(|data: &[u8]| {
     )
     .expect("fixed attribution");
     let request = if data.first().is_some_and(|byte| byte & 1 == 1) {
-        AuthenticatedOtlpLogsRequest::gzip(attribution, data.get(1..).unwrap_or_default().to_vec())
+        AuthenticatedOtlpLogsRequest::test_only_gzip(
+            attribution,
+            data.get(1..).unwrap_or_default().to_vec(),
+        )
     } else {
-        AuthenticatedOtlpLogsRequest::new(attribution, data.get(1..).unwrap_or_default().to_vec())
+        AuthenticatedOtlpLogsRequest::test_only_protobuf(
+            attribution,
+            data.get(1..).unwrap_or_default().to_vec(),
+        )
     };
     let _ = OtlpLogsReceiver::new().decode(request);
 });

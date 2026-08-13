@@ -133,12 +133,12 @@ pub fn attribution() -> TenantAttribution {
     .expect("ingest attribution")
 }
 
-pub fn protobuf_request() -> AuthenticatedOtlpLogsRequest {
+pub fn protobuf_request() -> AuthenticatedOtlpLogsRequest<'static> {
     protobuf_with_bodies(&["paid"])
 }
 
-pub fn protobuf_with_bodies(bodies: &[&str]) -> AuthenticatedOtlpLogsRequest {
-    AuthenticatedOtlpLogsRequest::new(attribution(), protobuf_bytes(bodies))
+pub fn protobuf_with_bodies(bodies: &[&str]) -> AuthenticatedOtlpLogsRequest<'static> {
+    AuthenticatedOtlpLogsRequest::test_only_protobuf(attribution(), protobuf_bytes(bodies))
 }
 
 pub fn protobuf_bytes(bodies: &[&str]) -> Vec<u8> {

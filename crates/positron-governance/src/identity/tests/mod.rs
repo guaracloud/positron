@@ -15,6 +15,9 @@ fn encoded_identity() -> Vec<u8> {
         PrincipalId::from_bytes([3; 16]).expect("principal"),
         [4; 32],
         [5; 32],
+        PrincipalId::from_bytes([12; 16]).expect("ingest principal"),
+        [13; 32],
+        [14; 32],
         [6; 32],
         [7; 32],
         vec![8; 64],
@@ -30,6 +33,13 @@ fn encoded_identity() -> Vec<u8> {
         .expect("governance")
         .into_parts()
         .0
+}
+
+#[test]
+fn distinct_ingest_principal_authenticates_without_system_impersonation() {
+    let identity = decode_initial_identity(&encoded_identity()).expect("identity");
+    assert_eq!(identity.ingest_principal.to_bytes(), [12; 16]);
+    assert_ne!(identity.ingest_principal, identity.principal);
 }
 
 #[test]
@@ -61,7 +71,7 @@ fn initial_identity_decoder_rejects_truncation_corruption_and_trailing_data() {
     trailing.push(0);
     assert!(decode_initial_identity(&trailing).is_err());
 
-    for range in [8..24, 323..331, 343..351] {
+    for range in [8..24, 403..411, 423..431] {
         let mut zeroed = encoded_identity();
         zeroed[range].fill(0);
         assert!(decode_initial_identity(&zeroed).is_err());
@@ -70,7 +80,7 @@ fn initial_identity_decoder_rejects_truncation_corruption_and_trailing_data() {
     oversized_slug[40] = 64;
     assert!(decode_initial_identity(&oversized_slug).is_err());
     let mut missing_integrity = encoded_identity();
-    missing_integrity[207..209].fill(0);
+    missing_integrity[287..289].fill(0);
     assert!(decode_initial_identity(&missing_integrity).is_err());
     let mut empty_display = encoded_identity();
     empty_display.drain(49..63);

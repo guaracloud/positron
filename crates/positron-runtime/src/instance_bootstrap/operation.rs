@@ -132,6 +132,10 @@ fn resume(
         .api_key_secret
         .as_ref()
         .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let ingest_api_secret = record
+        .ingest_api_key_secret
+        .as_ref()
+        .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let integrity_secret = record
         .integrity_key_secret
         .as_ref()
@@ -158,6 +162,9 @@ fn resume(
         record.administrator,
         record.api_key_salt,
         record.api_key_hash,
+        record.ingest_principal,
+        record.ingest_api_key_salt,
+        record.ingest_api_key_hash,
         integrity_identity.public_key(),
         record.integrity_fingerprint,
         protected_integrity,
@@ -192,7 +199,7 @@ fn resume(
     open_initial_ledgers(&authority, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
     if plan.creates_claim() {
-        ensure_claim(&access, &key, &record, api_secret)?;
+        ensure_claim(&access, &key, &record, api_secret, ingest_api_secret)?;
     }
     let initialized_record = record.initialized();
     let initialized = key
@@ -290,16 +297,23 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
             &encrypted_claim,
         )
         .map_err(key_failure)?;
-    let (principal, secret) = decode_claim(record.instance, &plaintext)?;
-    if principal != record.administrator {
+    let (principal, secret, ingest_principal, ingest_secret) =
+        decode_claim(record.instance, &plaintext)?;
+    if principal != record.administrator || ingest_principal != record.ingest_principal {
         return Err(BootstrapFailure::new(
             BootstrapFailureCode::IdentityMismatch,
         ));
     }
     let secret = Zeroizing::new(format_secret(&secret));
+    let ingest_secret = Zeroizing::new(format_secret(&ingest_secret));
     storage::remove(&access, BootstrapArtifact::Claim)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ClaimDestructionFailed))?;
-    Ok(BootstrapClaim { principal, secret })
+    Ok(BootstrapClaim {
+        principal,
+        secret,
+        ingest_principal,
+        ingest_secret,
+    })
 }
 
 fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, BootstrapFailure> {
@@ -316,6 +330,13 @@ fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, Bootstr
     let api_key_hash = key
         .salted_secret_hash(api_key_salt.as_ref(), api_key_secret.as_ref())
         .map_err(key_failure)?;
+    let ingest_principal = PrincipalId::from_bytes(key.random_identifier().map_err(key_failure)?)
+        .map_err(|_| entropy_failure())?;
+    let ingest_api_key_salt = key.random_secret().map_err(key_failure)?;
+    let ingest_api_key_secret = key.random_secret().map_err(key_failure)?;
+    let ingest_api_key_hash = key
+        .salted_secret_hash(ingest_api_key_salt.as_ref(), ingest_api_key_secret.as_ref())
+        .map_err(key_failure)?;
     let integrity_secret = key.random_secret().map_err(key_failure)?;
     let integrity_fingerprint = key
         .integrity_identity(integrity_secret.as_ref())
@@ -329,8 +350,12 @@ fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, Bootstr
         transaction,
         api_key_salt: *api_key_salt,
         api_key_hash,
+        ingest_principal,
+        ingest_api_key_salt: *ingest_api_key_salt,
+        ingest_api_key_hash,
         integrity_fingerprint,
         api_key_secret: Some(Zeroizing::new(*api_key_secret)),
+        ingest_api_key_secret: Some(Zeroizing::new(*ingest_api_key_secret)),
         integrity_key_secret: Some(Zeroizing::new(*integrity_secret)),
     })
 }

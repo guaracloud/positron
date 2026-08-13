@@ -10,7 +10,7 @@ fn authenticated_request_rejects_malformed_protobuf_permanently() {
         TenantId::from_bytes([2; 16]).expect("tenant"),
     )
     .expect("ingest attribution");
-    let request = AuthenticatedOtlpLogsRequest::new(attribution, vec![0xff]);
+    let request = AuthenticatedOtlpLogsRequest::test_only_protobuf(attribution, vec![0xff]);
 
     assert_eq!(
         OtlpLogsReceiver::new()

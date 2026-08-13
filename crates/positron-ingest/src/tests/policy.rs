@@ -6,7 +6,7 @@ use positron_kernel::{
 };
 use positron_signals::{LogScan, LogStore, ScanLimit};
 
-use crate::{IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
+use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
 
 use super::support::{fixture, protobuf_with_bodies};
 
@@ -77,6 +77,64 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
     assert_eq!(
         result.records()[0].policy_provenance().applied_rules(),
         &["reject-oversized"]
+    );
+}
+
+#[test]
+fn partial_admission_preserves_each_permanent_rejection_class() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x41; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x42; 32]), Box::new([0x43; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(41).expect("shard");
+    let ledger = ActiveSegmentLedger::open(
+        &fixture.authority,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x44; 32])),
+    )
+    .expect("ledger");
+    let oversized = "x".repeat(262_145);
+    let batch = OtlpLogsReceiver::new()
+        .decode(protobuf_with_bodies(&[
+            "reject-me",
+            oversized.as_str(),
+            "accepted",
+        ]))
+        .expect("structural decode");
+    let policy =
+        IngestPolicy::reject_exact_text_body(3, [0x45; 32], "reject", "reject-me").expect("policy");
+    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(3)));
+    let outcome = LogIngest::new(
+        &fixture.authority,
+        &ledger,
+        &clock,
+        &policy,
+        fixture.tenant,
+        shard,
+    )
+    .accept(
+        batch,
+        StoreBlockIdentity::new([0x46; 16]).expect("identity"),
+    );
+    let partial = match outcome {
+        IngestOutcome::Partial(partial) => partial,
+        other => panic!("expected partial, got {other:?}"),
+    };
+    assert_eq!(partial.permanently_rejected(), 2);
+    assert_eq!(
+        partial
+            .rejections()
+            .iter()
+            .map(|detail| (detail.code(), detail.records()))
+            .collect::<Vec<_>>(),
+        vec![
+            (IngestFailureCode::PolicyRejected, 1),
+            (IngestFailureCode::ValueLimitExceeded, 1),
+        ]
     );
 }
 

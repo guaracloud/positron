@@ -6,10 +6,10 @@ use super::{BootstrapFailure, BootstrapFailureCode};
 
 const PENDING_MAGIC: [u8; 8] = *b"POSIPN01";
 const INITIALIZED_MAGIC: [u8; 8] = *b"POSINI01";
-const CLAIM_MAGIC: [u8; 8] = *b"POSCLM01";
-const RECORD_BYTES_WITHOUT_SECRET: usize = 224;
-const RECORD_BYTES_WITH_SECRET: usize = 288;
-const CLAIM_BYTES: usize = 72;
+const CLAIM_MAGIC: [u8; 8] = *b"POSCLM02";
+const RECORD_BYTES_WITHOUT_SECRET: usize = 304;
+const RECORD_BYTES_WITH_SECRET: usize = 400;
+const CLAIM_BYTES: usize = 120;
 
 pub(super) struct BootstrapRecord {
     pub(super) instance: InstanceId,
@@ -20,7 +20,11 @@ pub(super) struct BootstrapRecord {
     pub(super) api_key_salt: [u8; 32],
     pub(super) api_key_hash: [u8; 32],
     pub(super) integrity_fingerprint: [u8; 32],
+    pub(super) ingest_principal: PrincipalId,
+    pub(super) ingest_api_key_salt: [u8; 32],
+    pub(super) ingest_api_key_hash: [u8; 32],
     pub(super) api_key_secret: Option<Zeroizing<[u8; 32]>>,
+    pub(super) ingest_api_key_secret: Option<Zeroizing<[u8; 32]>>,
     pub(super) integrity_key_secret: Option<Zeroizing<[u8; 32]>>,
 }
 
@@ -46,7 +50,13 @@ impl BootstrapRecord {
         bytes.extend_from_slice(&self.api_key_salt);
         bytes.extend_from_slice(&self.api_key_hash);
         bytes.extend_from_slice(&self.integrity_fingerprint);
+        bytes.extend_from_slice(&self.ingest_principal.to_bytes());
+        bytes.extend_from_slice(&self.ingest_api_key_salt);
+        bytes.extend_from_slice(&self.ingest_api_key_hash);
         if let Some(secret) = &self.api_key_secret {
+            bytes.extend_from_slice(secret.as_ref());
+        }
+        if let Some(secret) = &self.ingest_api_key_secret {
             bytes.extend_from_slice(secret.as_ref());
         }
         if let Some(secret) = &self.integrity_key_secret {
@@ -86,13 +96,22 @@ impl BootstrapRecord {
             api_key_salt: array(bytes, 128, 160)?,
             api_key_hash: array(bytes, 160, 192)?,
             integrity_fingerprint: array(bytes, 192, 224)?,
+            ingest_principal: PrincipalId::from_bytes(array(bytes, 224, 240)?)
+                .map_err(|_| corrupt())?,
+            ingest_api_key_salt: array(bytes, 240, 272)?,
+            ingest_api_key_hash: array(bytes, 272, 304)?,
             api_key_secret: if pending {
-                Some(Zeroizing::new(array(bytes, 224, 256)?))
+                Some(Zeroizing::new(array(bytes, 304, 336)?))
+            } else {
+                None
+            },
+            ingest_api_key_secret: if pending {
+                Some(Zeroizing::new(array(bytes, 336, 368)?))
             } else {
                 None
             },
             integrity_key_secret: if pending {
-                Some(Zeroizing::new(array(bytes, 256, 288)?))
+                Some(Zeroizing::new(array(bytes, 368, 400)?))
             } else {
                 None
             },
@@ -109,7 +128,11 @@ impl BootstrapRecord {
             api_key_salt: self.api_key_salt,
             api_key_hash: self.api_key_hash,
             integrity_fingerprint: self.integrity_fingerprint,
+            ingest_principal: self.ingest_principal,
+            ingest_api_key_salt: self.ingest_api_key_salt,
+            ingest_api_key_hash: self.ingest_api_key_hash,
             api_key_secret: None,
+            ingest_api_key_secret: None,
             integrity_key_secret: None,
         }
     }
@@ -123,19 +146,30 @@ pub(super) fn encode_claim(
     instance: InstanceId,
     principal: PrincipalId,
     secret: &[u8; 32],
+    ingest_principal: PrincipalId,
+    ingest_secret: &[u8; 32],
 ) -> Zeroizing<Vec<u8>> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(CLAIM_BYTES));
     bytes.extend_from_slice(&CLAIM_MAGIC);
     bytes.extend_from_slice(&instance.to_bytes());
     bytes.extend_from_slice(&principal.to_bytes());
     bytes.extend_from_slice(secret);
+    bytes.extend_from_slice(&ingest_principal.to_bytes());
+    bytes.extend_from_slice(ingest_secret);
     bytes
 }
+
+type DecodedBootstrapClaim = (
+    PrincipalId,
+    Zeroizing<[u8; 32]>,
+    PrincipalId,
+    Zeroizing<[u8; 32]>,
+);
 
 pub(super) fn decode_claim(
     expected_instance: InstanceId,
     bytes: &[u8],
-) -> Result<(PrincipalId, Zeroizing<[u8; 32]>), BootstrapFailure> {
+) -> Result<DecodedBootstrapClaim, BootstrapFailure> {
     if bytes.len() != CLAIM_BYTES || bytes.get(..8) != Some(CLAIM_MAGIC.as_slice()) {
         return Err(corrupt());
     }
@@ -147,6 +181,8 @@ pub(super) fn decode_claim(
     Ok((
         PrincipalId::from_bytes(array(bytes, 24, 40)?).map_err(|_| corrupt())?,
         Zeroizing::new(array(bytes, 40, 72)?),
+        PrincipalId::from_bytes(array(bytes, 72, 88)?).map_err(|_| corrupt())?,
+        Zeroizing::new(array(bytes, 88, 120)?),
     ))
 }
 

@@ -35,8 +35,15 @@ pub(super) fn ensure_claim(
     key: &BootstrapKeyCustody,
     record: &BootstrapRecord,
     secret: &[u8; 32],
+    ingest_secret: &[u8; 32],
 ) -> Result<(), BootstrapFailure> {
-    let plaintext = encode_claim(record.instance, record.administrator, secret);
+    let plaintext = encode_claim(
+        record.instance,
+        record.administrator,
+        secret,
+        record.ingest_principal,
+        ingest_secret,
+    );
     let encrypted = key
         .protect(record.instance, BootstrapObjectPurpose::Claim, &plaintext)
         .map_err(key_failure)?;

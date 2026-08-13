@@ -6,7 +6,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
 use prost::Message;
 
-use crate::{AuthenticatedOtlpLogsRequest, OtlpLogsReceiver};
+use crate::{AuthenticatedOtlpLogsRequest, OtlpLogsReceiver, ReceiveFailure};
 
 use super::support::{attribution, protobuf_request};
 
@@ -119,22 +119,54 @@ fn every_otlp_log_value_variant_remains_native_and_duplicate_occurrences_remain_
 }
 
 #[test]
-fn profile_string_table_references_are_ignored_as_empty_log_values() {
+fn profile_string_table_references_are_rejected_from_logs() {
     let request = proto_request(LogRecord {
         body: Some(any(any_value::Value::StringValueStrindex(4))),
         ..LogRecord::default()
     });
 
-    let batch = OtlpLogsReceiver::new()
-        .decode(request)
-        .expect("non-log profile reference is non-fatal");
     assert_eq!(
-        batch.records().first().and_then(|record| record.body()),
-        Some(&CandidateAttributeValue::null())
+        OtlpLogsReceiver::new()
+            .decode(request)
+            .expect_err("profile-only value cannot be represented as a Log"),
+        ReceiveFailure::UnsupportedValue,
     );
 }
 
-fn proto_request(record: LogRecord) -> AuthenticatedOtlpLogsRequest {
+#[test]
+fn timestamps_preserve_zero_and_i64_max_but_reject_larger_u64_values() {
+    let boundary = proto_request(LogRecord {
+        time_unix_nano: 0,
+        observed_time_unix_nano: i64::MAX as u64,
+        ..LogRecord::default()
+    });
+    let batch = OtlpLogsReceiver::new()
+        .decode(boundary)
+        .expect("typed timestamp boundaries");
+    let record = batch.records().first().expect("record");
+    assert_eq!(record.event_time_unix_nanos(), Some(0));
+    assert_eq!(record.observed_time_unix_nanos(), Some(i64::MAX));
+
+    for record in [
+        LogRecord {
+            time_unix_nano: i64::MAX as u64 + 1,
+            ..LogRecord::default()
+        },
+        LogRecord {
+            observed_time_unix_nano: i64::MAX as u64 + 1,
+            ..LogRecord::default()
+        },
+    ] {
+        assert_eq!(
+            OtlpLogsReceiver::new()
+                .decode(proto_request(record))
+                .expect_err("out-of-range timestamp"),
+            ReceiveFailure::TimestampOutOfRange,
+        );
+    }
+}
+
+fn proto_request(record: LogRecord) -> AuthenticatedOtlpLogsRequest<'static> {
     let request = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             scope_logs: vec![ScopeLogs {
@@ -144,7 +176,7 @@ fn proto_request(record: LogRecord) -> AuthenticatedOtlpLogsRequest {
             ..ResourceLogs::default()
         }],
     };
-    AuthenticatedOtlpLogsRequest::new(attribution(), request.encode_to_vec())
+    AuthenticatedOtlpLogsRequest::test_only_protobuf(attribution(), request.encode_to_vec())
 }
 
 fn any(value: any_value::Value) -> AnyValue {

@@ -156,6 +156,12 @@ impl InitializedInstance {
             .attribute(&self.key, credential, intent, hints)
     }
 
+    /// Borrows the initialized instance's ordinary resource-admission authority.
+    #[must_use]
+    pub const fn resource_governor(&self) -> positron_kernel::ResourceGovernor<'_> {
+        self._authority.governor()
+    }
+
     pub fn inspect_governance(
         &self,
         context: positron_governance::AuthorizedContext,
@@ -210,6 +216,8 @@ impl InitializedInstance {
 pub struct BootstrapClaim {
     pub(super) principal: PrincipalId,
     pub(super) secret: Zeroizing<String>,
+    pub(super) ingest_principal: PrincipalId,
+    pub(super) ingest_secret: Zeroizing<String>,
 }
 
 impl BootstrapClaim {
@@ -221,6 +229,16 @@ impl BootstrapClaim {
     #[must_use]
     pub fn secret(&self) -> &str {
         self.secret.as_str()
+    }
+
+    #[must_use]
+    pub const fn ingest_principal_id(&self) -> PrincipalId {
+        self.ingest_principal
+    }
+
+    #[must_use]
+    pub fn ingest_secret(&self) -> &str {
+        self.ingest_secret.as_str()
     }
 }
 

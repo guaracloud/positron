@@ -79,8 +79,12 @@ fn record_key_identity_mismatch_is_closed() {
         transaction: TransactionId::new([7; 16]).expect("transaction"),
         api_key_salt: [8; 32],
         api_key_hash: [9; 32],
+        ingest_principal: PrincipalId::from_bytes([16; 16]).expect("ingest principal"),
+        ingest_api_key_salt: [17; 32],
+        ingest_api_key_hash: [18; 32],
         integrity_fingerprint: [10; 32],
         api_key_secret: Some(Zeroizing::new([11; 32])),
+        ingest_api_key_secret: Some(Zeroizing::new([19; 32])),
         integrity_key_secret: Some(Zeroizing::new([12; 32])),
     };
     let wrong = BootstrapKeyIdentity::from_parts([13; 16], [14; 32], 15).expect("wrong key");

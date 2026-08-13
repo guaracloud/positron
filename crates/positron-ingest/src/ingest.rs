@@ -21,7 +21,32 @@ pub struct CommittedAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartialAdmission {
     committed: CommittedAdmission,
-    permanently_rejected: usize,
+    rejections: [RejectionDetail; 3],
+    rejection_class_count: u8,
+}
+
+/// One deterministic permanent-rejection class and its bounded record count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RejectionDetail {
+    code: IngestFailureCode,
+    records: usize,
+}
+
+impl RejectionDetail {
+    const EMPTY: Self = Self {
+        code: IngestFailureCode::PolicyRejected,
+        records: 0,
+    };
+
+    #[must_use]
+    pub const fn code(self) -> IngestFailureCode {
+        self.code
+    }
+
+    #[must_use]
+    pub const fn records(self) -> usize {
+        self.records
+    }
 }
 
 impl PartialAdmission {
@@ -31,8 +56,15 @@ impl PartialAdmission {
     }
 
     #[must_use]
-    pub const fn permanently_rejected(self) -> usize {
-        self.permanently_rejected
+    pub fn permanently_rejected(self) -> usize {
+        self.rejections().iter().map(|detail| detail.records).sum()
+    }
+
+    #[must_use]
+    pub fn rejections(&self) -> &[RejectionDetail] {
+        self.rejections
+            .get(..usize::from(self.rejection_class_count))
+            .unwrap_or_default()
     }
 }
 
@@ -149,13 +181,13 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord);
         }
         let mut accepted = Vec::new();
-        let mut rejected = 0_usize;
+        let mut rejection_counts = [0_usize; 3];
         let mut rejection_code = IngestFailureCode::InvalidRecord;
         for candidate in batch.into_records() {
             let policy = match self.policy.evaluate(&candidate) {
                 Ok(PolicyDecision::Accept(policy)) => policy,
                 Ok(PolicyDecision::Reject) => {
-                    rejected = rejected.saturating_add(1);
+                    increment_rejection(&mut rejection_counts, IngestFailureCode::PolicyRejected);
                     rejection_code = IngestFailureCode::PolicyRejected;
                     continue;
                 },
@@ -181,11 +213,11 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             ) {
                 Ok(record) => accepted.push(record),
                 Err(failure) => {
-                    rejected = rejected.saturating_add(1);
                     rejection_code = match failure.code() {
                         LogStoreFailureCode::LimitExceeded => IngestFailureCode::ValueLimitExceeded,
                         _ => IngestFailureCode::InvalidRecord,
                     };
+                    increment_rejection(&mut rejection_counts, rejection_code);
                 },
             }
         }
@@ -235,15 +267,50 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             None => self.ledger.append(block),
         };
         match result {
-            Ok(receipt) if rejected == 0 => {
+            Ok(receipt) if rejection_counts.iter().all(|count| *count == 0) => {
                 IngestOutcome::Full(CommittedAdmission { receipt, records })
             },
-            Ok(receipt) => IngestOutcome::Partial(PartialAdmission {
-                committed: CommittedAdmission { receipt, records },
-                permanently_rejected: rejected,
-            }),
+            Ok(receipt) => IngestOutcome::Partial(partial_admission(
+                CommittedAdmission { receipt, records },
+                rejection_counts,
+            )),
             Err(failure) => map_ledger_failure(&failure),
         }
+    }
+}
+
+fn increment_rejection(counts: &mut [usize; 3], code: IngestFailureCode) {
+    let index = match code {
+        IngestFailureCode::PolicyRejected => 0,
+        IngestFailureCode::InvalidRecord => 1,
+        IngestFailureCode::ValueLimitExceeded => 2,
+        _ => return,
+    };
+    if let Some(count) = counts.get_mut(index) {
+        *count = count.saturating_add(1);
+    }
+}
+
+fn partial_admission(committed: CommittedAdmission, counts: [usize; 3]) -> PartialAdmission {
+    let codes = [
+        IngestFailureCode::PolicyRejected,
+        IngestFailureCode::InvalidRecord,
+        IngestFailureCode::ValueLimitExceeded,
+    ];
+    let mut rejections = [RejectionDetail::EMPTY; 3];
+    let mut used = 0_u8;
+    for (code, records) in codes.into_iter().zip(counts) {
+        if records > 0
+            && let Some(detail) = rejections.get_mut(usize::from(used))
+        {
+            *detail = RejectionDetail { code, records };
+            used = used.saturating_add(1);
+        }
+    }
+    PartialAdmission {
+        committed,
+        rejections,
+        rejection_class_count: used,
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use positron_domain::identity::Scope;
+use positron_domain::identity::{PrincipalId, Scope};
 use positron_governance::{
     CatalogRootRotationStage, CompatibilityHints, InitialAuditContext, InitialGovernanceIntent,
     InitialTenantIntent, PresentedCredential, RequestedIntent,
@@ -225,6 +225,9 @@ fn authenticated_system_administrator_reads_the_successor_heterogeneous_audit_ch
         administrator,
         [57; 32],
         [58; 32],
+        PrincipalId::from_bytes([70; 16])?,
+        [71; 32],
+        [72; 32],
         [59; 32],
         [60; 32],
         vec![61; 64],

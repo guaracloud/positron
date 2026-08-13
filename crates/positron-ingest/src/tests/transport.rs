@@ -17,8 +17,10 @@ fn bounded_gzip_protobuf_decodes_after_attribution() {
     encoder
         .write_all(&protobuf_bytes(&["compressed"]))
         .expect("gzip write");
-    let request =
-        AuthenticatedOtlpLogsRequest::gzip(attribution(), encoder.finish().expect("gzip finish"));
+    let request = AuthenticatedOtlpLogsRequest::test_only_gzip(
+        attribution(),
+        encoder.finish().expect("gzip finish"),
+    );
     assert_eq!(
         OtlpLogsReceiver::new()
             .decode(request)
@@ -31,7 +33,7 @@ fn bounded_gzip_protobuf_decodes_after_attribution() {
 
 #[test]
 fn malformed_and_expanding_gzip_are_permanent_transport_failures() {
-    let malformed = AuthenticatedOtlpLogsRequest::gzip(attribution(), vec![1, 2, 3]);
+    let malformed = AuthenticatedOtlpLogsRequest::test_only_gzip(attribution(), vec![1, 2, 3]);
     assert_eq!(
         OtlpLogsReceiver::new()
             .decode(malformed)
@@ -43,8 +45,10 @@ fn malformed_and_expanding_gzip_are_permanent_transport_failures() {
     encoder
         .write_all(&vec![0_u8; 1_048_577])
         .expect("expansion source");
-    let expansion =
-        AuthenticatedOtlpLogsRequest::gzip(attribution(), encoder.finish().expect("gzip finish"));
+    let expansion = AuthenticatedOtlpLogsRequest::test_only_gzip(
+        attribution(),
+        encoder.finish().expect("gzip finish"),
+    );
     assert_eq!(
         OtlpLogsReceiver::new()
             .decode(expansion)
@@ -55,7 +59,8 @@ fn malformed_and_expanding_gzip_are_permanent_transport_failures() {
 
 #[test]
 fn protobuf_bytes_are_bounded_before_decode() {
-    let request = AuthenticatedOtlpLogsRequest::new(attribution(), vec![0; 1_048_577]);
+    let request =
+        AuthenticatedOtlpLogsRequest::test_only_protobuf(attribution(), vec![0; 1_048_577]);
     assert_eq!(
         OtlpLogsReceiver::new()
             .decode(request)
@@ -67,7 +72,7 @@ fn protobuf_bytes_are_bounded_before_decode() {
 #[test]
 fn compressed_bytes_records_and_native_value_depth_have_independent_bounds() {
     let oversized_compressed =
-        AuthenticatedOtlpLogsRequest::gzip(attribution(), vec![0; 1_048_577]);
+        AuthenticatedOtlpLogsRequest::test_only_gzip(attribution(), vec![0; 1_048_577]);
     assert_eq!(
         OtlpLogsReceiver::new()
             .decode(oversized_compressed)
@@ -103,7 +108,38 @@ fn compressed_bytes_records_and_native_value_depth_have_independent_bounds() {
     );
 }
 
-fn proto_request(records: Vec<LogRecord>) -> AuthenticatedOtlpLogsRequest {
+#[test]
+fn decoded_record_bytes_accept_the_exact_limit_and_reject_one_byte_more() {
+    let exact = proto_request(vec![LogRecord {
+        body: Some(AnyValue {
+            value: Some(any_value::Value::BytesValue(vec![0; 524_288])),
+        }),
+        ..LogRecord::default()
+    }]);
+    assert_eq!(
+        OtlpLogsReceiver::new()
+            .decode(exact)
+            .expect("inclusive decoded-record boundary")
+            .records()
+            .len(),
+        1
+    );
+
+    let over = proto_request(vec![LogRecord {
+        body: Some(AnyValue {
+            value: Some(any_value::Value::BytesValue(vec![0; 524_289])),
+        }),
+        ..LogRecord::default()
+    }]);
+    assert_eq!(
+        OtlpLogsReceiver::new()
+            .decode(over)
+            .expect_err("exclusive decoded-record boundary"),
+        ReceiveFailure::ValueLimitExceeded
+    );
+}
+
+fn proto_request(records: Vec<LogRecord>) -> AuthenticatedOtlpLogsRequest<'static> {
     let request = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             scope_logs: vec![ScopeLogs {
@@ -113,5 +149,5 @@ fn proto_request(records: Vec<LogRecord>) -> AuthenticatedOtlpLogsRequest {
             ..ResourceLogs::default()
         }],
     };
-    AuthenticatedOtlpLogsRequest::new(attribution(), request.encode_to_vec())
+    AuthenticatedOtlpLogsRequest::test_only_protobuf(attribution(), request.encode_to_vec())
 }

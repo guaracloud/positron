@@ -579,9 +579,13 @@ name = "positron-ingest"
 version = "0.0.0"
 dependencies = [
  "flate2",
+ "opentelemetry",
  "opentelemetry-proto",
+ "opentelemetry_sdk",
  "positron-domain",
+ "positron-governance",
  "positron-kernel",
+ "positron-runtime",
  "positron-signals",
  "prost",
 ]
