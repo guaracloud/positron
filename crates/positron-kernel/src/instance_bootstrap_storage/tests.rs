@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    BootstrapArtifact, BootstrapStorageFailure, InstanceBootstrapStorage, MountQualification,
+    BootstrapArtifact, BootstrapKeyCustody, BootstrapStorageFailure, InstanceBootstrapStorage,
+    MountQualification,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -39,6 +40,14 @@ impl Roots {
 
     fn data(&self) -> PathBuf {
         self.parent.join("data")
+    }
+
+    fn secrets(&self) -> PathBuf {
+        self.parent.join("secrets")
+    }
+
+    fn replacement_secrets(&self) -> PathBuf {
+        self.parent.join("replacement-secrets")
     }
 }
 
@@ -75,6 +84,68 @@ fn initialized_publication_never_replaces_a_racing_final_marker() {
             .read(BootstrapArtifact::InitializedStaging)
             .expect("candidate remains resumable"),
         b"candidate"
+    );
+}
+
+#[test]
+fn held_inspection_opens_key_from_original_secrets_directory_after_path_swap() {
+    let roots = Roots::new();
+    let original = BootstrapKeyCustody::initialize(&roots.secrets()).expect("original key");
+    fs::create_dir(roots.replacement_secrets()).expect("replacement secrets root");
+    fs::set_permissions(
+        roots.replacement_secrets(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("owner-only replacement");
+    let replacement =
+        BootstrapKeyCustody::initialize(&roots.replacement_secrets()).expect("replacement key");
+    let replacement_bytes = fs::read(roots.replacement_secrets().join("local-root-key.v1"))
+        .expect("replacement key bytes");
+    let access = roots.storage().inspect().expect("inspect original roots");
+    let detached = roots.parent.join("detached-secrets");
+    fs::rename(roots.secrets(), &detached).expect("detach original secrets root");
+    fs::rename(roots.replacement_secrets(), roots.secrets()).expect("install replacement root");
+
+    let opened = access.open_key().expect("open through held directory");
+
+    assert_eq!(opened.identity(), original.identity());
+    assert_ne!(opened.identity(), replacement.identity());
+    assert_eq!(
+        fs::read(roots.secrets().join("local-root-key.v1")).expect("replacement preserved"),
+        replacement_bytes
+    );
+}
+
+#[test]
+fn held_acquisition_initializes_key_in_original_secrets_directory_after_path_swap() {
+    let roots = Roots::new();
+    let storage = roots.storage();
+    let (_volume, access) = storage.acquire().expect("acquire original roots");
+    fs::create_dir(roots.replacement_secrets()).expect("replacement secrets root");
+    fs::set_permissions(
+        roots.replacement_secrets(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("owner-only replacement");
+    BootstrapKeyCustody::initialize(&roots.replacement_secrets()).expect("replacement key");
+    let replacement_bytes = fs::read(roots.replacement_secrets().join("local-root-key.v1"))
+        .expect("replacement key bytes");
+    let detached = roots.parent.join("detached-secrets");
+    fs::rename(roots.secrets(), &detached).expect("detach original secrets root");
+    fs::rename(roots.replacement_secrets(), roots.secrets()).expect("install replacement root");
+
+    let initialized = access
+        .initialize_key()
+        .expect("initialize through held directory");
+
+    assert_eq!(
+        access.open_key().expect("reopen original key").identity(),
+        initialized.identity()
+    );
+    assert!(detached.join("local-root-key.v1").is_file());
+    assert_eq!(
+        fs::read(roots.secrets().join("local-root-key.v1")).expect("replacement preserved"),
+        replacement_bytes
     );
 }
 

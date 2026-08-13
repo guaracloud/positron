@@ -24,11 +24,11 @@ use support::{
 
 pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
     let access = paths.storage.inspect().map_err(storage::storage_failure)?;
-    let state = storage::classify_with(paths, &access)?;
+    let state = storage::classify_with(&access)?;
     if state != BootstrapState::Initialized {
         return Ok(state);
     }
-    match validate_initialized(paths, &access) {
+    match validate_initialized(&access) {
         Ok(()) => Ok(BootstrapState::Initialized),
         Err(failure)
             if matches!(
@@ -42,14 +42,11 @@ pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, Bootstr
     }
 }
 
-fn validate_initialized(
-    paths: &BootstrapPaths,
-    access: &BootstrapArtifactAccess,
-) -> Result<(), BootstrapFailure> {
-    if storage::classify_with(paths, access)? != BootstrapState::Initialized {
+fn validate_initialized(access: &BootstrapArtifactAccess) -> Result<(), BootstrapFailure> {
+    if storage::classify_with(access)? != BootstrapState::Initialized {
         return Err(inconsistent());
     }
-    let key = paths.storage.open_key().map_err(key_failure)?;
+    let key = access.open_key().map_err(key_failure)?;
     let encoded = storage::read(access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
     require_key_identity(&record, key.identity())?;
@@ -101,9 +98,9 @@ fn resume(
         .map_err(storage::storage_failure)?
         .contains(positron_kernel::BootstrapEntry::LocalKey)
     {
-        paths.storage.open_key().map_err(key_failure)?
+        access.open_key().map_err(key_failure)?
     } else {
-        paths.storage.initialize_key().map_err(key_failure)?
+        access.initialize_key().map_err(key_failure)?
     };
     let pending_bytes = storage::read(&access, BootstrapArtifact::Pending)?;
     let record = if pending_bytes == INTENT {
@@ -214,10 +211,10 @@ fn resume(
 
 pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, BootstrapFailure> {
     let (volume, access) = acquire(paths)?;
-    if storage::classify_with(paths, &access)? != BootstrapState::Initialized {
+    if storage::classify_with(&access)? != BootstrapState::Initialized {
         return Err(inconsistent());
     }
-    let key = paths.storage.open_key().map_err(key_failure)?;
+    let key = access.open_key().map_err(key_failure)?;
     let encoded = storage::read(&access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
     require_key_identity(&record, key.identity())?;
@@ -242,14 +239,14 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
 
 pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapFailure> {
     let (_volume, access) = acquire(paths)?;
-    if storage::classify_with(paths, &access)? != BootstrapState::Initialized
+    if storage::classify_with(&access)? != BootstrapState::Initialized
         || !storage::exists(&access, BootstrapArtifact::Claim)?
     {
         return Err(BootstrapFailure::new(
             BootstrapFailureCode::ClaimUnavailable,
         ));
     }
-    let key = paths.storage.open_key().map_err(key_failure)?;
+    let key = access.open_key().map_err(key_failure)?;
     let initialized = storage::read(&access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &initialized)?;
     let encrypted_claim = storage::read(&access, BootstrapArtifact::Claim)?;

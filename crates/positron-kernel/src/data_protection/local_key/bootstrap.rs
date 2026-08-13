@@ -2,7 +2,6 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
 
 use std::os::unix::fs::MetadataExt;
 
@@ -11,66 +10,11 @@ use zeroize::Zeroize;
 
 use super::acl::{verify_directory_acl, verify_file_acl};
 use super::codec::{EncodedLocalKeyFile, SecretRootKey, encode_file_v1, parse_file_v1};
+pub(super) use super::security_directory::FreshInitializationRootProof;
 use super::{
     LOCAL_KEY_FILE_NAME, LOCAL_KEY_STAGING_FILE_NAME, LocalKeyCreationTime, LocalKeyFailure,
     LocalKeyFailureCode, LocalKeyId, VerifiedLocalKey, initialization_io,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LocalObjectIdentity {
-    device: u64,
-    inode: u64,
-}
-
-pub(super) struct FreshInitializationRootProof {
-    location: PathBuf,
-    expected_owner: u32,
-    expected_link_count: u64,
-    identity: LocalObjectIdentity,
-}
-
-impl FreshInitializationRootProof {
-    pub(super) fn new(location: &Path) -> Result<Self, LocalKeyFailure> {
-        let canonical = std::fs::canonicalize(location)
-            .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
-        validate_absolute_normalized_location(&canonical)?;
-        let metadata = std::fs::symlink_metadata(&canonical)
-            .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
-        if !metadata.file_type().is_dir() {
-            return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation));
-        }
-        let known = std::fs::read_dir(&canonical)
-            .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?
-            .all(|entry| {
-                entry
-                    .ok()
-                    .and_then(|entry| entry.file_name().into_string().ok())
-                    .is_some_and(|name| {
-                        matches!(
-                            name.as_str(),
-                            LOCAL_KEY_FILE_NAME | LOCAL_KEY_STAGING_FILE_NAME
-                        )
-                    })
-            });
-        if !known {
-            return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation));
-        }
-        Ok(Self {
-            location: canonical,
-            expected_owner: metadata.uid(),
-            expected_link_count: metadata.nlink(),
-            identity: LocalObjectIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            },
-        })
-    }
-
-    #[cfg(test)]
-    pub(super) fn for_test(location: &Path) -> Result<Self, LocalKeyFailure> {
-        Self::new(location)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LocalKeyInitializationEvent {
@@ -84,28 +28,28 @@ pub(super) fn initialize_local_key(
     proof: FreshInitializationRootProof,
 ) -> Result<VerifiedLocalKey, LocalKeyFailure> {
     initialization_event(LocalKeyInitializationEvent::OpenSecurityDirectory);
-    let directory = open_absolute_directory(&proof.location)?;
-    verify_security_directory(&directory, &proof)?;
+    proof.verify()?;
+    let directory = proof.directory();
     initialization_event(LocalKeyInitializationEvent::InspectSecurityDirectoryAcl);
-    verify_directory_acl(&directory)?;
+    verify_directory_acl(directory)?;
 
-    if exists(&directory, LOCAL_KEY_FILE_NAME)? {
-        initialization_io::synchronize_security_directory(&directory).map_err(|_| {
+    if exists(directory, LOCAL_KEY_FILE_NAME)? {
+        initialization_io::synchronize_security_directory(directory).map_err(|_| {
             LocalKeyFailure::new(LocalKeyFailureCode::SynchronizeSecurityDirectoryFailed)
         })?;
-        return super::persistence::open_existing_local_key(&proof.location);
+        return super::persistence::open_existing_local_key_in(directory);
     }
-    if exists(&directory, LOCAL_KEY_STAGING_FILE_NAME)? {
-        if let Ok(staged) = read_staged_key(&directory, proof.expected_owner) {
-            publish_staged_key(&directory)?;
+    if exists(directory, LOCAL_KEY_STAGING_FILE_NAME)? {
+        if let Ok(staged) = read_staged_key(directory, proof.expected_owner()) {
+            publish_staged_key(directory)?;
             return Ok(staged);
         }
-        remove_staged_key(&directory, proof.expected_owner)?;
+        remove_staged_key(directory, proof.expected_owner())?;
     }
 
     initialization_event(LocalKeyInitializationEvent::CreateFinalKeyFile);
     let mut file = unix_fs::openat(
-        &directory,
+        directory,
         LOCAL_KEY_STAGING_FILE_NAME,
         OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
@@ -119,9 +63,9 @@ pub(super) fn initialize_local_key(
         }
     })?;
     verify_named_key_file(
-        &directory,
+        directory,
         &file,
-        proof.expected_owner,
+        proof.expected_owner(),
         LOCAL_KEY_STAGING_FILE_NAME,
     )?;
     verify_file_acl(&file)?;
@@ -151,15 +95,15 @@ pub(super) fn initialize_local_key(
     initialization_io::synchronize_key_file(&file)
         .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::SynchronizeKeyFileFailed))?;
     verify_named_key_file(
-        &directory,
+        directory,
         &file,
-        proof.expected_owner,
+        proof.expected_owner(),
         LOCAL_KEY_STAGING_FILE_NAME,
     )?;
     verify_file_acl(&file)?;
     let verified = parse_file_v1(encoded)?;
     drop(file);
-    publish_staged_key(&directory)?;
+    publish_staged_key(directory)?;
     Ok(verified)
 }
 
@@ -236,67 +180,6 @@ fn publish_staged_key(directory: &File) -> Result<(), LocalKeyFailure> {
     .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::KeyAlreadyExists))?;
     initialization_io::synchronize_security_directory(directory)
         .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::SynchronizeSecurityDirectoryFailed))
-}
-
-fn validate_absolute_normalized_location(location: &Path) -> Result<(), LocalKeyFailure> {
-    if !location.is_absolute() {
-        return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation));
-    }
-    if location
-        .components()
-        .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
-    {
-        Ok(())
-    } else {
-        Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))
-    }
-}
-
-pub(super) fn open_absolute_directory(location: &Path) -> Result<File, LocalKeyFailure> {
-    validate_absolute_normalized_location(location)?;
-    let mut current =
-        File::open("/").map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
-    for component in location.components() {
-        match component {
-            Component::RootDir => {},
-            Component::Normal(name) => {
-                current = unix_fs::openat(
-                    &current,
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map(File::from)
-                .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation))?;
-            },
-            _ => return Err(LocalKeyFailure::new(LocalKeyFailureCode::InvalidLocation)),
-        }
-    }
-    Ok(current)
-}
-
-fn verify_security_directory(
-    directory: &File,
-    proof: &FreshInitializationRootProof,
-) -> Result<(), LocalKeyFailure> {
-    let metadata = directory
-        .metadata()
-        .map_err(|_| LocalKeyFailure::new(LocalKeyFailureCode::UnsafeSecurityDirectory))?;
-    let safe = metadata.file_type().is_dir()
-        && metadata.uid() == proof.expected_owner
-        && metadata.mode() & 0o7777 == 0o700
-        && metadata.nlink() == proof.expected_link_count
-        && LocalObjectIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        } == proof.identity;
-    if safe {
-        Ok(())
-    } else {
-        Err(LocalKeyFailure::new(
-            LocalKeyFailureCode::UnsafeSecurityDirectory,
-        ))
-    }
 }
 
 pub(super) fn verify_key_file(

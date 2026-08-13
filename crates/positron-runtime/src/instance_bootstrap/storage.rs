@@ -54,11 +54,10 @@ fn event(event: BootstrapFileEvent) -> Result<(), BootstrapFailure> {
 
 pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
     let access = paths.storage.inspect().map_err(storage_failure)?;
-    classify_with(paths, &access)
+    classify_with(&access)
 }
 
 pub(super) fn classify_with(
-    paths: &BootstrapPaths,
     access: &BootstrapArtifactAccess,
 ) -> Result<BootstrapState, BootstrapFailure> {
     let layout = access.layout().map_err(storage_failure)?;
@@ -81,7 +80,6 @@ pub(super) fn classify_with(
         return Ok(
             if required_storage
                 && authenticated_record(
-                    paths,
                     access,
                     BootstrapArtifact::Initialized,
                     BootstrapObjectPurpose::Initialized,
@@ -106,14 +104,12 @@ pub(super) fn classify_with(
         }
         let pending_valid = !layout.contains(BootstrapEntry::Pending)
             || authenticated_record(
-                paths,
                 access,
                 BootstrapArtifact::Pending,
                 BootstrapObjectPurpose::Pending,
             );
         let staged_valid = !layout.contains(BootstrapEntry::InitializedStaging)
             || authenticated_record(
-                paths,
                 access,
                 BootstrapArtifact::InitializedStaging,
                 BootstrapObjectPurpose::Initialized,
@@ -128,12 +124,11 @@ pub(super) fn classify_with(
 }
 
 fn authenticated_record(
-    paths: &BootstrapPaths,
     access: &BootstrapArtifactAccess,
     artifact: BootstrapArtifact,
     purpose: BootstrapObjectPurpose,
 ) -> bool {
-    let Ok(key) = paths.storage.open_key() else {
+    let Ok(key) = access.open_key() else {
         return false;
     };
     let Ok(encoded) = access.read(artifact) else {

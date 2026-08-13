@@ -9,6 +9,7 @@ mod codec;
 mod initialization_io;
 mod persistence;
 mod runtime_bootstrap;
+mod security_directory;
 
 #[cfg(test)]
 mod acl_tests;

@@ -180,16 +180,6 @@ impl InstanceBootstrapStorage {
         Ok((volume, BootstrapArtifactAccess { data, secrets }))
     }
 
-    /// Opens the local bootstrap key without revealing its location.
-    pub fn open_key(&self) -> Result<BootstrapKeyCustody, BootstrapKeyFailure> {
-        BootstrapKeyCustody::open(&self.secrets)
-    }
-
-    /// Initializes the local bootstrap key without revealing its location.
-    pub fn initialize_key(&self) -> Result<BootstrapKeyCustody, BootstrapKeyFailure> {
-        BootstrapKeyCustody::initialize(&self.secrets)
-    }
-
     /// Returns the trusted mount provenance attached to this authority.
     #[must_use]
     pub const fn qualification(&self) -> MountQualification {
@@ -204,6 +194,16 @@ pub struct BootstrapArtifactAccess {
 }
 
 impl BootstrapArtifactAccess {
+    /// Opens the local bootstrap key relative to the held secrets root.
+    pub fn open_key(&self) -> Result<BootstrapKeyCustody, BootstrapKeyFailure> {
+        BootstrapKeyCustody::open_in(&self.secrets)
+    }
+
+    /// Initializes the local bootstrap key relative to the held secrets root.
+    pub fn initialize_key(&self) -> Result<BootstrapKeyCustody, BootstrapKeyFailure> {
+        BootstrapKeyCustody::initialize_in(&self.secrets)
+    }
+
     /// Scans recognized root entries and rejects unsafe entry kinds.
     pub fn layout(&self) -> Result<BootstrapLayout, BootstrapStorageFailure> {
         let (mut data, data_unsafe) = scan(&self.data, BootstrapRoot::Data)?;

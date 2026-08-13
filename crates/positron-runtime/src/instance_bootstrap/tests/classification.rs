@@ -236,7 +236,11 @@ fn pending_authentication_fails_closed_at_key_file_and_envelope_boundaries()
                 b"invalid-key",
             )?;
         } else {
-            paths.storage.initialize_key()?;
+            paths
+                .storage
+                .inspect()
+                .map_err(|failure| format!("{failure:?}"))?
+                .initialize_key()?;
         }
         fs::write(
             paths.data_root().join(".positron-bootstrap.pending"),

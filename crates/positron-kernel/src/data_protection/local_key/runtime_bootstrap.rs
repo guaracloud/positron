@@ -11,8 +11,9 @@ use crate::data_protection::{
 use crate::{SegmentProtectionKey, SegmentScope};
 use positron_domain::identity::TenantId;
 
-use super::bootstrap::{FreshInitializationRootProof, initialize_local_key};
+use super::bootstrap::initialize_local_key;
 use super::persistence::open_existing_local_key;
+use super::security_directory::FreshInitializationRootProof;
 use super::{LocalKeyFailure, VerifiedLocalKey};
 
 const ENVELOPE_MAGIC: [u8; 8] = *b"POSBOOT1";
@@ -20,6 +21,7 @@ const ENVELOPE_BYTES_LIMIT: u32 = 1_048_960;
 const ENVELOPE_HEADER_BYTES: usize = 49;
 
 mod derivation;
+mod directory;
 use derivation::{derive_child, object_context, tenant_object_id, wrapped_context};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
