@@ -1,7 +1,17 @@
-//! @positron-scaffold-only
-//! Native Log and Trace Signal Store scaffold.
+//! Native signal stores.
 //!
-//! No store seam, physical layout, index, summary, or compaction behavior is
-//! implemented. Deferred signals have no scaffold or feature flag.
+//! The Log Store owns canonical native-log encoding and bounded scans over the
+//! kernel's authenticated active-segment ledger. Trace storage is deferred.
 
 #![forbid(unsafe_code)]
+
+mod log_store;
+
+pub use log_store::{
+    AttributeRepresentation, LogRecord, LogScan, LogScanResult, LogStore, LogStoreFailure,
+    LogStoreFailureCode, PolicyProvenance, PreparedLogBlock, ScanLimit, StoredLogAttribute,
+};
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use log_store::fuzz_log_store_block;

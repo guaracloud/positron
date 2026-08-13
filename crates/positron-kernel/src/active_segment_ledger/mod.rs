@@ -362,6 +362,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         Ok(LedgerSnapshot {
             _capacity: reservation,
+            scope: self.scope,
             frontier: state.frontier,
             blocks: state.blocks.clone(),
         })

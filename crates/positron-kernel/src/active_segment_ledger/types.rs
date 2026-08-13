@@ -250,11 +250,18 @@ impl CommittedBlock {
 /// A verified immutable view bounded by the published Durability Frontier.
 pub struct LedgerSnapshot<'kernel> {
     pub(super) _capacity: ResourceReservation<'kernel>,
+    pub(super) scope: SegmentScope,
     pub(super) frontier: CommitPosition,
     pub(super) blocks: Vec<CommittedBlock>,
 }
 
 impl LedgerSnapshot<'_> {
+    /// Returns the authenticated physical tenant, signal, and shard scope.
+    #[must_use]
+    pub const fn scope(&self) -> SegmentScope {
+        self.scope
+    }
+
     #[must_use]
     pub const fn frontier(&self) -> CommitPosition {
         self.frontier

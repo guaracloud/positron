@@ -428,6 +428,10 @@ dependencies = [
 [[package]]
 name = "positron-signals"
 version = "0.0.0"
+dependencies = [
+ "positron-domain",
+ "positron-kernel",
+]
 
 [[package]]
 name = "positron-upgrade"

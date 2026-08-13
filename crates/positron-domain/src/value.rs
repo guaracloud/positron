@@ -692,6 +692,21 @@ impl ValidatedAttributeValue {
         }
     }
 
+    /// Returns one ordered array entry by explicit optional index.
+    #[must_use]
+    pub fn array_entry(&self, index: usize) -> Option<&ValidatedAttributeValue> {
+        match &self.inner {
+            ValidatedAttributeValueInner::Array(values) => values.get(index),
+            ValidatedAttributeValueInner::Null
+            | ValidatedAttributeValueInner::Boolean(_)
+            | ValidatedAttributeValueInner::SignedInteger(_)
+            | ValidatedAttributeValueInner::FloatingPointBits(_)
+            | ValidatedAttributeValueInner::String(_)
+            | ValidatedAttributeValueInner::Bytes(_)
+            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+        }
+    }
+
     /// Returns the finite entry count only when this value is a validated key/value list.
     #[must_use]
     pub fn key_value_list_len(&self) -> Option<usize> {

@@ -364,6 +364,7 @@ dependencies = [
  "positron-governance",
  "positron-kernel",
  "positron-runtime",
+ "positron-signals",
 ]
 
 [[package]]
@@ -401,6 +402,14 @@ dependencies = [
  "positron-governance",
  "positron-kernel",
  "zeroize",
+]
+
+[[package]]
+name = "positron-signals"
+version = "0.0.0"
+dependencies = [
+ "positron-domain",
+ "positron-kernel",
 ]
 
 [[package]]
