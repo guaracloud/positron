@@ -32,10 +32,10 @@ pub(crate) fn query_record(
     ))
 }
 
-pub(crate) fn charge(
+pub(crate) fn charge_scan(
     state: &mut CursorState,
     result: &positron_signals::LogScanResult<'_>,
-    page: &[QueryRecord],
+    cpu_work_units: u64,
 ) -> Result<(), QueryFailure> {
     state.scanned_bytes = state
         .scanned_bytes
@@ -48,6 +48,28 @@ pub(crate) fn charge(
                 .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
         )
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+    state.cpu_work_units = state
+        .cpu_work_units
+        .checked_add(cpu_work_units)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+    Ok(())
+}
+
+pub(crate) fn charge_work(
+    state: &mut CursorState,
+    cpu_work_units: u64,
+) -> Result<(), QueryFailure> {
+    state.cpu_work_units = state
+        .cpu_work_units
+        .checked_add(cpu_work_units)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+    Ok(())
+}
+
+pub(crate) fn charge_output(
+    state: &mut CursorState,
+    page: &[QueryRecord],
+) -> Result<(), QueryFailure> {
     state.output_rows = state
         .output_rows
         .checked_add(
@@ -70,6 +92,8 @@ pub(crate) fn exhausted(state: &CursorState) -> bool {
         || state.decoded_records > state.budget.decoded_records()
         || state.output_rows > state.budget.output_rows()
         || state.output_bytes > state.budget.output_bytes()
+        || state.cpu_work_units > state.budget.cpu_work_units()
+        || state.elapsed_wall_seconds >= state.budget.wall_seconds()
 }
 
 pub(crate) fn batch_digest(

@@ -74,6 +74,9 @@ pub struct PlannedQuery<'kernel> {
     pub(crate) plan: LogicalPlan,
     pub(crate) budget: QueryBudget,
     pub(crate) _reservation: ResourceReservation<'kernel>,
+    pub(crate) started_at: u64,
+    pub(crate) last_observed_at: u64,
+    pub(crate) cpu_work_units: u64,
 }
 
 impl PlannedQuery<'_> {

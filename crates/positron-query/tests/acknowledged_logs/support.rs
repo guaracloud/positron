@@ -1,6 +1,9 @@
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_domain::identity::TenantId;
@@ -16,6 +19,112 @@ use positron_kernel::{
     TenantQuota, WorkClaim, WorkKind,
 };
 use positron_signals::{LogRecord, LogStore, PolicyProvenance};
+
+pub struct TestClock(AtomicU64);
+
+impl TestClock {
+    pub fn shared(now: u64) -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(now)))
+    }
+
+    pub fn set(&self, now: u64) {
+        self.0.store(now, Ordering::SeqCst);
+    }
+}
+
+pub struct StepClock(AtomicU64);
+
+impl StepClock {
+    pub fn shared(now: u64) -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(now)))
+    }
+}
+
+pub struct TestWorkMeter;
+
+impl positron_query::QueryWorkMeter for TestWorkMeter {
+    fn units(
+        &self,
+        _stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(1)
+    }
+}
+
+pub struct FailingClock;
+
+impl positron_query::QueryClock for FailingClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        Err(positron_query::QueryClockFailure)
+    }
+}
+
+pub struct FailingWorkMeter;
+
+impl positron_query::QueryWorkMeter for FailingWorkMeter {
+    fn units(
+        &self,
+        _stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Err(positron_query::QueryWorkFailure)
+    }
+}
+
+pub struct SequenceClock(Mutex<VecDeque<u64>>);
+
+impl SequenceClock {
+    pub fn shared(values: impl IntoIterator<Item = u64>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(values.into_iter().collect())))
+    }
+}
+
+impl positron_query::QueryClock for SequenceClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        self.0
+            .lock()
+            .map_err(|_| positron_query::QueryClockFailure)?
+            .pop_front()
+            .ok_or(positron_query::QueryClockFailure)
+    }
+}
+
+pub struct FailingStageWorkMeter(pub positron_query::QueryWorkStage);
+
+impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage == self.0 {
+            Err(positron_query::QueryWorkFailure)
+        } else {
+            Ok(1)
+        }
+    }
+}
+
+pub struct ConstantWorkMeter(pub u64);
+
+impl positron_query::QueryWorkMeter for ConstantWorkMeter {
+    fn units(
+        &self,
+        _stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(self.0)
+    }
+}
+
+impl positron_query::QueryClock for StepClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        Ok(self.0.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl positron_query::QueryClock for TestClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        Ok(self.0.load(Ordering::SeqCst))
+    }
+}
 
 const DIMENSIONS: usize = 11;
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);

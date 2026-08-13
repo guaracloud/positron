@@ -201,20 +201,36 @@ impl QueryBatch {
 pub struct QueryStats {
     records: u64,
     scanned_bytes: u64,
+    decoded_records: u64,
+    output_bytes: u64,
+    cpu_work_units: u64,
+    wall_seconds: u64,
     last_sequence: Option<u64>,
     result_digest: [u8; 32],
 }
 
+pub(crate) struct QueryCounters {
+    pub(crate) records: u64,
+    pub(crate) scanned_bytes: u64,
+    pub(crate) decoded_records: u64,
+    pub(crate) output_bytes: u64,
+    pub(crate) cpu_work_units: u64,
+    pub(crate) wall_seconds: u64,
+}
+
 impl QueryStats {
     pub(crate) const fn new(
-        records: u64,
-        scanned_bytes: u64,
+        counters: QueryCounters,
         last_sequence: Option<u64>,
         result_digest: [u8; 32],
     ) -> Self {
         Self {
-            records,
-            scanned_bytes,
+            records: counters.records,
+            scanned_bytes: counters.scanned_bytes,
+            decoded_records: counters.decoded_records,
+            output_bytes: counters.output_bytes,
+            cpu_work_units: counters.cpu_work_units,
+            wall_seconds: counters.wall_seconds,
             last_sequence,
             result_digest,
         }
@@ -226,6 +242,22 @@ impl QueryStats {
     #[must_use]
     pub const fn scanned_bytes(self) -> u64 {
         self.scanned_bytes
+    }
+    #[must_use]
+    pub const fn decoded_records(self) -> u64 {
+        self.decoded_records
+    }
+    #[must_use]
+    pub const fn output_bytes(self) -> u64 {
+        self.output_bytes
+    }
+    #[must_use]
+    pub const fn cpu_work_units(self) -> u64 {
+        self.cpu_work_units
+    }
+    #[must_use]
+    pub const fn wall_seconds(self) -> u64 {
+        self.wall_seconds
     }
     #[must_use]
     pub const fn last_sequence(self) -> Option<u64> {
@@ -277,6 +309,10 @@ pub struct QueryStream<'lease> {
     events: std::vec::IntoIter<QueryEvent>,
     terminal_observed: bool,
     release: Option<LeaseRelease<'lease>>,
+    retain_for_resume: bool,
+    resumable_delivery_observed: bool,
+    observed_stats: QueryStats,
+    batch_stats: QueryStats,
 }
 
 impl std::fmt::Debug for QueryStream<'_> {
@@ -286,25 +322,35 @@ impl std::fmt::Debug for QueryStream<'_> {
 }
 
 impl<'lease> QueryStream<'lease> {
-    pub(crate) fn new(events: Vec<QueryEvent>, release: LeaseRelease<'lease>) -> Self {
+    pub(crate) fn new(
+        events: Vec<QueryEvent>,
+        release: Option<LeaseRelease<'lease>>,
+        retain_for_resume: bool,
+        observed_stats: QueryStats,
+        batch_stats: QueryStats,
+    ) -> Self {
         Self {
             events: events.into_iter(),
             terminal_observed: false,
-            release: Some(release),
+            release,
+            retain_for_resume,
+            resumable_delivery_observed: false,
+            observed_stats,
+            batch_stats,
         }
     }
     pub fn cancel(&mut self) -> Result<(), QueryFailure> {
+        if let Some(release) = self.release.take() {
+            release()?;
+        }
         if self.terminal_observed {
             self.events = Vec::new().into_iter();
             return Ok(());
         }
-        if let Some(release) = self.release.take() {
-            release()?;
-        }
         self.events = vec![QueryEvent::Terminal(QueryTerminal::Incomplete(
             QueryIncomplete::new(
                 QueryFailure::new(QueryFailureCode::Cancelled),
-                QueryStats::new(0, 0, None, [0; 32]),
+                self.observed_stats,
             ),
         ))]
         .into_iter();
@@ -316,9 +362,31 @@ impl Iterator for QueryStream<'_> {
     type Item = QueryEvent;
     fn next(&mut self) -> Option<Self::Item> {
         let event = self.events.next();
+        if matches!(
+            event.as_ref(),
+            Some(QueryEvent::Header(header)) if header.initial_cursor().is_some()
+        ) || matches!(
+            event.as_ref(),
+            Some(QueryEvent::Terminal(QueryTerminal::Continued(_)))
+        ) {
+            self.resumable_delivery_observed = true;
+        }
+        if matches!(event, Some(QueryEvent::Batch(_))) {
+            self.observed_stats = self.batch_stats;
+        }
         if matches!(event, Some(QueryEvent::Terminal(_))) {
             self.terminal_observed = true;
         }
         event
+    }
+}
+
+impl Drop for QueryStream<'_> {
+    fn drop(&mut self) {
+        if !(self.retain_for_resume && self.resumable_delivery_observed)
+            && let Some(release) = self.release.take()
+        {
+            let _ = release();
+        }
     }
 }

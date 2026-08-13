@@ -8,6 +8,7 @@ pub struct QueryBudget {
     output_rows: u64,
     output_bytes: u64,
     memory_bytes: u64,
+    cpu_work_units: u64,
     wall_seconds: u64,
     maximum_time_range_nanoseconds: u64,
 }
@@ -43,9 +44,18 @@ impl QueryBudget {
             output_rows,
             output_bytes,
             memory_bytes,
+            cpu_work_units: 6,
             wall_seconds,
             maximum_time_range_nanoseconds: DEFAULT_MAXIMUM_TIME_RANGE_NANOSECONDS,
         })
+    }
+
+    pub fn with_cpu_work_units(mut self, maximum: u64) -> Result<Self, QueryFailure> {
+        if maximum == 0 || maximum > 1_024 {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
+        }
+        self.cpu_work_units = maximum;
+        Ok(self)
     }
 
     pub fn with_maximum_time_range_nanoseconds(
@@ -82,6 +92,11 @@ impl QueryBudget {
 
     pub(crate) const fn wall_seconds(self) -> u64 {
         self.wall_seconds
+    }
+
+    #[must_use]
+    pub const fn cpu_work_units(self) -> u64 {
+        self.cpu_work_units
     }
 
     pub(crate) const fn maximum_time_range_nanoseconds(self) -> u64 {

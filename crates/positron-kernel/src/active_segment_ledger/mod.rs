@@ -110,7 +110,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
-        let lease_reservations = snapshot_lease::recover_reservations(authority, scope, &snapshot)?;
+        let recovered_leases = snapshot_lease::recover_reservations(authority, scope, &snapshot)?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
         let mut segments = metadata.iter().copied().peekable();
         let mut blocks = Vec::new();
@@ -203,7 +203,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 retained_bytes,
                 next_sequence: 0,
                 poisoned: false,
-                lease_reservations,
+                lease_reservations: recovered_leases.reservations,
+                last_snapshot_lease_time: recovered_leases.last_observed,
             }),
         })
     }

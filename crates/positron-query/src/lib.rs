@@ -5,9 +5,11 @@
 mod budget;
 mod cursor;
 mod execution;
+mod execution_state;
 mod execution_support;
 mod failure;
 mod plan;
+mod runtime;
 mod service;
 mod stream;
 
@@ -15,6 +17,9 @@ pub use budget::QueryBudget;
 pub use cursor::QueryCursor;
 pub use failure::{QueryFailure, QueryFailureCode};
 pub use plan::{LogicalPlan, PlannedQuery, TemporalAxis, TemporalRange};
+pub use runtime::{
+    QueryClock, QueryClockFailure, QueryWorkFailure, QueryWorkMeter, QueryWorkStage,
+};
 pub use service::QueryService;
 pub use stream::{
     QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryStream,

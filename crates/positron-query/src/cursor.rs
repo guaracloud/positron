@@ -7,7 +7,9 @@ use crate::{
 
 const MAGIC: [u8; 8] = *b"POSQCR01";
 const CURSOR_PURPOSE: &[u8] = b"query-cursor-v1";
-const PAYLOAD_BYTES: usize = 309;
+const V1_PAYLOAD_BYTES: usize = 309;
+const PAYLOAD_BYTES: usize = 341;
+const V1_CURSOR_BYTES: usize = V1_PAYLOAD_BYTES + 32;
 const CURSOR_BYTES: usize = PAYLOAD_BYTES + 32;
 
 /// Opaque authenticated continuation with one fixed bounded representation.
@@ -16,7 +18,7 @@ pub struct QueryCursor(Vec<u8>);
 
 impl QueryCursor {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueryFailure> {
-        if bytes.len() != CURSOR_BYTES {
+        if !matches!(bytes.len(), V1_CURSOR_BYTES | CURSOR_BYTES) {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
         Ok(Self(bytes.to_vec()))
@@ -53,6 +55,10 @@ pub(crate) struct CursorState {
     pub(crate) decoded_records: u64,
     pub(crate) output_rows: u64,
     pub(crate) output_bytes: u64,
+    pub(crate) started_at: u64,
+    pub(crate) last_observed_at: u64,
+    pub(crate) cpu_work_units: u64,
+    pub(crate) elapsed_wall_seconds: u64,
 }
 
 pub(crate) fn encode(
@@ -94,12 +100,16 @@ pub(crate) fn encode(
         state.budget.output_rows(),
         state.budget.output_bytes(),
         state.budget.memory_bytes(),
+        state.budget.cpu_work_units(),
         state.budget.wall_seconds(),
         state.budget.maximum_time_range_nanoseconds(),
         state.scanned_bytes,
         state.decoded_records,
         state.output_rows,
         state.output_bytes,
+        state.started_at,
+        state.last_observed_at,
+        state.cpu_work_units,
     ] {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
@@ -121,9 +131,10 @@ pub(crate) fn decode(
     protector: &ControlTokenProtector<'_>,
     cursor: &QueryCursor,
 ) -> Result<CursorState, QueryFailure> {
+    let payload_bytes = cursor.as_bytes().len().saturating_sub(32);
     let (payload, authentication) = cursor
         .as_bytes()
-        .split_at_checked(PAYLOAD_BYTES)
+        .split_at_checked(payload_bytes)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let epoch = payload
         .get(8..16)
@@ -166,16 +177,41 @@ pub(crate) fn decode(
     let prior_digest = reader.array()?;
     let lease_identity = reader.array()?;
     let expiry = reader.u64()?;
+    let scanned_budget = reader.u64()?;
+    let decoded_budget = reader.u64()?;
+    let output_rows_budget = reader.u64()?;
+    let output_bytes_budget = reader.u64()?;
+    let memory_budget = reader.u64()?;
+    let (cpu_work_units, wall_budget) = if payload_bytes == V1_PAYLOAD_BYTES {
+        (None, reader.u64()?)
+    } else {
+        (Some(reader.u64()?), reader.u64()?)
+    };
     let budget = QueryBudget::new(
-        reader.u64()?,
-        reader.u64()?,
-        reader.u64()?,
-        reader.u64()?,
-        reader.u64()?,
-        reader.u64()?,
+        scanned_budget,
+        decoded_budget,
+        output_rows_budget,
+        output_bytes_budget,
+        memory_budget,
+        wall_budget,
     )
+    .and_then(|budget| match cpu_work_units {
+        Some(cpu) => budget.with_cpu_work_units(cpu),
+        None => Ok(budget),
+    })
     .and_then(|budget| budget.with_maximum_time_range_nanoseconds(reader.u64()?))
     .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let scanned_bytes = reader.u64()?;
+    let decoded_records = reader.u64()?;
+    let output_rows = reader.u64()?;
+    let output_bytes = reader.u64()?;
+    let (started_at, last_observed_at, actual_cpu_work_units) = if payload_bytes == V1_PAYLOAD_BYTES
+    {
+        let started = expiry.saturating_sub(budget.wall_seconds());
+        (started, started, 0)
+    } else {
+        (reader.u64()?, reader.u64()?, reader.u64()?)
+    };
     let state = CursorState {
         principal,
         tenant,
@@ -190,10 +226,14 @@ pub(crate) fn decode(
         lease_identity,
         expiry,
         budget,
-        scanned_bytes: reader.u64()?,
-        decoded_records: reader.u64()?,
-        output_rows: reader.u64()?,
-        output_bytes: reader.u64()?,
+        scanned_bytes,
+        decoded_records,
+        output_rows,
+        output_bytes,
+        started_at,
+        last_observed_at,
+        cpu_work_units: actual_cpu_work_units,
+        elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
     };
     if !reader.empty()
         || state.plan.limit() == 0

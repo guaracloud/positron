@@ -7,7 +7,7 @@ use positron_query::{
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
-use super::support::{KernelFixture, TemporaryRoots};
+use super::support::{KernelFixture, TemporaryRoots, TestClock};
 
 #[test]
 fn cancellation_replaces_unsent_events_with_one_non_complete_terminal() -> Result<(), Box<dyn Error>>
@@ -99,13 +99,18 @@ fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Resul
     )?;
     assert_eq!(
         service
-            .execute_page(query, 1)
+            .execute_page(query)
             .expect_err("zero batch limit")
             .code(),
         QueryFailureCode::InvalidBudget
     );
 
-    let service = fixture.service(1)?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(u64::MAX),
+    );
     let query = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 1",
@@ -113,7 +118,7 @@ fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Resul
     )?;
     assert_eq!(
         service
-            .execute_page(query, u64::MAX)
+            .execute_page(query)
             .expect_err("lease expiry overflow")
             .code(),
         QueryFailureCode::InvalidBudget
@@ -171,6 +176,20 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
             .code(),
         QueryFailureCode::InvalidBudget
     );
+    assert_eq!(
+        QueryBudget::new(1, 1, 1, 1, 1, 1)?
+            .with_cpu_work_units(0)
+            .expect_err("zero cpu budget")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+    assert_eq!(
+        QueryBudget::new(1, 1, 1, 1, 1, 1)?
+            .with_maximum_time_range_nanoseconds(0)
+            .expect_err("zero temporal bound")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
     assert!(QueryCursor::from_bytes(&[0; 340]).is_err());
     assert!(QueryCursor::from_bytes(&[0; 341]).is_ok());
     assert!(QueryCursor::from_bytes(&[0; 342]).is_err());
@@ -198,6 +217,7 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
         budget(),
     )?;
     assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+    drop((pipeline, sql));
     for source in [
         "logs | range query_time -100 100 | limit 0",
         "logs | range query_time -100 100 | limit 1025",
@@ -211,6 +231,17 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
             } else {
                 QueryFailureCode::UnsupportedQuery
             }
+        );
+    }
+    for source in [
+        "logs | range unsupported -100 100 | limit 1",
+        "logs | range query_time +1 100 | limit 1",
+        "logs | range query_time 01 100 | limit 1",
+        "logs | range query_time -01 100 | limit 1",
+    ] {
+        assert_eq!(
+            failure_code(service.plan_pipeline(fixture.context, source, budget()))?,
+            QueryFailureCode::UnsupportedQuery
         );
     }
     assert_eq!(
@@ -232,15 +263,15 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
     Ok(())
 }
 
-struct QueryFixture {
+pub(crate) struct QueryFixture {
     _roots: TemporaryRoots,
-    kernel: KernelFixture,
-    context: positron_governance::AuthorizedContext,
+    pub(crate) kernel: KernelFixture,
+    pub(crate) context: positron_governance::AuthorizedContext,
     administrator: positron_governance::AuthorizedContext,
 }
 
 impl QueryFixture {
-    fn new(label: &str) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(label: &str) -> Result<Self, Box<dyn Error>> {
         let roots = TemporaryRoots::new(label)?;
         let paths = BootstrapPaths::new(
             &roots.data(),

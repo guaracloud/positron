@@ -7,13 +7,14 @@ use super::support::{TemporaryRoot, establish_authority};
 use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_errno, with_ledger_fault};
 use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, LedgerCompletionState,
-    LedgerFailureCode, MountQualification, PreparedStoreBlock, PrimaryDataVolume,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
+    InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
+    PrimaryDataVolume, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, TransactionId,
 };
 
 mod admission_faults;
 mod sealing_faults;
+mod snapshot_leases;
 
 fn prepared(
     scope: SegmentScope,
@@ -25,58 +26,6 @@ fn prepared(
         StoreBlockIdentity::new([marker; 16])?,
         payload.to_vec(),
     )
-}
-
-#[test]
-fn snapshot_lease_pins_exact_visibility_across_append_restart_release_and_expiry()
--> Result<(), Box<dyn Error>> {
-    with_fixture(|authority, catalog, scope| {
-        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
-        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        ledger.append(prepared(scope, b"leased")?)?;
-        let lease = ledger.create_snapshot_lease(200)?;
-        let identity = lease.identity();
-        let source_identity = lease.snapshot().catalog_identity();
-        let source_generation = lease.snapshot().catalog_generation();
-        assert_eq!(lease.snapshot().blocks().len(), 1);
-        drop(lease);
-
-        ledger.append(prepared(scope, b"future")?)?;
-        let resumed = ledger.resume_snapshot_lease(identity, 101)?;
-        assert_eq!(resumed.snapshot().catalog_identity(), source_identity);
-        assert_eq!(resumed.snapshot().catalog_generation(), source_generation);
-        assert_eq!(resumed.snapshot().blocks().len(), 1);
-        assert_eq!(resumed.snapshot().blocks()[0].payload(), b"leased");
-        drop(resumed);
-        drop(ledger);
-
-        let reopened = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
-        let restarted = reopened.resume_snapshot_lease(identity, 102)?;
-        assert_eq!(restarted.snapshot().catalog_identity(), source_identity);
-        assert_eq!(restarted.snapshot().catalog_generation(), source_generation);
-        assert_eq!(restarted.snapshot().blocks().len(), 1);
-        drop(restarted);
-        reopened.release_snapshot_lease(identity)?;
-        reopened.release_snapshot_lease(identity)?;
-        assert_eq!(
-            reopened
-                .resume_snapshot_lease(identity, 103)
-                .expect_err("released lease is unavailable")
-                .code(),
-            LedgerFailureCode::SnapshotExpired
-        );
-
-        let expiring = reopened.create_snapshot_lease(110)?.identity();
-        assert_eq!(
-            reopened
-                .resume_snapshot_lease(expiring, 110)
-                .expect_err("expired lease is removed")
-                .code(),
-            LedgerFailureCode::SnapshotExpired
-        );
-        reopened.release_snapshot_lease(expiring)?;
-        Ok(())
-    })
 }
 
 #[test]
