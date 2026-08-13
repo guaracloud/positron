@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     AuditIntent, Catalog, CatalogFileEvent, CatalogObject, CatalogProposal, CatalogSecret,
-    FormatEpoch, InstanceId, TransactionId, with_catalog_fault,
+    CatalogWrappingKey, FormatEpoch, InstanceId, TransactionId, with_catalog_fault,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -59,8 +59,9 @@ pub(super) fn fuzz_catalog_stateful(data: &[u8]) {
     let Ok(catalog) = Catalog::open(&authority, instance, secret()) else {
         return;
     };
-    let operation_count = usize::from(data.first().copied().unwrap_or_default() % 3) + 1;
+    let operation_count = usize::from(data.first().copied().unwrap_or_default() % 4) + 1;
     let mut acknowledged = 0_u64;
+    let mut latest_payload = None;
     for operation in 0..operation_count {
         let selector = data.get(operation * 3 + 1).copied().unwrap_or_default();
         let transaction = data
@@ -86,6 +87,7 @@ pub(super) fn fuzz_catalog_stateful(data: &[u8]) {
         });
         if result.is_ok() {
             acknowledged = acknowledged.saturating_add(1);
+            latest_payload = Some(payload);
         }
     }
     drop(catalog);
@@ -121,30 +123,93 @@ pub(super) fn fuzz_catalog_stateful(data: &[u8]) {
         number
     );
     assert!(number >= acknowledged.saturating_sub(1));
+    if number != 0 && number == acknowledged {
+        let snapshot = recovered.pin().expect("recovered catalog pins");
+        let expected = latest_payload.expect("an acknowledged generation has a payload");
+        let object = CatalogObject::new(expected).expect("bounded fuzz payload");
+        assert_eq!(
+            snapshot.object(object.identity()).expect("object lookup"),
+            Some(object.plaintext.as_slice())
+        );
+    }
+
+    if number != 0 && data.get(11).is_some_and(|selector| selector & 1 == 1) {
+        let event = rewrap_fault_event(data.get(12).copied().unwrap_or_default());
+        let rotation = with_catalog_fault(event, || {
+            recovered.rewrap(
+                TransactionId::new(nonzero_id(0xf0))?,
+                CatalogWrappingKey::from_owned_at_epoch(Box::new([0xf2; 32]), [0xf3; 16], 2)?,
+                AuditIntent::new(b"fuzz root rotation".to_vec())?,
+            )
+        });
+        let rotation_acknowledged = rotation.is_ok();
+        drop(recovered);
+        drop(authority);
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
+            .expect("fuzz catalog releases volume after rotation");
+        let Some(authority) = fuzz_authority(volume) else {
+            return;
+        };
+        let successor = successor_secret()
+            .with_predecessor(predecessor_key())
+            .expect("fixed routes form a valid overlap");
+        let resumed = Catalog::open(&authority, instance, successor)
+            .expect("partial rewrap remains restartable with both routes");
+        let completed = resumed
+            .rewrap(
+                TransactionId::new(nonzero_id(0xf0)).expect("fixed transaction"),
+                successor_key(),
+                AuditIntent::new(b"fuzz root rotation".to_vec()).expect("fixed audit"),
+            )
+            .expect("rotation retry completes");
+        assert_eq!(completed.completed().number(), number + 3);
+        assert_eq!(
+            resumed
+                .governance_audit_records()
+                .expect("rotation audit reads")
+                .len() as u64,
+            number + 3
+        );
+        if rotation_acknowledged {
+            assert_eq!(resumed.pin().expect("rotation pins").number(), number + 3);
+        }
+    }
 }
 
 fn corrupt_persisted_byte(root: &std::path::Path, selector: Option<u8>) -> bool {
     let Some(selector) = selector else {
         return false;
     };
-    let directory = root.join("catalog").join("generations");
+    let published = fs::read_dir(root.join("catalog/generations"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            fs::metadata(entry.path())
+                .is_ok_and(|metadata| metadata.len() == super::storage::MARKER_BYTES as u64)
+        });
+    if !published {
+        return false;
+    }
+    let directories = ["objects", "governance-audit", "commits", "generations"];
+    let selected = directories[usize::from(selector) % directories.len()];
+    let directory = root.join("catalog").join(selected);
     let Ok(mut entries) = fs::read_dir(directory) else {
         return false;
     };
+    let mut corrupted = false;
     while let Some(Ok(entry)) = entries.next() {
         let Ok(mut bytes) = fs::read(entry.path()) else {
             continue;
         };
-        if bytes.len() != super::storage::MARKER_BYTES {
-            continue;
-        }
-        let index = usize::from(selector) % bytes.len();
+        let index = usize::from(selector).wrapping_mul(17) % bytes.len();
         if let Some(byte) = bytes.get_mut(index) {
             *byte ^= 0x80;
-            return fs::write(entry.path(), bytes).is_ok();
+            corrupted |= fs::write(entry.path(), bytes).is_ok();
         }
     }
-    false
+    corrupted
 }
 
 fn fuzz_authority(volume: OwnedPrimaryDataVolume) -> Option<StorageKernelResourceAuthority> {
@@ -210,6 +275,21 @@ fn secret() -> CatalogSecret {
     CatalogSecret::from_owned(Box::new([0xe1; 32]), Box::new([0xf1; 32]))
 }
 
+fn predecessor_key() -> CatalogWrappingKey {
+    CatalogWrappingKey::from_owned_at_epoch(Box::new([0xf1; 32]), [1; 16], 1)
+        .expect("fixed predecessor route")
+}
+
+fn successor_key() -> CatalogWrappingKey {
+    CatalogWrappingKey::from_owned_at_epoch(Box::new([0xf2; 32]), [0xf3; 16], 2)
+        .expect("fixed successor route")
+}
+
+fn successor_secret() -> CatalogSecret {
+    CatalogSecret::from_owned_at_epoch(Box::new([0xe1; 32]), Box::new([0xf2; 32]), [0xf3; 16], 2)
+        .expect("fixed successor secret")
+}
+
 fn nonzero_id(last: u8) -> [u8; 16] {
     let mut bytes = [0_u8; 16];
     if let Some((last_byte, _)) = bytes.split_last_mut() {
@@ -220,6 +300,8 @@ fn nonzero_id(last: u8) -> [u8; 16] {
 
 fn fault_event(selector: u8) -> CatalogFileEvent {
     let events = [
+        CatalogFileEvent::SynchronizeTransactionDigest,
+        CatalogFileEvent::SynchronizeTransactionDirectory,
         CatalogFileEvent::WriteObject,
         CatalogFileEvent::PartialObjectWrite,
         CatalogFileEvent::SynchronizeObject,
@@ -243,4 +325,15 @@ fn fault_event(selector: u8) -> CatalogFileEvent {
         .get(usize::from(selector) % events.len())
         .copied()
         .unwrap_or(CatalogFileEvent::WriteObject)
+}
+
+fn rewrap_fault_event(selector: u8) -> CatalogFileEvent {
+    let events = [
+        CatalogFileEvent::PartialRewrapWrite,
+        CatalogFileEvent::SynchronizeRewrap,
+        CatalogFileEvent::SynchronizeRewrapDirectory,
+        CatalogFileEvent::WriteMarker,
+        CatalogFileEvent::SynchronizeGenerationDirectory,
+    ];
+    events[usize::from(selector) % events.len()]
 }

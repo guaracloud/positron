@@ -1,12 +1,18 @@
 use super::*;
 
 #[test]
-fn marker_scan_ignores_only_short_torn_entries_and_counts_authentication_failures()
+fn marker_scan_ignores_only_a_canonical_short_prefix_and_counts_authentication_failures()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let storage = CatalogStorage::open(&volume)?;
-    write_new_file(&storage.generations, "short.marker", b"torn")?;
+    let torn_generation = CatalogGenerationId([0x60; 32]);
+    let torn = encode_marker(&secret(8), 2, torn_generation)?;
+    write_new_file(
+        &storage.generations,
+        &marker_name(2, torn_generation),
+        &torn[..37],
+    )?;
     let generation = CatalogGenerationId([0x61; 32]);
     let marker = encode_marker(&secret(7), 1, generation)?;
     write_new_file(&storage.generations, "wrong-key.marker", &marker)?;
@@ -14,6 +20,59 @@ fn marker_scan_ignores_only_short_torn_entries_and_counts_authentication_failure
     let scan = storage.markers(&secret(8))?;
     assert!(scan.verified.is_empty());
     assert_eq!(scan.authentication_failures, 1);
+    Ok(())
+}
+
+#[test]
+fn every_nonempty_proper_canonical_marker_prefix_is_torn_but_no_other_shape_is()
+-> Result<(), Box<dyn std::error::Error>> {
+    let key = secret(8);
+    let generation = CatalogGenerationId([0x62; 32]);
+    let name = marker_name(7, generation);
+    let marker = encode_marker(&key, 7, generation)?;
+    for length in 1..super::super::marker::MARKER_BYTES {
+        assert!(canonical_marker_prefix(
+            &key,
+            name.as_bytes(),
+            &marker[..length]
+        )?);
+    }
+    assert!(!canonical_marker_prefix(&key, name.as_bytes(), b"")?);
+    assert!(!canonical_marker_prefix(&key, name.as_bytes(), b"torn")?);
+    assert!(!canonical_marker_prefix(
+        &key,
+        b"short.marker",
+        &marker[..4]
+    )?);
+    for offset in [0_usize, 20, 21, 22] {
+        let mut malformed = name.as_bytes().to_vec();
+        malformed[offset] = match offset {
+            0 => b'x',
+            20 => b'_',
+            21 => b'G',
+            _ => b'g',
+        };
+        assert!(!canonical_marker_prefix(&key, &malformed, &marker[..4])?);
+    }
+    let overflowing = format!("18446744073709551616-{}.marker", "62".repeat(32));
+    assert!(!canonical_marker_prefix(
+        &key,
+        overflowing.as_bytes(),
+        &marker[..4]
+    )?);
+    let zero_number = format!("{:020}-{}.marker", 0, "62".repeat(32));
+    assert!(!canonical_marker_prefix(
+        &key,
+        zero_number.as_bytes(),
+        &marker[..4]
+    )?);
+    let origin = format!("{:020}-{}.marker", 7, "00".repeat(32));
+    assert!(!canonical_marker_prefix(
+        &key,
+        origin.as_bytes(),
+        &marker[..4]
+    )?);
+    assert!(!canonical_marker_prefix(&key, name.as_bytes(), &marker)?);
     Ok(())
 }
 
@@ -130,6 +189,31 @@ fn existing_marker_retry_classifies_authentication_format_and_shape_failures()
 #[test]
 fn recovery_rejects_authenticated_but_semantically_inconsistent_records()
 -> Result<(), Box<dyn std::error::Error>> {
+    for (suffix, epoch) in [(20_u8, 2_u32), (21, u32::MAX)] {
+        let root = TemporaryRoot::new()?;
+        let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+        let storage = CatalogStorage::open(&volume)?;
+        let key = secret(6);
+        let mut record = base_record(
+            1,
+            CatalogGenerationId::ORIGIN,
+            instance(1),
+            transaction(suffix),
+        );
+        record.format_epoch = FormatEpoch(epoch);
+        record.transaction_digest = transaction_digest(record.format_epoch, &record.objects, None)?;
+        let staging = storage.open_transaction(record.transaction, record.transaction_digest)?;
+        publish_record(&storage, &staging, &key, record)?;
+        assert_eq!(
+            recover(&storage, &key, instance(1))
+                .err()
+                .expect("an authenticated unsupported Format Epoch must fail")
+                .code(),
+            CatalogFailureCode::UnsupportedFormat,
+            "epoch {epoch}"
+        );
+    }
+
     {
         let root = TemporaryRoot::new()?;
         let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

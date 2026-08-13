@@ -22,8 +22,8 @@ use super::io::{
 };
 use super::marker::{MarkerDecode, decode_marker, encode_marker};
 use super::{
-    CatalogStorage, MAX_GENERATION_DIRECTORY_NAME_BYTES, MAX_GENERATIONS, marker_name, object_name,
-    reserve_directory_entry,
+    CatalogStorage, MAX_GENERATION_DIRECTORY_NAME_BYTES, MAX_GENERATIONS, canonical_marker_prefix,
+    marker_name, object_name, reserve_directory_entry,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);

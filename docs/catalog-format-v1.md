@@ -19,6 +19,9 @@ markers share one 16,777,216-byte recoverability budget. At most 65,536 committe
 Publication refuses a successor before artifact I/O if it would exceed either retained-history
 bound. Recovery applies the identical limits while walking the chain; each individual read is
 separately bounded and the reserved recovery claim covers the canonical worst case.
+Format Epoch `1` is the exact readable and writable set for this format. Zero is not a Format
+Epoch. Publication rejects every other nonzero value before admission or artifact I/O, and
+recovery of an authenticated commit carrying any other value is `UnsupportedFormat`.
 
 ## Encrypted system-object envelope
 
@@ -44,8 +47,10 @@ The authenticated generation marker is exactly 82 bytes:
 `magic[8] || version:u16 || generation-number:u64 || generation-id[32] || HMAC-SHA256[32]`
 
 Its MAC uses the Catalog system key and a marker domain separator. A marker is published only under
-the canonical pathname derived from the authenticated number and generation ID. A genuinely short
-marker is an unpublished torn write. A complete marker with bad magic, unsupported version,
+the canonical pathname derived from the authenticated number and generation ID. Only a nonempty
+proper byte prefix of the exact authenticated marker encoding for that canonical pathname is an
+unpublished torn write. Empty data, an arbitrary short value, or a prefix under any other pathname
+fences recovery. A complete marker with bad magic, unsupported version,
 sentinel identity, bad MAC, trailing data, or mismatched pathname fences recovery.
 
 ## Publication, retry, and recovery
@@ -62,6 +67,19 @@ artifacts are never acknowledged because a pathname exists: each is opened descr
 bounded, authenticated against its exact expected identity and context, synchronized as a named
 file, and followed by its directory durability barrier on every retry. A retry after marker rename
 revalidates and resynchronizes the complete generation before acknowledging it.
+The per-transaction `transaction.digest` identity file is synchronized before its containing
+transaction directory and staging parent on creation and every retry; a pathname alone never
+establishes durable transaction identity.
+
+Root rotation derives three bounded Catalog transactions from one Administration transaction and
+publishes stage-tagged Governance Audit Records for `started`, successor `verified`, and
+`completed`. After `started`, every reachable object, audit, and commit envelope is authenticated
+under either the predecessor or successor, rewrapped when necessary, and synchronized as a named
+file followed by its containing directory even when already under the successor. The verified and
+completed generations are then published under the successor. The predecessor remains configured
+through both publications and is retired only after completed is durable. Restart with both routes
+repeats the same deterministic transactions and barriers; a changed intent is an idempotency
+conflict.
 
 Recovery bounds the complete directory enumeration before classifying entries, verifies markers,
 walks the exact predecessor chain, authenticates every retained commit/audit record, verifies audit

@@ -33,6 +33,8 @@ use marker::{MarkerDecode, decode_marker, encode_marker};
 
 #[cfg(any(test, fuzzing))]
 pub(crate) use fault::with_catalog_fault;
+#[cfg(test)]
+pub(crate) use fault::with_catalog_fault_after;
 
 pub(super) const FRAME_OVERHEAD_BYTES: usize = 315;
 const MAX_COMMIT_FRAME_BYTES: usize = 262_144;
@@ -143,7 +145,12 @@ impl CatalogStorage {
             format_epoch,
             &encoded,
         ) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                emit_event(CatalogFileEvent::SynchronizeRewrap)?;
+                synchronize_named_file(directory, name)?;
+                emit_event(CatalogFileEvent::SynchronizeRewrapDirectory)?;
+                return synchronize(directory);
+            },
             Err(failure) if failure.code() == CatalogFailureCode::AuthenticationFailed => {},
             Err(failure) => return Err(failure),
         }
@@ -168,6 +175,18 @@ impl CatalogStorage {
         synchronize(&self.staging)?;
         unix_fs::renameat(&self.staging, &temporary_name, directory, name)
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        let published = read_exact_file(directory, name, maximum)?;
+        rewrap_artifact_envelope(
+            replacement,
+            replacement,
+            instance,
+            kind,
+            identity,
+            format_epoch,
+            &published,
+        )?;
+        emit_event(CatalogFileEvent::SynchronizeRewrap)?;
+        synchronize_named_file(directory, name)?;
         emit_event(CatalogFileEvent::SynchronizeRewrapDirectory)?;
         synchronize(directory)
     }
@@ -240,9 +259,12 @@ impl CatalogStorage {
             }
         } else {
             write_new_file(&directory, "transaction.digest", &digest)?;
-            synchronize(&directory)?;
-            synchronize(&self.staging)?;
         }
+        emit_event(CatalogFileEvent::SynchronizeTransactionDigest)?;
+        synchronize_named_file(&directory, "transaction.digest")?;
+        emit_event(CatalogFileEvent::SynchronizeTransactionDirectory)?;
+        synchronize(&directory)?;
+        synchronize(&self.staging)?;
         Ok(directory)
     }
 
@@ -466,7 +488,7 @@ impl CatalogStorage {
                 MarkerDecode::Unsupported => {
                     return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
                 },
-                MarkerDecode::Published(_, _) | MarkerDecode::Torn | MarkerDecode::Corrupt => {
+                MarkerDecode::Published(_, _) | MarkerDecode::Corrupt => {
                     return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
                 },
             }
@@ -510,6 +532,12 @@ impl CatalogStorage {
             }
             reserve_directory_entry(&mut entry_count, &mut name_bytes, name.to_bytes().len())?;
             let encoded = read_exact_file(&self.generations, name, MARKER_BYTES)?;
+            if encoded.len() < MARKER_BYTES {
+                if canonical_marker_prefix(secret, name.to_bytes(), &encoded)? {
+                    continue;
+                }
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
             match decode_marker(secret, &encoded)? {
                 MarkerDecode::Published(number, generation) => {
                     if name.to_bytes() != marker_name(number, generation).as_bytes() {
@@ -519,7 +547,6 @@ impl CatalogStorage {
                         return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
                     }
                 },
-                MarkerDecode::Torn => {},
                 MarkerDecode::AuthenticationFailed => authentication_failures += 1,
                 MarkerDecode::Corrupt => {
                     return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
@@ -533,6 +560,64 @@ impl CatalogStorage {
             verified: markers,
             authentication_failures,
         })
+    }
+}
+
+fn canonical_marker_prefix(
+    secret: &CatalogSecret,
+    name: &[u8],
+    encoded: &[u8],
+) -> Result<bool, CatalogFailure> {
+    if encoded.is_empty() || encoded.len() >= MARKER_BYTES {
+        return Ok(false);
+    }
+    let Some(number_bytes) = name.get(..20) else {
+        return Ok(false);
+    };
+    if name.get(20) != Some(&b'-') || name.get(85..) != Some(b".marker") || name.len() != 92 {
+        return Ok(false);
+    }
+    let mut number = 0_u64;
+    for byte in number_bytes {
+        let Some(digit) = byte.checked_sub(b'0').filter(|digit| *digit <= 9) else {
+            return Ok(false);
+        };
+        let Some(next) = number
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit)))
+        else {
+            return Ok(false);
+        };
+        number = next;
+    }
+    let Some(identity_hex) = name.get(21..85) else {
+        return Ok(false);
+    };
+    let mut identity = [0_u8; 32];
+    for (destination, pair) in identity.iter_mut().zip(identity_hex.chunks_exact(2)) {
+        let Some(high) = hex_value(pair.first().copied()) else {
+            return Ok(false);
+        };
+        let Some(low) = hex_value(pair.get(1).copied()) else {
+            return Ok(false);
+        };
+        *destination = (high << 4) | low;
+    }
+    let generation = CatalogGenerationId(identity);
+    if number == 0
+        || generation == CatalogGenerationId::ORIGIN
+        || marker_name(number, generation).as_bytes() != name
+    {
+        return Ok(false);
+    }
+    Ok(encode_marker(secret, number, generation)?.starts_with(encoded))
+}
+
+fn hex_value(value: Option<u8>) -> Option<u8> {
+    match value? {
+        value @ b'0'..=b'9' => Some(value - b'0'),
+        value @ b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
     }
 }
 

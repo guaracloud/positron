@@ -52,11 +52,17 @@ fn only_entry(path: PathBuf) -> Result<PathBuf, Box<dyn Error>> {
 }
 
 #[test]
-fn torn_unpublished_marker_falls_back_to_the_predecessor() -> Result<(), Box<dyn Error>> {
+fn canonical_marker_prefix_falls_back_while_arbitrary_short_bytes_fence()
+-> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let instance = InstanceId::new(id(81))?;
-    fs::create_dir_all(root.0.join("catalog/generations"))?;
-    fs::write(root.0.join("catalog/generations/torn.marker"), b"torn")?;
+    single_publication(&root, instance)?;
+    let marker = only_entry(root.0.join("catalog/generations"))?;
+    let complete = fs::read(&marker)?;
+    fs::write(
+        &marker,
+        complete.get(..37).ok_or("complete marker too short")?,
+    )?;
 
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
     let authority = establish_catalog_authority(volume)?;
@@ -64,6 +70,15 @@ fn torn_unpublished_marker_falls_back_to_the_predecessor() -> Result<(), Box<dyn
 
     assert_eq!(recovered.pin()?.number(), 0);
     assert!(recovered.governance_audit_records()?.is_empty());
+    drop(recovered);
+    drop(authority);
+
+    fs::write(marker, b"torn")?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let failure = Catalog::open(&authority, instance, secret())
+        .expect_err("arbitrary short bytes are not a torn publication");
+    assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
     Ok(())
 }
 
@@ -243,15 +258,22 @@ fn complete_marker_with_unknown_version_fences_recovery() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn only_nonempty_short_markers_are_unpublished_while_other_shapes_fence()
+fn only_canonical_nonempty_marker_prefixes_are_unpublished_while_other_shapes_fence()
 -> Result<(), Box<dyn Error>> {
-    for shape in ["empty", "trailing", "directory", "hard-link"] {
+    for shape in [
+        "empty",
+        "impossible-prefix",
+        "trailing",
+        "directory",
+        "hard-link",
+    ] {
         let root = TemporaryRoot::new()?;
         let instance = InstanceId::new(id(88))?;
         single_publication(&root, instance)?;
         let marker = only_entry(root.0.join("catalog/generations"))?;
         match shape {
             "empty" => fs::write(&marker, [])?,
+            "impossible-prefix" => fs::write(&marker, b"X")?,
             "trailing" => {
                 let mut bytes = fs::read(&marker)?;
                 bytes.push(0);

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use positron_kernel::{MountQualification, PrimaryDataVolume};
 
 use super::super::storage::fault::CatalogFileEvent;
-use super::super::storage::with_catalog_fault;
+use super::super::storage::{with_catalog_fault, with_catalog_fault_after};
 use super::super::{
     AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject, CatalogProposal,
     CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, TransactionId,
@@ -76,6 +76,45 @@ fn proposal(transaction: u8, value: u8) -> Result<CatalogProposal, CatalogFailur
 }
 
 #[test]
+fn transaction_identity_file_and_directory_sync_faults_restart_and_retry_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    for event in [
+        CatalogFileEvent::SynchronizeTransactionDigest,
+        CatalogFileEvent::SynchronizeTransactionDirectory,
+    ] {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(31))?;
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let catalog = Catalog::open(&authority, instance, secret())?;
+        let expected = catalog.pin()?.identity();
+        let failure = with_catalog_fault(event, || {
+            catalog.commit(
+                expected,
+                proposal(32, 7)?,
+                Some(AuditIntent::new(b"durable transaction identity".to_vec())?),
+            )
+        })
+        .expect_err("transaction identity durability fault must precede publication");
+        assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
+        drop(catalog);
+        drop(authority);
+
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let reopened = Catalog::open(&authority, instance, secret())?;
+        assert_eq!(reopened.pin()?.number(), 0);
+        let committed = reopened.commit(
+            expected,
+            proposal(32, 7)?,
+            Some(AuditIntent::new(b"durable transaction identity".to_vec())?),
+        )?;
+        assert_eq!(committed.number(), 1, "{event:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn interrupted_root_rewrap_restarts_with_predecessor_and_retries_idempotently()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TemporaryRoot::new()?;
@@ -90,7 +129,11 @@ fn interrupted_root_rewrap_restarts_with_predecessor_and_retries_idempotently()
     )?;
 
     let failure = with_catalog_fault(CatalogFileEvent::SynchronizeRewrapDirectory, || {
-        catalog.rewrap(wrapping_key(0x32, 0x42, 8)?)
+        catalog.rewrap(
+            TransactionId::new(id(43))?,
+            wrapping_key(0x32, 0x42, 8)?,
+            AuditIntent::new(b"root rotation operation".to_vec())?,
+        )
     })
     .expect_err("post-rename rewrap fault must return unknown completion");
     assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
@@ -102,16 +145,98 @@ fn interrupted_root_rewrap_restarts_with_predecessor_and_retries_idempotently()
     let predecessor = wrapping_key(0x31, 0x41, 7)?;
     let resumed_secret = rotating_secret(0x32, 0x42, 8)?.with_predecessor(predecessor)?;
     let resumed = Catalog::open(&authority, instance, resumed_secret)?;
-    assert_eq!(resumed.pin()?.number(), 1);
-    resumed.rewrap(wrapping_key(0x32, 0x42, 8)?)?;
+    assert_eq!(resumed.pin()?.number(), 2);
+    for event in [
+        CatalogFileEvent::SynchronizeRewrap,
+        CatalogFileEvent::SynchronizeRewrapDirectory,
+    ] {
+        for _ in 0..3 {
+            let repeated = with_catalog_fault(event, || {
+                resumed.rewrap(
+                    TransactionId::new(id(43))?,
+                    wrapping_key(0x32, 0x42, 8)?,
+                    AuditIntent::new(b"root rotation operation".to_vec())?,
+                )
+            })
+            .expect_err("every successor envelope must repeat both durability barriers");
+            assert_eq!(repeated.code(), CatalogFailureCode::StorageUnavailable);
+            assert_eq!(resumed.pin()?.number(), 2, "{event:?}");
+            assert_eq!(resumed.governance_audit_records()?.len(), 2, "{event:?}");
+        }
+    }
+    resumed.rewrap(
+        TransactionId::new(id(43))?,
+        wrapping_key(0x32, 0x42, 8)?,
+        AuditIntent::new(b"root rotation operation".to_vec())?,
+    )?;
     drop(resumed);
     drop(authority);
 
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
     let authority = establish_catalog_authority(volume)?;
     let reopened = Catalog::open(&authority, instance, rotating_secret(0x32, 0x42, 8)?)?;
-    assert_eq!(reopened.pin()?.number(), 1);
-    assert_eq!(reopened.governance_audit_records()?.len(), 1);
+    assert_eq!(reopened.pin()?.number(), 4);
+    assert_eq!(reopened.governance_audit_records()?.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn completion_publication_fault_never_advances_or_retires_before_verified_progress()
+-> Result<(), Box<dyn std::error::Error>> {
+    for event in [
+        CatalogFileEvent::WriteMarker,
+        CatalogFileEvent::SynchronizeGenerationDirectory,
+    ] {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(44))?;
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let catalog = Catalog::open(&authority, instance, rotating_secret(0x33, 0x43, 7)?)?;
+        catalog.commit(
+            catalog.pin()?.identity(),
+            proposal(45, 10)?,
+            Some(AuditIntent::new(b"initial mutation".to_vec())?),
+        )?;
+        let failure = with_catalog_fault_after(event, 2, || {
+            catalog.rewrap(
+                TransactionId::new(id(46))?,
+                wrapping_key(0x34, 0x44, 8)?,
+                AuditIntent::new(b"governed completion fault".to_vec())?,
+            )
+        })
+        .expect_err("the selected completion publication barrier must fail");
+        assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
+        assert_eq!(catalog.pin()?.number(), 3, "{event:?}");
+        assert_eq!(catalog.governance_audit_records()?.len(), 3, "{event:?}");
+        if event == CatalogFileEvent::SynchronizeGenerationDirectory {
+            let acknowledged = catalog.rewrap(
+                TransactionId::new(id(46))?,
+                wrapping_key(0x34, 0x44, 8)?,
+                AuditIntent::new(b"governed completion fault".to_vec())?,
+            )?;
+            assert_eq!(acknowledged.completed().number(), 4);
+            assert_eq!(catalog.governance_audit_records()?.len(), 4);
+        }
+        drop(catalog);
+        drop(authority);
+
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let resumed = Catalog::open(
+            &authority,
+            instance,
+            rotating_secret(0x34, 0x44, 8)?.with_predecessor(wrapping_key(0x33, 0x43, 7)?)?,
+        )?;
+        let recovered_number = resumed.pin()?.number();
+        assert!(matches!(recovered_number, 3 | 4), "{event:?}");
+        let completed = resumed.rewrap(
+            TransactionId::new(id(46))?,
+            wrapping_key(0x34, 0x44, 8)?,
+            AuditIntent::new(b"governed completion fault".to_vec())?,
+        )?;
+        assert_eq!(completed.completed().number(), 4, "{event:?}");
+        assert_eq!(resumed.governance_audit_records()?.len(), 4, "{event:?}");
+    }
     Ok(())
 }
 

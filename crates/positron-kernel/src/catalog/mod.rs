@@ -16,14 +16,16 @@ use codec::{
 };
 use storage::{CatalogStorage, FRAME_OVERHEAD_BYTES, MAX_GENERATIONS};
 
+use crate::data_protection::DataProtection;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority};
 
 use types::AuditFrontier;
 pub use types::{
     AuditIntent, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
-    CatalogObject, CatalogObjectId, CatalogProposal, CatalogSecret, CatalogSnapshot,
-    CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId, TransactionId,
+    CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
+    CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
+    TransactionId,
 };
 
 #[cfg(fuzzing)]
@@ -36,6 +38,8 @@ const MAX_RECOVERED_AUDIT_BYTES: usize = 16_777_216;
 const MAX_RETAINED_HISTORY_BYTES: usize = 16_777_216;
 const MAX_RECOVERY_MEMORY_BYTES: u64 = 70_000_000;
 const MAX_RECOVERY_ITEMS: u64 = 65_540;
+const ROTATION_AUDIT_DOMAIN: &[u8] = b"catalog-root-rotation-v1\0";
+const ROTATION_TRANSACTION_DOMAIN: &[u8] = b"positron-catalog-root-rotation-transaction-v1";
 
 /// The only Release 1 authority that publishes Catalog Generations.
 pub struct Catalog<'authority> {
@@ -44,6 +48,7 @@ pub struct Catalog<'authority> {
     instance: InstanceId,
     secret: Mutex<CatalogSecret>,
     storage: CatalogStorage,
+    operation: Mutex<()>,
     state: Mutex<CatalogState>,
 }
 
@@ -95,6 +100,7 @@ impl<'authority> Catalog<'authority> {
             instance,
             secret: Mutex::new(secret),
             storage,
+            operation: Mutex::new(()),
             state: Mutex::new(state),
         })
     }
@@ -114,6 +120,9 @@ impl<'authority> Catalog<'authority> {
         proposal: CatalogProposal,
         audit: Option<AuditIntent>,
     ) -> Result<CatalogCommit, CatalogFailure> {
+        if !proposal.format_epoch.is_catalog_writable() {
+            return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
+        }
         let durability_claim = RecoveryWorkClaim::system(
             RecoveryWorkKind::DurabilityCompletion,
             commit_resource_claim(&proposal, audit.as_ref())?,
@@ -124,6 +133,19 @@ impl<'authority> Catalog<'authority> {
             .recovery()
             .reserve(durability_claim)
             .map_err(CatalogFailure::admission)?;
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        self.commit_unreserved(expected, proposal, audit)
+    }
+
+    fn commit_unreserved(
+        &self,
+        expected: CatalogGenerationId,
+        proposal: CatalogProposal,
+        audit: Option<AuditIntent>,
+    ) -> Result<CatalogCommit, CatalogFailure> {
         let mut state = self
             .state
             .lock()
@@ -286,9 +308,18 @@ impl<'authority> Catalog<'authority> {
     /// Rewraps every reachable encrypted artifact under a successor root key.
     ///
     /// Marker authentication is a separate stable authority and is never changed. An
-    /// interrupted pass can be reopened with [`CatalogSecret::with_predecessor`] and retried;
-    /// artifacts are replaced atomically and an already rewrapped artifact is skipped.
-    pub fn rewrap(&self, replacement: CatalogWrappingKey) -> Result<(), CatalogFailure> {
+    /// interrupted pass can be reopened with [`CatalogSecret::with_predecessor`] and retried.
+    /// Started, successor-verified, and completed states are deterministic audited Catalog
+    /// transactions. The predecessor route remains installed until completion is published.
+    pub fn rewrap(
+        &self,
+        transaction: TransactionId,
+        replacement: CatalogWrappingKey,
+        intent: AuditIntent,
+    ) -> Result<CatalogRotation, CatalogFailure> {
+        let transactions = rotation_transactions(transaction)?;
+        let audits = rotation_audits(&replacement, &intent)?;
+        let replacement_route = (replacement.provider_key_reference, replacement.key_epoch);
         let claim = RecoveryWorkClaim::system(
             RecoveryWorkKind::DurabilityCompletion,
             rewrap_resource_claim(),
@@ -299,60 +330,196 @@ impl<'authority> Catalog<'authority> {
             .recovery()
             .reserve(claim)
             .map_err(CatalogFailure::admission)?;
-        let state = self
-            .state
+        let _operation = self
+            .operation
             .lock()
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+
+        self.refresh_state()?;
+        let started_exists = self.has_transaction(transactions[0])?;
+        {
+            let secret = self
+                .secret
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let valid_route = match secret.predecessor.as_ref() {
+                Some(_) => replacement.same_route(&secret.wrapping),
+                None => {
+                    (started_exists && replacement.same_route(&secret.wrapping))
+                        || (replacement.key_epoch > secret.wrapping.key_epoch
+                            && !replacement.same_route(&secret.wrapping))
+                },
+            };
+            if !valid_route {
+                return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+            }
+        }
+
+        let expected = self.pin()?.identity();
+        let started = self.commit_unreserved(
+            expected,
+            self.rotation_proposal(transactions[0])?,
+            Some(audits[0].clone()),
+        )?;
+
+        if !self.has_transaction(transactions[1])? {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let mut secret = self
+                .secret
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let current = match secret.predecessor.as_ref() {
+                Some(predecessor) => predecessor,
+                None => &secret.wrapping,
+            };
+            for outcome in state.transactions.values() {
+                for identity in &outcome.record.objects {
+                    self.storage.rewrap_object(
+                        current,
+                        &replacement,
+                        self.instance,
+                        *identity,
+                        outcome.record.format_epoch,
+                    )?;
+                }
+                if let Some(audit) = outcome.audit.as_ref() {
+                    self.storage.rewrap_audit(
+                        current,
+                        &replacement,
+                        self.instance,
+                        audit.position,
+                        audit.hash,
+                    )?;
+                }
+                self.storage.rewrap_commit(
+                    current,
+                    &replacement,
+                    self.instance,
+                    outcome.record.generation,
+                )?;
+            }
+            if secret.predecessor.is_none() {
+                let predecessor = std::mem::replace(&mut secret.wrapping, replacement);
+                secret.predecessor = Some(predecessor);
+            }
+        }
+
+        let verified = self.commit_unreserved(
+            self.pin()?.identity(),
+            self.rotation_proposal(transactions[1])?,
+            Some(audits[1].clone()),
+        )?;
+        let completed = self.commit_unreserved(
+            self.pin()?.identity(),
+            self.rotation_proposal(transactions[2])?,
+            Some(audits[2].clone()),
+        )?;
         let mut secret = self
             .secret
             .lock()
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-        let current = match secret.predecessor.as_ref() {
-            Some(predecessor) => {
-                if !replacement.same_route(&secret.wrapping) {
-                    return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
-                }
-                predecessor
-            },
-            None => {
-                if replacement.key_epoch <= secret.wrapping.key_epoch
-                    || replacement.same_route(&secret.wrapping)
-                {
-                    return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
-                }
-                &secret.wrapping
-            },
-        };
-        for outcome in state.transactions.values() {
-            for identity in &outcome.record.objects {
-                self.storage.rewrap_object(
-                    current,
-                    &replacement,
-                    self.instance,
-                    *identity,
-                    outcome.record.format_epoch,
-                )?;
-            }
-            if let Some(audit) = outcome.audit.as_ref() {
-                self.storage.rewrap_audit(
-                    current,
-                    &replacement,
-                    self.instance,
-                    audit.position,
-                    audit.hash,
-                )?;
-            }
-            self.storage.rewrap_commit(
-                current,
-                &replacement,
-                self.instance,
-                outcome.record.generation,
-            )?;
+        if secret.wrapping.provider_key_reference != replacement_route.0
+            || secret.wrapping.key_epoch != replacement_route.1
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
         }
-        secret.wrapping = replacement;
         secret.predecessor = None;
+        Ok(CatalogRotation {
+            started,
+            verified,
+            completed,
+        })
+    }
+
+    fn refresh_state(&self) -> Result<(), CatalogFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let recovered = recover(&self.storage, &secret, self.instance)?;
+        if recovered.current.number() > state.current.number() {
+            *state = recovered;
+        }
         Ok(())
     }
+
+    fn has_transaction(&self, transaction: TransactionId) -> Result<bool, CatalogFailure> {
+        self.state
+            .lock()
+            .map(|state| state.transactions.contains_key(&transaction))
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
+    }
+
+    fn rotation_proposal(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<CatalogProposal, CatalogFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let epoch = state
+            .current
+            .format_epoch()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        let objects = state
+            .current
+            .0
+            .objects
+            .values()
+            .map(|plaintext| CatalogObject::new(plaintext.to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        CatalogProposal::new(transaction, epoch, objects)
+    }
+}
+
+fn rotation_transactions(base: TransactionId) -> Result<[TransactionId; 3], CatalogFailure> {
+    fn derive(base: TransactionId, stage: u8) -> Result<TransactionId, CatalogFailure> {
+        let mut encoded = Vec::with_capacity(ROTATION_TRANSACTION_DOMAIN.len() + 17);
+        encoded.extend_from_slice(ROTATION_TRANSACTION_DOMAIN);
+        encoded.extend_from_slice(&base.0);
+        encoded.push(stage);
+        let digest = DataProtection::hash(&encoded)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        let mut identifier = [0_u8; 16];
+        identifier.copy_from_slice(&digest[..16]);
+        TransactionId::new(identifier)
+    }
+    Ok([derive(base, 0)?, derive(base, 1)?, derive(base, 2)?])
+}
+
+fn rotation_audits(
+    replacement: &CatalogWrappingKey,
+    intent: &AuditIntent,
+) -> Result<[AuditIntent; 3], CatalogFailure> {
+    fn prepare(
+        replacement: &CatalogWrappingKey,
+        intent: &AuditIntent,
+        stage: &[u8],
+    ) -> Result<AuditIntent, CatalogFailure> {
+        let mut encoded = Vec::with_capacity(
+            ROTATION_AUDIT_DOMAIN.len() + stage.len() + 1 + 16 + 8 + intent.0.len(),
+        );
+        encoded.extend_from_slice(ROTATION_AUDIT_DOMAIN);
+        encoded.extend_from_slice(stage);
+        encoded.push(0);
+        encoded.extend_from_slice(&replacement.provider_key_reference);
+        encoded.extend_from_slice(&replacement.key_epoch.to_be_bytes());
+        encoded.extend_from_slice(&intent.0);
+        AuditIntent::new(encoded)
+    }
+    Ok([
+        prepare(replacement, intent, b"started")?,
+        prepare(replacement, intent, b"verified")?,
+        prepare(replacement, intent, b"completed")?,
+    ])
 }
 
 fn retained_artifact_bytes(plaintext_bytes: usize) -> Result<usize, CatalogFailure> {
@@ -502,6 +669,9 @@ fn recover(
             highest_number,
         )?;
         let record = decode_commit(generation, &encoded)?;
+        if !record.format_epoch.is_catalog_readable() {
+            return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
+        }
         if record.instance != instance || record.number != expected_number {
             return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
         }

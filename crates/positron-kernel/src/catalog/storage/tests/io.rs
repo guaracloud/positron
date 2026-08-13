@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn markers_distinguish_published_torn_and_unauthenticated_records() {
+fn marker_decoder_distinguishes_complete_shape_format_and_authentication() {
     let generation = CatalogGenerationId([0x41; 32]);
     let published = encode_marker(&secret(3), 9, generation).expect("marker must encode");
     assert!(matches!(
@@ -10,8 +10,8 @@ fn markers_distinguish_published_torn_and_unauthenticated_records() {
     ));
     for length in 0..published.len() {
         assert!(matches!(
-            decode_marker(&secret(3), &published[..length]).expect("torn marker is classified"),
-            MarkerDecode::Torn
+            decode_marker(&secret(3), &published[..length]).expect("short marker is classified"),
+            MarkerDecode::Corrupt
         ));
     }
 

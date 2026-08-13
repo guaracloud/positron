@@ -652,7 +652,11 @@ async fn commit(
     proposal: CatalogProposal,
     audit: Option<AuditIntent>,
 ) -> Result<CatalogCommit, CatalogFailure>;
-fn rewrap(replacement: CatalogWrappingKey) -> Result<(), CatalogFailure>;
+fn rewrap(
+    transaction: TransactionId,
+    replacement: CatalogWrappingKey,
+    intent: AuditIntent,
+) -> Result<CatalogRotation, CatalogFailure>;
 ```
 
 The Catalog Writer is the only publication authority. It writes immutable
@@ -663,61 +667,20 @@ authenticated marker. Readers pin immutable generations.
 Telemetry Store Block append does not perform a Catalog Transaction. Catalog
 publication covers segment and control-plane lifecycle transitions.
 
-Catalog codec version 1 uses canonical big-endian integers and rejects missing,
-trailing, duplicate, out-of-order, or over-limit fields. A Catalog Commit Record
-has the exact byte layout below; `N` is the bounded, nonzero object count and
-each object identity is 32 bytes. Its Catalog Generation identity is SHA-256 of
-the complete encoded record.
+The canonical Catalog durable layouts, bounds, compatibility set, and crash
+rules are defined only in [Catalog durable format v1](catalog-format-v1.md).
+This application design owns the flow: a commit jointly publishes one complete
+state generation and its optional Governance Audit Record through the sole
+Catalog Writer.
 
-| Offset | Bytes | Field |
-| ---: | ---: | --- |
-| 0 | 8 | magic `PCOMV001` |
-| 8 | 2 | codec version, `1` |
-| 10 | 8 | generation number |
-| 18 | 32 | predecessor generation identity |
-| 50 | 16 | instance identity |
-| 66 | 4 | nonzero Format Epoch |
-| 70 | 16 | transaction identity |
-| 86 | 32 | transaction digest |
-| 118 | 32 | object-set digest |
-| 150 | 8 | governance-audit frontier position |
-| 158 | 32 | governance-audit frontier hash |
-| 190 | 4 | object count `N` |
-| 194 | `32 * N` | strictly increasing object identities |
-
-The object-set digest is SHA-256 over
-`"positron-catalog-object-set-v1" || N:u64 || object-identities`. The
-transaction digest is SHA-256 over
-`"positron-catalog-transaction-v1" || format-epoch:u32 || object-set-digest ||
-audit-present:u8`, followed, when present, by `intent-length:u64 || intent`.
-
-A Governance Audit Record has this exact layout, where `L` is in
-`1..=65_536`:
-
-| Offset | Bytes | Field |
-| ---: | ---: | --- |
-| 0 | 8 | magic `PAUDV001` |
-| 8 | 2 | codec version, `1` |
-| 10 | 8 | nonzero audit position |
-| 18 | 32 | predecessor audit hash |
-| 50 | 16 | transaction identity |
-| 66 | 4 | intent length `L` |
-| 70 | `L` | redacted governance intent |
-| `70 + L` | 32 | record hash |
-
-The record hash is SHA-256 over
-`"positron-governance-audit-record-v1" || position:u64 || predecessor-hash ||
-transaction-id || intent-length:u64 || intent`. Commit records bind the
-resulting position and hash as one audit frontier.
-
-Catalog root rotation keeps marker authentication under a separate stable
-secret. It atomically replaces only authenticated artifact envelope headers;
-the encrypted frame and content-derived identities do not change. Rewrap is a
-governed durability-completion operation. A restart encountering a partial pass
-must be supplied both the successor and predecessor wrapping routes, completes
-the idempotent pass, and may retire the predecessor only after every reachable
-artifact verifies under the successor. Without that explicit recovery input,
-mixed or wrongly keyed reachable state fences recovery.
+Root rotation is one governed durability-completion operation. The supplied
+Administration transaction deterministically publishes audited `started`,
+`verified`, and `completed` Catalog transactions. Rewrap changes only verified
+artifact envelope headers and leaves marker authentication and content-derived
+identities stable. The successor route remains overlapped with its predecessor
+through verification; only the durable completed generation authorizes
+predecessor retirement. Restart supplies both routes for a partial pass and
+retries the same operation idempotently.
 
 #### Resource Governor
 

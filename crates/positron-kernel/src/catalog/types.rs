@@ -61,6 +61,8 @@ impl CatalogGenerationId {
 pub struct FormatEpoch(pub(super) u32);
 
 impl FormatEpoch {
+    pub const CATALOG_V1: Self = Self(1);
+
     pub const fn new(value: u32) -> Result<Self, CatalogFailure> {
         if value == 0 {
             Err(CatalogFailure::new(CatalogFailureCode::InvalidInput))
@@ -72,6 +74,14 @@ impl FormatEpoch {
     #[must_use]
     pub const fn value(self) -> u32 {
         self.0
+    }
+
+    pub(super) const fn is_catalog_readable(self) -> bool {
+        self.0 == Self::CATALOG_V1.0
+    }
+
+    pub(super) const fn is_catalog_writable(self) -> bool {
+        self.is_catalog_readable()
     }
 }
 
@@ -202,6 +212,7 @@ impl std::fmt::Debug for CatalogObject {
     }
 }
 
+#[derive(Clone)]
 pub struct AuditIntent(pub(super) Vec<u8>);
 
 impl AuditIntent {
@@ -385,6 +396,31 @@ impl GovernanceAuditRecord {
 pub struct CatalogCommit {
     pub(super) snapshot: CatalogSnapshot,
     pub(super) audit: Option<GovernanceAuditRecord>,
+}
+
+/// The durable Catalog publications that authorize one completed root-key rotation.
+#[derive(Clone, Debug)]
+pub struct CatalogRotation {
+    pub(super) started: CatalogCommit,
+    pub(super) verified: CatalogCommit,
+    pub(super) completed: CatalogCommit,
+}
+
+impl CatalogRotation {
+    #[must_use]
+    pub fn started(&self) -> &CatalogCommit {
+        &self.started
+    }
+
+    #[must_use]
+    pub fn verified(&self) -> &CatalogCommit {
+        &self.verified
+    }
+
+    #[must_use]
+    pub fn completed(&self) -> &CatalogCommit {
+        &self.completed
+    }
 }
 
 impl CatalogCommit {

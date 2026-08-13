@@ -29,19 +29,19 @@ pub(super) fn decode_marker(
     encoded: &[u8],
 ) -> Result<MarkerDecode, CatalogFailure> {
     let Some((magic, remaining)) = encoded.split_first_chunk::<8>() else {
-        return Ok(MarkerDecode::Torn);
+        return Ok(MarkerDecode::Corrupt);
     };
     let Some((version, remaining)) = remaining.split_first_chunk::<2>() else {
-        return Ok(MarkerDecode::Torn);
+        return Ok(MarkerDecode::Corrupt);
     };
     let Some((number_bytes, remaining)) = remaining.split_first_chunk::<8>() else {
-        return Ok(MarkerDecode::Torn);
+        return Ok(MarkerDecode::Corrupt);
     };
     let Some((generation_bytes, remaining)) = remaining.split_first_chunk::<32>() else {
-        return Ok(MarkerDecode::Torn);
+        return Ok(MarkerDecode::Corrupt);
     };
     let Some((stored_mac, trailing)) = remaining.split_first_chunk::<32>() else {
-        return Ok(MarkerDecode::Torn);
+        return Ok(MarkerDecode::Corrupt);
     };
     if !trailing.is_empty() || *magic != MARKER_MAGIC {
         return Ok(MarkerDecode::Corrupt);
@@ -77,7 +77,6 @@ fn hmac(secret: &CatalogSecret, payload: &[u8]) -> Result<[u8; 32], CatalogFailu
 }
 pub(super) enum MarkerDecode {
     Published(u64, CatalogGenerationId),
-    Torn,
     AuthenticationFailed,
     Corrupt,
     Unsupported,

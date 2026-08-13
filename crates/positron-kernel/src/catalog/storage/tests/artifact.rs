@@ -249,3 +249,90 @@ fn root_rotation_rewraps_only_the_dek_envelope() {
         CatalogFailureCode::AuthenticationFailed
     );
 }
+
+#[test]
+fn stored_rewrap_rejects_corruption_wrong_predecessor_and_partial_replacement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let storage = CatalogStorage::open(&volume)?;
+    let current = CatalogSecret::from_owned_at_epoch(
+        Box::new([0x40; 32]),
+        Box::new([0x41; 32]),
+        [0x42; 16],
+        7,
+    )?;
+    let replacement = CatalogSecret::from_owned_at_epoch(
+        Box::new([0x40; 32]),
+        Box::new([0x43; 32]),
+        [0x44; 16],
+        8,
+    )?;
+    let plaintext = b"stored rewrap boundary";
+    let identity = CatalogObjectId(Sha256::digest(plaintext).into());
+    let epoch = FormatEpoch(1);
+    let transaction = storage.open_transaction(transaction(31), [0x51; 32])?;
+    storage.publish_object(
+        &transaction,
+        &current,
+        instance(3),
+        identity,
+        epoch,
+        plaintext,
+    )?;
+
+    let wrong = secret(0x52);
+    assert_eq!(
+        storage
+            .rewrap_object(
+                &wrong.wrapping,
+                &replacement.wrapping,
+                instance(3),
+                identity,
+                epoch,
+            )
+            .expect_err("an unrelated predecessor cannot rewrap a stored artifact")
+            .code(),
+        CatalogFailureCode::AuthenticationFailed
+    );
+    let partial = with_catalog_fault(CatalogFileEvent::PartialRewrapWrite, || {
+        storage.rewrap_object(
+            &current.wrapping,
+            &replacement.wrapping,
+            instance(3),
+            identity,
+            epoch,
+        )
+    })
+    .expect_err("a partial replacement must remain retryable");
+    assert_eq!(partial.code(), CatalogFailureCode::StorageUnavailable);
+    storage.rewrap_object(
+        &current.wrapping,
+        &replacement.wrapping,
+        instance(3),
+        identity,
+        epoch,
+    )?;
+
+    let path = root
+        .path()
+        .join("catalog/objects")
+        .join(object_name(epoch, identity));
+    let mut corrupted = fs::read(&path)?;
+    corrupted[0] ^= 1;
+    fs::write(path, corrupted)?;
+    assert_eq!(
+        storage
+            .rewrap_object(
+                &current.wrapping,
+                &replacement.wrapping,
+                instance(3),
+                identity,
+                epoch,
+            )
+            .expect_err("a corrupt successor artifact must fail closed")
+            .code(),
+        CatalogFailureCode::IntegrityCorruption
+    );
+    Ok(())
+}

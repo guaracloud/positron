@@ -332,6 +332,61 @@ fn catalog_commit_admission_refuses_before_work_and_releases_every_dimension_for
     Ok(())
 }
 
+#[test]
+fn catalog_writes_only_the_declared_current_format_epoch_before_admission_or_io()
+-> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        FormatEpoch::new(0)
+            .expect_err("zero is not a Format Epoch")
+            .code(),
+        CatalogFailureCode::InvalidInput
+    );
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(id(67))?,
+        CatalogSecret::from_owned(Box::new([0xb6; 32]), Box::new([0xc6; 32])),
+    )?;
+    let blocker = authority.recovery().reserve(RecoveryWorkClaim::system(
+        RecoveryWorkKind::DurabilityCompletion,
+        catalog_recovery_claim(),
+    )?)?;
+    let expected = catalog.pin()?.identity();
+    for (transaction, epoch) in [(68_u8, 2_u32), (69, u32::MAX)] {
+        let failure = catalog
+            .commit(
+                expected,
+                CatalogProposal::new(
+                    TransactionId::new(id(transaction))?,
+                    FormatEpoch::new(epoch)?,
+                    vec![CatalogObject::new(vec![transaction])?],
+                )?,
+                None,
+            )
+            .expect_err("an unsupported writable epoch must precede admission and mutation");
+        assert_eq!(failure.code(), CatalogFailureCode::UnsupportedFormat);
+        assert_eq!(catalog.pin()?.number(), 0);
+    }
+    drop(blocker);
+    assert_eq!(
+        catalog
+            .commit(
+                expected,
+                CatalogProposal::new(
+                    TransactionId::new(id(70))?,
+                    FormatEpoch::new(1)?,
+                    vec![CatalogObject::new(b"current epoch".to_vec())?],
+                )?,
+                None,
+            )?
+            .number(),
+        1
+    );
+    Ok(())
+}
+
 impl Drop for TemporaryRoot {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.0) {
@@ -501,7 +556,7 @@ fn catalog_writer_publishes_an_externally_readable_immutable_generation()
 }
 
 #[test]
-fn governed_root_rewrap_preserves_generation_identity_and_stable_markers()
+fn governed_root_rewrap_publishes_audited_start_verification_and_completion()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let instance = InstanceId::new(id(81))?;
@@ -517,7 +572,7 @@ fn governed_root_rewrap_preserves_generation_identity_and_stable_markers()
             7,
         )?,
     )?;
-    let committed = catalog.commit(
+    catalog.commit(
         catalog.pin()?.identity(),
         CatalogProposal::new(
             TransactionId::new(id(82))?,
@@ -526,24 +581,68 @@ fn governed_root_rewrap_preserves_generation_identity_and_stable_markers()
         )?,
         Some(AuditIntent::new(b"rotate wrapping root".to_vec())?),
     )?;
-    let identity = committed.identity();
-    catalog.rewrap(CatalogWrappingKey::from_owned_at_epoch(
-        Box::new([0xb8; 32]),
-        [0xc8; 16],
-        8,
-    )?)?;
+    for (transaction, provider, epoch) in [(84_u8, 0xc7_u8, 7_u64), (85, 0xc6, 6)] {
+        let failure = catalog
+            .rewrap(
+                TransactionId::new(id(transaction))?,
+                CatalogWrappingKey::from_owned_at_epoch(
+                    Box::new([0xb6; 32]),
+                    [provider; 16],
+                    epoch,
+                )?,
+                AuditIntent::new(b"invalid root rotation".to_vec())?,
+            )
+            .expect_err("a non-successor route must fail before an audited start");
+        assert_eq!(failure.code(), CatalogFailureCode::InvalidInput);
+        assert_eq!(catalog.pin()?.number(), 1);
+        assert_eq!(catalog.governance_audit_records()?.len(), 1);
+    }
+    let rotation = catalog.rewrap(
+        TransactionId::new(id(83))?,
+        CatalogWrappingKey::from_owned_at_epoch(Box::new([0xb8; 32]), [0xc8; 16], 8)?,
+        AuditIntent::new(b"operator approved root rotation".to_vec())?,
+    )?;
+    assert_eq!(rotation.started().number(), 2);
+    assert_eq!(rotation.verified().number(), 3);
+    assert_eq!(rotation.completed().number(), 4);
+    let records = catalog.governance_audit_records()?;
+    assert_eq!(records.len(), 4);
+    assert!(
+        records[1]
+            .intent()
+            .starts_with(b"catalog-root-rotation-v1\0started\0")
+    );
+    assert!(
+        records[2]
+            .intent()
+            .starts_with(b"catalog-root-rotation-v1\0verified\0")
+    );
+    assert!(
+        records[3]
+            .intent()
+            .starts_with(b"catalog-root-rotation-v1\0completed\0")
+    );
     assert_eq!(
         catalog
-            .rewrap(CatalogWrappingKey::from_owned_at_epoch(
-                Box::new([0xb9; 32]),
-                [0xc8; 16],
-                8,
-            )?)
-            .expect_err("the active route cannot be rewrapped to the same epoch")
-            .code(),
-        CatalogFailureCode::InvalidInput
+            .rewrap(
+                TransactionId::new(id(83))?,
+                CatalogWrappingKey::from_owned_at_epoch(Box::new([0xb8; 32]), [0xc8; 16], 8)?,
+                AuditIntent::new(b"operator approved root rotation".to_vec())?,
+            )?
+            .completed()
+            .identity(),
+        rotation.completed().identity()
     );
-    assert_eq!(catalog.pin()?.identity(), identity);
+    let conflict = catalog
+        .rewrap(
+            TransactionId::new(id(83))?,
+            CatalogWrappingKey::from_owned_at_epoch(Box::new([0xb8; 32]), [0xc8; 16], 8)?,
+            AuditIntent::new(b"different rotation intent".to_vec())?,
+        )
+        .expect_err("one rotation transaction cannot be rebound to another intent");
+    assert_eq!(conflict.code(), CatalogFailureCode::IdempotencyConflict);
+    assert_eq!(catalog.governance_audit_records()?.len(), 4);
+    assert_eq!(catalog.pin()?.identity(), rotation.completed().identity());
     drop(catalog);
     drop(authority);
 
@@ -559,7 +658,18 @@ fn governed_root_rewrap_preserves_generation_identity_and_stable_markers()
             8,
         )?,
     )?;
-    assert_eq!(reopened.pin()?.identity(), identity);
-    assert_eq!(reopened.governance_audit_records()?.len(), 1);
+    assert_eq!(reopened.pin()?.identity(), rotation.completed().identity());
+    assert_eq!(reopened.governance_audit_records()?.len(), 4);
+    assert_eq!(
+        reopened
+            .rewrap(
+                TransactionId::new(id(83))?,
+                CatalogWrappingKey::from_owned_at_epoch(Box::new([0xb8; 32]), [0xc8; 16], 8)?,
+                AuditIntent::new(b"operator approved root rotation".to_vec())?,
+            )?
+            .completed()
+            .identity(),
+        rotation.completed().identity()
+    );
     Ok(())
 }
