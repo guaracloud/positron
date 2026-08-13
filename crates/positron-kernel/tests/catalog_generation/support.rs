@@ -22,14 +22,15 @@ pub fn establish_catalog_authority(
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
     let observed = ObservedResourceEnvironment::observe(
         &volume,
-        RegisteredResourceBounds::new([100, 100, 300_000_000, 300_000, 100, 100, 100])?,
+        RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])?,
     )?;
     let large = ResourceAmounts::new([
         70_000_001, 2, 2, 70_000_001, 65_541, 2, 2, 2, 2, 9, 20_000_001,
     ]);
     let small = uniform(1);
     let dual = uniform(2);
-    let recovery_capacity = add(add(add(large, large)?, large)?, uniform(6))?;
+    let durability = add(add(large, large)?, large)?;
+    let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(6))?;
     let ordinary_capacity = uniform(16);
     let governed = add(recovery_capacity, ordinary_capacity)?;
     let raw = add(governed, cardinality.governor_bootstrap_overhead(1)?)?;
@@ -53,7 +54,7 @@ pub fn establish_catalog_authority(
         OrdinaryPoolPolicy::new(uniform(4), uniform(3), uniform(2), uniform(1))?,
     )
     .map_err(|failure| format!("catalog test policy: {failure:?}"))?;
-    let recovery = RecoveryPoolCapacities::new(large, small, dual, small, large, small, small)
+    let recovery = RecoveryPoolCapacities::new(durability, small, dual, small, large, small, small)
         .map_err(|failure| format!("catalog test recovery pools: {failure:?}"))?;
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)
         .map_err(|failure| format!("catalog test governor configuration: {failure:?}"))?;

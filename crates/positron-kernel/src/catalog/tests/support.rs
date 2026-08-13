@@ -15,7 +15,8 @@ pub(super) fn establish_catalog_authority(
     ]);
     let small = uniform(1);
     let dual = uniform(2);
-    let recovery_capacity = add(add(add(large, large)?, large)?, uniform(6))?;
+    let durability = add(add(large, large)?, large)?;
+    let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(6))?;
     let governed = add(recovery_capacity, uniform(16))?;
     let raw = add(governed, cardinality.governor_bootstrap_overhead(1)?)?;
     let observed = ObservedResourceEnvironment::for_test(
@@ -40,7 +41,8 @@ pub(super) fn establish_catalog_authority(
         [TenantQuota::new(tenant, 1, uniform(16))?],
         OrdinaryPoolPolicy::new(uniform(4), uniform(3), uniform(2), uniform(1))?,
     )?;
-    let recovery = RecoveryPoolCapacities::new(large, small, dual, small, large, small, small)?;
+    let recovery =
+        RecoveryPoolCapacities::new(durability, small, dual, small, large, small, small)?;
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;
     Ok(StorageKernelResourceAuthority::establish(
         volume,

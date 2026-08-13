@@ -23,6 +23,9 @@ pub(crate) enum CatalogFileEvent {
     SynchronizeMarker,
     RenameMarker,
     SynchronizeGenerationDirectory,
+    PartialRewrapWrite,
+    SynchronizeRewrap,
+    SynchronizeRewrapDirectory,
 }
 
 pub(super) fn injected_partial_write_length(

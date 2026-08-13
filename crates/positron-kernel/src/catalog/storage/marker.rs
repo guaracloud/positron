@@ -57,7 +57,9 @@ pub(super) fn decode_marker(
     let mut domain_payload = Vec::with_capacity(MARKER_MAC_DOMAIN.len() + authenticated.len());
     domain_payload.extend_from_slice(MARKER_MAC_DOMAIN);
     domain_payload.extend_from_slice(authenticated);
-    if DataProtection::verify_authentication(&secret.key, &domain_payload, stored_mac).is_err() {
+    if DataProtection::verify_authentication(&secret.marker_key, &domain_payload, stored_mac)
+        .is_err()
+    {
         return Ok(MarkerDecode::AuthenticationFailed);
     }
     if number == 0 || generation == CatalogGenerationId::ORIGIN {
@@ -70,7 +72,7 @@ fn hmac(secret: &CatalogSecret, payload: &[u8]) -> Result<[u8; 32], CatalogFailu
     let mut authenticated = Vec::with_capacity(MARKER_MAC_DOMAIN.len() + payload.len());
     authenticated.extend_from_slice(MARKER_MAC_DOMAIN);
     authenticated.extend_from_slice(payload);
-    DataProtection::authenticate(&secret.key, &authenticated)
+    DataProtection::authenticate(&secret.marker_key, &authenticated)
         .map_err(|_| CatalogFailure::new(CatalogFailureCode::AuthenticationFailed))
 }
 pub(super) enum MarkerDecode {

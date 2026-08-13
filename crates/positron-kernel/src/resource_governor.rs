@@ -32,6 +32,8 @@ mod telemetry_tests;
 #[cfg(test)]
 mod tests;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use accounting::{GovernorConfiguration, GovernorInner, GovernorSetupInput, KernelOwnership};
 use bootstrap::{BootstrapAllocationStage, BootstrapInventoryLayout};
 #[cfg(fuzzing)]
@@ -130,6 +132,17 @@ pub struct ResourceGovernor<'authority> {
 /// ```
 pub struct StorageKernelResourceAuthority {
     inner: GovernorInner,
+    catalog_writer_held: AtomicBool,
+}
+
+pub(crate) struct CatalogWriterLease<'authority> {
+    held: &'authority AtomicBool,
+}
+
+impl Drop for CatalogWriterLease<'_> {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for StorageKernelResourceAuthority {
@@ -313,6 +326,7 @@ impl StorageKernelResourceAuthority {
         let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
+            catalog_writer_held: AtomicBool::new(false),
         })
     }
 
@@ -327,6 +341,7 @@ impl StorageKernelResourceAuthority {
         let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
+            catalog_writer_held: AtomicBool::new(false),
         })
     }
 
@@ -342,6 +357,7 @@ impl StorageKernelResourceAuthority {
         let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
+            catalog_writer_held: AtomicBool::new(false),
         })
     }
     /// Establishes the sole governor after earlier private bootstrap/recovery steps.
@@ -366,6 +382,7 @@ impl StorageKernelResourceAuthority {
         }
         Ok(Self {
             inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
+            catalog_writer_held: AtomicBool::new(false),
         })
     }
 
@@ -387,6 +404,15 @@ impl StorageKernelResourceAuthority {
             #[cfg(any(test, fuzzing))]
             KernelOwnership::TestOnly => None,
         }
+    }
+
+    pub(crate) fn acquire_catalog_writer(&self) -> Option<CatalogWriterLease<'_>> {
+        self.catalog_writer_held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| CatalogWriterLease {
+                held: &self.catalog_writer_held,
+            })
     }
 
     #[cfg(test)]

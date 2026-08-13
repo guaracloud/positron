@@ -5,7 +5,7 @@ use crate::data_protection::{
 };
 
 use super::super::types::{
-    CatalogFailure, CatalogFailureCode, CatalogSecret, FormatEpoch, InstanceId,
+    CatalogFailure, CatalogFailureCode, CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId,
 };
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"PARTV003";
@@ -26,7 +26,7 @@ pub(super) enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    const fn tag(self) -> u8 {
+    pub(super) const fn tag(self) -> u8 {
         match self {
             Self::Object => 1,
             Self::Audit => 2,
@@ -61,7 +61,7 @@ pub(super) fn protect_artifact(
     )?;
     let object = artifact_context(kind, context_digest, format_epoch)?;
     let key = DataProtection::random_key(object).map_err(map_frame_failure)?;
-    let wrapping_key = contextual_wrapping_key(secret, context_digest)?;
+    let wrapping_key = contextual_wrapping_key(&secret.wrapping, context_digest)?;
     let key_context = wrapped_key_context(instance, kind, key_id, DATA_KEY_EPOCH, context_digest)?;
     let wrapped_payload = DataProtection::wrap_key_payload(&wrapping_key, &key, key_context)
         .map_err(map_frame_failure)?;
@@ -92,8 +92,8 @@ pub(super) fn protect_artifact(
     encoded.push(kind.tag());
     encoded.extend_from_slice(&LOCAL_PROVIDER.to_be_bytes());
     encoded.extend_from_slice(&AES_256_KWP_ALGORITHM.to_be_bytes());
-    encoded.extend_from_slice(&secret.provider_key_reference);
-    encoded.extend_from_slice(&secret.key_epoch.to_be_bytes());
+    encoded.extend_from_slice(&secret.wrapping.provider_key_reference);
+    encoded.extend_from_slice(&secret.wrapping.key_epoch.to_be_bytes());
     encoded.extend_from_slice(&key_id);
     encoded.extend_from_slice(&DATA_KEY_EPOCH.to_be_bytes());
     encoded.extend_from_slice(&context_digest);
@@ -114,13 +114,7 @@ pub(super) fn open_artifact(
         .split_at_checked(ARTIFACT_HEADER_BYTES)
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
     let decoded = decode_header(header, kind)?;
-    if decoded.provider_key_reference != secret.provider_key_reference
-        || decoded.root_key_epoch != secret.key_epoch
-    {
-        return Err(CatalogFailure::new(
-            CatalogFailureCode::AuthenticationFailed,
-        ));
-    }
+    let wrapping = wrapping_key_for_header(secret, &decoded)?;
     if decoded.key_epoch != DATA_KEY_EPOCH {
         return Err(CatalogFailure::new(
             CatalogFailureCode::AuthenticationFailed,
@@ -140,7 +134,7 @@ pub(super) fn open_artifact(
         ));
     }
     let object = artifact_context(kind, expected_context, format_epoch)?;
-    let wrapping_key = contextual_wrapping_key(secret, expected_context)?;
+    let wrapping_key = contextual_wrapping_key(wrapping, expected_context)?;
     let key_context = wrapped_key_context(
         instance,
         kind,
@@ -180,9 +174,10 @@ struct DecodedHeader {
 }
 
 fn decode_header(header: &[u8], kind: ArtifactKind) -> Result<DecodedHeader, CatalogFailure> {
-    if header.get(..8) != Some(ARTIFACT_MAGIC.as_slice())
-        || header.get(8..10) != Some(ARTIFACT_VERSION.to_be_bytes().as_slice())
-        || header.get(10) != Some(&kind.tag())
+    if header.get(..8) != Some(ARTIFACT_MAGIC.as_slice()) || header.get(10) != Some(&kind.tag()) {
+        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+    }
+    if header.get(8..10) != Some(ARTIFACT_VERSION.to_be_bytes().as_slice())
         || header.get(11..13) != Some(LOCAL_PROVIDER.to_be_bytes().as_slice())
         || header.get(13..15) != Some(AES_256_KWP_ALGORITHM.to_be_bytes().as_slice())
     {
@@ -249,12 +244,32 @@ fn wrapped_key_context(
 }
 
 fn contextual_wrapping_key(
-    secret: &CatalogSecret,
+    secret: &CatalogWrappingKey,
     context_digest: [u8; 32],
 ) -> Result<SecretKeyBytes, CatalogFailure> {
     DataProtection::authenticate(&secret.key, &context_digest)
         .map(|bytes| SecretKeyBytes::from_owned(Box::new(bytes)))
         .map_err(|_| CatalogFailure::new(CatalogFailureCode::AuthenticationFailed))
+}
+
+fn wrapping_key_for_header<'secret>(
+    secret: &'secret CatalogSecret,
+    decoded: &DecodedHeader,
+) -> Result<&'secret CatalogWrappingKey, CatalogFailure> {
+    if decoded.provider_key_reference == secret.wrapping.provider_key_reference
+        && decoded.root_key_epoch == secret.wrapping.key_epoch
+    {
+        return Ok(&secret.wrapping);
+    }
+    if let Some(predecessor) = secret.predecessor.as_ref()
+        && decoded.provider_key_reference == predecessor.provider_key_reference
+        && decoded.root_key_epoch == predecessor.key_epoch
+    {
+        return Ok(predecessor);
+    }
+    Err(CatalogFailure::new(
+        CatalogFailureCode::AuthenticationFailed,
+    ))
 }
 
 fn artifact_context(
@@ -279,10 +294,9 @@ fn artifact_context(
     ))
 }
 
-#[cfg(test)]
 pub(super) fn rewrap_artifact_envelope(
-    current: &CatalogSecret,
-    replacement: &CatalogSecret,
+    current: &CatalogWrappingKey,
+    replacement: &CatalogWrappingKey,
     instance: InstanceId,
     kind: ArtifactKind,
     content_identity: [u8; 32],

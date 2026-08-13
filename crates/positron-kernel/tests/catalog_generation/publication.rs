@@ -1,14 +1,15 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use positron_kernel::{
     AdmissionFailureCode, AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal,
-    CatalogSecret, FormatEpoch, InstanceId, MountQualification, PrimaryDataVolume,
-    RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension, TransactionId,
+    CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, MountQualification,
+    PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension, TransactionId,
 };
 
 use super::support::{catalog_recovery_claim, establish_catalog_authority};
@@ -41,7 +42,7 @@ fn stale_and_concurrent_proposals_publish_at_most_one_successor() -> Result<(), 
     let catalog = Arc::new(Catalog::open(
         &authority,
         InstanceId::new(id(21))?,
-        CatalogSecret::from_owned(Box::new([0xb1; 32])),
+        CatalogSecret::from_owned(Box::new([0xa1; 32]), Box::new([0xb1; 32])),
     )?);
     let predecessor = catalog.pin()?.identity();
     let outcomes = thread::scope(|scope| {
@@ -71,12 +72,93 @@ fn stale_and_concurrent_proposals_publish_at_most_one_successor() -> Result<(), 
         .iter()
         .find_map(|outcome| outcome.as_ref().err())
         .ok_or("one proposal must fail")?;
-    assert_eq!(failure.code(), CatalogFailureCode::StaleGeneration);
-    assert_eq!(
-        failure.current_generation(),
-        Some(catalog.pin()?.identity())
-    );
+    match failure.code() {
+        CatalogFailureCode::StaleGeneration => assert_eq!(
+            failure.current_generation(),
+            Some(catalog.pin()?.identity())
+        ),
+        CatalogFailureCode::ResourceAdmissionRefused => assert!(matches!(
+            failure.admission_failure().map(|failure| failure.code()),
+            Some(
+                AdmissionFailureCode::GovernorContended
+                    | AdmissionFailureCode::ProtectedCapacityUnavailable
+            )
+        )),
+        other => return Err(format!("unexpected concurrent outcome: {other:?}").into()),
+    }
     assert_eq!(catalog.pin()?.number(), 1);
+    let resources = authority.governor().inspect()?;
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(
+            resources.recovery_pool_usage(RecoveryWorkKind::DurabilityCompletion, dimension),
+            0,
+            "{dimension:?} reservation leaked"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn authority_owns_exactly_one_catalog_writer_during_concurrent_open_and_commit()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let instance = InstanceId::new(id(24))?;
+    let (opened_sender, opened_receiver) = mpsc::channel();
+    let release = Arc::new(Barrier::new(3));
+
+    let outcomes = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for value in [25_u8, 26] {
+            let opened_sender = opened_sender.clone();
+            let release = Arc::clone(&release);
+            let authority = &authority;
+            handles.push(scope.spawn(move || {
+                let opened = Catalog::open(
+                    authority,
+                    instance,
+                    CatalogSecret::from_owned(Box::new([0xc1; 32]), Box::new([0xd1; 32])),
+                );
+                opened_sender
+                    .send(opened.is_ok())
+                    .expect("main test thread retains the open-report receiver");
+                release.wait();
+                match opened {
+                    Ok(catalog) => catalog.commit(
+                        catalog.pin()?.identity(),
+                        CatalogProposal::new(
+                            TransactionId::new(id(value))?,
+                            FormatEpoch::new(1)?,
+                            vec![CatalogObject::new(vec![value])?],
+                        )?,
+                        Some(AuditIntent::new(vec![value])?),
+                    ),
+                    Err(failure) => Err(failure),
+                }
+            }));
+        }
+        drop(opened_sender);
+        let opened = opened_receiver.iter().take(2).collect::<Vec<_>>();
+        release.wait();
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().map_err(|_| "catalog thread panicked"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, Box<dyn Error>>((opened, outcomes))
+    })?;
+
+    assert_eq!(outcomes.0.iter().filter(|opened| **opened).count(), 1);
+    assert_eq!(
+        outcomes.1.iter().filter(|outcome| outcome.is_ok()).count(),
+        1
+    );
+    let failure = outcomes
+        .1
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .ok_or("one open must fail")?;
+    assert_eq!(failure.code(), CatalogFailureCode::ConcurrentWriter);
     Ok(())
 }
 
@@ -89,7 +171,7 @@ fn retry_with_same_transaction_is_idempotent_and_changed_content_conflicts()
     let catalog = Catalog::open(
         &authority,
         InstanceId::new(id(31))?,
-        CatalogSecret::from_owned(Box::new([0xc1; 32])),
+        CatalogSecret::from_owned(Box::new([0xb1; 32]), Box::new([0xc1; 32])),
     )?;
     let transaction = TransactionId::new(id(32))?;
     let expected = catalog.pin()?.identity();
@@ -130,7 +212,7 @@ fn governance_sensitive_generation_and_audit_record_publish_jointly() -> Result<
     let catalog = Catalog::open(
         &authority,
         InstanceId::new(id(11))?,
-        CatalogSecret::from_owned(Box::new([0xa1; 32])),
+        CatalogSecret::from_owned(Box::new([0x91; 32]), Box::new([0xa1; 32])),
     )?;
     let object = CatalogObject::new(b"tenant lifecycle: read-only".to_vec())?;
     let object_id = object.identity();
@@ -181,7 +263,7 @@ fn catalog_recovery_admission_is_typed_and_released_for_retry() -> Result<(), Bo
     let failure = Catalog::open(
         &authority,
         InstanceId::new(id(61))?,
-        CatalogSecret::from_owned(Box::new([0xc2; 32])),
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xc2; 32])),
     )
     .expect_err("recovery without its bounded reservation must fail closed");
     assert_eq!(failure.code(), CatalogFailureCode::ResourceAdmissionRefused);
@@ -194,7 +276,7 @@ fn catalog_recovery_admission_is_typed_and_released_for_retry() -> Result<(), Bo
     let catalog = Catalog::open(
         &authority,
         InstanceId::new(id(61))?,
-        CatalogSecret::from_owned(Box::new([0xc2; 32])),
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xc2; 32])),
     )?;
     assert_eq!(catalog.pin()?.number(), 0);
     assert_eq!(
@@ -204,6 +286,49 @@ fn catalog_recovery_admission_is_typed_and_released_for_retry() -> Result<(), Bo
             .recovery_pool_usage(RecoveryWorkKind::Repair, ResourceDimension::MemoryBytes),
         0
     );
+    Ok(())
+}
+
+#[test]
+fn catalog_commit_admission_refuses_before_work_and_releases_every_dimension_for_retry()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(id(65))?,
+        CatalogSecret::from_owned(Box::new([0xb5; 32]), Box::new([0xc5; 32])),
+    )?;
+    let blocker = authority.recovery().reserve(RecoveryWorkClaim::system(
+        RecoveryWorkKind::DurabilityCompletion,
+        catalog_recovery_claim(),
+    )?)?;
+    let expected = catalog.pin()?.identity();
+    let proposal = || {
+        CatalogProposal::new(
+            TransactionId::new(id(66))?,
+            FormatEpoch::new(1)?,
+            vec![CatalogObject::new(b"governed commit".to_vec())?],
+        )
+    };
+
+    let failure = catalog
+        .commit(expected, proposal()?, None)
+        .expect_err("commit without its complete reservation must fail before mutation");
+    assert_eq!(failure.code(), CatalogFailureCode::ResourceAdmissionRefused);
+    assert_eq!(catalog.pin()?.number(), 0);
+
+    drop(blocker);
+    assert_eq!(catalog.commit(expected, proposal()?, None)?.number(), 1);
+    let resources = authority.governor().inspect()?;
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(
+            resources.recovery_pool_usage(RecoveryWorkKind::DurabilityCompletion, dimension),
+            0,
+            "{dimension:?} reservation leaked"
+        );
+    }
     Ok(())
 }
 
@@ -314,7 +439,7 @@ fn public_catalog_values_enforce_bounds_and_keep_secrets_out_of_diagnostics()
     assert!(format!("{proposal:?}").contains("object_count: 1"));
     let audit = AuditIntent::new(b"redacted action".to_vec())?;
     assert_eq!(format!("{audit:?}"), "AuditIntent { encoded_bytes: 15 }");
-    let secret = CatalogSecret::from_owned(Box::new([0x7d; 32]));
+    let secret = CatalogSecret::from_owned(Box::new([0x6d; 32]), Box::new([0x7d; 32]));
     let diagnostic = format!("{secret:?}");
     assert_eq!(diagnostic, "CatalogSecret { <redacted> }");
     assert!(!diagnostic.contains("125"));
@@ -335,7 +460,7 @@ fn catalog_writer_publishes_an_externally_readable_immutable_generation()
     let catalog = Catalog::open(
         &authority,
         InstanceId::new(id(1))?,
-        CatalogSecret::from_owned(Box::new([0x91; 32])),
+        CatalogSecret::from_owned(Box::new([0x81; 32]), Box::new([0x91; 32])),
     )?;
     let predecessor = catalog.pin()?;
     assert_eq!(predecessor.number(), 0);
@@ -372,5 +497,69 @@ fn catalog_writer_publishes_an_externally_readable_immutable_generation()
         format!("{catalog:?}"),
         "Catalog { <storage-and-key-redacted> }"
     );
+    Ok(())
+}
+
+#[test]
+fn governed_root_rewrap_preserves_generation_identity_and_stable_markers()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(81))?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned_at_epoch(
+            Box::new([0xa7; 32]),
+            Box::new([0xb7; 32]),
+            [0xc7; 16],
+            7,
+        )?,
+    )?;
+    let committed = catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new(id(82))?,
+            FormatEpoch::new(1)?,
+            vec![CatalogObject::new(b"stable content identity".to_vec())?],
+        )?,
+        Some(AuditIntent::new(b"rotate wrapping root".to_vec())?),
+    )?;
+    let identity = committed.identity();
+    catalog.rewrap(CatalogWrappingKey::from_owned_at_epoch(
+        Box::new([0xb8; 32]),
+        [0xc8; 16],
+        8,
+    )?)?;
+    assert_eq!(
+        catalog
+            .rewrap(CatalogWrappingKey::from_owned_at_epoch(
+                Box::new([0xb9; 32]),
+                [0xc8; 16],
+                8,
+            )?)
+            .expect_err("the active route cannot be rewrapped to the same epoch")
+            .code(),
+        CatalogFailureCode::InvalidInput
+    );
+    assert_eq!(catalog.pin()?.identity(), identity);
+    drop(catalog);
+    drop(authority);
+
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let reopened = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned_at_epoch(
+            Box::new([0xa7; 32]),
+            Box::new([0xb8; 32]),
+            [0xc8; 16],
+            8,
+        )?,
+    )?;
+    assert_eq!(reopened.pin()?.identity(), identity);
+    assert_eq!(reopened.governance_audit_records()?.len(), 1);
     Ok(())
 }

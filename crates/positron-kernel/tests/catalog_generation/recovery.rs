@@ -134,6 +134,79 @@ fn published_generation_with_corrupt_commit_record_fails_closed() -> Result<(), 
 }
 
 #[test]
+fn every_missing_or_unsafe_published_artifact_fences_as_integrity_corruption()
+-> Result<(), Box<dyn Error>> {
+    for relative in ["objects", "governance-audit", "commits"] {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(89))?;
+        single_publication(&root, instance)?;
+        let artifact = only_entry(root.0.join("catalog").join(relative))?;
+        fs::remove_file(artifact)?;
+
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let failure = Catalog::open(&authority, instance, secret())
+            .expect_err("missing published artifact must fence recovery");
+        assert_eq!(
+            failure.code(),
+            CatalogFailureCode::IntegrityCorruption,
+            "{relative}"
+        );
+    }
+
+    for shape in ["directory", "hard-link"] {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(90))?;
+        single_publication(&root, instance)?;
+        let object = only_entry(root.0.join("catalog/objects"))?;
+        if shape == "directory" {
+            fs::remove_file(&object)?;
+            fs::create_dir(&object)?;
+        } else {
+            fs::hard_link(&object, object.with_extension("linked"))?;
+        }
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let failure = Catalog::open(&authority, instance, secret())
+            .expect_err("unsafe published artifact must fence recovery");
+        assert_eq!(
+            failure.code(),
+            CatalogFailureCode::IntegrityCorruption,
+            "{shape}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn artifact_magic_and_kind_corruption_are_distinct_from_unknown_format_version()
+-> Result<(), Box<dyn Error>> {
+    for (offset, value, expected) in [
+        (0_usize, b'X', CatalogFailureCode::IntegrityCorruption),
+        (10, 9, CatalogFailureCode::IntegrityCorruption),
+        (9, 4, CatalogFailureCode::UnsupportedFormat),
+    ] {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(91))?;
+        single_publication(&root, instance)?;
+        let object = only_entry(root.0.join("catalog/objects"))?;
+        let mut bytes = fs::read(&object)?;
+        let byte = bytes
+            .get_mut(offset)
+            .ok_or("artifact header is unexpectedly short")?;
+        *byte = value;
+        fs::write(object, bytes)?;
+
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let failure = Catalog::open(&authority, instance, secret())
+            .expect_err("invalid artifact header must fence recovery");
+        assert_eq!(failure.code(), expected, "offset {offset}");
+    }
+    Ok(())
+}
+
+#[test]
 fn complete_marker_with_bad_magic_fences_recovery() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let instance = InstanceId::new(id(85))?;
@@ -170,6 +243,42 @@ fn complete_marker_with_unknown_version_fences_recovery() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn only_nonempty_short_markers_are_unpublished_while_other_shapes_fence()
+-> Result<(), Box<dyn Error>> {
+    for shape in ["empty", "trailing", "directory", "hard-link"] {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(88))?;
+        single_publication(&root, instance)?;
+        let marker = only_entry(root.0.join("catalog/generations"))?;
+        match shape {
+            "empty" => fs::write(&marker, [])?,
+            "trailing" => {
+                let mut bytes = fs::read(&marker)?;
+                bytes.push(0);
+                fs::write(&marker, bytes)?;
+            },
+            "directory" => {
+                fs::remove_file(&marker)?;
+                fs::create_dir(&marker)?;
+            },
+            "hard-link" => fs::hard_link(&marker, marker.with_extension("linked"))?,
+            _ => return Err("unknown marker shape".into()),
+        }
+
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let failure = Catalog::open(&authority, instance, secret())
+            .expect_err("a non-torn published-marker shape must fence recovery");
+        assert_eq!(
+            failure.code(),
+            CatalogFailureCode::IntegrityCorruption,
+            "{shape}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn authenticated_marker_under_a_mismatched_name_fences_recovery() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let instance = InstanceId::new(id(86))?;
@@ -196,7 +305,7 @@ fn wrong_catalog_key_cannot_open_a_published_generation() -> Result<(), Box<dyn 
     let failure = Catalog::open(
         &authority,
         instance,
-        CatalogSecret::from_owned(Box::new([0x44; 32])),
+        CatalogSecret::from_owned(Box::new([0x43; 32]), Box::new([0x44; 32])),
     )
     .expect_err("wrong catalog secret must fail closed");
 
@@ -246,7 +355,7 @@ fn id(last: u8) -> [u8; 16] {
 }
 
 fn secret() -> CatalogSecret {
-    CatalogSecret::from_owned(Box::new([0xd1; 32]))
+    CatalogSecret::from_owned(Box::new([0xc1; 32]), Box::new([0xd1; 32]))
 }
 
 #[test]

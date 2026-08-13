@@ -16,13 +16,14 @@ use codec::{
 };
 use storage::{CatalogStorage, FRAME_OVERHEAD_BYTES, MAX_GENERATIONS};
 
+use crate::resource_governor::CatalogWriterLease;
 use crate::{RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority};
 
 use types::AuditFrontier;
 pub use types::{
     AuditIntent, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
-    CatalogObject, CatalogObjectId, CatalogProposal, CatalogSecret, CatalogSnapshot, FormatEpoch,
-    GovernanceAuditRecord, InstanceId, TransactionId,
+    CatalogObject, CatalogObjectId, CatalogProposal, CatalogSecret, CatalogSnapshot,
+    CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId, TransactionId,
 };
 
 #[cfg(fuzzing)]
@@ -39,8 +40,9 @@ const MAX_RECOVERY_ITEMS: u64 = 65_540;
 /// The only Release 1 authority that publishes Catalog Generations.
 pub struct Catalog<'authority> {
     authority: &'authority StorageKernelResourceAuthority,
+    _writer: CatalogWriterLease<'authority>,
     instance: InstanceId,
-    secret: CatalogSecret,
+    secret: Mutex<CatalogSecret>,
     storage: CatalogStorage,
     state: Mutex<CatalogState>,
 }
@@ -72,6 +74,9 @@ impl<'authority> Catalog<'authority> {
         instance: InstanceId,
         secret: CatalogSecret,
     ) -> Result<Self, CatalogFailure> {
+        let writer = authority
+            .acquire_catalog_writer()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
         let recovery_claim =
             RecoveryWorkClaim::system(RecoveryWorkKind::Repair, recovery_resource_claim())
                 .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
@@ -86,8 +91,9 @@ impl<'authority> Catalog<'authority> {
         let state = recover(&storage, &secret, instance)?;
         Ok(Self {
             authority,
+            _writer: writer,
             instance,
-            secret,
+            secret: Mutex::new(secret),
             storage,
             state: Mutex::new(state),
         })
@@ -108,10 +114,6 @@ impl<'authority> Catalog<'authority> {
         proposal: CatalogProposal,
         audit: Option<AuditIntent>,
     ) -> Result<CatalogCommit, CatalogFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
         let durability_claim = RecoveryWorkClaim::system(
             RecoveryWorkKind::DurabilityCompletion,
             commit_resource_claim(&proposal, audit.as_ref())?,
@@ -122,6 +124,14 @@ impl<'authority> Catalog<'authority> {
             .recovery()
             .reserve(durability_claim)
             .map_err(CatalogFailure::admission)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
         let object_ids: Vec<_> = proposal
             .objects
             .iter()
@@ -134,7 +144,7 @@ impl<'authority> Catalog<'authority> {
         )?;
         // Resolve an earlier acknowledgement-ambiguous marker publication before
         // evaluating idempotency or the expected-generation precondition.
-        let recovered = recover(&self.storage, &self.secret, self.instance)?;
+        let recovered = recover(&self.storage, &secret, self.instance)?;
         if recovered.current.number() > state.current.number() {
             *state = recovered;
         }
@@ -144,18 +154,13 @@ impl<'authority> Catalog<'authority> {
                 return Err(CatalogFailure::new(CatalogFailureCode::IdempotencyConflict));
             }
             self.storage.confirm_publication(
-                &self.secret,
+                &secret,
                 self.instance,
                 &outcome.record,
                 outcome.audit.as_ref(),
             )?;
             return Ok(CatalogCommit {
-                snapshot: load_snapshot(
-                    &self.storage,
-                    &self.secret,
-                    self.instance,
-                    &outcome.record,
-                )?,
+                snapshot: load_snapshot(&self.storage, &secret, self.instance, &outcome.record)?,
                 audit: outcome.audit.clone(),
             });
         }
@@ -223,7 +228,7 @@ impl<'authority> Catalog<'authority> {
         for object in proposal.objects {
             self.storage.publish_object(
                 &transaction,
-                &self.secret,
+                &secret,
                 self.instance,
                 object.identity,
                 proposal.format_epoch,
@@ -232,24 +237,19 @@ impl<'authority> Catalog<'authority> {
             objects.insert(object.identity, Arc::from(object.plaintext));
         }
         if let Some((record, encoded)) = &prepared_audit {
-            self.storage.publish_audit(
-                &transaction,
-                &self.secret,
-                self.instance,
-                record,
-                encoded,
-            )?;
+            self.storage
+                .publish_audit(&transaction, &secret, self.instance, record, encoded)?;
         }
 
         self.storage.publish_commit(
             &transaction,
-            &self.secret,
+            &secret,
             self.instance,
             record.generation,
             &encoded_commit,
         )?;
         self.storage
-            .publish_marker(&transaction, &self.secret, number, record.generation)?;
+            .publish_marker(&transaction, &secret, number, record.generation)?;
 
         let snapshot = snapshot_from_record(&record, objects);
         let visible_audit = prepared_audit.map(|(record, _)| record);
@@ -281,6 +281,77 @@ impl<'authority> Catalog<'authority> {
             .lock()
             .map(|state| state.audit.clone())
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
+    }
+
+    /// Rewraps every reachable encrypted artifact under a successor root key.
+    ///
+    /// Marker authentication is a separate stable authority and is never changed. An
+    /// interrupted pass can be reopened with [`CatalogSecret::with_predecessor`] and retried;
+    /// artifacts are replaced atomically and an already rewrapped artifact is skipped.
+    pub fn rewrap(&self, replacement: CatalogWrappingKey) -> Result<(), CatalogFailure> {
+        let claim = RecoveryWorkClaim::system(
+            RecoveryWorkKind::DurabilityCompletion,
+            rewrap_resource_claim(),
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let _reservation = self
+            .authority
+            .recovery()
+            .reserve(claim)
+            .map_err(CatalogFailure::admission)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let current = match secret.predecessor.as_ref() {
+            Some(predecessor) => {
+                if !replacement.same_route(&secret.wrapping) {
+                    return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+                }
+                predecessor
+            },
+            None => {
+                if replacement.key_epoch <= secret.wrapping.key_epoch
+                    || replacement.same_route(&secret.wrapping)
+                {
+                    return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+                }
+                &secret.wrapping
+            },
+        };
+        for outcome in state.transactions.values() {
+            for identity in &outcome.record.objects {
+                self.storage.rewrap_object(
+                    current,
+                    &replacement,
+                    self.instance,
+                    *identity,
+                    outcome.record.format_epoch,
+                )?;
+            }
+            if let Some(audit) = outcome.audit.as_ref() {
+                self.storage.rewrap_audit(
+                    current,
+                    &replacement,
+                    self.instance,
+                    audit.position,
+                    audit.hash,
+                )?;
+            }
+            self.storage.rewrap_commit(
+                current,
+                &replacement,
+                self.instance,
+                outcome.record.generation,
+            )?;
+        }
+        secret.wrapping = replacement;
+        secret.predecessor = None;
+        Ok(())
     }
 }
 
@@ -322,6 +393,22 @@ fn recovery_resource_claim() -> ResourceAmounts {
     ])
 }
 
+fn rewrap_resource_claim() -> ResourceAmounts {
+    recovery_resource_claim().maximum(ResourceAmounts::new([
+        MAX_RECOVERY_MEMORY_BYTES,
+        1,
+        1,
+        MAX_RECOVERY_MEMORY_BYTES,
+        MAX_RECOVERY_ITEMS,
+        0,
+        1,
+        1,
+        1,
+        8,
+        MAX_RETAINED_HISTORY_BYTES as u64,
+    ]))
+}
+
 fn commit_resource_claim(
     proposal: &CatalogProposal,
     audit: Option<&AuditIntent>,
@@ -347,7 +434,7 @@ fn commit_resource_claim(
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(1_048_576))
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    Ok(ResourceAmounts::new([
+    let publication = ResourceAmounts::new([
         u64::try_from(memory_bytes)
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
         1,
@@ -363,7 +450,8 @@ fn commit_resource_claim(
         8,
         u64::try_from(durable_bytes)
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
-    ]))
+    ]);
+    Ok(publication.maximum(recovery_resource_claim()))
 }
 
 fn recover(

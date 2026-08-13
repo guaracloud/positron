@@ -8,7 +8,7 @@ use super::super::storage::fault::CatalogFileEvent;
 use super::super::storage::with_catalog_fault;
 use super::super::{
     AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject, CatalogProposal,
-    CatalogSecret, FormatEpoch, InstanceId, TransactionId,
+    CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, TransactionId,
 };
 use super::support::establish_catalog_authority;
 
@@ -43,7 +43,28 @@ fn id(last: u8) -> [u8; 16] {
 }
 
 fn secret() -> CatalogSecret {
-    CatalogSecret::from_owned(Box::new([0xe1; 32]))
+    CatalogSecret::from_owned(Box::new([0xd1; 32]), Box::new([0xe1; 32]))
+}
+
+fn rotating_secret(
+    wrapping_byte: u8,
+    provider: u8,
+    epoch: u64,
+) -> Result<CatalogSecret, CatalogFailure> {
+    CatalogSecret::from_owned_at_epoch(
+        Box::new([0xa7; 32]),
+        Box::new([wrapping_byte; 32]),
+        [provider; 16],
+        epoch,
+    )
+}
+
+fn wrapping_key(
+    wrapping_byte: u8,
+    provider: u8,
+    epoch: u64,
+) -> Result<CatalogWrappingKey, CatalogFailure> {
+    CatalogWrappingKey::from_owned_at_epoch(Box::new([wrapping_byte; 32]), [provider; 16], epoch)
 }
 
 fn proposal(transaction: u8, value: u8) -> Result<CatalogProposal, CatalogFailure> {
@@ -52,6 +73,46 @@ fn proposal(transaction: u8, value: u8) -> Result<CatalogProposal, CatalogFailur
         FormatEpoch::new(1)?,
         vec![CatalogObject::new(vec![value])?],
     )
+}
+
+#[test]
+fn interrupted_root_rewrap_restarts_with_predecessor_and_retries_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(41))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, rotating_secret(0x31, 0x41, 7)?)?;
+    catalog.commit(
+        catalog.pin()?.identity(),
+        proposal(42, 9)?,
+        Some(AuditIntent::new(b"root rotation".to_vec())?),
+    )?;
+
+    let failure = with_catalog_fault(CatalogFileEvent::SynchronizeRewrapDirectory, || {
+        catalog.rewrap(wrapping_key(0x32, 0x42, 8)?)
+    })
+    .expect_err("post-rename rewrap fault must return unknown completion");
+    assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
+    drop(catalog);
+    drop(authority);
+
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let predecessor = wrapping_key(0x31, 0x41, 7)?;
+    let resumed_secret = rotating_secret(0x32, 0x42, 8)?.with_predecessor(predecessor)?;
+    let resumed = Catalog::open(&authority, instance, resumed_secret)?;
+    assert_eq!(resumed.pin()?.number(), 1);
+    resumed.rewrap(wrapping_key(0x32, 0x42, 8)?)?;
+    drop(resumed);
+    drop(authority);
+
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let reopened = Catalog::open(&authority, instance, rotating_secret(0x32, 0x42, 8)?)?;
+    assert_eq!(reopened.pin()?.number(), 1);
+    assert_eq!(reopened.governance_audit_records()?.len(), 1);
+    Ok(())
 }
 
 #[test]

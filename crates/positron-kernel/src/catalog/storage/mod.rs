@@ -10,7 +10,8 @@ use crate::OwnedPrimaryDataVolume;
 use super::codec::MAX_AUDIT_RECORD_BYTES;
 use super::types::{
     CatalogFailure, CatalogFailureCode, CatalogGenerationId, CatalogObjectId, CatalogSecret,
-    FormatEpoch, GovernanceAuditRecord, InstanceId, MAX_CATALOG_OBJECT_BYTES, TransactionId,
+    CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId, MAX_CATALOG_OBJECT_BYTES,
+    TransactionId,
 };
 
 mod artifact;
@@ -21,7 +22,7 @@ mod marker;
 #[cfg(test)]
 mod tests;
 
-use artifact::{ArtifactKind, open_artifact, protect_artifact};
+use artifact::{ArtifactKind, open_artifact, protect_artifact, rewrap_artifact_envelope};
 use fault::{CatalogFileEvent, emit_event};
 use io::{
     entry_exists, open_or_create_directory, read_exact_file, synchronize, synchronize_named_file,
@@ -54,6 +55,123 @@ pub(super) struct MarkerScan {
 }
 
 impl CatalogStorage {
+    pub(super) fn rewrap_object(
+        &self,
+        current: &CatalogWrappingKey,
+        replacement: &CatalogWrappingKey,
+        instance: InstanceId,
+        identity: CatalogObjectId,
+        format_epoch: FormatEpoch,
+    ) -> Result<(), CatalogFailure> {
+        let name = object_name(format_epoch, identity);
+        self.rewrap_named(
+            &self.objects,
+            &name,
+            MAX_CATALOG_OBJECT_BYTES + FRAME_OVERHEAD_BYTES,
+            current,
+            replacement,
+            instance,
+            ArtifactKind::Object,
+            identity.0,
+            format_epoch,
+        )
+    }
+
+    pub(super) fn rewrap_audit(
+        &self,
+        current: &CatalogWrappingKey,
+        replacement: &CatalogWrappingKey,
+        instance: InstanceId,
+        position: u64,
+        hash: [u8; 32],
+    ) -> Result<(), CatalogFailure> {
+        let name = audit_name(position, hash);
+        self.rewrap_named(
+            &self.audit,
+            &name,
+            MAX_AUDIT_FRAME_BYTES,
+            current,
+            replacement,
+            instance,
+            ArtifactKind::Audit,
+            hash,
+            FormatEpoch(1),
+        )
+    }
+
+    pub(super) fn rewrap_commit(
+        &self,
+        current: &CatalogWrappingKey,
+        replacement: &CatalogWrappingKey,
+        instance: InstanceId,
+        generation: CatalogGenerationId,
+    ) -> Result<(), CatalogFailure> {
+        let name = commit_name(generation);
+        self.rewrap_named(
+            &self.commits,
+            &name,
+            MAX_COMMIT_FRAME_BYTES,
+            current,
+            replacement,
+            instance,
+            ArtifactKind::Commit,
+            generation.0,
+            FormatEpoch(1),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rewrap_named(
+        &self,
+        directory: &File,
+        name: &str,
+        maximum: usize,
+        current: &CatalogWrappingKey,
+        replacement: &CatalogWrappingKey,
+        instance: InstanceId,
+        kind: ArtifactKind,
+        identity: [u8; 32],
+        format_epoch: FormatEpoch,
+    ) -> Result<(), CatalogFailure> {
+        let encoded = read_exact_file(directory, name, maximum)?;
+        match rewrap_artifact_envelope(
+            replacement,
+            replacement,
+            instance,
+            kind,
+            identity,
+            format_epoch,
+            &encoded,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(failure) if failure.code() == CatalogFailureCode::AuthenticationFailed => {},
+            Err(failure) => return Err(failure),
+        }
+        let rewrapped = rewrap_artifact_envelope(
+            current,
+            replacement,
+            instance,
+            kind,
+            identity,
+            format_epoch,
+            &encoded,
+        )?;
+        let temporary_name = format!("rewrap-{}-{name}", kind.tag());
+        write_transaction_file(
+            &self.staging,
+            &temporary_name,
+            &rewrapped,
+            CatalogFileEvent::PartialRewrapWrite,
+        )?;
+        emit_event(CatalogFileEvent::SynchronizeRewrap)?;
+        synchronize_named_file(&self.staging, &temporary_name)?;
+        synchronize(&self.staging)?;
+        unix_fs::renameat(&self.staging, &temporary_name, directory, name)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        emit_event(CatalogFileEvent::SynchronizeRewrapDirectory)?;
+        synchronize(directory)
+    }
+
     pub(super) fn confirm_publication(
         &self,
         secret: &CatalogSecret,
@@ -391,13 +509,7 @@ impl CatalogStorage {
                 continue;
             }
             reserve_directory_entry(&mut entry_count, &mut name_bytes, name.to_bytes().len())?;
-            let encoded = match read_exact_file(&self.generations, name, MARKER_BYTES) {
-                Ok(encoded) => encoded,
-                Err(failure) if failure.code == CatalogFailureCode::IntegrityCorruption => {
-                    continue;
-                },
-                Err(failure) => return Err(failure),
-            };
+            let encoded = read_exact_file(&self.generations, name, MARKER_BYTES)?;
             match decode_marker(secret, &encoded)? {
                 MarkerDecode::Published(number, generation) => {
                     if name.to_bytes() != marker_name(number, generation).as_bytes() {

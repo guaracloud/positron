@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU8, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
 use positron_domain::identity::TenantId;
 
@@ -164,6 +164,7 @@ fn establishment_moves_every_retained_payload_without_reallocation() {
     let before = configuration.inner.payload_addresses_for_test();
     let authority = StorageKernelResourceAuthority {
         inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
+        catalog_writer_held: AtomicBool::new(false),
     };
     let after = authority.inner.payload_addresses_for_test();
     assert_eq!(after, before);

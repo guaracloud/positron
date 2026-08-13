@@ -136,7 +136,13 @@ fn open_regular_file<N: rustix::path::Arg>(
         Mode::empty(),
     )
     .map(File::from)
-    .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) {
+            CatalogFailure::new(CatalogFailureCode::IntegrityCorruption)
+        } else {
+            CatalogFailure::new(CatalogFailureCode::StorageUnavailable)
+        }
+    })?;
     let metadata = file
         .metadata()
         .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;

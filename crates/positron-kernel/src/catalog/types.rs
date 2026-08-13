@@ -75,22 +75,13 @@ impl FormatEpoch {
     }
 }
 
-pub struct CatalogSecret {
+pub struct CatalogWrappingKey {
     pub(super) key: SecretKeyBytes,
     pub(super) provider_key_reference: [u8; 16],
     pub(super) key_epoch: u64,
 }
 
-impl CatalogSecret {
-    #[must_use]
-    pub fn from_owned(bytes: Box<[u8; 32]>) -> Self {
-        Self {
-            key: SecretKeyBytes::from_owned(bytes),
-            provider_key_reference: [1; 16],
-            key_epoch: 1,
-        }
-    }
-
+impl CatalogWrappingKey {
     pub fn from_owned_at_epoch(
         bytes: Box<[u8; 32]>,
         provider_key_reference: [u8; 16],
@@ -104,6 +95,68 @@ impl CatalogSecret {
             provider_key_reference,
             key_epoch,
         })
+    }
+
+    pub(super) fn same_route(&self, other: &Self) -> bool {
+        self.provider_key_reference == other.provider_key_reference
+            && self.key_epoch == other.key_epoch
+    }
+}
+
+impl std::fmt::Debug for CatalogWrappingKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CatalogWrappingKey { <redacted> }")
+    }
+}
+
+pub struct CatalogSecret {
+    pub(super) marker_key: SecretKeyBytes,
+    pub(super) wrapping: CatalogWrappingKey,
+    pub(super) predecessor: Option<CatalogWrappingKey>,
+}
+
+impl CatalogSecret {
+    #[must_use]
+    pub fn from_owned(marker_authentication: Box<[u8; 32]>, wrapping_key: Box<[u8; 32]>) -> Self {
+        Self {
+            marker_key: SecretKeyBytes::from_owned(marker_authentication),
+            wrapping: CatalogWrappingKey {
+                key: SecretKeyBytes::from_owned(wrapping_key),
+                provider_key_reference: [1; 16],
+                key_epoch: 1,
+            },
+            predecessor: None,
+        }
+    }
+
+    pub fn from_owned_at_epoch(
+        marker_authentication: Box<[u8; 32]>,
+        wrapping_key: Box<[u8; 32]>,
+        provider_key_reference: [u8; 16],
+        key_epoch: u64,
+    ) -> Result<Self, CatalogFailure> {
+        Ok(Self {
+            marker_key: SecretKeyBytes::from_owned(marker_authentication),
+            wrapping: CatalogWrappingKey::from_owned_at_epoch(
+                wrapping_key,
+                provider_key_reference,
+                key_epoch,
+            )?,
+            predecessor: None,
+        })
+    }
+
+    pub fn with_predecessor(
+        mut self,
+        predecessor: CatalogWrappingKey,
+    ) -> Result<Self, CatalogFailure> {
+        if predecessor.key_epoch >= self.wrapping.key_epoch
+            || predecessor.same_route(&self.wrapping)
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        self.predecessor = Some(predecessor);
+        Ok(self)
     }
 }
 
@@ -192,10 +245,12 @@ impl CatalogProposal {
             return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
         }
         objects.sort_by_key(CatalogObject::identity);
-        if objects
-            .windows(2)
-            .any(|pair| pair[0].identity == pair[1].identity)
-        {
+        if objects.windows(2).any(|pair| {
+            let [left, right] = pair else {
+                return false;
+            };
+            left.identity == right.identity
+        }) {
             return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
         }
         Ok(Self {

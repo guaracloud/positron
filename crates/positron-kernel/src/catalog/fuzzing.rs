@@ -92,16 +92,25 @@ pub(super) fn fuzz_catalog_stateful(data: &[u8]) {
     drop(authority);
 
     let corruption = (data.len() > 10).then(|| data.last().copied()).flatten();
-    corrupt_persisted_byte(&root.0, corruption);
+    let corrupted_reachable_artifact = corrupt_persisted_byte(&root.0, corruption);
 
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
         .expect("fuzz catalog releases volume ownership");
     let Some(authority) = fuzz_authority(volume) else {
         return;
     };
-    let Ok(recovered) = Catalog::open(&authority, instance, secret()) else {
+    let recovery = Catalog::open(&authority, instance, secret());
+    if corrupted_reachable_artifact {
+        let failure = recovery.expect_err("reachable persisted corruption must fence recovery");
+        assert!(matches!(
+            failure.code(),
+            super::CatalogFailureCode::IntegrityCorruption
+                | super::CatalogFailureCode::AuthenticationFailed
+                | super::CatalogFailureCode::UnsupportedFormat
+        ));
         return;
-    };
+    }
+    let recovered = recovery.expect("uncorrupted persisted state must recover");
     let number = recovered.pin().expect("recovered catalog pins").number();
     assert!(number <= operation_count as u64);
     assert_eq!(
@@ -114,28 +123,28 @@ pub(super) fn fuzz_catalog_stateful(data: &[u8]) {
     assert!(number >= acknowledged.saturating_sub(1));
 }
 
-fn corrupt_persisted_byte(root: &std::path::Path, selector: Option<u8>) {
+fn corrupt_persisted_byte(root: &std::path::Path, selector: Option<u8>) -> bool {
     let Some(selector) = selector else {
-        return;
+        return false;
     };
-    let directories = ["objects", "governance-audit", "commits", "generations"];
-    let directory = root
-        .join("catalog")
-        .join(directories[usize::from(selector) % 4]);
+    let directory = root.join("catalog").join("generations");
     let Ok(mut entries) = fs::read_dir(directory) else {
-        return;
+        return false;
     };
-    let Some(Ok(entry)) = entries.next() else {
-        return;
-    };
-    let Ok(mut bytes) = fs::read(entry.path()) else {
-        return;
-    };
-    let index = usize::from(selector) % bytes.len().max(1);
-    if let Some(byte) = bytes.get_mut(index) {
-        *byte ^= 0x80;
-        let _ = fs::write(entry.path(), bytes);
+    while let Some(Ok(entry)) = entries.next() {
+        let Ok(mut bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        if bytes.len() != super::storage::MARKER_BYTES {
+            continue;
+        }
+        let index = usize::from(selector) % bytes.len();
+        if let Some(byte) = bytes.get_mut(index) {
+            *byte ^= 0x80;
+            return fs::write(entry.path(), bytes).is_ok();
+        }
     }
+    false
 }
 
 fn fuzz_authority(volume: OwnedPrimaryDataVolume) -> Option<StorageKernelResourceAuthority> {
@@ -198,12 +207,14 @@ fn add(left: ResourceAmounts, right: ResourceAmounts) -> Option<ResourceAmounts>
 }
 
 fn secret() -> CatalogSecret {
-    CatalogSecret::from_owned(Box::new([0xf1; 32]))
+    CatalogSecret::from_owned(Box::new([0xe1; 32]), Box::new([0xf1; 32]))
 }
 
 fn nonzero_id(last: u8) -> [u8; 16] {
     let mut bytes = [0_u8; 16];
-    bytes[15] = last.max(1);
+    if let Some((last_byte, _)) = bytes.split_last_mut() {
+        *last_byte = last.max(1);
+    }
     bytes
 }
 
@@ -228,5 +239,8 @@ fn fault_event(selector: u8) -> CatalogFileEvent {
         CatalogFileEvent::RenameMarker,
         CatalogFileEvent::SynchronizeGenerationDirectory,
     ];
-    events[usize::from(selector) % events.len()]
+    events
+        .get(usize::from(selector) % events.len())
+        .copied()
+        .unwrap_or(CatalogFileEvent::WriteObject)
 }

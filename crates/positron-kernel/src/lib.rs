@@ -77,8 +77,8 @@ mod resource_governor;
 
 pub use catalog::{
     AuditIntent, Catalog, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
-    CatalogObject, CatalogObjectId, CatalogProposal, CatalogSecret, CatalogSnapshot, FormatEpoch,
-    GovernanceAuditRecord, InstanceId, TransactionId,
+    CatalogObject, CatalogObjectId, CatalogProposal, CatalogSecret, CatalogSnapshot,
+    CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId, TransactionId,
 };
 
 pub use resource_governor::{
