@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn object_authenticator_verifies_only_the_exact_evidence() -> Result<(), &'static str> {
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameObjectContext, FrameObjectId, KeyEpoch,
+        ObjectDataKey, SecretKeyInput,
+    };
+
+    let object = FrameObjectContext::tenant_segment(
+        TenantId::from_bytes([0x11; 16]).map_err(|_| "invalid tenant")?,
+        SignalKind::Logs,
+        VirtualShardId::new(1).map_err(|_| "invalid shard")?,
+        FrameObjectId::new([0x12; 16]).map_err(|_| "invalid object")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "invalid format")?,
+    );
+    let key = ObjectDataKey::import(SecretKeyInput::from_test_bytes([0x13; 32]), object);
+    let authenticator = DataProtection::authenticate_object_key(&key, b"receipt-evidence")
+        .map_err(|_| "authentication failed")?;
+    DataProtection::verify_object_authentication(&key, b"receipt-evidence", &authenticator)
+        .map_err(|_| "exact evidence did not verify")?;
+    let failure = DataProtection::verify_object_authentication(
+        &key,
+        b"different-receipt-evidence",
+        &authenticator,
+    )
+    .expect_err("different evidence must not verify");
+    if failure.code() == FrameFailureCode::AuthenticationFailed {
+        Ok(())
+    } else {
+        Err("wrong authenticator failure classification")
+    }
+}
+
+#[test]
 fn wrong_key_returns_no_plaintext() -> Result<(), &'static str> {
     use super::{
         DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,
@@ -34,6 +67,50 @@ fn wrong_key_returns_no_plaintext() -> Result<(), &'static str> {
         Ok(())
     } else {
         Err("wrong-key failure classification differed")
+    }
+}
+
+#[test]
+fn frame_open_rejects_a_key_bound_to_a_different_object_before_parsing() -> Result<(), &'static str>
+{
+    use super::{
+        DataProtection, FormatEpoch, FrameFailureCode, FrameLimits, FrameObjectContext,
+        FrameObjectId, FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput, SegmentFramePurpose,
+    };
+
+    let tenant = TenantId::from_bytes([0x25; 16]).map_err(|_| "invalid tenant")?;
+    let shard = VirtualShardId::new(2).map_err(|_| "invalid shard")?;
+    let object = FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        FrameObjectId::new([0x35; 16]).map_err(|_| "invalid object")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "invalid format")?,
+    );
+    let other = FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        FrameObjectId::new([0x36; 16]).map_err(|_| "invalid other object")?,
+        KeyEpoch::new(1),
+        FormatEpoch::new(1).map_err(|_| "invalid format")?,
+    );
+    let key = ObjectDataKey::import(SecretKeyInput::from_test_bytes([0x45; 32]), object);
+    let expected = other
+        .frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(0))
+        .map_err(|_| "invalid frame context")?;
+    let failure = DataProtection::open_frame(
+        &key,
+        expected,
+        b"not-even-a-frame",
+        FrameLimits::new(256).map_err(|_| "invalid limits")?,
+    )
+    .expect_err("object mismatch must be rejected before parsing");
+    if failure.code() == FrameFailureCode::AuthenticationFailed {
+        Ok(())
+    } else {
+        Err("object mismatch was misclassified")
     }
 }
 

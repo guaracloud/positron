@@ -78,6 +78,10 @@ fn root_authority_owns_the_volume_lock_for_its_complete_lifetime()
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
     let configuration = configuration(&volume, tenant)?;
     let authority = StorageKernelResourceAuthority::establish(volume, configuration)?;
+    assert_eq!(
+        format!("{authority:?}"),
+        "StorageKernelResourceAuthority { <bounded capability> }"
+    );
     let failure = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)
         .expect_err("the live root authority must retain the owned volume lock");
     assert_eq!(failure.code(), VolumeFailureCode::Busy);
@@ -104,6 +108,14 @@ fn deterministic_environment_remains_bound_to_its_exact_volume()
     let mismatch = StorageKernelResourceAuthority::establish(substitute_volume, configuration)
         .expect_err("deterministic observation must reject a different volume");
     assert_eq!(mismatch.failure(), GovernorFailure::ObservedVolumeMismatch);
+    assert_eq!(
+        format!("{mismatch:?}"),
+        "EstablishmentFailure { <redacted> }"
+    );
+    assert_eq!(
+        mismatch.to_string(),
+        "resource governor establishment failed"
+    );
     let (substitute_volume, configuration) = mismatch.into_parts();
     let authority = StorageKernelResourceAuthority::establish(observed_volume, configuration)?;
 

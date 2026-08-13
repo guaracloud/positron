@@ -2,16 +2,18 @@ use rustix::process::{Resource, getrlimit};
 
 use super::{
     CapacityObservationFailure, RegisteredResourceBounds, detected_descriptor_capacity,
-    observe_file_descriptors, open_file_descriptor_count,
+    open_file_descriptor_count,
 };
 use crate::{InventoryCardinalityLimits, ResourceDimension};
 
 #[test]
-fn observed_descriptor_capacity_never_exceeds_current_soft_headroom_after_bootstrap() {
+fn descriptor_capacity_uses_one_coherent_soft_headroom_observation() {
     let soft_limit = getrlimit(Resource::Nofile)
         .current
         .expect("the supported test host must expose a finite soft descriptor limit");
-    let detected = observe_file_descriptors().expect("descriptor observation must succeed");
+    let observed_open = open_file_descriptor_count().expect("open descriptor count succeeds");
+    let detected = detected_descriptor_capacity(soft_limit, observed_open)
+        .expect("descriptor observation must succeed");
     let overhead = InventoryCardinalityLimits::new(1, 1)
         .and_then(|limits| limits.governor_bootstrap_overhead(1))
         .expect("one-tenant bootstrap inventory must be valid")
@@ -19,12 +21,17 @@ fn observed_descriptor_capacity_never_exceeds_current_soft_headroom_after_bootst
     let work_ceiling = detected
         .checked_sub(overhead)
         .expect("observation reserves the fixed bootstrap descriptor overhead");
-    let currently_open = open_file_descriptor_count().expect("open descriptor count succeeds");
-    let current_headroom = soft_limit
-        .checked_sub(currently_open)
+    // Model parallel tests opening descriptors after this observation. Their
+    // later process state cannot retroactively change the sampled capacity.
+    let executable = std::env::current_exe().expect("test executable path is available");
+    let _concurrent_churn = (0..8)
+        .map(|_| std::fs::File::open(&executable).expect("descriptor churn fixture opens"))
+        .collect::<Vec<_>>();
+    let observed_headroom = soft_limit
+        .checked_sub(observed_open)
         .expect("open descriptors remain beneath the soft limit");
 
-    assert!(work_ceiling <= current_headroom);
+    assert_eq!(work_ceiling, observed_headroom);
 }
 
 #[test]

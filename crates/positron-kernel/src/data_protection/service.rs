@@ -1,9 +1,11 @@
 use super::{
     AES_256_GCM_TAG_BYTES, CryptoBackend, CryptoBackendFailure, EncryptedFrame, FRAME_HEADER_BYTES,
     FrameContext, FrameFailure, FrameFailureCode, FrameLimits, FrameObjectContext, ObjectDataKey,
-    RustCryptoBackend, SecretKeyBytes, SecretKeyInput, VerifiedFrame, WrappedKeyContext,
-    encode_associated_data, encode_authenticated_header, encode_wrapped_key_payload, nonce_for,
-    parse_frame, verify_wrapped_key_payload,
+    RustCryptoBackend, SecretKeyBytes, SecretKeyInput, SegmentEnvelopeRoute, VerifiedFrame,
+    WrappedKeyContext, encode_associated_data, encode_authenticated_header,
+    encode_segment_wrapped_key_payload_with_route, encode_wrapped_key_payload, nonce_for,
+    parse_frame, segment_context_encoding_with_route,
+    verify_segment_wrapped_key_payload_with_route, verify_wrapped_key_payload,
 };
 
 /// The Storage Kernel's authenticated encrypted-frame entry point.
@@ -29,6 +31,13 @@ impl DataProtection {
         limits: FrameLimits,
     ) -> Result<EncryptedFrame, FrameFailure> {
         Self::release().protect_frame(key, context, plaintext, limits)
+    }
+
+    pub(crate) fn protected_frame_length(
+        plaintext_bytes: usize,
+        limits: FrameLimits,
+    ) -> Result<u32, FrameFailure> {
+        BackendDataProtection::<RustCryptoBackend>::protected_frame_length(plaintext_bytes, limits)
     }
 
     /// Authenticates a bounded frame before exposing its plaintext.
@@ -58,6 +67,21 @@ impl DataProtection {
             .map_err(|_| FrameFailure::new(FrameFailureCode::AuthenticationFailed))
     }
 
+    pub(crate) fn authenticate_object_key(
+        key: &ObjectDataKey,
+        bytes: &[u8],
+    ) -> Result<[u8; 32], FrameFailure> {
+        Self::authenticate(&key.key, bytes)
+    }
+
+    pub(crate) fn verify_object_authentication(
+        key: &ObjectDataKey,
+        bytes: &[u8],
+        expected: &[u8; 32],
+    ) -> Result<(), FrameFailure> {
+        Self::verify_authentication(&key.key, bytes, expected)
+    }
+
     pub(crate) fn verify_authentication(
         key: &SecretKeyBytes,
         bytes: &[u8],
@@ -74,9 +98,21 @@ impl DataProtection {
     }
 
     pub(crate) fn random_identifier() -> Result<[u8; 32], FrameFailure> {
+        Self::random_identifier_with_backend(&Self::release().backend)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_backend_random_identifier<B: CryptoBackend>(
+        backend: B,
+    ) -> Result<[u8; 32], FrameFailure> {
+        Self::random_identifier_with_backend(&backend)
+    }
+
+    fn random_identifier_with_backend<B: CryptoBackend>(
+        backend: &B,
+    ) -> Result<[u8; 32], FrameFailure> {
         let mut identifier = [0_u8; 32];
-        Self::release()
-            .backend
+        backend
             .fill_random(&mut identifier)
             .map_err(|_| FrameFailure::new(FrameFailureCode::EntropyUnavailable))?;
         if identifier.iter().all(|byte| *byte == 0) {
@@ -110,6 +146,77 @@ impl DataProtection {
         let key = verify_wrapped_key_payload(payload, context)?;
         Ok(ObjectDataKey { key, object })
     }
+
+    pub(crate) fn wrap_segment_key(
+        wrapping_key: &SecretKeyBytes,
+        object_key: &ObjectDataKey,
+        instance: [u8; 16],
+    ) -> Result<Vec<u8>, FrameFailure> {
+        Self::wrap_segment_key_with_route(
+            wrapping_key,
+            object_key,
+            instance,
+            SegmentEnvelopeRoute {
+                provider_family: 1,
+                provider_reference: [1; 16],
+                provider_key_epoch: 1,
+            },
+        )
+    }
+
+    pub(crate) fn wrap_segment_key_with_route(
+        wrapping_key: &SecretKeyBytes,
+        object_key: &ObjectDataKey,
+        instance: [u8; 16],
+        route: SegmentEnvelopeRoute,
+    ) -> Result<Vec<u8>, FrameFailure> {
+        let context = segment_context_encoding_with_route(instance, object_key.object, route)?;
+        let digest = Self::hash(&context)?;
+        let payload =
+            encode_segment_wrapped_key_payload_with_route(object_key, instance, digest, route)?;
+        Self::release()
+            .backend
+            .wrap_key_aes_256_kwp(wrapping_key, &payload.bytes)
+            .map_err(|_| FrameFailure::new(FrameFailureCode::SealFailed))
+    }
+
+    pub(crate) fn unwrap_segment_key(
+        wrapping_key: &SecretKeyBytes,
+        wrapped_payload: &[u8],
+        instance: [u8; 16],
+        object: FrameObjectContext,
+    ) -> Result<ObjectDataKey, FrameFailure> {
+        Self::unwrap_segment_key_with_route(
+            wrapping_key,
+            wrapped_payload,
+            instance,
+            object,
+            SegmentEnvelopeRoute {
+                provider_family: 1,
+                provider_reference: [1; 16],
+                provider_key_epoch: 1,
+            },
+        )
+    }
+
+    pub(crate) fn unwrap_segment_key_with_route(
+        wrapping_key: &SecretKeyBytes,
+        wrapped_payload: &[u8],
+        instance: [u8; 16],
+        object: FrameObjectContext,
+        route: SegmentEnvelopeRoute,
+    ) -> Result<ObjectDataKey, FrameFailure> {
+        let context = segment_context_encoding_with_route(instance, object, route)?;
+        let digest = Self::hash(&context)?;
+        let payload = Self::release()
+            .backend
+            .unwrap_key_aes_256_kwp(wrapping_key, wrapped_payload)
+            .map_err(|_| FrameFailure::new(FrameFailureCode::AuthenticationFailed))?;
+        let key = verify_segment_wrapped_key_payload_with_route(
+            payload, instance, object, digest, route,
+        )?;
+        Ok(ObjectDataKey { key, object })
+    }
 }
 
 pub(super) struct BackendDataProtection<B> {
@@ -117,6 +224,23 @@ pub(super) struct BackendDataProtection<B> {
 }
 
 impl<B: CryptoBackend> BackendDataProtection<B> {
+    fn protected_frame_length(
+        plaintext_bytes: usize,
+        limits: FrameLimits,
+    ) -> Result<u32, FrameFailure> {
+        let ciphertext_bytes = plaintext_bytes
+            .checked_add(AES_256_GCM_TAG_BYTES as usize)
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
+        let encoded_bytes = FRAME_HEADER_BYTES
+            .checked_add(ciphertext_bytes)
+            .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
+        if encoded_bytes > limits.max_encoded_bytes {
+            return Err(FrameFailure::new(FrameFailureCode::LimitExceeded));
+        }
+        Ok(encoded_bytes)
+    }
+
     pub(super) fn import_object_key(
         &self,
         input: SecretKeyInput,
@@ -149,17 +273,10 @@ impl<B: CryptoBackend> BackendDataProtection<B> {
         if key.object != context.object {
             return Err(FrameFailure::new(FrameFailureCode::InvalidContext));
         }
-        let ciphertext_bytes = plaintext
-            .len()
-            .checked_add(AES_256_GCM_TAG_BYTES as usize)
-            .and_then(|length| u32::try_from(length).ok())
+        let encoded_bytes = Self::protected_frame_length(plaintext.len(), limits)?;
+        let ciphertext_bytes = encoded_bytes
+            .checked_sub(FRAME_HEADER_BYTES)
             .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
-        let encoded_bytes = FRAME_HEADER_BYTES
-            .checked_add(ciphertext_bytes)
-            .ok_or_else(|| FrameFailure::new(FrameFailureCode::LimitExceeded))?;
-        if encoded_bytes > limits.max_encoded_bytes {
-            return Err(FrameFailure::new(FrameFailureCode::LimitExceeded));
-        }
 
         let header = encode_authenticated_header(context.sequence, ciphertext_bytes);
         let associated_data = encode_associated_data(&header, context);

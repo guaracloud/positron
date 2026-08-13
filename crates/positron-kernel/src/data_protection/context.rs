@@ -5,7 +5,7 @@ use super::{FrameFailure, FrameFailureCode, MINIMUM_ENCODED_FRAME_BYTES};
 
 /// The immutable identity of one encrypted persistent object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FrameObjectId([u8; 16]);
+pub(crate) struct FrameObjectId(pub(super) [u8; 16]);
 
 impl FrameObjectId {
     /// Creates a non-sentinel persistent object identity.
@@ -20,7 +20,7 @@ impl FrameObjectId {
 
 /// The immutable generation of key material protecting an object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KeyEpoch(u64);
+pub(crate) struct KeyEpoch(pub(super) u64);
 
 impl KeyEpoch {
     /// Creates an exact immutable key epoch.
@@ -32,7 +32,7 @@ impl KeyEpoch {
 
 /// The independently versioned persistent format generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FormatEpoch(u32);
+pub(crate) struct FormatEpoch(pub(super) u32);
 
 impl FormatEpoch {
     /// Creates a non-zero Format Epoch.
@@ -62,7 +62,7 @@ impl FrameSequence {
 
 /// The segment payload purpose authenticated with one frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SegmentFramePurpose {
+pub(crate) enum SegmentFramePurpose {
     /// A canonical Signal Store block.
     StoreBlock,
     /// A Signal Store index extent.
@@ -71,6 +71,8 @@ pub(super) enum SegmentFramePurpose {
     Statistics,
     /// Segment metadata.
     SegmentMetadata,
+    /// The acknowledged local durability bound of an active segment.
+    DurabilityFrontier,
 }
 
 impl SegmentFramePurpose {
@@ -80,6 +82,7 @@ impl SegmentFramePurpose {
             Self::Index => 2,
             Self::Statistics => 3,
             Self::SegmentMetadata => 4,
+            Self::DurabilityFrontier => 5,
         }
     }
 }
@@ -118,13 +121,13 @@ impl SystemObjectKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FrameScope {
+pub(crate) enum FrameScope {
     Tenant(TenantId),
     System,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FrameObjectClass {
+pub(crate) enum FrameObjectClass {
     Segment {
         signal: SignalKind,
         shard: VirtualShardId,
@@ -195,7 +198,7 @@ impl FrameObjectContext {
     }
 
     /// Creates the authoritative context for one segment frame.
-    pub(super) const fn frame(
+    pub(crate) const fn frame(
         self,
         purpose: SegmentFramePurpose,
         sequence: FrameSequence,

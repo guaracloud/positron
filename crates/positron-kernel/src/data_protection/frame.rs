@@ -79,7 +79,7 @@ pub(crate) struct FrameFailure {
 }
 
 impl FrameFailure {
-    pub(super) const fn new(code: FrameFailureCode) -> Self {
+    pub(crate) const fn new(code: FrameFailureCode) -> Self {
         Self { code }
     }
 

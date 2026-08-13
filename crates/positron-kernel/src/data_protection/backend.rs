@@ -308,7 +308,7 @@ impl SecretKeyInput {
 /// A per-object data key bound to its authoritative identity and epochs.
 pub(crate) struct ObjectDataKey {
     pub(super) key: SecretKeyBytes,
-    pub(super) object: FrameObjectContext,
+    pub(crate) object: FrameObjectContext,
 }
 
 impl ObjectDataKey {

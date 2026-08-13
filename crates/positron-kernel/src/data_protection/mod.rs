@@ -26,16 +26,23 @@ use backend::{CryptoBackend, CryptoBackendFailure, RustCryptoBackend, SecretPlai
 pub(crate) use backend::{ObjectDataKey, SecretKeyBytes, SecretKeyInput};
 use codec::{encode_associated_data, encode_authenticated_header, nonce_for, parse_frame};
 pub(crate) use context::{
-    FormatEpoch as FrameFormatEpoch, FrameContext, FrameLimits, FrameObjectContext, FrameObjectId,
-    FrameSequence, KeyEpoch, SystemObjectKind,
+    FormatEpoch as FrameFormatEpoch, FrameContext, FrameLimits, FrameObjectClass,
+    FrameObjectContext, FrameObjectId, FrameScope, FrameSequence, KeyEpoch, SegmentFramePurpose,
+    SystemObjectKind,
 };
 pub(crate) use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
-pub(crate) use key_envelope::WrappedKeyContext;
-use key_envelope::{encode_wrapped_key_payload, verify_wrapped_key_payload};
+pub(crate) use key_envelope::{SegmentEnvelopeRoute, WrappedKeyContext};
+#[cfg(test)]
+use key_envelope::{encode_segment_wrapped_key_payload, segment_context_encoding};
+use key_envelope::{
+    encode_segment_wrapped_key_payload_with_route, encode_wrapped_key_payload,
+    segment_context_encoding_with_route, verify_segment_wrapped_key_payload_with_route,
+    verify_wrapped_key_payload,
+};
 pub(crate) use service::DataProtection;
 
 #[cfg(any(test, fuzzing))]
-use context::{FormatEpoch, SegmentFramePurpose};
+use context::FormatEpoch;
 
 const FRAME_MAGIC: [u8; 4] = *b"PFRM";
 const FRAME_VERSION: u16 = 1;

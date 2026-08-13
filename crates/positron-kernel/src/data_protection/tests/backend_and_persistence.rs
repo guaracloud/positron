@@ -188,6 +188,77 @@ fn wrapped_key_payload_round_trip_verifies_its_embedded_authority() -> Result<()
 }
 
 #[test]
+fn segment_wrapped_keys_bind_every_physical_scope_dimension() -> Result<(), &'static str> {
+    let instance = [0x81; 16];
+    let wrapping_key = SecretKeyBytes::from_owned(Box::new([0x82; 32]));
+    let system_object = super::FrameObjectContext::system(
+        super::SystemObjectKind::Catalog,
+        super::FrameObjectId::new([0x83; 16]).map_err(|_| "invalid system object")?,
+        super::KeyEpoch::new(1),
+        super::FormatEpoch::new(1).map_err(|_| "invalid format epoch")?,
+    );
+    let system_key = super::ObjectDataKey::import(
+        super::SecretKeyInput::from_test_bytes([0x84; 32]),
+        system_object,
+    );
+    for failure in [
+        super::segment_context_encoding(instance, system_object)
+            .expect_err("system objects have no segment envelope context"),
+        super::encode_segment_wrapped_key_payload(&system_key, instance, [0x85; 32])
+            .err()
+            .expect("system keys cannot use the segment envelope format"),
+    ] {
+        if failure.code() != super::FrameFailureCode::InvalidContext {
+            return Err("invalid segment envelope context was misclassified");
+        }
+    }
+
+    let tenant = TenantId::from_bytes([0x86; 16]).map_err(|_| "invalid tenant")?;
+    let shard = VirtualShardId::new(7).map_err(|_| "invalid shard")?;
+    let object = super::FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Traces,
+        shard,
+        super::FrameObjectId::new([0x87; 16]).map_err(|_| "invalid segment object")?,
+        super::KeyEpoch::new(3),
+        super::FormatEpoch::new(4).map_err(|_| "invalid segment format")?,
+    );
+    let object_key = super::ObjectDataKey::generate(object)
+        .map_err(|_| "segment object key generation failed")?;
+    if format!("{object_key:?}") != "ObjectDataKey { <redacted> }" {
+        return Err("segment object key debug output was not redacted");
+    }
+    let wrapped = super::DataProtection::wrap_segment_key(&wrapping_key, &object_key, instance)
+        .map_err(|_| "segment key wrap failed")?;
+    let opened =
+        super::DataProtection::unwrap_segment_key(&wrapping_key, &wrapped, instance, object)
+            .map_err(|_| "segment key unwrap failed")?;
+    if opened.key.expose_to_backend() != object_key.key.expose_to_backend() {
+        return Err("segment key round trip differed");
+    }
+
+    let substituted = super::FrameObjectContext::tenant_segment(
+        tenant,
+        SignalKind::Logs,
+        shard,
+        super::FrameObjectId::new([0x87; 16]).map_err(|_| "invalid segment object")?,
+        super::KeyEpoch::new(3),
+        super::FormatEpoch::new(4).map_err(|_| "invalid segment format")?,
+    );
+    if super::DataProtection::unwrap_segment_key(&wrapping_key, &wrapped, instance, substituted)
+        .is_ok()
+    {
+        return Err("segment envelope accepted a substituted signal");
+    }
+    if super::DataProtection::unwrap_segment_key(&wrapping_key, &wrapped, [0x89; 16], object)
+        .is_ok()
+    {
+        return Err("segment envelope accepted a substituted instance");
+    }
+    Ok(())
+}
+
+#[test]
 fn wrapped_key_context_rejects_every_sentinel_and_encodes_every_key_kind() {
     use super::{FrameFailureCode, SystemObjectKind, WrappedKeyContext};
 
@@ -606,6 +677,17 @@ fn entropy_failure_is_typed_and_secret_safe() -> Result<(), &'static str> {
         return Err("entropy failure was not typed and secret-safe");
     }
     Ok(())
+}
+
+#[test]
+fn all_zero_random_identifiers_are_refused_as_entropy_failure() -> Result<(), &'static str> {
+    let identifier = super::DataProtection::with_backend_random_identifier(SealFailureBackend)
+        .expect_err("an all-zero identifier is a forbidden entropy result");
+    if identifier.code() == super::FrameFailureCode::EntropyUnavailable {
+        Ok(())
+    } else {
+        Err("zero identifier entropy was misclassified")
+    }
 }
 
 #[test]

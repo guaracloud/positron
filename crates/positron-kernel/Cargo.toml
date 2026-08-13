@@ -46,5 +46,9 @@ path = "tests/resource_governor_integration.rs"
 name = "catalog_generation"
 path = "tests/catalog_generation.rs"
 
+[[test]]
+name = "active_segment_ledger"
+path = "tests/active_segment_ledger.rs"
+
 [lints]
 workspace = true

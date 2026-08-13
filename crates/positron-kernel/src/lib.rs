@@ -2,12 +2,12 @@
 //!
 //! This slice owns the concrete Release 1 Primary Data Volume and authenticated
 //! encrypted-frame protection. Authoritative frame context, object keys, and
-//! frame protection remain private to the Storage Kernel until the Active
-//! Segment Ledger can issue sequence-owned capabilities.
+//! frame protection remain private to the Storage Kernel. The Active Segment
+//! Ledger owns durable frame-sequence allocation and exposes only opaque block,
+//! receipt, and snapshot capabilities.
 //!
-//! Provider bootstrap, Key Envelopes, the Envelope Catalog, key lifecycle, and
-//! durable frame-sequence allocation remain outside this crate's implemented
-//! surface.
+//! Provider bootstrap and broader key lifecycle remain outside this crate's
+//! implemented surface.
 //!
 //! Frame authority is deliberately unavailable to dependent crates. Each
 //! promised private name is checked independently so one inaccessible import
@@ -50,9 +50,6 @@
 //! use positron_kernel::KeyEpoch;
 //! ```
 //! ```compile_fail
-//! use positron_kernel::FormatEpoch;
-//! ```
-//! ```compile_fail
 //! use positron_kernel::SegmentFramePurpose;
 //! ```
 //! ```compile_fail
@@ -70,6 +67,7 @@
 #[cfg(test)]
 extern crate self as positron_kernel;
 
+mod active_segment_ledger;
 mod catalog;
 #[allow(dead_code)]
 mod data_protection;
@@ -80,6 +78,12 @@ pub use catalog::{
     CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
     CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
     TransactionId,
+};
+
+pub use active_segment_ledger::{
+    ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
+    LedgerFailure, LedgerFailureCode, LedgerSnapshot, PreparedStoreBlock, SealedSegment, SegmentId,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 
 pub use resource_governor::{
@@ -113,6 +117,10 @@ pub use data_protection::fuzz_local_root_key_file;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use catalog::fuzz_catalog_stateful;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use active_segment_ledger::fuzz_active_segment_stateful;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
