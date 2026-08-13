@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::BootstrapPaths;
+use positron_kernel::MountQualification;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -25,8 +26,12 @@ impl Roots {
     }
 
     pub(super) fn paths(&self) -> BootstrapPaths {
-        BootstrapPaths::new(&self.parent.join("data"), &self.parent.join("secrets"))
-            .expect("test roots are distinct")
+        BootstrapPaths::new(
+            &self.parent.join("data"),
+            &self.parent.join("secrets"),
+            MountQualification::LocalHost,
+        )
+        .expect("test roots are distinct")
     }
 }
 

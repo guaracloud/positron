@@ -101,6 +101,12 @@ impl DataProtection {
         Self::random_identifier_with_backend(&Self::release().backend)
     }
 
+    pub(crate) fn ed25519_public_key(
+        private_seed: SecretKeyInput,
+    ) -> Result<[u8; 32], FrameFailure> {
+        Self::release().ed25519_public_key(private_seed)
+    }
+
     #[cfg(test)]
     pub(super) fn with_backend_random_identifier<B: CryptoBackend>(
         backend: B,
@@ -224,6 +230,15 @@ pub(super) struct BackendDataProtection<B> {
 }
 
 impl<B: CryptoBackend> BackendDataProtection<B> {
+    pub(super) fn ed25519_public_key(
+        &self,
+        private_seed: SecretKeyInput,
+    ) -> Result<[u8; 32], FrameFailure> {
+        self.backend
+            .ed25519_public_key(&private_seed.0)
+            .map_err(|_| FrameFailure::new(FrameFailureCode::SealFailed))
+    }
+
     fn protected_frame_length(
         plaintext_bytes: usize,
         limits: FrameLimits,

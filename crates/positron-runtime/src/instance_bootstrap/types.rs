@@ -3,7 +3,9 @@ use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
-use positron_kernel::InstanceId;
+use positron_kernel::{
+    BootstrapKeyCustody, InstanceId, MountQualification, StorageKernelResourceAuthority,
+};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,10 +61,15 @@ impl Error for BootstrapFailure {}
 pub struct BootstrapPaths {
     pub(super) data: PathBuf,
     pub(super) secrets: PathBuf,
+    pub(super) qualification: MountQualification,
 }
 
 impl BootstrapPaths {
-    pub fn new(data: &Path, secrets: &Path) -> Result<Self, BootstrapFailure> {
+    pub fn new(
+        data: &Path,
+        secrets: &Path,
+        qualification: MountQualification,
+    ) -> Result<Self, BootstrapFailure> {
         let data = std::fs::canonicalize(data)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::InvalidRoots))?;
         let secrets = std::fs::canonicalize(secrets)
@@ -75,7 +82,11 @@ impl BootstrapPaths {
         if !separate {
             return Err(BootstrapFailure::new(BootstrapFailureCode::InvalidRoots));
         }
-        Ok(Self { data, secrets })
+        Ok(Self {
+            data,
+            secrets,
+            qualification,
+        })
     }
 
     #[must_use]
@@ -86,6 +97,11 @@ impl BootstrapPaths {
     #[must_use]
     pub fn secrets_root(&self) -> &Path {
         &self.secrets
+    }
+
+    #[must_use]
+    pub const fn mount_qualification(&self) -> MountQualification {
+        self.qualification
     }
 }
 
@@ -107,8 +123,9 @@ impl InitializationPlan {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitializedInstance {
+    pub(super) _key: BootstrapKeyCustody,
+    pub(super) _authority: StorageKernelResourceAuthority,
     pub(super) instance: InstanceId,
     pub(super) tenant: TenantId,
     pub(super) tenant_slug: TenantSlug,
@@ -117,6 +134,18 @@ pub struct InitializedInstance {
     pub(super) catalog_generation: u64,
     pub(super) governance_audit_frontier: u64,
     pub(super) claim_available: bool,
+}
+
+impl std::fmt::Debug for InitializedInstance {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitializedInstance")
+            .field("instance", &self.instance)
+            .field("tenant", &self.tenant)
+            .field("catalog_generation", &self.catalog_generation)
+            .field("claim_available", &self.claim_available)
+            .finish_non_exhaustive()
+    }
 }
 
 impl InitializedInstance {

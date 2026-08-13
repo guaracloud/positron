@@ -87,7 +87,7 @@ fn stale_fresh_root_proof_refuses_without_changing_the_existing_key()
 }
 
 #[test]
-fn exclusive_creation_refuses_a_racing_final_name_before_entropy()
+fn transactional_publication_preserves_a_racing_final_name_and_restartable_staging()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = SecurityRoot::create()?;
     let proof = FreshInitializationRootProof::for_test(&root.path)?;
@@ -116,7 +116,8 @@ fn exclusive_creation_refuses_a_racing_final_name_before_entropy()
         observed.map(|_| ()),
         Err(LocalKeyFailure::new(LocalKeyFailureCode::KeyAlreadyExists))
     );
-    assert!(!events.contains(&LocalKeyInitializationEvent::RequestEntropy));
+    assert!(events.contains(&LocalKeyInitializationEvent::RequestEntropy));
+    assert!(root.path.join(LOCAL_KEY_STAGING_FILE_NAME).is_file());
     let racing_bytes = Zeroizing::new(std::fs::read(final_path)?);
     assert!(
         racing_bytes.as_slice() == b"racing-entry",

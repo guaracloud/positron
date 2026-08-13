@@ -2,22 +2,25 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use zeroize::Zeroizing;
 
 use crate::catalog::{CatalogSecret, InstanceId};
 use crate::data_protection::{
-    DataProtection, FrameFormatEpoch, FrameLimits, FrameObjectContext, FrameObjectId,
-    FrameSequence, KeyEpoch, ObjectDataKey, SecretKeyInput, SystemObjectKind,
+    DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SecretKeyBytes, SecretKeyInput,
 };
 use crate::{SegmentProtectionKey, SegmentScope};
+use positron_domain::identity::TenantId;
 
 use super::bootstrap::{FreshInitializationRootProof, initialize_local_key};
 use super::persistence::open_existing_local_key;
 use super::{LocalKeyFailure, VerifiedLocalKey};
 
-const DERIVATION_DOMAIN: &[u8] = b"positron-instance-bootstrap-derivation-v1\0";
 const ENVELOPE_MAGIC: [u8; 8] = *b"POSBOOT1";
 const ENVELOPE_BYTES_LIMIT: u32 = 1_048_960;
+const ENVELOPE_HEADER_BYTES: usize = 49;
+
+mod derivation;
+use derivation::{derive_child, object_context, tenant_object_id, wrapped_context};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapObjectPurpose {
@@ -165,8 +168,9 @@ impl BootstrapKeyCustody {
         &self,
         instance: InstanceId,
     ) -> Result<CatalogSecret, BootstrapKeyFailure> {
-        let marker = self.derive(instance, b"catalog-marker", &[])?;
-        let wrapping = self.derive(instance, b"catalog-wrapping", &[])?;
+        let system = self.system_kek(instance)?;
+        let marker = derive_child(&system, instance, b"catalog-marker", &[])?;
+        let wrapping = derive_child(&system, instance, b"catalog-wrapping-kek", &[])?;
         Ok(CatalogSecret::from_owned(marker, wrapping))
     }
 
@@ -175,15 +179,41 @@ impl BootstrapKeyCustody {
         instance: InstanceId,
         scope: SegmentScope,
     ) -> Result<SegmentProtectionKey, BootstrapKeyFailure> {
-        let mut context = Vec::with_capacity(23);
+        let system = self.system_kek(instance)?;
+        let tenant = derive_child(
+            &system,
+            instance,
+            b"tenant-kek",
+            &scope.tenant_id().to_bytes(),
+        )?;
+        let tenant = SecretKeyBytes::from_owned(tenant);
+        let mut context = Zeroizing::new(Vec::with_capacity(23));
         context.extend_from_slice(&scope.tenant_id().to_bytes());
         context.push(match scope.signal_kind() {
             positron_domain::routing::SignalKind::Logs => 1,
             positron_domain::routing::SignalKind::Traces => 2,
         });
         context.extend_from_slice(&scope.shard_id().value().to_be_bytes());
-        self.derive(instance, b"active-segment", &context)
+        derive_child(&tenant, instance, b"active-segment-wrapping-kek", &context)
             .map(SegmentProtectionKey::from_owned)
+    }
+
+    pub fn tenant_key_envelope(
+        &self,
+        instance: InstanceId,
+        tenant: TenantId,
+    ) -> Result<Vec<u8>, BootstrapKeyFailure> {
+        let system = self.system_kek(instance)?;
+        let tenant_key = derive_child(&system, instance, b"tenant-kek", &tenant.to_bytes())?;
+        let object_id = tenant_object_id(tenant)?;
+        let context = object_context(object_id)?;
+        let object_key = ObjectDataKey::import(SecretKeyInput::from_owned(tenant_key), context);
+        DataProtection::wrap_key_payload(
+            &system,
+            &object_key,
+            wrapped_context(instance, BootstrapObjectPurpose::Initialized, object_id)?,
+        )
+        .map_err(map_frame)
     }
 
     pub fn protect(
@@ -204,7 +234,8 @@ impl BootstrapKeyCustody {
         instance: InstanceId,
         plaintext: &[u8; 32],
     ) -> Result<Vec<u8>, BootstrapKeyFailure> {
-        let derived = self.derive(instance, b"instance-integrity-object", &[])?;
+        let system = self.system_kek(instance)?;
+        let derived = derive_child(&system, instance, b"instance-integrity-object", &[])?;
         let mut object_id = [0_u8; 16];
         object_id.copy_from_slice(derived.get(..16).ok_or(BootstrapKeyFailure::InvalidInput)?);
         if object_id.iter().all(|byte| *byte == 0) {
@@ -225,8 +256,12 @@ impl BootstrapKeyCustody {
         object_id: [u8; 16],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, BootstrapKeyFailure> {
-        let key = self.object_key(instance, purpose, object_id)?;
         let context = object_context(object_id)?;
+        let system = self.system_kek(instance)?;
+        let key = self.object_key(&system, instance, purpose, object_id)?;
+        let wrapped_context = wrapped_context(instance, purpose, object_id)?;
+        let wrapped =
+            DataProtection::wrap_key_payload(&system, &key, wrapped_context).map_err(map_frame)?;
         let frame = DataProtection::protect_frame(
             &key,
             context
@@ -237,14 +272,22 @@ impl BootstrapKeyCustody {
         )
         .map_err(map_frame)?;
         let frame_bytes = frame.as_bytes();
+        let wrapped_length =
+            u32::try_from(wrapped.len()).map_err(|_| BootstrapKeyFailure::LimitExceeded)?;
         let frame_length =
             u32::try_from(frame_bytes.len()).map_err(|_| BootstrapKeyFailure::LimitExceeded)?;
-        let mut encoded = Vec::with_capacity(45_usize.saturating_add(frame_bytes.len()));
+        let mut encoded = Vec::with_capacity(
+            ENVELOPE_HEADER_BYTES
+                .saturating_add(wrapped.len())
+                .saturating_add(frame_bytes.len()),
+        );
         encoded.extend_from_slice(&ENVELOPE_MAGIC);
         encoded.push(purpose.tag());
         encoded.extend_from_slice(&instance.to_bytes());
         encoded.extend_from_slice(&object_id);
+        encoded.extend_from_slice(&wrapped_length.to_be_bytes());
         encoded.extend_from_slice(&frame_length.to_be_bytes());
+        encoded.extend_from_slice(&wrapped);
         encoded.extend_from_slice(frame_bytes);
         Ok(encoded)
     }
@@ -254,7 +297,7 @@ impl BootstrapKeyCustody {
         instance: InstanceId,
         purpose: BootstrapObjectPurpose,
         encoded: &[u8],
-    ) -> Result<Vec<u8>, BootstrapKeyFailure> {
+    ) -> Result<Zeroizing<Vec<u8>>, BootstrapKeyFailure> {
         if encoded.get(..8) != Some(ENVELOPE_MAGIC.as_slice())
             || encoded.get(8).copied() != Some(purpose.tag())
         {
@@ -267,19 +310,39 @@ impl BootstrapKeyCustody {
             .get(25..41)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(BootstrapKeyFailure::Authentication)?;
-        let frame_length = encoded
+        let wrapped_length = encoded
             .get(41..45)
             .and_then(|bytes| bytes.try_into().ok())
             .map(u32::from_be_bytes)
             .ok_or(BootstrapKeyFailure::Authentication)?;
+        let frame_length = encoded
+            .get(45..49)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_be_bytes)
+            .ok_or(BootstrapKeyFailure::Authentication)?;
+        let wrapped_end = ENVELOPE_HEADER_BYTES
+            .checked_add(
+                usize::try_from(wrapped_length).map_err(|_| BootstrapKeyFailure::Authentication)?,
+            )
+            .ok_or(BootstrapKeyFailure::Authentication)?;
+        let wrapped = encoded
+            .get(ENVELOPE_HEADER_BYTES..wrapped_end)
+            .ok_or(BootstrapKeyFailure::Authentication)?;
         let frame = encoded
-            .get(45..)
+            .get(wrapped_end..)
             .ok_or(BootstrapKeyFailure::Authentication)?;
         if usize::try_from(frame_length).ok() != Some(frame.len()) {
             return Err(BootstrapKeyFailure::Authentication);
         }
-        let key = self.object_key(instance, purpose, object_id)?;
+        let system = self.system_kek(instance)?;
         let context = object_context(object_id)?;
+        let key = DataProtection::unwrap_key_payload(
+            &system,
+            wrapped,
+            wrapped_context(instance, purpose, object_id)?,
+            context,
+        )
+        .map_err(map_frame)?;
         DataProtection::open_frame(
             &key,
             context
@@ -288,24 +351,8 @@ impl BootstrapKeyCustody {
             frame,
             FrameLimits::new(ENVELOPE_BYTES_LIMIT).map_err(map_frame)?,
         )
-        .map(|verified| verified.as_plaintext().to_vec())
+        .map(|verified| Zeroizing::new(verified.as_plaintext().to_vec()))
         .map_err(map_frame)
-    }
-
-    pub fn routed_instance(
-        purpose: BootstrapObjectPurpose,
-        encoded: &[u8],
-    ) -> Result<InstanceId, BootstrapKeyFailure> {
-        if encoded.get(..8) != Some(ENVELOPE_MAGIC.as_slice())
-            || encoded.get(8).copied() != Some(purpose.tag())
-        {
-            return Err(BootstrapKeyFailure::Authentication);
-        }
-        let instance: [u8; 16] = encoded
-            .get(9..25)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or(BootstrapKeyFailure::Authentication)?;
-        InstanceId::new(instance).map_err(|_| BootstrapKeyFailure::InvalidInput)
     }
 
     pub fn salted_secret_hash(
@@ -313,7 +360,7 @@ impl BootstrapKeyCustody {
         salt: &[u8; 32],
         secret: &[u8; 32],
     ) -> Result<[u8; 32], BootstrapKeyFailure> {
-        let mut input = Vec::with_capacity(96);
+        let mut input = Zeroizing::new(Vec::with_capacity(96));
         input.extend_from_slice(b"positron-bootstrap-api-key-hash-v1\0");
         input.extend_from_slice(salt);
         input.extend_from_slice(secret);
@@ -324,13 +371,9 @@ impl BootstrapKeyCustody {
         &self,
         private_seed: &[u8; 32],
     ) -> Result<BootstrapIntegrityIdentity, BootstrapKeyFailure> {
-        let key_pair = Ed25519KeyPair::from_seed_unchecked(private_seed)
-            .map_err(|_| BootstrapKeyFailure::InvalidInput)?;
-        let public_key: [u8; 32] = key_pair
-            .public_key()
-            .as_ref()
-            .try_into()
-            .map_err(|_| BootstrapKeyFailure::InvalidInput)?;
+        let public_key =
+            DataProtection::ed25519_public_key(SecretKeyInput::from_owned(Box::new(*private_seed)))
+                .map_err(map_frame)?;
         let mut input = Vec::with_capacity(72);
         input.extend_from_slice(b"positron-instance-integrity-key-fingerprint-v1\0");
         input.extend_from_slice(&public_key);
@@ -340,54 +383,6 @@ impl BootstrapKeyCustody {
             fingerprint,
         })
     }
-
-    fn object_key(
-        &self,
-        instance: InstanceId,
-        purpose: BootstrapObjectPurpose,
-        object_id: [u8; 16],
-    ) -> Result<ObjectDataKey, BootstrapKeyFailure> {
-        let mut derivation_context = [0_u8; 17];
-        derivation_context[0] = purpose.tag();
-        derivation_context[1..].copy_from_slice(&object_id);
-        let derived = self.derive(instance, b"bootstrap-object", &derivation_context)?;
-        let context = object_context(object_id)?;
-        Ok(ObjectDataKey::import(
-            SecretKeyInput::from_owned(derived),
-            context,
-        ))
-    }
-
-    fn derive(
-        &self,
-        instance: InstanceId,
-        purpose: &[u8],
-        context: &[u8],
-    ) -> Result<Box<[u8; 32]>, BootstrapKeyFailure> {
-        let mut input = Vec::with_capacity(
-            DERIVATION_DOMAIN
-                .len()
-                .saturating_add(16)
-                .saturating_add(purpose.len())
-                .saturating_add(context.len()),
-        );
-        input.extend_from_slice(DERIVATION_DOMAIN);
-        input.extend_from_slice(&instance.to_bytes());
-        input.extend_from_slice(purpose);
-        input.extend_from_slice(context);
-        DataProtection::authenticate(&self.key.root_key.0, &input)
-            .map(Box::new)
-            .map_err(map_frame)
-    }
-}
-
-fn object_context(object_id: [u8; 16]) -> Result<FrameObjectContext, BootstrapKeyFailure> {
-    Ok(FrameObjectContext::system(
-        SystemObjectKind::InstanceBootstrap,
-        FrameObjectId::new(object_id).map_err(map_frame)?,
-        KeyEpoch::new(1),
-        FrameFormatEpoch::new(1).map_err(map_frame)?,
-    ))
 }
 
 fn map_local(_failure: LocalKeyFailure) -> BootstrapKeyFailure {

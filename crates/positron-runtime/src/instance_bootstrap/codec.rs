@@ -25,12 +25,12 @@ pub(super) struct BootstrapRecord {
 }
 
 impl BootstrapRecord {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(if self.api_key_secret.is_some() {
+    pub(super) fn encode(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Zeroizing::new(Vec::with_capacity(if self.api_key_secret.is_some() {
             RECORD_BYTES_WITH_SECRET
         } else {
             RECORD_BYTES_WITHOUT_SECRET
-        });
+        }));
         bytes.extend_from_slice(if self.api_key_secret.is_some() {
             &PENDING_MAGIC
         } else {
@@ -123,8 +123,8 @@ pub(super) fn encode_claim(
     instance: InstanceId,
     principal: PrincipalId,
     secret: &[u8; 32],
-) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(CLAIM_BYTES);
+) -> Zeroizing<Vec<u8>> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(CLAIM_BYTES));
     bytes.extend_from_slice(&CLAIM_MAGIC);
     bytes.extend_from_slice(&instance.to_bytes());
     bytes.extend_from_slice(&principal.to_bytes());
@@ -135,7 +135,7 @@ pub(super) fn encode_claim(
 pub(super) fn decode_claim(
     expected_instance: InstanceId,
     bytes: &[u8],
-) -> Result<(PrincipalId, Box<[u8; 32]>), BootstrapFailure> {
+) -> Result<(PrincipalId, Zeroizing<[u8; 32]>), BootstrapFailure> {
     if bytes.len() != CLAIM_BYTES || bytes.get(..8) != Some(CLAIM_MAGIC.as_slice()) {
         return Err(corrupt());
     }
@@ -146,7 +146,7 @@ pub(super) fn decode_claim(
     }
     Ok((
         PrincipalId::from_bytes(array(bytes, 24, 40)?).map_err(|_| corrupt())?,
-        Box::new(array(bytes, 40, 72)?),
+        Zeroizing::new(array(bytes, 40, 72)?),
     ))
 }
 

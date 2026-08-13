@@ -10,6 +10,13 @@ use positron_kernel::{
 use super::{BootstrapFailure, BootstrapFailureCode};
 
 const DIMENSIONS: usize = 11;
+const DEFAULT_TENANT_QUOTA: [u64; DIMENSIONS] = [
+    5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+];
+
+pub(super) const fn initial_tenant_quota() -> [u64; DIMENSIONS] {
+    DEFAULT_TENANT_QUOTA
+}
 
 pub(super) fn establish(
     volume: OwnedPrimaryDataVolume,
@@ -28,9 +35,7 @@ pub(super) fn establish(
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
-    let ordinary_capacity = ResourceAmounts::new([
-        5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
-    ]);
+    let ordinary_capacity = ResourceAmounts::new(DEFAULT_TENANT_QUOTA);
     let governed = add(recovery_capacity, ordinary_capacity)?;
     let raw = add(
         governed,

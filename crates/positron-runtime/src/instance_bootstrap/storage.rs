@@ -2,6 +2,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
+use positron_kernel::{BootstrapKeyCustody, BootstrapObjectPurpose};
+
+use super::codec::BootstrapRecord;
 use super::{BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState};
 
 pub(super) const PENDING: &str = ".positron-bootstrap.pending";
@@ -9,6 +12,7 @@ pub(super) const INITIALIZED_TEMP: &str = ".positron-bootstrap.initialized.new";
 pub(super) const INITIALIZED: &str = ".positron-bootstrap.initialized";
 pub(super) const CLAIM: &str = "bootstrap-claim.v1";
 pub(super) const LOCAL_KEY: &str = "local-root-key.v1";
+pub(super) const LOCAL_KEY_STAGING: &str = "local-root-key.v1.new";
 pub(super) const INTENT: &[u8] = b"positron-bootstrap-in-progress-v1";
 const MAX_ARTIFACT_BYTES: u64 = 2_097_152;
 
@@ -59,7 +63,7 @@ fn event(event: BootstrapFileEvent) -> Result<(), BootstrapFailure> {
 pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
     let data = entries(&paths.data)?;
     let secrets = entries(&paths.secrets)?;
-    if data.is_empty() && secrets.is_empty() {
+    if data.iter().all(|name| name == ".positron-volume.lock") && secrets.is_empty() {
         return Ok(BootstrapState::Empty);
     }
     let has_key = secrets.iter().any(|name| name == LOCAL_KEY);
@@ -80,16 +84,31 @@ pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, Bootstr
     });
     let known_secrets = secrets
         .iter()
-        .all(|name| matches!(name.as_str(), LOCAL_KEY | CLAIM));
+        .all(|name| matches!(name.as_str(), LOCAL_KEY | LOCAL_KEY_STAGING | CLAIM));
     if !known_data || !known_secrets {
         return Ok(BootstrapState::Inconsistent);
     }
-    if has_initialized && has_key && !has_pending {
-        return Ok(BootstrapState::Initialized);
+    if has_initialized && has_pending {
+        return Ok(BootstrapState::Inconsistent);
+    }
+    if has_initialized && has_key {
+        let required_storage =
+            data.iter().any(|name| name == "catalog") && data.iter().any(|name| name == "segments");
+        return Ok(
+            if required_storage
+                && authenticated_record(paths, INITIALIZED, BootstrapObjectPurpose::Initialized)
+            {
+                BootstrapState::Initialized
+            } else {
+                BootstrapState::Inconsistent
+            },
+        );
     }
     if has_pending {
         if !has_key {
-            let raw_intent_only = secrets.is_empty()
+            let staged_key_only =
+                secrets.is_empty() || (secrets.len() == 1 && secrets[0] == LOCAL_KEY_STAGING);
+            let raw_intent_only = staged_key_only
                 && data
                     .iter()
                     .all(|name| matches!(name.as_str(), PENDING | ".positron-volume.lock"))
@@ -100,9 +119,40 @@ pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, Bootstr
                 BootstrapState::Inconsistent
             });
         }
-        return Ok(BootstrapState::Incomplete);
+        let pending_valid = !data.iter().any(|name| name == PENDING)
+            || authenticated_record(paths, PENDING, BootstrapObjectPurpose::Pending);
+        let staged_valid = !data.iter().any(|name| name == INITIALIZED_TEMP)
+            || authenticated_record(paths, INITIALIZED_TEMP, BootstrapObjectPurpose::Initialized);
+        return Ok(if pending_valid && staged_valid {
+            BootstrapState::Incomplete
+        } else {
+            BootstrapState::Inconsistent
+        });
     }
     Ok(BootstrapState::Inconsistent)
+}
+
+fn authenticated_record(
+    paths: &BootstrapPaths,
+    name: &str,
+    purpose: BootstrapObjectPurpose,
+) -> bool {
+    let Ok(key) = BootstrapKeyCustody::open(&paths.secrets) else {
+        return false;
+    };
+    let Ok(encoded) = read(&paths.data, name) else {
+        return false;
+    };
+    let Ok(instance) = BootstrapKeyCustody::routed_instance(purpose, &encoded) else {
+        return false;
+    };
+    let Ok(plaintext) = key.open_object(instance, purpose, &encoded) else {
+        return false;
+    };
+    let Ok(record) = BootstrapRecord::decode(&plaintext) else {
+        return false;
+    };
+    record.instance == instance && record.key == key.identity()
 }
 
 fn entries(root: &Path) -> Result<Vec<String>, BootstrapFailure> {

@@ -17,7 +17,7 @@ pub enum InstanceBootstrap {}
 
 impl InstanceBootstrap {
     pub fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
-        storage::classify(paths)
+        operation::classify(paths)
     }
 
     pub fn initialize(

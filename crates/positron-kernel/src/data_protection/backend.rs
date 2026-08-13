@@ -2,6 +2,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_kw::{KeyInit as KeyWrapInit, KwpAes256};
 use hmac::{Hmac, Mac};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -69,6 +70,7 @@ pub(super) enum CryptoBackendFailure {
     OpenFailed,
     WrapFailed,
     UnwrapFailed,
+    SignatureFailed,
 }
 
 pub(super) trait CryptoBackend {
@@ -123,6 +125,13 @@ pub(super) trait CryptoBackend {
         wrapped: &[u8],
     ) -> Result<SecretPlaintext, CryptoBackendFailure> {
         RustCryptoBackend.unwrap_key_aes_256_kwp(key, wrapped)
+    }
+
+    fn ed25519_public_key(
+        &self,
+        private_seed: &SecretKeyBytes,
+    ) -> Result<[u8; 32], CryptoBackendFailure> {
+        RustCryptoBackend.ed25519_public_key(private_seed)
     }
 }
 
@@ -220,6 +229,18 @@ impl CryptoBackend for RustCryptoBackend {
         wrapped: &[u8],
     ) -> Result<SecretPlaintext, CryptoBackendFailure> {
         aes_kwp_unwrap(key, wrapped)
+    }
+
+    fn ed25519_public_key(
+        &self,
+        private_seed: &SecretKeyBytes,
+    ) -> Result<[u8; 32], CryptoBackendFailure> {
+        Ed25519KeyPair::from_seed_unchecked(private_seed.expose_to_backend())
+            .map_err(|_| CryptoBackendFailure::SignatureFailed)?
+            .public_key()
+            .as_ref()
+            .try_into()
+            .map_err(|_| CryptoBackendFailure::SignatureFailed)
     }
 }
 

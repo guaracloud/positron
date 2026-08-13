@@ -8,6 +8,7 @@ use libfuzzer_sys::fuzz_target;
 use positron_runtime::{
     BootstrapFailureCode, BootstrapPaths, InitializationPlan, InstanceBootstrap,
 };
+use positron_kernel::MountQualification;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -38,7 +39,7 @@ impl FuzzRoots {
     }
 
     fn paths(&self) -> Option<BootstrapPaths> {
-        BootstrapPaths::new(&self.data, &self.secrets).ok()
+        BootstrapPaths::new(&self.data, &self.secrets, MountQualification::LocalHost).ok()
     }
 }
 

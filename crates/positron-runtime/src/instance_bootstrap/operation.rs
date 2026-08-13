@@ -1,10 +1,10 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_governance::InitialGovernanceIntent;
+use positron_governance::{InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
-    ActiveSegmentLedger, AuditIntent, BootstrapKeyCustody, BootstrapKeyIdentity,
-    BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal, FormatEpoch, InstanceId,
-    MountQualification, PrimaryDataVolume, SegmentScope, TransactionId,
+    ActiveSegmentLedger, AuditIntent, BootstrapKeyCustody, BootstrapObjectPurpose, Catalog,
+    CatalogObject, CatalogProposal, FormatEpoch, InstanceId, OwnedPrimaryDataVolume, SegmentScope,
+    StorageKernelResourceAuthority, TransactionId,
 };
 use zeroize::Zeroizing;
 
@@ -15,29 +15,53 @@ use super::{
     InitializationPlan, InitializedInstance, resources,
 };
 
+pub(super) mod support;
+use support::{
+    acquire, catalog_failure, entropy_failure, format_secret, inconsistent, key_failure,
+    require_key_identity,
+};
+
+pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
+    let state = storage::classify(paths)?;
+    if state != BootstrapState::Initialized {
+        return Ok(state);
+    }
+    match reopen(paths) {
+        Ok(initialized) => {
+            drop(initialized);
+            Ok(BootstrapState::Initialized)
+        },
+        Err(_) => Ok(BootstrapState::Inconsistent),
+    }
+}
+
 pub(super) fn initialize(
     paths: &BootstrapPaths,
     plan: InitializationPlan,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     match storage::classify(paths)? {
-        BootstrapState::Empty => storage::write_new(&paths.data, PENDING, INTENT)?,
+        BootstrapState::Empty => {
+            let volume = acquire(paths)?;
+            storage::write_new(&paths.data, PENDING, INTENT)?;
+            return resume(paths, plan, volume);
+        },
         BootstrapState::Incomplete => {},
         BootstrapState::Initialized => return reopen(paths),
         BootstrapState::Inconsistent => return Err(inconsistent()),
     }
-    resume(paths, plan)
+    resume(paths, plan, acquire(paths)?)
 }
 
 fn resume(
     paths: &BootstrapPaths,
     plan: InitializationPlan,
+    volume: OwnedPrimaryDataVolume,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     if storage::exists(&paths.data, INITIALIZED_TEMP) && !storage::exists(&paths.data, PENDING) {
         storage::publish_initialized(&paths.data)?;
+        drop(volume);
         return reopen(paths);
     }
-    let volume = PrimaryDataVolume::acquire(&paths.data, MountQualification::LocalHost)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::StorageUnavailable))?;
     let key = if storage::exists(&paths.secrets, LOCAL_KEY) {
         BootstrapKeyCustody::open(&paths.secrets).map_err(key_failure)?
     } else {
@@ -85,18 +109,29 @@ fn resume(
     let protected_integrity = key
         .protect_instance_integrity_key(record.instance, integrity_secret)
         .map_err(key_failure)?;
-    let governance = InitialGovernanceIntent::new(
+    let tenant_key_envelope = key
+        .tenant_key_envelope(record.instance, record.tenant)
+        .map_err(key_failure)?;
+    let tenant_intent = InitialTenantIntent::new(
         record.instance.to_bytes(),
         record.tenant,
-        &BootstrapRecord::tenant_slug()?,
+        BootstrapRecord::tenant_slug()?,
+        "Default tenant",
         record.administrator,
         record.api_key_salt,
         record.api_key_hash,
         integrity_identity.public_key(),
         record.integrity_fingerprint,
-        &protected_integrity,
+        protected_integrity,
+        tenant_key_envelope,
+        2_592_000,
+        1,
+        1,
+        resources::initial_tenant_quota(),
     )
     .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let governance = InitialGovernanceIntent::create_tenant(tenant_intent)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let (governance_object, audit_intent) = governance.into_parts();
     let initial = catalog
         .commit(
@@ -128,16 +163,15 @@ fn resume(
     }
     storage::remove(&paths.data, PENDING)?;
     storage::publish_initialized(&paths.data)?;
-    outcome(
-        &record,
-        current.number(),
-        initial
-            .governance_audit_record()
-            .map_or(current.governance_audit_frontier(), |audit| {
-                audit.position()
-            }),
-        storage::exists(&paths.secrets, CLAIM),
-    )
+    let generation = current.number();
+    let audit = initial
+        .governance_audit_record()
+        .map_or(current.governance_audit_frontier(), |audit| {
+            audit.position()
+        });
+    let claim_available = storage::exists(&paths.secrets, CLAIM);
+    drop(catalog);
+    outcome(&record, key, authority, generation, audit, claim_available)
 }
 
 pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, BootstrapFailure> {
@@ -148,8 +182,7 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let encoded = storage::read(&paths.data, INITIALIZED)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
     require_key_identity(&record, key.identity())?;
-    let volume = PrimaryDataVolume::acquire(&paths.data, MountQualification::LocalHost)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::StorageUnavailable))?;
+    let volume = acquire(paths)?;
     let authority = resources::establish(volume, record.tenant)?;
     let catalog = Catalog::open(
         &authority,
@@ -162,12 +195,11 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     }
     open_initial_ledgers(&authority, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
-    outcome(
-        &record,
-        current.number(),
-        current.governance_audit_frontier(),
-        storage::exists(&paths.secrets, CLAIM),
-    )
+    let generation = current.number();
+    let audit = current.governance_audit_frontier();
+    let claim_available = storage::exists(&paths.secrets, CLAIM);
+    drop(catalog);
+    outcome(&record, key, authority, generation, audit, claim_available)
 }
 
 pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapFailure> {
@@ -195,7 +227,7 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
             BootstrapFailureCode::IdentityMismatch,
         ));
     }
-    let secret = Zeroizing::new(format_secret(secret.as_ref()));
+    let secret = Zeroizing::new(format_secret(&secret));
     storage::remove(&paths.secrets, CLAIM)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ClaimDestructionFailed))?;
     Ok(BootstrapClaim { principal, secret })
@@ -300,11 +332,15 @@ fn ensure_claim(
 
 fn outcome(
     record: &BootstrapRecord,
+    key: BootstrapKeyCustody,
+    authority: StorageKernelResourceAuthority,
     generation: u64,
     audit: u64,
     claim_available: bool,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     Ok(InitializedInstance {
+        _key: key,
+        _authority: authority,
         instance: record.instance,
         tenant: record.tenant,
         tenant_slug: BootstrapRecord::tenant_slug()?,
@@ -314,74 +350,4 @@ fn outcome(
         governance_audit_frontier: audit,
         claim_available,
     })
-}
-
-fn require_key_identity(
-    record: &BootstrapRecord,
-    actual: BootstrapKeyIdentity,
-) -> Result<(), BootstrapFailure> {
-    if record.key == actual {
-        Ok(())
-    } else {
-        Err(BootstrapFailure::new(
-            BootstrapFailureCode::IdentityMismatch,
-        ))
-    }
-}
-
-fn format_secret(secret: &[u8; 32]) -> String {
-    let mut result = String::with_capacity(68);
-    result.push_str("pos_");
-    for byte in secret {
-        result.push(hex_digit(byte >> 4));
-        result.push(hex_digit(byte & 0x0f));
-    }
-    result
-}
-
-const fn hex_digit(value: u8) -> char {
-    match value {
-        0 => '0',
-        1 => '1',
-        2 => '2',
-        3 => '3',
-        4 => '4',
-        5 => '5',
-        6 => '6',
-        7 => '7',
-        8 => '8',
-        9 => '9',
-        10 => 'a',
-        11 => 'b',
-        12 => 'c',
-        13 => 'd',
-        14 => 'e',
-        15 => 'f',
-        _ => '?',
-    }
-}
-
-fn inconsistent() -> BootstrapFailure {
-    BootstrapFailure::new(BootstrapFailureCode::InconsistentRoots)
-}
-
-fn entropy_failure() -> BootstrapFailure {
-    BootstrapFailure::new(BootstrapFailureCode::EntropyUnavailable)
-}
-
-fn key_failure(failure: positron_kernel::BootstrapKeyFailure) -> BootstrapFailure {
-    let code = match failure {
-        positron_kernel::BootstrapKeyFailure::Custody => {
-            BootstrapFailureCode::KeyCustodyUnavailable
-        },
-        positron_kernel::BootstrapKeyFailure::Entropy => BootstrapFailureCode::EntropyUnavailable,
-        positron_kernel::BootstrapKeyFailure::Authentication
-        | positron_kernel::BootstrapKeyFailure::InvalidInput
-        | positron_kernel::BootstrapKeyFailure::LimitExceeded => BootstrapFailureCode::CorruptState,
-    };
-    BootstrapFailure::new(code)
-}
-
-fn catalog_failure(_failure: positron_kernel::CatalogFailure) -> BootstrapFailure {
-    BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable)
 }
