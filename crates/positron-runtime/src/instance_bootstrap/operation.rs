@@ -17,7 +17,8 @@ use super::{
 
 mod completion;
 pub(super) mod support;
-use completion::{ensure_claim, governance_audit_records, open_initial_ledgers, outcome};
+pub(super) use completion::governance_audit_records;
+use completion::{ensure_claim, open_initial_ledgers, outcome};
 use support::{
     acquire, catalog_failure, entropy_failure, format_secret, inconsistent, key_failure,
     recover_pending_replacement, require_key_identity,

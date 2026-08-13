@@ -86,16 +86,19 @@ pub(super) fn outcome(
     })
 }
 
-pub(super) fn governance_audit_records(
+pub(in crate::instance_bootstrap) fn governance_audit_records(
     catalog: &Catalog<'_>,
 ) -> Result<Vec<GovernanceAuditEntry>, BootstrapFailure> {
     catalog
         .governance_audit_records()
         .map_err(catalog_failure)?
         .iter()
-        .map(|record| {
-            GovernanceAuditEntry::decode(record)
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
+        .filter_map(|record| match GovernanceAuditEntry::project(record) {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None,
+            Err(_) => Some(Err(BootstrapFailure::new(
+                BootstrapFailureCode::CorruptState,
+            ))),
         })
         .collect()
 }

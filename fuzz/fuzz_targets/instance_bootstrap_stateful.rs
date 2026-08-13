@@ -177,6 +177,19 @@ fuzz_target!(|data: &[u8]| {
                             )
                             .is_err()
                     );
+                    let adversarial = PresentedCredential::parse(secret)
+                        .expect("a claimed credential retains canonical syntax");
+                    let failure = instance
+                        .attribute(
+                            adversarial,
+                            RequestedIntent::SystemAdministration,
+                            CompatibilityHints::fuzz_adversarial(&data[index..]),
+                        )
+                        .expect_err("proxy and nested tenant claims cannot select authority");
+                    assert_eq!(
+                        failure.to_string(),
+                        "credential or authority was rejected"
+                    );
                 }
             },
             7 => {

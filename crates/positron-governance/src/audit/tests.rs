@@ -1,6 +1,6 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 
-use super::GovernanceAuditEntry;
+use super::{GovernanceAuditEntry, root_rotation_intent_is_valid};
 use crate::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 
 fn audit_intent() -> Vec<u8> {
@@ -68,4 +68,25 @@ fn audit_decoder_rejects_truncation_corruption_and_trailing_data() {
         invalid_tag[offset] = value;
         assert!(GovernanceAuditEntry::decode_intent(1, &invalid_tag).is_err());
     }
+}
+
+#[test]
+fn audit_schema_router_accepts_only_complete_known_rotation_records() {
+    let mut valid = b"catalog-root-rotation-v1\0completed\0".to_vec();
+    valid.extend_from_slice(&[1; 16]);
+    valid.extend_from_slice(&2_u64.to_be_bytes());
+    valid.extend_from_slice(b"approved");
+    assert!(root_rotation_intent_is_valid(&valid));
+
+    for corrupt in [
+        b"unknown-audit-v1\0completed\0".as_slice(),
+        b"catalog-root-rotation-v1\0unknown\0".as_slice(),
+        b"catalog-root-rotation-v1\0completed\0".as_slice(),
+    ] {
+        assert!(!root_rotation_intent_is_valid(corrupt));
+    }
+    let mut zero_epoch = valid;
+    let epoch_start = b"catalog-root-rotation-v1\0completed\0".len() + 16;
+    zero_epoch[epoch_start..epoch_start + 8].fill(0);
+    assert!(!root_rotation_intent_is_valid(&zero_epoch));
 }

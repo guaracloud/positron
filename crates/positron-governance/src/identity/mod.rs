@@ -57,6 +57,7 @@ impl Identity {
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, AttributionFailure> {
         if hints.external_alias.is_some()
+            || hints.has_untrusted_authority_claims()
             || !keys
                 .verify_salted_secret_hash(&self.salt, credential.secret(), &self.hash)
                 .map_err(|_| AttributionFailure)?
@@ -161,6 +162,10 @@ pub enum RequestedIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompatibilityHints {
     external_alias: Option<String>,
+    #[cfg(fuzzing)]
+    untrusted_proxy_actor: bool,
+    #[cfg(fuzzing)]
+    tenant_claims: Vec<[u8; 16]>,
 }
 
 impl CompatibilityHints {
@@ -168,6 +173,10 @@ impl CompatibilityHints {
     pub const fn none() -> Self {
         Self {
             external_alias: None,
+            #[cfg(fuzzing)]
+            untrusted_proxy_actor: false,
+            #[cfg(fuzzing)]
+            tenant_claims: Vec::new(),
         }
     }
 
@@ -184,7 +193,45 @@ impl CompatibilityHints {
         }
         Ok(Self {
             external_alias: Some(alias.to_owned()),
+            #[cfg(fuzzing)]
+            untrusted_proxy_actor: false,
+            #[cfg(fuzzing)]
+            tenant_claims: Vec::new(),
         })
+    }
+
+    /// Builds untrusted proxy and tenant-selection evidence only in fuzz
+    /// builds so arbitrary inputs exercise the real attribution boundary.
+    #[cfg(fuzzing)]
+    pub fn fuzz_adversarial(source: &[u8]) -> Self {
+        let mut tenant_claims = source
+            .chunks(16)
+            .take(2)
+            .map(|chunk| {
+                let mut claim = [0_u8; 16];
+                claim[..chunk.len()].copy_from_slice(chunk);
+                claim
+            })
+            .collect::<Vec<_>>();
+        if tenant_claims.is_empty() {
+            tenant_claims.push([1; 16]);
+        }
+        Self {
+            external_alias: None,
+            untrusted_proxy_actor: source.first().is_none_or(|byte| byte & 1 != 0),
+            tenant_claims,
+        }
+    }
+
+    fn has_untrusted_authority_claims(&self) -> bool {
+        #[cfg(fuzzing)]
+        {
+            self.untrusted_proxy_actor || !self.tenant_claims.is_empty()
+        }
+        #[cfg(not(fuzzing))]
+        {
+            false
+        }
     }
 }
 

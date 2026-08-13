@@ -1,10 +1,19 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use positron_domain::identity::Scope;
-use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_domain::identity::{PrincipalId, Scope, TenantId, TenantSlug};
+use positron_governance::{
+    CompatibilityHints, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
+    PresentedCredential, RequestedIntent,
+};
+use positron_kernel::{
+    AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogSecret, CatalogWrappingKey,
+    FormatEpoch, MountQualification, PrimaryDataVolume, TransactionId,
+};
 
 use super::super::InitializationPlan;
+use super::super::operation::governance_audit_records;
+use super::super::resources;
 use super::support::Roots;
 use crate::InstanceBootstrap;
 
@@ -123,6 +132,92 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
         CompatibilityHints::none(),
     )?;
     assert_eq!(retried.inspect_governance(context)?.audit_records(), audit);
+    Ok(())
+}
+
+#[test]
+fn initialization_audit_projection_survives_a_heterogeneous_root_rotation_chain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    catalog.rewrap(
+        TransactionId::new([44; 16])?,
+        CatalogWrappingKey::from_owned_at_epoch(Box::new([45; 32]), [46; 16], 2)?,
+        AuditIntent::new(b"approved bootstrap catalog rotation".to_vec())?,
+    )?;
+
+    assert_eq!(catalog.governance_audit_records()?.len(), 4);
+    let initialization = governance_audit_records(&catalog)?;
+    assert_eq!(initialization.len(), 1);
+    assert_eq!(initialization[0].action(), "instance.initialize");
+    Ok(())
+}
+
+#[test]
+fn heterogeneous_audit_chain_reopens_under_the_successor_catalog_route()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let tenant = TenantId::from_bytes([52; 16])?;
+    let volume =
+        PrimaryDataVolume::acquire(&roots.parent().join("data"), MountQualification::LocalHost)?;
+    let authority = resources::establish(volume, tenant)?;
+    let instance = positron_kernel::InstanceId::new([51; 16])?;
+    let marker = [53; 32];
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned_at_epoch(Box::new(marker), Box::new([54; 32]), [55; 16], 1)?,
+    )?;
+    let governance = InitialGovernanceIntent::create_tenant(InitialTenantIntent::new(
+        instance.to_bytes(),
+        tenant,
+        TenantSlug::parse_canonical("default")?,
+        "Default tenant",
+        PrincipalId::from_bytes([56; 16])?,
+        [57; 32],
+        [58; 32],
+        [59; 32],
+        [60; 32],
+        vec![61; 64],
+        vec![62; 48],
+        2_592_000,
+        1,
+        1,
+        [1; 11],
+        InitialAuditContext::new(1_725_000_001, [63; 16], true)?,
+    )?)?;
+    let (object, audit) = governance.into_parts();
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new([64; 16])?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(object)?],
+        )?,
+        Some(AuditIntent::new(audit)?),
+    )?;
+    catalog.rewrap(
+        TransactionId::new([65; 16])?,
+        CatalogWrappingKey::from_owned_at_epoch(Box::new([66; 32]), [67; 16], 2)?,
+        AuditIntent::new(b"approved governance rotation".to_vec())?,
+    )?;
+    drop(catalog);
+
+    let reopened = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned_at_epoch(Box::new(marker), Box::new([66; 32]), [67; 16], 2)?,
+    )?;
+    assert_eq!(reopened.governance_audit_records()?.len(), 4);
+    let initialization = governance_audit_records(&reopened)?;
+    assert_eq!(initialization.len(), 1);
+    assert_eq!(initialization[0].action(), "instance.initialize");
     Ok(())
 }
 

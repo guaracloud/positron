@@ -4,6 +4,7 @@ use positron_kernel::GovernanceAuditRecord;
 use crate::identity::IdentityFailure;
 
 const MAGIC: [u8; 8] = *b"POSAUD01";
+const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +44,19 @@ pub struct GovernanceAuditEntry {
 }
 
 impl GovernanceAuditEntry {
+    /// Projects a complete, kernel-validated chain record into the typed
+    /// initialization view. Known non-initialization schemas are validated and
+    /// retained by the kernel chain but deliberately omitted from this view.
+    pub fn project(record: &GovernanceAuditRecord) -> Result<Option<Self>, IdentityFailure> {
+        if record.intent().starts_with(MAGIC.as_slice()) {
+            return Self::decode(record).map(Some);
+        }
+        if root_rotation_intent_is_valid(record.intent()) {
+            return Ok(None);
+        }
+        Err(IdentityFailure)
+    }
+
     pub fn decode(record: &GovernanceAuditRecord) -> Result<Self, IdentityFailure> {
         Self::decode_intent(record.position(), record.intent())
     }
@@ -138,6 +152,34 @@ impl GovernanceAuditEntry {
     pub const fn metadata(&self) -> &InitialAuditMetadata {
         &self.metadata
     }
+}
+
+fn root_rotation_intent_is_valid(intent: &[u8]) -> bool {
+    let Some(remaining) = intent.strip_prefix(ROOT_ROTATION_MAGIC) else {
+        return false;
+    };
+    let stage_end = remaining.iter().position(|byte| *byte == 0);
+    let Some(stage_end) = stage_end else {
+        return false;
+    };
+    let Some(stage) = remaining.get(..stage_end) else {
+        return false;
+    };
+    if !matches!(stage, b"started" | b"verified" | b"completed") {
+        return false;
+    }
+    let Some(body) = remaining.get(stage_end.saturating_add(1)..) else {
+        return false;
+    };
+    body.len() >= 25
+        && body
+            .get(..16)
+            .is_some_and(|provider| provider.iter().any(|byte| *byte != 0))
+        && body
+            .get(16..24)
+            .and_then(|epoch| epoch.try_into().ok())
+            .map(u64::from_be_bytes)
+            .is_some_and(|epoch| epoch != 0)
 }
 
 struct Cursor<'a> {
