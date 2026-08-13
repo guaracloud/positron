@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use libfuzzer_sys::fuzz_target;
-use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_governance::{
+    CatalogRootRotationStage, CompatibilityHints, GovernanceAuditEntry, PresentedCredential,
+    RequestedIntent,
+};
 use positron_runtime::{
     BootstrapFailureCode, BootstrapPaths, InitializationPlan, InstanceBootstrap,
 };
@@ -71,9 +74,70 @@ fn corrupt(path: &Path, selector: usize) {
     }
 }
 
+fn heterogeneous_rotation_entries(data: &[u8]) -> Vec<GovernanceAuditEntry> {
+    let mut provider_key_reference = [0_u8; 16];
+    let provider_bytes = data.get(..data.len().min(16)).unwrap_or_default();
+    provider_key_reference[..provider_bytes.len()].copy_from_slice(provider_bytes);
+    if provider_key_reference.iter().all(|byte| *byte == 0) {
+        provider_key_reference[0] = 1;
+    }
+    let mut epoch_bytes = [0_u8; 8];
+    let epoch_source = data.get(16..data.len().min(24)).unwrap_or_default();
+    epoch_bytes[..epoch_source.len()].copy_from_slice(epoch_source);
+    let key_epoch = u64::from_be_bytes(epoch_bytes).max(1);
+    let mut transaction_id = provider_key_reference;
+    transaction_id[15] ^= 0x80;
+    if transaction_id.iter().all(|byte| *byte == 0) {
+        transaction_id[0] = 1;
+    }
+
+    [b"started".as_slice(), b"verified", b"completed"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            let mut intent = b"catalog-root-rotation-v1\0".to_vec();
+            intent.extend_from_slice(stage);
+            intent.push(0);
+            intent.extend_from_slice(&provider_key_reference);
+            intent.extend_from_slice(&key_epoch.to_be_bytes());
+            intent.extend_from_slice(b"fuzz-sensitive-metadata");
+            intent.extend_from_slice(data.get(..data.len().min(24)).unwrap_or_default());
+            let entry = positron_governance::fuzz_decode_governance_audit(
+                u64::try_from(index).expect("bounded stage") + 2,
+                transaction_id,
+                &intent,
+            )
+            .expect("complete known rotation schema");
+            let rendered = format!("{entry:?} {entry}");
+            assert!(!rendered.contains("fuzz-sensitive-metadata"));
+            entry
+        })
+        .collect()
+}
+
 fuzz_target!(|data: &[u8]| {
     let split = data.len() / 2;
     positron_governance::fuzz_parse_governance(&data[..split], &data[split..]);
+    let rotations = heterogeneous_rotation_entries(data);
+    assert_eq!(rotations.len(), 3);
+    assert_eq!(
+        rotations
+            .iter()
+            .map(|entry| entry.position())
+            .collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+    assert_eq!(
+        rotations
+            .iter()
+            .map(|entry| entry.as_catalog_root_rotation().expect("rotation").stage())
+            .collect::<Vec<_>>(),
+        [
+            CatalogRootRotationStage::Started,
+            CatalogRootRotationStage::Verified,
+            CatalogRootRotationStage::Completed,
+        ]
+    );
     if let Ok(text) = std::str::from_utf8(data) {
         if let Ok(credential) = PresentedCredential::parse(text) {
             assert!(!format!("{credential:?}").contains(text));
@@ -154,6 +218,18 @@ fuzz_target!(|data: &[u8]| {
                         .inspect_governance(authorized)
                         .expect("system administration authorizes governance inspection");
                     assert_eq!(audit.audit_records().len(), 1);
+                    let heterogeneous = audit
+                        .audit_records()
+                        .iter()
+                        .chain(rotations.iter())
+                        .collect::<Vec<_>>();
+                    assert_eq!(heterogeneous.len(), 4);
+                    for (index, entry) in heterogeneous.iter().enumerate() {
+                        assert_eq!(
+                            entry.position(),
+                            u64::try_from(index).expect("bounded audit chain") + 1
+                        );
+                    }
                     let presented = PresentedCredential::parse(secret)
                         .expect("a claimed credential retains canonical syntax");
                     assert!(

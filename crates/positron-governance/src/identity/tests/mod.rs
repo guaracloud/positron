@@ -121,6 +121,19 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
         },
         AuthorizedContext {
             principal: identity.principal,
+            scope: Scope::TenantAdministration,
+            tenant: Some(
+                TenantAttribution::new(
+                    identity.principal,
+                    Scope::TenantAdministration,
+                    identity.tenant,
+                )
+                .expect("tenant-administration context"),
+            ),
+            authority: identity.instance,
+        },
+        AuthorizedContext {
+            principal: identity.principal,
             scope: Scope::SystemAdministration,
             tenant: None,
             authority: [99; 16],

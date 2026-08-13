@@ -1,7 +1,13 @@
+mod rotation;
+
+use std::fmt::{Display, Formatter};
+
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
+
+pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
 
 const MAGIC: [u8; 8] = *b"POSAUD01";
 const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
@@ -29,9 +35,16 @@ impl InitialAuditMetadata {
     }
 }
 
-/// Administration-owned meaning reconstructed from one committed kernel audit entry.
+/// Closed Administration-owned meaning for exactly one committed kernel audit position.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GovernanceAuditEntry {
+pub enum GovernanceAuditEntry {
+    Initialization(InitializationAuditEntry),
+    CatalogRootRotation(CatalogRootRotationAuditEntry),
+}
+
+/// Typed, bounded meaning of the committed instance initialization audit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitializationAuditEntry {
     position: u64,
     ingest_time_unix_seconds: u64,
     principal: PrincipalId,
@@ -44,23 +57,86 @@ pub struct GovernanceAuditEntry {
 }
 
 impl GovernanceAuditEntry {
-    /// Projects a complete, kernel-validated chain record into the typed
-    /// initialization view. Known non-initialization schemas are validated and
-    /// retained by the kernel chain but deliberately omitted from this view.
-    pub fn project(record: &GovernanceAuditRecord) -> Result<Option<Self>, IdentityFailure> {
-        if record.intent().starts_with(MAGIC.as_slice()) {
-            return Self::decode(record).map(Some);
+    /// Decodes every supported committed schema without weakening the closed
+    /// failure for unknown or malformed records.
+    pub fn decode(record: &GovernanceAuditRecord) -> Result<Self, IdentityFailure> {
+        Self::decode_fields(
+            record.position(),
+            record.transaction().to_bytes(),
+            record.intent(),
+        )
+    }
+
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        match self {
+            Self::Initialization(entry) => entry.position(),
+            Self::CatalogRootRotation(entry) => entry.position(),
         }
-        if root_rotation_intent_is_valid(record.intent()) {
-            return Ok(None);
+    }
+
+    #[must_use]
+    pub fn action(&self) -> &str {
+        match self {
+            Self::Initialization(entry) => entry.action(),
+            Self::CatalogRootRotation(entry) => entry.action(),
+        }
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> &str {
+        match self {
+            Self::Initialization(entry) => entry.outcome(),
+            Self::CatalogRootRotation(entry) => entry.outcome(),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_initialization(&self) -> Option<&InitializationAuditEntry> {
+        match self {
+            Self::Initialization(entry) => Some(entry),
+            Self::CatalogRootRotation(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_catalog_root_rotation(&self) -> Option<&CatalogRootRotationAuditEntry> {
+        match self {
+            Self::CatalogRootRotation(entry) => Some(entry),
+            Self::Initialization(_) => None,
+        }
+    }
+
+    pub(crate) fn decode_fields(
+        position: u64,
+        transaction_id: [u8; 16],
+        intent: &[u8],
+    ) -> Result<Self, IdentityFailure> {
+        if intent.starts_with(MAGIC.as_slice()) {
+            return InitializationAuditEntry::decode_intent(position, intent)
+                .map(Self::Initialization);
+        }
+        if intent.starts_with(ROOT_ROTATION_MAGIC) {
+            return CatalogRootRotationAuditEntry::decode_intent(position, transaction_id, intent)
+                .map(Self::CatalogRootRotation);
         }
         Err(IdentityFailure)
     }
+}
 
-    pub fn decode(record: &GovernanceAuditRecord) -> Result<Self, IdentityFailure> {
-        Self::decode_intent(record.position(), record.intent())
+impl Display for GovernanceAuditEntry {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "governance audit position {}: {} {}",
+            self.position(),
+            self.action(),
+            self.outcome()
+        )
     }
+}
 
+impl InitializationAuditEntry {
     pub(crate) fn decode_intent(position: u64, encoded: &[u8]) -> Result<Self, IdentityFailure> {
         let mut cursor = Cursor::new(encoded);
         if cursor.take_array::<8>()? != MAGIC {
@@ -78,7 +154,7 @@ impl GovernanceAuditEntry {
             _ => return Err(IdentityFailure),
         };
         let action = cursor.take_text_u8(128)?.to_owned();
-        if action.is_empty() || cursor.take_u8()? != 1 {
+        if action != "instance.initialize" || cursor.take_u8()? != 1 {
             return Err(IdentityFailure);
         }
         let target = cursor.take_array()?;
@@ -87,7 +163,7 @@ impl GovernanceAuditEntry {
         }
         let outcome = cursor.take_text_u8(64)?.to_owned();
         let request_id = cursor.take_array()?;
-        if outcome.is_empty() || request_id.iter().all(|byte| *byte == 0) {
+        if outcome != "succeeded" || request_id.iter().all(|byte| *byte == 0) {
             return Err(IdentityFailure);
         }
         let non_interactive = match cursor.take_u8()? {
@@ -152,34 +228,6 @@ impl GovernanceAuditEntry {
     pub const fn metadata(&self) -> &InitialAuditMetadata {
         &self.metadata
     }
-}
-
-fn root_rotation_intent_is_valid(intent: &[u8]) -> bool {
-    let Some(remaining) = intent.strip_prefix(ROOT_ROTATION_MAGIC) else {
-        return false;
-    };
-    let stage_end = remaining.iter().position(|byte| *byte == 0);
-    let Some(stage_end) = stage_end else {
-        return false;
-    };
-    let Some(stage) = remaining.get(..stage_end) else {
-        return false;
-    };
-    if !matches!(stage, b"started" | b"verified" | b"completed") {
-        return false;
-    }
-    let Some(body) = remaining.get(stage_end.saturating_add(1)..) else {
-        return false;
-    };
-    body.len() >= 25
-        && body
-            .get(..16)
-            .is_some_and(|provider| provider.iter().any(|byte| *byte != 0))
-        && body
-            .get(16..24)
-            .and_then(|epoch| epoch.try_into().ok())
-            .map(u64::from_be_bytes)
-            .is_some_and(|epoch| epoch != 0)
 }
 
 struct Cursor<'a> {

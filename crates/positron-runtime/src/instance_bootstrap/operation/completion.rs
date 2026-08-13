@@ -93,12 +93,9 @@ pub(in crate::instance_bootstrap) fn governance_audit_records(
         .governance_audit_records()
         .map_err(catalog_failure)?
         .iter()
-        .filter_map(|record| match GovernanceAuditEntry::project(record) {
-            Ok(Some(record)) => Some(Ok(record)),
-            Ok(None) => None,
-            Err(_) => Some(Err(BootstrapFailure::new(
-                BootstrapFailureCode::CorruptState,
-            ))),
+        .map(|record| {
+            GovernanceAuditEntry::decode(record)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
         })
         .collect()
 }

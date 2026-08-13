@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use positron_domain::identity::{PrincipalId, Scope, TenantId, TenantSlug};
+use positron_domain::identity::Scope;
 use positron_governance::{
-    CompatibilityHints, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
-    PresentedCredential, RequestedIntent,
+    CatalogRootRotationStage, CompatibilityHints, InitialAuditContext, InitialGovernanceIntent,
+    InitialTenantIntent, PresentedCredential, RequestedIntent,
 };
 use positron_kernel::{
     AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogSecret, CatalogWrappingKey,
@@ -100,16 +100,23 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
     let inspection = initialized.inspect_governance(administrator_context)?;
     let audit = inspection.audit_records().to_vec();
     assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0].position(), 1);
-    assert_eq!(audit[0].principal_id(), administrator);
-    assert_eq!(audit[0].tenant_id(), Some(tenant));
-    assert_eq!(audit[0].action(), "instance.initialize");
-    assert_eq!(audit[0].outcome(), "succeeded");
-    assert!(audit[0].ingest_time_unix_seconds() > 0);
-    assert_eq!(audit[0].target(), initialized.instance_id().to_bytes());
-    assert_ne!(audit[0].request_id(), [0; 16]);
-    assert_eq!(audit[0].metadata().initialization_mode(), "non-interactive");
-    assert_eq!(audit[0].metadata().tenant_slug(), slug.as_str());
+    let initialization = audit[0].as_initialization().expect("initialization audit");
+    assert_eq!(initialization.position(), 1);
+    assert_eq!(initialization.principal_id(), administrator);
+    assert_eq!(initialization.tenant_id(), Some(tenant));
+    assert_eq!(initialization.action(), "instance.initialize");
+    assert_eq!(initialization.outcome(), "succeeded");
+    assert!(initialization.ingest_time_unix_seconds() > 0);
+    assert_eq!(
+        initialization.target(),
+        initialized.instance_id().to_bytes()
+    );
+    assert_ne!(initialization.request_id(), [0; 16]);
+    assert_eq!(
+        initialization.metadata().initialization_mode(),
+        "non-interactive"
+    );
+    assert_eq!(initialization.metadata().tenant_slug(), slug.as_str());
     assert!(inspection.contains_tenant_id(tenant));
     assert!(inspection.contains_tenant_slug(&slug));
     drop(initialized);
@@ -136,7 +143,7 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
 }
 
 #[test]
-fn initialization_audit_projection_survives_a_heterogeneous_root_rotation_chain()
+fn heterogeneous_audit_decoder_preserves_every_committed_rotation_position()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;
     let paths = roots.paths();
@@ -146,28 +153,64 @@ fn initialization_audit_projection_survives_a_heterogeneous_root_rotation_chain(
         initialized.instance,
         initialized.key.catalog_secret(initialized.instance)?,
     )?;
+    let rotation_transaction = TransactionId::new([44; 16])?;
     catalog.rewrap(
-        TransactionId::new([44; 16])?,
+        rotation_transaction,
         CatalogWrappingKey::from_owned_at_epoch(Box::new([45; 32]), [46; 16], 2)?,
-        AuditIntent::new(b"approved bootstrap catalog rotation".to_vec())?,
+        AuditIntent::new(b"sensitive operator approval".to_vec())?,
     )?;
 
-    assert_eq!(catalog.governance_audit_records()?.len(), 4);
-    let initialization = governance_audit_records(&catalog)?;
-    assert_eq!(initialization.len(), 1);
-    assert_eq!(initialization[0].action(), "instance.initialize");
+    let records = catalog.governance_audit_records()?;
+    let audit = governance_audit_records(&catalog)?;
+    assert_eq!(audit.len(), records.len());
+    assert_eq!(audit.len(), 4);
+    assert!(audit[0].as_initialization().is_some());
+    let expected = [
+        CatalogRootRotationStage::Started,
+        CatalogRootRotationStage::Verified,
+        CatalogRootRotationStage::Completed,
+    ];
+    for ((record, entry), stage) in records.iter().zip(&audit).skip(1).zip(expected) {
+        let rotation = entry.as_catalog_root_rotation().expect("rotation audit");
+        assert_eq!(entry.position(), record.position());
+        assert_eq!(rotation.stage(), stage);
+        assert_eq!(rotation.provider_key_reference(), [46; 16]);
+        assert_eq!(rotation.key_epoch(), 2);
+        assert_eq!(rotation.transaction_id(), record.transaction().to_bytes());
+        assert_ne!(rotation.transaction_id(), rotation_transaction.to_bytes());
+        assert_eq!(rotation.outcome(), "committed");
+        let rendered = format!("{entry:?} {entry}");
+        assert!(!rendered.contains("sensitive operator approval"));
+        assert!(!rendered.contains(&format!("{:?}", [45_u8; 32])));
+    }
     Ok(())
 }
 
 #[test]
-fn heterogeneous_audit_chain_reopens_under_the_successor_catalog_route()
+fn authenticated_system_administrator_reads_the_successor_heterogeneous_audit_chain()
 -> Result<(), Box<dyn std::error::Error>> {
+    let bootstrap_roots = Roots::new()?;
+    let bootstrap_paths = bootstrap_roots.paths();
+    let initialized =
+        InstanceBootstrap::initialize(&bootstrap_paths, InitializationPlan::non_interactive())?;
+    let instance = initialized.instance_id();
+    let tenant = initialized.default_tenant_id();
+    let tenant_slug = initialized.default_tenant_slug().clone();
+    let administrator = initialized.system_administrator_id();
+    drop(initialized);
+    let claim = InstanceBootstrap::claim(&bootstrap_paths)?;
+    let initialized = InstanceBootstrap::reopen(&bootstrap_paths)?;
+    let administrator_context = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    drop(initialized);
+
     let roots = Roots::new()?;
-    let tenant = TenantId::from_bytes([52; 16])?;
     let volume =
         PrimaryDataVolume::acquire(&roots.parent().join("data"), MountQualification::LocalHost)?;
     let authority = resources::establish(volume, tenant)?;
-    let instance = positron_kernel::InstanceId::new([51; 16])?;
     let marker = [53; 32];
     let catalog = Catalog::open(
         &authority,
@@ -177,9 +220,9 @@ fn heterogeneous_audit_chain_reopens_under_the_successor_catalog_route()
     let governance = InitialGovernanceIntent::create_tenant(InitialTenantIntent::new(
         instance.to_bytes(),
         tenant,
-        TenantSlug::parse_canonical("default")?,
+        tenant_slug.clone(),
         "Default tenant",
-        PrincipalId::from_bytes([56; 16])?,
+        administrator,
         [57; 32],
         [58; 32],
         [59; 32],
@@ -205,7 +248,7 @@ fn heterogeneous_audit_chain_reopens_under_the_successor_catalog_route()
     catalog.rewrap(
         TransactionId::new([65; 16])?,
         CatalogWrappingKey::from_owned_at_epoch(Box::new([66; 32]), [67; 16], 2)?,
-        AuditIntent::new(b"approved governance rotation".to_vec())?,
+        AuditIntent::new(b"sensitive successor rotation context".to_vec())?,
     )?;
     drop(catalog);
 
@@ -215,9 +258,33 @@ fn heterogeneous_audit_chain_reopens_under_the_successor_catalog_route()
         CatalogSecret::from_owned_at_epoch(Box::new(marker), Box::new([66; 32]), [67; 16], 2)?,
     )?;
     assert_eq!(reopened.governance_audit_records()?.len(), 4);
-    let initialization = governance_audit_records(&reopened)?;
-    assert_eq!(initialization.len(), 1);
-    assert_eq!(initialization[0].action(), "instance.initialize");
+    let audit = governance_audit_records(&reopened)?;
+    let identity = positron_governance::Identity::open(&reopened.pin()?)?;
+    let inspection = identity.inspect(administrator_context, &audit)?;
+    assert_eq!(inspection.audit_records().len(), 4);
+    assert_eq!(
+        inspection
+            .audit_records()
+            .iter()
+            .map(|entry| entry.position())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert!(inspection.audit_records()[0].as_initialization().is_some());
+    assert_eq!(
+        inspection.audit_records()[1..]
+            .iter()
+            .map(|entry| entry.as_catalog_root_rotation().expect("rotation").stage())
+            .collect::<Vec<_>>(),
+        [
+            CatalogRootRotationStage::Started,
+            CatalogRootRotationStage::Verified,
+            CatalogRootRotationStage::Completed,
+        ]
+    );
+    assert!(inspection.contains_tenant_id(tenant));
+    assert!(inspection.contains_tenant_slug(&tenant_slug));
+    assert!(!format!("{inspection:?}").contains("sensitive successor rotation context"));
     Ok(())
 }
 

@@ -14,7 +14,10 @@ use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 mod audit;
 mod identity;
 
-pub use audit::{GovernanceAuditEntry, InitialAuditMetadata};
+pub use audit::{
+    CatalogRootRotationAuditEntry, CatalogRootRotationStage, GovernanceAuditEntry,
+    InitialAuditMetadata, InitializationAuditEntry,
+};
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
     IdentityFailure, PresentedCredential, RequestedIntent,
@@ -242,7 +245,18 @@ impl Error for GovernanceIntentFailure {}
 #[cfg(fuzzing)]
 pub fn fuzz_parse_governance(identity: &[u8], audit: &[u8]) {
     let _ = identity::codec::decode_initial_identity(identity);
-    let _ = GovernanceAuditEntry::decode_intent(1, audit);
+    let _ = audit::InitializationAuditEntry::decode_intent(1, audit);
+}
+
+/// Exercises the closed heterogeneous audit decoder with arbitrary fields in
+/// fuzz builds; production callers receive kernel-authenticated records.
+#[cfg(fuzzing)]
+pub fn fuzz_decode_governance_audit(
+    position: u64,
+    transaction_id: [u8; 16],
+    intent: &[u8],
+) -> Result<GovernanceAuditEntry, IdentityFailure> {
+    GovernanceAuditEntry::decode_fields(position, transaction_id, intent)
 }
 
 #[cfg(test)]
