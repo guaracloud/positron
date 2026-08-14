@@ -1,6 +1,7 @@
 use super::{OtlpLogsReceiver, ReceiveFailure};
 
 mod group_capacity;
+mod json_semantics;
 mod metadata_accounting;
 mod zero_identifiers;
 

@@ -1,4 +1,14 @@
 use super::*;
+use std::sync::{Mutex, MutexGuard};
+
+static LIVE_NATIVE_TEST: Mutex<()> = Mutex::new(());
+
+pub(super) fn live_test_guard() -> MutexGuard<'static, ()> {
+    match LIVE_NATIVE_TEST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 pub(super) fn bindings(
     roots: &TestRoots,
@@ -46,7 +56,11 @@ pub(super) fn http(
     request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
     stream.write_all(body)?;
-    stream.shutdown(std::net::Shutdown::Write)?;
+    match stream.shutdown(std::net::Shutdown::Write) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {},
+        Err(error) => return Err(error.into()),
+    }
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {

@@ -20,10 +20,13 @@ fn receiver_failures_preserve_auth_capacity_and_request_classes() {
         map_receive_failure(ReceiveFailure::CapacityUnavailable),
         ServiceFailure::CapacityUnavailable
     );
+    assert_eq!(
+        map_receive_failure(ReceiveFailure::TransportLimitExceeded),
+        ServiceFailure::RequestTooLarge
+    );
     for failure in [
         ReceiveFailure::MalformedPayload,
         ReceiveFailure::MalformedCompression,
-        ReceiveFailure::TransportLimitExceeded,
         ReceiveFailure::ValueLimitExceeded,
         ReceiveFailure::TimestampOutOfRange,
         ReceiveFailure::UnsupportedValue,

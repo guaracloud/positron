@@ -24,6 +24,7 @@ use support::*;
 #[test]
 fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
     let roots = TestRoots::new("loopback")?;
     let paths = roots.paths()?;
     drop(InstanceBootstrap::initialize(
@@ -53,7 +54,13 @@ fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
     assert_status(capability.clone(), 200);
     assert!(capability.contains("\"availability\":1"));
 
-    let unauthorized = http(otlp, "POST", "/v1/logs", &[], &[0xff])?;
+    let unauthorized = http(
+        otlp,
+        "POST",
+        "/v1/logs",
+        &[("Content-Type", "application/x-protobuf")],
+        &[0xff],
+    )?;
     assert_status(unauthorized, 401);
     let body = otlp_body("durable-loopback");
     let authorization = format!(
@@ -64,11 +71,14 @@ fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
         otlp,
         "POST",
         "/v1/logs",
-        &[("Authorization", &authorization)],
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/x-protobuf"),
+        ],
         &body,
     )?;
     assert_status(accepted.clone(), 200);
-    assert!(accepted.contains("\"accepted\":1"));
+    assert!(accepted.contains("Content-Type: application/x-protobuf"));
 
     let query_secret = claim
         .query_secret()
@@ -107,6 +117,7 @@ fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
 #[test]
 fn loopback_transport_enforces_bounded_http_and_typed_statuses()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
     let roots = TestRoots::new("bounds")?;
     let paths = roots.paths()?;
     drop(InstanceBootstrap::initialize(
@@ -241,7 +252,10 @@ fn loopback_transport_enforces_bounded_http_and_typed_statuses()
             otlp,
             "POST",
             "/v1/logs",
-            &[("Authorization", &authorization)],
+            &[
+                ("Authorization", &authorization),
+                ("Content-Type", "application/x-protobuf"),
+            ],
             &[0xff],
         )?,
         400,
@@ -251,7 +265,10 @@ fn loopback_transport_enforces_bounded_http_and_typed_statuses()
             otlp,
             "POST",
             "/v1/logs",
-            &[("Authorization", "Bearer invalid")],
+            &[
+                ("Authorization", "Bearer invalid"),
+                ("Content-Type", "application/x-protobuf"),
+            ],
             &[0xff],
         )?,
         401,
@@ -267,6 +284,7 @@ fn loopback_transport_enforces_bounded_http_and_typed_statuses()
 #[test]
 fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn std::error::Error>>
 {
+    let _guard = live_test_guard();
     let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let wildcard = "0.0.0.0:1".parse()?;
     assert!(

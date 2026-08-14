@@ -3,12 +3,10 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use positron_api::generated::{ApiError, CapabilityResponse};
-use positron_ingest::IngestOutcome;
 
-use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceFailure, ServiceHandle};
+use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceHandle};
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
-const MAX_OTLP_BODY_BYTES: usize = 1_048_576;
 const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
 
 pub(super) fn serve_connection(
@@ -17,9 +15,10 @@ pub(super) fn serve_connection(
     health: &HealthState,
     services: Option<&ServiceHandle>,
 ) -> Result<(), ConnectionFailure> {
-    if stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .is_err()
+    if stream.set_nonblocking(false).is_err()
+        || stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .is_err()
         || stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .is_err()
@@ -68,9 +67,7 @@ fn route(
         },
         (ListenerRole::OtlpHttp, "POST", "/v1/logs") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
-            let bearer = head.bearer.ok_or_else(|| Response::empty(401))?;
-            let body = read_body(stream, head.content_length, MAX_OTLP_BODY_BYTES)?;
-            Ok(ingest_response(services.ingest_otlp_logs(&bearer, body)))
+            super::otlp_http::receive(stream, head, services)
         },
         (ListenerRole::Operations, _, "/health/live" | "/health/ready")
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
@@ -79,11 +76,14 @@ fn route(
     }
 }
 
-struct RequestHead {
-    method: String,
-    path: String,
-    content_length: usize,
-    bearer: Option<String>,
+pub(super) struct RequestHead {
+    pub(super) method: String,
+    pub(super) path: String,
+    pub(super) content_length: usize,
+    pub(super) bearer: Option<String>,
+    pub(super) content_type: Option<String>,
+    pub(super) content_encoding: Option<String>,
+    pub(super) tenant_hint: Option<String>,
 }
 
 fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
@@ -108,6 +108,9 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
     }
     let mut content_length = None;
     let mut bearer = None;
+    let mut content_type = None;
+    let mut content_encoding = None;
+    let mut tenant_hint = None;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').ok_or_else(|| Response::empty(400))?;
         let value = value.trim();
@@ -118,6 +121,21 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
             content_length = Some(value.parse().map_err(|_| Response::empty(400))?);
         } else if name.eq_ignore_ascii_case("authorization") {
             bearer = value.strip_prefix("Bearer ").map(ToOwned::to_owned);
+        } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type.is_some() {
+                return Err(Response::empty(400));
+            }
+            content_type = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("content-encoding") {
+            if content_encoding.is_some() {
+                return Err(Response::empty(400));
+            }
+            content_encoding = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("x-scope-orgid") {
+            if tenant_hint.is_some() {
+                return Err(Response::empty(400));
+            }
+            tenant_hint = Some(value.to_owned());
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(Response::empty(400));
         }
@@ -127,10 +145,17 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
         path: path.to_owned(),
         content_length: content_length.unwrap_or(0),
         bearer,
+        content_type,
+        content_encoding,
+        tenant_hint,
     })
 }
 
-fn read_body(stream: &mut TcpStream, length: usize, maximum: usize) -> Result<Vec<u8>, Response> {
+pub(super) fn read_body(
+    stream: &mut TcpStream,
+    length: usize,
+    maximum: usize,
+) -> Result<Vec<u8>, Response> {
     if length > maximum {
         return Err(Response::empty(413));
     }
@@ -182,57 +207,64 @@ fn capability_response(result: Result<CapabilityResponse, ApiError>) -> Response
     }
 }
 
-fn ingest_response(
-    result: Result<positron_ingest::IngestRequestOutcome, ServiceFailure>,
-) -> Response {
-    match result {
-        Ok(outcome) => match outcome.terminal_failure() {
-            Some(IngestOutcome::Retryable(_)) => {
-                Response::json(503, "{\"outcome\":\"retryable\"}".into())
-            },
-            Some(IngestOutcome::Permanent(_)) => {
-                Response::json(422, "{\"outcome\":\"rejected\"}".into())
-            },
-            Some(IngestOutcome::Ambiguous(_)) => {
-                Response::json(500, "{\"outcome\":\"ambiguous\"}".into())
-            },
-            Some(IngestOutcome::Full(_) | IngestOutcome::Partial(_)) => {
-                Response::json(500, "{\"outcome\":\"internal\"}".into())
-            },
-            None => Response::json(
-                200,
-                format!(
-                    "{{\"accepted\":{},\"rejected\":{}}}",
-                    outcome.accepted_records(),
-                    outcome.permanently_rejected_records()
-                ),
-            ),
-        },
-        Err(ServiceFailure::Unauthorized) => Response::empty(401),
-        Err(ServiceFailure::CapacityUnavailable) => Response::empty(429),
-        Err(ServiceFailure::InvalidRequest) => Response::empty(400),
-        Err(ServiceFailure::KeyUnavailable | ServiceFailure::StorageUnavailable) => {
-            Response::empty(503)
-        },
-        Err(ServiceFailure::Internal) => Response::json(500, "{\"outcome\":\"internal\"}".into()),
-    }
-}
-
-struct Response {
+pub(super) struct Response {
     status: u16,
-    body: String,
+    content_type: &'static str,
+    body: Vec<u8>,
+    retry_after_seconds: Option<u32>,
 }
 
 impl Response {
-    fn empty(status: u16) -> Self {
+    pub(super) fn empty(status: u16) -> Self {
         Self {
             status,
-            body: String::new(),
+            content_type: "application/json",
+            body: Vec::new(),
+            retry_after_seconds: None,
         }
     }
 
-    fn json(status: u16, body: String) -> Self {
-        Self { status, body }
+    pub(super) fn json(status: u16, body: String) -> Self {
+        Self {
+            status,
+            content_type: "application/json",
+            body: body.into_bytes(),
+            retry_after_seconds: None,
+        }
+    }
+
+    pub(super) fn protobuf(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            content_type: "application/x-protobuf",
+            body,
+            retry_after_seconds: None,
+        }
+    }
+
+    pub(super) const fn with_retry_after(mut self, seconds: u32) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) const fn status(&self) -> u16 {
+        self.status
+    }
+
+    #[cfg(test)]
+    pub(super) const fn content_type(&self) -> &'static str {
+        self.content_type
+    }
+
+    #[cfg(test)]
+    pub(super) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    #[cfg(test)]
+    pub(super) const fn retry_after_seconds(&self) -> Option<u32> {
+        self.retry_after_seconds
     }
 }
 
@@ -244,17 +276,24 @@ fn write_response(stream: &mut TcpStream, response: Response) -> Result<(), std:
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Content Too Large",
+        415 => "Unsupported Media Type",
         422 => "Unprocessable Content",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
+    let retry_after = response
+        .retry_after_seconds
+        .map_or_else(String::new, |seconds| format!("Retry-After: {seconds}\r\n"));
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
         response.status,
         reason,
-        response.body.len()
+        response.content_type,
+        response.body.len(),
+        retry_after
     );
     stream.write_all(header.as_bytes())?;
-    stream.write_all(response.body.as_bytes())
+    stream.write_all(&response.body)
 }

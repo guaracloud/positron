@@ -11,16 +11,15 @@ fuzz_target!(|data: &[u8]| {
         TenantId::from_bytes([2; 16]).expect("fixed tenant"),
     )
     .expect("fixed attribution");
-    let request = if data.first().is_some_and(|byte| byte & 1 == 1) {
-        AuthenticatedOtlpLogsRequest::test_only_gzip(
+    let payload = data.get(1..).unwrap_or_default().to_vec();
+    let request = match data.first().map_or(0, |byte| byte & 0b11) {
+        0 => AuthenticatedOtlpLogsRequest::test_only_protobuf(attribution, payload),
+        1 => AuthenticatedOtlpLogsRequest::test_only_gzip(attribution, payload),
+        2 => AuthenticatedOtlpLogsRequest::test_only_json(attribution, payload),
+        _ => AuthenticatedOtlpLogsRequest::test_only_gzip_json(
             attribution,
-            data.get(1..).unwrap_or_default().to_vec(),
-        )
-    } else {
-        AuthenticatedOtlpLogsRequest::test_only_protobuf(
-            attribution,
-            data.get(1..).unwrap_or_default().to_vec(),
-        )
+            payload,
+        ),
     };
     let _ = OtlpLogsReceiver::new().decode(request);
 });

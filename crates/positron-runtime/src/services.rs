@@ -9,7 +9,7 @@ use positron_governance::{
 use positron_ingest::{
     AdmissionGroupOutcome, AdmissionGroupPlanFailure, AuthenticatedOtlpLogsRequest,
     IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, OtlpLogsReceiver,
-    reserve_otlp_logs_transport,
+    OtlpLogsRequestEncoding, reserve_otlp_logs_transport,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
@@ -105,6 +105,23 @@ impl ServiceHandle {
         ingest_authenticated(self, request)
     }
 
+    pub(crate) fn ingest_encoded_otlp_logs(
+        &self,
+        context: AuthorizedContext,
+        encoding: OtlpLogsRequestEncoding,
+        body: Vec<u8>,
+        reservation: TransferredResourceReservation,
+    ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        let capacity = reservation
+            .reclaim(self.instance.resource_governor())
+            .map_err(|_| ServiceFailure::Internal)?;
+        let request = AuthenticatedOtlpLogsRequest::encoded_after_transport_admission(
+            context, encoding, body, capacity,
+        )
+        .map_err(map_receive_failure)?;
+        ingest_authenticated(self, request)
+    }
+
     #[cfg(test)]
     pub(crate) fn install_receiver_test_backend(
         &self,
@@ -117,10 +134,10 @@ impl ServiceHandle {
         Ok(())
     }
 
-    pub(crate) fn admit_otlp_grpc(
+    pub(crate) fn admit_otlp_logs(
         &self,
         context: AuthorizedContext,
-    ) -> Result<GrpcAdmissionLease, ServiceFailure> {
+    ) -> Result<OtlpAdmissionLease, ServiceFailure> {
         let reservation = reserve_otlp_logs_transport(context, self.instance.resource_governor())
             .map_err(|failure| match failure {
                 positron_ingest::ReceiveFailure::CapacityUnavailable => {
@@ -129,8 +146,8 @@ impl ServiceHandle {
                 _ => ServiceFailure::InvalidRequest,
             })?
             .transfer();
-        Ok(GrpcAdmissionLease {
-            inner: Arc::new(GrpcAdmissionLeaseInner {
+        Ok(OtlpAdmissionLease {
+            inner: Arc::new(OtlpAdmissionLeaseInner {
                 services: self.clone(),
                 reservation: Mutex::new(Some(reservation)),
             }),
@@ -228,11 +245,7 @@ fn ingest_authenticated<'authority>(
         .into_admission_groups(instance.admission_group_planner.as_ref())
         .map_err(map_admission_group_plan_failure)?;
     if groups.is_empty() {
-        return Ok(IngestRequestOutcome::new(vec![AdmissionGroupOutcome::new(
-            instance.logs_shard,
-            0,
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
-        )]));
+        return Ok(IngestRequestOutcome::new(Vec::new()));
     }
     #[cfg(test)]
     if let Some(backend) = services
@@ -308,6 +321,7 @@ fn map_admission_group_plan_failure(failure: AdmissionGroupPlanFailure) -> Servi
 pub enum ServiceFailure {
     Unauthorized,
     CapacityUnavailable,
+    RequestTooLarge,
     InvalidRequest,
     KeyUnavailable,
     StorageUnavailable,
@@ -315,16 +329,16 @@ pub enum ServiceFailure {
 }
 
 #[derive(Clone)]
-pub(crate) struct GrpcAdmissionLease {
-    inner: Arc<GrpcAdmissionLeaseInner>,
+pub(crate) struct OtlpAdmissionLease {
+    inner: Arc<OtlpAdmissionLeaseInner>,
 }
 
-struct GrpcAdmissionLeaseInner {
+struct OtlpAdmissionLeaseInner {
     services: ServiceHandle,
     reservation: Mutex<Option<TransferredResourceReservation>>,
 }
 
-impl GrpcAdmissionLease {
+impl OtlpAdmissionLease {
     pub(crate) fn take(&self) -> Result<TransferredResourceReservation, ServiceFailure> {
         self.inner
             .reservation
@@ -335,7 +349,7 @@ impl GrpcAdmissionLease {
     }
 }
 
-impl Drop for GrpcAdmissionLeaseInner {
+impl Drop for OtlpAdmissionLeaseInner {
     fn drop(&mut self) {
         let reservation = match self.reservation.get_mut() {
             Ok(reservation) => reservation,
@@ -351,6 +365,7 @@ fn map_receive_failure(failure: positron_ingest::ReceiveFailure) -> ServiceFailu
     match failure {
         positron_ingest::ReceiveFailure::AuthenticationRejected => ServiceFailure::Unauthorized,
         positron_ingest::ReceiveFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
+        positron_ingest::ReceiveFailure::TransportLimitExceeded => ServiceFailure::RequestTooLarge,
         _ => ServiceFailure::InvalidRequest,
     }
 }
