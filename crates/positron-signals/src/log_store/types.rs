@@ -1,9 +1,7 @@
 use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{
-    AttributeNamespace, AttributeOccurrenceSet, AttributeOccurrenceSetCandidate, ByteLimit,
-    CandidateAttributeValue, CollectionLimit, DynamicValueLimits, NestingLimit, RecordLimits,
-    RequestLimits, ValidatedAttributeValue, ValueLimitProfile, ValueLimitProfileCandidate,
-    ValueLimitSet,
+    AttributeNamespace, AttributeOccurrenceSet, AttributeOccurrenceSetCandidate,
+    CandidateAttributeValue, ValidatedAttributeValue, ValueLimitProfile,
 };
 use positron_kernel::{IngestTime, PreparedStoreBlock};
 
@@ -12,8 +10,6 @@ use super::failure::LogStoreFailure;
 const MAX_POLICY_RULES: usize = 64;
 const MAX_RULE_ID_BYTES: usize = 256;
 const MAX_ATTRIBUTES: usize = 1_024;
-const MAX_ATTRIBUTE_BYTES: usize = 65_536;
-const MAX_BODY_BYTES: usize = 262_144;
 
 /// Immutable evidence identifying the Ingest Policy applied before persistence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +123,7 @@ impl LogRecord {
     /// Applies the Log Store's authoritative semantic Value Limits to a
     /// receiver-native candidate after Ingest Policy evaluation.
     pub fn checked_receiver_candidate(
+        profile: ValueLimitProfile,
         event_time_unix_nanos: Option<i64>,
         observed_time_unix_nanos: Option<i64>,
         body: Option<CandidateAttributeValue>,
@@ -146,9 +143,11 @@ impl LogRecord {
             })
             .transpose()?;
         let body = body
-            .map(|body| validated_value(body_value_profile()?, body))
+            .map(|body| {
+                body.validate_log_body(profile)
+                    .map_err(|_| LogStoreFailure::limit_exceeded())
+            })
             .transpose()?;
-        let profile = value_profile()?;
         let attributes = attributes
             .into_iter()
             .map(|attribute| {
@@ -158,7 +157,7 @@ impl LogRecord {
                     .map_err(|_| LogStoreFailure::limit_exceeded())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::checked_native(event_time, observed_time, body, attributes, policy)
+        Self::checked_native(profile, event_time, observed_time, body, attributes, policy)
     }
 
     pub fn checked_minimal(
@@ -167,11 +166,14 @@ impl LogRecord {
         attributes: Vec<(&str, &str, &str)>,
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
-        let profile = value_profile()?;
+        let profile = value_profile();
         let event_time = checked_event_time(event_time_unix_nanos)?;
-        let body_profile = body_value_profile()?;
         let body = body
-            .map(|body| validated_value(body_profile, CandidateAttributeValue::string(body)))
+            .map(|body| {
+                CandidateAttributeValue::string(body)
+                    .validate_log_body(profile)
+                    .map_err(|_| LogStoreFailure::limit_exceeded())
+            })
             .transpose()?;
         let mut checked: Vec<StoredLogAttribute> = Vec::new();
         for (namespace, key, value) in attributes {
@@ -191,10 +193,11 @@ impl LogRecord {
                 .map_err(|_| LogStoreFailure::limit_exceeded())?,
             ));
         }
-        Self::checked_native(event_time, None, body, checked, policy)
+        Self::checked_native(profile, event_time, None, body, checked, policy)
     }
 
-    pub fn checked_native(
+    pub(super) fn checked_native(
+        profile: ValueLimitProfile,
         event_time: EventTime,
         observed_time: Option<ObservedTime>,
         body: Option<ValidatedAttributeValue>,
@@ -202,6 +205,58 @@ impl LogRecord {
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
         if attributes.len() > MAX_ATTRIBUTES {
+            return Err(LogStoreFailure::limit_exceeded());
+        }
+        let maximum = usize::try_from(
+            profile
+                .effective_limits()
+                .dynamic_value()
+                .attributes_per_namespace()
+                .value(),
+        )
+        .map_err(|_| LogStoreFailure::limit_exceeded())?;
+        let mut occurrences_by_namespace = [0_usize; 3];
+        for attribute in &attributes {
+            let index = match attribute.occurrences().namespace() {
+                AttributeNamespace::Resource => 0,
+                AttributeNamespace::InstrumentationScope => 1,
+                AttributeNamespace::Record => 2,
+            };
+            let count = occurrences_by_namespace
+                .get_mut(index)
+                .ok_or_else(LogStoreFailure::invalid_input)?;
+            *count = count
+                .checked_add(attribute.occurrences().len())
+                .filter(|count| *count <= maximum)
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        }
+        let decoded_limit =
+            usize::try_from(profile.effective_limits().record().decoded_bytes().value())
+                .map_err(|_| LogStoreFailure::limit_exceeded())?;
+        let mut decoded_bytes = body
+            .as_ref()
+            .map_or(Ok(0), ValidatedAttributeValue::decoded_size_bytes)
+            .map_err(|_| LogStoreFailure::limit_exceeded())?;
+        for attribute in &attributes {
+            decoded_bytes = decoded_bytes
+                .checked_add(attribute.occurrences().key().len())
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+            for index in 0..attribute.occurrences().len() {
+                let value = attribute
+                    .occurrences()
+                    .occurrence(index)
+                    .ok_or_else(LogStoreFailure::invalid_input)?;
+                decoded_bytes = decoded_bytes
+                    .checked_add(
+                        value
+                            .decoded_size_bytes()
+                            .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                    )
+                    .filter(|bytes| *bytes <= decoded_limit)
+                    .ok_or_else(LogStoreFailure::limit_exceeded)?;
+            }
+        }
+        if decoded_bytes > decoded_limit {
             return Err(LogStoreFailure::limit_exceeded());
         }
         Ok(Self {
@@ -302,70 +357,10 @@ impl StoredLogRecord {
     pub const fn policy_provenance(&self) -> &PolicyProvenance {
         self.record.policy_provenance()
     }
-
-    pub(super) fn from_decoded(
-        event_time: EventTime,
-        observed_time: Option<ObservedTime>,
-        ingest_time: IngestTime,
-        body: Option<ValidatedAttributeValue>,
-        attributes: Vec<StoredLogAttribute>,
-        policy: PolicyProvenance,
-    ) -> Result<Self, LogStoreFailure> {
-        let record = LogRecord::checked_native(event_time, observed_time, body, attributes, policy)
-            .map_err(|_| LogStoreFailure::malformed_block())?;
-        Ok(Self::new(record, ingest_time))
-    }
 }
 
-pub(super) fn value_profile() -> Result<ValueLimitProfile, LogStoreFailure> {
-    value_profile_with(MAX_ATTRIBUTE_BYTES as u32)
-}
-
-pub(super) fn body_value_profile() -> Result<ValueLimitProfile, LogStoreFailure> {
-    value_profile_with(MAX_BODY_BYTES as u32)
-}
-
-fn value_profile_with(individual_value_bytes: u32) -> Result<ValueLimitProfile, LogStoreFailure> {
-    let bytes = |value| ByteLimit::new(value).map_err(|_| LogStoreFailure::invalid_input());
-    let entries = |value| CollectionLimit::new(value).map_err(|_| LogStoreFailure::invalid_input());
-    let request = RequestLimits::new(
-        bytes(1_048_576)?,
-        bytes(1_048_576)?,
-        entries(1_024)?,
-        entries(4_096)?,
-    );
-    let record = RecordLimits::new(
-        bytes(1_048_576)?,
-        bytes(1_048_576)?,
-        bytes(MAX_BODY_BYTES as u32)?,
-    );
-    let dynamic = DynamicValueLimits::new(
-        bytes(individual_value_bytes)?,
-        entries(MAX_ATTRIBUTES as u32)?,
-        bytes(MAX_ATTRIBUTE_BYTES as u32)?,
-        NestingLimit::new(16).map_err(|_| LogStoreFailure::invalid_input())?,
-        entries(1_024)?,
-        entries(1_024)?,
-    );
-    ValueLimitProfileCandidate::new(ValueLimitSet::new(request, record, dynamic), None)
-        .validate()
-        .map_err(|_| LogStoreFailure::invalid_input())
-}
-
-pub(super) fn validated_value(
-    profile: ValueLimitProfile,
-    candidate: CandidateAttributeValue,
-) -> Result<ValidatedAttributeValue, LogStoreFailure> {
-    let set = AttributeOccurrenceSetCandidate::new(
-        AttributeNamespace::Record,
-        "value".to_owned(),
-        vec![candidate],
-    )
-    .validate(profile)
-    .map_err(|_| LogStoreFailure::limit_exceeded())?;
-    set.occurrence(0)
-        .cloned()
-        .ok_or_else(LogStoreFailure::invalid_input)
+pub(super) const fn value_profile() -> ValueLimitProfile {
+    ValueLimitProfile::release_1_system_maximum()
 }
 
 /// Opaque checked Log Store output accepted by the Storage Kernel ledger.

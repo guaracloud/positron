@@ -75,6 +75,7 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     let too_many_attributes = vec![attribute; 1_025];
     assert_eq!(
         LogRecord::checked_native(
+            profile,
             EventTime::missing(),
             None,
             None,

@@ -1,14 +1,17 @@
 use positron_domain::identity::{Scope, TenantId};
 use positron_domain::routing::VirtualShardId;
 use positron_kernel::{
-    ActiveSegmentLedger, AppendCancellation, CommitReceipt, LedgerCompletionState, LedgerFailure,
-    LedgerFailureCode, LifecycleClock, LifecycleClockSource, ResourceAmounts,
-    StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, AppendCancellation, CommitReceipt, LifecycleClock, LifecycleClockSource,
+    ResourceAmounts, StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
 };
-use positron_signals::{LogStore, LogStoreFailure, LogStoreFailureCode};
+use positron_signals::{LogStore, LogStoreFailureCode};
 
 use crate::policy::PolicyDecision;
 use crate::{IngestPolicy, NativeLogBatch};
+
+mod failure;
+
+use failure::{map_ledger_failure, map_store_failure};
 
 /// One independently committed Admission Group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,8 +184,10 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord);
         }
         let mut accepted = Vec::new();
+        let mut accepted_attributes = 0_usize;
         let mut rejection_counts = [0_usize; 3];
         let mut rejection_code = IngestFailureCode::InvalidRecord;
+        let value_profile = batch.value_limit_profile();
         for candidate in batch.into_records() {
             let policy = match self.policy.evaluate(&candidate) {
                 Ok(PolicyDecision::Accept(policy)) => policy,
@@ -192,6 +197,17 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     continue;
                 },
                 Err(failure) => return map_store_failure(&failure),
+            };
+            let candidate_attributes = match candidate
+                .attributes()
+                .iter()
+                .try_fold(0_usize, |total, attribute| {
+                    total.checked_add(attribute.occurrences().len())
+                }) {
+                Some(count) => count,
+                None => {
+                    return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+                },
             };
             let (event_time, observed_time, body, attributes) = candidate.into_parts();
             let attributes = attributes
@@ -205,13 +221,24 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                 })
                 .collect();
             match positron_signals::LogRecord::checked_receiver_candidate(
+                value_profile,
                 event_time,
                 observed_time,
                 body,
                 attributes,
                 policy,
             ) {
-                Ok(record) => accepted.push(record),
+                Ok(record) => {
+                    accepted_attributes = match accepted_attributes
+                        .checked_add(candidate_attributes)
+                    {
+                        Some(count) => count,
+                        None => {
+                            return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+                        },
+                    };
+                    accepted.push(record);
+                },
                 Err(failure) => {
                     rejection_code = match failure.code() {
                         LogStoreFailureCode::LimitExceeded => IngestFailureCode::ValueLimitExceeded,
@@ -220,6 +247,31 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     increment_rejection(&mut rejection_counts, rejection_code);
                 },
             }
+        }
+        let maximum_records =
+            match usize::try_from(value_profile.effective_limits().request().records().value()) {
+                Ok(limit) => limit,
+                Err(_) => {
+                    return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+                },
+            };
+        if accepted.len() > maximum_records {
+            return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+        }
+        let maximum_attributes = match usize::try_from(
+            value_profile
+                .effective_limits()
+                .request()
+                .aggregate_attributes()
+                .value(),
+        ) {
+            Ok(limit) => limit,
+            Err(_) => {
+                return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+            },
+        };
+        if accepted_attributes > maximum_attributes {
+            return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
         }
         if accepted.is_empty() {
             return IngestOutcome::Permanent(rejection_code);
@@ -311,58 +363,5 @@ fn partial_admission(committed: CommittedAdmission, counts: [usize; 3]) -> Parti
         committed,
         rejections,
         rejection_class_count: used,
-    }
-}
-
-fn map_store_failure(failure: &LogStoreFailure) -> IngestOutcome {
-    match failure.code() {
-        LogStoreFailureCode::InvalidInput
-        | LogStoreFailureCode::MalformedBlock
-        | LogStoreFailureCode::PhysicalScopeMismatch => {
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord)
-        },
-        LogStoreFailureCode::LimitExceeded => {
-            IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
-        },
-        LogStoreFailureCode::ResourceExhausted
-        | LogStoreFailureCode::ClockUnavailable
-        | LogStoreFailureCode::ResourceAdmissionRefused => {
-            IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
-        },
-        LogStoreFailureCode::Kernel => {
-            IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
-        },
-    }
-}
-
-fn map_ledger_failure(failure: &LedgerFailure) -> IngestOutcome {
-    let code = match failure.code() {
-        LedgerFailureCode::Cancelled => IngestFailureCode::Cancelled,
-        LedgerFailureCode::IdempotencyConflict => IngestFailureCode::IdempotencyConflict,
-        LedgerFailureCode::LimitExceeded => IngestFailureCode::ValueLimitExceeded,
-        LedgerFailureCode::InvalidInput | LedgerFailureCode::PhysicalScopeMismatch => {
-            IngestFailureCode::InvalidRecord
-        },
-        LedgerFailureCode::ResourceAdmissionRefused => IngestFailureCode::CapacityUnavailable,
-        LedgerFailureCode::StorageUnavailable
-        | LedgerFailureCode::StorageExhausted
-        | LedgerFailureCode::IntegrityCorruption
-        | LedgerFailureCode::AuthenticationFailed
-        | LedgerFailureCode::ConcurrentWriter
-        | LedgerFailureCode::UnsupportedFormat
-        | LedgerFailureCode::StaleGeneration
-        | LedgerFailureCode::SnapshotExpired
-        | LedgerFailureCode::RecoveryRequired => IngestFailureCode::StorageUnavailable,
-    };
-    match failure.completion_state() {
-        LedgerCompletionState::CommitAmbiguous => IngestOutcome::Ambiguous(code),
-        LedgerCompletionState::RecoveryRequired => IngestOutcome::Retryable(code),
-        LedgerCompletionState::RejectedBeforeMutation => match failure.code() {
-            LedgerFailureCode::InvalidInput
-            | LedgerFailureCode::PhysicalScopeMismatch
-            | LedgerFailureCode::LimitExceeded
-            | LedgerFailureCode::IdempotencyConflict => IngestOutcome::Permanent(code),
-            _ => IngestOutcome::Retryable(code),
-        },
     }
 }

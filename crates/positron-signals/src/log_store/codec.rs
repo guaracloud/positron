@@ -4,8 +4,8 @@ use positron_domain::value::{AttributeNamespace, AttributeOccurrenceSetCandidate
 
 use super::LogStoreFailure;
 use super::types::{
-    AttributeRepresentation, PolicyProvenance, StoredLogAttribute, StoredLogRecord,
-    body_value_profile, validated_value, value_profile,
+    AttributeRepresentation, LogRecord, PolicyProvenance, StoredLogAttribute, StoredLogRecord,
+    value_profile,
 };
 use positron_kernel::LedgerSnapshot;
 
@@ -14,8 +14,12 @@ const VERSION: u16 = 1;
 const MAX_RECORDS: usize = 1_024;
 const MAX_COLLECTION: usize = 1_024;
 const MAX_NESTING: u8 = 16;
+#[cfg(fuzzing)]
+mod fuzz;
 mod size;
 mod value;
+#[cfg(fuzzing)]
+pub(super) use fuzz::fuzz_decode_block;
 pub(super) use size::encoded_block_length;
 
 pub(super) fn encode_block(
@@ -123,13 +127,16 @@ pub(super) fn decode_block(
     if count == 0 {
         return Err(LogStoreFailure::malformed_block());
     }
-    let decoded_count = count.min(limit);
-    let mut records = bounded_vec(decoded_count)?;
-    for _ in 0..decoded_count {
-        records.push(decode_record(snapshot, &mut input)?);
+    let retained_count = count.min(limit);
+    let mut records = bounded_vec(retained_count)?;
+    for index in 0..count {
+        let decoded = decode_record(&mut input)?;
+        if index < retained_count {
+            records.push(decoded.into_stored(snapshot));
+        }
     }
-    let truncated = decoded_count < count;
-    if !truncated && !input.is_empty() {
+    let truncated = retained_count < count;
+    if !input.is_empty() {
         return Err(LogStoreFailure::malformed_block());
     }
     Ok(DecodedBlock { records, truncated })
@@ -140,38 +147,38 @@ pub(super) struct DecodedBlock {
     pub(super) truncated: bool,
 }
 
-#[cfg(fuzzing)]
-pub(super) fn fuzz_decode_block(
-    expected_tenant: TenantId,
-    bytes: &[u8],
-) -> Result<(), LogStoreFailure> {
-    let _ = expected_tenant;
-    let mut input = Input::new(bytes);
-    let _ = value::decode(&mut input, MAX_NESTING, 262_144)?;
-    Ok(())
+struct DecodedRecord {
+    record: LogRecord,
+    ingest_time: UnixNanoseconds,
 }
 
-fn decode_record(
-    snapshot: &LedgerSnapshot<'_>,
-    input: &mut Input<'_>,
-) -> Result<StoredLogRecord, LogStoreFailure> {
+impl DecodedRecord {
+    fn into_stored(self, snapshot: &LedgerSnapshot<'_>) -> StoredLogRecord {
+        StoredLogRecord::new(
+            self.record,
+            snapshot.reconstruct_ingest_time(self.ingest_time),
+        )
+    }
+}
+
+fn decode_record(input: &mut Input<'_>) -> Result<DecodedRecord, LogStoreFailure> {
     let event_time = decode_event_time(input)?;
     let observed_time = match input.u8()? {
         0 => None,
         1 => Some(decode_observed_time(input)?),
         _ => return Err(LogStoreFailure::malformed_block()),
     };
-    let ingest_time = snapshot.reconstruct_ingest_time(UnixNanoseconds::new(input.i64()?));
-    let body_profile = body_value_profile()?;
+    let ingest_time = UnixNanoseconds::new(input.i64()?);
+    let profile = value_profile();
     let body = match input.u8()? {
         0 => None,
         1 => Some(
-            validated_value(body_profile, value::decode(input, MAX_NESTING, 262_144)?)
+            value::decode(input, MAX_NESTING, 262_144)?
+                .validate_log_body(profile)
                 .map_err(|_| LogStoreFailure::malformed_block())?,
         ),
         _ => return Err(LogStoreFailure::malformed_block()),
     };
-    let profile = value_profile()?;
     let attribute_count = input.count(MAX_COLLECTION)?;
     let mut attributes = bounded_vec(attribute_count)?;
     for _ in 0..attribute_count {
@@ -209,14 +216,13 @@ fn decode_record(
     }
     let policy = PolicyProvenance::new(generation, digest, rules)
         .map_err(|_| LogStoreFailure::malformed_block())?;
-    StoredLogRecord::from_decoded(
-        event_time,
-        observed_time,
+    let record =
+        LogRecord::checked_native(profile, event_time, observed_time, body, attributes, policy)
+            .map_err(|_| LogStoreFailure::malformed_block())?;
+    Ok(DecodedRecord {
+        record,
         ingest_time,
-        body,
-        attributes,
-        policy,
-    )
+    })
 }
 
 fn decode_event_time(input: &mut Input<'_>) -> Result<EventTime, LogStoreFailure> {

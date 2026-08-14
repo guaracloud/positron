@@ -134,6 +134,27 @@ fn profile_string_table_references_are_rejected_from_logs() {
 }
 
 #[test]
+fn nested_profile_string_table_references_propagate_a_closed_rejection() {
+    let request = proto_request(LogRecord {
+        body: Some(any(any_value::Value::KvlistValue(KeyValueList {
+            values: vec![KeyValue {
+                key: "nested".to_owned(),
+                value: Some(any(any_value::Value::StringValueStrindex(4))),
+                ..KeyValue::default()
+            }],
+        }))),
+        ..LogRecord::default()
+    });
+
+    assert_eq!(
+        OtlpLogsReceiver::new()
+            .decode(request)
+            .expect_err("nested profile-only values remain unsupported"),
+        ReceiveFailure::UnsupportedValue,
+    );
+}
+
+#[test]
 fn timestamps_preserve_zero_and_i64_max_but_reject_larger_u64_values() {
     let boundary = proto_request(LogRecord {
         time_unix_nano: 0,

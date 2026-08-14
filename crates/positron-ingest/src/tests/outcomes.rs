@@ -1,6 +1,9 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
+use positron_domain::value::{
+    ByteLimit, RecordLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+};
 use positron_kernel::{
     ActiveSegmentLedger, AppendCancellation, Catalog, CatalogSecret, FixedLifecycleClockSource,
     InstanceId, LifecycleClock, ResourceAmounts, SegmentProtectionKey, SegmentScope,
@@ -295,4 +298,57 @@ fn committed_logs_survive_reopen_and_remain_publicly_readable() {
         result.records()[0].body().and_then(|body| body.as_str()),
         Some("paid")
     );
+}
+
+#[test]
+fn receiver_profile_snapshot_governs_post_policy_log_validation() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xb1; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(111).expect("shard");
+    let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &fixture.authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xb4; 32])),
+    )
+    .expect("ledger");
+    let maximum = ValueLimitProfile::release_1_system_maximum().system_limits();
+    let tenant_record = RecordLimits::new(
+        maximum.record().encoded_bytes(),
+        maximum.record().decoded_bytes(),
+        ByteLimit::new(4).expect("fixture limit is nonzero"),
+    );
+    let tenant = ValueLimitSet::new(maximum.request(), tenant_record, maximum.dynamic_value());
+    let profile = ValueLimitProfileCandidate::new(maximum, Some(tenant))
+        .validate()
+        .expect("tenant profile lowers only the body limit");
+    let batch = OtlpLogsReceiver::with_value_limit_profile(profile)
+        .decode(protobuf_with_bodies(&["12345"]))
+        .expect("structural decode uses the safe system maximum before policy");
+    let policy = IngestPolicy::preserving(1, [0xb5; 32]).expect("policy");
+    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(12)));
+
+    let outcome = LogIngest::new(
+        &fixture.authority,
+        &ledger,
+        &clock,
+        &policy,
+        fixture.tenant,
+        shard,
+    )
+    .accept(
+        batch,
+        StoreBlockIdentity::new([0xb6; 16]).expect("identity"),
+    );
+    assert_eq!(
+        outcome,
+        IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
+    );
+    assert!(ledger.snapshot().expect("snapshot").blocks().is_empty());
 }

@@ -1,10 +1,8 @@
-use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use positron_domain::identity::TenantAttribution;
-use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
+use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_governance::AuthorizedContext;
 use positron_kernel::{
     ResourceAmounts, ResourceGovernor, ResourceReservation, WorkClaim, WorkKind,
@@ -12,10 +10,12 @@ use positron_kernel::{
 use prost::Message;
 
 mod bounds;
+mod mapping;
 mod preflight;
 mod transport;
 
 use bounds::{MAX_DECODED_BATCH_BYTES, decoded_record_bytes};
+use mapping::{candidate_value, checked_timestamp, grouped_attributes};
 use preflight::validate_record_count;
 use transport::bounded_protobuf;
 
@@ -206,6 +206,7 @@ impl NativeLogCandidate {
 pub struct NativeLogBatch {
     attribution: TenantAttribution,
     records: Vec<NativeLogCandidate>,
+    value_limit_profile: ValueLimitProfile,
 }
 
 impl NativeLogBatch {
@@ -223,16 +224,37 @@ impl NativeLogBatch {
     pub fn into_records(self) -> Vec<NativeLogCandidate> {
         self.records
     }
+
+    #[must_use]
+    pub const fn value_limit_profile(&self) -> ValueLimitProfile {
+        self.value_limit_profile
+    }
 }
 
 /// Minimal OTLP Logs Receiver Adapter.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OtlpLogsReceiver;
+#[derive(Clone, Copy, Debug)]
+pub struct OtlpLogsReceiver {
+    value_limit_profile: ValueLimitProfile,
+}
+
+impl Default for OtlpLogsReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl OtlpLogsReceiver {
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self::with_value_limit_profile(ValueLimitProfile::release_1_system_maximum())
+    }
+
+    /// Binds one validated profile snapshot to transport and semantic decode.
+    #[must_use]
+    pub const fn with_value_limit_profile(value_limit_profile: ValueLimitProfile) -> Self {
+        Self {
+            value_limit_profile,
+        }
     }
 
     pub fn decode(
@@ -245,7 +267,7 @@ impl OtlpLogsReceiver {
             capacity,
         } = request;
         let _capacity = capacity;
-        let protobuf = bounded_protobuf(payload)?;
+        let protobuf = bounded_protobuf(payload, self.value_limit_profile)?;
         validate_record_count(&protobuf)?;
         let decoded = ExportLogsServiceRequest::decode(protobuf.as_slice())
             .map_err(|_| ReceiveFailure::MalformedPayload)?;
@@ -295,12 +317,9 @@ impl OtlpLogsReceiver {
         Ok(NativeLogBatch {
             attribution,
             records,
+            value_limit_profile: self.value_limit_profile,
         })
     }
-}
-
-fn checked_timestamp(value: u64) -> Result<i64, ReceiveFailure> {
-    i64::try_from(value).map_err(|_| ReceiveFailure::TimestampOutOfRange)
 }
 
 impl OtlpPayload {
@@ -308,84 +327,5 @@ impl OtlpPayload {
         match self {
             Self::Protobuf(bytes) | Self::GzipProtobuf(bytes) => bytes.len(),
         }
-    }
-}
-
-fn grouped_attributes(
-    resource: &[KeyValue],
-    scope: &[KeyValue],
-    record: &[KeyValue],
-) -> Result<Vec<NativeLogAttribute>, ReceiveFailure> {
-    let mut groups = BTreeMap::<(AttributeNamespace, String), Vec<CandidateAttributeValue>>::new();
-    for (namespace, attributes) in [
-        (AttributeNamespace::Resource, resource),
-        (AttributeNamespace::InstrumentationScope, scope),
-        (AttributeNamespace::Record, record),
-    ] {
-        for attribute in attributes {
-            let candidate = match &attribute.value {
-                Some(value) => candidate_value(value.clone(), MAX_NESTING_DEPTH)?,
-                None => CandidateAttributeValue::null(),
-            };
-            groups
-                .entry((namespace, attribute.key.clone()))
-                .or_default()
-                .push(candidate);
-        }
-    }
-    Ok(groups
-        .into_iter()
-        .map(|((namespace, key), occurrences)| NativeLogAttribute {
-            namespace,
-            key,
-            occurrences,
-        })
-        .collect())
-}
-
-fn candidate_value(
-    value: AnyValue,
-    remaining_depth: u16,
-) -> Result<CandidateAttributeValue, ReceiveFailure> {
-    let Some(value) = value.value else {
-        return Ok(CandidateAttributeValue::null());
-    };
-    match value {
-        any_value::Value::StringValue(value) => Ok(CandidateAttributeValue::string(value)),
-        any_value::Value::BoolValue(value) => Ok(CandidateAttributeValue::boolean(value)),
-        any_value::Value::IntValue(value) => Ok(CandidateAttributeValue::signed_integer(value)),
-        any_value::Value::DoubleValue(value) => Ok(CandidateAttributeValue::floating_point_bits(
-            value.to_bits(),
-        )),
-        any_value::Value::BytesValue(value) => Ok(CandidateAttributeValue::bytes(value)),
-        any_value::Value::StringValueStrindex(_) => Err(ReceiveFailure::UnsupportedValue),
-        any_value::Value::ArrayValue(value) => {
-            let next = remaining_depth
-                .checked_sub(1)
-                .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-            value
-                .values
-                .into_iter()
-                .map(|value| candidate_value(value, next))
-                .collect::<Result<Vec<_>, _>>()
-                .map(CandidateAttributeValue::array)
-        },
-        any_value::Value::KvlistValue(value) => {
-            let next = remaining_depth
-                .checked_sub(1)
-                .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-            value
-                .values
-                .into_iter()
-                .map(|entry| {
-                    let value = entry.value.map_or_else(
-                        || Ok(CandidateAttributeValue::null()),
-                        |value| candidate_value(value, next),
-                    )?;
-                    Ok(CandidateKeyValue::new(entry.key, value))
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(CandidateAttributeValue::key_value_list)
-        },
     }
 }

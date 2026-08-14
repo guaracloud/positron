@@ -19,11 +19,10 @@ fn body_bytes_bounds_round_trip_above_attribute_limit_through_exact_maximum()
 -> Result<(), Box<dyn Error>> {
     for (size, marker) in [(65_537, 0x73), (262_144, 0x74)] {
         let body = vec![0xa5; size];
-        let checked = value(
-            super::super::types::body_value_profile()?,
-            CandidateAttributeValue::bytes(body.clone()),
-        )?;
+        let profile = value_profile()?;
+        let checked = CandidateAttributeValue::bytes(body.clone()).validate_log_body(profile)?;
         let record = LogRecord::checked_native(
+            profile,
             EventTime::missing(),
             None,
             Some(checked),

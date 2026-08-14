@@ -5,6 +5,9 @@ use flate2::write::GzEncoder;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use positron_domain::value::{
+    ByteLimit, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+};
 use prost::Message;
 
 use crate::{AuthenticatedOtlpLogsRequest, OtlpLogsReceiver, ReceiveFailure};
@@ -65,6 +68,32 @@ fn protobuf_bytes_are_bounded_before_decode() {
         OtlpLogsReceiver::new()
             .decode(request)
             .expect_err("transport bound"),
+        ReceiveFailure::TransportLimitExceeded
+    );
+}
+
+#[test]
+fn tenant_lowered_transport_limit_is_applied_from_the_request_profile() {
+    let maximum = ValueLimitProfile::release_1_system_maximum().system_limits();
+    let tenant_request = RequestLimits::new(
+        ByteLimit::new(1).expect("fixture limit is nonzero"),
+        maximum.request().decompressed_bytes(),
+        maximum.request().records(),
+        maximum.request().aggregate_attributes(),
+    );
+    let tenant = ValueLimitSet::new(tenant_request, maximum.record(), maximum.dynamic_value());
+    let profile = ValueLimitProfileCandidate::new(maximum, Some(tenant))
+        .validate()
+        .expect("tenant profile only lowers the compressed-byte limit");
+    let request = AuthenticatedOtlpLogsRequest::test_only_protobuf(
+        attribution(),
+        protobuf_bytes(&["profile-bound"]),
+    );
+
+    assert_eq!(
+        OtlpLogsReceiver::with_value_limit_profile(profile)
+            .decode(request)
+            .expect_err("the effective compressed-byte limit applies before decode"),
         ReceiveFailure::TransportLimitExceeded
     );
 }
