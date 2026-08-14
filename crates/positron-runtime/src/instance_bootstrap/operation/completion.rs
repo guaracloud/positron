@@ -108,6 +108,7 @@ pub(super) fn outcome(
         tenant: record.tenant,
         logs_shard,
         ingest_policy,
+        value_limit_profile: positron_domain::value::ValueLimitProfile::release_1_system_maximum(),
         admission_group_planner,
         tenant_slug: BootstrapRecord::tenant_slug()?,
         administrator: record.administrator,

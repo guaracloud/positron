@@ -122,6 +122,20 @@ impl ServiceHandle {
         ingest_authenticated(self, request)
     }
 
+    pub(crate) fn otlp_logs_transport_limits(&self) -> Result<(usize, usize), ServiceFailure> {
+        let request = self
+            .instance
+            .value_limit_profile
+            .effective_limits()
+            .request();
+        Ok((
+            usize::try_from(request.compressed_bytes().value())
+                .map_err(|_| ServiceFailure::Internal)?,
+            usize::try_from(request.decompressed_bytes().value())
+                .map_err(|_| ServiceFailure::Internal)?,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn install_receiver_test_backend(
         &self,
@@ -238,7 +252,7 @@ fn ingest_authenticated<'authority>(
     request: AuthenticatedOtlpLogsRequest<'authority>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     let instance = &services.instance;
-    let batch = OtlpLogsReceiver::new()
+    let batch = OtlpLogsReceiver::with_value_limit_profile(instance.value_limit_profile)
         .decode(request)
         .map_err(map_receive_failure)?;
     let groups = batch

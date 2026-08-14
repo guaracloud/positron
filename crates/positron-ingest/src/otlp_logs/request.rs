@@ -114,31 +114,31 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
         })
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(test)]
     #[must_use]
-    pub fn test_only_protobuf(attribution: TenantAttribution, protobuf: Vec<u8>) -> Self {
+    pub(crate) fn test_only_protobuf(attribution: TenantAttribution, protobuf: Vec<u8>) -> Self {
         Self::test_only(attribution, OtlpPayload::Protobuf(protobuf))
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(test)]
     #[must_use]
-    pub fn test_only_gzip(attribution: TenantAttribution, gzip_protobuf: Vec<u8>) -> Self {
+    pub(crate) fn test_only_gzip(attribution: TenantAttribution, gzip_protobuf: Vec<u8>) -> Self {
         Self::test_only(attribution, OtlpPayload::GzipProtobuf(gzip_protobuf))
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(test)]
     #[must_use]
-    pub fn test_only_json(attribution: TenantAttribution, json: Vec<u8>) -> Self {
+    pub(crate) fn test_only_json(attribution: TenantAttribution, json: Vec<u8>) -> Self {
         Self::test_only(attribution, OtlpPayload::Json(json))
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(test)]
     #[must_use]
-    pub fn test_only_gzip_json(attribution: TenantAttribution, gzip_json: Vec<u8>) -> Self {
+    pub(crate) fn test_only_gzip_json(attribution: TenantAttribution, gzip_json: Vec<u8>) -> Self {
         Self::test_only(attribution, OtlpPayload::GzipJson(gzip_json))
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(test)]
     fn test_only(attribution: TenantAttribution, payload: OtlpPayload) -> Self {
         Self {
             attribution,

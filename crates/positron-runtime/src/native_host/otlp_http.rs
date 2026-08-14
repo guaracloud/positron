@@ -10,7 +10,6 @@ use prost::Message;
 use super::native_http::{RequestHead, Response, read_body};
 use crate::{ServiceFailure, ServiceHandle};
 
-const MAX_OTLP_BODY_BYTES: usize = 1_048_576;
 const INVALID_ARGUMENT: i32 = 3;
 const RESOURCE_EXHAUSTED: i32 = 8;
 const INTERNAL: i32 = 13;
@@ -89,7 +88,16 @@ pub(super) fn receive(
     let admission = services
         .admit_otlp_logs(context)
         .map_err(|failure| service_response_with_encoding(failure, response_encoding))?;
-    if head.content_length > MAX_OTLP_BODY_BYTES {
+    let (encoded_limit, decoded_limit) = services
+        .otlp_logs_transport_limits()
+        .map_err(|failure| service_response_with_encoding(failure, response_encoding))?;
+    let body_limit = match request_encoding {
+        OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::Json => {
+            encoded_limit.min(decoded_limit)
+        },
+        OtlpLogsRequestEncoding::GzipProtobuf | OtlpLogsRequestEncoding::GzipJson => encoded_limit,
+    };
+    if head.content_length > body_limit {
         return Err(failure(
             413,
             RESOURCE_EXHAUSTED,
@@ -97,7 +105,7 @@ pub(super) fn receive(
             response_encoding,
         ));
     }
-    let body = read_body(stream, head.content_length, MAX_OTLP_BODY_BYTES).map_err(|_| {
+    let body = read_body(stream, head.content_length, body_limit).map_err(|_| {
         failure(
             400,
             INVALID_ARGUMENT,
@@ -226,17 +234,28 @@ fn success(rejected: usize, encoding: ResponseEncoding) -> Response {
             error_message: "some log records were permanently rejected".to_owned(),
         })
     };
-    let response = ExportLogsServiceResponse { partial_success };
     match encoding {
-        ResponseEncoding::Protobuf => Response::protobuf(200, response.encode_to_vec()),
-        ResponseEncoding::Json => match serde_json::to_string(&response) {
-            Ok(body) => Response::json(200, body),
-            Err(_) => failure(
-                500,
-                INTERNAL,
-                "OTLP Logs response encoding failed",
-                encoding,
-            ),
+        ResponseEncoding::Protobuf => Response::protobuf(
+            200,
+            ExportLogsServiceResponse { partial_success }.encode_to_vec(),
+        ),
+        ResponseEncoding::Json => match partial_success {
+            None => Response::json(200, "{}".to_owned()),
+            Some(partial) => match serde_json::to_string(&partial.error_message) {
+                Ok(message) => Response::json(
+                    200,
+                    format!(
+                        "{{\"partialSuccess\":{{\"rejectedLogRecords\":\"{}\",\"errorMessage\":{message}}}}}",
+                        partial.rejected_log_records,
+                    ),
+                ),
+                Err(_) => failure(
+                    500,
+                    INTERNAL,
+                    "OTLP Logs response encoding failed",
+                    encoding,
+                ),
+            },
         },
     }
 }
@@ -283,12 +302,10 @@ fn service_response_with_encoding(
 
 fn failure(status: u16, code: i32, message: &str, encoding: ResponseEncoding) -> Response {
     match encoding {
-        ResponseEncoding::Json => match serde_json::to_string(&serde_json::json!({
-            "code": code,
-            "message": message,
-            "details": [],
-        })) {
-            Ok(body) => Response::json(status, body),
+        ResponseEncoding::Json => match serde_json::to_string(message) {
+            Ok(message) => {
+                Response::json(status, format!("{{\"code\":{code},\"message\":{message}}}"))
+            },
             Err(_) => Response::empty(500),
         },
         ResponseEncoding::Protobuf => Response::protobuf(

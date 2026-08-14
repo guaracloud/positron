@@ -21,3 +21,18 @@ fn json_export_preserves_native_semantics_and_negotiates_json_response()
     );
     Ok(())
 }
+
+#[test]
+fn json_container_fanout_is_rejected_before_materializing_decode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = LiveHttpHarness::start("json-preflight-fanout")?;
+    let body = format!("{{\"resourceLogs\":[{}]}}", vec!["{}"; 1_025].join(","));
+    let response = harness.export_body(HttpEncoding::Json, None, body.as_bytes())?;
+
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.body(),
+        br#"{"code":3,"message":"OTLP Logs request was rejected"}"#,
+    );
+    Ok(())
+}

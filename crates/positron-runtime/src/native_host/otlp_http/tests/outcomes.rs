@@ -31,6 +31,15 @@ fn success_and_partial_success_have_otlp_shapes_in_both_encodings() {
 }
 
 #[test]
+fn json_success_uses_exact_canonical_protojson() {
+    assert_eq!(success(0, ResponseEncoding::Json).body(), b"{}");
+    assert_eq!(
+        success(2, ResponseEncoding::Json).body(),
+        br#"{"partialSuccess":{"rejectedLogRecords":"2","errorMessage":"some log records were permanently rejected"}}"#,
+    );
+}
+
+#[test]
 fn service_failures_have_stable_protocol_statuses() {
     for encoding in [ResponseEncoding::Protobuf, ResponseEncoding::Json] {
         for (failure, http_status, rpc_code, message, retry_after) in [
@@ -93,6 +102,14 @@ fn service_failures_have_stable_protocol_statuses() {
             assert_eq!(response.retry_after_seconds(), retry_after);
         }
     }
+}
+
+#[test]
+fn json_failure_uses_exact_google_rpc_status_protojson() {
+    assert_eq!(
+        ingest_response(Err(ServiceFailure::InvalidRequest), ResponseEncoding::Json).body(),
+        br#"{"code":3,"message":"OTLP Logs request was rejected"}"#,
+    );
 }
 
 #[test]

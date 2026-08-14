@@ -1,8 +1,12 @@
 use super::ReceiveFailure;
 use positron_domain::value::ValueLimitProfile;
 
-const MAX_RESOURCE_LOGS: usize = 1_024;
-const MAX_SCOPE_LOGS: usize = 1_024;
+mod json;
+mod limits;
+
+pub(super) use json::validate_json;
+use limits::{StructuralLimits, increment};
+
 const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
 const MAX_GROUP_DEPTH: usize = 64;
 
@@ -10,45 +14,8 @@ pub(super) fn validate_record_count(
     protobuf: &[u8],
     profile: ValueLimitProfile,
 ) -> Result<(), ReceiveFailure> {
-    let maximum_nesting_depth = usize::from(
-        profile
-            .system_limits()
-            .dynamic_value()
-            .nesting_depth()
-            .value(),
-    );
-    let records_limit = usize::try_from(profile.system_limits().request().records().value())
-        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-    let attributes_limit = usize::try_from(
-        profile
-            .system_limits()
-            .request()
-            .aggregate_attributes()
-            .value(),
-    )
-    .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-    let array_entries_limit = usize::try_from(
-        profile
-            .system_limits()
-            .dynamic_value()
-            .array_entries()
-            .value(),
-    )
-    .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-    let key_value_list_entries_limit = usize::try_from(
-        profile
-            .system_limits()
-            .dynamic_value()
-            .key_value_list_entries()
-            .value(),
-    )
-    .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
     Counters {
-        records_limit,
-        attributes_limit,
-        array_entries_limit,
-        key_value_list_entries_limit,
-        maximum_nesting_depth,
+        limits: StructuralLimits::from_profile(profile)?,
         ..Counters::default()
     }
     .visit_request(protobuf)
@@ -59,11 +26,7 @@ struct Counters {
     scope_logs: usize,
     records: usize,
     attributes: usize,
-    records_limit: usize,
-    attributes_limit: usize,
-    array_entries_limit: usize,
-    key_value_list_entries_limit: usize,
-    maximum_nesting_depth: usize,
+    limits: StructuralLimits,
 }
 
 impl Default for Counters {
@@ -73,11 +36,17 @@ impl Default for Counters {
             scope_logs: 0,
             records: 0,
             attributes: 0,
-            records_limit: 1,
-            attributes_limit: 1,
-            array_entries_limit: 1,
-            key_value_list_entries_limit: 1,
-            maximum_nesting_depth: 1,
+            limits: StructuralLimits {
+                containers: 1,
+                records: 1,
+                attributes: 1,
+                attribute_entries: 1,
+                array_entries: 1,
+                key_value_entries: 1,
+                nesting_depth: 1,
+                value_bytes: 1,
+                key_bytes: 1,
+            },
         }
     }
 }
@@ -86,7 +55,7 @@ impl Counters {
     fn visit_request(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
         visit_fields(message, |field, value| {
             if field == 1 {
-                increment(&mut self.resource_logs, MAX_RESOURCE_LOGS)?;
+                increment(&mut self.resource_logs, self.limits.containers)?;
                 self.visit_resource_logs(value)?;
             }
             Ok(())
@@ -97,7 +66,7 @@ impl Counters {
         visit_fields(message, |field, value| match field {
             1 => self.visit_resource(value),
             2 => {
-                increment(&mut self.scope_logs, MAX_SCOPE_LOGS)?;
+                increment(&mut self.scope_logs, self.limits.containers)?;
                 self.visit_scope_logs(value)
             },
             _ => Ok(()),
@@ -105,8 +74,10 @@ impl Counters {
     }
 
     fn visit_resource(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        let mut entries = 0;
         visit_fields(message, |field, value| {
             if field == 1 {
+                increment(&mut entries, self.limits.attribute_entries)?;
                 self.visit_attribute(value, 0)?;
             }
             Ok(())
@@ -117,7 +88,7 @@ impl Counters {
         visit_fields(message, |field, value| match field {
             1 => self.visit_scope(value),
             2 => {
-                increment(&mut self.records, self.records_limit)?;
+                increment(&mut self.records, self.limits.records)?;
                 self.visit_log_record(value)
             },
             _ => Ok(()),
@@ -125,8 +96,10 @@ impl Counters {
     }
 
     fn visit_scope(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        let mut entries = 0;
         visit_fields(message, |field, value| {
             if field == 3 {
+                increment(&mut entries, self.limits.attribute_entries)?;
                 self.visit_attribute(value, 0)?;
             }
             Ok(())
@@ -134,15 +107,19 @@ impl Counters {
     }
 
     fn visit_log_record(&mut self, message: &[u8]) -> Result<(), ReceiveFailure> {
+        let mut entries = 0;
         visit_fields(message, |field, value| match field {
             5 => self.visit_any_value(value, 0),
-            6 => self.visit_attribute(value, 0),
+            6 => {
+                increment(&mut entries, self.limits.attribute_entries)?;
+                self.visit_attribute(value, 0)
+            },
             _ => Ok(()),
         })
     }
 
     fn visit_attribute(&mut self, message: &[u8], depth: usize) -> Result<(), ReceiveFailure> {
-        increment(&mut self.attributes, self.attributes_limit)?;
+        increment(&mut self.attributes, self.limits.attributes)?;
         self.visit_key_value(message, depth)
     }
 
@@ -168,7 +145,7 @@ impl Counters {
         let mut entries = 0_usize;
         visit_fields(message, |field, value| {
             if field == 1 {
-                increment(&mut entries, self.array_entries_limit)?;
+                increment(&mut entries, self.limits.array_entries)?;
                 self.visit_any_value(value, next)?;
             }
             Ok(())
@@ -180,7 +157,7 @@ impl Counters {
         let mut entries = 0_usize;
         visit_fields(message, |field, value| {
             if field == 1 {
-                increment(&mut entries, self.key_value_list_entries_limit)?;
+                increment(&mut entries, self.limits.key_value_entries)?;
                 self.visit_key_value(value, next)?;
             }
             Ok(())
@@ -189,17 +166,9 @@ impl Counters {
     fn next_depth(&self, depth: usize) -> Result<usize, ReceiveFailure> {
         depth
             .checked_add(1)
-            .filter(|next| *next <= self.maximum_nesting_depth)
+            .filter(|next| *next <= self.limits.nesting_depth)
             .ok_or(ReceiveFailure::ValueLimitExceeded)
     }
-}
-
-fn increment(value: &mut usize, limit: usize) -> Result<(), ReceiveFailure> {
-    *value = value
-        .checked_add(1)
-        .filter(|next| *next <= limit)
-        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-    Ok(())
 }
 
 fn visit_fields(

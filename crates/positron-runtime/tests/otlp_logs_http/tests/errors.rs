@@ -95,7 +95,7 @@ fn assert_rpc_status(
             let status: serde_json::Value = serde_json::from_slice(response.body())?;
             assert_eq!(status["code"], rpc_code);
             assert_eq!(status["message"], message);
-            assert_eq!(status["details"], serde_json::json!([]));
+            assert!(status.get("details").is_none());
         },
     }
     Ok(())

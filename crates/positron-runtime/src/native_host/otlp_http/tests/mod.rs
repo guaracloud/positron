@@ -1,4 +1,6 @@
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsPartialSuccess, ExportLogsServiceResponse,
+};
 use positron_domain::routing::VirtualShardId;
 use positron_ingest::{AdmissionGroupOutcome, IngestOutcome, IngestRequestOutcome};
 use prost::Message;
@@ -38,6 +40,24 @@ fn decode_success(response: &Response, encoding: ResponseEncoding) -> ExportLogs
         ResponseEncoding::Protobuf => {
             ExportLogsServiceResponse::decode(response.body()).expect("protobuf response")
         },
-        ResponseEncoding::Json => serde_json::from_slice(response.body()).expect("JSON response"),
+        ResponseEncoding::Json => {
+            let value: serde_json::Value =
+                serde_json::from_slice(response.body()).expect("JSON response");
+            let partial_success =
+                value
+                    .get("partialSuccess")
+                    .map(|partial| ExportLogsPartialSuccess {
+                        rejected_log_records: partial["rejectedLogRecords"]
+                            .as_str()
+                            .expect("decimal string")
+                            .parse()
+                            .expect("i64 records"),
+                        error_message: partial["errorMessage"]
+                            .as_str()
+                            .expect("error message")
+                            .to_owned(),
+                    });
+            ExportLogsServiceResponse { partial_success }
+        },
     }
 }

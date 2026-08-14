@@ -20,7 +20,7 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
-use preflight::validate_record_count;
+use preflight::{validate_json, validate_record_count};
 use request::OtlpPayload;
 use transport::bounded_payload;
 
@@ -47,6 +47,11 @@ pub fn reserve_otlp_logs_transport<'authority>(
 /// Validates the Release 1 OTLP Logs protobuf shape before structural decoding.
 pub fn preflight_otlp_logs_protobuf(protobuf: &[u8]) -> Result<(), ReceiveFailure> {
     validate_record_count(protobuf, ValueLimitProfile::release_1_system_maximum())
+}
+
+/// Validates the Release 1 OTLP Logs ProtoJSON shape before materializing decode.
+pub fn preflight_otlp_logs_json(json: &[u8]) -> Result<(), ReceiveFailure> {
+    validate_json(json, ValueLimitProfile::release_1_system_maximum())
 }
 
 fn ingest_attribution(context: AuthorizedContext) -> Result<TenantAttribution, ReceiveFailure> {
@@ -252,6 +257,7 @@ impl OtlpLogsReceiver {
                         .map_err(|_| ReceiveFailure::MalformedPayload)?
                 },
                 transport::BoundedOtlpPayload::Json(json) => {
+                    validate_json(&json, self.value_limit_profile)?;
                     serde_json::from_slice(&json).map_err(|_| ReceiveFailure::MalformedPayload)?
                 },
             },
