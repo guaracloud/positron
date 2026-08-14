@@ -8,14 +8,13 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_governance::{
-    AdministrativeIdempotencyKey, CompatibilityHints, IngestPolicyAdministration,
-    PresentedCredential, RequestedIntent, ResourceGeneration,
+    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
+    ResourceGeneration,
 };
 use positron_ingest::{
     AdmissionGroupPlanFailure, AdmissionGroupPlanner, IngestFailureCode, IngestOutcome,
     IngestPolicy, NativeLogCandidate, PolicyAction, PolicyRule,
 };
-use positron_kernel::Catalog;
 use prost::Message;
 
 use crate::services::ServiceHandle;
@@ -76,28 +75,17 @@ fn running_service_switches_after_activation_but_inflight_groups_keep_one_snapsh
     let services = ServiceHandle::new(Arc::clone(&initialized));
 
     let inflight = thread::scope(|scope| -> Result<_, Box<dyn std::error::Error>> {
-        let services = services.clone();
+        let inflight_services = services.clone();
         let ingest_secret = ingest_secret.clone();
         let handle = scope.spawn(move || {
-            services.ingest_otlp_logs(
+            inflight_services.ingest_otlp_logs(
                 &ingest_secret,
                 request(&["old-first", "old-second"]).encode_to_vec(),
             )
         });
         barrier.wait();
-        let catalog = Catalog::open(
-            &initialized._authority,
-            initialized.instance,
-            initialized.key.catalog_secret(initialized.instance)?,
-        )?;
-        let administration = IngestPolicyAdministration::new(
-            &catalog,
-            &initialized.identity,
-            initialized.ingest_policy.clone(),
-        );
-        administration.activate(
+        services.activate_ingest_policy(
             administrator,
-            initialized.tenant,
             ResourceGeneration::new(1)?,
             AdministrativeIdempotencyKey::new([0xa1; 16])?,
             IngestPolicy::compile(
@@ -109,8 +97,6 @@ fn running_service_switches_after_activation_but_inflight_groups_keep_one_snapsh
                 )?],
             )?,
         )?;
-        drop(administration);
-        drop(catalog);
         barrier.wait();
         Ok(handle
             .join()

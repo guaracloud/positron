@@ -55,6 +55,18 @@ pub struct IngestPolicyActivation {
 }
 
 /// Read-only serving view of the latest durably activated tenant policy.
+///
+/// A serving cache cannot be constructed independently from its bound
+/// Administration.
+///
+/// ```compile_fail
+/// use positron_domain::identity::TenantId;
+/// use positron_governance::IngestPolicyAdministration;
+/// use positron_kernel::CatalogSnapshot;
+/// fn detached(snapshot: &CatalogSnapshot, tenant: TenantId) {
+///     let _ = IngestPolicyAdministration::serving_snapshot(snapshot, tenant);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct IngestPolicyServingSnapshot {
     current: Arc<RwLock<Arc<IngestPolicy>>>,
@@ -105,45 +117,41 @@ impl IngestPolicyActivation {
     }
 }
 
-pub struct IngestPolicyAdministration<'catalog, 'authority, 'identity> {
-    catalog: &'catalog Catalog<'authority>,
-    identity: &'identity Identity,
+pub struct IngestPolicyAdministration {
+    tenant: TenantId,
     serving: IngestPolicyServingSnapshot,
 }
 
-impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'authority, 'identity> {
-    #[must_use]
-    pub fn new(
-        catalog: &'catalog Catalog<'authority>,
-        identity: &'identity Identity,
-        serving: IngestPolicyServingSnapshot,
-    ) -> Self {
-        Self {
-            catalog,
-            identity,
-            serving,
-        }
+impl IngestPolicyAdministration {
+    pub fn open(
+        catalog: &Catalog<'_>,
+        tenant: TenantId,
+    ) -> Result<Self, PolicyAdministrationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        Ok(Self {
+            tenant,
+            serving: IngestPolicyServingSnapshot {
+                current: Arc::new(RwLock::new(Arc::new(Self::activated(&snapshot, tenant)?))),
+            },
+        })
     }
 
-    pub fn serving_snapshot(
-        snapshot: &CatalogSnapshot,
-        tenant: TenantId,
-    ) -> Result<IngestPolicyServingSnapshot, PolicyAdministrationFailure> {
-        Ok(IngestPolicyServingSnapshot {
-            current: Arc::new(RwLock::new(Arc::new(Self::activated(snapshot, tenant)?))),
-        })
+    #[must_use]
+    pub fn serving(&self) -> IngestPolicyServingSnapshot {
+        self.serving.clone()
     }
 
     pub fn activate(
         &self,
+        catalog: &Catalog<'_>,
+        identity: &Identity,
         context: AuthorizedContext,
-        tenant: TenantId,
         expected: ResourceGeneration,
         key: AdministrativeIdempotencyKey,
         candidate: IngestPolicy,
     ) -> Result<IngestPolicyActivation, PolicyAdministrationFailure> {
-        let principal = self
-            .identity
+        let tenant = self.tenant;
+        let principal = identity
             .authorize_policy_activation(context, tenant)
             .map_err(|_| {
                 PolicyAdministrationFailure::new(PolicyAdministrationFailureCode::Unauthorized)
@@ -155,7 +163,7 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
             ));
         }
         let request_digest = request_digest(tenant, expected, requested, candidate.digest());
-        let snapshot = self.catalog.pin().map_err(map_catalog)?;
+        let snapshot = catalog.pin().map_err(map_catalog)?;
         if let Some(receipt) = find_receipt(&snapshot, key)? {
             if receipt.principal != principal
                 || receipt.tenant != tenant
@@ -172,7 +180,7 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
             return Ok(IngestPolicyActivation {
                 generation: requested,
                 digest: candidate.digest(),
-                audit_position: audit_position(self.catalog, key)?,
+                audit_position: audit_position(catalog, key)?,
             });
         }
         let current = Self::activated(&snapshot, tenant)?;
@@ -195,8 +203,7 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
         };
         objects.push(CatalogObject::new(encode_receipt(semantics)).map_err(map_catalog)?);
         let audit = encode_audit(semantics);
-        let commit = self
-            .catalog
+        let commit = catalog
             .commit(
                 snapshot.identity(),
                 CatalogProposal::new(
@@ -207,7 +214,7 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
                 .map_err(map_catalog)?,
                 Some(AuditIntent::new(audit).map_err(map_catalog)?),
             )
-            .map_err(|failure| self.map_commit_failure(tenant, failure))?;
+            .map_err(|failure| self.map_commit_failure(catalog, failure))?;
         self.serving.advance(candidate.clone())?;
         let audit_position = commit
             .governance_audit_record()
@@ -224,7 +231,7 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
         })
     }
 
-    pub fn activated(
+    fn activated(
         snapshot: &CatalogSnapshot,
         tenant: TenantId,
     ) -> Result<IngestPolicy, PolicyAdministrationFailure> {
@@ -263,17 +270,17 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
 
     fn map_commit_failure(
         &self,
-        tenant: TenantId,
+        catalog: &Catalog<'_>,
         failure: positron_kernel::CatalogFailure,
     ) -> PolicyAdministrationFailure {
         if failure.code() != CatalogFailureCode::StaleGeneration {
             return map_catalog(failure);
         }
-        let snapshot = match self.catalog.pin() {
+        let snapshot = match catalog.pin() {
             Ok(snapshot) => snapshot,
             Err(pin_failure) => return map_catalog(pin_failure),
         };
-        match Self::activated(&snapshot, tenant) {
+        match Self::activated(&snapshot, self.tenant) {
             Ok(current) => PolicyAdministrationFailure::stale(current.generation()),
             Err(decode_failure) => decode_failure,
         }

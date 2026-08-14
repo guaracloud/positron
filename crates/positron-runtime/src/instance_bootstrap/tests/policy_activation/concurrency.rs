@@ -31,11 +31,7 @@ fn concurrent_catalog_activation_reports_current_resource_generation()
         initialized.instance,
         initialized.key.catalog_secret(initialized.instance)?,
     )?;
-    let administration = IngestPolicyAdministration::new(
-        &catalog,
-        &initialized.identity,
-        initialized.ingest_policy.clone(),
-    );
+    let administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
 
     for generation in 2_u64..=9 {
         let barrier = Arc::new(Barrier::new(3));
@@ -44,6 +40,8 @@ fn concurrent_catalog_activation_reports_current_resource_generation()
             for (marker, large) in [(0x40_u8, false), (0x80, true)] {
                 let barrier = Arc::clone(&barrier);
                 let administration = &administration;
+                let catalog = &catalog;
+                let identity = &initialized.identity;
                 let key = AdministrativeIdempotencyKey::new(
                     [marker.wrapping_add(u8::try_from(generation).expect("bounded generation"));
                         16],
@@ -77,8 +75,9 @@ fn concurrent_catalog_activation_reports_current_resource_generation()
                     let expected = ResourceGeneration::new(generation - 1)?;
                     for _ in 0..16 {
                         match administration.activate(
+                            catalog,
+                            identity,
                             administrator,
-                            initialized.tenant,
                             expected,
                             key,
                             policy.clone(),
@@ -92,13 +91,7 @@ fn concurrent_catalog_activation_reports_current_resource_generation()
                             outcome => return outcome,
                         }
                     }
-                    administration.activate(
-                        administrator,
-                        initialized.tenant,
-                        expected,
-                        key,
-                        policy,
-                    )
+                    administration.activate(catalog, identity, administrator, expected, key, policy)
                 }));
             }
             barrier.wait();

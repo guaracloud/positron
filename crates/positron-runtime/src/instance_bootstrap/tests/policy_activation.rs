@@ -61,20 +61,14 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
         initialized.instance,
         initialized.key.catalog_secret(initialized.instance)?,
     )?;
-    let administration = IngestPolicyAdministration::new(
-        &catalog,
-        &initialized.identity,
-        initialized.ingest_policy.clone(),
-    );
-    assert_eq!(
-        IngestPolicyAdministration::activated(&catalog.pin()?, initialized.tenant)?.generation(),
-        1,
-    );
+    let administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
+    assert_eq!(administration.serving().pin()?.generation(), 1,);
     assert_eq!(
         administration
             .activate(
+                &catalog,
+                &initialized.identity,
                 ingest,
-                initialized.tenant,
                 ResourceGeneration::new(1)?,
                 AdministrativeIdempotencyKey::new([0x91; 16])?,
                 policy.clone(),
@@ -86,8 +80,9 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
     assert_eq!(
         administration
             .activate(
+                &catalog,
+                &initialized.identity,
                 administrator,
-                initialized.tenant,
                 ResourceGeneration::new(1)?,
                 AdministrativeIdempotencyKey::new([0x90; 16])?,
                 IngestPolicy::preserving(3)?,
@@ -97,8 +92,9 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
         PolicyAdministrationFailureCode::InvalidResourceGeneration,
     );
     let outcome = administration.activate(
+        &catalog,
+        &initialized.identity,
         administrator,
-        initialized.tenant,
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0x92; 16])?,
         policy.clone(),
@@ -106,8 +102,9 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
     assert_eq!(outcome.resource_generation().get(), 2);
     assert_eq!(outcome.digest(), first_digest);
     let retry = administration.activate(
+        &catalog,
+        &initialized.identity,
         administrator,
-        initialized.tenant,
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0x92; 16])?,
         policy.clone(),
@@ -124,8 +121,9 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
     assert_eq!(
         administration
             .activate(
+                &catalog,
+                &initialized.identity,
                 administrator,
-                initialized.tenant,
                 ResourceGeneration::new(1)?,
                 AdministrativeIdempotencyKey::new([0x92; 16])?,
                 conflicting,
@@ -136,8 +134,9 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
     );
     let stale = administration
         .activate(
+            &catalog,
+            &initialized.identity,
             administrator,
-            initialized.tenant,
             ResourceGeneration::new(1)?,
             AdministrativeIdempotencyKey::new([0x93; 16])?,
             policy.clone(),
@@ -151,7 +150,7 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
         stale.current_generation().map(ResourceGeneration::get),
         Some(2)
     );
-    let activated = IngestPolicyAdministration::activated(&catalog.pin()?, initialized.tenant)?;
+    let activated = administration.serving().pin()?;
     assert_eq!(activated.digest(), first_digest);
     let audits = catalog.governance_audit_records()?;
     let record = audits
@@ -185,17 +184,15 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
     )?;
     let successor_digest = successor.digest();
     let successor_outcome = administration.activate(
+        &catalog,
+        &initialized.identity,
         administrator,
-        initialized.tenant,
         ResourceGeneration::new(2)?,
         AdministrativeIdempotencyKey::new([0x94; 16])?,
         successor,
     )?;
     assert_eq!(successor_outcome.resource_generation().get(), 3);
-    assert_eq!(
-        IngestPolicyAdministration::activated(&catalog.pin()?, initialized.tenant)?.digest(),
-        successor_digest,
-    );
+    assert_eq!(administration.serving().pin()?.digest(), successor_digest,);
     drop(audits);
     drop(claim);
     drop(catalog);
@@ -203,7 +200,7 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
 
     let reopened = InstanceBootstrap::reopen(&paths)
         .map_err(|failure| format!("bootstrap reopen: {:?}", failure.code()))?;
-    let reopened_policy = reopened.ingest_policy.pin()?;
+    let reopened_policy = reopened.ingest_policy.serving().pin()?;
     assert_eq!(reopened_policy.generation(), 3);
     assert_eq!(reopened_policy.digest(), successor_digest);
 

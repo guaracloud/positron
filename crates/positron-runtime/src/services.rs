@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use positron_domain::routing::SignalKind;
 use positron_governance::{
-    AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
+    AuthorizedContext, CompatibilityHints, IngestPolicyServingSnapshot, PresentedCredential,
+    RequestedIntent,
 };
 use positron_ingest::{
     AdmissionGroupOutcome, AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest,
@@ -19,6 +20,7 @@ use crate::InitializedInstance;
 
 mod failure;
 mod otlp;
+mod policy;
 
 pub use failure::ServiceFailure;
 use failure::{map_admission_group_plan_failure, map_receive_failure};
@@ -29,6 +31,7 @@ mod tests;
 #[derive(Clone)]
 pub struct ServiceHandle {
     instance: Arc<InitializedInstance>,
+    ingest_policy: IngestPolicyServingSnapshot,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
 }
@@ -47,8 +50,10 @@ impl std::fmt::Debug for ServiceHandle {
 
 impl ServiceHandle {
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Self {
+        let ingest_policy = instance.ingest_policy.serving();
         Self {
             instance,
+            ingest_policy,
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
         }
@@ -268,7 +273,7 @@ fn ingest_native_batch(
     batch: NativeLogBatch<'_>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     let instance = &services.instance;
-    let policy = instance
+    let policy = services
         .ingest_policy
         .pin()
         .map_err(|_| ServiceFailure::Internal)?;

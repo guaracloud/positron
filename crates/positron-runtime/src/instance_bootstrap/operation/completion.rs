@@ -92,7 +92,7 @@ pub(super) fn outcome(
     generation: u64,
     audit_frontier: u64,
     claim_available: bool,
-    ingest_policy: positron_governance::IngestPolicyServingSnapshot,
+    ingest_policy: positron_governance::IngestPolicyAdministration,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     let logs_shard = VirtualShardId::new(1)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
