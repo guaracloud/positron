@@ -143,7 +143,11 @@ fn validate_attribute_value(
             )?)
         },
     };
-    Ok(ValidatedAttributeValue { inner })
+    let validated = ValidatedAttributeValue { inner };
+    if exceeds_byte_limit(validated.value_size_bytes()?, value_bytes) {
+        return Err(DomainFailure::value_limit_exceeded());
+    }
+    Ok(validated)
 }
 
 fn validate_attribute_array(

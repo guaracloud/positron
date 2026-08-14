@@ -4,14 +4,15 @@ use positron_kernel::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, LifecycleClock, LifecycleClockSource,
     ResourceAmounts, StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
 };
-use positron_signals::{LogStore, LogStoreFailureCode};
+use positron_signals::LogStore;
 
 use crate::policy::PolicyDecision;
 use crate::{IngestPolicy, NativeLogBatch};
 
 mod failure;
 
-use failure::{map_ledger_failure, map_store_failure};
+pub(crate) use failure::classify_log_store_failure_code;
+use failure::map_ledger_failure;
 
 /// One independently committed Admission Group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,7 +197,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     rejection_code = IngestFailureCode::PolicyRejected;
                     continue;
                 },
-                Err(failure) => return map_store_failure(&failure),
+                Err(failure) => return classify_log_store_failure_code(failure.code()),
             };
             let candidate_attributes = match candidate
                 .attributes()
@@ -239,12 +240,12 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     };
                     accepted.push(record);
                 },
-                Err(failure) => {
-                    rejection_code = match failure.code() {
-                        LogStoreFailureCode::LimitExceeded => IngestFailureCode::ValueLimitExceeded,
-                        _ => IngestFailureCode::InvalidRecord,
-                    };
-                    increment_rejection(&mut rejection_counts, rejection_code);
+                Err(failure) => match classify_log_store_failure_code(failure.code()) {
+                    IngestOutcome::Permanent(code) => {
+                        rejection_code = code;
+                        increment_rejection(&mut rejection_counts, rejection_code);
+                    },
+                    other => return other,
                 },
             }
         }
@@ -311,7 +312,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             accepted,
         ) {
             Ok(prepared) => prepared,
-            Err(failure) => return map_store_failure(&failure),
+            Err(failure) => return classify_log_store_failure_code(failure.code()),
         };
         let block = prepared.into_store_block();
         let result = match cancellation {

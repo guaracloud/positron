@@ -1,7 +1,7 @@
 use crate::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind, ByteLimit,
-    CandidateAttributeValue, CollectionLimit, DynamicValueLimits, NestingLimit, RecordLimits,
-    RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+    CandidateAttributeValue, CandidateKeyValue, CollectionLimit, DynamicValueLimits, NestingLimit,
+    RecordLimits, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
 
 mod validation;

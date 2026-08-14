@@ -1,6 +1,7 @@
 use positron_domain::identity::TenantId;
 
-use super::{Input, MAGIC, MAX_RECORDS, VERSION, decode_record};
+use super::limits::CodecLimits;
+use super::{Input, MAGIC, VERSION, decode_record};
 use crate::log_store::LogStoreFailure;
 
 pub(in crate::log_store) fn fuzz_decode_block(
@@ -18,12 +19,13 @@ pub(in crate::log_store) fn fuzz_decode_block(
     if tenant != expected_tenant.to_bytes() {
         return Err(LogStoreFailure::physical_scope_mismatch());
     }
-    let count = input.count(MAX_RECORDS)?;
+    let limits = CodecLimits::release_1()?;
+    let count = input.count(limits.records)?;
     if count == 0 {
         return Err(LogStoreFailure::malformed_block());
     }
     for _ in 0..count {
-        let _ = decode_record(&mut input)?;
+        let _ = decode_record(&mut input, limits)?;
     }
     if !input.is_empty() {
         return Err(LogStoreFailure::malformed_block());

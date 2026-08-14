@@ -6,7 +6,8 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::value::{
-    ByteLimit, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+    ByteLimit, RecordLimits, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate,
+    ValueLimitSet,
 };
 use prost::Message;
 
@@ -99,6 +100,57 @@ fn tenant_lowered_transport_limit_is_applied_from_the_request_profile() {
 }
 
 #[test]
+fn tenant_encoded_record_limit_accepts_exact_and_rejects_one_byte_over() {
+    let exact_record = LogRecord {
+        body: Some(AnyValue {
+            value: Some(any_value::Value::StringValue("1234".to_owned())),
+        }),
+        ..LogRecord::default()
+    };
+    let over_record = LogRecord {
+        body: Some(AnyValue {
+            value: Some(any_value::Value::StringValue("12345".to_owned())),
+        }),
+        ..LogRecord::default()
+    };
+    let encoded_limit = exact_record.encoded_len();
+    assert_eq!(over_record.encoded_len(), encoded_limit + 1);
+    let maximum = ValueLimitProfile::release_1_system_maximum().system_limits();
+    let tenant_record = RecordLimits::new(
+        ByteLimit::new(u32::try_from(encoded_limit).expect("fixture size fits u32"))
+            .expect("fixture limit is nonzero"),
+        maximum.record().decoded_bytes(),
+        maximum.record().log_body_bytes(),
+    );
+    let profile = ValueLimitProfileCandidate::new(
+        maximum,
+        Some(ValueLimitSet::new(
+            maximum.request(),
+            tenant_record,
+            maximum.dynamic_value(),
+        )),
+    )
+    .validate()
+    .expect("tenant profile only lowers encoded-record bytes");
+    let receiver = OtlpLogsReceiver::with_value_limit_profile(profile);
+
+    assert_eq!(
+        receiver
+            .decode(proto_request(vec![exact_record]))
+            .expect("exact encoded-record boundary")
+            .records()
+            .len(),
+        1
+    );
+    assert_eq!(
+        receiver
+            .decode(proto_request(vec![over_record]))
+            .expect_err("one byte over the effective encoded-record boundary"),
+        ReceiveFailure::ValueLimitExceeded
+    );
+}
+
+#[test]
 fn compressed_bytes_records_and_native_value_depth_have_independent_bounds() {
     let oversized_compressed =
         AuthenticatedOtlpLogsRequest::test_only_gzip(attribution(), vec![0; 1_048_577]);
@@ -118,7 +170,7 @@ fn compressed_bytes_records_and_native_value_depth_have_independent_bounds() {
     );
 
     let mut nested = AnyValue { value: None };
-    for _ in 0..18 {
+    for _ in 0..129 {
         nested = AnyValue {
             value: Some(any_value::Value::ArrayValue(ArrayValue {
                 values: vec![nested],
@@ -139,6 +191,18 @@ fn compressed_bytes_records_and_native_value_depth_have_independent_bounds() {
 
 #[test]
 fn decoded_record_bytes_accept_the_exact_limit_and_reject_one_byte_more() {
+    let maximum = ValueLimitProfile::release_1_system_maximum().system_limits();
+    let record = RecordLimits::new(
+        maximum.record().encoded_bytes(),
+        ByteLimit::new(524_288).expect("fixture decoded limit is nonzero"),
+        maximum.record().log_body_bytes(),
+    );
+    let profile = ValueLimitProfileCandidate::new(
+        ValueLimitSet::new(maximum.request(), record, maximum.dynamic_value()),
+        None,
+    )
+    .validate()
+    .expect("configured system profile lowers decoded-record bytes");
     let exact = proto_request(vec![LogRecord {
         body: Some(AnyValue {
             value: Some(any_value::Value::BytesValue(vec![0; 524_288])),
@@ -146,7 +210,7 @@ fn decoded_record_bytes_accept_the_exact_limit_and_reject_one_byte_more() {
         ..LogRecord::default()
     }]);
     assert_eq!(
-        OtlpLogsReceiver::new()
+        OtlpLogsReceiver::with_value_limit_profile(profile)
             .decode(exact)
             .expect("inclusive decoded-record boundary")
             .records()
@@ -161,7 +225,7 @@ fn decoded_record_bytes_accept_the_exact_limit_and_reject_one_byte_more() {
         ..LogRecord::default()
     }]);
     assert_eq!(
-        OtlpLogsReceiver::new()
+        OtlpLogsReceiver::with_value_limit_profile(profile)
             .decode(over)
             .expect_err("exclusive decoded-record boundary"),
         ReceiveFailure::ValueLimitExceeded

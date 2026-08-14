@@ -58,3 +58,38 @@ fn configured_system_limits_cannot_raise_the_release_one_safe_maximum() {
         "configured system limits cannot exceed the compiled safe maximum"
     );
 }
+
+#[test]
+fn aggregate_collection_bytes_accept_exact_and_reject_nested_over_limit_values() {
+    let profile = profile_with_value_and_body_bytes(4, 8);
+    let exact =
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new(
+                "first".to_owned(),
+                CandidateAttributeValue::string("12".to_owned()),
+            ),
+            CandidateKeyValue::new(
+                "second".to_owned(),
+                CandidateAttributeValue::string("34".to_owned()),
+            ),
+        ])])
+        .validate_attribute(profile)
+        .expect("two nested two-byte values are the exact aggregate boundary");
+    assert_eq!(exact.kind(), AttributeValueKind::Array);
+
+    let over = CandidateAttributeValue::array(vec![CandidateAttributeValue::key_value_list(vec![
+        CandidateKeyValue::new(
+            "first".to_owned(),
+            CandidateAttributeValue::string("12".to_owned()),
+        ),
+        CandidateKeyValue::new(
+            "second".to_owned(),
+            CandidateAttributeValue::string("345".to_owned()),
+        ),
+    ])])
+    .validate_attribute(profile);
+    assert!(
+        over.is_err(),
+        "nested collection totals cannot exceed the individual-value byte limit"
+    );
+}

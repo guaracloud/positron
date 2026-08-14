@@ -9,7 +9,6 @@ use super::failure::LogStoreFailure;
 
 const MAX_POLICY_RULES: usize = 64;
 const MAX_RULE_ID_BYTES: usize = 256;
-const MAX_ATTRIBUTES: usize = 1_024;
 
 /// Immutable evidence identifying the Ingest Policy applied before persistence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,7 +144,7 @@ impl LogRecord {
         let body = body
             .map(|body| {
                 body.validate_log_body(profile)
-                    .map_err(|_| LogStoreFailure::limit_exceeded())
+                    .map_err(LogStoreFailure::domain)
             })
             .transpose()?;
         let attributes = attributes
@@ -154,7 +153,7 @@ impl LogRecord {
                 attribute
                     .validate(profile)
                     .map(StoredLogAttribute::generic)
-                    .map_err(|_| LogStoreFailure::limit_exceeded())
+                    .map_err(LogStoreFailure::domain)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Self::checked_native(profile, event_time, observed_time, body, attributes, policy)
@@ -172,7 +171,7 @@ impl LogRecord {
             .map(|body| {
                 CandidateAttributeValue::string(body)
                     .validate_log_body(profile)
-                    .map_err(|_| LogStoreFailure::limit_exceeded())
+                    .map_err(LogStoreFailure::domain)
             })
             .transpose()?;
         let mut checked: Vec<StoredLogAttribute> = Vec::new();
@@ -190,7 +189,7 @@ impl LogRecord {
                     vec![CandidateAttributeValue::string(value.to_owned())],
                 )
                 .validate(profile)
-                .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                .map_err(LogStoreFailure::domain)?,
             ));
         }
         Self::checked_native(profile, event_time, None, body, checked, policy)
@@ -204,9 +203,6 @@ impl LogRecord {
         attributes: Vec<StoredLogAttribute>,
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
-        if attributes.len() > MAX_ATTRIBUTES {
-            return Err(LogStoreFailure::limit_exceeded());
-        }
         let maximum = usize::try_from(
             profile
                 .effective_limits()
@@ -236,7 +232,7 @@ impl LogRecord {
         let mut decoded_bytes = body
             .as_ref()
             .map_or(Ok(0), ValidatedAttributeValue::decoded_size_bytes)
-            .map_err(|_| LogStoreFailure::limit_exceeded())?;
+            .map_err(LogStoreFailure::domain)?;
         for attribute in &attributes {
             decoded_bytes = decoded_bytes
                 .checked_add(attribute.occurrences().key().len())
@@ -250,7 +246,7 @@ impl LogRecord {
                     .checked_add(
                         value
                             .decoded_size_bytes()
-                            .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                            .map_err(LogStoreFailure::domain)?,
                     )
                     .filter(|bytes| *bytes <= decoded_limit)
                     .ok_or_else(LogStoreFailure::limit_exceeded)?;

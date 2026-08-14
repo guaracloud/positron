@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn domain_allocation_failure_remains_retryable_through_log_store_classification() {
+    assert_eq!(
+        crate::log_store::failure::classify_domain_failure_code(
+            positron_domain::outcome::DomainFailureCode::AllocationUnavailable,
+        ),
+        LogStoreFailureCode::ResourceExhausted
+    );
+    assert_eq!(
+        crate::log_store::failure::classify_domain_failure_code(
+            positron_domain::outcome::DomainFailureCode::ValueLimitExceeded,
+        ),
+        LogStoreFailureCode::LimitExceeded
+    );
+}
+
+#[test]
 fn record_validation_counts_all_occurrences_in_each_namespace() -> Result<(), Box<dyn Error>> {
     let request = RequestLimits::new(
         ByteLimit::new(1_024)?,

@@ -1,10 +1,10 @@
 use positron_kernel::{LedgerCompletionState, LedgerFailure, LedgerFailureCode};
-use positron_signals::{LogStoreFailure, LogStoreFailureCode};
+use positron_signals::LogStoreFailureCode;
 
 use super::{IngestFailureCode, IngestOutcome};
 
-pub(super) fn map_store_failure(failure: &LogStoreFailure) -> IngestOutcome {
-    match failure.code() {
+pub(crate) const fn classify_log_store_failure_code(code: LogStoreFailureCode) -> IngestOutcome {
+    match code {
         LogStoreFailureCode::InvalidInput
         | LogStoreFailureCode::MalformedBlock
         | LogStoreFailureCode::PhysicalScopeMismatch => {

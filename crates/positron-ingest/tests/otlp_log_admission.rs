@@ -6,3 +6,5 @@ mod native_values;
 mod producer;
 #[path = "otlp_log_admission/support.rs"]
 mod support;
+#[path = "otlp_log_admission/value_limits.rs"]
+mod value_limits;

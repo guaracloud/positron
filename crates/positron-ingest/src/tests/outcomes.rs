@@ -9,11 +9,23 @@ use positron_kernel::{
     InstanceId, LifecycleClock, ResourceAmounts, SegmentProtectionKey, SegmentScope,
     StoreBlockIdentity, WorkClaim, WorkKind,
 };
-use positron_signals::{LogScan, LogStore, ScanLimit};
+use positron_signals::{LogScan, LogStore, LogStoreFailureCode, ScanLimit};
 
 use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
 
 use super::support::{fixture, protobuf_request, protobuf_with_bodies};
+
+#[test]
+fn log_store_allocation_failure_remains_retryable_at_ingest_boundary() {
+    assert_eq!(
+        crate::ingest::classify_log_store_failure_code(LogStoreFailureCode::ResourceExhausted),
+        IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
+    );
+    assert_eq!(
+        crate::ingest::classify_log_store_failure_code(LogStoreFailureCode::LimitExceeded),
+        IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
+    );
+}
 
 #[test]
 fn attributed_batch_cannot_cross_the_admission_group_tenant() {

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
 
-use super::{MAX_NESTING_DEPTH, NativeLogAttribute, ReceiveFailure};
+use super::{NativeLogAttribute, ReceiveFailure};
 
 pub(super) fn checked_timestamp(value: u64) -> Result<i64, ReceiveFailure> {
     i64::try_from(value).map_err(|_| ReceiveFailure::TimestampOutOfRange)
@@ -13,6 +13,7 @@ pub(super) fn grouped_attributes(
     resource: &[KeyValue],
     scope: &[KeyValue],
     record: &[KeyValue],
+    maximum_nesting_depth: u16,
 ) -> Result<Vec<NativeLogAttribute>, ReceiveFailure> {
     let mut groups = BTreeMap::<(AttributeNamespace, String), Vec<CandidateAttributeValue>>::new();
     for (namespace, attributes) in [
@@ -22,7 +23,7 @@ pub(super) fn grouped_attributes(
     ] {
         for attribute in attributes {
             let candidate = match &attribute.value {
-                Some(value) => candidate_value(value.clone(), MAX_NESTING_DEPTH)?,
+                Some(value) => candidate_value(value.clone(), maximum_nesting_depth)?,
                 None => CandidateAttributeValue::null(),
             };
             groups
