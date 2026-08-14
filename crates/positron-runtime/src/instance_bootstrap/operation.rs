@@ -200,7 +200,7 @@ fn resume(
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = IngestPolicyAdministration::activated(&current, record.tenant)
+    let ingest_policy = IngestPolicyAdministration::serving_snapshot(&current, record.tenant)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
@@ -243,7 +243,7 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = IngestPolicyAdministration::activated(&current, record.tenant)
+    let ingest_policy = IngestPolicyAdministration::serving_snapshot(&current, record.tenant)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(

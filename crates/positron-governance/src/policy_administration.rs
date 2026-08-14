@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::{Arc, RwLock};
 
 use crate::{AuthorizedContext, Identity};
 use positron_domain::identity::TenantId;
@@ -53,6 +54,42 @@ pub struct IngestPolicyActivation {
     audit_position: u64,
 }
 
+/// Read-only serving view of the latest durably activated tenant policy.
+#[derive(Clone)]
+pub struct IngestPolicyServingSnapshot {
+    current: Arc<RwLock<Arc<IngestPolicy>>>,
+}
+
+impl IngestPolicyServingSnapshot {
+    pub fn pin(&self) -> Result<Arc<IngestPolicy>, PolicyAdministrationFailure> {
+        self.current
+            .read()
+            .map(|current| Arc::clone(&current))
+            .map_err(|_| {
+                PolicyAdministrationFailure::new(
+                    PolicyAdministrationFailureCode::PersistenceUnavailable,
+                )
+            })
+    }
+
+    fn advance(&self, policy: IngestPolicy) -> Result<(), PolicyAdministrationFailure> {
+        let mut current = self.current.write().map_err(|_| {
+            PolicyAdministrationFailure::new(
+                PolicyAdministrationFailureCode::PersistenceUnavailable,
+            )
+        })?;
+        if current.generation() == policy.generation() && current.digest() != policy.digest() {
+            return Err(PolicyAdministrationFailure::new(
+                PolicyAdministrationFailureCode::CorruptState,
+            ));
+        }
+        if current.generation() < policy.generation() {
+            *current = Arc::new(policy);
+        }
+        Ok(())
+    }
+}
+
 impl IngestPolicyActivation {
     #[must_use]
     pub const fn resource_generation(self) -> ResourceGeneration {
@@ -71,15 +108,30 @@ impl IngestPolicyActivation {
 pub struct IngestPolicyAdministration<'catalog, 'authority, 'identity> {
     catalog: &'catalog Catalog<'authority>,
     identity: &'identity Identity,
+    serving: IngestPolicyServingSnapshot,
 }
 
 impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'authority, 'identity> {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         catalog: &'catalog Catalog<'authority>,
         identity: &'identity Identity,
+        serving: IngestPolicyServingSnapshot,
     ) -> Self {
-        Self { catalog, identity }
+        Self {
+            catalog,
+            identity,
+            serving,
+        }
+    }
+
+    pub fn serving_snapshot(
+        snapshot: &CatalogSnapshot,
+        tenant: TenantId,
+    ) -> Result<IngestPolicyServingSnapshot, PolicyAdministrationFailure> {
+        Ok(IngestPolicyServingSnapshot {
+            current: Arc::new(RwLock::new(Arc::new(Self::activated(snapshot, tenant)?))),
+        })
     }
 
     pub fn activate(
@@ -116,6 +168,7 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
                     PolicyAdministrationFailureCode::IdempotencyConflict,
                 ));
             }
+            self.serving.advance(candidate.clone())?;
             return Ok(IngestPolicyActivation {
                 generation: requested,
                 digest: candidate.digest(),
@@ -154,7 +207,8 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
                 .map_err(map_catalog)?,
                 Some(AuditIntent::new(audit).map_err(map_catalog)?),
             )
-            .map_err(map_catalog)?;
+            .map_err(|failure| self.map_commit_failure(tenant, failure))?;
+        self.serving.advance(candidate.clone())?;
         let audit_position = commit
             .governance_audit_record()
             .ok_or_else(|| {
@@ -205,6 +259,24 @@ impl<'catalog, 'authority, 'identity> IngestPolicyAdministration<'catalog, 'auth
             },
             Ok,
         )
+    }
+
+    fn map_commit_failure(
+        &self,
+        tenant: TenantId,
+        failure: positron_kernel::CatalogFailure,
+    ) -> PolicyAdministrationFailure {
+        if failure.code() != CatalogFailureCode::StaleGeneration {
+            return map_catalog(failure);
+        }
+        let snapshot = match self.catalog.pin() {
+            Ok(snapshot) => snapshot,
+            Err(pin_failure) => return map_catalog(pin_failure),
+        };
+        match Self::activated(&snapshot, tenant) {
+            Ok(current) => PolicyAdministrationFailure::stale(current.generation()),
+            Err(decode_failure) => decode_failure,
+        }
     }
 }
 
@@ -303,7 +375,7 @@ fn map_catalog(failure: positron_kernel::CatalogFailure) -> PolicyAdministration
             PolicyAdministrationFailureCode::IdempotencyConflict
         },
         CatalogFailureCode::StaleGeneration => {
-            PolicyAdministrationFailureCode::StaleResourceGeneration
+            PolicyAdministrationFailureCode::PersistenceUnavailable
         },
         CatalogFailureCode::IntegrityCorruption => PolicyAdministrationFailureCode::CorruptState,
         _ => PolicyAdministrationFailureCode::PersistenceUnavailable,

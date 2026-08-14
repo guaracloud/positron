@@ -180,6 +180,9 @@ impl GovernanceAuditEntry {
             }
             let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
                 .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
             let principal =
                 PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
             let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;

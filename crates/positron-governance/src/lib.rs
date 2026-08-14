@@ -25,7 +25,8 @@ pub use identity::{
 };
 pub use policy_administration::{
     AdministrativeIdempotencyKey, IngestPolicyActivation, IngestPolicyAdministration,
-    PolicyAdministrationFailure, PolicyAdministrationFailureCode, ResourceGeneration,
+    IngestPolicyServingSnapshot, PolicyAdministrationFailure, PolicyAdministrationFailureCode,
+    ResourceGeneration,
 };
 
 const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV03";

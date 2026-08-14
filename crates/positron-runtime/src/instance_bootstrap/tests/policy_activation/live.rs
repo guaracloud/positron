@@ -1,0 +1,152 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use positron_domain::identity::TenantId;
+use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, IngestPolicyAdministration,
+    PresentedCredential, RequestedIntent, ResourceGeneration,
+};
+use positron_ingest::{
+    AdmissionGroupPlanFailure, AdmissionGroupPlanner, IngestFailureCode, IngestOutcome,
+    IngestPolicy, NativeLogCandidate, PolicyAction, PolicyRule,
+};
+use positron_kernel::Catalog;
+use prost::Message;
+
+use crate::services::ServiceHandle;
+
+use super::super::super::{InitializationPlan, InstanceBootstrap};
+use super::super::support::Roots;
+
+struct BlockingTwoGroups {
+    barrier: Arc<Barrier>,
+    shards: [VirtualShardId; 2],
+    blocked: AtomicBool,
+}
+
+impl AdmissionGroupPlanner for BlockingTwoGroups {
+    fn assigned_shard(
+        &self,
+        _tenant: TenantId,
+        _signal: SignalKind,
+        ordinal: u32,
+        _record: &NativeLogCandidate,
+    ) -> Result<VirtualShardId, AdmissionGroupPlanFailure> {
+        if ordinal == 0 && !self.blocked.swap(true, Ordering::AcqRel) {
+            self.barrier.wait();
+            self.barrier.wait();
+        }
+        self.shards
+            .get(
+                usize::try_from(ordinal)
+                    .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?,
+            )
+            .copied()
+            .ok_or(AdmissionGroupPlanFailure::RecordCountExceeded)
+    }
+}
+
+#[test]
+fn running_service_switches_after_activation_but_inflight_groups_keep_one_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    drop(initialized);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let mut initialized = InstanceBootstrap::reopen(&paths)?;
+    let administrator = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let ingest_secret = claim.ingest_secret().ok_or("ingest secret")?.to_owned();
+    let barrier = Arc::new(Barrier::new(2));
+    initialized.admission_group_planner = Arc::new(BlockingTwoGroups {
+        barrier: Arc::clone(&barrier),
+        shards: [initialized.logs_shard, VirtualShardId::new(2)?],
+        blocked: AtomicBool::new(false),
+    });
+    let initialized = Arc::new(initialized);
+    let services = ServiceHandle::new(Arc::clone(&initialized));
+
+    let inflight = thread::scope(|scope| -> Result<_, Box<dyn std::error::Error>> {
+        let services = services.clone();
+        let ingest_secret = ingest_secret.clone();
+        let handle = scope.spawn(move || {
+            services.ingest_otlp_logs(
+                &ingest_secret,
+                request(&["old-first", "old-second"]).encode_to_vec(),
+            )
+        });
+        barrier.wait();
+        let catalog = Catalog::open(
+            &initialized._authority,
+            initialized.instance,
+            initialized.key.catalog_secret(initialized.instance)?,
+        )?;
+        let administration = IngestPolicyAdministration::new(
+            &catalog,
+            &initialized.identity,
+            initialized.ingest_policy.clone(),
+        );
+        administration.activate(
+            administrator,
+            initialized.tenant,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0xa1; 16])?,
+            IngestPolicy::compile(
+                2,
+                vec![PolicyRule::new(
+                    "reject-after-activation",
+                    Vec::new(),
+                    PolicyAction::Reject,
+                )?],
+            )?,
+        )?;
+        drop(administration);
+        drop(catalog);
+        barrier.wait();
+        Ok(handle
+            .join()
+            .map_err(|_| std::io::Error::other("service thread panicked"))??)
+    })?;
+    assert_eq!(inflight.groups().len(), 2);
+    assert_eq!(inflight.accepted_records(), 2);
+
+    let after =
+        services.ingest_otlp_logs(&ingest_secret, request(&["new-request"]).encode_to_vec())?;
+    assert_eq!(after.permanently_rejected_records(), 1);
+    assert_eq!(
+        after.terminal_failure(),
+        Some(IngestOutcome::Permanent(IngestFailureCode::PolicyRejected))
+    );
+    Ok(())
+}
+
+fn request(bodies: &[&str]) -> ExportLogsServiceRequest {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: bodies
+                    .iter()
+                    .map(|body| LogRecord {
+                        time_unix_nano: 42,
+                        observed_time_unix_nano: 84,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue((*body).to_owned())),
+                        }),
+                        ..LogRecord::default()
+                    })
+                    .collect(),
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+}

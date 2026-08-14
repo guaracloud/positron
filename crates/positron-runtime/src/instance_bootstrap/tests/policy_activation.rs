@@ -4,10 +4,15 @@ use positron_governance::{
     RequestedIntent, ResourceGeneration,
 };
 use positron_ingest::{IngestPolicy, PolicyAction, PolicyRule};
-use positron_kernel::Catalog;
+use positron_kernel::{
+    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
+};
 
 use super::super::{InitializationPlan, InstanceBootstrap};
 use super::support::Roots;
+
+mod concurrency;
+mod live;
 
 #[test]
 fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,7 +61,11 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
         initialized.instance,
         initialized.key.catalog_secret(initialized.instance)?,
     )?;
-    let administration = IngestPolicyAdministration::new(&catalog, &initialized.identity);
+    let administration = IngestPolicyAdministration::new(
+        &catalog,
+        &initialized.identity,
+        initialized.ingest_policy.clone(),
+    );
     assert_eq!(
         IngestPolicyAdministration::activated(&catalog.pin()?, initialized.tenant)?.generation(),
         1,
@@ -165,6 +174,7 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
     assert_eq!(activation.idempotency_key().to_bytes(), [0x92; 16]);
     assert_eq!(activation.digest(), first_digest);
     assert_ne!(activation.request_digest(), [0; 32]);
+    let activation_audit_intent = record.intent().to_vec();
     let successor = IngestPolicy::compile(
         3,
         vec![PolicyRule::new(
@@ -193,7 +203,39 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
 
     let reopened = InstanceBootstrap::reopen(&paths)
         .map_err(|failure| format!("bootstrap reopen: {:?}", failure.code()))?;
-    assert_eq!(reopened.ingest_policy.generation(), 3);
-    assert_eq!(reopened.ingest_policy.digest(), successor_digest);
+    let reopened_policy = reopened.ingest_policy.pin()?;
+    assert_eq!(reopened_policy.generation(), 3);
+    assert_eq!(reopened_policy.digest(), successor_digest);
+
+    let catalog = Catalog::open(
+        &reopened._authority,
+        reopened.instance,
+        reopened.key.catalog_secret(reopened.instance)?,
+    )?;
+    let current = catalog.pin()?;
+    let mut objects = Vec::new();
+    for identity in current.object_identities() {
+        let bytes = current
+            .object(identity)?
+            .ok_or("catalog object disappeared")?;
+        objects.push(CatalogObject::new(bytes.to_vec())?);
+    }
+    let mismatched = catalog.commit(
+        current.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0x95; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        Some(AuditIntent::new(activation_audit_intent)?),
+    )?;
+    assert!(
+        GovernanceAuditEntry::decode(
+            mismatched
+                .governance_audit_record()
+                .ok_or("mismatched audit disappeared")?
+        )
+        .is_err()
+    );
     Ok(())
 }
