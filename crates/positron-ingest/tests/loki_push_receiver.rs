@@ -9,3 +9,6 @@ mod bounds;
 
 #[path = "loki_push_receiver/protobuf_bounds.rs"]
 mod protobuf_bounds;
+
+#[path = "loki_push_receiver/preflight.rs"]
+mod preflight;

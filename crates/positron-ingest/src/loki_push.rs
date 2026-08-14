@@ -3,6 +3,7 @@
 use positron_domain::value::ValueLimitProfile;
 
 mod mapping;
+mod preflight;
 mod proto;
 mod request;
 
@@ -47,9 +48,11 @@ impl LokiPushReceiver {
         } = request;
         match payload.bounded(self.value_limit_profile)? {
             request::BoundedLokiPayload::Json(json) => {
+                preflight::validate_json(&json, self.value_limit_profile)?;
                 mapping::json_batch(attribution, json, self.value_limit_profile, capacity)
             },
             request::BoundedLokiPayload::Protobuf(protobuf) => {
+                preflight::validate_protobuf(&protobuf, self.value_limit_profile)?;
                 mapping::protobuf_batch(attribution, protobuf, self.value_limit_profile, capacity)
             },
         }

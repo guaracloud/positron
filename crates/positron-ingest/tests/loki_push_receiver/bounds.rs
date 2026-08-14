@@ -104,6 +104,24 @@ fn compressed_and_expanded_byte_bounds_are_exact_and_release_capacity() -> Resul
         ReceiveFailure::TransportLimitExceeded,
     );
     assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+
+    let exact_streams =
+        AuthenticatedLokiPushRequest::json(authorize()?, governor, json_streams(1_024))?;
+    assert!(
+        LokiPushReceiver::new()
+            .decode(exact_streams)?
+            .records()
+            .is_empty()
+    );
+    let over_streams =
+        AuthenticatedLokiPushRequest::json(authorize()?, governor, json_streams(1_025))?;
+    assert_eq!(
+        LokiPushReceiver::new()
+            .decode(over_streams)
+            .expect_err("over empty-stream amplification"),
+        ReceiveFailure::ValueLimitExceeded,
+    );
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
     Ok(())
 }
 
@@ -170,8 +188,8 @@ fn structural_record_and_attribute_bounds_are_exact() -> Result<(), Box<dyn Erro
 }
 
 fn exact_json(length: usize) -> Result<Vec<u8>, Box<dyn Error>> {
-    let prefix = br#"{"streams":[{"stream":{},"values":[["1",""#;
-    let suffix = br#""]]}]}"#;
+    let prefix = br#"{"padding":""#;
+    let suffix = br#"","streams":[{"stream":{"app":"test"},"values":[["1","line"]]}]}"#;
     let fill = length
         .checked_sub(prefix.len())
         .and_then(|value| value.checked_sub(suffix.len()))
@@ -213,10 +231,17 @@ fn json_records(records: usize, attributes: bool) -> Vec<u8> {
     let stream = if attributes {
         "{\"a\":\"1\",\"b\":\"2\",\"c\":\"3\",\"d\":\"4\"}"
     } else {
-        "{}"
+        "{\"app\":\"test\"}"
     };
     let values = std::iter::repeat_n("[\"1\",\"x\"]", records)
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"streams\":[{{\"stream\":{stream},\"values\":[{values}]}}]}}").into_bytes()
+}
+
+fn json_streams(streams: usize) -> Vec<u8> {
+    let streams = std::iter::repeat_n(r#"{"stream":{"app":"test"},"values":[]}"#, streams)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"{{"streams":[{streams}]}}"#).into_bytes()
 }

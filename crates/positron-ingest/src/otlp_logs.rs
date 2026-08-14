@@ -13,7 +13,7 @@ mod admission_groups;
 mod bounds;
 mod decoded;
 mod mapping;
-mod preflight;
+pub(crate) mod preflight;
 mod request;
 mod transport;
 

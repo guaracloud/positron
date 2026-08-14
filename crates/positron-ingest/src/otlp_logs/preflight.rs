@@ -1,8 +1,8 @@
 use super::ReceiveFailure;
 use positron_domain::value::ValueLimitProfile;
 
-mod json;
-mod limits;
+pub(crate) mod json;
+pub(crate) mod limits;
 
 pub(super) use json::validate_json;
 use limits::{StructuralLimits, increment};
@@ -187,20 +187,20 @@ fn visit_fields(
     Ok(())
 }
 
-struct Cursor<'message> {
+pub(crate) struct Cursor<'message> {
     remaining: &'message [u8],
 }
 
 impl<'message> Cursor<'message> {
-    const fn new(message: &'message [u8]) -> Self {
+    pub(crate) const fn new(message: &'message [u8]) -> Self {
         Self { remaining: message }
     }
 
-    const fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.remaining.is_empty()
     }
 
-    fn take_key(&mut self) -> Result<(u64, u8), ReceiveFailure> {
+    pub(crate) fn take_key(&mut self) -> Result<(u64, u8), ReceiveFailure> {
         let key = self.take_varint()?;
         let field = key >> 3;
         let wire = (key & 7) as u8;
@@ -210,7 +210,7 @@ impl<'message> Cursor<'message> {
         Ok((field, wire))
     }
 
-    fn take_varint(&mut self) -> Result<u64, ReceiveFailure> {
+    pub(crate) fn take_varint(&mut self) -> Result<u64, ReceiveFailure> {
         let mut value = 0_u64;
         for index in 0..10 {
             let (byte, remaining) = self
@@ -232,7 +232,7 @@ impl<'message> Cursor<'message> {
         Err(ReceiveFailure::MalformedPayload)
     }
 
-    fn take_length_delimited(&mut self) -> Result<&'message [u8], ReceiveFailure> {
+    pub(crate) fn take_length_delimited(&mut self) -> Result<&'message [u8], ReceiveFailure> {
         let length =
             usize::try_from(self.take_varint()?).map_err(|_| ReceiveFailure::MalformedPayload)?;
         let (value, remaining) = self
@@ -243,7 +243,7 @@ impl<'message> Cursor<'message> {
         Ok(value)
     }
 
-    fn skip_value(&mut self, field: u64, wire: u8) -> Result<(), ReceiveFailure> {
+    pub(crate) fn skip_value(&mut self, field: u64, wire: u8) -> Result<(), ReceiveFailure> {
         match wire {
             0 => self.take_varint().map(|_| ()),
             1 => self.skip_bytes(8),

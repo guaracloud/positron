@@ -32,12 +32,27 @@ fn protobuf_record_and_attribute_bounds_are_exact_and_labels_fail_closed()
     };
     let governor = fixture.authority.governor();
 
-    let exact = admitted(authorize()?, governor, request(1_024, 0, "{}"))?;
+    let exact_streams = admitted(authorize()?, governor, stream_request(1_024))?;
+    assert!(
+        LokiPushReceiver::new()
+            .decode(exact_streams)?
+            .records()
+            .is_empty()
+    );
+    let over_streams = admitted(authorize()?, governor, stream_request(1_025))?;
+    assert_eq!(
+        LokiPushReceiver::new()
+            .decode(over_streams)
+            .expect_err("over protobuf stream amplification"),
+        ReceiveFailure::ValueLimitExceeded,
+    );
+
+    let exact = admitted(authorize()?, governor, request(1_024, 0, r#"{app="test"}"#))?;
     assert_eq!(
         LokiPushReceiver::new().decode(exact)?.records().len(),
         1_024
     );
-    let over = admitted(authorize()?, governor, request(1_025, 0, "{}"))?;
+    let over = admitted(authorize()?, governor, request(1_025, 0, r#"{app="test"}"#))?;
     assert_eq!(
         LokiPushReceiver::new()
             .decode(over)
@@ -45,12 +60,12 @@ fn protobuf_record_and_attribute_bounds_are_exact_and_labels_fail_closed()
         ReceiveFailure::ValueLimitExceeded,
     );
 
-    let exact = admitted(authorize()?, governor, request(1_024, 4, "{}"))?;
+    let exact = admitted(authorize()?, governor, request(1_024, 3, r#"{app="test"}"#))?;
     assert_eq!(
         LokiPushReceiver::new().decode(exact)?.records().len(),
         1_024
     );
-    let over = admitted(authorize()?, governor, request(1_024, 5, "{}"))?;
+    let over = admitted(authorize()?, governor, request(1_024, 4, r#"{app="test"}"#))?;
     assert_eq!(
         LokiPushReceiver::new()
             .decode(over)
@@ -66,6 +81,94 @@ fn protobuf_record_and_attribute_bounds_are_exact_and_labels_fail_closed()
         ReceiveFailure::MalformedPayload,
     );
     assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    Ok(())
+}
+
+#[test]
+fn protobuf_labels_follow_pinned_prometheus_name_and_uniqueness_rules() -> Result<(), Box<dyn Error>>
+{
+    let roots = temporary_roots()?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let fixture = fixture(instance.default_tenant_id())?;
+    let ingest_secret = claim.ingest_secret().ok_or("missing credential")?;
+    let governor = fixture.authority.governor();
+
+    for labels in [
+        "{}",
+        r#"{1bad="value"}"#,
+        r#"{bad.name="value"}"#,
+        r#"{bad:name="value"}"#,
+        r#"{nonasciié="value"}"#,
+        r#"{dup="first",dup="second"}"#,
+        r#"{dup="same",dup="same"}"#,
+        r#"{bad="unterminated}"#,
+    ] {
+        let credential = PresentedCredential::parse(ingest_secret)?;
+        let context = instance.attribute(
+            credential,
+            RequestedIntent::Ingest,
+            CompatibilityHints::none(),
+        )?;
+        let request = admitted(context, governor, request(1, 0, labels))?;
+        assert_eq!(
+            LokiPushReceiver::new()
+                .decode(request)
+                .expect_err("invalid label set must fail"),
+            ReceiveFailure::MalformedPayload,
+        );
+        assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn protobuf_wire_scanner_rejects_wrong_wire_truncation_and_varint_overflow()
+-> Result<(), Box<dyn Error>> {
+    let roots = temporary_roots()?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let fixture = fixture(instance.default_tenant_id())?;
+    let ingest_secret = claim.ingest_secret().ok_or("missing credential")?;
+    let governor = fixture.authority.governor();
+
+    let cases = [
+        vec![0x08, 0x00],
+        vec![0x0a, 0x05, 0x0a],
+        vec![
+            0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02,
+        ],
+        vec![0x0a, 0x02, 0x08, 0x00],
+    ];
+    for bytes in cases {
+        let credential = PresentedCredential::parse(ingest_secret)?;
+        let context = instance.attribute(
+            credential,
+            RequestedIntent::Ingest,
+            CompatibilityHints::none(),
+        )?;
+        let compressed = snap::raw::Encoder::new().compress_vec(&bytes)?;
+        let request = AuthenticatedLokiPushRequest::snappy_protobuf(context, governor, compressed)?;
+        assert_eq!(
+            LokiPushReceiver::new()
+                .decode(request)
+                .expect_err("malformed protobuf wire must fail"),
+            ReceiveFailure::MalformedPayload,
+        );
+        assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    }
     Ok(())
 }
 
@@ -101,6 +204,19 @@ fn request(records: usize, metadata_per_record: usize, labels: &str) -> PushRequ
                 })
                 .collect(),
         }],
+    }
+}
+
+fn stream_request(streams: usize) -> PushRequest {
+    PushRequest {
+        streams: std::iter::repeat_n(
+            StreamAdapter {
+                labels: r#"{app="test"}"#.to_owned(),
+                entries: Vec::new(),
+            },
+            streams,
+        )
+        .collect(),
     }
 }
 

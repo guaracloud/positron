@@ -92,3 +92,47 @@ fn malformed_compression_payloads_and_headers_have_stable_statuses() -> Result<(
     );
     Ok(())
 }
+
+#[test]
+fn invalid_label_sets_fail_without_storage_and_valid_follow_up_succeeds()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::LiveLokiHarness::start("il")?;
+    let bearer = format!("Bearer {}", harness.bearer());
+    let headers = [
+        ("Authorization", bearer.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+
+    for body in [
+        br#"{"streams":[{"stream":{},"values":[["1","empty-labels"]]}]}"#.as_slice(),
+        br#"{"streams":[{"stream":{"dup":"one","dup":"two"},"values":[["2","duplicate-label"]]}]}"#
+            .as_slice(),
+        br#"{"streams":[{"stream":{"1bad":"value"},"values":[["3","invalid-name"]]}]}"#.as_slice(),
+    ] {
+        support::assert_status(
+            harness.http(
+                ListenerRole::LokiPush,
+                "POST",
+                "/loki/api/v1/push",
+                &headers,
+                body,
+            )?,
+            400,
+        );
+    }
+    let query = "logs | range query_time 0 100 | limit 16";
+    assert!(harness.query_log_bodies(query)?.is_empty());
+
+    support::assert_status(
+        harness.http(
+            ListenerRole::LokiPush,
+            "POST",
+            "/loki/api/v1/push",
+            &headers,
+            br#"{"streams":[{"stream":{"app":"api"},"values":[["4","follow-up"]]}]}"#,
+        )?,
+        204,
+    );
+    assert_eq!(harness.query_log_bodies(query)?, vec!["follow-up"]);
+    Ok(())
+}
