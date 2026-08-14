@@ -875,6 +875,7 @@ name = "positron-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "opentelemetry-proto",
  "positron-domain",
  "positron-governance",
  "positron-ingest",
@@ -882,6 +883,7 @@ dependencies = [
  "positron-query",
  "positron-runtime",
  "positron-signals",
+ "prost",
 ]
 
 [[package]]
@@ -890,6 +892,8 @@ version = "0.0.0"
 dependencies = [
  "positron-domain",
  "positron-kernel",
+ "positron-policy",
+ "sha2",
  "zeroize",
 ]
 
@@ -902,6 +906,7 @@ dependencies = [
  "positron-domain",
  "positron-governance",
  "positron-kernel",
+ "positron-policy",
  "positron-signals",
  "prost",
  "serde_json",
@@ -924,6 +929,14 @@ dependencies = [
  "sha2",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "positron-policy"
+version = "0.0.0"
+dependencies = [
+ "positron-domain",
+ "sha2",
 ]
 
 [[package]]
@@ -963,6 +976,7 @@ version = "0.0.0"
 dependencies = [
  "positron-domain",
  "positron-kernel",
+ "positron-policy",
 ]
 
 [[package]]

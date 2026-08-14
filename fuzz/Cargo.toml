@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "logs"] }
 positron-kernel = { path = "../crates/positron-kernel" }
 positron-domain = { path = "../crates/positron-domain" }
 positron-governance = { path = "../crates/positron-governance" }
@@ -16,6 +17,7 @@ positron-ingest = { path = "../crates/positron-ingest" }
 positron-runtime = { path = "../crates/positron-runtime" }
 positron-signals = { path = "../crates/positron-signals" }
 positron-query = { path = "../crates/positron-query" }
+prost = "=0.14.3"
 
 [[bin]]
 name = "primary_data_volume_stateful"
@@ -90,6 +92,13 @@ bench = false
 [[bin]]
 name = "loki_push_decode"
 path = "fuzz_targets/loki_push_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ingest_policy"
+path = "fuzz_targets/ingest_policy.rs"
 test = false
 doc = false
 bench = false

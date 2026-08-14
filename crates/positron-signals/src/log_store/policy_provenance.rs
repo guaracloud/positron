@@ -12,7 +12,7 @@ pub struct PolicyProvenance {
 }
 
 impl PolicyProvenance {
-    pub fn new(
+    pub(crate) fn new(
         generation: u64,
         digest: [u8; 32],
         applied_rules: Vec<String>,
@@ -31,6 +31,16 @@ impl PolicyProvenance {
             digest,
             applied_rules,
         })
+    }
+
+    pub(crate) fn from_evaluated(
+        provenance: &positron_policy::PolicyProvenance,
+    ) -> Result<Self, LogStoreFailure> {
+        Self::new(
+            provenance.generation(),
+            provenance.digest(),
+            provenance.applied_rules().to_vec(),
+        )
     }
 
     #[must_use]

@@ -162,6 +162,7 @@ fn admitted_empty<'authority>(
             }],
         })),
         capacity: Some(initial),
+        receiver: crate::PolicyReceiver::OtlpGrpc,
     })
 }
 
@@ -231,5 +232,6 @@ fn admitted<'authority>(
         attribution: attribution(),
         payload: OtlpPayload::Decoded(Box::new(decoded)),
         capacity: Some(initial),
+        receiver: crate::PolicyReceiver::OtlpGrpc,
     })
 }

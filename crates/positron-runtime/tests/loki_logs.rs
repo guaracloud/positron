@@ -24,9 +24,6 @@ mod otlp_producer;
 #[path = "loki_logs/tracing_loki_producer.rs"]
 mod tracing_loki_producer;
 
-#[path = "loki_logs/policy.rs"]
-mod policy;
-
 #[path = "loki_logs/recovery.rs"]
 mod recovery;
 

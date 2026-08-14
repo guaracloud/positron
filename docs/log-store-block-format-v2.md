@@ -1,14 +1,23 @@
 # Log Store Block Format v2
 
-This document is the byte-level authority for the current native Log Store
-Block. Version 2 extends, and does not reinterpret, the version 1 format in
+This document remains the byte-level authority for native Log Store Block
+version 2. Version 2 extends, and does not reinterpret, the version 1 format in
 [`log-store-block-format-v1.md`](log-store-block-format-v1.md). Readers retain
-the complete version 1 contract; writers emit version 2.
+the complete version 1 contract. Current writers emit version 2; current
+readers continue to accept versions 1 and 2.
 
 The block envelope is unchanged except that its version field is `2`. All
 version 1 bounds, byte order, rejection rules, record ordering, body encoding,
 policy provenance, and scan behavior remain authoritative unless explicitly
 extended below. Unknown versions and tags still fail closed.
+
+Ingest Policy transformations use only the existing native value grammar:
+removed values are absent, redacted values are native nulls, and truncated
+values retain their bounded native prefix. Existing policy provenance stores
+the activated policy generation, canonical content digest, and only the stable
+IDs of rules whose actions applied. Audit and query code reconstruct the exact
+actions from that immutable activated policy and provenance; no policy-only
+value tag exists in this format.
 
 ## Record metadata extension
 
@@ -46,4 +55,4 @@ Version 2 extends the attribute namespace tag table with:
 
 Tags `1` through `3` keep their exact version 1 meanings. Tag `4` is invalid in
 a version 1 block and cannot be silently reinterpreted by a new reader. The
-version 2 writer uses tag `4` only for the native Stream Attribute namespace.
+version 2 format uses tag `4` only for the native Stream Attribute namespace.

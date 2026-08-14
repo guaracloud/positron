@@ -145,13 +145,13 @@ impl InitializationPlan {
 
 pub struct InitializedInstance {
     pub(crate) key: BootstrapKeyCustody,
-    pub(super) identity: positron_governance::Identity,
+    pub(crate) identity: positron_governance::Identity,
     pub(super) audit: Vec<positron_governance::GovernanceAuditEntry>,
     pub(crate) _authority: StorageKernelResourceAuthority,
     pub(crate) instance: InstanceId,
     pub(crate) tenant: TenantId,
     pub(crate) logs_shard: positron_domain::routing::VirtualShardId,
-    pub(crate) ingest_policy: positron_ingest::IngestPolicy,
+    pub(crate) ingest_policy: positron_governance::IngestPolicyAdministration,
     pub(crate) value_limit_profile: positron_domain::value::ValueLimitProfile,
     pub(crate) admission_group_planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
     pub(super) tenant_slug: TenantSlug,

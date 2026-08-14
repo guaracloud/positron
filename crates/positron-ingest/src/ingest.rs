@@ -6,8 +6,7 @@ use positron_kernel::{
 };
 use positron_signals::LogStore;
 
-use crate::policy::PolicyDecision;
-use crate::{IngestPolicy, NativeLogBatch};
+use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation};
 
 mod capacity;
 mod failure;
@@ -183,7 +182,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         identity: StoreBlockIdentity,
         cancellation: Option<&AppendCancellation>,
     ) -> IngestOutcome {
-        let (attribution, records, value_profile, capacity) = batch.into_parts();
+        let (attribution, records, value_profile, capacity, receiver) = batch.into_parts();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
         }
@@ -194,22 +193,19 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             Ok(count) => count,
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
+        let Some(group_amounts) = group_work_amounts(input_record_count, self.policy.budget())
+        else {
+            return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+        };
         let mut capacity = match capacity {
             Some(mut capacity) => {
-                if capacity
-                    .try_resize(group_work_amounts(input_record_count))
-                    .is_err()
-                {
+                if capacity.try_resize(group_amounts).is_err() {
                     return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
                 }
                 capacity
             },
             None => {
-                let claim = match WorkClaim::tenant(
-                    self.tenant,
-                    WorkKind::Ingest,
-                    group_work_amounts(input_record_count),
-                ) {
+                let claim = match WorkClaim::tenant(self.tenant, WorkKind::Ingest, group_amounts) {
                     Ok(claim) => claim,
                     Err(_) => {
                         return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
@@ -228,16 +224,16 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         let mut rejection_counts = [0_usize; 3];
         let mut rejection_code = IngestFailureCode::InvalidRecord;
         for candidate in records {
-            let policy = match self.policy.evaluate(&candidate) {
-                Ok(PolicyDecision::Accept(policy)) => policy,
-                Ok(PolicyDecision::Reject) => {
+            let evaluated = match self.policy.evaluate(candidate, receiver) {
+                Ok(PolicyEvaluation::Accepted(record)) => *record,
+                Ok(PolicyEvaluation::Rejected) => {
                     increment_rejection(&mut rejection_counts, IngestFailureCode::PolicyRejected);
                     rejection_code = IngestFailureCode::PolicyRejected;
                     continue;
                 },
-                Err(failure) => return classify_log_store_failure_code(failure.code()),
+                Err(_) => return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
             };
-            let candidate_attributes = match candidate
+            let candidate_attributes = match evaluated
                 .attributes()
                 .iter()
                 .try_fold(0_usize, |total, attribute| {
@@ -248,26 +244,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
                 },
             };
-            let (event_time, observed_time, body, attributes, metadata) = candidate.into_parts();
-            let attributes = attributes
-                .into_iter()
-                .map(|attribute| {
-                    positron_domain::value::AttributeOccurrenceSetCandidate::new(
-                        attribute.namespace(),
-                        attribute.key().to_owned(),
-                        attribute.occurrences().to_vec(),
-                    )
-                })
-                .collect();
-            match positron_signals::LogRecord::checked_receiver_candidate_with_metadata(
-                value_profile,
-                event_time,
-                observed_time,
-                body,
-                attributes,
-                metadata,
-                policy,
-            ) {
+            match positron_signals::LogRecord::checked_evaluated(value_profile, evaluated) {
                 Ok(record) => {
                     accepted_attributes = match accepted_attributes
                         .checked_add(candidate_attributes)
@@ -322,7 +299,12 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
         if capacity
-            .try_resize(group_work_amounts(record_count))
+            .try_resize(
+                match group_work_amounts(record_count, self.policy.budget()) {
+                    Some(amounts) => amounts,
+                    None => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+                },
+            )
             .is_err()
         {
             return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);

@@ -66,7 +66,7 @@ fn effective_nesting_boundary_survives_authenticated_admission_and_reopen()
     let shard = VirtualShardId::new(141)?;
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
     let protection_key = || SegmentProtectionKey::from_owned(Box::new([0xf4; 32]));
-    let policy = IngestPolicy::preserving(18, [0xf5; 32])?;
+    let policy = IngestPolicy::preserving(18)?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(600)));
     {
         let ledger =
@@ -152,7 +152,7 @@ fn decoded_record_boundary_survives_authenticated_admission_and_reopen()
     let shard = VirtualShardId::new(151)?;
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
     let protection_key = || SegmentProtectionKey::from_owned(Box::new([0xd4; 32]));
-    let policy = IngestPolicy::preserving(19, [0xd5; 32])?;
+    let policy = IngestPolicy::preserving(19)?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(700)));
     {
         let ledger =
@@ -245,7 +245,7 @@ fn authenticated_request<'authority>(
         RequestedIntent::Ingest,
         CompatibilityHints::none(),
     )?;
-    Ok(AuthenticatedOtlpLogsRequest::protobuf(
+    Ok(AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         request.encode_to_vec(),

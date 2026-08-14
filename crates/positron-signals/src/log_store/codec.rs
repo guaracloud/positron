@@ -10,7 +10,8 @@ use positron_kernel::LedgerSnapshot;
 
 const MAGIC: &[u8; 8] = b"PLOGBL01";
 const LEGACY_VERSION: u16 = 1;
-const VERSION: u16 = 2;
+const METADATA_VERSION: u16 = 2;
+const VERSION: u16 = METADATA_VERSION;
 #[cfg(fuzzing)]
 mod fuzz;
 mod limits;
@@ -125,7 +126,7 @@ pub(super) fn decode_block(
         return Err(LogStoreFailure::malformed_block());
     }
     let version = input.u16()?;
-    if version != LEGACY_VERSION && version != VERSION {
+    if !matches!(version, LEGACY_VERSION | METADATA_VERSION) {
         return Err(LogStoreFailure::malformed_block());
     }
     let tenant: [u8; 16] = input
@@ -195,9 +196,15 @@ fn decode_record(
     let body = match input.u8()? {
         0 => None,
         1 => Some(
-            value::decode(input, limits.nesting_depth, limits.body_bytes, limits)?
-                .validate_log_body(profile)
-                .map_err(|_| LogStoreFailure::malformed_block())?,
+            value::decode(
+                input,
+                limits.nesting_depth,
+                limits.body_bytes,
+                limits,
+                version,
+            )?
+            .validate_log_body(profile)
+            .map_err(|_| LogStoreFailure::malformed_block())?,
         ),
         _ => return Err(LogStoreFailure::malformed_block()),
     };
@@ -222,6 +229,7 @@ fn decode_record(
                 limits.nesting_depth,
                 limits.value_bytes,
                 limits,
+                version,
             )?);
         }
         let occurrences = AttributeOccurrenceSetCandidate::new(namespace, key, occurrences)
@@ -317,7 +325,7 @@ fn decode_namespace(tag: u8, version: u16) -> Result<AttributeNamespace, LogStor
         (1, _) => Ok(AttributeNamespace::Resource),
         (2, _) => Ok(AttributeNamespace::InstrumentationScope),
         (3, _) => Ok(AttributeNamespace::Record),
-        (4, VERSION) => Ok(AttributeNamespace::Stream),
+        (4, METADATA_VERSION) => Ok(AttributeNamespace::Stream),
         _ => Err(LogStoreFailure::malformed_block()),
     }
 }

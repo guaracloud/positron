@@ -4,9 +4,7 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_ingest::{
-    AdmissionGroupPlanFailure, AdmissionGroupPlanner, IngestPolicy, NativeLogCandidate,
-};
+use positron_ingest::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, NativeLogCandidate};
 use positron_runtime::{ExitOutcome, ShutdownTrigger};
 
 use super::support::{LiveGrpcHarness, otlp_request};
@@ -96,16 +94,12 @@ async fn unsupported_signal_is_exposed_as_permanent_invalid_argument()
 #[tokio::test(flavor = "current_thread")]
 async fn independent_groups_commit_and_report_permanent_rejection_without_rollback()
 -> Result<(), Box<dyn std::error::Error>> {
-    let policy =
-        IngestPolicy::reject_exact_text_body(7, [0x77; 32], "reject-second-group", "reject-me")?;
     let planner = Arc::new(ExplicitTwoShardPlan {
         first: VirtualShardId::new(1)?,
         second: VirtualShardId::new(2)?,
     });
     let harness = LiveGrpcHarness::start_with("admission-groups", |configuration| {
-        configuration
-            .with_ingest_policy(policy)
-            .with_admission_group_planner(planner)
+        configuration.with_admission_group_planner(planner)
     })?;
     let mut client = tokio::time::timeout(
         Duration::from_secs(2),
@@ -115,7 +109,7 @@ async fn independent_groups_commit_and_report_permanent_rejection_without_rollba
 
     for _ in 0..2 {
         let mut payload = otlp_request("group-one");
-        let rejected = otlp_request("reject-me")
+        let rejected = otlp_request(&"x".repeat(262_145))
             .resource_logs
             .into_iter()
             .next()

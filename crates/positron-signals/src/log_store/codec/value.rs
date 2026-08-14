@@ -178,6 +178,7 @@ pub(super) fn decode(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
+    version: u16,
 ) -> Result<CandidateAttributeValue, LogStoreFailure> {
     Ok(match input.u8()? {
         0 => CandidateAttributeValue::null(),
@@ -190,12 +191,19 @@ pub(super) fn decode(
         3 => CandidateAttributeValue::floating_point_bits(input.u64()?),
         4 => CandidateAttributeValue::string(input.string(value_bytes)?),
         5 => CandidateAttributeValue::bytes(input.bytes(value_bytes)?),
-        6 => CandidateAttributeValue::array(decode_array(input, depth, value_bytes, limits)?),
+        6 => CandidateAttributeValue::array(decode_array(
+            input,
+            depth,
+            value_bytes,
+            limits,
+            version,
+        )?),
         7 => CandidateAttributeValue::key_value_list(decode_key_value_list(
             input,
             depth,
             value_bytes,
             limits,
+            version,
         )?),
         _ => return Err(LogStoreFailure::malformed_block()),
     })
@@ -206,6 +214,7 @@ fn decode_array(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
+    version: u16,
 ) -> Result<Vec<CandidateAttributeValue>, LogStoreFailure> {
     let next = depth
         .checked_sub(1)
@@ -213,7 +222,7 @@ fn decode_array(
     let count = input.count(limits.array_entries)?;
     let mut values = bounded_vec(count)?;
     for _ in 0..count {
-        values.push(decode(input, next, value_bytes, limits)?);
+        values.push(decode(input, next, value_bytes, limits, version)?);
     }
     Ok(values)
 }
@@ -223,6 +232,7 @@ fn decode_key_value_list(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
+    version: u16,
 ) -> Result<Vec<CandidateKeyValue>, LogStoreFailure> {
     let next = depth
         .checked_sub(1)
@@ -232,7 +242,7 @@ fn decode_key_value_list(
     for _ in 0..count {
         values.push(CandidateKeyValue::new(
             input.string(limits.key_bytes)?,
-            decode(input, next, value_bytes, limits)?,
+            decode(input, next, value_bytes, limits, version)?,
         ));
     }
     Ok(values)

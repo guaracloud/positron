@@ -130,9 +130,6 @@ impl ApplicationRuntime {
                 },
             }
         };
-        if let Some(policy) = configuration.ingest_policy {
-            instance.ingest_policy = policy;
-        }
         if let Some(planner) = configuration.admission_group_planner {
             instance.admission_group_planner = planner;
         }

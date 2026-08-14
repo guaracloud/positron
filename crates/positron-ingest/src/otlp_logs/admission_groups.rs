@@ -73,6 +73,7 @@ impl<'authority> NativeLogBatch<'authority> {
             value_limit_profile,
             decoded_bytes,
             mut capacity,
+            receiver,
         } = self;
         let record_count = records.len();
         let grouped_bytes = grouped_retained_bytes(decoded_bytes, record_count)
@@ -117,6 +118,7 @@ impl<'authority> NativeLogBatch<'authority> {
                     value_limit_profile,
                     decoded_bytes: 0,
                     capacity: None,
+                    receiver,
                 },
             })
             .collect::<Vec<_>>()

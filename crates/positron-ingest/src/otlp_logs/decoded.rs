@@ -13,6 +13,7 @@ pub(super) fn native_batch<'authority>(
     decoded: ExportLogsServiceRequest,
     value_limit_profile: ValueLimitProfile,
     capacity: Option<ResourceReservation<'authority>>,
+    receiver: crate::PolicyReceiver,
 ) -> Result<NativeLogBatch<'authority>, ReceiveFailure> {
     let mut records = Vec::new();
     let mut attribute_count = 0_usize;
@@ -150,13 +151,13 @@ pub(super) fn native_batch<'authority>(
                     scope_dropped_attributes_count,
                     scope_schema_url.clone(),
                 );
-                records.push(NativeLogCandidate {
-                    event_time_unix_nanos: Some(checked_timestamp(log.time_unix_nano)?),
-                    observed_time_unix_nanos: Some(checked_timestamp(log.observed_time_unix_nano)?),
+                records.push(NativeLogCandidate::new(
+                    Some(checked_timestamp(log.time_unix_nano)?),
+                    Some(checked_timestamp(log.observed_time_unix_nano)?),
                     body,
                     attributes,
                     metadata,
-                });
+                ));
             }
         }
     }
@@ -171,5 +172,6 @@ pub(super) fn native_batch<'authority>(
         decoded_bytes: u64::try_from(retained_bytes)
             .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
         capacity,
+        receiver,
     })
 }

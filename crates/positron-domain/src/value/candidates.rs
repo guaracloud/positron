@@ -39,6 +39,21 @@ impl CandidateKeyValue {
     pub fn new(key: String, value: CandidateAttributeValue) -> Self {
         Self { key, value }
     }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &CandidateAttributeValue {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn value_mut(&mut self) -> &mut CandidateAttributeValue {
+        &mut self.value
+    }
 }
 
 impl CandidateAttributeValue {

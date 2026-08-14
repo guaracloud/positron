@@ -6,7 +6,10 @@ use positron_kernel::{
 };
 use positron_signals::{LogScan, LogStore, ScanLimit};
 
-use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
+use crate::{
+    IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver, PolicyAction,
+    PolicyPredicate, PolicyRule, PolicyTarget,
+};
 
 #[test]
 fn release_one_default_policy_has_one_canonical_non_placeholder_snapshot() {
@@ -40,13 +43,8 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
     let batch = OtlpLogsReceiver::new()
         .decode(request)
         .expect("structural decode");
-    let policy = IngestPolicy::reject_exact_text_body(
-        7,
-        [0x75; 32],
-        "reject-oversized",
-        &oversized_rejected,
-    )
-    .expect("policy");
+    let policy = IngestPolicy::reject_exact_text_body(7, "reject-oversized", &oversized_rejected)
+        .expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
 
     let partial = match LogIngest::new(
@@ -84,8 +82,38 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
     assert_eq!(result.records()[0].policy_provenance().generation(), 7);
     assert_eq!(
         result.records()[0].policy_provenance().applied_rules(),
-        &["reject-oversized"]
+        &[] as &[String]
     );
+}
+
+#[test]
+fn later_predicates_observe_prior_ordered_transformations() {
+    let batch = OtlpLogsReceiver::new()
+        .decode(protobuf_with_bodies(&["12345"]))
+        .expect("decode");
+    let (_, mut records, _, _, receiver) = batch.into_parts();
+    let policy = IngestPolicy::compile(
+        8,
+        vec![
+            PolicyRule::new(
+                "truncate",
+                Vec::new(),
+                PolicyAction::TruncateBytes(PolicyTarget::body(), 4),
+            )
+            .expect("truncate rule"),
+            PolicyRule::new(
+                "reject-truncated",
+                vec![PolicyPredicate::body_exact_text("1234").expect("predicate")],
+                PolicyAction::Reject,
+            )
+            .expect("reject rule"),
+        ],
+    )
+    .expect("policy");
+    assert!(matches!(
+        policy.evaluate(records.remove(0), receiver),
+        Ok(crate::PolicyEvaluation::Rejected)
+    ));
 }
 
 #[test]
@@ -113,8 +141,7 @@ fn partial_admission_preserves_each_permanent_rejection_class() {
             "accepted",
         ]))
         .expect("structural decode");
-    let policy =
-        IngestPolicy::reject_exact_text_body(3, [0x45; 32], "reject", "reject-me").expect("policy");
+    let policy = IngestPolicy::reject_exact_text_body(3, "reject", "reject-me").expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(3)));
     let outcome = LogIngest::new(
         &fixture.authority,
@@ -167,7 +194,7 @@ fn value_limit_rejection_never_claims_durability() {
     let batch = OtlpLogsReceiver::new()
         .decode(protobuf_with_bodies(&[oversized.as_str()]))
         .expect("structural decode");
-    let policy = IngestPolicy::preserving(1, [0x7b; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
     assert!(matches!(
         LogIngest::new(
@@ -207,8 +234,7 @@ fn complete_policy_rejection_is_permanent_and_has_no_receipt() {
     let batch = OtlpLogsReceiver::new()
         .decode(protobuf_with_bodies(&["reject-me"]))
         .expect("decode");
-    let policy =
-        IngestPolicy::reject_exact_text_body(2, [0x81; 32], "reject", "reject-me").expect("policy");
+    let policy = IngestPolicy::reject_exact_text_body(2, "reject", "reject-me").expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
     assert_eq!(
         LogIngest::new(

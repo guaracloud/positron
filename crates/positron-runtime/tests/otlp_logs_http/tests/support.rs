@@ -84,6 +84,13 @@ pub(super) struct LiveHttpHarness {
 
 impl LiveHttpHarness {
     pub(super) fn start(label: &str) -> Result<Self, TestError> {
+        Self::start_with(label, std::convert::identity)
+    }
+
+    pub(super) fn start_with(
+        label: &str,
+        configure: impl FnOnce(ServeConfiguration) -> ServeConfiguration,
+    ) -> Result<Self, TestError> {
         let test_guard = match LIVE_HTTP_TEST.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -104,10 +111,11 @@ impl LiveHttpHarness {
             .ok_or("query secret missing")?
             .to_owned();
         let host = positron_runtime::NativeHost::new(bindings(&roots)?);
-        let process = ApplicationRuntime::start(
-            ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
-            HostInputs::new(&host, &host),
-        )?;
+        let configuration = configure(ServeConfiguration::new(
+            paths,
+            InitializationMode::ExistingOnly,
+        ));
+        let process = ApplicationRuntime::start(configuration, HostInputs::new(&host, &host))?;
         let endpoint = process
             .bound_endpoints()
             .iter()

@@ -48,7 +48,7 @@ fn attributed_batch_cannot_cross_the_admission_group_tenant() {
     let batch = OtlpLogsReceiver::new()
         .decode(protobuf_request())
         .expect("batch");
-    let policy = IngestPolicy::preserving(1, [0x65; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
     let outcome = LogIngest::new(
         &fixture.authority,
@@ -106,7 +106,7 @@ fn cancellation_and_capacity_refusal_are_retryable_and_release_reservations() {
         SegmentProtectionKey::from_owned(Box::new([0x84; 32])),
     )
     .expect("ledger");
-    let policy = IngestPolicy::preserving(1, [0x85; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
     let ingest = LogIngest::new(
         &fixture.authority,
@@ -190,7 +190,7 @@ fn post_commit_disconnect_is_ambiguous_while_retry_replays_one_durable_block() {
         SegmentProtectionKey::from_owned(Box::new([0x94; 32])),
     )
     .expect("ledger");
-    let policy = IngestPolicy::preserving(1, [0x95; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(10)));
     let ingest = LogIngest::new(
         &fixture.authority,
@@ -261,7 +261,7 @@ fn committed_logs_survive_reopen_and_remain_publicly_readable() {
     .expect("catalog");
     let shard = VirtualShardId::new(101).expect("shard");
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
-    let policy = IngestPolicy::preserving(1, [0xa4; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(11)));
     {
         let ledger = ActiveSegmentLedger::open(
@@ -343,7 +343,7 @@ fn receiver_profile_snapshot_governs_post_policy_log_validation() {
     let batch = OtlpLogsReceiver::with_value_limit_profile(profile)
         .decode(protobuf_with_bodies(&["12345"]))
         .expect("structural decode uses the safe system maximum before policy");
-    let policy = IngestPolicy::preserving(1, [0xb5; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(12)));
 
     let outcome = LogIngest::new(

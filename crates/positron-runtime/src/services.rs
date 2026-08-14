@@ -2,13 +2,13 @@ use std::sync::{Arc, Mutex};
 
 use positron_domain::routing::SignalKind;
 use positron_governance::{
-    AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
+    AuthorizedContext, CompatibilityHints, IngestPolicyServingSnapshot, PresentedCredential,
+    RequestedIntent,
 };
 use positron_ingest::{
     AdmissionGroupOutcome, AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest,
     IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, LokiPushReceiver,
-    LokiPushRequestEncoding, NativeLogBatch, OtlpLogsReceiver, OtlpLogsRequestEncoding,
-    reserve_log_receiver_transport,
+    LokiPushRequestEncoding, NativeLogBatch, OtlpLogsReceiver, reserve_log_receiver_transport,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
@@ -19,6 +19,8 @@ use positron_query::{QueryBudget, QueryEvent, QueryService};
 use crate::InitializedInstance;
 
 mod failure;
+mod otlp;
+mod policy;
 
 pub use failure::ServiceFailure;
 use failure::{map_admission_group_plan_failure, map_receive_failure};
@@ -29,6 +31,7 @@ mod tests;
 #[derive(Clone)]
 pub struct ServiceHandle {
     instance: Arc<InitializedInstance>,
+    ingest_policy: IngestPolicyServingSnapshot,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
 }
@@ -47,8 +50,10 @@ impl std::fmt::Debug for ServiceHandle {
 
 impl ServiceHandle {
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Self {
+        let ingest_policy = instance.ingest_policy.serving();
         Self {
             instance,
+            ingest_policy,
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
         }
@@ -61,7 +66,7 @@ impl ServiceHandle {
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
         let context = self.authorize_logs(bearer)?;
         let instance = &self.instance;
-        let request = AuthenticatedOtlpLogsRequest::protobuf(
+        let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
             context,
             instance._authority.governor(),
             protobuf,
@@ -99,25 +104,8 @@ impl ServiceHandle {
         let capacity = reservation
             .reclaim(instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
-        let request = AuthenticatedOtlpLogsRequest::decoded_after_transport_admission(
+        let request = AuthenticatedOtlpLogsRequest::decoded_otlp_grpc_after_transport_admission(
             context, decoded, capacity,
-        )
-        .map_err(map_receive_failure)?;
-        ingest_authenticated(self, request)
-    }
-
-    pub(crate) fn ingest_encoded_otlp_logs(
-        &self,
-        context: AuthorizedContext,
-        encoding: OtlpLogsRequestEncoding,
-        body: Vec<u8>,
-        reservation: TransferredResourceReservation,
-    ) -> Result<IngestRequestOutcome, ServiceFailure> {
-        let capacity = reservation
-            .reclaim(self.instance.resource_governor())
-            .map_err(|_| ServiceFailure::Internal)?;
-        let request = AuthenticatedOtlpLogsRequest::encoded_after_transport_admission(
-            context, encoding, body, capacity,
         )
         .map_err(map_receive_failure)?;
         ingest_authenticated(self, request)
@@ -285,6 +273,10 @@ fn ingest_native_batch(
     batch: NativeLogBatch<'_>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     let instance = &services.instance;
+    let policy = services
+        .ingest_policy
+        .pin()
+        .map_err(|_| ServiceFailure::Internal)?;
     let groups = batch
         .into_admission_groups(instance.admission_group_planner.as_ref())
         .map_err(map_admission_group_plan_failure)?;
@@ -329,7 +321,7 @@ fn ingest_native_batch(
                                 &instance._authority,
                                 &ledger,
                                 &clock,
-                                &instance.ingest_policy,
+                                &policy,
                                 instance.tenant,
                                 shard,
                             )

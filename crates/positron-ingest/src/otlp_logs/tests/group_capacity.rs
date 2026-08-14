@@ -87,9 +87,8 @@ fn second_group_capacity_is_reserved_before_its_configured_policy_result() {
     }
     assert!(!held.is_empty());
 
-    let policy =
-        IngestPolicy::reject_exact_text_body(1, [0x35; 32], "second-group-policy", "reject-second")
-            .expect("policy");
+    let policy = IngestPolicy::reject_exact_text_body(1, "second-group-policy", "reject-second")
+        .expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
     let outcome = LogIngest::new(
         &fixture.authority,

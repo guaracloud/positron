@@ -41,7 +41,7 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
         CompatibilityHints::none(),
     )?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         native_request().encode_to_vec(),
@@ -56,7 +56,7 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
     let shard = VirtualShardId::new(131)?;
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
     let protection_key = || SegmentProtectionKey::from_owned(Box::new([0xe4; 32]));
-    let policy = IngestPolicy::preserving(17, [0xe5; 32])?;
+    let policy = IngestPolicy::preserving(17)?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(500)));
     {
         let ledger =

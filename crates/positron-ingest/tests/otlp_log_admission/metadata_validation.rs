@@ -29,7 +29,7 @@ fn nonempty_trace_and_span_ids_require_their_exact_native_widths() -> Result<(),
     let fixture = fixture(instance.default_tenant_id())?;
 
     for (trace_id, span_id) in [(vec![1; 15], vec![]), (vec![], vec![2; 7])] {
-        let request = AuthenticatedOtlpLogsRequest::protobuf(
+        let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
             context,
             fixture.authority.governor(),
             request_with_ids(trace_id, span_id).encode_to_vec(),

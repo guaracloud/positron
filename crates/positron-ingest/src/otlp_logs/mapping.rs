@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
 
-use super::{NativeLogAttribute, ReceiveFailure};
+use super::ReceiveFailure;
+use positron_policy::NativeLogAttribute;
 
 pub(super) fn checked_timestamp(value: u64) -> Result<i64, ReceiveFailure> {
     i64::try_from(value).map_err(|_| ReceiveFailure::TimestampOutOfRange)
@@ -49,11 +50,7 @@ pub(super) fn grouped_attributes(
     }
     Ok(groups
         .into_iter()
-        .map(|((namespace, key), occurrences)| NativeLogAttribute {
-            namespace,
-            key,
-            occurrences,
-        })
+        .map(|((namespace, key), occurrences)| NativeLogAttribute::new(namespace, key, occurrences))
         .collect())
 }
 

@@ -16,3 +16,4 @@ workspace = true
 [dependencies]
 positron-domain = { path = "../positron-domain" }
 positron-kernel = { path = "../positron-kernel" }
+positron-policy = { path = "../positron-policy" }

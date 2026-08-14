@@ -1,5 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_governance::Identity;
+use positron_governance::{Identity, IngestPolicyAdministration};
 use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
     AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
@@ -17,9 +17,11 @@ use super::{
     InitializationPlan, InitializedInstance, resources,
 };
 
+mod classification;
 mod compatibility;
 mod completion;
 pub(super) mod support;
+pub(super) use classification::classify;
 pub(super) use completion::governance_audit_records;
 use completion::{ensure_claim, open_initial_ledgers, outcome};
 pub(super) use support::decode_record;
@@ -27,46 +29,6 @@ use support::{
     acquire, catalog_failure, entropy_failure, format_secret, inconsistent, key_failure,
     recover_pending_replacement, require_key_identity,
 };
-
-pub(super) fn classify(paths: &BootstrapPaths) -> Result<BootstrapState, BootstrapFailure> {
-    let access = paths.storage.inspect().map_err(storage::storage_failure)?;
-    let state = storage::classify_with(&access)?;
-    if state != BootstrapState::Initialized {
-        return Ok(state);
-    }
-    match validate_initialized(&access) {
-        Ok(()) => Ok(BootstrapState::Initialized),
-        Err(failure)
-            if matches!(
-                failure.code(),
-                BootstrapFailureCode::CorruptState | BootstrapFailureCode::IdentityMismatch
-            ) =>
-        {
-            Ok(BootstrapState::Inconsistent)
-        },
-        Err(failure) => Err(failure),
-    }
-}
-
-fn validate_initialized(access: &BootstrapArtifactAccess) -> Result<(), BootstrapFailure> {
-    if storage::classify_with(access)? != BootstrapState::Initialized {
-        return Err(inconsistent());
-    }
-    let key = access.open_key().map_err(key_failure)?;
-    let encoded = storage::read(access, BootstrapArtifact::Initialized)?;
-    let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
-    require_key_identity(&record, key.identity())?;
-    let generation = access
-        .inspect_catalog(
-            record.instance,
-            key.catalog_secret(record.instance).map_err(key_failure)?,
-        )
-        .map_err(storage::storage_failure)?;
-    if generation == 0 {
-        return Err(BootstrapFailure::new(BootstrapFailureCode::CorruptState));
-    }
-    Ok(())
-}
 
 pub(super) fn initialize(
     paths: &BootstrapPaths,
@@ -238,6 +200,8 @@ fn resume(
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
+    let ingest_policy = IngestPolicyAdministration::open(&catalog, record.tenant)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,
@@ -248,6 +212,7 @@ fn resume(
         generation,
         audit,
         claim_available,
+        ingest_policy,
     )
 }
 
@@ -278,6 +243,8 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
+    let ingest_policy = IngestPolicyAdministration::open(&catalog, record.tenant)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,
@@ -288,6 +255,7 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
         generation,
         audit,
         claim_available,
+        ingest_policy,
     )
 }
 

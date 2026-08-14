@@ -44,7 +44,7 @@ fn lowered_request_record_limit_is_checked_after_policy_before_commit() {
     let batch = OtlpLogsReceiver::with_value_limit_profile(profile)
         .decode(protobuf_with_bodies(&["first", "second"]))
         .expect("structural decode stays within hard safe maxima");
-    let policy = IngestPolicy::preserving(1, [0xc5; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(13)));
 
     let outcome = LogIngest::new(
@@ -98,7 +98,7 @@ fn lowered_request_attribute_limit_counts_namespaced_source_occurrences() {
     let batch = OtlpLogsReceiver::with_value_limit_profile(profile)
         .decode(protobuf_with_bodies(&["one-record-two-attributes"]))
         .expect("resource and record attributes are structurally valid");
-    let policy = IngestPolicy::preserving(1, [0xd5; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(14)));
 
     let outcome = LogIngest::new(
