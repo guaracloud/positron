@@ -6,6 +6,7 @@ use prost::Message;
 use crate::{NativeLogBatch, ReceiveFailure};
 
 use super::{ensure_record_bytes, native_record, retained_bytes};
+use crate::loki_push::preflight::labels::parse_label_set;
 use crate::loki_push::proto::PushRequest;
 
 pub(crate) fn protobuf_batch<'authority>(
@@ -29,7 +30,15 @@ pub(crate) fn protobuf_batch<'authority>(
     let mut records = Vec::new();
     let mut attributes = 0_usize;
     for stream in decoded.streams {
-        let labels = parse_labels(&stream.labels)?;
+        let labels = parse_label_set(
+            &stream.labels,
+            usize::try_from(limits.dynamic_value().attributes_per_namespace().value())
+                .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
+            usize::try_from(limits.dynamic_value().key_path_bytes().value())
+                .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
+            usize::try_from(limits.dynamic_value().individual_value_bytes().value())
+                .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
+        )?;
         for entry in stream.entries {
             if records.len() == record_limit {
                 return Err(ReceiveFailure::ValueLimitExceeded);
@@ -69,58 +78,4 @@ pub(crate) fn protobuf_batch<'authority>(
         u64::try_from(retained).map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
         capacity,
     )
-}
-
-fn parse_labels(source: &str) -> Result<Vec<(String, String)>, ReceiveFailure> {
-    let source = source.trim();
-    let inner = source
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'))
-        .ok_or(ReceiveFailure::MalformedPayload)?;
-    let mut remaining = inner;
-    let mut labels = Vec::new();
-    while !remaining.trim().is_empty() {
-        remaining = remaining.trim_start();
-        let equals = remaining
-            .find('=')
-            .ok_or(ReceiveFailure::MalformedPayload)?;
-        let name = remaining[..equals].trim();
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'.'))
-        {
-            return Err(ReceiveFailure::MalformedPayload);
-        }
-        remaining = remaining[(equals + 1)..].trim_start();
-        let quoted = quoted_value_length(remaining)?;
-        let value = serde_json::from_str::<String>(&remaining[..quoted])
-            .map_err(|_| ReceiveFailure::MalformedPayload)?;
-        labels.push((name.to_owned(), value));
-        remaining = remaining[quoted..].trim_start();
-        if remaining.is_empty() {
-            break;
-        }
-        remaining = remaining
-            .strip_prefix(',')
-            .ok_or(ReceiveFailure::MalformedPayload)?;
-    }
-    Ok(labels)
-}
-
-fn quoted_value_length(source: &str) -> Result<usize, ReceiveFailure> {
-    if !source.starts_with('"') {
-        return Err(ReceiveFailure::MalformedPayload);
-    }
-    let mut escaped = false;
-    for (index, byte) in source.bytes().enumerate().skip(1) {
-        if escaped {
-            escaped = false;
-        } else if byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            return Ok(index + 1);
-        }
-    }
-    Err(ReceiveFailure::MalformedPayload)
 }

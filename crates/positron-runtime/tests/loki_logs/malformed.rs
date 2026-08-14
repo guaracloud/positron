@@ -2,7 +2,7 @@ use std::error::Error;
 
 use positron_runtime::ListenerRole;
 
-use super::support;
+use super::{producer, support};
 
 #[test]
 fn malformed_compression_payloads_and_headers_have_stable_statuses() -> Result<(), Box<dyn Error>> {
@@ -108,6 +108,9 @@ fn invalid_label_sets_fail_without_storage_and_valid_follow_up_succeeds()
         br#"{"streams":[{"stream":{"dup":"one","dup":"two"},"values":[["2","duplicate-label"]]}]}"#
             .as_slice(),
         br#"{"streams":[{"stream":{"1bad":"value"},"values":[["3","invalid-name"]]}]}"#.as_slice(),
+        br#"{"streams":[{"stream":{"a":"one","\u0061":"two"},"values":[["3","semantic-duplicate"]]}]}"#.as_slice(),
+        br#"{"streams":[{"stream":{"app":"api"},"values":[["3","metadata-duplicate",{"m":"one","\u006d":"two"}]]}]}"#.as_slice(),
+        br#"{"streams":[{"stream":{"\uD800":"value"},"values":[["3","bad-surrogate"]]}]}"#.as_slice(),
     ] {
         support::assert_status(
             harness.http(
@@ -120,7 +123,22 @@ fn invalid_label_sets_fail_without_storage_and_valid_follow_up_succeeds()
             400,
         );
     }
-    let query = "logs | range query_time 0 100 | limit 16";
+    let protobuf_headers = [
+        ("Authorization", bearer.as_str()),
+        ("Content-Type", "application/x-protobuf"),
+        ("Content-Encoding", "snappy"),
+    ];
+    support::assert_status(
+        harness.http(
+            ListenerRole::LokiPush,
+            "POST",
+            "/loki/api/v1/push",
+            &protobuf_headers,
+            &producer::snappy_push_with_labels("invalid-protobuf", r#"{app="bad\z"}"#)?,
+        )?,
+        400,
+    );
+    let query = "logs | range query_time 0 2000000000 | limit 16";
     assert!(harness.query_log_bodies(query)?.is_empty());
 
     support::assert_status(
@@ -129,10 +147,23 @@ fn invalid_label_sets_fail_without_storage_and_valid_follow_up_succeeds()
             "POST",
             "/loki/api/v1/push",
             &headers,
-            br#"{"streams":[{"stream":{"app":"api"},"values":[["4","follow-up"]]}]}"#,
+            br#"{"streams":[{"stream":{"a\u0070p":"api"},"values":[["4","follow-up"]]}]}"#,
         )?,
         204,
     );
-    assert_eq!(harness.query_log_bodies(query)?, vec!["follow-up"]);
+    support::assert_status(
+        harness.http(
+            ListenerRole::LokiPush,
+            "POST",
+            "/loki/api/v1/push",
+            &protobuf_headers,
+            &producer::snappy_push_with_labels("protobuf-follow-up", " { app = `api,blue` } ")?,
+        )?,
+        204,
+    );
+    assert_eq!(
+        harness.query_log_bodies(query)?,
+        vec!["follow-up", "protobuf-follow-up"]
+    );
     Ok(())
 }

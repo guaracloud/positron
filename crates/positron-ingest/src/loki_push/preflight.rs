@@ -1,5 +1,6 @@
 mod json;
-mod labels;
+mod json_key;
+pub(super) mod labels;
 mod protobuf;
 
 pub(super) use json::validate_json;

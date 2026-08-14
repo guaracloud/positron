@@ -3,9 +3,13 @@ use std::error::Error;
 use prost::Message;
 
 pub(super) fn snappy_push(line: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    snappy_push_with_labels(line, "{app=\"producer\"}")
+}
+
+pub(super) fn snappy_push_with_labels(line: &str, labels: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let protobuf = PushRequest {
         streams: vec![StreamAdapter {
-            labels: "{app=\"producer\"}".to_owned(),
+            labels: labels.to_owned(),
             entries: vec![EntryAdapter {
                 timestamp: Some(Timestamp {
                     seconds: 1,

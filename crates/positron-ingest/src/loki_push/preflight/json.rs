@@ -4,6 +4,8 @@ use crate::ReceiveFailure;
 use crate::otlp_logs::preflight::json::cursor::{Cursor, StringToken};
 use crate::otlp_logs::preflight::limits::{StructuralLimits, increment};
 
+use super::json_key;
+
 pub(crate) fn validate_json(json: &[u8], profile: ValueLimitProfile) -> Result<(), ReceiveFailure> {
     let system = profile.system_limits();
     let record_bytes = usize::try_from(system.record().decoded_bytes().value())
@@ -41,9 +43,11 @@ struct Validator<'a> {
 impl Validator<'_> {
     fn request(&mut self) -> Result<(), ReceiveFailure> {
         self.cursor.object_start()?;
+        let mut fields = Vec::new();
         let mut found = false;
         while let Some(field) = self.cursor.field()? {
-            if field.is("streams") {
+            let key = self.unique_key(&mut fields, &field)?;
+            if key == "streams" {
                 if found {
                     return Err(ReceiveFailure::MalformedPayload);
                 }
@@ -72,13 +76,15 @@ impl Validator<'_> {
         self.cursor.object_start()?;
         let mut labels = None;
         let mut records = None;
+        let mut fields = Vec::new();
         while let Some(field) = self.cursor.field()? {
-            if field.is("stream") {
+            let key = self.unique_key(&mut fields, &field)?;
+            if key == "stream" {
                 if labels.is_some() {
                     return Err(ReceiveFailure::MalformedPayload);
                 }
                 labels = Some(self.labels()?);
-            } else if field.is("values") {
+            } else if key == "values" {
                 if records.is_some() {
                     return Err(ReceiveFailure::MalformedPayload);
                 }
@@ -111,26 +117,24 @@ impl Validator<'_> {
 
     fn labels(&mut self) -> Result<(usize, usize), ReceiveFailure> {
         self.cursor.object_start()?;
-        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut names = Vec::new();
         let mut bytes = 0usize;
         let mut count = 0usize;
         while let Some(name) = self.cursor.field()? {
             increment(&mut count, self.limits.attribute_entries)?;
-            if !valid_label_name(&name) || names.iter().any(|seen| seen == name.raw()) {
+            let name = json_key::decode(&name, self.limits.key_bytes)?;
+            if !valid_label_name(&name) || names.contains(&name) {
                 return Err(ReceiveFailure::MalformedPayload);
-            }
-            if name.decoded_len > self.limits.key_bytes {
-                return Err(ReceiveFailure::ValueLimitExceeded);
             }
             let value = self.cursor.string()?;
             if value.decoded_len > self.limits.value_bytes {
                 return Err(ReceiveFailure::ValueLimitExceeded);
             }
             bytes = bytes
-                .checked_add(name.decoded_len)
+                .checked_add(name.len())
                 .and_then(|total| total.checked_add(value.decoded_len))
                 .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-            names.push(name.raw().to_vec());
+            names.push(name);
         }
         Ok((names.len(), bytes))
     }
@@ -179,14 +183,12 @@ impl Validator<'_> {
 
     fn metadata(&mut self, mut record: RecordSize) -> Result<RecordSize, ReceiveFailure> {
         self.cursor.object_start()?;
-        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut names = Vec::new();
         while let Some(name) = self.cursor.field()? {
             increment(&mut record.attributes, self.limits.attribute_entries)?;
-            if names.iter().any(|seen| seen == name.raw()) {
+            let name = json_key::decode(&name, self.limits.key_bytes)?;
+            if names.contains(&name) {
                 return Err(ReceiveFailure::MalformedPayload);
-            }
-            if name.decoded_len > self.limits.key_bytes {
-                return Err(ReceiveFailure::ValueLimitExceeded);
             }
             let value = self.cursor.string()?;
             if value.decoded_len > self.limits.value_bytes {
@@ -194,17 +196,32 @@ impl Validator<'_> {
             }
             record.bytes = record
                 .bytes
-                .checked_add(name.decoded_len)
+                .checked_add(name.len())
                 .and_then(|total| total.checked_add(value.decoded_len))
                 .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-            names.push(name.raw().to_vec());
+            names.push(name);
         }
         Ok(record)
     }
+
+    fn unique_key(
+        &self,
+        keys: &mut Vec<String>,
+        token: &StringToken<'_>,
+    ) -> Result<String, ReceiveFailure> {
+        let key = json_key::decode(token, self.limits.key_bytes)?;
+        if keys.contains(&key) {
+            return Err(ReceiveFailure::MalformedPayload);
+        }
+        keys.try_reserve(1)
+            .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+        keys.push(key.clone());
+        Ok(key)
+    }
 }
 
-fn valid_label_name(name: &StringToken<'_>) -> bool {
-    let raw = name.raw();
+fn valid_label_name(name: &str) -> bool {
+    let raw = name.as_bytes();
     raw.first()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
         && raw

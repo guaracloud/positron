@@ -101,6 +101,46 @@ fn protobuf_labels_follow_pinned_prometheus_name_and_uniqueness_rules() -> Resul
     let governor = fixture.authority.governor();
 
     for labels in [
+        " \t{ app = \"api\" , _env9 = `prod,blue` }\n",
+        r#"{esc="a\n\t\xAF\u263a\U0001F600\101\377\a\b\f\r\v\\\""}"#,
+        "{raw=\x60left\rright\x60}",
+    ] {
+        let credential = PresentedCredential::parse(ingest_secret)?;
+        let context = instance.attribute(
+            credential,
+            RequestedIntent::Ingest,
+            CompatibilityHints::none(),
+        )?;
+        let request = admitted(context, governor, request(1, 0, labels))?;
+        assert_eq!(LokiPushReceiver::new().decode(request)?.records().len(), 1);
+        assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    }
+
+    for (length, expected) in [
+        (65_536usize, None),
+        (65_537usize, Some(ReceiveFailure::ValueLimitExceeded)),
+    ] {
+        let credential = PresentedCredential::parse(ingest_secret)?;
+        let context = instance.attribute(
+            credential,
+            RequestedIntent::Ingest,
+            CompatibilityHints::none(),
+        )?;
+        let labels = format!(r#"{{app="{}"}}"#, "x".repeat(length));
+        let request = admitted(context, governor, request(1, 0, &labels))?;
+        match expected {
+            None => assert_eq!(LokiPushReceiver::new().decode(request)?.records().len(), 1),
+            Some(expected) => assert_eq!(
+                LokiPushReceiver::new()
+                    .decode(request)
+                    .expect_err("decoded label value over limit"),
+                expected,
+            ),
+        }
+        assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    }
+
+    for labels in [
         "{}",
         r#"{1bad="value"}"#,
         r#"{bad.name="value"}"#,
@@ -109,6 +149,16 @@ fn protobuf_labels_follow_pinned_prometheus_name_and_uniqueness_rules() -> Resul
         r#"{dup="first",dup="second"}"#,
         r#"{dup="same",dup="same"}"#,
         r#"{bad="unterminated}"#,
+        r#"{bad="unsupported\z"}"#,
+        "{bad=`unterminated}",
+        r#"{bad="value",}"#,
+        r#"{bad="one" next="two"}"#,
+        r#"{bad="\uD800"}"#,
+        r#"{bad="\12"}"#,
+        r#"{bad="\400"}"#,
+        r#"{bad="\xG0"}"#,
+        r#"{bad="\U00110000"}"#,
+        r#"{bad="value"} trailing"#,
     ] {
         let credential = PresentedCredential::parse(ingest_secret)?;
         let context = instance.attribute(
