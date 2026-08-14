@@ -10,7 +10,8 @@ use positron_config::{CommandLineOverrides, ConfigurationInputs, EnvironmentOver
 use positron_kernel::MountQualification;
 use positron_runtime::{
     ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs, InitializationMode,
-    NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
+    NativeBindings, NativeHost, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,
+    ServeConfiguration, ShutdownTrigger,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -19,6 +20,7 @@ const EXIT_OK: u8 = 0;
 const EXIT_CONFIGURATION: u8 = 2;
 const EXIT_STARTUP: u8 = 3;
 const EXIT_FORCED: u8 = 4;
+const STARTUP_RECOVERY_DEADLINE: Duration = Duration::from_secs(3);
 
 pub fn run_native(
     arguments: impl IntoIterator<Item = String>,
@@ -70,14 +72,76 @@ fn run(
     )
     .map_err(|_| LaunchFailure::Configuration)?;
     let host = NativeHost::new(bindings);
-    let process = ApplicationRuntime::start(
+    let recovery =
+        NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
+    let process = match ApplicationRuntime::start(
         ServeConfiguration::new(paths, arguments.initialization),
-        HostInputs::new(&host, &host),
-    )
-    .map_err(LaunchFailure::Startup)?;
-    let signals = Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?;
+        HostInputs::with_recovery(&host, &host, &recovery),
+    ) {
+        Ok(process) => process,
+        Err(outcome @ (ExitOutcome::Graceful | ExitOutcome::Forced)) => return Ok(outcome),
+        Err(outcome) => return Err(LaunchFailure::Startup(outcome)),
+    };
+    let signals = recovery.into_signals()?;
     let deadline = Duration::from_secs(u64::from(effective.shutdown_grace_seconds()));
     wait_for_shutdown(process, signals, deadline)
+}
+
+struct NativeRecovery {
+    started: Instant,
+    signals: std::sync::Mutex<Option<Signals>>,
+}
+
+impl NativeRecovery {
+    fn new(signals: Signals) -> Self {
+        Self {
+            started: Instant::now(),
+            signals: std::sync::Mutex::new(Some(signals)),
+        }
+    }
+
+    fn into_signals(self) -> Result<Signals, LaunchFailure> {
+        self.signals
+            .into_inner()
+            .map_err(|_| LaunchFailure::Signal)?
+            .ok_or(LaunchFailure::Signal)
+    }
+
+    fn pending_trigger(signals: &mut Signals) -> Option<ShutdownTrigger> {
+        let count = signals.pending().take(2).count();
+        match count {
+            0 => None,
+            1 => Some(ShutdownTrigger::FirstSignal),
+            _ => Some(ShutdownTrigger::SecondSignal),
+        }
+    }
+}
+
+impl RecoveryAttemptHost for NativeRecovery {
+    fn after_failure(&self, attempt: RecoveryAttempt) -> RecoveryDecision {
+        if attempt.number() >= 32 || self.started.elapsed() >= STARTUP_RECOVERY_DEADLINE {
+            return RecoveryDecision::Exhausted;
+        }
+        let delay =
+            Duration::from_millis(10_u64.saturating_mul(u64::from(attempt.number())).min(100));
+        let wait_until = Instant::now() + delay;
+        while Instant::now() < wait_until && self.started.elapsed() < STARTUP_RECOVERY_DEADLINE {
+            let trigger = self
+                .signals
+                .lock()
+                .ok()
+                .and_then(|mut signals| signals.as_mut().and_then(Self::pending_trigger));
+            if let Some(trigger) = trigger {
+                return RecoveryDecision::Terminate(trigger);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if self.started.elapsed() >= STARTUP_RECOVERY_DEADLINE {
+            RecoveryDecision::Exhausted
+        } else {
+            RecoveryDecision::Retry
+        }
+    }
 }
 
 fn wait_for_shutdown(
@@ -160,6 +224,7 @@ impl LaunchFailure {
                 | ExitOutcome::StartupUnavailable(_)
                 | ExitOutcome::ListenerUnavailable(_)
                 | ExitOutcome::TaskUnavailable(_)
+                | ExitOutcome::InternalCleanupFailure(_)
                 | ExitOutcome::Fenced => EXIT_STARTUP,
             },
             Self::Signal => EXIT_STARTUP,
@@ -184,14 +249,19 @@ fn exit_code(outcome: ExitOutcome) -> ExitCode {
         ExitOutcome::StartupUnavailable(_)
         | ExitOutcome::ListenerUnavailable(_)
         | ExitOutcome::TaskUnavailable(_)
+        | ExitOutcome::InternalCleanupFailure(_)
         | ExitOutcome::Fenced => ExitCode::from(EXIT_STARTUP),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ExitOutcome, LaunchFailure, exit_code};
-    use positron_runtime::{BootstrapFailureCode, ListenerRole, TaskRole};
+    use super::{
+        ExitOutcome, LaunchFailure, NativeRecovery, RecoveryAttemptHost, RecoveryDecision,
+        ShutdownTrigger, exit_code,
+    };
+    use positron_runtime::{BootstrapFailureCode, ListenerRole, RecoveryAttempt, TaskRole};
+    use signal_hook::iterator::Signals;
 
     #[test]
     fn every_typed_runtime_outcome_has_a_stable_native_exit() {
@@ -202,6 +272,7 @@ mod tests {
             ExitOutcome::StartupUnavailable(BootstrapFailureCode::StorageUnavailable),
             ExitOutcome::ListenerUnavailable(ListenerRole::Api),
             ExitOutcome::TaskUnavailable(TaskRole::Api),
+            ExitOutcome::InternalCleanupFailure(positron_runtime::CleanupFailure::none()),
             ExitOutcome::Fenced,
         ] {
             let code = exit_code(outcome);
@@ -217,5 +288,46 @@ mod tests {
             LaunchFailure::Signal.message(),
             "signal handling unavailable"
         );
+    }
+
+    #[test]
+    fn native_recovery_retries_then_exhausts_at_the_attempt_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recovery = NativeRecovery::new(Signals::new(std::iter::empty::<i32>())?);
+
+        assert_eq!(
+            recovery.after_failure(RecoveryAttempt::for_test(1)),
+            RecoveryDecision::Retry
+        );
+        assert_eq!(
+            recovery.after_failure(RecoveryAttempt::for_test(32)),
+            RecoveryDecision::Exhausted
+        );
+        assert!(recovery.into_signals().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn native_recovery_preserves_typed_attempt_metadata() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let recovery = NativeRecovery::new(Signals::new(std::iter::empty::<i32>())?);
+        let attempt = RecoveryAttempt::for_test(2);
+        assert_eq!(attempt.failure(), BootstrapFailureCode::StorageUnavailable);
+        assert!(!attempt.ownership_held());
+        assert_eq!(recovery.after_failure(attempt), RecoveryDecision::Retry);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_native_signal_interrupts_recovery_backoff() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let recovery = NativeRecovery::new(Signals::new([signal_hook::consts::signal::SIGUSR1])?);
+        signal_hook::low_level::raise(signal_hook::consts::signal::SIGUSR1)?;
+
+        assert_eq!(
+            recovery.after_failure(RecoveryAttempt::for_test(1)),
+            RecoveryDecision::Terminate(ShutdownTrigger::FirstSignal)
+        );
+        Ok(())
     }
 }

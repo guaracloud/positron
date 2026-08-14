@@ -40,7 +40,7 @@ pub struct BootstrapFailure {
 }
 
 impl BootstrapFailure {
-    pub(super) const fn new(code: BootstrapFailureCode) -> Self {
+    pub(crate) const fn new(code: BootstrapFailureCode) -> Self {
         Self { code }
     }
 
@@ -116,6 +116,11 @@ impl BootstrapPaths {
             .acquire()
             .map(|(volume, _)| volume)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
+    }
+
+    #[doc(hidden)]
+    pub fn retain_volume_for_test(&self) -> Result<OwnedPrimaryDataVolume, BootstrapFailure> {
+        self.retain_volume()
     }
 }
 

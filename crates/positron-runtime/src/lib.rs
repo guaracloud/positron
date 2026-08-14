@@ -22,8 +22,9 @@ pub use listener::{
 };
 pub use native_host::{NativeBindings, NativeHost, NativeHostFailure};
 pub use process::{
-    ApplicationRuntime, DrainingProcess, ExitOutcome, HostInputs, InitializationMode,
-    RunningProcess, ServeConfiguration, ShutdownTrigger,
+    ApplicationRuntime, CleanupFailure, DrainingProcess, ExitOutcome, HostInputs,
+    InitializationMode, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision, RunningProcess,
+    ServeConfiguration, ShutdownTrigger,
 };
 pub use services::{ServiceFailure, ServiceHandle};
 pub use task::{

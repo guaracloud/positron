@@ -104,12 +104,17 @@ fn listener_bind_failure_is_typed_and_releases_the_volume_claim()
         positron_runtime::ExitOutcome::ListenerUnavailable(ListenerRole::OtlpHttp)
     );
     assert!(roots.acquire_volume_again().is_ok());
-    assert!(
-        !tasks
+    assert_eq!(
+        tasks
             .events
             .borrow()
             .iter()
-            .any(|event| matches!(event, TaskEvent::Spawned(_)))
+            .filter_map(|event| match event {
+                TaskEvent::Spawned(role) => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [TaskRole::Control, TaskRole::Operations]
     );
     Ok(())
 }
@@ -211,11 +216,61 @@ fn partial_task_spawn_failure_aborts_started_tasks_and_releases_ownership()
             .filter(|event| matches!(event, TaskEvent::Aborted(..)))
             .cloned()
             .collect::<Vec<_>>(),
-        [TaskEvent::Aborted(
-            TaskRole::Operations,
-            ProcessPhase::Recovering,
-            true,
-        )]
+        [
+            TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true),
+            TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Recovering, true),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn partial_spawn_with_failed_rollback_reports_internal_cleanup_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("spawn-rollback-fault")?;
+    let listeners = ObservingListeners {
+        fail_close: Some(ListenerRole::Api),
+        ..ObservingListeners::default()
+    };
+    let tasks = ObservingTasks {
+        fail_spawn: Some(TaskRole::Api),
+        fail_abort: Some(TaskRole::Operations),
+        ..ObservingTasks::default()
+    };
+
+    let failure = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&listeners, &tasks),
+    )
+    .expect_err("failed rollback must not report only the later spawn failure");
+
+    let positron_runtime::ExitOutcome::InternalCleanupFailure(cleanup) = failure else {
+        panic!("unexpected startup outcome: {failure:?}");
+    };
+    assert_eq!(cleanup.first_task(), Some(TaskRole::Operations));
+    assert_eq!(cleanup.task_failures(), 1);
+    assert_eq!(cleanup.listener_failures(), 1);
+    assert!(roots.acquire_volume_again().is_ok());
+    assert!(tasks.events.borrow().iter().any(|event| matches!(
+        event,
+        TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true)
+    )));
+    assert_eq!(
+        tasks
+            .events
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, TaskEvent::Aborted(..)))
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true),
+            TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Recovering, true),
+            TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true),
+        ]
     );
     Ok(())
 }
@@ -247,7 +302,7 @@ fn fenced_partial_task_spawn_failure_aborts_started_tasks_and_releases_ownership
     assert!(roots.acquire_volume_again().is_ok());
     assert!(tasks.events.borrow().iter().any(|event| matches!(
         event,
-        TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Fenced, true)
+        TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Recovering, true)
     )));
     Ok(())
 }

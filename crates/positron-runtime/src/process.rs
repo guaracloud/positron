@@ -4,10 +4,10 @@ use positron_kernel::OwnedPrimaryDataVolume;
 
 use crate::health::ProcessState;
 use crate::{
-    BootstrapFailureCode, BootstrapPaths, BoundEndpoint, BoundListener, HealthState,
-    InitializationPlan, InstanceBootstrap, ListenerFactory, ListenerRequest, ListenerRole,
-    ProcessPhase, RegisteredTask, RunningTask, ServiceHandle, TaskCancellation, TaskFailure,
-    TaskJoinOutcome, TaskRegistrar, TaskRole,
+    BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BoundEndpoint, BoundListener,
+    HealthState, InitializationPlan, InstanceBootstrap, ListenerFactory, ListenerRequest,
+    ListenerRole, ProcessPhase, RegisteredTask, RunningTask, ServiceHandle, TaskCancellation,
+    TaskFailure, TaskJoinOutcome, TaskRegistrar, TaskRole,
 };
 
 /// Whether serving may initialize a provably empty instance.
@@ -38,6 +38,7 @@ impl ServeConfiguration {
 pub struct HostInputs<'host> {
     listeners: &'host dyn ListenerFactory,
     tasks: &'host dyn TaskRegistrar,
+    recovery: &'host dyn RecoveryAttemptHost,
 }
 
 impl<'host> HostInputs<'host> {
@@ -46,7 +47,88 @@ impl<'host> HostInputs<'host> {
         listeners: &'host dyn ListenerFactory,
         tasks: &'host dyn TaskRegistrar,
     ) -> Self {
-        Self { listeners, tasks }
+        Self {
+            listeners,
+            tasks,
+            recovery: &BOUNDED_RECOVERY,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_recovery(
+        listeners: &'host dyn ListenerFactory,
+        tasks: &'host dyn TaskRegistrar,
+        recovery: &'host dyn RecoveryAttemptHost,
+    ) -> Self {
+        Self {
+            listeners,
+            tasks,
+            recovery,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryAttempt {
+    number: u8,
+    failure: BootstrapFailureCode,
+    ownership_held: bool,
+}
+
+impl RecoveryAttempt {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn for_test(number: u8) -> Self {
+        Self {
+            number,
+            failure: BootstrapFailureCode::StorageUnavailable,
+            ownership_held: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        self.number
+    }
+
+    #[must_use]
+    pub const fn failure(self) -> BootstrapFailureCode {
+        self.failure
+    }
+
+    #[must_use]
+    pub const fn ownership_held(self) -> bool {
+        self.ownership_held
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryDecision {
+    Retry,
+    Exhausted,
+    Terminate(ShutdownTrigger),
+}
+
+pub trait RecoveryAttemptHost {
+    fn prerequisite_status(&self) -> Result<(), BootstrapFailureCode> {
+        Ok(())
+    }
+
+    fn after_failure(&self, attempt: RecoveryAttempt) -> RecoveryDecision;
+}
+
+struct BoundedRecovery;
+static BOUNDED_RECOVERY: BoundedRecovery = BoundedRecovery;
+
+impl RecoveryAttemptHost for BoundedRecovery {
+    fn after_failure(&self, attempt: RecoveryAttempt) -> RecoveryDecision {
+        if attempt.number >= 32 {
+            return RecoveryDecision::Exhausted;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            10_u64.saturating_mul(u64::from(attempt.number)).min(100),
+        ));
+        RecoveryDecision::Retry
     }
 }
 
@@ -59,7 +141,41 @@ pub enum ExitOutcome {
     StartupUnavailable(BootstrapFailureCode),
     ListenerUnavailable(ListenerRole),
     TaskUnavailable(TaskRole),
+    InternalCleanupFailure(CleanupFailure),
     Fenced,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleanupFailure {
+    first_task: Option<TaskRole>,
+    task_failures: u8,
+    listener_failures: u8,
+}
+
+impl CleanupFailure {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            first_task: None,
+            task_failures: 0,
+            listener_failures: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn first_task(self) -> Option<TaskRole> {
+        self.first_task
+    }
+
+    #[must_use]
+    pub const fn task_failures(self) -> u8 {
+        self.task_failures
+    }
+
+    #[must_use]
+    pub const fn listener_failures(self) -> u8 {
+        self.listener_failures
+    }
 }
 
 impl std::fmt::Display for ExitOutcome {
@@ -81,7 +197,7 @@ pub enum ShutdownTrigger {
 pub struct RunningProcess {
     state: ProcessState,
     listeners: Vec<Box<dyn BoundListener>>,
-    tasks: Vec<Box<dyn RunningTask>>,
+    tasks: RunningTasks,
     cancellation: TaskCancellation,
     instance: Option<Arc<Mutex<crate::InitializedInstance>>>,
     fenced_volume: Option<OwnedPrimaryDataVolume>,
@@ -90,6 +206,8 @@ pub struct RunningProcess {
 
 /// A process that has stopped data admission and awaits one terminal trigger.
 pub struct DrainingProcess(RunningProcess);
+
+type RunningTasks = Vec<(TaskRole, Box<dyn RunningTask>)>;
 
 impl std::fmt::Debug for RunningProcess {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,7 +281,7 @@ impl DrainingProcess {
     }
 
     pub fn poll(&mut self) -> Result<bool, TaskFailure> {
-        for task in &mut self.0.tasks {
+        for (_, task) in &mut self.0.tasks {
             match task.poll_join()? {
                 Some(TaskJoinOutcome::Joined) => {},
                 Some(TaskJoinOutcome::DeadlineExpired | TaskJoinOutcome::SecondSignal) => {
@@ -183,7 +301,7 @@ impl DrainingProcess {
             return self.0.abort_shutdown();
         }
         if trigger == ShutdownTrigger::FirstSignal {
-            for task in &mut self.0.tasks {
+            for (_, task) in &mut self.0.tasks {
                 match task.join() {
                     Ok(TaskJoinOutcome::Joined) => {},
                     Ok(TaskJoinOutcome::DeadlineExpired | TaskJoinOutcome::SecondSignal)
@@ -208,7 +326,7 @@ impl RunningProcess {
     fn abort_shutdown(&mut self) -> ExitOutcome {
         self.state.transition(ProcessPhase::Stopping);
         self.cancellation.cancel();
-        for task in &mut self.tasks {
+        for (_, task) in &mut self.tasks {
             match task.abort() {
                 Ok(()) | Err(_) => {},
             }
@@ -227,7 +345,7 @@ impl Drop for RunningProcess {
     fn drop(&mut self) {
         self.state.transition(ProcessPhase::Stopping);
         close_listeners(&mut self.listeners);
-        for task in &mut self.tasks {
+        for (_, task) in &mut self.tasks {
             match task.abort() {
                 Ok(()) | Err(_) => {},
             }

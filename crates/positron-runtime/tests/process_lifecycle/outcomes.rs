@@ -60,6 +60,7 @@ fn deadline_aborts_every_task_and_never_reports_graceful_completion()
             .cloned()
             .collect::<Vec<_>>(),
         [
+            TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
@@ -181,7 +182,7 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     assert_eq!(health.readiness(), Readiness::NotReady);
     assert!(roots.acquire_volume_again().is_ok());
     let events = tasks.events.borrow();
-    assert_eq!(events.len(), 9);
+    assert_eq!(events.len(), 12);
     assert!(matches!(
         events.last(),
         Some(TaskEvent::Joined(TaskRole::OtlpHttp, ..))
