@@ -164,8 +164,8 @@ impl GovernorInner {
         })
     }
 
-    /// Moves a fully allocated configuration into inline state. `Mutex::new`
-    /// and atomic construction retain their values inline and do not allocate.
+    /// Moves a fully allocated configuration into state and gives transferred
+    /// reservations shared ownership of only the preallocated drop ledger.
     pub(in crate::resource_governor) fn new(
         ownership: KernelOwnership,
         configuration: GovernorConfiguration,
@@ -189,11 +189,11 @@ impl GovernorInner {
             recovery_system_pool_capacities: configuration.recovery_system_pool_capacities,
             disk_thresholds: configuration.disk_thresholds,
             state: Mutex::new(configuration.state),
-            slot_signals: configuration.slot_signals,
-            pending_words: configuration.pending_words,
-            has_pending_releases: AtomicBool::new(false),
+            drop_ledger: Arc::new(super::super::ledger::DropLedger::new(
+                configuration.slot_signals,
+                configuration.pending_words,
+            )),
             last_pressure: AtomicU8::new(pressure_index(initial_pressure)),
-            pending_fence: AtomicBool::new(false),
             contention_count: AtomicU64::new(0),
         }
     }

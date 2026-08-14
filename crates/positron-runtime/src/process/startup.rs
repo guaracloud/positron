@@ -136,6 +136,9 @@ impl ApplicationRuntime {
         if let Some(planner) = configuration.admission_group_planner {
             instance.admission_group_planner = planner;
         }
+        if let Some(source) = configuration.ledger_operation_fault_source {
+            instance.ledger_operation_fault_source = Some(source);
+        }
         let instance = Arc::new(instance);
         let services = ServiceHandle::new(Arc::clone(&instance));
         for role in [

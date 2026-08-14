@@ -1,5 +1,7 @@
 //! OTLP Logs gRPC public-boundary integration tests.
 
+#[path = "otlp_logs_grpc/admission_group_faults.rs"]
+mod admission_group_faults;
 #[path = "otlp_logs_grpc/admission_groups.rs"]
 mod admission_groups;
 #[path = "otlp_logs_grpc/authenticated_export.rs"]

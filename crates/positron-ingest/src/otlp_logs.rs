@@ -22,7 +22,7 @@ mod tests;
 use preflight::validate_record_count;
 use transport::bounded_protobuf;
 
-pub use admission_groups::NativeLogAdmissionGroup;
+pub use admission_groups::{NativeLogAdmissionGroup, NativeLogAdmissionGroups};
 
 const RECEIVER_CAPACITY: ResourceAmounts =
     ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 1, 0]);

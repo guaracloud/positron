@@ -1,6 +1,6 @@
-use positron_ingest::ReceiveFailure;
+use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
 
-use super::{ServiceFailure, map_receive_failure};
+use super::{ServiceFailure, map_admission_group_plan_failure, map_receive_failure};
 
 #[test]
 fn service_diagnostics_are_stable_and_secret_free() {
@@ -30,4 +30,20 @@ fn receiver_failures_preserve_auth_capacity_and_request_classes() {
     ] {
         assert_eq!(map_receive_failure(failure), ServiceFailure::InvalidRequest);
     }
+}
+
+#[test]
+fn planner_failures_preserve_permanent_retryable_and_invariant_classes() {
+    assert_eq!(
+        map_admission_group_plan_failure(AdmissionGroupPlanFailure::UnsupportedSignal),
+        ServiceFailure::InvalidRequest
+    );
+    assert_eq!(
+        map_admission_group_plan_failure(AdmissionGroupPlanFailure::AssignmentUnavailable),
+        ServiceFailure::CapacityUnavailable
+    );
+    assert_eq!(
+        map_admission_group_plan_failure(AdmissionGroupPlanFailure::RecordCountExceeded),
+        ServiceFailure::Internal
+    );
 }

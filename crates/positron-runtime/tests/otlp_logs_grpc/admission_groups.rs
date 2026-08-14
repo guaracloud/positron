@@ -16,6 +16,20 @@ struct ExplicitTwoShardPlan {
     second: VirtualShardId,
 }
 
+struct RefusingPlan(AdmissionGroupPlanFailure);
+
+impl AdmissionGroupPlanner for RefusingPlan {
+    fn assigned_shard(
+        &self,
+        _tenant: TenantId,
+        _signal: SignalKind,
+        _record_ordinal: u32,
+        _record: &NativeLogCandidate,
+    ) -> Result<VirtualShardId, AdmissionGroupPlanFailure> {
+        Err(self.0)
+    }
+}
+
 impl AdmissionGroupPlanner for ExplicitTwoShardPlan {
     fn assigned_shard(
         &self,
@@ -33,6 +47,50 @@ impl AdmissionGroupPlanner for ExplicitTwoShardPlan {
             self.second
         })
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn assignment_unavailable_is_exposed_as_retryable_capacity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = LiveGrpcHarness::start_with("plan-capacity", |configuration| {
+        configuration.with_admission_group_planner(Arc::new(RefusingPlan(
+            AdmissionGroupPlanFailure::AssignmentUnavailable,
+        )))
+    })?;
+    let mut client = LogsServiceClient::connect(format!("http://{}", harness.endpoint())).await?;
+    let status = client
+        .export(harness.authorize(tonic::Request::new(otlp_request("capacity")))?)
+        .await
+        .expect_err("unavailable assignment must refuse the request");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    drop(client);
+    assert_eq!(
+        harness.shutdown(ShutdownTrigger::FirstSignal).await?,
+        ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_signal_is_exposed_as_permanent_invalid_argument()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = LiveGrpcHarness::start_with("plan-invalid", |configuration| {
+        configuration.with_admission_group_planner(Arc::new(RefusingPlan(
+            AdmissionGroupPlanFailure::UnsupportedSignal,
+        )))
+    })?;
+    let mut client = LogsServiceClient::connect(format!("http://{}", harness.endpoint())).await?;
+    let status = client
+        .export(harness.authorize(tonic::Request::new(otlp_request("invalid")))?)
+        .await
+        .expect_err("invalid assignment must refuse the request");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    drop(client);
+    assert_eq!(
+        harness.shutdown(ShutdownTrigger::FirstSignal).await?,
+        ExitOutcome::Graceful
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

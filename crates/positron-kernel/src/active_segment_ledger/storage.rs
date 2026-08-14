@@ -1,25 +1,35 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+use std::sync::Arc;
 
 use rustix::fs::{self as unix_fs, AtFlags, Dir, Mode, OFlags};
 
 use crate::OwnedPrimaryDataVolume;
 use crate::catalog::{CatalogSnapshot, InstanceId};
 use crate::data_protection::{
-    DataProtection, EncryptedFrame, FrameLimits, FrameSequence, ObjectDataKey, SegmentFramePurpose,
+    DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SegmentFramePurpose,
 };
 
-use super::fault::{LedgerFileEvent, emit_event, injected_partial_write_length};
+use super::fault::{
+    LedgerFileEvent, LedgerOperationFaultSource, emit_event, emit_injected_event,
+    injected_partial_write_length,
+};
 use super::format::{
     SegmentMetadata, SegmentState, decode_header, decode_metadata, encode_header, encode_metadata,
 };
 use super::io::{map_errno, map_io_error, open_or_create_directory, open_regular, synchronize};
 use super::recovery::frontier_temporary_name;
-use super::recovery::{RecoveryState, frontier_name, publish_frontier, recover, segment_name};
+use super::recovery::{
+    RecoveryState, frontier_name, publish_frontier_with_operation_fault, recover, segment_name,
+};
 use super::{
     LedgerFailure, LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
     map_frame_failure, object_context,
 };
+
+mod append;
+#[cfg(test)]
+pub(super) use append::write_segment_bytes;
 
 const MAX_SEGMENTS: usize = 1_024;
 const MAX_HEADER_BYTES: usize = 512;
@@ -58,6 +68,8 @@ pub(super) struct LedgerStorage {
     active: File,
     sealed: File,
     current: Option<SegmentMetadata>,
+    fault_scope: Option<SegmentScope>,
+    fault_source: Option<Arc<dyn LedgerOperationFaultSource>>,
 }
 
 impl LedgerStorage {
@@ -71,7 +83,20 @@ impl LedgerStorage {
             active,
             sealed,
             current: None,
+            fault_scope: None,
+            fault_source: None,
         })
+    }
+
+    pub(super) fn open_with_operation_faults(
+        volume: &OwnedPrimaryDataVolume,
+        scope: SegmentScope,
+        source: Arc<dyn LedgerOperationFaultSource>,
+    ) -> Result<Self, LedgerFailure> {
+        let mut storage = Self::open(volume)?;
+        storage.fault_scope = Some(scope);
+        storage.fault_source = Some(source);
+        Ok(storage)
     }
 
     pub(super) fn catalog_segments(
@@ -356,86 +381,6 @@ impl LedgerStorage {
         self.current
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
     }
-
-    pub(super) fn append_and_commit<R>(
-        &self,
-        key: &ObjectDataKey,
-        sequence: u64,
-        position: positron_domain::routing::CommitPosition,
-        frame_bytes: u32,
-        protect_frame: impl FnOnce() -> Result<EncryptedFrame, LedgerFailure>,
-        admit_durability: impl FnOnce() -> Result<R, LedgerFailure>,
-    ) -> Result<[u8; 32], AppendFailure> {
-        let unchanged = SegmentMutation::NotStarted;
-        let metadata = self
-            .current
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
-            .map_err(|failure| unchanged.failure(failure))?;
-        let mut file = open_regular(&self.active, &segment_name(metadata.id), true)
-            .map_err(|failure| unchanged.failure(failure))?;
-        file.seek(SeekFrom::End(0))
-            .map_err(map_io_error)
-            .map_err(|failure| unchanged.failure(failure))?;
-        emit_event(LedgerFileEvent::WriteFrame).map_err(|failure| unchanged.failure(failure))?;
-        let prefix = frame_bytes.to_be_bytes();
-        let partial = injected_partial_write_length(LedgerFileEvent::PartialFrameWrite, 4);
-        let prefix_bytes = partial.map_or(prefix.as_slice(), |length| &prefix[..length]);
-        let mutation = write_segment_bytes(&mut file, prefix_bytes, SegmentMutation::NotStarted)?;
-        if partial.is_some() {
-            return Err(mutation.failure(LedgerFailure::new(LedgerFailureCode::StorageUnavailable)));
-        }
-        let encrypted = protect_frame().map_err(|failure| mutation.failure(failure))?;
-        write_segment_bytes(&mut file, encrypted.as_bytes(), mutation)?;
-        let _durability = admit_durability().map_err(|failure| mutation.failure(failure))?;
-        emit_event(LedgerFileEvent::SynchronizeFrame)
-            .map_err(|failure| mutation.failure(failure))?;
-        synchronize(&file).map_err(|failure| mutation.failure(failure))?;
-        emit_event(LedgerFileEvent::InspectSegmentMetadata)
-            .map_err(|failure| mutation.failure(failure))?;
-        let durable_bytes = file
-            .metadata()
-            .map_err(map_io_error)
-            .map_err(|failure| mutation.failure(failure))?
-            .len();
-        publish_frontier(
-            &self.active,
-            metadata.id,
-            key,
-            durable_bytes,
-            sequence
-                .checked_add(1)
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
-                .map_err(|failure| mutation.failure(failure))?,
-            position,
-        )
-        .map_err(|failure| mutation.failure(failure))
-    }
-}
-
-pub(super) fn write_segment_bytes(
-    file: &mut impl Write,
-    bytes: &[u8],
-    mut mutation: SegmentMutation,
-) -> Result<SegmentMutation, AppendFailure> {
-    let mut written = 0_usize;
-    while written < bytes.len() {
-        match file.write(&bytes[written..]) {
-            Ok(0) => {
-                return Err(mutation.failure(map_io_error(std::io::Error::from(
-                    std::io::ErrorKind::WriteZero,
-                ))));
-            },
-            Ok(count) => {
-                written = written.checked_add(count).ok_or_else(|| {
-                    mutation.failure(LedgerFailure::new(LedgerFailureCode::LimitExceeded))
-                })?;
-                mutation = SegmentMutation::BytesWritten;
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
-            Err(error) => return Err(mutation.failure(map_io_error(error))),
-        }
-    }
-    Ok(mutation)
 }
 
 pub(super) fn recognized_ledger_name(name: &[u8]) -> bool {

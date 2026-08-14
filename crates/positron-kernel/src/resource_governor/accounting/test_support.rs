@@ -33,8 +33,8 @@ impl GovernorInner {
             state.recovery_tenant_pool_usage.as_ptr() as usize,
             state.ordinary_tenant_pool_usage.as_ptr() as usize,
             state.tenant_outstanding.as_ptr() as usize,
-            self.slot_signals.as_ptr() as usize,
-            self.pending_words.as_ptr() as usize,
+            self.drop_ledger.slot_signals.as_ptr() as usize,
+            self.drop_ledger.pending_words.as_ptr() as usize,
             state.grant_records.as_ptr() as usize,
             state.free_slots.as_ptr() as usize,
         ]

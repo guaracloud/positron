@@ -92,6 +92,12 @@ pub(super) fn native_batch<'authority>(
                     &resource,
                     &scope,
                     &log,
+                    [
+                        &resource_schema_url,
+                        &scope_name,
+                        &scope_version,
+                        &scope_schema_url,
+                    ],
                     structural_nesting_depth,
                     structural_decoded_record_bytes,
                 )?;

@@ -7,10 +7,14 @@ pub(super) fn decoded_record_bytes(
     resource: &[KeyValue],
     scope: &[KeyValue],
     record: &LogRecord,
+    cloned_metadata: [&str; 4],
     maximum_nesting_depth: u16,
     maximum_decoded_record_bytes: usize,
 ) -> Result<usize, ReceiveFailure> {
     let mut bytes = record.severity_text.len();
+    for value in cloned_metadata {
+        bytes = add_decoded_bytes(bytes, value.len(), maximum_decoded_record_bytes)?;
+    }
     if let Some(body) = &record.body {
         bytes = add_decoded_bytes(
             bytes,

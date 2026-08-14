@@ -109,6 +109,7 @@ pub(super) fn outcome(
         logs_shard,
         ingest_policy,
         admission_group_planner,
+        ledger_operation_fault_source: None,
         tenant_slug: BootstrapRecord::tenant_slug()?,
         administrator: record.administrator,
         integrity_key_fingerprint: record.integrity_fingerprint,

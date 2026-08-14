@@ -82,7 +82,7 @@ fn corrupt_pending_bit_and_missing_record_fail_closed() {
 #[test]
 fn padding_bit_past_the_last_slot_fences_without_indexing_storage() {
     let (governor, _) = super::super::lifecycle_tests::governor();
-    governor.inner.pending_words[0].fetch_or(1_u64 << 63, Ordering::Release);
+    governor.inner.drop_ledger.pending_words[0].fetch_or(1_u64 << 63, Ordering::Release);
     governor.inner.publish_pending_hint_for_test();
     let snapshot = governor
         .inspect()

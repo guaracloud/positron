@@ -2,15 +2,17 @@ use positron_domain::identity::{Scope, TenantId};
 use positron_domain::routing::VirtualShardId;
 use positron_kernel::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, LifecycleClock, LifecycleClockSource,
-    ResourceAmounts, StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
+    StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_signals::LogStore;
 
 use crate::policy::PolicyDecision;
 use crate::{IngestPolicy, NativeLogBatch};
 
+mod capacity;
 mod failure;
 
+use capacity::group_work_amounts;
 pub(crate) use failure::classify_log_store_failure_code;
 use failure::map_ledger_failure;
 
@@ -188,6 +190,39 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         if records.is_empty() {
             return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord);
         }
+        let input_record_count = match u64::try_from(records.len()) {
+            Ok(count) => count,
+            Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+        };
+        let mut capacity = match capacity {
+            Some(mut capacity) => {
+                if capacity
+                    .try_resize(group_work_amounts(input_record_count))
+                    .is_err()
+                {
+                    return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
+                }
+                capacity
+            },
+            None => {
+                let claim = match WorkClaim::tenant(
+                    self.tenant,
+                    WorkKind::Ingest,
+                    group_work_amounts(input_record_count),
+                ) {
+                    Ok(claim) => claim,
+                    Err(_) => {
+                        return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+                    },
+                };
+                match self.authority.governor().reserve(claim) {
+                    Ok(capacity) => capacity,
+                    Err(_) => {
+                        return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
+                    },
+                }
+            },
+        };
         let mut accepted = Vec::new();
         let mut accepted_attributes = 0_usize;
         let mut rejection_counts = [0_usize; 3];
@@ -286,41 +321,12 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             Ok(count) => count,
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
-        let amounts = ResourceAmounts::new([
-            1_048_576,
-            1,
-            1,
-            1_048_576,
-            record_count,
-            0,
-            1,
-            1,
-            1,
-            4,
-            1_048_576,
-        ]);
-        let capacity = match capacity {
-            Some(mut capacity) => {
-                if capacity.try_resize(amounts).is_err() {
-                    return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
-                }
-                capacity
-            },
-            None => {
-                let claim = match WorkClaim::tenant(self.tenant, WorkKind::Ingest, amounts) {
-                    Ok(claim) => claim,
-                    Err(_) => {
-                        return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
-                    },
-                };
-                match self.authority.governor().reserve(claim) {
-                    Ok(capacity) => capacity,
-                    Err(_) => {
-                        return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
-                    },
-                }
-            },
-        };
+        if capacity
+            .try_resize(group_work_amounts(record_count))
+            .is_err()
+        {
+            return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
+        }
         let prepared = match LogStore::new().prepare(
             capacity,
             self.clock,

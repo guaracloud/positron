@@ -7,8 +7,9 @@ use positron_governance::{
     AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
 };
 use positron_ingest::{
-    AdmissionGroupOutcome, AuthenticatedOtlpLogsRequest, IngestFailureCode, IngestOutcome,
-    IngestRequestOutcome, LogIngest, OtlpLogsReceiver, reserve_otlp_logs_transport,
+    AdmissionGroupOutcome, AdmissionGroupPlanFailure, AuthenticatedOtlpLogsRequest,
+    IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, OtlpLogsReceiver,
+    reserve_otlp_logs_transport,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
@@ -134,6 +135,17 @@ impl ServiceHandle {
         source: &str,
         budget: QueryBudget,
     ) -> Result<Vec<String>, ServiceFailure> {
+        self.query_log_bodies_on_shard(bearer, self.instance.logs_shard, source, budget)
+    }
+
+    #[doc(hidden)]
+    pub fn query_log_bodies_on_shard(
+        &self,
+        bearer: &str,
+        shard: positron_domain::routing::VirtualShardId,
+        source: &str,
+        budget: QueryBudget,
+    ) -> Result<Vec<String>, ServiceFailure> {
         let instance = &self.instance;
         let context = instance
             .attribute(
@@ -151,7 +163,6 @@ impl ServiceHandle {
                 .map_err(|_| ServiceFailure::KeyUnavailable)?,
         )
         .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        let shard = instance.logs_shard;
         let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
         let protection = instance
             .key
@@ -191,7 +202,7 @@ fn ingest_authenticated<'authority>(
         .map_err(map_receive_failure)?;
     let groups = batch
         .into_admission_groups(instance.admission_group_planner.as_ref())
-        .map_err(|_| ServiceFailure::Internal)?;
+        .map_err(map_admission_group_plan_failure)?;
     if groups.is_empty() {
         return Ok(IngestRequestOutcome::new(vec![AdmissionGroupOutcome::new(
             instance.logs_shard,
@@ -219,7 +230,19 @@ fn ingest_authenticated<'authority>(
         let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
         let outcome = match instance.key.segment_key(instance.instance, scope) {
             Ok(protection) => {
-                match ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection) {
+                let ledger = match instance.ledger_operation_fault_source.as_ref() {
+                    Some(source) => ActiveSegmentLedger::open_with_operation_fault_source(
+                        &instance._authority,
+                        &catalog,
+                        scope,
+                        protection,
+                        Arc::clone(source),
+                    ),
+                    None => {
+                        ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
+                    },
+                };
+                match ledger {
                     Ok(ledger) => match instance.key.random_identifier() {
                         Ok(identifier) => match StoreBlockIdentity::new(identifier) {
                             Ok(identity) => LogIngest::new(
@@ -248,6 +271,14 @@ fn ingest_authenticated<'authority>(
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     Ok(IngestRequestOutcome::new(outcomes))
+}
+
+fn map_admission_group_plan_failure(failure: AdmissionGroupPlanFailure) -> ServiceFailure {
+    match failure {
+        AdmissionGroupPlanFailure::UnsupportedSignal => ServiceFailure::InvalidRequest,
+        AdmissionGroupPlanFailure::AssignmentUnavailable => ServiceFailure::CapacityUnavailable,
+        AdmissionGroupPlanFailure::RecordCountExceeded => ServiceFailure::Internal,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

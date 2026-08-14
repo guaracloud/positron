@@ -37,11 +37,12 @@ impl<'authority> ResourceReservation<'authority> {
     pub fn transfer(mut self) -> TransferredResourceReservation {
         self.active = false;
         TransferredResourceReservation {
-            governor_identity: std::ptr::from_ref(self.governor).addr(),
+            drop_ledger: Arc::clone(&self.governor.drop_ledger),
             slot: self.slot,
             owner: self.owner,
             identity: self.identity,
             amounts: self.amounts,
+            active: true,
         }
     }
 
@@ -130,13 +131,14 @@ impl<'authority> ResourceReservation<'authority> {
 impl TransferredResourceReservation {
     /// Rebinds this move-only token to the same governor that granted it.
     pub fn reclaim(
-        self,
+        mut self,
         governor: ResourceGovernor<'_>,
     ) -> Result<ResourceReservation<'_>, GovernorFailure> {
-        if self.governor_identity != std::ptr::from_ref(governor.inner).addr() {
+        if !Arc::ptr_eq(&self.drop_ledger, &governor.inner.drop_ledger) {
             governor.inner.mark_foreign_release();
             return Err(GovernorFailure::InternalFenced);
         }
+        self.active = false;
         Ok(ResourceReservation::new(
             governor.inner,
             self.owner,
@@ -148,10 +150,17 @@ impl TransferredResourceReservation {
 
     /// Returns this slot to the same Resource Governor that granted it.
     pub fn release(self, governor: ResourceGovernor<'_>) {
-        if self.governor_identity == std::ptr::from_ref(governor.inner).addr() {
-            governor.inner.mark_drop_pending(self.slot);
-        } else {
+        if !Arc::ptr_eq(&self.drop_ledger, &governor.inner.drop_ledger) {
             governor.inner.mark_foreign_release();
+        }
+    }
+}
+
+impl Drop for TransferredResourceReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.drop_ledger.mark_drop_pending(self.slot);
+            self.active = false;
         }
     }
 }

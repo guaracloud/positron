@@ -1,5 +1,8 @@
 use super::{OtlpLogsReceiver, ReceiveFailure};
 
+mod group_capacity;
+mod metadata_accounting;
+
 #[test]
 fn receiver_defaults_and_failures_keep_the_public_contract() {
     assert_eq!(
