@@ -1079,6 +1079,8 @@ version = "0.0.0"
 dependencies = [
  "positron-domain",
  "positron-kernel",
+ "positron-policy",
+ "sha2",
  "zeroize",
 ]
 

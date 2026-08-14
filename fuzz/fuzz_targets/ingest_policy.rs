@@ -110,7 +110,7 @@ impl FuzzFixture {
         let Ok(policy) = compile_policy(data) else {
             return;
         };
-        let request = AuthenticatedOtlpLogsRequest::protobuf(
+        let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
             self.context,
             self.authority.governor(),
             request(data).encode_to_vec(),

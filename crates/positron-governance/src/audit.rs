@@ -6,12 +6,13 @@ use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
+use crate::{AdministrativeIdempotencyKey, ResourceGeneration};
 
 pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
 
 const MAGIC: [u8; 8] = *b"POSAUD01";
 const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
-const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL01";
+const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,9 +48,48 @@ pub enum GovernanceAuditEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngestPolicyActivationAuditEntry {
     position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    principal: PrincipalId,
     tenant: TenantId,
-    generation: u64,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
     digest: [u8; 32],
+    request_digest: [u8; 32],
+}
+
+impl IngestPolicyActivationAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
 }
 
 /// Typed, bounded meaning of the committed instance initialization audit.
@@ -138,18 +178,34 @@ impl GovernanceAuditEntry {
             if cursor.take_array::<8>()? != POLICY_ACTIVATION_MAGIC {
                 return Err(IdentityFailure);
             }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            let principal =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
             let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
-            let generation = cursor.take_u64()?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
             let digest = cursor.take_array()?;
-            if generation == 0 || digest.iter().all(|byte| *byte == 0) || !cursor.is_empty() {
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || digest.iter().all(|byte| *byte == 0)
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
                 return Err(IdentityFailure);
             }
             return Ok(Self::IngestPolicyActivation(
                 IngestPolicyActivationAuditEntry {
                     position,
+                    idempotency_key,
+                    principal,
                     tenant,
+                    expected_generation,
                     generation,
                     digest,
+                    request_digest,
                 },
             ));
         }

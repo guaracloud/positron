@@ -245,7 +245,7 @@ fn authenticated_request<'authority>(
         RequestedIntent::Ingest,
         CompatibilityHints::none(),
     )?;
-    Ok(AuthenticatedOtlpLogsRequest::protobuf(
+    Ok(AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         request.encode_to_vec(),

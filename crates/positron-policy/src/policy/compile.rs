@@ -54,7 +54,12 @@ impl IngestPolicy {
                 })
                 .ok_or(PolicyCompileFailure::PolicyBytesExceeded)?;
         }
-        let digest = super::canonical::digest(&rules)?;
+        let encoded = super::canonical::encode(&rules)?;
+        crate::activation::MAX_ACTIVATED_POLICY_OBJECT_BYTES
+            .checked_sub(32)
+            .filter(|maximum| encoded.len() <= *maximum)
+            .ok_or(PolicyCompileFailure::PolicyBytesExceeded)?;
+        let digest = super::canonical::digest_encoded(&encoded);
         let scratch_bytes = u64::try_from(rules.len())
             .ok()
             .and_then(|count| count.checked_mul(u64::try_from(std::mem::size_of::<String>()).ok()?))
@@ -154,10 +159,8 @@ impl PolicyPredicate {
         match self {
             Self::AttributeExists(path) | Self::AttributeType(path, _) => path.worst_case_steps(),
             Self::ServiceIdentity(_) => MAX_NATIVE_RECORD_BYTES,
-            Self::BodyExactText(_)
-            | Self::SignalStore(_)
-            | Self::Receiver(_)
-            | Self::LogSeverity(_) => 1,
+            Self::BodyExactText(value) => u64::try_from(value.len()).unwrap_or(u64::MAX).max(1),
+            Self::SignalStore(_) | Self::Receiver(_) | Self::LogSeverity(_) => 1,
         }
     }
 }

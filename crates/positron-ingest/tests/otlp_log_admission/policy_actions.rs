@@ -44,7 +44,7 @@ fn remove_erases_source_content_and_persists_typed_provenance() -> Result<(), Bo
         CompatibilityHints::none(),
     )?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         request().encode_to_vec(),
@@ -122,7 +122,7 @@ fn remove_erases_source_content_and_persists_typed_provenance() -> Result<(), Bo
 fn ordered_rules_transform_repeated_and_nested_native_values() -> Result<(), Box<dyn Error>> {
     let (instance, context) = attributed_instance("ordered-policy")?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         nested_request().encode_to_vec(),
@@ -197,7 +197,7 @@ fn ordered_rules_transform_repeated_and_nested_native_values() -> Result<(), Box
 fn ordered_accept_and_reject_stop_at_the_first_terminal_action() -> Result<(), Box<dyn Error>> {
     let (instance, context) = attributed_instance("terminal-policy")?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         bodies_request(&["first", "second"]).encode_to_vec(),

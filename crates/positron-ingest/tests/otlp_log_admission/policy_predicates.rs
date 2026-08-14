@@ -20,7 +20,7 @@ fn predicates_match_signal_receiver_service_severity_path_and_native_type()
 -> Result<(), Box<dyn Error>> {
     let (instance, context) = attributed_instance("predicate-policy")?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         request().encode_to_vec(),

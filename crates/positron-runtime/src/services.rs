@@ -7,8 +7,7 @@ use positron_governance::{
 use positron_ingest::{
     AdmissionGroupOutcome, AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest,
     IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, LokiPushReceiver,
-    LokiPushRequestEncoding, NativeLogBatch, OtlpLogsReceiver, OtlpLogsRequestEncoding,
-    reserve_log_receiver_transport,
+    LokiPushRequestEncoding, NativeLogBatch, OtlpLogsReceiver, reserve_log_receiver_transport,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
@@ -19,6 +18,7 @@ use positron_query::{QueryBudget, QueryEvent, QueryService};
 use crate::InitializedInstance;
 
 mod failure;
+mod otlp;
 
 pub use failure::ServiceFailure;
 use failure::{map_admission_group_plan_failure, map_receive_failure};
@@ -61,7 +61,7 @@ impl ServiceHandle {
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
         let context = self.authorize_logs(bearer)?;
         let instance = &self.instance;
-        let request = AuthenticatedOtlpLogsRequest::protobuf(
+        let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
             context,
             instance._authority.governor(),
             protobuf,
@@ -99,26 +99,8 @@ impl ServiceHandle {
         let capacity = reservation
             .reclaim(instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
-        let request = AuthenticatedOtlpLogsRequest::decoded_after_transport_admission(
+        let request = AuthenticatedOtlpLogsRequest::decoded_otlp_grpc_after_transport_admission(
             context, decoded, capacity,
-        )
-        .map_err(map_receive_failure)?;
-        ingest_authenticated(self, request)
-    }
-
-    pub(crate) fn ingest_encoded_otlp_logs(
-        &self,
-        context: AuthorizedContext,
-        encoding: OtlpLogsRequestEncoding,
-        receiver: positron_ingest::PolicyReceiver,
-        body: Vec<u8>,
-        reservation: TransferredResourceReservation,
-    ) -> Result<IngestRequestOutcome, ServiceFailure> {
-        let capacity = reservation
-            .reclaim(self.instance.resource_governor())
-            .map_err(|_| ServiceFailure::Internal)?;
-        let request = AuthenticatedOtlpLogsRequest::encoded_after_transport_admission(
-            context, encoding, receiver, body, capacity,
         )
         .map_err(map_receive_failure)?;
         ingest_authenticated(self, request)

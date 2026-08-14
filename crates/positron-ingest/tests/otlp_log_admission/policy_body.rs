@@ -20,7 +20,7 @@ use super::support::fixture;
 fn body_remove_redact_and_utf8_truncate_persist_typed_evidence() -> Result<(), Box<dyn Error>> {
     let (instance, context) = attributed_instance("body-policy")?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         bodies_request(&["remove-body", "redact-body", "ol\u{00e1}-mundo"]).encode_to_vec(),
@@ -83,7 +83,7 @@ fn body_truncation_precedes_the_post_policy_value_limit_profile() -> Result<(), 
         maximum.dynamic_value(),
     );
     let profile = ValueLimitProfileCandidate::new(maximum, Some(tenant)).validate()?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         bodies_request(&["12345"]).encode_to_vec(),
@@ -118,7 +118,7 @@ fn unchanged_body_that_exceeds_the_post_policy_limit_is_rejected() -> Result<(),
         maximum.dynamic_value(),
     );
     let profile = ValueLimitProfileCandidate::new(maximum, Some(tenant)).validate()?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         bodies_request(&["12345"]).encode_to_vec(),

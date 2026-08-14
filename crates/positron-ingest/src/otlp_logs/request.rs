@@ -41,24 +41,62 @@ pub struct AuthenticatedOtlpLogsRequest<'authority> {
 }
 
 impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
-    pub fn protobuf(
+    pub fn otlp_grpc_protobuf(
         context: AuthorizedContext,
         governor: ResourceGovernor<'authority>,
         protobuf: Vec<u8>,
     ) -> Result<Self, ReceiveFailure> {
-        Self::admit(context, governor, OtlpPayload::Protobuf(protobuf))
+        Self::admit(
+            context,
+            governor,
+            OtlpPayload::Protobuf(protobuf),
+            crate::PolicyReceiver::OtlpGrpc,
+        )
     }
 
-    pub fn gzip_protobuf(
+    pub fn otlp_grpc_gzip_protobuf(
         context: AuthorizedContext,
         governor: ResourceGovernor<'authority>,
         gzip_protobuf: Vec<u8>,
     ) -> Result<Self, ReceiveFailure> {
-        Self::admit(context, governor, OtlpPayload::GzipProtobuf(gzip_protobuf))
+        Self::admit(
+            context,
+            governor,
+            OtlpPayload::GzipProtobuf(gzip_protobuf),
+            crate::PolicyReceiver::OtlpGrpc,
+        )
+    }
+
+    pub fn otlp_http(
+        context: AuthorizedContext,
+        governor: ResourceGovernor<'authority>,
+        encoding: OtlpLogsRequestEncoding,
+        body: Vec<u8>,
+    ) -> Result<Self, ReceiveFailure> {
+        Self::admit(
+            context,
+            governor,
+            payload(encoding, body),
+            http_receiver(encoding),
+        )
+    }
+
+    pub fn loki_otlp(
+        context: AuthorizedContext,
+        governor: ResourceGovernor<'authority>,
+        encoding: OtlpLogsRequestEncoding,
+        body: Vec<u8>,
+    ) -> Result<Self, ReceiveFailure> {
+        Self::admit(
+            context,
+            governor,
+            payload(encoding, body),
+            loki_otlp_receiver(encoding),
+        )
     }
 
     /// Accepts a message decoded by an authenticated bounded gRPC transport.
-    pub fn decoded_after_transport_admission(
+    pub fn decoded_otlp_grpc_after_transport_admission(
         context: AuthorizedContext,
         decoded: ExportLogsServiceRequest,
         capacity: ResourceReservation<'authority>,
@@ -72,24 +110,31 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
     }
 
     /// Accepts encoded bytes only after authentication and transport admission.
-    pub fn encoded_after_transport_admission(
+    pub fn encoded_otlp_http_after_transport_admission(
         context: AuthorizedContext,
         encoding: OtlpLogsRequestEncoding,
-        receiver: crate::PolicyReceiver,
         body: Vec<u8>,
         capacity: ResourceReservation<'authority>,
     ) -> Result<Self, ReceiveFailure> {
-        let payload = match encoding {
-            OtlpLogsRequestEncoding::Protobuf => OtlpPayload::Protobuf(body),
-            OtlpLogsRequestEncoding::GzipProtobuf => OtlpPayload::GzipProtobuf(body),
-            OtlpLogsRequestEncoding::Json => OtlpPayload::Json(body),
-            OtlpLogsRequestEncoding::GzipJson => OtlpPayload::GzipJson(body),
-        };
         Ok(Self {
             attribution: ingest_attribution(context)?,
-            payload,
+            payload: payload(encoding, body),
             capacity: Some(capacity),
-            receiver,
+            receiver: http_receiver(encoding),
+        })
+    }
+
+    pub fn encoded_loki_otlp_after_transport_admission(
+        context: AuthorizedContext,
+        encoding: OtlpLogsRequestEncoding,
+        body: Vec<u8>,
+        capacity: ResourceReservation<'authority>,
+    ) -> Result<Self, ReceiveFailure> {
+        Ok(Self {
+            attribution: ingest_attribution(context)?,
+            payload: payload(encoding, body),
+            capacity: Some(capacity),
+            receiver: loki_otlp_receiver(encoding),
         })
     }
 
@@ -97,6 +142,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
         context: AuthorizedContext,
         governor: ResourceGovernor<'authority>,
         payload: OtlpPayload,
+        receiver: crate::PolicyReceiver,
     ) -> Result<Self, ReceiveFailure> {
         let attribution = ingest_attribution(context)?;
         let maximum_request_bytes = usize::try_from(
@@ -115,7 +161,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             attribution,
             payload,
             capacity: Some(capacity),
-            receiver: crate::PolicyReceiver::OtlpGrpc,
+            receiver,
         })
     }
 
@@ -152,19 +198,36 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             receiver: crate::PolicyReceiver::OtlpGrpc,
         }
     }
+}
 
-    #[cfg(test)]
-    pub(super) fn test_only_with_receiver(
-        attribution: TenantAttribution,
-        payload: OtlpPayload,
-        receiver: crate::PolicyReceiver,
-    ) -> Self {
-        Self {
-            attribution,
-            payload,
-            capacity: None,
-            receiver,
-        }
+fn payload(encoding: OtlpLogsRequestEncoding, body: Vec<u8>) -> OtlpPayload {
+    match encoding {
+        OtlpLogsRequestEncoding::Protobuf => OtlpPayload::Protobuf(body),
+        OtlpLogsRequestEncoding::GzipProtobuf => OtlpPayload::GzipProtobuf(body),
+        OtlpLogsRequestEncoding::Json => OtlpPayload::Json(body),
+        OtlpLogsRequestEncoding::GzipJson => OtlpPayload::GzipJson(body),
+    }
+}
+
+const fn http_receiver(encoding: OtlpLogsRequestEncoding) -> crate::PolicyReceiver {
+    match encoding {
+        OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::GzipProtobuf => {
+            crate::PolicyReceiver::OtlpHttpProtobuf
+        },
+        OtlpLogsRequestEncoding::Json | OtlpLogsRequestEncoding::GzipJson => {
+            crate::PolicyReceiver::OtlpHttpJson
+        },
+    }
+}
+
+const fn loki_otlp_receiver(encoding: OtlpLogsRequestEncoding) -> crate::PolicyReceiver {
+    match encoding {
+        OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::GzipProtobuf => {
+            crate::PolicyReceiver::LokiOtlpProtobuf
+        },
+        OtlpLogsRequestEncoding::Json | OtlpLogsRequestEncoding::GzipJson => {
+            crate::PolicyReceiver::LokiOtlpJson
+        },
     }
 }
 

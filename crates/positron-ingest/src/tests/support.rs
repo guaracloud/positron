@@ -38,7 +38,7 @@ pub fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
     let ordinary_capacity = ResourceAmounts::new([
-        5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+        5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 800, 32, 2_000_000,
     ]);
     let governed = add(recovery_capacity, ordinary_capacity)?;
     let raw = add(governed, cardinality.governor_bootstrap_overhead(1)?)?;

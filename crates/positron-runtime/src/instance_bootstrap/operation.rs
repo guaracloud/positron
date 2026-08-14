@@ -1,5 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_governance::Identity;
+use positron_governance::{Identity, IngestPolicyAdministration};
 use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
     AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
@@ -20,12 +20,10 @@ use super::{
 mod classification;
 mod compatibility;
 mod completion;
-mod policy;
 pub(super) mod support;
 pub(super) use classification::classify;
 pub(super) use completion::governance_audit_records;
 use completion::{ensure_claim, open_initial_ledgers, outcome};
-pub(super) use policy::activated_policy;
 pub(super) use support::decode_record;
 use support::{
     acquire, catalog_failure, entropy_failure, format_secret, inconsistent, key_failure,
@@ -202,7 +200,8 @@ fn resume(
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = activated_policy(&current, record.tenant)?;
+    let ingest_policy = IngestPolicyAdministration::activated(&current, record.tenant)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,
@@ -244,7 +243,8 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = activated_policy(&current, record.tenant)?;
+    let ingest_policy = IngestPolicyAdministration::activated(&current, record.tenant)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,

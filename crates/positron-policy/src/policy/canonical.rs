@@ -7,8 +7,8 @@ use super::{
 
 pub(crate) const MAGIC: &[u8] = b"positron-ingest-policy-v1\0";
 
-pub(super) fn digest(rules: &[PolicyRule]) -> Result<[u8; 32], PolicyCompileFailure> {
-    Ok(Sha256::digest(encode(rules)?).into())
+pub(super) fn digest_encoded(encoded: &[u8]) -> [u8; 32] {
+    Sha256::digest(encoded).into()
 }
 
 pub(crate) fn encode(rules: &[PolicyRule]) -> Result<Vec<u8>, PolicyCompileFailure> {

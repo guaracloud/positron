@@ -3,7 +3,6 @@ use super::{OtlpLogsReceiver, ReceiveFailure};
 mod group_capacity;
 mod json_semantics;
 mod metadata_accounting;
-mod receiver_identity;
 mod zero_identifiers;
 
 #[test]

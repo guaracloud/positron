@@ -43,11 +43,12 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
 -> Result<(), Box<dyn Error>> {
     let (instance, context) = attributed_instance("capacity-policy")?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let batch = OtlpLogsReceiver::new().decode(AuthenticatedOtlpLogsRequest::protobuf(
-        context,
-        fixture.authority.governor(),
-        bodies_request(&["commit-first", "policy-reject-later"]).encode_to_vec(),
-    )?)?;
+    let batch =
+        OtlpLogsReceiver::new().decode(AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
+            context,
+            fixture.authority.governor(),
+            bodies_request(&["commit-first", "policy-reject-later"]).encode_to_vec(),
+        )?)?;
     let shards = [VirtualShardId::new(91)?, VirtualShardId::new(92)?];
     let mut groups = batch.into_admission_groups(&TwoShards(shards))?;
     let catalog = Catalog::open(

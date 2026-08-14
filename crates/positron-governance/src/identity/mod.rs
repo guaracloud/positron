@@ -46,6 +46,22 @@ pub struct Identity {
 }
 
 impl Identity {
+    pub(super) fn authorize_policy_activation(
+        &self,
+        context: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        if context.principal != self.principal
+            || context.scope != Scope::SystemAdministration
+            || context.tenant.is_some()
+            || context.authority != self.instance
+            || tenant != self.tenant
+        {
+            return Err(AttributionFailure);
+        }
+        Ok(context.principal)
+    }
+
     /// Reconstructs the unique initialization identity from a pinned Catalog.
     pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
         let mut identity = None;

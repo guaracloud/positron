@@ -13,6 +13,7 @@ use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 
 mod audit;
 mod identity;
+mod policy_administration;
 
 pub use audit::{
     CatalogRootRotationAuditEntry, CatalogRootRotationStage, GovernanceAuditEntry,
@@ -21,6 +22,10 @@ pub use audit::{
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
     IdentityFailure, PresentedCredential, RequestedIntent,
+};
+pub use policy_administration::{
+    AdministrativeIdempotencyKey, IngestPolicyActivation, IngestPolicyAdministration,
+    PolicyAdministrationFailure, PolicyAdministrationFailureCode, ResourceGeneration,
 };
 
 const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV03";

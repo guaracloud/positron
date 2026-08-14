@@ -9,23 +9,18 @@ use crate::{
 };
 
 const ACTIVATION_MAGIC: &[u8; 8] = b"PIPACT01";
-const AUDIT_MAGIC: &[u8; 8] = b"POSPOL01";
+const ACTIVATION_HEADER_BYTES: usize = 8 + 16 + 8;
+pub const MAX_ACTIVATED_POLICY_OBJECT_BYTES: usize = 1_048_576;
 
 /// Opaque, validated Catalog object bytes for one tenant policy activation.
 pub struct ActivatedPolicyObject {
     object: Vec<u8>,
-    audit: Vec<u8>,
 }
 
 impl ActivatedPolicyObject {
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.object
-    }
-
-    #[must_use]
-    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
-        (self.object, self.audit)
     }
 }
 
@@ -82,20 +77,16 @@ impl IngestPolicy {
     ) -> Result<ActivatedPolicyObject, PolicyActivationFailure> {
         let definition =
             super::policy::canonical::encode(&self.rules).map_err(|_| PolicyActivationFailure)?;
-        let mut bytes = Vec::with_capacity(32_usize.saturating_add(definition.len()));
+        let capacity = ACTIVATION_HEADER_BYTES
+            .checked_add(definition.len())
+            .filter(|bytes| *bytes <= MAX_ACTIVATED_POLICY_OBJECT_BYTES)
+            .ok_or(PolicyActivationFailure)?;
+        let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(ACTIVATION_MAGIC);
         bytes.extend_from_slice(&tenant.to_bytes());
         bytes.extend_from_slice(&self.generation.to_be_bytes());
         bytes.extend_from_slice(&definition);
-        let mut audit = Vec::with_capacity(64);
-        audit.extend_from_slice(AUDIT_MAGIC);
-        audit.extend_from_slice(&tenant.to_bytes());
-        audit.extend_from_slice(&self.generation.to_be_bytes());
-        audit.extend_from_slice(&self.digest);
-        Ok(ActivatedPolicyObject {
-            object: bytes,
-            audit,
-        })
+        Ok(ActivatedPolicyObject { object: bytes })
     }
 
     pub fn decode_activated_object(

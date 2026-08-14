@@ -41,7 +41,7 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
         CompatibilityHints::none(),
     )?;
     let fixture = fixture(instance.default_tenant_id())?;
-    let request = AuthenticatedOtlpLogsRequest::protobuf(
+    let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
         context,
         fixture.authority.governor(),
         native_request().encode_to_vec(),

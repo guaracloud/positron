@@ -1,8 +1,8 @@
 use positron_domain::identity::TenantId;
 use positron_domain::value::AttributeNamespace;
 use positron_policy::{
-    IngestPolicy, PolicyAction, PolicyAttributePath, PolicyCompileFailure, PolicyPredicate,
-    PolicyRule,
+    IngestPolicy, MAX_ACTIVATED_POLICY_OBJECT_BYTES, PolicyAction, PolicyAttributePath,
+    PolicyCompileFailure, PolicyPredicate, PolicyRule,
 };
 
 #[test]
@@ -34,6 +34,44 @@ fn activated_object_round_trips_exact_policy_and_is_tenant_scoped() {
     let mut corrupt = bytes;
     corrupt.push(1);
     assert!(IngestPolicy::decode_activated_object(tenant, &corrupt).is_err());
+}
+
+#[test]
+fn compiler_ceiling_is_the_exact_persisted_activation_object_size() {
+    let tenant = TenantId::from_bytes([9; 16]).expect("tenant");
+    let make_policy = |body: String| {
+        IngestPolicy::compile(
+            1,
+            vec![
+                PolicyRule::new(
+                    "exact",
+                    vec![PolicyPredicate::body_exact_text(body).expect("predicate")],
+                    PolicyAction::Accept,
+                )
+                .expect("rule"),
+            ],
+        )
+    };
+    let empty_bytes = make_policy(String::new())
+        .expect("empty body policy")
+        .activated_object(tenant)
+        .expect("activation")
+        .into_bytes()
+        .len();
+    let exact_body_bytes = MAX_ACTIVATED_POLICY_OBJECT_BYTES - empty_bytes;
+    let exact = make_policy("a".repeat(exact_body_bytes)).expect("exact maximum");
+    assert_eq!(
+        exact
+            .activated_object(tenant)
+            .expect("activation")
+            .into_bytes()
+            .len(),
+        MAX_ACTIVATED_POLICY_OBJECT_BYTES,
+    );
+    assert_eq!(
+        make_policy("a".repeat(exact_body_bytes + 1)).expect_err("one byte over"),
+        PolicyCompileFailure::PolicyBytesExceeded,
+    );
 }
 
 #[test]

@@ -6,7 +6,9 @@ mod metadata;
 mod policy;
 mod provenance;
 
-pub use activation::{ActivatedPolicyObject, PolicyActivationFailure};
+pub use activation::{
+    ActivatedPolicyObject, MAX_ACTIVATED_POLICY_OBJECT_BYTES, PolicyActivationFailure,
+};
 pub use candidate::{EvaluatedLogRecord, NativeLogAttribute, NativeLogCandidate};
 pub use metadata::LogMetadata;
 pub use policy::{

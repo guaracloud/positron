@@ -43,11 +43,12 @@ fn admitted_request_keeps_one_immutable_snapshot_across_groups() -> Result<(), B
     let (instance, context) = attributed_instance("snapshot-policy")?;
     let first_fixture = fixture(instance.default_tenant_id())?;
     let old = body_policy(31, PolicyAction::Redact(PolicyTarget::body()))?;
-    let old_batch = OtlpLogsReceiver::new().decode(AuthenticatedOtlpLogsRequest::protobuf(
-        context,
-        first_fixture.authority.governor(),
-        bodies_request(&["sensitive", "sensitive"]).encode_to_vec(),
-    )?)?;
+    let old_batch =
+        OtlpLogsReceiver::new().decode(AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
+            context,
+            first_fixture.authority.governor(),
+            bodies_request(&["sensitive", "sensitive"]).encode_to_vec(),
+        )?)?;
     let shards = [VirtualShardId::new(72)?, VirtualShardId::new(73)?];
     let groups = old_batch.into_admission_groups(&TwoGroups(shards))?;
     let current = body_policy(32, PolicyAction::Remove(PolicyTarget::body()))?;
@@ -96,11 +97,12 @@ fn admitted_request_keeps_one_immutable_snapshot_across_groups() -> Result<(), B
     }
 
     let refreshed_fixture = fixture(instance.default_tenant_id())?;
-    let new_batch = OtlpLogsReceiver::new().decode(AuthenticatedOtlpLogsRequest::protobuf(
-        context,
-        refreshed_fixture.authority.governor(),
-        bodies_request(&["sensitive"]).encode_to_vec(),
-    )?)?;
+    let new_batch =
+        OtlpLogsReceiver::new().decode(AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
+            context,
+            refreshed_fixture.authority.governor(),
+            bodies_request(&["sensitive"]).encode_to_vec(),
+        )?)?;
     let new_result = ingest_and_scan(&refreshed_fixture, new_batch, &current, 82)?;
     assert!(new_result.records()[0].body().is_none());
     assert_eq!(new_result.records()[0].policy_provenance().generation(), 32);

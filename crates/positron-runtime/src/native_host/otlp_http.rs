@@ -116,23 +116,11 @@ pub(super) fn receive(
     let reservation = admission
         .take()
         .map_err(|failure| service_response_with_encoding(failure, response_encoding))?;
-    let receiver = match (head.path.as_str(), request_encoding) {
-        (
-            "/otlp/v1/logs",
-            OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::GzipProtobuf,
-        ) => positron_ingest::PolicyReceiver::LokiOtlpProtobuf,
-        ("/otlp/v1/logs", OtlpLogsRequestEncoding::Json | OtlpLogsRequestEncoding::GzipJson) => {
-            positron_ingest::PolicyReceiver::LokiOtlpJson
-        },
-        (_, OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::GzipProtobuf) => {
-            positron_ingest::PolicyReceiver::OtlpHttpProtobuf
-        },
-        (_, OtlpLogsRequestEncoding::Json | OtlpLogsRequestEncoding::GzipJson) => {
-            positron_ingest::PolicyReceiver::OtlpHttpJson
-        },
+    let result = if head.path == "/otlp/v1/logs" {
+        services.ingest_encoded_loki_otlp_logs(context, request_encoding, body, reservation)
+    } else {
+        services.ingest_encoded_otlp_http_logs(context, request_encoding, body, reservation)
     };
-    let result =
-        services.ingest_encoded_otlp_logs(context, request_encoding, receiver, body, reservation);
     Ok(ingest_response(result, response_encoding))
 }
 
