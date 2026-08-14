@@ -9,22 +9,28 @@ use positron_kernel::{
 };
 use prost::Message;
 
+mod admission_groups;
 mod bounds;
+mod decoded;
 mod mapping;
 mod preflight;
 mod transport;
 
-use bounds::decoded_record_bytes;
-use mapping::{candidate_value, checked_timestamp, grouped_attributes};
+#[cfg(test)]
+mod tests;
+
 use preflight::validate_record_count;
 use transport::bounded_protobuf;
 
+pub use admission_groups::{NativeLogAdmissionGroup, NativeLogAdmissionGroups};
+
 const RECEIVER_CAPACITY: ResourceAmounts =
-    ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 0, 0]);
+    ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 1, 0]);
 
 enum OtlpPayload {
     Protobuf(Vec<u8>),
     GzipProtobuf(Vec<u8>),
+    Decoded(Box<ExportLogsServiceRequest>),
 }
 
 /// OTLP bytes that can exist only after authoritative tenant attribution.
@@ -59,15 +65,25 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
         Self::admit(context, governor, OtlpPayload::GzipProtobuf(gzip_protobuf))
     }
 
+    /// Accepts a message decoded by an authenticated bounded gRPC transport.
+    pub fn decoded_after_transport_admission(
+        context: AuthorizedContext,
+        decoded: ExportLogsServiceRequest,
+        capacity: ResourceReservation<'authority>,
+    ) -> Result<Self, ReceiveFailure> {
+        Ok(Self {
+            attribution: ingest_attribution(context)?,
+            payload: OtlpPayload::Decoded(Box::new(decoded)),
+            capacity: Some(capacity),
+        })
+    }
+
     fn admit(
         context: AuthorizedContext,
         governor: ResourceGovernor<'authority>,
         payload: OtlpPayload,
     ) -> Result<Self, ReceiveFailure> {
-        let attribution = context
-            .tenant_attribution()
-            .filter(|attribution| attribution.scope() == positron_domain::identity::Scope::Ingest)
-            .ok_or(ReceiveFailure::AuthenticationRejected)?;
+        let attribution = ingest_attribution(context)?;
         let maximum_request_bytes = usize::try_from(
             ValueLimitProfile::release_1_system_maximum()
                 .system_limits()
@@ -79,11 +95,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
         if payload.encoded_len() > maximum_request_bytes {
             return Err(ReceiveFailure::TransportLimitExceeded);
         }
-        let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
-            .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
-        let capacity = governor
-            .reserve(claim)
-            .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+        let capacity = reserve_otlp_logs_transport(context, governor)?;
         Ok(Self {
             attribution,
             payload,
@@ -110,6 +122,32 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             capacity: None,
         }
     }
+}
+
+/// Reserves the canonical receiver budget before an authenticated transport
+/// begins structural decode or decompression.
+pub fn reserve_otlp_logs_transport<'authority>(
+    context: AuthorizedContext,
+    governor: ResourceGovernor<'authority>,
+) -> Result<ResourceReservation<'authority>, ReceiveFailure> {
+    let attribution = ingest_attribution(context)?;
+    let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
+        .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+    governor
+        .reserve(claim)
+        .map_err(|_| ReceiveFailure::CapacityUnavailable)
+}
+
+/// Validates the Release 1 OTLP Logs protobuf shape before structural decoding.
+pub fn preflight_otlp_logs_protobuf(protobuf: &[u8]) -> Result<(), ReceiveFailure> {
+    validate_record_count(protobuf, ValueLimitProfile::release_1_system_maximum())
+}
+
+fn ingest_attribution(context: AuthorizedContext) -> Result<TenantAttribution, ReceiveFailure> {
+    context
+        .tenant_attribution()
+        .filter(|attribution| attribution.scope() == positron_domain::identity::Scope::Ingest)
+        .ok_or(ReceiveFailure::AuthenticationRejected)
 }
 
 /// Stable receiver-side rejection classes.
@@ -165,6 +203,7 @@ pub struct NativeLogCandidate {
     observed_time_unix_nanos: Option<i64>,
     body: Option<CandidateAttributeValue>,
     attributes: Vec<NativeLogAttribute>,
+    metadata: positron_signals::LogMetadata,
 }
 
 impl NativeLogCandidate {
@@ -195,25 +234,29 @@ impl NativeLogCandidate {
         Option<i64>,
         Option<CandidateAttributeValue>,
         Vec<NativeLogAttribute>,
+        positron_signals::LogMetadata,
     ) {
         (
             self.event_time_unix_nanos,
             self.observed_time_unix_nanos,
             self.body,
             self.attributes,
+            self.metadata,
         )
     }
 }
 
 /// One tenant-bound native batch after protocol mapping.
 #[derive(Debug)]
-pub struct NativeLogBatch {
+pub struct NativeLogBatch<'authority> {
     attribution: TenantAttribution,
     records: Vec<NativeLogCandidate>,
     value_limit_profile: ValueLimitProfile,
+    decoded_bytes: u64,
+    capacity: Option<ResourceReservation<'authority>>,
 }
 
-impl NativeLogBatch {
+impl<'authority> NativeLogBatch<'authority> {
     #[must_use]
     pub const fn attribution(&self) -> TenantAttribution {
         self.attribution
@@ -225,13 +268,37 @@ impl NativeLogBatch {
     }
 
     #[must_use]
-    pub fn into_records(self) -> Vec<NativeLogCandidate> {
-        self.records
-    }
-
-    #[must_use]
     pub const fn value_limit_profile(&self) -> ValueLimitProfile {
         self.value_limit_profile
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        TenantAttribution,
+        Vec<NativeLogCandidate>,
+        ValueLimitProfile,
+        Option<ResourceReservation<'authority>>,
+    ) {
+        (
+            self.attribution,
+            self.records,
+            self.value_limit_profile,
+            self.capacity,
+        )
+    }
+
+    fn resize_after_decode(&mut self) -> Result<(), ReceiveFailure> {
+        let record_count =
+            u64::try_from(self.records.len()).map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
+        let amounts =
+            ResourceAmounts::new([self.decoded_bytes, 1, 1, 0, record_count, 0, 0, 0, 1, 1, 0]);
+        if let Some(capacity) = self.capacity.as_mut() {
+            capacity
+                .try_resize(amounts)
+                .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+        }
+        Ok(())
     }
 }
 
@@ -261,127 +328,28 @@ impl OtlpLogsReceiver {
         }
     }
 
-    pub fn decode(
+    pub fn decode<'authority>(
         &self,
-        request: AuthenticatedOtlpLogsRequest,
-    ) -> Result<NativeLogBatch, ReceiveFailure> {
+        request: AuthenticatedOtlpLogsRequest<'authority>,
+    ) -> Result<NativeLogBatch<'authority>, ReceiveFailure> {
         let AuthenticatedOtlpLogsRequest {
             attribution,
             payload,
             capacity,
         } = request;
-        let _capacity = capacity;
-        let protobuf = bounded_protobuf(payload, self.value_limit_profile)?;
-        validate_record_count(&protobuf, self.value_limit_profile)?;
-        let decoded = ExportLogsServiceRequest::decode(protobuf.as_slice())
-            .map_err(|_| ReceiveFailure::MalformedPayload)?;
-        let mut records = Vec::new();
-        let mut attribute_count = 0_usize;
-        let mut decoded_batch_bytes = 0_usize;
-        let encoded_record_limit = usize::try_from(
-            self.value_limit_profile
-                .effective_limits()
-                .record()
-                .encoded_bytes()
-                .value(),
-        )
-        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-        let structural_nesting_depth = self
-            .value_limit_profile
-            .system_limits()
-            .dynamic_value()
-            .nesting_depth()
-            .value();
-        let structural_decoded_record_bytes = usize::try_from(
-            self.value_limit_profile
-                .system_limits()
-                .record()
-                .decoded_bytes()
-                .value(),
-        )
-        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-        let structural_decoded_batch_bytes = usize::try_from(
-            self.value_limit_profile
-                .system_limits()
-                .request()
-                .decompressed_bytes()
-                .value(),
-        )
-        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-        let structural_record_limit = usize::try_from(
-            self.value_limit_profile
-                .system_limits()
-                .request()
-                .records()
-                .value(),
-        )
-        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-        let structural_attribute_limit = usize::try_from(
-            self.value_limit_profile
-                .system_limits()
-                .request()
-                .aggregate_attributes()
-                .value(),
-        )
-        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-        for resource_logs in decoded.resource_logs {
-            let resource = resource_logs
-                .resource
-                .map_or_else(Vec::new, |value| value.attributes);
-            for scope_logs in resource_logs.scope_logs {
-                let scope = scope_logs
-                    .scope
-                    .map_or_else(Vec::new, |value| value.attributes);
-                for log in scope_logs.log_records {
-                    if records.len() == structural_record_limit
-                        || log.encoded_len() > encoded_record_limit
-                    {
-                        return Err(ReceiveFailure::ValueLimitExceeded);
-                    }
-                    let decoded_record_bytes = decoded_record_bytes(
-                        &resource,
-                        &scope,
-                        &log,
-                        structural_nesting_depth,
-                        structural_decoded_record_bytes,
-                    )?;
-                    decoded_batch_bytes = decoded_batch_bytes
-                        .checked_add(decoded_record_bytes)
-                        .filter(|bytes| *bytes <= structural_decoded_batch_bytes)
-                        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-                    attribute_count = attribute_count
-                        .checked_add(resource.len())
-                        .and_then(|count| count.checked_add(scope.len()))
-                        .and_then(|count| count.checked_add(log.attributes.len()))
-                        .filter(|count| *count <= structural_attribute_limit)
-                        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-                    let body = log
-                        .body
-                        .map(|value| candidate_value(value, structural_nesting_depth))
-                        .transpose()?;
-                    let attributes = grouped_attributes(
-                        &resource,
-                        &scope,
-                        &log.attributes,
-                        structural_nesting_depth,
-                    )?;
-                    let event_time = Some(checked_timestamp(log.time_unix_nano)?);
-                    let observed_time_unix_nanos =
-                        Some(checked_timestamp(log.observed_time_unix_nano)?);
-                    records.push(NativeLogCandidate {
-                        event_time_unix_nanos: event_time,
-                        observed_time_unix_nanos,
-                        body,
-                        attributes,
-                    });
-                }
-            }
-        }
-        Ok(NativeLogBatch {
-            attribution,
-            records,
-            value_limit_profile: self.value_limit_profile,
-        })
+        let decoded = match payload {
+            OtlpPayload::Decoded(decoded) => *decoded,
+            encoded => {
+                let protobuf = bounded_protobuf(encoded, self.value_limit_profile)?;
+                validate_record_count(&protobuf, self.value_limit_profile)?;
+                ExportLogsServiceRequest::decode(protobuf.as_slice())
+                    .map_err(|_| ReceiveFailure::MalformedPayload)?
+            },
+        };
+        let mut batch =
+            decoded::native_batch(attribution, decoded, self.value_limit_profile, capacity)?;
+        batch.resize_after_decode()?;
+        Ok(batch)
     }
 }
 
@@ -389,6 +357,7 @@ impl OtlpPayload {
     fn encoded_len(&self) -> usize {
         match self {
             Self::Protobuf(bytes) | Self::GzipProtobuf(bytes) => bytes.len(),
+            Self::Decoded(message) => message.encoded_len(),
         }
     }
 }

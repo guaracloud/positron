@@ -8,6 +8,7 @@ pub(super) struct CodecLimits {
     pub(super) occurrences: usize,
     pub(super) nesting_depth: u8,
     pub(super) body_bytes: usize,
+    pub(super) record_bytes: usize,
     pub(super) value_bytes: usize,
     pub(super) key_bytes: usize,
     pub(super) array_entries: usize,
@@ -29,6 +30,7 @@ impl CodecLimits {
             nesting_depth: u8::try_from(dynamic.nesting_depth().value())
                 .map_err(|_| LogStoreFailure::invalid_input())?,
             body_bytes: to_usize(profile.record().log_body_bytes().value())?,
+            record_bytes: to_usize(profile.record().decoded_bytes().value())?,
             value_bytes: to_usize(dynamic.individual_value_bytes().value())?,
             key_bytes: to_usize(dynamic.key_path_bytes().value())?,
             array_entries: to_usize(dynamic.array_entries().value())?,

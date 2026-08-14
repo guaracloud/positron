@@ -5,56 +5,7 @@ use positron_domain::value::{
 };
 use positron_kernel::{IngestTime, PreparedStoreBlock};
 
-use super::failure::LogStoreFailure;
-
-const MAX_POLICY_RULES: usize = 64;
-const MAX_RULE_ID_BYTES: usize = 256;
-
-/// Immutable evidence identifying the Ingest Policy applied before persistence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PolicyProvenance {
-    generation: u64,
-    digest: [u8; 32],
-    applied_rules: Vec<String>,
-}
-
-impl PolicyProvenance {
-    pub fn new(
-        generation: u64,
-        digest: [u8; 32],
-        applied_rules: Vec<String>,
-    ) -> Result<Self, LogStoreFailure> {
-        if generation == 0
-            || digest.iter().all(|byte| *byte == 0)
-            || applied_rules.len() > MAX_POLICY_RULES
-            || applied_rules
-                .iter()
-                .any(|rule| rule.is_empty() || rule.len() > MAX_RULE_ID_BYTES)
-        {
-            return Err(LogStoreFailure::invalid_input());
-        }
-        Ok(Self {
-            generation,
-            digest,
-            applied_rules,
-        })
-    }
-
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    #[must_use]
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-
-    #[must_use]
-    pub fn applied_rules(&self) -> &[String] {
-        &self.applied_rules
-    }
-}
+use super::{LogMetadata, PolicyProvenance, failure::LogStoreFailure};
 
 /// The M1 physical dynamic-attribute representation carried by a Log Block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +66,7 @@ pub struct LogRecord {
     observed_time: Option<ObservedTime>,
     body: Option<ValidatedAttributeValue>,
     attributes: Vec<StoredLogAttribute>,
+    metadata: LogMetadata,
     policy: PolicyProvenance,
 }
 
@@ -127,6 +79,27 @@ impl LogRecord {
         observed_time_unix_nanos: Option<i64>,
         body: Option<CandidateAttributeValue>,
         attributes: Vec<AttributeOccurrenceSetCandidate>,
+        policy: PolicyProvenance,
+    ) -> Result<Self, LogStoreFailure> {
+        Self::checked_receiver_candidate_with_metadata(
+            profile,
+            event_time_unix_nanos,
+            observed_time_unix_nanos,
+            body,
+            attributes,
+            LogMetadata::empty(),
+            policy,
+        )
+    }
+
+    /// Applies semantic limits while preserving receiver-native intrinsic metadata.
+    pub fn checked_receiver_candidate_with_metadata(
+        profile: ValueLimitProfile,
+        event_time_unix_nanos: Option<i64>,
+        observed_time_unix_nanos: Option<i64>,
+        body: Option<CandidateAttributeValue>,
+        attributes: Vec<AttributeOccurrenceSetCandidate>,
+        metadata: LogMetadata,
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
         let event_time = checked_event_time(event_time_unix_nanos)?;
@@ -156,7 +129,15 @@ impl LogRecord {
                     .map_err(LogStoreFailure::domain)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::checked_native(profile, event_time, observed_time, body, attributes, policy)
+        Self::checked_native(
+            profile,
+            event_time,
+            observed_time,
+            body,
+            attributes,
+            metadata,
+            policy,
+        )
     }
 
     pub fn checked_minimal(
@@ -192,7 +173,15 @@ impl LogRecord {
                 .map_err(LogStoreFailure::domain)?,
             ));
         }
-        Self::checked_native(profile, event_time, None, body, checked, policy)
+        Self::checked_native(
+            profile,
+            event_time,
+            None,
+            body,
+            checked,
+            LogMetadata::empty(),
+            policy,
+        )
     }
 
     pub(super) fn checked_native(
@@ -201,6 +190,7 @@ impl LogRecord {
         observed_time: Option<ObservedTime>,
         body: Option<ValidatedAttributeValue>,
         attributes: Vec<StoredLogAttribute>,
+        metadata: LogMetadata,
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
         let maximum = usize::try_from(
@@ -252,6 +242,9 @@ impl LogRecord {
                     .ok_or_else(LogStoreFailure::limit_exceeded)?;
             }
         }
+        decoded_bytes = decoded_bytes
+            .checked_add(metadata.decoded_size_bytes()?)
+            .ok_or_else(LogStoreFailure::limit_exceeded)?;
         if decoded_bytes > decoded_limit {
             return Err(LogStoreFailure::limit_exceeded());
         }
@@ -260,6 +253,7 @@ impl LogRecord {
             observed_time,
             body,
             attributes,
+            metadata,
             policy,
         })
     }
@@ -282,6 +276,11 @@ impl LogRecord {
     #[must_use]
     pub fn attributes(&self) -> &[StoredLogAttribute] {
         &self.attributes
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> &LogMetadata {
+        &self.metadata
     }
 
     #[must_use]
@@ -347,6 +346,11 @@ impl StoredLogRecord {
     #[must_use]
     pub fn attributes(&self) -> &[StoredLogAttribute] {
         self.record.attributes()
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> &LogMetadata {
+        self.record.metadata()
     }
 
     #[must_use]

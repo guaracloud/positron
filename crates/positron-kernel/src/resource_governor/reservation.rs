@@ -32,6 +32,20 @@ impl<'authority> ResourceReservation<'authority> {
         status.result
     }
 
+    /// Transfers drop-based release across an asynchronous boundary without
+    /// creating another capacity authority.
+    pub fn transfer(mut self) -> TransferredResourceReservation {
+        self.active = false;
+        TransferredResourceReservation {
+            drop_ledger: Arc::clone(&self.governor.drop_ledger),
+            slot: self.slot,
+            owner: self.owner,
+            identity: self.identity,
+            amounts: self.amounts,
+            active: true,
+        }
+    }
+
     /// Atomically replaces the grant while preserving immutable work identity.
     pub fn try_resize(
         &mut self,
@@ -109,6 +123,43 @@ impl<'authority> ResourceReservation<'authority> {
     fn release(&mut self) {
         if self.active {
             self.governor.mark_drop_pending(self.slot);
+            self.active = false;
+        }
+    }
+}
+
+impl TransferredResourceReservation {
+    /// Rebinds this move-only token to the same governor that granted it.
+    pub fn reclaim(
+        mut self,
+        governor: ResourceGovernor<'_>,
+    ) -> Result<ResourceReservation<'_>, GovernorFailure> {
+        if !Arc::ptr_eq(&self.drop_ledger, &governor.inner.drop_ledger) {
+            governor.inner.mark_foreign_release();
+            return Err(GovernorFailure::InternalFenced);
+        }
+        self.active = false;
+        Ok(ResourceReservation::new(
+            governor.inner,
+            self.owner,
+            self.identity,
+            self.amounts,
+            self.slot,
+        ))
+    }
+
+    /// Returns this slot to the same Resource Governor that granted it.
+    pub fn release(self, governor: ResourceGovernor<'_>) {
+        if !Arc::ptr_eq(&self.drop_ledger, &governor.inner.drop_ledger) {
+            governor.inner.mark_foreign_release();
+        }
+    }
+}
+
+impl Drop for TransferredResourceReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.drop_ledger.mark_drop_pending(self.slot);
             self.active = false;
         }
     }

@@ -4,17 +4,22 @@
 
 mod ingest;
 mod otlp_logs;
+mod planning;
 mod policy;
+mod request_outcome;
 
 pub use ingest::{
     CommittedAdmission, IngestFailureCode, IngestOutcome, LogIngest, PartialAdmission,
     RejectionDetail,
 };
 pub use otlp_logs::{
-    AuthenticatedOtlpLogsRequest, NativeLogAttribute, NativeLogBatch, NativeLogCandidate,
-    OtlpLogsReceiver, ReceiveFailure,
+    AuthenticatedOtlpLogsRequest, NativeLogAdmissionGroup, NativeLogAdmissionGroups,
+    NativeLogAttribute, NativeLogBatch, NativeLogCandidate, OtlpLogsReceiver, ReceiveFailure,
+    preflight_otlp_logs_protobuf, reserve_otlp_logs_transport,
 };
+pub use planning::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, FixedAdmissionGroupPlanner};
 pub use policy::IngestPolicy;
+pub use request_outcome::{AdmissionGroupOutcome, IngestRequestOutcome};
 
 #[cfg(test)]
 mod tests;

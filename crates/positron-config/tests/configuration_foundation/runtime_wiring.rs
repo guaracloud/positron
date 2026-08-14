@@ -7,7 +7,8 @@ fn runtime_endpoints_and_key_path_are_explicit_typed_configuration() {
              control_path = \"/tmp/positron-explicit.sock\"\n\
              operations_bind_address = \"127.0.0.1:19101\"\n\
              api_bind_address = \"127.0.0.1:19102\"\n\
-             otlp_http_bind_address = \"127.0.0.1:19103\"\n\
+             otlp_grpc_bind_address = \"127.0.0.1:19103\"\n\
+             otlp_http_bind_address = \"127.0.0.1:19104\"\n\
              [storage]\n\
              data_directory = \"/srv/positron\"\n\
              secrets_directory = \"/srv/positron-secrets\"\n\
@@ -27,8 +28,12 @@ fn runtime_endpoints_and_key_path_are_explicit_typed_configuration() {
     );
     assert_eq!(effective.api_bind_address().to_string(), "127.0.0.1:19102");
     assert_eq!(
-        effective.otlp_http_bind_address().to_string(),
+        effective.otlp_grpc_bind_address().to_string(),
         "127.0.0.1:19103"
+    );
+    assert_eq!(
+        effective.otlp_http_bind_address().to_string(),
+        "127.0.0.1:19104"
     );
     assert_eq!(
         effective.local_key_file().as_path().to_str(),

@@ -91,16 +91,16 @@ fn second_signal_cleanup_overflow_is_bounded_and_deterministic()
     else {
         panic!("cleanup overflow must remain typed");
     };
-    assert_eq!(cleanup.task_failures(), 4);
+    assert_eq!(cleanup.task_failures(), 5);
     assert_eq!(cleanup.listener_failures(), 1);
     assert!(cleanup.overflowed());
     assert_eq!(
         cleanup.failed_roles().collect::<Vec<_>>(),
         [
             positron_runtime::CleanupRole::Task(TaskRole::OtlpHttp),
+            positron_runtime::CleanupRole::Task(TaskRole::OtlpGrpc),
             positron_runtime::CleanupRole::Task(TaskRole::Api),
             positron_runtime::CleanupRole::Task(TaskRole::Operations),
-            positron_runtime::CleanupRole::Task(TaskRole::Control),
         ]
     );
     assert!(roots.acquire_volume_again().is_ok());
@@ -166,6 +166,7 @@ fn deadline_aborts_every_task_and_never_reports_graceful_completion()
             .collect::<Vec<_>>(),
         [
             TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
+            TaskEvent::Aborted(TaskRole::OtlpGrpc, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Stopping, true),
@@ -287,7 +288,7 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     assert_eq!(health.readiness(), Readiness::NotReady);
     assert!(roots.acquire_volume_again().is_ok());
     let events = tasks.events.borrow();
-    assert_eq!(events.len(), 12);
+    assert_eq!(events.len(), 15);
     assert!(matches!(
         events.last(),
         Some(TaskEvent::Joined(TaskRole::OtlpHttp, ..))
@@ -309,6 +310,7 @@ impl TestPort for ListenerRole {
             ListenerRole::Control => 42_399,
             ListenerRole::Operations => 42_400,
             ListenerRole::Api => 42_401,
+            ListenerRole::OtlpGrpc => 42_402,
             ListenerRole::OtlpHttp => 42_403,
         }
     }

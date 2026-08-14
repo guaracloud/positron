@@ -15,11 +15,12 @@ pub struct EffectiveConfiguration {
     pub(crate) control_path: String,
     pub(crate) operations_bind_address: SocketAddr,
     pub(crate) api_bind_address: SocketAddr,
+    pub(crate) otlp_grpc_bind_address: SocketAddr,
     pub(crate) otlp_http_bind_address: SocketAddr,
     pub(crate) data_directory: String,
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
-    pub(crate) sources: [SettingSource; 10],
+    pub(crate) sources: [SettingSource; 11],
 }
 
 impl EffectiveConfiguration {
@@ -51,6 +52,11 @@ impl EffectiveConfiguration {
     #[must_use]
     pub const fn api_bind_address(&self) -> SocketAddr {
         self.api_bind_address
+    }
+
+    #[must_use]
+    pub const fn otlp_grpc_bind_address(&self) -> SocketAddr {
+        self.otlp_grpc_bind_address
     }
 
     #[must_use]
@@ -93,6 +99,8 @@ impl EffectiveConfiguration {
         rendered.push_str(&self.operations_bind_address.to_string());
         rendered.push_str("\"\napi_bind_address = \"");
         rendered.push_str(&self.api_bind_address.to_string());
+        rendered.push_str("\"\notlp_grpc_bind_address = \"");
+        rendered.push_str(&self.otlp_grpc_bind_address.to_string());
         rendered.push_str("\"\notlp_http_bind_address = \"");
         rendered.push_str(&self.otlp_http_bind_address.to_string());
         rendered.push_str("\"\n\n[storage]\ndata_directory = \"");
@@ -104,7 +112,7 @@ impl EffectiveConfiguration {
     }
 
     pub fn plan_update(&self, candidate: &Self) -> Result<ConfigurationPlan, ConfigurationFailure> {
-        let mut changes = Vec::with_capacity(10);
+        let mut changes = Vec::with_capacity(11);
         for definition in contract::SETTING_DEFINITIONS {
             let setting = definition.setting();
             if self.setting_differs(candidate, setting) {
@@ -132,6 +140,9 @@ impl EffectiveConfiguration {
                 self.operations_bind_address != other.operations_bind_address
             },
             Setting::ListenerApiBindAddress => self.api_bind_address != other.api_bind_address,
+            Setting::ListenerOtlpGrpcBindAddress => {
+                self.otlp_grpc_bind_address != other.otlp_grpc_bind_address
+            },
             Setting::ListenerOtlpHttpBindAddress => {
                 self.otlp_http_bind_address != other.otlp_http_bind_address
             },
@@ -152,6 +163,7 @@ impl Debug for EffectiveConfiguration {
             .field("control_path", &self.control_path)
             .field("operations_bind_address", &self.operations_bind_address)
             .field("api_bind_address", &self.api_bind_address)
+            .field("otlp_grpc_bind_address", &self.otlp_grpc_bind_address)
             .field("otlp_http_bind_address", &self.otlp_http_bind_address)
             .field("data_directory", &self.data_directory)
             .field("secrets_directory", &self.secrets_directory)

@@ -40,5 +40,6 @@ pub(super) fn bounded_protobuf(
             }
             Ok(decoded)
         },
+        OtlpPayload::Decoded(_) => Err(ReceiveFailure::MalformedPayload),
     }
 }

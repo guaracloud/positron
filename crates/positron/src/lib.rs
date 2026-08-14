@@ -68,6 +68,7 @@ fn run(
         PathBuf::from(effective.control_path()),
         effective.operations_bind_address(),
         effective.api_bind_address(),
+        effective.otlp_grpc_bind_address(),
         effective.otlp_http_bind_address(),
     )
     .map_err(|_| LaunchFailure::Configuration)?;

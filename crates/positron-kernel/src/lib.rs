@@ -115,8 +115,8 @@ pub use resource_governor::{
     RecoveryWorkClaim, RecoveryWorkKind, RegisteredResourceBounds, ReleaseOutcome, ResizeFailure,
     ResizeFailureCode, ResizeOutcome, ResourceAmounts, ResourceDimension, ResourceGovernor,
     ResourceGovernorConfiguration, ResourceInventory, ResourceReservation, ResourceSnapshot,
-    ShutdownReconciliation, StorageKernelResourceAuthority, TenantQuota, WorkClaim, WorkClass,
-    WorkKind,
+    ShutdownReconciliation, StorageKernelResourceAuthority, TenantQuota,
+    TransferredResourceReservation, WorkClaim, WorkClass, WorkKind,
 };
 
 #[cfg(fuzzing)]

@@ -270,12 +270,20 @@ fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn
     let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let wildcard = "0.0.0.0:1".parse()?;
     assert!(
-        NativeBindings::new(PathBuf::from("relative.sock"), loopback, loopback, loopback).is_err()
+        NativeBindings::new(
+            PathBuf::from("relative.sock"),
+            loopback,
+            loopback,
+            loopback,
+            loopback,
+        )
+        .is_err()
     );
     assert!(
         NativeBindings::new(
             PathBuf::from("/tmp/control.sock"),
             wildcard,
+            loopback,
             loopback,
             loopback
         )
@@ -288,6 +296,7 @@ fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn
     let bindings = NativeBindings::new(
         roots.parent.join("collision.sock"),
         occupied_address,
+        loopback,
         loopback,
         loopback,
     )?;

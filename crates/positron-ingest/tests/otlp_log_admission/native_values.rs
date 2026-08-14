@@ -4,7 +4,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{
     AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
-use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
@@ -135,6 +135,23 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
         Some([7_u8, 8_u8].as_slice())
     );
     assert_eq!(record.policy_provenance().generation(), 17);
+    let metadata = record.metadata();
+    assert_eq!(metadata.severity_number(), SeverityNumber::Warn as i32);
+    assert_eq!(metadata.severity_text(), "warning");
+    assert_eq!(metadata.trace_id(), Some([0x11; 16]));
+    assert_eq!(metadata.span_id(), Some([0x22; 8]));
+    assert_eq!(metadata.event_name(), "checkout.completed");
+    assert_eq!(metadata.flags(), 1);
+    assert_eq!(metadata.dropped_attributes_count(), 3);
+    assert_eq!(metadata.resource_dropped_attributes_count(), 5);
+    assert_eq!(
+        metadata.resource_schema_url(),
+        "https://resource.example/v1"
+    );
+    assert_eq!(metadata.scope_name(), "native-model");
+    assert_eq!(metadata.scope_version(), "1.2.3");
+    assert_eq!(metadata.scope_dropped_attributes_count(), 7);
+    assert_eq!(metadata.scope_schema_url(), "https://scope.example/v2");
     assert!(result.complete());
     Ok(())
 }
@@ -157,17 +174,23 @@ fn native_request() -> ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(Resource {
                 attributes: vec![attribute("same-key", text("resource"))],
+                dropped_attributes_count: 5,
                 ..Resource::default()
             }),
+            schema_url: "https://resource.example/v1".to_owned(),
             scope_logs: vec![ScopeLogs {
                 scope: Some(InstrumentationScope {
                     name: "native-model".to_owned(),
+                    version: "1.2.3".to_owned(),
                     attributes: vec![attribute("same-key", boolean(true))],
-                    ..InstrumentationScope::default()
+                    dropped_attributes_count: 7,
                 }),
+                schema_url: "https://scope.example/v2".to_owned(),
                 log_records: vec![LogRecord {
                     time_unix_nano: 42,
                     observed_time_unix_nano: 84,
+                    severity_number: SeverityNumber::Warn as i32,
+                    severity_text: "warning".to_owned(),
                     body: Some(key_value_list(vec![attribute(
                         "items",
                         array(vec![bytes(vec![0, 255]), AnyValue { value: None }]),
@@ -176,11 +199,13 @@ fn native_request() -> ExportLogsServiceRequest {
                         attribute("same-key", signed_integer(-7)),
                         attribute("same-key", bytes(vec![7, 8])),
                     ],
-                    ..LogRecord::default()
+                    dropped_attributes_count: 3,
+                    flags: 1,
+                    trace_id: vec![0x11; 16],
+                    span_id: vec![0x22; 8],
+                    event_name: "checkout.completed".to_owned(),
                 }],
-                ..ScopeLogs::default()
             }],
-            ..ResourceLogs::default()
         }],
     }
 }

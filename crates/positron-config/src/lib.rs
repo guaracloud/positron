@@ -62,11 +62,12 @@ struct Candidate {
     control_path: String,
     operations_bind_address: SocketAddr,
     api_bind_address: SocketAddr,
+    otlp_grpc_bind_address: SocketAddr,
     otlp_http_bind_address: SocketAddr,
     data_directory: String,
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
-    sources: [SettingSource; 10],
+    sources: [SettingSource; 11],
 }
 
 impl Candidate {
@@ -77,6 +78,7 @@ impl Candidate {
         let control = setting_definition(Setting::ListenerControlPath).default_value();
         let operations = setting_definition(Setting::ListenerOperationsBindAddress).default_value();
         let api = setting_definition(Setting::ListenerApiBindAddress).default_value();
+        let otlp_grpc = setting_definition(Setting::ListenerOtlpGrpcBindAddress).default_value();
         let otlp_http = setting_definition(Setting::ListenerOtlpHttpBindAddress).default_value();
         let data = setting_definition(Setting::StorageDataDirectory).default_value();
         let secrets = setting_definition(Setting::StorageSecretsDirectory).default_value();
@@ -91,6 +93,10 @@ impl Candidate {
                 Setting::ListenerOperationsBindAddress,
             )?,
             api_bind_address: parse_loopback_address(api, Setting::ListenerApiBindAddress)?,
+            otlp_grpc_bind_address: parse_loopback_address(
+                otlp_grpc,
+                Setting::ListenerOtlpGrpcBindAddress,
+            )?,
             otlp_http_bind_address: parse_loopback_address(
                 otlp_http,
                 Setting::ListenerOtlpHttpBindAddress,
@@ -98,7 +104,7 @@ impl Candidate {
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
             secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
             local_key_file: ProtectedFileReference::parse(local_key)?,
-            sources: [SettingSource::CompiledDefault; 10],
+            sources: [SettingSource::CompiledDefault; 11],
         })
     }
 
@@ -133,6 +139,9 @@ impl Candidate {
             },
             Setting::ListenerApiBindAddress => {
                 self.api_bind_address = parse_loopback_address(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcBindAddress => {
+                self.otlp_grpc_bind_address = parse_loopback_address(value, setting)?;
             },
             Setting::ListenerOtlpHttpBindAddress => {
                 self.otlp_http_bind_address = parse_loopback_address(value, setting)?;
@@ -171,6 +180,7 @@ impl Candidate {
             control_path: self.control_path,
             operations_bind_address: self.operations_bind_address,
             api_bind_address: self.api_bind_address,
+            otlp_grpc_bind_address: self.otlp_grpc_bind_address,
             otlp_http_bind_address: self.otlp_http_bind_address,
             data_directory: self.data_directory,
             secrets_directory: self.secrets_directory,
@@ -294,10 +304,11 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::ListenerControlPath => 3,
         Setting::ListenerOperationsBindAddress => 4,
         Setting::ListenerApiBindAddress => 5,
-        Setting::ListenerOtlpHttpBindAddress => 6,
-        Setting::StorageDataDirectory => 7,
-        Setting::StorageSecretsDirectory => 8,
-        Setting::SecurityLocalKeyFile => 9,
+        Setting::ListenerOtlpGrpcBindAddress => 6,
+        Setting::ListenerOtlpHttpBindAddress => 7,
+        Setting::StorageDataDirectory => 8,
+        Setting::StorageSecretsDirectory => 9,
+        Setting::SecurityLocalKeyFile => 10,
     }
 }
 
@@ -316,6 +327,7 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerControlPath => FailureSource::ListenerControlPath,
         Setting::ListenerOperationsBindAddress => FailureSource::ListenerOperationsBindAddress,
         Setting::ListenerApiBindAddress => FailureSource::ListenerApiBindAddress,
+        Setting::ListenerOtlpGrpcBindAddress => FailureSource::ListenerOtlpGrpcBindAddress,
         Setting::ListenerOtlpHttpBindAddress => FailureSource::ListenerOtlpHttpBindAddress,
         Setting::StorageDataDirectory => FailureSource::StorageDataDirectory,
         Setting::StorageSecretsDirectory => FailureSource::StorageSecretsDirectory,

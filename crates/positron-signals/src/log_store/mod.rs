@@ -4,6 +4,8 @@ mod codec;
 mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
+mod metadata;
+mod policy_provenance;
 mod scan;
 mod types;
 
@@ -19,10 +21,11 @@ use positron_kernel::{
 };
 
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
+pub use metadata::LogMetadata;
+pub use policy_provenance::PolicyProvenance;
 pub use scan::{LogScan, LogScanResult, ScanLimit, ScannedLogRecord};
 pub use types::{
-    AttributeRepresentation, LogRecord, PolicyProvenance, PreparedLogBlock, StoredLogAttribute,
-    StoredLogRecord,
+    AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
 };
 
 /// The concrete Release 1 Log Signal Store adapter.

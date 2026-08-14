@@ -2,23 +2,26 @@ use positron_domain::identity::TenantId;
 use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{AttributeNamespace, AttributeOccurrenceSetCandidate};
 
-use super::LogStoreFailure;
 use super::types::{
-    AttributeRepresentation, LogRecord, PolicyProvenance, StoredLogAttribute, StoredLogRecord,
-    value_profile,
+    AttributeRepresentation, LogRecord, StoredLogAttribute, StoredLogRecord, value_profile,
 };
+use super::{LogStoreFailure, PolicyProvenance};
 use positron_kernel::LedgerSnapshot;
 
 const MAGIC: &[u8; 8] = b"PLOGBL01";
-const VERSION: u16 = 1;
+const LEGACY_VERSION: u16 = 1;
+const VERSION: u16 = 2;
 #[cfg(fuzzing)]
 mod fuzz;
 mod limits;
+mod metadata;
+mod primitives;
 mod size;
 mod value;
 #[cfg(fuzzing)]
 pub(super) use fuzz::fuzz_decode_block;
 use limits::CodecLimits;
+use primitives::{Input, put_bytes, put_count, put_i32, put_u16, put_u32};
 pub(super) use size::encoded_block_length;
 
 pub(super) fn encode_block(
@@ -59,6 +62,7 @@ fn encode_record(
     } else {
         output.push(0);
     }
+    metadata::encode(output, record.record().metadata())?;
     output.extend_from_slice(&record.ingest_time().instant().value().to_be_bytes());
     if let Some(body) = record.body() {
         output.push(1);
@@ -117,7 +121,11 @@ pub(super) fn decode_block(
     limit: usize,
 ) -> Result<DecodedBlock, LogStoreFailure> {
     let mut input = Input::new(bytes);
-    if input.take(MAGIC.len())? != MAGIC || input.u16()? != VERSION {
+    if input.take(MAGIC.len())? != MAGIC {
+        return Err(LogStoreFailure::malformed_block());
+    }
+    let version = input.u16()?;
+    if version != LEGACY_VERSION && version != VERSION {
         return Err(LogStoreFailure::malformed_block());
     }
     let tenant: [u8; 16] = input
@@ -135,7 +143,7 @@ pub(super) fn decode_block(
     let retained_count = count.min(limit);
     let mut records = bounded_vec(retained_count)?;
     for index in 0..count {
-        let decoded = decode_record(&mut input, limits)?;
+        let decoded = decode_record(&mut input, limits, version)?;
         if index < retained_count {
             records.push(decoded.into_stored(snapshot));
         }
@@ -169,12 +177,18 @@ impl DecodedRecord {
 fn decode_record(
     input: &mut Input<'_>,
     limits: CodecLimits,
+    version: u16,
 ) -> Result<DecodedRecord, LogStoreFailure> {
     let event_time = decode_event_time(input)?;
     let observed_time = match input.u8()? {
         0 => None,
         1 => Some(decode_observed_time(input)?),
         _ => return Err(LogStoreFailure::malformed_block()),
+    };
+    let metadata = if version == LEGACY_VERSION {
+        super::LogMetadata::empty()
+    } else {
+        metadata::decode(input, limits)?
     };
     let ingest_time = UnixNanoseconds::new(input.i64()?);
     let profile = value_profile();
@@ -229,9 +243,16 @@ fn decode_record(
     }
     let policy = PolicyProvenance::new(generation, digest, rules)
         .map_err(|_| LogStoreFailure::malformed_block())?;
-    let record =
-        LogRecord::checked_native(profile, event_time, observed_time, body, attributes, policy)
-            .map_err(|_| LogStoreFailure::malformed_block())?;
+    let record = LogRecord::checked_native(
+        profile,
+        event_time,
+        observed_time,
+        body,
+        attributes,
+        metadata,
+        policy,
+    )
+    .map_err(|_| LogStoreFailure::malformed_block())?;
     Ok(DecodedRecord {
         record,
         ingest_time,
@@ -296,105 +317,5 @@ fn decode_namespace(tag: u8) -> Result<AttributeNamespace, LogStoreFailure> {
         2 => Ok(AttributeNamespace::InstrumentationScope),
         3 => Ok(AttributeNamespace::Record),
         _ => Err(LogStoreFailure::malformed_block()),
-    }
-}
-
-pub(super) fn put_count(output: &mut Vec<u8>, value: usize) -> Result<(), LogStoreFailure> {
-    put_u16(
-        output,
-        u16::try_from(value).map_err(|_| LogStoreFailure::limit_exceeded())?,
-    );
-    Ok(())
-}
-
-fn put_u16(output: &mut Vec<u8>, value: u16) {
-    output.extend_from_slice(&value.to_be_bytes());
-}
-
-pub(super) fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), LogStoreFailure> {
-    output.extend_from_slice(
-        &u32::try_from(value.len())
-            .map_err(|_| LogStoreFailure::limit_exceeded())?
-            .to_be_bytes(),
-    );
-    output.extend_from_slice(value);
-    Ok(())
-}
-
-pub(super) struct Input<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> Input<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
-    }
-
-    fn take(&mut self, count: usize) -> Result<&'a [u8], LogStoreFailure> {
-        let (value, remaining) = self
-            .remaining
-            .split_at_checked(count)
-            .ok_or_else(LogStoreFailure::malformed_block)?;
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    pub(super) fn u8(&mut self) -> Result<u8, LogStoreFailure> {
-        self.take(1)?
-            .first()
-            .copied()
-            .ok_or_else(LogStoreFailure::malformed_block)
-    }
-
-    fn u16(&mut self) -> Result<u16, LogStoreFailure> {
-        Ok(u16::from_be_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32, LogStoreFailure> {
-        Ok(u32::from_be_bytes(self.array()?))
-    }
-
-    pub(super) fn u64(&mut self) -> Result<u64, LogStoreFailure> {
-        Ok(u64::from_be_bytes(self.array()?))
-    }
-
-    pub(super) fn i64(&mut self) -> Result<i64, LogStoreFailure> {
-        Ok(i64::from_be_bytes(self.array()?))
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], LogStoreFailure> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| LogStoreFailure::malformed_block())
-    }
-
-    pub(super) fn count(&mut self, maximum: usize) -> Result<usize, LogStoreFailure> {
-        let count = usize::from(self.u16()?);
-        if count > maximum {
-            return Err(LogStoreFailure::malformed_block());
-        }
-        Ok(count)
-    }
-
-    pub(super) fn bytes(&mut self, maximum: usize) -> Result<Vec<u8>, LogStoreFailure> {
-        let count = usize::try_from(self.u32()?).map_err(|_| LogStoreFailure::malformed_block())?;
-        if count > maximum {
-            return Err(LogStoreFailure::malformed_block());
-        }
-        let source = self.take(count)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(count)
-            .map_err(|_| LogStoreFailure::resource_exhausted())?;
-        bytes.extend_from_slice(source);
-        Ok(bytes)
-    }
-
-    pub(super) fn string(&mut self, maximum: usize) -> Result<String, LogStoreFailure> {
-        String::from_utf8(self.bytes(maximum)?).map_err(|_| LogStoreFailure::malformed_block())
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.remaining.is_empty()
     }
 }

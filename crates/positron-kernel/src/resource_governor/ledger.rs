@@ -5,8 +5,10 @@ use std::mem::size_of;
 use std::sync::atomic::Ordering;
 
 mod allocation;
+mod drop_ledger;
 
 pub(super) use allocation::{LedgerAllocation, allocate};
+pub(super) use drop_ledger::DropLedger;
 
 use super::accounting::{AccountingState, ChargeAttribution, ChargeOwner, GovernorInner};
 use super::claim::{RecoveryWorkKind, ReservationIdentity, WorkKind};
@@ -194,12 +196,15 @@ impl GrantKind {
 
 impl GovernorInner {
     pub(super) fn drain_pending(&self, state: &mut AccountingState) {
-        let must_scan = self.has_pending_releases.swap(false, Ordering::AcqRel)
-            || self.pending_fence.load(Ordering::Acquire);
+        let must_scan = self
+            .drop_ledger
+            .has_pending_releases
+            .swap(false, Ordering::AcqRel)
+            || self.drop_ledger.pending_fence.load(Ordering::Acquire);
         if !must_scan {
             return;
         }
-        for (word_index, word) in self.pending_words.iter().enumerate() {
+        for (word_index, word) in self.drop_ledger.pending_words.iter().enumerate() {
             let mut bits = word.swap(0, Ordering::AcqRel);
             while bits != 0 {
                 let bit_index = bits.trailing_zeros() as usize;
@@ -211,7 +216,7 @@ impl GovernorInner {
                     state.lifecycle = super::GovernorLifecycle::Fenced;
                     continue;
                 };
-                let Some(signal) = self.slot_signals.get(index) else {
+                let Some(signal) = self.drop_ledger.slot_signals.get(index) else {
                     state.lifecycle = super::GovernorLifecycle::Fenced;
                     continue;
                 };
@@ -250,7 +255,7 @@ impl GovernorInner {
         let slot = state.free_slots.pop()?;
         let index = usize::from(slot);
         let record_slot = state.grant_records.get_mut(index)?;
-        let signal = self.slot_signals.get(index)?;
+        let signal = self.drop_ledger.slot_signals.get(index)?;
         if record_slot.is_some() || signal.load(Ordering::Acquire) != SLOT_FREE {
             return None;
         }
@@ -260,36 +265,17 @@ impl GovernorInner {
     }
 
     pub(super) fn mark_drop_pending(&self, slot: u16) {
-        let index = usize::from(slot);
-        let Some(signal) = self.slot_signals.get(index) else {
-            self.pending_fence.store(true, Ordering::Release);
-            return;
-        };
-        if signal
-            .compare_exchange(
-                SLOT_ACTIVE,
-                SLOT_RELEASE_PENDING,
-                Ordering::Release,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            self.pending_fence.store(true, Ordering::Release);
-            return;
-        }
-        let word_index = index / 64;
-        let bit = 1_u64 << (index % 64);
-        let Some(word) = self.pending_words.get(word_index) else {
-            self.pending_fence.store(true, Ordering::Release);
-            return;
-        };
-        word.fetch_or(bit, Ordering::Release);
-        self.has_pending_releases.store(true, Ordering::Release);
+        self.drop_ledger.mark_drop_pending(slot);
+    }
+
+    pub(super) fn mark_foreign_release(&self) {
+        self.drop_ledger.mark_foreign_release();
     }
 
     #[cfg(test)]
     pub(super) fn mark_status_pending_for_test(&self, slot: u16) -> bool {
-        self.slot_signals
+        self.drop_ledger
+            .slot_signals
             .get(usize::from(slot))
             .is_some_and(|signal| {
                 signal
@@ -306,19 +292,25 @@ impl GovernorInner {
     #[cfg(test)]
     pub(super) fn publish_pending_bit_for_test(&self, slot: u16) -> bool {
         let index = usize::from(slot);
-        self.pending_words.get(index / 64).is_some_and(|word| {
-            word.fetch_or(1_u64 << (index % 64), Ordering::Release);
-            true
-        })
+        self.drop_ledger
+            .pending_words
+            .get(index / 64)
+            .is_some_and(|word| {
+                word.fetch_or(1_u64 << (index % 64), Ordering::Release);
+                true
+            })
     }
 
     #[cfg(test)]
     pub(super) fn publish_pending_hint_for_test(&self) {
-        self.has_pending_releases.store(true, Ordering::Release);
+        self.drop_ledger
+            .has_pending_releases
+            .store(true, Ordering::Release);
     }
 
     pub(super) fn slot_is_active(&self, slot: u16) -> bool {
-        self.slot_signals
+        self.drop_ledger
+            .slot_signals
             .get(usize::from(slot))
             .is_some_and(|signal| signal.load(Ordering::Acquire) == SLOT_ACTIVE)
     }
@@ -328,7 +320,7 @@ impl GovernorInner {
         let Some(record) = state.grant_records.get_mut(index) else {
             return false;
         };
-        let Some(signal) = self.slot_signals.get(index) else {
+        let Some(signal) = self.drop_ledger.slot_signals.get(index) else {
             return false;
         };
         if signal.load(Ordering::Acquire) != SLOT_ACTIVE || record.take().is_none() {

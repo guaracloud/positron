@@ -11,13 +11,14 @@ pub enum ListenerRole {
     Control,
     Operations,
     Api,
+    OtlpGrpc,
     OtlpHttp,
 }
 
 impl ListenerRole {
     #[must_use]
     pub const fn is_data(self) -> bool {
-        matches!(self, Self::Api | Self::OtlpHttp)
+        matches!(self, Self::Api | Self::OtlpGrpc | Self::OtlpHttp)
     }
 }
 

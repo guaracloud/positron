@@ -18,6 +18,7 @@ fn listener_only_cleanup_truth_is_typed_for_every_listener_role()
         ListenerRole::Control,
         ListenerRole::Operations,
         ListenerRole::Api,
+        ListenerRole::OtlpGrpc,
         ListenerRole::OtlpHttp,
     ] {
         let roots = TestRoots::new(&format!("listener-only-{role:?}"))?;

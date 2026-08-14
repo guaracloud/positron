@@ -7,6 +7,8 @@ use positron_kernel::{
     ResourceDimension, ResourceInventory, TenantQuota, WorkClaim, WorkClass, WorkKind,
 };
 
+mod transfers;
+
 fn uniform(value: u64) -> ResourceAmounts {
     ResourceAmounts::new([value; 11])
 }

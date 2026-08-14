@@ -182,28 +182,34 @@ fn capability_response(result: Result<CapabilityResponse, ApiError>) -> Response
     }
 }
 
-fn ingest_response(result: Result<IngestOutcome, ServiceFailure>) -> Response {
+fn ingest_response(
+    result: Result<positron_ingest::IngestRequestOutcome, ServiceFailure>,
+) -> Response {
     match result {
-        Ok(IngestOutcome::Full(committed)) => Response::json(
-            200,
-            format!("{{\"accepted\":{},\"rejected\":0}}", committed.records()),
-        ),
-        Ok(IngestOutcome::Partial(partial)) => Response::json(
-            200,
-            format!(
-                "{{\"accepted\":{},\"rejected\":{}}}",
-                partial.committed().records(),
-                partial.permanently_rejected()
+        Ok(outcome) => match outcome.terminal_failure() {
+            Some(IngestOutcome::Retryable(_)) => {
+                Response::json(503, "{\"outcome\":\"retryable\"}".into())
+            },
+            Some(IngestOutcome::Permanent(_)) => {
+                Response::json(422, "{\"outcome\":\"rejected\"}".into())
+            },
+            Some(IngestOutcome::Ambiguous(_)) => {
+                Response::json(500, "{\"outcome\":\"ambiguous\"}".into())
+            },
+            Some(IngestOutcome::Full(_) | IngestOutcome::Partial(_)) => {
+                Response::json(500, "{\"outcome\":\"internal\"}".into())
+            },
+            None => Response::json(
+                200,
+                format!(
+                    "{{\"accepted\":{},\"rejected\":{}}}",
+                    outcome.accepted_records(),
+                    outcome.permanently_rejected_records()
+                ),
             ),
-        ),
-        Ok(IngestOutcome::Retryable(_)) => {
-            Response::json(503, "{\"outcome\":\"retryable\"}".into())
-        },
-        Ok(IngestOutcome::Permanent(_)) => Response::json(422, "{\"outcome\":\"rejected\"}".into()),
-        Ok(IngestOutcome::Ambiguous(_)) => {
-            Response::json(500, "{\"outcome\":\"ambiguous\"}".into())
         },
         Err(ServiceFailure::Unauthorized) => Response::empty(401),
+        Err(ServiceFailure::CapacityUnavailable) => Response::empty(429),
         Err(ServiceFailure::InvalidRequest) => Response::empty(400),
         Err(ServiceFailure::KeyUnavailable | ServiceFailure::StorageUnavailable) => {
             Response::empty(503)

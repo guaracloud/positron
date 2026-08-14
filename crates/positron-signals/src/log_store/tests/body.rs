@@ -27,6 +27,7 @@ fn body_bytes_bounds_round_trip_above_attribute_limit_through_exact_maximum()
             None,
             Some(checked),
             vec![],
+            LogMetadata::empty(),
             PolicyProvenance::new(1, [0x70; 32], vec![])?,
         )?;
         let actual = round_trip_record(record, marker)?;

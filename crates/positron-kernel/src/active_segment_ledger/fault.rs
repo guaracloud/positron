@@ -3,7 +3,7 @@ use super::LedgerFailure;
 use super::io::map_errno;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LedgerFileEvent {
+pub(super) enum LedgerFileEvent {
     WriteFrame,
     PartialFrameWrite,
     SynchronizeFrame,

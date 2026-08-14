@@ -35,8 +35,8 @@ mod telemetry_tests;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use accounting::{GovernorConfiguration, GovernorInner, GovernorSetupInput, KernelOwnership};
 pub(crate) use active_segment_leases::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
@@ -215,6 +215,27 @@ pub struct ResourceReservation<'authority> {
     identity: ReservationIdentity,
     amounts: ResourceAmounts,
     active: bool,
+}
+
+/// A move-only reservation transferred across an asynchronous transport seam.
+///
+/// The original governor remains the sole accounting authority. This token
+/// owns its release capability and returns the slot on every ordinary drop,
+/// whether or not a caller reclaims it.
+#[must_use = "a transferred reservation must remain owned until it is released"]
+pub struct TransferredResourceReservation {
+    drop_ledger: Arc<ledger::DropLedger>,
+    slot: u16,
+    owner: accounting::ChargeOwner,
+    identity: ReservationIdentity,
+    amounts: ResourceAmounts,
+    active: bool,
+}
+
+impl std::fmt::Debug for TransferredResourceReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TransferredResourceReservation { <bounded capability> }")
+    }
 }
 
 impl std::fmt::Debug for ResourceReservation<'_> {
