@@ -219,7 +219,8 @@ const fn task_bit(role: TaskRole) -> u8 {
         TaskRole::Control => 0,
         TaskRole::Operations => 1,
         TaskRole::Api => 2,
-        TaskRole::OtlpHttp => 3,
+        TaskRole::OtlpGrpc => 3,
+        TaskRole::OtlpHttp => 4,
     }
 }
 
@@ -228,7 +229,8 @@ const fn listener_bit(role: ListenerRole) -> u8 {
         ListenerRole::Control => 0,
         ListenerRole::Operations => 1,
         ListenerRole::Api => 2,
-        ListenerRole::OtlpHttp => 3,
+        ListenerRole::OtlpGrpc => 3,
+        ListenerRole::OtlpHttp => 4,
     }
 }
 

@@ -17,12 +17,14 @@ use crate::{
 };
 
 mod native_http;
+mod otlp_grpc;
 
 #[derive(Clone, Debug)]
 pub struct NativeBindings {
     control: PathBuf,
     operations: SocketAddr,
     api: SocketAddr,
+    otlp_grpc: SocketAddr,
     otlp_http: SocketAddr,
 }
 
@@ -31,12 +33,14 @@ impl NativeBindings {
         control: PathBuf,
         operations: SocketAddr,
         api: SocketAddr,
+        otlp_grpc: SocketAddr,
         otlp_http: SocketAddr,
     ) -> Result<Self, NativeHostFailure> {
         BoundEndpoint::control(control.clone()).map_err(|_| NativeHostFailure::InvalidBinding)?;
         for (role, address) in [
             (ListenerRole::Operations, operations),
             (ListenerRole::Api, api),
+            (ListenerRole::OtlpGrpc, otlp_grpc),
             (ListenerRole::OtlpHttp, otlp_http),
         ] {
             BoundEndpoint::tcp(role, address).map_err(|_| NativeHostFailure::InvalidBinding)?;
@@ -45,6 +49,7 @@ impl NativeBindings {
             control,
             operations,
             api,
+            otlp_grpc,
             otlp_http,
         })
     }
@@ -53,6 +58,7 @@ impl NativeBindings {
         match role {
             ListenerRole::Operations => Some(self.operations),
             ListenerRole::Api => Some(self.api),
+            ListenerRole::OtlpGrpc => Some(self.otlp_grpc),
             ListenerRole::OtlpHttp => Some(self.otlp_http),
             ListenerRole::Control => None,
         }
@@ -105,6 +111,20 @@ type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
 impl Admission {
     fn stop(&self) {
         self.accepting.store(false, Ordering::Release);
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    fn tcp_listener(&self) -> Result<TcpListener, ListenerFailure> {
+        match &self.listener {
+            NativeListener::Tcp(listener) => listener
+                .try_clone()
+                .map_err(|_| ListenerFailure::BindUnavailable),
+            #[cfg(unix)]
+            NativeListener::Unix(_) => Err(ListenerFailure::InvalidEndpoint),
+        }
     }
 }
 
@@ -230,6 +250,7 @@ impl RegisteredTask for NativeRegisteredTask {
             TaskRole::Control => ListenerRole::Control,
             TaskRole::Operations => ListenerRole::Operations,
             TaskRole::Api => ListenerRole::Api,
+            TaskRole::OtlpGrpc => ListenerRole::OtlpGrpc,
             TaskRole::OtlpHttp => ListenerRole::OtlpHttp,
         };
         let mut admissions = self
@@ -246,7 +267,13 @@ impl RegisteredTask for NativeRegisteredTask {
         let handle = std::thread::Builder::new()
             .name(format!("positron-{listener_role:?}"))
             .spawn(move || {
-                serve(admission, task_cancellation, health, services);
+                if listener_role == ListenerRole::OtlpGrpc {
+                    otlp_grpc::serve(admission, task_cancellation, services)
+                        .map_err(|_| TaskFailure::JoinUnavailable)
+                } else {
+                    serve_http(admission, task_cancellation, health, services);
+                    Ok(())
+                }
             })
             .map_err(|_| TaskFailure::SpawnUnavailable)?;
         Ok(Box::new(NativeRunningTask {
@@ -258,7 +285,7 @@ impl RegisteredTask for NativeRegisteredTask {
 
 struct NativeRunningTask {
     cancellation: TaskCancellation,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<(), TaskFailure>>>,
 }
 
 impl RunningTask for NativeRunningTask {
@@ -282,14 +309,16 @@ impl RunningTask for NativeRunningTask {
     }
 }
 
-fn join_thread(handle: &mut Option<JoinHandle<()>>) -> Result<(), TaskFailure> {
-    if handle.take().is_some_and(|handle| handle.join().is_err()) {
-        return Err(TaskFailure::JoinUnavailable);
+fn join_thread(
+    handle: &mut Option<JoinHandle<Result<(), TaskFailure>>>,
+) -> Result<(), TaskFailure> {
+    if let Some(handle) = handle.take() {
+        return handle.join().map_err(|_| TaskFailure::JoinUnavailable)?;
     }
     Ok(())
 }
 
-fn serve(
+fn serve_http(
     admission: Arc<Admission>,
     cancellation: TaskCancellation,
     health: HealthState,

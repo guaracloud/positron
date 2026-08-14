@@ -53,7 +53,7 @@ fn recoverable_ownership_outage_stays_not_ready_then_serves_after_bounded_retry(
     assert_eq!(retries.attempts.get(), 1);
     assert_eq!(process.health().phase(), ProcessPhase::Serving);
     assert_eq!(process.health().readiness(), Readiness::Ready);
-    assert_eq!(listeners.bound.borrow().len(), 4);
+    assert_eq!(listeners.bound.borrow().len(), 5);
     Ok(())
 }
 
@@ -180,7 +180,7 @@ fn safely_acquired_ownership_is_retained_during_key_outage_backoff()
 
     assert_eq!(recovery.attempts.get(), 1);
     assert_eq!(process.health().phase(), ProcessPhase::Serving);
-    assert_eq!(listeners.bound.borrow().len(), 4);
+    assert_eq!(listeners.bound.borrow().len(), 5);
     Ok(())
 }
 

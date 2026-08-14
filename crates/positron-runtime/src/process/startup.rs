@@ -132,7 +132,11 @@ impl ApplicationRuntime {
         };
         let instance = Arc::new(Mutex::new(instance));
         let services = ServiceHandle::new(Arc::clone(&instance));
-        for role in [ListenerRole::Api, ListenerRole::OtlpHttp] {
+        for role in [
+            ListenerRole::Api,
+            ListenerRole::OtlpGrpc,
+            ListenerRole::OtlpHttp,
+        ] {
             if let Err(failure) = bind(role, &state, host.listeners, &mut listeners) {
                 return Err(cleanup_startup(
                     failure,
@@ -181,6 +185,7 @@ fn register_tasks(registrar: &dyn TaskRegistrar) -> Result<RegisteredTasks, Exit
         TaskRole::Control,
         TaskRole::Operations,
         TaskRole::Api,
+        TaskRole::OtlpGrpc,
         TaskRole::OtlpHttp,
     ]
     .into_iter()

@@ -10,6 +10,7 @@ pub(super) fn bindings(
         ephemeral,
         ephemeral,
         ephemeral,
+        ephemeral,
     )?)
 }
 

@@ -5,11 +5,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{HealthState, ServiceHandle};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskRole {
     Control,
     Operations,
     Api,
+    OtlpGrpc,
     OtlpHttp,
 }
 

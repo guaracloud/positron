@@ -102,6 +102,7 @@ pub enum FailureSource {
     ListenerControlPath,
     ListenerOperationsBindAddress,
     ListenerApiBindAddress,
+    ListenerOtlpGrpcBindAddress,
     ListenerOtlpHttpBindAddress,
     StorageDataDirectory,
     StorageSecretsDirectory,
