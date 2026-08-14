@@ -551,7 +551,14 @@ preserve this knowledge split:
 - Ingest owns receiver-independent admission ordering
 
 The Log Store hides full-text structures, scalar attribute indexes, generic
-typed overflow, and workload-driven Attribute Promotion.
+typed overflow, and workload-driven Attribute Promotion. It owns bounded
+Tenant Schema Catalog discovery: namespace-qualified paths, typed variants,
+conflicts, query-use evidence, budget accounting, and the lossless Schema
+Overflow placement decision. Catalog state is immutable to the Signal Store
+and is published only through the Storage Kernel Catalog Writer; no receiver
+or private schema publisher may bypass that authority. Generic and overflow
+representations use the same logical scan and explicit typed occurrence query
+semantics.
 
 The canonical Log Store Block layout and bounded logical scan are defined by
 [`log-store-block-format-v2.md`](log-store-block-format-v2.md), which preserves

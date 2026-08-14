@@ -56,3 +56,24 @@ Version 2 extends the attribute namespace tag table with:
 Tags `1` through `3` keep their exact version 1 meanings. Tag `4` is invalid in
 a version 1 block and cannot be silently reinterpreted by a new reader. The
 version 2 format uses tag `4` only for the native Stream Attribute namespace.
+
+## Schema Catalog and overflow
+
+The Log Store owns a bounded Tenant Schema Catalog separately from Store Block
+payloads. Its immutable Catalog Object uses the ASCII magic `PSCHEMA1` and
+version `1`, followed by the tenant identity, entry/memory/persistent-byte/
+index-byte budgets, overflow record and byte counters, and deterministic
+namespace-qualified path entries. Each entry preserves observed typed
+variants, observation and conflict counts, query-use count, promotion state,
+and index bytes. The object is content-addressed and published only through
+the Storage Kernel Catalog Writer with the generation precondition and
+governance evidence required by ADR-0069.
+
+Discovery spends bounded work and admits an entry only when every applicable
+catalog and index budget remains available. A valid attribute that cannot be
+admitted is encoded with the existing physical representation tag `2` as
+Schema Overflow. Its namespace, key, ordered occurrences, and complete native
+values remain unchanged; overflow updates only bounded evidence and never
+allocates catalog, statistics, dictionary, or automatic-index state. Generic
+and overflow records therefore have identical logical scan and typed-query
+semantics, while overflow scans report reduced pruning.

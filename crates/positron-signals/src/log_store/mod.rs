@@ -7,6 +7,7 @@ mod fuzzing;
 mod metadata;
 mod policy_provenance;
 mod scan;
+mod schema;
 mod types;
 
 #[cfg(fuzzing)]
@@ -24,6 +25,10 @@ pub use failure::{LogStoreFailure, LogStoreFailureCode};
 pub use metadata::LogMetadata;
 pub use policy_provenance::PolicyProvenance;
 pub use scan::{LogScan, LogScanResult, ScanLimit, ScannedLogRecord};
+pub use schema::{
+    OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaEntry, SchemaFailure, SchemaObservation,
+    SchemaPath, SchemaQuery, SchemaQueryResult, SchemaRepresentation, SchemaValue,
+};
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
 };
@@ -54,10 +59,67 @@ impl LogStore {
         identity: StoreBlockIdentity,
         records: Vec<LogRecord>,
     ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
+        self.prepare_internal(capacity, clock, tenant, shard, identity, records, None)
+    }
+
+    /// Prepares a block while atomically observing bounded schema state for its records.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_schema<'capacity, S: LifecycleClockSource>(
+        &self,
+        capacity: ResourceReservation<'capacity>,
+        clock: &LifecycleClock<S>,
+        tenant: TenantId,
+        shard: VirtualShardId,
+        identity: StoreBlockIdentity,
+        records: Vec<LogRecord>,
+        schema: &mut SchemaCatalog,
+    ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
+        self.prepare_internal(
+            capacity,
+            clock,
+            tenant,
+            shard,
+            identity,
+            records,
+            Some(schema),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_internal<'capacity, S: LifecycleClockSource>(
+        &self,
+        capacity: ResourceReservation<'capacity>,
+        clock: &LifecycleClock<S>,
+        tenant: TenantId,
+        shard: VirtualShardId,
+        identity: StoreBlockIdentity,
+        mut records: Vec<LogRecord>,
+        schema: Option<&mut SchemaCatalog>,
+    ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
         if !capacity.authorizes_ingest_preparation(tenant, 1_048_576) {
             return Err(LogStoreFailure::resource_admission_refused());
         }
         let encoded_bytes = codec::encoded_block_length(&records)?;
+        if let Some(schema) = schema {
+            for record in &mut records {
+                let attributes = record
+                    .attributes()
+                    .iter()
+                    .map(|attribute| attribute.occurrences().clone())
+                    .collect::<Vec<_>>();
+                let observation = schema.observe(&attributes).map_err(map_schema_failure)?;
+                for (attribute, (_, representation)) in record
+                    .attributes_mut()
+                    .iter_mut()
+                    .zip(observation.attributes())
+                {
+                    attribute.set_representation(match representation {
+                        SchemaRepresentation::Cataloged => AttributeRepresentation::Generic,
+                        SchemaRepresentation::Overflow => AttributeRepresentation::SchemaOverflow,
+                    });
+                }
+            }
+        }
         let stored = records
             .into_iter()
             .map(|record| {
@@ -152,6 +214,21 @@ impl LogStore {
             scanned_bytes,
             capacity,
         ))
+    }
+}
+
+fn map_schema_failure(failure: SchemaFailure) -> LogStoreFailure {
+    match failure {
+        SchemaFailure::AllocationUnavailable => LogStoreFailure::resource_exhausted(),
+        SchemaFailure::LimitExceeded
+        | SchemaFailure::InvalidBudget
+        | SchemaFailure::PathTooLong => LogStoreFailure::limit_exceeded(),
+        SchemaFailure::InvalidPath | SchemaFailure::InvalidValue => {
+            LogStoreFailure::invalid_input()
+        },
+        SchemaFailure::MalformedCatalog | SchemaFailure::CatalogUnavailable => {
+            LogStoreFailure::invalid_input()
+        },
     }
 }
 

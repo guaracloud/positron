@@ -9,8 +9,10 @@ mod log_store;
 
 pub use log_store::{
     AttributeRepresentation, LogMetadata, LogRecord, LogScan, LogScanResult, LogStore,
-    LogStoreFailure, LogStoreFailureCode, PolicyProvenance, PreparedLogBlock, ScanLimit,
-    ScannedLogRecord, StoredLogAttribute, StoredLogRecord,
+    LogStoreFailure, LogStoreFailureCode, OccurrenceSelector, PolicyProvenance, PreparedLogBlock,
+    ScanLimit, ScannedLogRecord, SchemaBudget, SchemaCatalog, SchemaEntry, SchemaFailure,
+    SchemaObservation, SchemaPath, SchemaQuery, SchemaQueryResult, SchemaRepresentation,
+    SchemaValue, StoredLogAttribute, StoredLogRecord,
 };
 
 #[cfg(fuzzing)]
