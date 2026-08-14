@@ -100,7 +100,7 @@ pub use instance_bootstrap_storage::{
 
 pub use lifecycle_clock::{
     FixedLifecycleClockSource, IngestTime, LifecycleClock, LifecycleClockFailure,
-    LifecycleClockSource,
+    LifecycleClockSource, SystemLifecycleClockSource,
 };
 
 pub use resource_governor::{

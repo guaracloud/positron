@@ -11,14 +11,42 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
+positron-api = { path = "../positron-api" }
 positron-domain = { path = "../positron-domain" }
 positron-governance = { path = "../positron-governance" }
+positron-ingest = { path = "../positron-ingest" }
 positron-kernel = { path = "../positron-kernel" }
+positron-query = { path = "../positron-query" }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = "=0.14.3"
 
 [[test]]
 name = "instance_bootstrap"
 path = "tests/instance_bootstrap.rs"
+
+[[test]]
+name = "process_lifecycle"
+path = "tests/process_lifecycle.rs"
+
+[[test]]
+name = "native_transport"
+path = "tests/native_transport.rs"
+
+[[test]]
+name = "process_forced"
+path = "tests/process_forced.rs"
+
+[[test]]
+name = "process_registration"
+path = "tests/process_registration.rs"
+
+[[test]]
+name = "listener_contract"
+path = "tests/listener_contract.rs"
+
 
 [lints]
 workspace = true

@@ -1,9 +1,7 @@
-//! @positron-scaffold-only
-//! Positron binary and composition-root scaffold.
-//!
-//! This entry point intentionally performs no application behavior. Its scope
-//! must be activated in the engineering registries before composition begins.
+//! Native Positron composition root.
 
 #![forbid(unsafe_code)]
 
-fn main() {}
+fn main() -> std::process::ExitCode {
+    positron::run_native(std::env::args().skip(1), std::env::vars())
+}

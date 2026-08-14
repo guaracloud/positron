@@ -537,6 +537,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
+name = "positron-api"
+version = "0.0.0"
+
+[[package]]
 name = "positron-darwin-acl"
 version = "0.0.0"
 
@@ -616,9 +620,12 @@ dependencies = [
 name = "positron-runtime"
 version = "0.0.0"
 dependencies = [
+ "positron-api",
  "positron-domain",
  "positron-governance",
+ "positron-ingest",
  "positron-kernel",
+ "positron-query",
  "zeroize",
 ]
 

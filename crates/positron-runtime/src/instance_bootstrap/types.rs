@@ -5,7 +5,7 @@ use std::path::Path;
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
     BootstrapKeyCustody, InstanceBootstrapStorage, InstanceId, MountQualification,
-    StorageKernelResourceAuthority,
+    OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
 
@@ -40,7 +40,7 @@ pub struct BootstrapFailure {
 }
 
 impl BootstrapFailure {
-    pub(super) const fn new(code: BootstrapFailureCode) -> Self {
+    pub(crate) const fn new(code: BootstrapFailureCode) -> Self {
         Self { code }
     }
 
@@ -83,6 +83,19 @@ impl BootstrapPaths {
         })
     }
 
+    /// Binds bootstrap custody to the exact effective local-key reference.
+    pub fn with_local_key(
+        data: &Path,
+        secrets: &Path,
+        local_key_file: &Path,
+        qualification: MountQualification,
+    ) -> Result<Self, BootstrapFailure> {
+        if local_key_file != secrets.join("local-root-key.v1") {
+            return Err(BootstrapFailure::new(BootstrapFailureCode::InvalidRoots));
+        }
+        Self::new(data, secrets, qualification)
+    }
+
     #[cfg(test)]
     pub(super) fn data_root(&self) -> &Path {
         &self.data
@@ -96,6 +109,18 @@ impl BootstrapPaths {
     #[must_use]
     pub const fn mount_qualification(&self) -> MountQualification {
         self.storage.qualification()
+    }
+
+    pub(crate) fn retain_volume(&self) -> Result<OwnedPrimaryDataVolume, BootstrapFailure> {
+        self.storage
+            .acquire()
+            .map(|(volume, _)| volume)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
+    }
+
+    #[doc(hidden)]
+    pub fn retain_volume_for_test(&self) -> Result<OwnedPrimaryDataVolume, BootstrapFailure> {
+        self.retain_volume()
     }
 }
 
@@ -118,12 +143,12 @@ impl InitializationPlan {
 }
 
 pub struct InitializedInstance {
-    pub(super) key: BootstrapKeyCustody,
+    pub(crate) key: BootstrapKeyCustody,
     pub(super) identity: positron_governance::Identity,
     pub(super) audit: Vec<positron_governance::GovernanceAuditEntry>,
-    pub(super) _authority: StorageKernelResourceAuthority,
-    pub(super) instance: InstanceId,
-    pub(super) tenant: TenantId,
+    pub(crate) _authority: StorageKernelResourceAuthority,
+    pub(crate) instance: InstanceId,
+    pub(crate) tenant: TenantId,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,
     pub(super) integrity_key_fingerprint: [u8; 32],
@@ -145,6 +170,13 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
+    pub(crate) fn begin_shutdown(&self) -> Result<(), BootstrapFailure> {
+        self._authority
+            .begin_shutdown()
+            .map(|_| ())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
+    }
+
     pub fn attribute(
         &self,
         credential: positron_governance::PresentedCredential,

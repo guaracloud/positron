@@ -25,7 +25,8 @@ pub trait LifecycleClockSource: Send + Sync {
     fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure>;
 }
 
-pub(crate) struct SystemLifecycleClockSource;
+/// Trusted production wall-clock source for kernel-assigned time.
+pub struct SystemLifecycleClockSource;
 
 impl LifecycleClockSource for SystemLifecycleClockSource {
     fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {

@@ -10,5 +10,19 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[dependencies]
+positron-config = { path = "../positron-config" }
+positron-kernel = { path = "../positron-kernel" }
+positron-runtime = { path = "../positron-runtime" }
+signal-hook = "=0.3.18"
+
+[lib]
+name = "positron"
+path = "src/lib.rs"
+
+[[test]]
+name = "process_exit"
+path = "tests/process_exit.rs"
+
 [lints]
 workspace = true
