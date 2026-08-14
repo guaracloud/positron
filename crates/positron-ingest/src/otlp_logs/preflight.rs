@@ -323,5 +323,5 @@ impl<'message> Cursor<'message> {
 }
 
 #[cfg(test)]
-#[path = "preflight/tests.rs"]
+#[path = "preflight/tests/mod.rs"]
 mod tests;
