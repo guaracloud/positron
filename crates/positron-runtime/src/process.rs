@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use positron_kernel::OwnedPrimaryDataVolume;
 
@@ -18,10 +18,11 @@ pub enum InitializationMode {
 }
 
 /// Fully typed inputs needed to establish the M1 database authorities.
-#[derive(Debug)]
 pub struct ServeConfiguration {
     paths: BootstrapPaths,
     initialization: InitializationMode,
+    ingest_policy: Option<positron_ingest::IngestPolicy>,
+    admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
 }
 
 impl ServeConfiguration {
@@ -30,7 +31,39 @@ impl ServeConfiguration {
         Self {
             paths,
             initialization,
+            ingest_policy: None,
+            admission_group_planner: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_ingest_policy(mut self, policy: positron_ingest::IngestPolicy) -> Self {
+        self.ingest_policy = Some(policy);
+        self
+    }
+
+    #[must_use]
+    pub fn with_admission_group_planner(
+        mut self,
+        planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
+    ) -> Self {
+        self.admission_group_planner = Some(planner);
+        self
+    }
+}
+
+impl std::fmt::Debug for ServeConfiguration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServeConfiguration")
+            .field("paths", &self.paths)
+            .field("initialization", &self.initialization)
+            .field("ingest_policy", &self.ingest_policy.is_some())
+            .field(
+                "admission_group_planner",
+                &self.admission_group_planner.is_some(),
+            )
+            .finish()
     }
 }
 
@@ -166,7 +199,7 @@ pub struct RunningProcess {
     listeners: Vec<Box<dyn BoundListener>>,
     tasks: RunningTasks,
     cancellation: TaskCancellation,
-    instance: Option<Arc<Mutex<crate::InitializedInstance>>>,
+    instance: Option<Arc<crate::InitializedInstance>>,
     fenced_volume: Option<OwnedPrimaryDataVolume>,
     services: Option<ServiceHandle>,
     cleanup: CleanupAccumulator,
@@ -238,11 +271,11 @@ impl RunningProcess {
         if listener_close_failed {
             self.state.transition(ProcessPhase::Stopping);
         }
-        if self.instance.as_ref().is_some_and(|instance| {
-            instance
-                .lock()
-                .map_or(true, |instance| instance.begin_shutdown().is_err())
-        }) {
+        if self
+            .instance
+            .as_ref()
+            .is_some_and(|instance| instance.begin_shutdown().is_err())
+        {
             self.state.transition(ProcessPhase::Stopping);
         }
         self.cancellation.cancel();

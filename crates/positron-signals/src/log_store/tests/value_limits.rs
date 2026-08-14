@@ -106,3 +106,69 @@ fn decoded_record_limit_is_checked_after_value_validation() -> Result<(), Box<dy
     assert_eq!(failure.code(), LogStoreFailureCode::LimitExceeded);
     Ok(())
 }
+
+#[test]
+fn metadata_strings_share_the_record_decoded_byte_ceiling() -> Result<(), Box<dyn Error>> {
+    let request = RequestLimits::new(
+        ByteLimit::new(1_024)?,
+        ByteLimit::new(1_024)?,
+        CollectionLimit::new(8)?,
+        CollectionLimit::new(8)?,
+    );
+    let record = RecordLimits::new(
+        ByteLimit::new(1_024)?,
+        ByteLimit::new(4)?,
+        ByteLimit::new(8)?,
+    );
+    let dynamic = DynamicValueLimits::new(
+        ByteLimit::new(8)?,
+        CollectionLimit::new(8)?,
+        ByteLimit::new(64)?,
+        NestingLimit::new(4)?,
+        CollectionLimit::new(8)?,
+        CollectionLimit::new(8)?,
+    );
+    let profile =
+        ValueLimitProfileCandidate::new(ValueLimitSet::new(request, record, dynamic), None)
+            .validate()?;
+    let policy = || PolicyProvenance::new(1, [0x73; 32], vec![]);
+
+    LogRecord::checked_receiver_candidate_with_metadata(
+        profile,
+        None,
+        None,
+        None,
+        vec![],
+        metadata_with_severity("1234"),
+        policy()?,
+    )?;
+    let over = LogRecord::checked_receiver_candidate_with_metadata(
+        profile,
+        None,
+        None,
+        None,
+        vec![],
+        metadata_with_severity("12345"),
+        policy()?,
+    )
+    .expect_err("metadata above the decoded record ceiling must fail closed");
+    assert_eq!(over.code(), LogStoreFailureCode::LimitExceeded);
+    Ok(())
+}
+
+fn metadata_with_severity(severity_text: &str) -> LogMetadata {
+    LogMetadata::new(
+        0,
+        severity_text.to_owned(),
+        None,
+        None,
+        0,
+        0,
+        0,
+        String::new(),
+        String::new(),
+        String::new(),
+        0,
+        String::new(),
+    )
+}

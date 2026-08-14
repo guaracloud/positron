@@ -32,6 +32,19 @@ impl<'authority> ResourceReservation<'authority> {
         status.result
     }
 
+    /// Transfers drop-based release across an asynchronous boundary without
+    /// creating another capacity authority.
+    pub fn transfer(mut self) -> TransferredResourceReservation {
+        self.active = false;
+        TransferredResourceReservation {
+            governor_identity: std::ptr::from_ref(self.governor).addr(),
+            slot: self.slot,
+            owner: self.owner,
+            identity: self.identity,
+            amounts: self.amounts,
+        }
+    }
+
     /// Atomically replaces the grant while preserving immutable work identity.
     pub fn try_resize(
         &mut self,
@@ -110,6 +123,35 @@ impl<'authority> ResourceReservation<'authority> {
         if self.active {
             self.governor.mark_drop_pending(self.slot);
             self.active = false;
+        }
+    }
+}
+
+impl TransferredResourceReservation {
+    /// Rebinds this move-only token to the same governor that granted it.
+    pub fn reclaim(
+        self,
+        governor: ResourceGovernor<'_>,
+    ) -> Result<ResourceReservation<'_>, GovernorFailure> {
+        if self.governor_identity != std::ptr::from_ref(governor.inner).addr() {
+            governor.inner.mark_foreign_release();
+            return Err(GovernorFailure::InternalFenced);
+        }
+        Ok(ResourceReservation::new(
+            governor.inner,
+            self.owner,
+            self.identity,
+            self.amounts,
+            self.slot,
+        ))
+    }
+
+    /// Returns this slot to the same Resource Governor that granted it.
+    pub fn release(self, governor: ResourceGovernor<'_>) {
+        if self.governor_identity == std::ptr::from_ref(governor.inner).addr() {
+            governor.inner.mark_drop_pending(self.slot);
+        } else {
+            governor.inner.mark_foreign_release();
         }
     }
 }

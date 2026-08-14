@@ -25,7 +25,7 @@ fn preparation_accepts_exact_block_maximum_and_rejects_the_next_byte_without_clo
         tenant,
         VirtualShardId::new(81)?,
         StoreBlockIdentity::new([0x81; 16])?,
-        sized_records(261_876)?,
+        sized_records(261_708)?,
     )?;
     assert_eq!(reads.load(Ordering::Relaxed), 4);
     assert_eq!(
@@ -46,7 +46,7 @@ fn preparation_accepts_exact_block_maximum_and_rejects_the_next_byte_without_clo
             tenant,
             VirtualShardId::new(82)?,
             StoreBlockIdentity::new([0x82; 16])?,
-            sized_records(261_877)?,
+            sized_records(261_709)?,
         )
         .err()
         .ok_or("the first byte beyond the Store Block maximum unexpectedly prepared")?;

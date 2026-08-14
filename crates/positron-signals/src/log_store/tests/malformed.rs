@@ -165,3 +165,56 @@ fn result_limit_does_not_hide_a_malformed_declared_record() -> Result<(), Box<dy
     assert_eq!(failure.code(), LogStoreFailureCode::MalformedBlock);
     Ok(())
 }
+
+#[test]
+fn version_two_metadata_tags_and_truncation_fail_closed() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x18; 16])?,
+        CatalogSecret::from_owned(Box::new([0x28; 32]), Box::new([0x38; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let record = minimal_record("metadata", 1)?;
+    let encoded_bytes =
+        crate::log_store::codec::encoded_block_length(std::slice::from_ref(&record))?;
+    let stored = StoredLogRecord::new(record, clock(1).assign_ingest_time()?);
+    let valid = crate::log_store::codec::encode_block(tenant, &[stored], encoded_bytes)?;
+    let cases = [
+        ("unknown trace ID tag", replaced_byte(&valid, 38, 9)?),
+        (
+            "truncated metadata",
+            valid
+                .get(..39)
+                .ok_or("v2 metadata fixture was shorter than expected")?
+                .to_vec(),
+        ),
+    ];
+    for (index, (description, bytes)) in cases.into_iter().enumerate() {
+        let shard = VirtualShardId::new(u32::try_from(index + 83)?)?;
+        let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+        let ledger = ActiveSegmentLedger::open(
+            &authority,
+            &catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([u8::try_from(index + 0x58)?; 32])),
+        )?;
+        ledger.append(PreparedStoreBlock::new(
+            scope,
+            StoreBlockIdentity::new([u8::try_from(index + 0x78)?; 16])?,
+            bytes,
+        )?)?;
+        let failure = LogStore::new()
+            .scan(
+                authority.governor(),
+                tenant,
+                &ledger.snapshot()?,
+                LogScan::all(ScanLimit::new(1)?),
+            )
+            .expect_err(description);
+        assert_eq!(failure.code(), LogStoreFailureCode::MalformedBlock);
+    }
+    Ok(())
+}

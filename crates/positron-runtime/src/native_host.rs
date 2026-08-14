@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
@@ -264,11 +264,13 @@ impl RegisteredTask for NativeRegisteredTask {
         let admission = admissions.remove(index).1;
         drop(admissions);
         let task_cancellation = cancellation.clone();
+        let force = TaskCancellation::new();
+        let force_cancellation = force.clone();
         let handle = std::thread::Builder::new()
             .name(format!("positron-{listener_role:?}"))
             .spawn(move || {
                 if listener_role == ListenerRole::OtlpGrpc {
-                    otlp_grpc::serve(admission, task_cancellation, services)
+                    otlp_grpc::serve(admission, task_cancellation, force_cancellation, services)
                         .map_err(|_| TaskFailure::JoinUnavailable)
                 } else {
                     serve_http(admission, task_cancellation, health, services);
@@ -278,6 +280,7 @@ impl RegisteredTask for NativeRegisteredTask {
             .map_err(|_| TaskFailure::SpawnUnavailable)?;
         Ok(Box::new(NativeRunningTask {
             cancellation,
+            force,
             handle: Some(handle),
         }))
     }
@@ -285,6 +288,7 @@ impl RegisteredTask for NativeRegisteredTask {
 
 struct NativeRunningTask {
     cancellation: TaskCancellation,
+    force: TaskCancellation,
     handle: Option<JoinHandle<Result<(), TaskFailure>>>,
 }
 
@@ -299,14 +303,37 @@ impl RunningTask for NativeRunningTask {
     }
 
     fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure> {
-        join_thread(&mut self.handle)?;
-        Ok(TaskJoinOutcome::Joined)
+        if join_thread_within(&mut self.handle, Duration::from_millis(250))? {
+            Ok(TaskJoinOutcome::Joined)
+        } else {
+            Ok(TaskJoinOutcome::DeadlineExpired)
+        }
     }
 
     fn abort(&mut self) -> Result<(), TaskFailure> {
         self.cancellation.cancel();
-        join_thread(&mut self.handle)
+        self.force.cancel();
+        if join_thread_within(&mut self.handle, Duration::from_millis(250))? {
+            Ok(())
+        } else {
+            Err(TaskFailure::AbortUnavailable)
+        }
     }
+}
+
+fn join_thread_within(
+    handle: &mut Option<JoinHandle<Result<(), TaskFailure>>>,
+    limit: Duration,
+) -> Result<bool, TaskFailure> {
+    let deadline = Instant::now() + limit;
+    while handle.as_ref().is_some_and(|handle| !handle.is_finished()) {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    join_thread(handle)?;
+    Ok(true)
 }
 
 fn join_thread(

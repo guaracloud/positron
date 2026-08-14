@@ -217,6 +217,26 @@ pub struct ResourceReservation<'authority> {
     active: bool,
 }
 
+/// A move-only reservation transferred across an asynchronous transport seam.
+///
+/// The original governor remains the sole accounting authority. Callers must
+/// bind this token to an owner that releases it against that same governor on
+/// every terminal path.
+#[must_use = "a transferred reservation must remain owned until it is released"]
+pub struct TransferredResourceReservation {
+    governor_identity: usize,
+    slot: u16,
+    owner: accounting::ChargeOwner,
+    identity: ReservationIdentity,
+    amounts: ResourceAmounts,
+}
+
+impl std::fmt::Debug for TransferredResourceReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TransferredResourceReservation { <bounded capability> }")
+    }
+}
+
 impl std::fmt::Debug for ResourceReservation<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ResourceReservation { <bounded capability> }")

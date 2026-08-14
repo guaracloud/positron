@@ -4,6 +4,7 @@ use positron_kernel::{
     ActiveSegmentLedger, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
     BootstrapObjectPurpose, Catalog, SegmentScope, StorageKernelResourceAuthority,
 };
+use std::sync::Arc;
 
 use super::super::codec::{BootstrapRecord, encode_claim, encode_legacy_claim};
 use super::super::storage;
@@ -92,6 +93,12 @@ pub(super) fn outcome(
     audit_frontier: u64,
     claim_available: bool,
 ) -> Result<InitializedInstance, BootstrapFailure> {
+    let logs_shard = VirtualShardId::new(1)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let ingest_policy = positron_ingest::IngestPolicy::release_1_default()
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let admission_group_planner =
+        Arc::new(positron_ingest::FixedAdmissionGroupPlanner::new(logs_shard));
     Ok(InitializedInstance {
         key,
         identity,
@@ -99,6 +106,9 @@ pub(super) fn outcome(
         _authority: authority,
         instance: record.instance,
         tenant: record.tenant,
+        logs_shard,
+        ingest_policy,
+        admission_group_planner,
         tenant_slug: BootstrapRecord::tenant_slug()?,
         administrator: record.administrator,
         integrity_key_fingerprint: record.integrity_fingerprint,

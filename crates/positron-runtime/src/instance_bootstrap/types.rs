@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
+use std::sync::Arc;
 
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
@@ -149,6 +150,9 @@ pub struct InitializedInstance {
     pub(crate) _authority: StorageKernelResourceAuthority,
     pub(crate) instance: InstanceId,
     pub(crate) tenant: TenantId,
+    pub(crate) logs_shard: positron_domain::routing::VirtualShardId,
+    pub(crate) ingest_policy: positron_ingest::IngestPolicy,
+    pub(crate) admission_group_planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,
     pub(super) integrity_key_fingerprint: [u8; 32],

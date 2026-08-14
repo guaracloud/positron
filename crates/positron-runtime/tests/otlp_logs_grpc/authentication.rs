@@ -1,36 +1,18 @@
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
-use positron_runtime::{
-    ApplicationRuntime, HostInputs, InitializationMode, InstanceBootstrap, ServeConfiguration,
-    ShutdownTrigger,
-};
+use positron_runtime::{ExitOutcome, ShutdownTrigger};
 use tonic::{Code, Request};
 
-use super::support::{TestRoots, address, bindings, otlp_request};
+use super::support::{LiveGrpcHarness, otlp_request};
 
 #[tokio::test(flavor = "current_thread")]
 async fn authentication_rejection_precedes_message_decompression_and_decoding()
 -> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("authentication")?;
-    let paths = roots.paths()?;
-    drop(InstanceBootstrap::initialize(
-        &paths,
-        positron_runtime::InitializationPlan::non_interactive(),
-    )?);
-    let claim = InstanceBootstrap::claim(&paths)?;
-    let host = positron_runtime::NativeHost::new(bindings(&roots, "auth")?);
-    let process = ApplicationRuntime::start(
-        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
-        HostInputs::new(&host, &host),
-    )?;
-    let endpoint = address(
-        &process.bound_endpoints(),
-        positron_runtime::ListenerRole::OtlpGrpc,
-    )?;
+    let harness = LiveGrpcHarness::start("authentication")?;
     let mut client = tokio::time::timeout(
         Duration::from_secs(2),
-        LogsServiceClient::connect(format!("http://{endpoint}")),
+        LogsServiceClient::connect(format!("http://{}", harness.endpoint())),
     )
     .await??;
     let oversized_body = "x".repeat(4 * 1024 * 1024 + 1);
@@ -48,15 +30,7 @@ async fn authentication_rejection_precedes_message_decompression_and_decoding()
         "OTLP Logs request authentication was rejected"
     );
 
-    let mut conflicting = Request::new(otlp_request(&oversized_body));
-    conflicting.metadata_mut().insert(
-        "authorization",
-        format!(
-            "Bearer {}",
-            claim.ingest_secret().ok_or("ingest secret missing")?
-        )
-        .parse()?,
-    );
+    let mut conflicting = harness.authorize(Request::new(otlp_request(&oversized_body)))?;
     conflicting
         .metadata_mut()
         .insert("x-scope-orgid", "other-tenant".parse()?);
@@ -70,10 +44,9 @@ async fn authentication_rejection_precedes_message_decompression_and_decoding()
         "OTLP Logs request authentication was rejected"
     );
     drop(client);
-    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
-        process.shutdown(ShutdownTrigger::FirstSignal),
-        positron_runtime::ExitOutcome::Graceful
+        harness.shutdown(ShutdownTrigger::FirstSignal).await?,
+        ExitOutcome::Graceful
     );
     Ok(())
 }

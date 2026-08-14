@@ -1,17 +1,19 @@
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use positron_domain::identity::TenantAttribution;
 use positron_domain::value::ValueLimitProfile;
+use positron_kernel::ResourceReservation;
 use prost::Message;
 
 use super::bounds::decoded_record_bytes;
-use super::mapping::{candidate_value, checked_timestamp, grouped_attributes};
+use super::mapping::{candidate_value, checked_identifier, checked_timestamp, grouped_attributes};
 use super::{NativeLogBatch, NativeLogCandidate, ReceiveFailure};
 
-pub(super) fn native_batch(
+pub(super) fn native_batch<'authority>(
     attribution: TenantAttribution,
     decoded: ExportLogsServiceRequest,
     value_limit_profile: ValueLimitProfile,
-) -> Result<NativeLogBatch, ReceiveFailure> {
+    capacity: Option<ResourceReservation<'authority>>,
+) -> Result<NativeLogBatch<'authority>, ReceiveFailure> {
     let mut records = Vec::new();
     let mut attribute_count = 0_usize;
     let mut decoded_batch_bytes = 0_usize;
@@ -61,13 +63,25 @@ pub(super) fn native_batch(
     )
     .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
     for resource_logs in decoded.resource_logs {
-        let resource = resource_logs
-            .resource
-            .map_or_else(Vec::new, |value| value.attributes);
+        let resource_schema_url = resource_logs.schema_url;
+        let (resource, resource_dropped_attributes_count) = resource_logs.resource.map_or_else(
+            || (Vec::new(), 0),
+            |value| (value.attributes, value.dropped_attributes_count),
+        );
         for scope_logs in resource_logs.scope_logs {
-            let scope = scope_logs
-                .scope
-                .map_or_else(Vec::new, |value| value.attributes);
+            let scope_schema_url = scope_logs.schema_url;
+            let (scope_name, scope_version, scope, scope_dropped_attributes_count) =
+                scope_logs.scope.map_or_else(
+                    || (String::new(), String::new(), Vec::new(), 0),
+                    |value| {
+                        (
+                            value.name,
+                            value.version,
+                            value.attributes,
+                            value.dropped_attributes_count,
+                        )
+                    },
+                );
             for log in scope_logs.log_records {
                 if records.len() == structural_record_limit
                     || log.encoded_len() > encoded_record_limit
@@ -101,11 +115,26 @@ pub(super) fn native_batch(
                     &log.attributes,
                     structural_nesting_depth,
                 )?;
+                let metadata = positron_signals::LogMetadata::new(
+                    log.severity_number,
+                    log.severity_text.clone(),
+                    checked_identifier(&log.trace_id)?,
+                    checked_identifier(&log.span_id)?,
+                    log.flags,
+                    log.dropped_attributes_count,
+                    resource_dropped_attributes_count,
+                    resource_schema_url.clone(),
+                    scope_name.clone(),
+                    scope_version.clone(),
+                    scope_dropped_attributes_count,
+                    scope_schema_url.clone(),
+                );
                 records.push(NativeLogCandidate {
                     event_time_unix_nanos: Some(checked_timestamp(log.time_unix_nano)?),
                     observed_time_unix_nanos: Some(checked_timestamp(log.observed_time_unix_nano)?),
                     body,
                     attributes,
+                    metadata,
                 });
             }
         }
@@ -114,5 +143,8 @@ pub(super) fn native_batch(
         attribution,
         records,
         value_limit_profile,
+        decoded_bytes: u64::try_from(decoded_batch_bytes)
+            .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
+        capacity,
     })
 }

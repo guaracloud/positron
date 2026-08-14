@@ -47,7 +47,7 @@ impl ApplicationRuntime {
             },
         };
         let mut attempt = 0_u8;
-        let (_classified, instance) = loop {
+        let (_classified, mut instance) = loop {
             let bootstrap = host
                 .recovery
                 .prerequisite_status()
@@ -130,7 +130,13 @@ impl ApplicationRuntime {
                 },
             }
         };
-        let instance = Arc::new(Mutex::new(instance));
+        if let Some(policy) = configuration.ingest_policy {
+            instance.ingest_policy = policy;
+        }
+        if let Some(planner) = configuration.admission_group_planner {
+            instance.admission_group_planner = planner;
+        }
+        let instance = Arc::new(instance);
         let services = ServiceHandle::new(Arc::clone(&instance));
         for role in [
             ListenerRole::Api,

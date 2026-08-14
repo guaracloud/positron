@@ -16,8 +16,8 @@ use positron_kernel::{
 };
 
 use super::{
-    AttributeRepresentation, LogRecord, LogScan, LogStore, LogStoreFailureCode, PolicyProvenance,
-    ScanLimit, StoredLogAttribute, StoredLogRecord,
+    AttributeRepresentation, LogMetadata, LogRecord, LogScan, LogStore, LogStoreFailureCode,
+    PolicyProvenance, ScanLimit, StoredLogAttribute, StoredLogRecord,
 };
 use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,

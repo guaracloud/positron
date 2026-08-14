@@ -287,6 +287,10 @@ impl GovernorInner {
         self.has_pending_releases.store(true, Ordering::Release);
     }
 
+    pub(super) fn mark_foreign_release(&self) {
+        self.pending_fence.store(true, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(super) fn mark_status_pending_for_test(&self, slot: u16) -> bool {
         self.slot_signals

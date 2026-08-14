@@ -9,6 +9,18 @@ pub(super) fn checked_timestamp(value: u64) -> Result<i64, ReceiveFailure> {
     i64::try_from(value).map_err(|_| ReceiveFailure::TimestampOutOfRange)
 }
 
+pub(super) fn checked_identifier<const N: usize>(
+    value: &[u8],
+) -> Result<Option<[u8; N]>, ReceiveFailure> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .try_into()
+        .map(Some)
+        .map_err(|_| ReceiveFailure::MalformedPayload)
+}
+
 pub(super) fn grouped_attributes(
     resource: &[KeyValue],
     scope: &[KeyValue],

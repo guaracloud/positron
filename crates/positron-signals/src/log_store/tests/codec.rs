@@ -109,6 +109,7 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         )?),
         Some(body),
         attributes,
+        LogMetadata::empty(),
         PolicyProvenance::new(9, [0x79; 32], vec![])?,
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
@@ -151,5 +152,39 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         StoredLogAttribute::generic(result.records()[0].attributes()[1].occurrences().clone()),
         result.records()[0].attributes()[1]
     );
+    Ok(())
+}
+
+#[test]
+fn version_one_blocks_decode_with_explicit_empty_metadata() -> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x13; 16])?,
+        CatalogSecret::from_owned(Box::new([0x23; 32]), Box::new([0x33; 32])),
+    )?;
+    let shard = VirtualShardId::new(3)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x53; 32])),
+    )?;
+    ledger.append(PreparedStoreBlock::new(
+        scope,
+        StoreBlockIdentity::new([0x63; 16])?,
+        encoded_log_fixture(tenant),
+    )?)?;
+    let result = LogStore::new().scan(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+    )?;
+    assert_eq!(result.records()[0].metadata(), &LogMetadata::empty());
     Ok(())
 }

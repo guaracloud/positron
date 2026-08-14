@@ -8,6 +8,14 @@ use positron_signals::{LogScan, LogStore, ScanLimit};
 
 use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
 
+#[test]
+fn release_one_default_policy_has_one_canonical_non_placeholder_snapshot() {
+    let policy = IngestPolicy::release_1_default().expect("default policy");
+    assert_eq!(policy.provenance().generation(), 1);
+    assert_ne!(policy.provenance().digest(), [1_u8; 32]);
+    assert!(policy.provenance().applied_rules().is_empty());
+}
+
 use super::support::{fixture, protobuf_with_bodies};
 
 #[test]

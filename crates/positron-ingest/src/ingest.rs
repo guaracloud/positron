@@ -155,7 +155,11 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
 
     /// Validates, reserves, prepares, and durably commits one Admission Group.
     #[must_use]
-    pub fn accept(&self, batch: NativeLogBatch, identity: StoreBlockIdentity) -> IngestOutcome {
+    pub fn accept(
+        &self,
+        batch: NativeLogBatch<'kernel>,
+        identity: StoreBlockIdentity,
+    ) -> IngestOutcome {
         self.accept_inner(batch, identity, None)
     }
 
@@ -164,7 +168,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
     #[must_use]
     pub fn accept_cancellable(
         &self,
-        batch: NativeLogBatch,
+        batch: NativeLogBatch<'kernel>,
         identity: StoreBlockIdentity,
         cancellation: &AppendCancellation,
     ) -> IngestOutcome {
@@ -173,23 +177,22 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
 
     fn accept_inner(
         &self,
-        batch: NativeLogBatch,
+        batch: NativeLogBatch<'kernel>,
         identity: StoreBlockIdentity,
         cancellation: Option<&AppendCancellation>,
     ) -> IngestOutcome {
-        let attribution = batch.attribution();
+        let (attribution, records, value_profile, capacity) = batch.into_parts();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
         }
-        if batch.records().is_empty() {
+        if records.is_empty() {
             return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord);
         }
         let mut accepted = Vec::new();
         let mut accepted_attributes = 0_usize;
         let mut rejection_counts = [0_usize; 3];
         let mut rejection_code = IngestFailureCode::InvalidRecord;
-        let value_profile = batch.value_limit_profile();
-        for candidate in batch.into_records() {
+        for candidate in records {
             let policy = match self.policy.evaluate(&candidate) {
                 Ok(PolicyDecision::Accept(policy)) => policy,
                 Ok(PolicyDecision::Reject) => {
@@ -210,7 +213,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
                 },
             };
-            let (event_time, observed_time, body, attributes) = candidate.into_parts();
+            let (event_time, observed_time, body, attributes, metadata) = candidate.into_parts();
             let attributes = attributes
                 .into_iter()
                 .map(|attribute| {
@@ -221,12 +224,13 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     )
                 })
                 .collect();
-            match positron_signals::LogRecord::checked_receiver_candidate(
+            match positron_signals::LogRecord::checked_receiver_candidate_with_metadata(
                 value_profile,
                 event_time,
                 observed_time,
                 body,
                 attributes,
+                metadata,
                 policy,
             ) {
                 Ok(record) => {
@@ -295,13 +299,27 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             4,
             1_048_576,
         ]);
-        let claim = match WorkClaim::tenant(self.tenant, WorkKind::Ingest, amounts) {
-            Ok(claim) => claim,
-            Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
-        };
-        let capacity = match self.authority.governor().reserve(claim) {
-            Ok(capacity) => capacity,
-            Err(_) => return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable),
+        let capacity = match capacity {
+            Some(mut capacity) => {
+                if capacity.try_resize(amounts).is_err() {
+                    return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
+                }
+                capacity
+            },
+            None => {
+                let claim = match WorkClaim::tenant(self.tenant, WorkKind::Ingest, amounts) {
+                    Ok(claim) => claim,
+                    Err(_) => {
+                        return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+                    },
+                };
+                match self.authority.governor().reserve(claim) {
+                    Ok(capacity) => capacity,
+                    Err(_) => {
+                        return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
+                    },
+                }
+            },
         };
         let prepared = match LogStore::new().prepare(
             capacity,

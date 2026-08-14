@@ -1,71 +1,61 @@
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
-use positron_query::QueryBudget;
-use positron_runtime::{
-    ApplicationRuntime, HostInputs, InitializationMode, InstanceBootstrap, ServeConfiguration,
-    ShutdownTrigger,
-};
+use positron_runtime::{ExitOutcome, ShutdownTrigger};
 use std::time::Duration;
 use tonic::Request;
 
-use super::support::{TestRoots, address, bindings, otlp_request};
+use super::support::{LiveGrpcHarness, otlp_request};
 
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_export_commits_before_success_and_is_queryable()
 -> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("export")?;
-    let paths = roots.paths()?;
-    drop(InstanceBootstrap::initialize(
-        &paths,
-        positron_runtime::InitializationPlan::non_interactive(),
-    )?);
-    let claim = InstanceBootstrap::claim(&paths)?;
-    let host = positron_runtime::NativeHost::new(bindings(&roots, "g")?);
-    let process = ApplicationRuntime::start(
-        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
-        HostInputs::new(&host, &host),
-    )?;
-    let endpoint = address(
-        &process.bound_endpoints(),
-        positron_runtime::ListenerRole::OtlpGrpc,
-    )?;
+    let harness = LiveGrpcHarness::start("authenticated-export")?;
     let mut client = tokio::time::timeout(
         Duration::from_secs(2),
-        LogsServiceClient::connect(format!("http://{endpoint}")),
+        LogsServiceClient::connect(format!("http://{}", harness.endpoint())),
     )
     .await??;
-    let mut request = Request::new(otlp_request("grpc-durable"));
-    request.metadata_mut().insert(
-        "authorization",
-        format!(
-            "Bearer {}",
-            claim.ingest_secret().ok_or("ingest secret missing")?
-        )
-        .parse()?,
-    );
+    let request = harness.authorize(Request::new(otlp_request("grpc-durable")))?;
 
     let response = tokio::time::timeout(Duration::from_secs(2), client.export(request))
         .await??
         .into_inner();
 
     assert!(response.partial_success.is_none());
-    let services = process
-        .services()
-        .ok_or("serving process omitted services")?;
-    assert_eq!(
-        format!("{services:?}"),
-        "ServiceHandle { <authorized runtime services> }"
-    );
-    let bodies = services.query_log_bodies(
-        claim.query_secret().ok_or("query secret missing")?,
-        "logs | range query_time 0 100 | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
-    )?;
+    let bodies = harness.query_log_bodies("logs | range query_time 0 100 | limit 16")?;
     assert_eq!(bodies, ["grpc-durable"]);
     drop(client);
-    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
-        process.shutdown(ShutdownTrigger::FirstSignal),
-        positron_runtime::ExitOutcome::Graceful
+        harness.shutdown(ShutdownTrigger::FirstSignal).await?,
+        ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn acknowledged_log_survives_process_drop_and_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut harness = LiveGrpcHarness::start("crash-restart")?;
+    let mut client = LogsServiceClient::connect(format!("http://{}", harness.endpoint())).await?;
+    let request = harness.authorize(Request::new(otlp_request("survives-restart")))?;
+    assert!(
+        client
+            .export(request)
+            .await?
+            .into_inner()
+            .partial_success
+            .is_none()
+    );
+    drop(client);
+
+    harness.crash()?;
+    harness.restart()?;
+    assert_eq!(
+        harness.query_log_bodies("logs | range query_time 0 100 | limit 16")?,
+        ["survives-restart"]
+    );
+    assert_eq!(
+        harness.shutdown(ShutdownTrigger::FirstSignal).await?,
+        ExitOutcome::Graceful
     );
     Ok(())
 }

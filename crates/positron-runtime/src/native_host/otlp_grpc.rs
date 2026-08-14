@@ -8,12 +8,14 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
 use positron_governance::{AuthorizedContext, CompatibilityHints};
-use positron_ingest::{IngestFailureCode, IngestOutcome};
+use positron_ingest::{IngestFailureCode, IngestOutcome, IngestRequestOutcome};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codec::CompressionEncoding;
+use tonic::service::LayerExt;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+use tower::util::MapResponseLayer;
 
 use super::Admission;
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
@@ -26,6 +28,7 @@ mod tests;
 pub(super) fn serve(
     admission: Arc<Admission>,
     cancellation: TaskCancellation,
+    force: TaskCancellation,
     services: Option<ServiceHandle>,
 ) -> Result<(), GrpcFailure> {
     let services = services.ok_or(GrpcFailure)?;
@@ -41,19 +44,54 @@ pub(super) fn serve(
         let receiver = LogsServiceServer::new(OtlpLogsGrpc { services })
             .accept_compressed(CompressionEncoding::Gzip)
             .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
         let receiver = InterceptedService::new(receiver, move |request| {
             authenticate(request, &authentication)
         });
-        Server::builder()
+        let graceful_admission = Arc::clone(&admission);
+        let serving = Server::builder()
             .add_service(receiver)
             .serve_with_incoming_shutdown(incoming, async move {
-                while admission.is_accepting() && !cancellation.is_cancelled() {
+                while graceful_admission.is_accepting() && !cancellation.is_cancelled() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-            })
-            .await
-            .map_err(|_| GrpcFailure)
+            });
+        tokio::pin!(serving);
+        tokio::select! {
+            result = &mut serving => result.map_err(|_| GrpcFailure),
+            () = wait_for(force) => Ok(()),
+        }
     })
+}
+
+fn map_decode_failure<B>(mut response: http::Response<B>) -> http::Response<B> {
+    let is_wire_decode_failure = response
+        .headers()
+        .get("grpc-status")
+        .is_some_and(|value| value == "13")
+        && response
+            .headers()
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|message| {
+                message.starts_with("failed%20to%20decode%20Protobuf%20message:")
+            });
+    if is_wire_decode_failure {
+        response
+            .headers_mut()
+            .insert("grpc-status", http::HeaderValue::from_static("3"));
+        response.headers_mut().insert(
+            "grpc-message",
+            http::HeaderValue::from_static("OTLP%20Logs%20request%20was%20malformed"),
+        );
+    }
+    response
+}
+
+async fn wait_for(cancellation: TaskCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 fn authenticate(mut request: Request<()>, services: &ServiceHandle) -> Result<Request<()>, Status> {
@@ -75,7 +113,9 @@ fn authenticate(mut request: Request<()>, services: &ServiceHandle) -> Result<Re
     let context = services
         .authorize_otlp_logs_with_hints(bearer, hints)
         .map_err(|_| authentication_rejected())?;
+    let admission = services.admit_otlp_grpc(context).map_err(service_status)?;
     request.extensions_mut().insert(context);
+    request.extensions_mut().insert(admission);
     Ok(request)
 }
 
@@ -92,36 +132,49 @@ struct OtlpLogsGrpc {
 impl LogsService for OtlpLogsGrpc {
     async fn export(
         &self,
-        request: Request<ExportLogsServiceRequest>,
+        mut request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
         let context = request
             .extensions()
             .get::<AuthorizedContext>()
             .copied()
             .ok_or_else(authentication_rejected)?;
+        let admission = request
+            .extensions_mut()
+            .remove::<crate::services::GrpcAdmissionLease>()
+            .ok_or_else(|| Status::internal("OTLP Logs admission context was unavailable"))?;
+        let reservation = admission.take().map_err(service_status)?;
         let outcome = self
             .services
-            .ingest_decoded_otlp_logs(context, request.into_inner())
+            .ingest_decoded_otlp_logs(context, request.into_inner(), reservation)
             .map_err(service_status)?;
         render(outcome)
     }
 }
 
-fn render(outcome: IngestOutcome) -> Result<Response<ExportLogsServiceResponse>, Status> {
-    match outcome {
-        IngestOutcome::Full(_) => Ok(Response::new(ExportLogsServiceResponse {
+fn render(outcome: IngestRequestOutcome) -> Result<Response<ExportLogsServiceResponse>, Status> {
+    if let Some(failure) = outcome.terminal_failure() {
+        return render_failure(failure);
+    }
+    let rejected = outcome.permanently_rejected_records();
+    if rejected == 0 {
+        Ok(Response::new(ExportLogsServiceResponse {
             partial_success: None,
-        })),
-        IngestOutcome::Partial(partial) => {
-            let rejected_log_records = i64::try_from(partial.permanently_rejected())
-                .map_err(|_| Status::internal("OTLP Logs outcome could not be represented"))?;
-            Ok(Response::new(ExportLogsServiceResponse {
-                partial_success: Some(ExportLogsPartialSuccess {
-                    rejected_log_records,
-                    error_message: "some log records were permanently rejected".to_owned(),
-                }),
-            }))
-        },
+        }))
+    } else {
+        let rejected_log_records = i64::try_from(rejected)
+            .map_err(|_| Status::internal("OTLP Logs outcome could not be represented"))?;
+        Ok(Response::new(ExportLogsServiceResponse {
+            partial_success: Some(ExportLogsPartialSuccess {
+                rejected_log_records,
+                error_message: "some log records were permanently rejected".to_owned(),
+            }),
+        }))
+    }
+}
+
+fn render_failure(outcome: IngestOutcome) -> Result<Response<ExportLogsServiceResponse>, Status> {
+    match outcome {
         IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable) => Err(
             Status::resource_exhausted("OTLP Logs ingest capacity is unavailable"),
         ),
@@ -134,12 +187,18 @@ fn render(outcome: IngestOutcome) -> Result<Response<ExportLogsServiceResponse>,
         IngestOutcome::Ambiguous(_) => Err(Status::unavailable(
             "OTLP Logs commit outcome is ambiguous; retry may duplicate records",
         )),
+        IngestOutcome::Full(_) | IngestOutcome::Partial(_) => {
+            Err(Status::internal("OTLP Logs outcome aggregation failed"))
+        },
     }
 }
 
 fn service_status(failure: ServiceFailure) -> Status {
     match failure {
         ServiceFailure::Unauthorized => authentication_rejected(),
+        ServiceFailure::CapacityUnavailable => {
+            Status::resource_exhausted("OTLP Logs ingest capacity is unavailable")
+        },
         ServiceFailure::InvalidRequest => {
             Status::invalid_argument("OTLP Logs request was rejected")
         },

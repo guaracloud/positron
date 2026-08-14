@@ -35,6 +35,7 @@ fn encoded_record_length(
             1
         },
     )?;
+    bytes = bounded_add(bytes, super::metadata::encoded_length(record.metadata())?)?;
     bytes = bounded_add(bytes, 9)?;
     if let Some(body) = record.body() {
         bytes = bounded_add(bytes, value::encoded_length(body, maximum_nesting_depth)?)?;

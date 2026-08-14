@@ -80,6 +80,7 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
             None,
             None,
             too_many_attributes,
+            LogMetadata::empty(),
             policy.clone(),
         )
         .expect_err("record attribute sets are bounded")

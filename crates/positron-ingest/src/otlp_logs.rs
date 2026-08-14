@@ -9,6 +9,7 @@ use positron_kernel::{
 };
 use prost::Message;
 
+mod admission_groups;
 mod bounds;
 mod decoded;
 mod mapping;
@@ -21,8 +22,10 @@ mod tests;
 use preflight::validate_record_count;
 use transport::bounded_protobuf;
 
+pub use admission_groups::NativeLogAdmissionGroup;
+
 const RECEIVER_CAPACITY: ResourceAmounts =
-    ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 0, 0]);
+    ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 1, 0]);
 
 enum OtlpPayload {
     Protobuf(Vec<u8>),
@@ -63,12 +66,16 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
     }
 
     /// Accepts a message decoded by an authenticated bounded gRPC transport.
-    pub fn decoded(
+    pub fn decoded_after_transport_admission(
         context: AuthorizedContext,
-        governor: ResourceGovernor<'authority>,
         decoded: ExportLogsServiceRequest,
+        capacity: ResourceReservation<'authority>,
     ) -> Result<Self, ReceiveFailure> {
-        Self::admit(context, governor, OtlpPayload::Decoded(Box::new(decoded)))
+        Ok(Self {
+            attribution: ingest_attribution(context)?,
+            payload: OtlpPayload::Decoded(Box::new(decoded)),
+            capacity: Some(capacity),
+        })
     }
 
     fn admit(
@@ -76,10 +83,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
         governor: ResourceGovernor<'authority>,
         payload: OtlpPayload,
     ) -> Result<Self, ReceiveFailure> {
-        let attribution = context
-            .tenant_attribution()
-            .filter(|attribution| attribution.scope() == positron_domain::identity::Scope::Ingest)
-            .ok_or(ReceiveFailure::AuthenticationRejected)?;
+        let attribution = ingest_attribution(context)?;
         let maximum_request_bytes = usize::try_from(
             ValueLimitProfile::release_1_system_maximum()
                 .system_limits()
@@ -91,11 +95,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
         if payload.encoded_len() > maximum_request_bytes {
             return Err(ReceiveFailure::TransportLimitExceeded);
         }
-        let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
-            .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
-        let capacity = governor
-            .reserve(claim)
-            .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+        let capacity = reserve_otlp_logs_transport(context, governor)?;
         Ok(Self {
             attribution,
             payload,
@@ -122,6 +122,27 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             capacity: None,
         }
     }
+}
+
+/// Reserves the canonical receiver budget before an authenticated transport
+/// begins structural decode or decompression.
+pub fn reserve_otlp_logs_transport<'authority>(
+    context: AuthorizedContext,
+    governor: ResourceGovernor<'authority>,
+) -> Result<ResourceReservation<'authority>, ReceiveFailure> {
+    let attribution = ingest_attribution(context)?;
+    let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
+        .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+    governor
+        .reserve(claim)
+        .map_err(|_| ReceiveFailure::CapacityUnavailable)
+}
+
+fn ingest_attribution(context: AuthorizedContext) -> Result<TenantAttribution, ReceiveFailure> {
+    context
+        .tenant_attribution()
+        .filter(|attribution| attribution.scope() == positron_domain::identity::Scope::Ingest)
+        .ok_or(ReceiveFailure::AuthenticationRejected)
 }
 
 /// Stable receiver-side rejection classes.
@@ -177,6 +198,7 @@ pub struct NativeLogCandidate {
     observed_time_unix_nanos: Option<i64>,
     body: Option<CandidateAttributeValue>,
     attributes: Vec<NativeLogAttribute>,
+    metadata: positron_signals::LogMetadata,
 }
 
 impl NativeLogCandidate {
@@ -207,25 +229,29 @@ impl NativeLogCandidate {
         Option<i64>,
         Option<CandidateAttributeValue>,
         Vec<NativeLogAttribute>,
+        positron_signals::LogMetadata,
     ) {
         (
             self.event_time_unix_nanos,
             self.observed_time_unix_nanos,
             self.body,
             self.attributes,
+            self.metadata,
         )
     }
 }
 
 /// One tenant-bound native batch after protocol mapping.
 #[derive(Debug)]
-pub struct NativeLogBatch {
+pub struct NativeLogBatch<'authority> {
     attribution: TenantAttribution,
     records: Vec<NativeLogCandidate>,
     value_limit_profile: ValueLimitProfile,
+    decoded_bytes: u64,
+    capacity: Option<ResourceReservation<'authority>>,
 }
 
-impl NativeLogBatch {
+impl<'authority> NativeLogBatch<'authority> {
     #[must_use]
     pub const fn attribution(&self) -> TenantAttribution {
         self.attribution
@@ -237,13 +263,37 @@ impl NativeLogBatch {
     }
 
     #[must_use]
-    pub fn into_records(self) -> Vec<NativeLogCandidate> {
-        self.records
-    }
-
-    #[must_use]
     pub const fn value_limit_profile(&self) -> ValueLimitProfile {
         self.value_limit_profile
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        TenantAttribution,
+        Vec<NativeLogCandidate>,
+        ValueLimitProfile,
+        Option<ResourceReservation<'authority>>,
+    ) {
+        (
+            self.attribution,
+            self.records,
+            self.value_limit_profile,
+            self.capacity,
+        )
+    }
+
+    fn resize_after_decode(&mut self) -> Result<(), ReceiveFailure> {
+        let record_count =
+            u64::try_from(self.records.len()).map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
+        let amounts =
+            ResourceAmounts::new([self.decoded_bytes, 1, 1, 0, record_count, 0, 0, 0, 1, 1, 0]);
+        if let Some(capacity) = self.capacity.as_mut() {
+            capacity
+                .try_resize(amounts)
+                .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+        }
+        Ok(())
     }
 }
 
@@ -273,16 +323,15 @@ impl OtlpLogsReceiver {
         }
     }
 
-    pub fn decode(
+    pub fn decode<'authority>(
         &self,
-        request: AuthenticatedOtlpLogsRequest,
-    ) -> Result<NativeLogBatch, ReceiveFailure> {
+        request: AuthenticatedOtlpLogsRequest<'authority>,
+    ) -> Result<NativeLogBatch<'authority>, ReceiveFailure> {
         let AuthenticatedOtlpLogsRequest {
             attribution,
             payload,
             capacity,
         } = request;
-        let _capacity = capacity;
         let decoded = match payload {
             OtlpPayload::Decoded(decoded) => *decoded,
             encoded => {
@@ -292,7 +341,10 @@ impl OtlpLogsReceiver {
                     .map_err(|_| ReceiveFailure::MalformedPayload)?
             },
         };
-        decoded::native_batch(attribution, decoded, self.value_limit_profile)
+        let mut batch =
+            decoded::native_batch(attribution, decoded, self.value_limit_profile, capacity)?;
+        batch.resize_after_decode()?;
+        Ok(batch)
     }
 }
 
