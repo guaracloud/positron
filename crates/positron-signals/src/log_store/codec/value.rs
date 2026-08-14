@@ -2,8 +2,9 @@ use positron_domain::value::{
     AttributeValueKind, CandidateAttributeValue, CandidateKeyValue, ValidatedAttributeValue,
 };
 
+use super::limits::CodecLimits;
 use super::size::bounded_add;
-use super::{Input, MAX_COLLECTION, bounded_vec, put_bytes, put_count};
+use super::{Input, bounded_vec, put_bytes, put_count};
 use crate::log_store::LogStoreFailure;
 
 pub(super) fn encoded_length(
@@ -176,6 +177,7 @@ pub(super) fn decode(
     input: &mut Input<'_>,
     depth: u8,
     value_bytes: usize,
+    limits: CodecLimits,
 ) -> Result<CandidateAttributeValue, LogStoreFailure> {
     Ok(match input.u8()? {
         0 => CandidateAttributeValue::null(),
@@ -188,11 +190,12 @@ pub(super) fn decode(
         3 => CandidateAttributeValue::floating_point_bits(input.u64()?),
         4 => CandidateAttributeValue::string(input.string(value_bytes)?),
         5 => CandidateAttributeValue::bytes(input.bytes(value_bytes)?),
-        6 => CandidateAttributeValue::array(decode_array(input, depth, value_bytes)?),
+        6 => CandidateAttributeValue::array(decode_array(input, depth, value_bytes, limits)?),
         7 => CandidateAttributeValue::key_value_list(decode_key_value_list(
             input,
             depth,
             value_bytes,
+            limits,
         )?),
         _ => return Err(LogStoreFailure::malformed_block()),
     })
@@ -202,14 +205,15 @@ fn decode_array(
     input: &mut Input<'_>,
     depth: u8,
     value_bytes: usize,
+    limits: CodecLimits,
 ) -> Result<Vec<CandidateAttributeValue>, LogStoreFailure> {
     let next = depth
         .checked_sub(1)
         .ok_or_else(LogStoreFailure::malformed_block)?;
-    let count = input.count(MAX_COLLECTION)?;
+    let count = input.count(limits.array_entries)?;
     let mut values = bounded_vec(count)?;
     for _ in 0..count {
-        values.push(decode(input, next, value_bytes)?);
+        values.push(decode(input, next, value_bytes, limits)?);
     }
     Ok(values)
 }
@@ -218,16 +222,17 @@ fn decode_key_value_list(
     input: &mut Input<'_>,
     depth: u8,
     value_bytes: usize,
+    limits: CodecLimits,
 ) -> Result<Vec<CandidateKeyValue>, LogStoreFailure> {
     let next = depth
         .checked_sub(1)
         .ok_or_else(LogStoreFailure::malformed_block)?;
-    let count = input.count(MAX_COLLECTION)?;
+    let count = input.count(limits.key_value_list_entries)?;
     let mut values = bounded_vec(count)?;
     for _ in 0..count {
         values.push(CandidateKeyValue::new(
-            input.string(65_536)?,
-            decode(input, next, value_bytes)?,
+            input.string(limits.key_bytes)?,
+            decode(input, next, value_bytes, limits)?,
         ));
     }
     Ok(values)

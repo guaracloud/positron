@@ -2,6 +2,23 @@ use super::*;
 use positron_kernel::{FixedLifecycleClockSource, LifecycleClock};
 
 #[test]
+fn receiver_zero_observed_time_preserves_its_non_usable_quality() -> Result<(), Box<dyn Error>> {
+    let record = LogRecord::checked_receiver_candidate(
+        value_profile()?,
+        None,
+        Some(0),
+        None,
+        vec![],
+        PolicyProvenance::new(1, [0x71; 32], vec![])?,
+    )?;
+
+    let observed = record.observed_time().ok_or("observed time missing")?;
+    assert_eq!(observed.instant(), Some(UnixNanoseconds::new(0)));
+    assert_eq!(observed.quality(), SourceTimeQuality::Zero);
+    Ok(())
+}
+
+#[test]
 fn kernel_clock_assigns_ingest_and_retention_time_while_event_time_remains_untrusted()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

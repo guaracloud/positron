@@ -128,3 +128,40 @@ fn authenticated_malformed_record_shapes_fail_closed_at_their_exact_boundaries()
     }
     Ok(())
 }
+
+#[test]
+fn result_limit_does_not_hide_a_malformed_declared_record() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x17; 16])?,
+        CatalogSecret::from_owned(Box::new([0x27; 32]), Box::new([0x37; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(81)?);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x57; 32])),
+    )?;
+    let declared_two_with_one_record = replaced_bytes(&encoded_log_fixture(tenant), 26, [0, 2])?;
+    ledger.append(PreparedStoreBlock::new(
+        scope,
+        StoreBlockIdentity::new([0x77; 16])?,
+        declared_two_with_one_record,
+    )?)?;
+
+    let failure = LogStore::new()
+        .scan(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            LogScan::all(ScanLimit::new(1)?),
+        )
+        .expect_err("the complete authenticated block must validate before observation");
+    assert_eq!(failure.code(), LogStoreFailureCode::MalformedBlock);
+    Ok(())
+}

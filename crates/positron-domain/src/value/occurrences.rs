@@ -1,0 +1,224 @@
+/// A pre-validation ordered set of repeated occurrences for one attribute key.
+///
+/// Duplicate occurrences are intentionally preserved in input order. This
+/// candidate may be too large or contain over-limit text, so it is not safe for
+/// Signal Store, catalog, or query use until `validate` returns the later state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttributeOccurrenceSetCandidate {
+    namespace: AttributeNamespace,
+    key: String,
+    occurrences: Vec<CandidateAttributeValue>,
+}
+impl AttributeOccurrenceSetCandidate {
+    /// Builds the pre-validation representation of one repeated attribute key.
+    #[must_use]
+    pub fn new(
+        namespace: AttributeNamespace,
+        key: String,
+        occurrences: Vec<CandidateAttributeValue>,
+    ) -> Self {
+        Self {
+            namespace,
+            key,
+            occurrences,
+        }
+    }
+
+    /// Validates bounds and produces the later invariant-bearing occurrence set.
+    pub fn validate(
+        self,
+        profile: ValueLimitProfile,
+    ) -> Result<AttributeOccurrenceSet, DomainFailure> {
+        let limits = profile.effective_limits();
+        if self.key.is_empty()
+            || exceeds_byte_limit(self.key.len(), limits.dynamic_value().key_path_bytes())
+            || self.occurrences.is_empty()
+            || exceeds_collection_limit(
+                self.occurrences.len(),
+                limits.dynamic_value().attributes_per_namespace(),
+            )
+        {
+            return Err(DomainFailure::value_limit_exceeded());
+        }
+        let mut validated = Vec::new();
+        validated
+            .try_reserve_exact(self.occurrences.len())
+            .map_err(|_| DomainFailure::allocation_unavailable())?;
+        for candidate in self.occurrences {
+            validated.push(validate_attribute_value(
+                candidate,
+                limits,
+                limits.dynamic_value().individual_value_bytes(),
+                limits.dynamic_value().nesting_depth().value(),
+            )?);
+        }
+        Ok(AttributeOccurrenceSet {
+            namespace: self.namespace,
+            key: self.key,
+            occurrences: validated,
+        })
+    }
+}
+
+/// A profile-bounded ordered set of repeated typed values for one attribute key.
+///
+/// This is the post-validation state. It preserves namespace, key, occurrence
+/// order, and typed variants; callers cannot construct it unchecked or use
+/// indexing without an explicit optional result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttributeOccurrenceSet {
+    namespace: AttributeNamespace,
+    key: String,
+    occurrences: Vec<ValidatedAttributeValue>,
+}
+
+impl AttributeOccurrenceSet {
+    /// Returns the namespace that owns this occurrence set.
+    #[must_use]
+    pub const fn namespace(&self) -> AttributeNamespace {
+        self.namespace
+    }
+
+    /// Returns the validated attribute key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the finite number of preserved occurrences.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.occurrences.len()
+    }
+
+    /// Returns whether this checked occurrence set contains no values.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.occurrences.is_empty()
+    }
+
+    /// Returns one occurrence by explicit optional index.
+    #[must_use]
+    pub fn occurrence(&self, index: usize) -> Option<&ValidatedAttributeValue> {
+        self.occurrences.get(index)
+    }
+}
+
+fn validate_attribute_value(
+    candidate: CandidateAttributeValue,
+    limits: ValueLimitSet,
+    value_bytes: ByteLimit,
+    remaining_depth: u16,
+) -> Result<ValidatedAttributeValue, DomainFailure> {
+    let inner = match candidate {
+        CandidateAttributeValue::Null => ValidatedAttributeValueInner::Null,
+        CandidateAttributeValue::Boolean(value) => ValidatedAttributeValueInner::Boolean(value),
+        CandidateAttributeValue::SignedInteger(value) => {
+            ValidatedAttributeValueInner::SignedInteger(value)
+        },
+        CandidateAttributeValue::FloatingPointBits(value) => {
+            ValidatedAttributeValueInner::FloatingPointBits(value)
+        },
+        CandidateAttributeValue::String(value) => {
+            if exceeds_byte_limit(value.len(), value_bytes) {
+                return Err(DomainFailure::value_limit_exceeded());
+            }
+            ValidatedAttributeValueInner::String(value)
+        },
+        CandidateAttributeValue::Bytes(value) => {
+            if exceeds_byte_limit(value.len(), value_bytes) {
+                return Err(DomainFailure::value_limit_exceeded());
+            }
+            ValidatedAttributeValueInner::Bytes(value)
+        },
+        CandidateAttributeValue::Array(values) => ValidatedAttributeValueInner::Array(
+            validate_attribute_array(values, limits, value_bytes, remaining_depth)?,
+        ),
+        CandidateAttributeValue::KeyValueList(values) => {
+            ValidatedAttributeValueInner::KeyValueList(validate_key_value_list(
+                values,
+                limits,
+                value_bytes,
+                remaining_depth,
+            )?)
+        },
+    };
+    let validated = ValidatedAttributeValue { inner };
+    if exceeds_byte_limit(validated.value_size_bytes()?, value_bytes) {
+        return Err(DomainFailure::value_limit_exceeded());
+    }
+    Ok(validated)
+}
+
+fn validate_attribute_array(
+    values: Vec<CandidateAttributeValue>,
+    limits: ValueLimitSet,
+    value_bytes: ByteLimit,
+    remaining_depth: u16,
+) -> Result<Vec<ValidatedAttributeValue>, DomainFailure> {
+    let Some(child_depth) = remaining_depth.checked_sub(1) else {
+        return Err(DomainFailure::value_limit_exceeded());
+    };
+    if exceeds_collection_limit(values.len(), limits.dynamic_value().array_entries()) {
+        return Err(DomainFailure::value_limit_exceeded());
+    }
+    let mut validated = Vec::new();
+    validated
+        .try_reserve_exact(values.len())
+        .map_err(|_| DomainFailure::allocation_unavailable())?;
+    for value in values {
+        validated.push(validate_attribute_value(
+            value,
+            limits,
+            value_bytes,
+            child_depth,
+        )?);
+    }
+    Ok(validated)
+}
+
+fn validate_key_value_list(
+    values: Vec<CandidateKeyValue>,
+    limits: ValueLimitSet,
+    value_bytes: ByteLimit,
+    remaining_depth: u16,
+) -> Result<Vec<ValidatedKeyValue>, DomainFailure> {
+    let Some(child_depth) = remaining_depth.checked_sub(1) else {
+        return Err(DomainFailure::value_limit_exceeded());
+    };
+    if exceeds_collection_limit(
+        values.len(),
+        limits.dynamic_value().key_value_list_entries(),
+    ) {
+        return Err(DomainFailure::value_limit_exceeded());
+    }
+    let mut validated = Vec::new();
+    validated
+        .try_reserve_exact(values.len())
+        .map_err(|_| DomainFailure::allocation_unavailable())?;
+    for CandidateKeyValue { key, value } in values {
+        if key.is_empty() || exceeds_byte_limit(key.len(), limits.dynamic_value().key_path_bytes())
+        {
+            return Err(DomainFailure::value_limit_exceeded());
+        }
+        validated.push(ValidatedKeyValue {
+            key,
+            value: validate_attribute_value(value, limits, value_bytes, child_depth)?,
+        });
+    }
+    Ok(validated)
+}
+
+fn exceeds_byte_limit(actual: usize, limit: ByteLimit) -> bool {
+    match usize::try_from(limit.value()) {
+        Ok(limit) => actual > limit,
+        Err(_) => false,
+    }
+}
+
+fn exceeds_collection_limit(actual: usize, limit: CollectionLimit) -> bool {
+    match usize::try_from(limit.value()) {
+        Ok(limit) => actual > limit,
+        Err(_) => false,
+    }
+}

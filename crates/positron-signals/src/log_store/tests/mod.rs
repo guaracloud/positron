@@ -31,6 +31,7 @@ mod public_contract;
 mod scan;
 mod support;
 mod time;
+mod value_limits;
 
 fn minimal_record(body: &str, _ingest_time: i64) -> Result<LogRecord, Box<dyn Error>> {
     Ok(LogRecord::checked_minimal(

@@ -1,8 +1,10 @@
-use super::validate_record_count;
+use super::validate_record_count as validate_with_profile;
 use crate::ReceiveFailure;
+use positron_domain::value::ValueLimitProfile;
 
 const CONTAINER_LIMIT: usize = 1_024;
-const VALUE_LIMIT: usize = 4_096;
+const ATTRIBUTE_LIMIT: usize = 4_096;
+const COLLECTION_LIMIT: usize = 1_024;
 
 #[test]
 fn every_repeated_container_has_an_inclusive_pre_decode_limit() {
@@ -17,14 +19,21 @@ fn every_repeated_container_has_an_inclusive_pre_decode_limit() {
             Err(ReceiveFailure::ValueLimitExceeded),
         );
     }
+    assert_eq!(
+        validate_record_count(&request_with_empty_attributes(ATTRIBUTE_LIMIT)),
+        Ok(())
+    );
+    assert_eq!(
+        validate_record_count(&request_with_empty_attributes(ATTRIBUTE_LIMIT + 1)),
+        Err(ReceiveFailure::ValueLimitExceeded),
+    );
     for build in [
-        request_with_empty_attributes as fn(usize) -> Vec<u8>,
-        request_with_empty_kvlist_entries,
+        request_with_empty_kvlist_entries as fn(usize) -> Vec<u8>,
         request_with_empty_array_values,
     ] {
-        assert_eq!(validate_record_count(&build(VALUE_LIMIT)), Ok(()));
+        assert_eq!(validate_record_count(&build(COLLECTION_LIMIT)), Ok(()));
         assert_eq!(
-            validate_record_count(&build(VALUE_LIMIT + 1)),
+            validate_record_count(&build(COLLECTION_LIMIT + 1)),
             Err(ReceiveFailure::ValueLimitExceeded),
         );
     }
@@ -52,13 +61,17 @@ fn adversarial_empty_container_fanout_is_rejected_without_decoding() {
 #[test]
 fn nested_dynamic_collections_stop_before_decode_allocation() {
     assert_eq!(
-        validate_record_count(&request_with_nested_array(16)),
+        validate_record_count(&request_with_nested_array(128)),
         Ok(())
     );
     assert_eq!(
-        validate_record_count(&request_with_nested_array(17)),
+        validate_record_count(&request_with_nested_array(129)),
         Err(ReceiveFailure::ValueLimitExceeded),
     );
+}
+
+fn validate_record_count(protobuf: &[u8]) -> Result<(), ReceiveFailure> {
+    validate_with_profile(protobuf, ValueLimitProfile::release_1_system_maximum())
 }
 
 #[test]

@@ -36,6 +36,11 @@ impl LogStore {
         Self
     }
 
+    /// Returns the single effective Release 1 Value Limit Profile.
+    pub const fn value_limit_profile() -> positron_domain::value::ValueLimitProfile {
+        types::value_profile()
+    }
+
     /// Prepares one canonical, checked Log Store Block for kernel durability.
     pub fn prepare<'capacity, S: LifecycleClockSource>(
         &self,

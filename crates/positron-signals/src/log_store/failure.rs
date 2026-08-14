@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use positron_domain::outcome::{DomainFailure, DomainFailureCode};
 use positron_kernel::LedgerFailure;
 
 /// Stable failure class returned at the Log Store interface.
@@ -65,6 +66,12 @@ impl LogStoreFailure {
         }
     }
 
+    pub(super) const fn domain(failure: DomainFailure) -> Self {
+        Self {
+            code: classify_domain_failure_code(failure.code()),
+        }
+    }
+
     pub(super) fn kernel(_failure: LedgerFailure) -> Self {
         Self {
             code: LogStoreFailureCode::Kernel,
@@ -74,6 +81,20 @@ impl LogStoreFailure {
     #[must_use]
     pub const fn code(&self) -> LogStoreFailureCode {
         self.code
+    }
+}
+
+pub(crate) const fn classify_domain_failure_code(code: DomainFailureCode) -> LogStoreFailureCode {
+    match code {
+        DomainFailureCode::AllocationUnavailable => LogStoreFailureCode::ResourceExhausted,
+        DomainFailureCode::ValueLimitExceeded => LogStoreFailureCode::LimitExceeded,
+        DomainFailureCode::InvalidIdentifier
+        | DomainFailureCode::InvalidAttribution
+        | DomainFailureCode::InvalidLifecycleTransition
+        | DomainFailureCode::InvalidTimeAnnotation
+        | DomainFailureCode::ArithmeticOverflow
+        | DomainFailureCode::LimitExceedsSystem
+        | DomainFailureCode::InvalidLimit => LogStoreFailureCode::InvalidInput,
     }
 }
 

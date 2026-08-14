@@ -101,6 +101,7 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         )]),
     )?;
     let record = LogRecord::checked_native(
+        profile,
         EventTime::received(UnixNanoseconds::new(-55), SourceTimeQuality::Outlier)?,
         Some(ObservedTime::received(
             UnixNanoseconds::new(88),
