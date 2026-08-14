@@ -130,7 +130,7 @@ fn authenticate(mut request: Request<()>, services: &ServiceHandle) -> Result<Re
     let context = services
         .authorize_otlp_logs_with_hints(bearer, hints)
         .map_err(|_| authentication_rejected())?;
-    let admission = services.admit_otlp_grpc(context).map_err(service_status)?;
+    let admission = services.admit_otlp_logs(context).map_err(service_status)?;
     request.extensions_mut().insert(context);
     request.extensions_mut().insert(admission);
     Ok(request)
@@ -159,7 +159,7 @@ impl LogsService for OtlpLogsGrpc {
             .ok_or_else(authentication_rejected)?;
         let admission = request
             .extensions_mut()
-            .remove::<crate::services::GrpcAdmissionLease>()
+            .remove::<crate::services::OtlpAdmissionLease>()
             .ok_or_else(|| Status::internal("OTLP Logs admission context was unavailable"))?;
         let reservation = admission.take().map_err(service_status)?;
         if request.get_ref().resource_logs.iter().all(|resource| {
@@ -231,6 +231,9 @@ fn service_status(failure: ServiceFailure) -> Status {
         ServiceFailure::Unauthorized => authentication_rejected(),
         ServiceFailure::CapacityUnavailable => {
             Status::resource_exhausted("OTLP Logs ingest capacity is unavailable")
+        },
+        ServiceFailure::RequestTooLarge => {
+            Status::resource_exhausted("OTLP Logs request exceeds the receiver limit")
         },
         ServiceFailure::InvalidRequest => {
             Status::invalid_argument("OTLP Logs request was rejected")

@@ -2,8 +2,10 @@ use super::validate_record_count as validate_with_profile;
 use crate::ReceiveFailure;
 use positron_domain::value::ValueLimitProfile;
 
+mod json;
+
 const CONTAINER_LIMIT: usize = 1_024;
-const ATTRIBUTE_LIMIT: usize = 4_096;
+const ATTRIBUTE_LIMIT: usize = 1_024;
 const COLLECTION_LIMIT: usize = 1_024;
 
 #[test]
@@ -25,6 +27,14 @@ fn every_repeated_container_has_an_inclusive_pre_decode_limit() {
     );
     assert_eq!(
         validate_record_count(&request_with_empty_attributes(ATTRIBUTE_LIMIT + 1)),
+        Err(ReceiveFailure::ValueLimitExceeded),
+    );
+    assert_eq!(
+        validate_record_count(&request_with_aggregate_attributes(4_096)),
+        Ok(())
+    );
+    assert_eq!(
+        validate_record_count(&request_with_aggregate_attributes(4_097)),
         Err(ReceiveFailure::ValueLimitExceeded),
     );
     for build in [
@@ -172,6 +182,15 @@ fn request_with_empty_attributes(count: usize) -> Vec<u8> {
     let resource = repeated_messages(1, &[], count);
     let resource_logs = message(1, &resource);
     message(1, &resource_logs)
+}
+
+fn request_with_aggregate_attributes(count: usize) -> Vec<u8> {
+    let mut request = Vec::new();
+    for chunk in (0..count).collect::<Vec<_>>().chunks(ATTRIBUTE_LIMIT) {
+        let resource = repeated_messages(1, &[], chunk.len());
+        request.extend_from_slice(&message(1, &message(1, &resource)));
+    }
+    request
 }
 
 fn request_with_empty_kvlist_entries(count: usize) -> Vec<u8> {

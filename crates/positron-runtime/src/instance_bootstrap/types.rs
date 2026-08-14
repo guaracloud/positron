@@ -152,6 +152,7 @@ pub struct InitializedInstance {
     pub(crate) tenant: TenantId,
     pub(crate) logs_shard: positron_domain::routing::VirtualShardId,
     pub(crate) ingest_policy: positron_ingest::IngestPolicy,
+    pub(crate) value_limit_profile: positron_domain::value::ValueLimitProfile,
     pub(crate) admission_group_planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,

@@ -14,115 +14,21 @@ mod bounds;
 mod decoded;
 mod mapping;
 mod preflight;
+mod request;
 mod transport;
 
 #[cfg(test)]
 mod tests;
 
-use preflight::validate_record_count;
-use transport::bounded_protobuf;
+use preflight::{validate_json, validate_record_count};
+use request::OtlpPayload;
+use transport::bounded_payload;
 
 pub use admission_groups::{NativeLogAdmissionGroup, NativeLogAdmissionGroups};
+pub use request::{AuthenticatedOtlpLogsRequest, OtlpLogsRequestEncoding};
 
 const RECEIVER_CAPACITY: ResourceAmounts =
     ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 1, 0]);
-
-enum OtlpPayload {
-    Protobuf(Vec<u8>),
-    GzipProtobuf(Vec<u8>),
-    Decoded(Box<ExportLogsServiceRequest>),
-}
-
-/// OTLP bytes that can exist only after authoritative tenant attribution.
-///
-/// ```compile_fail
-/// use positron_ingest::AuthenticatedOtlpLogsRequest;
-///
-/// // Raw protocol bytes cannot reach the Receiver Adapter without a checked
-/// // Tenant Attribution created by the identity boundary.
-/// let _ = AuthenticatedOtlpLogsRequest::new(vec![0_u8]);
-/// ```
-pub struct AuthenticatedOtlpLogsRequest<'authority> {
-    attribution: TenantAttribution,
-    payload: OtlpPayload,
-    capacity: Option<ResourceReservation<'authority>>,
-}
-
-impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
-    pub fn protobuf(
-        context: AuthorizedContext,
-        governor: ResourceGovernor<'authority>,
-        protobuf: Vec<u8>,
-    ) -> Result<Self, ReceiveFailure> {
-        Self::admit(context, governor, OtlpPayload::Protobuf(protobuf))
-    }
-
-    pub fn gzip_protobuf(
-        context: AuthorizedContext,
-        governor: ResourceGovernor<'authority>,
-        gzip_protobuf: Vec<u8>,
-    ) -> Result<Self, ReceiveFailure> {
-        Self::admit(context, governor, OtlpPayload::GzipProtobuf(gzip_protobuf))
-    }
-
-    /// Accepts a message decoded by an authenticated bounded gRPC transport.
-    pub fn decoded_after_transport_admission(
-        context: AuthorizedContext,
-        decoded: ExportLogsServiceRequest,
-        capacity: ResourceReservation<'authority>,
-    ) -> Result<Self, ReceiveFailure> {
-        Ok(Self {
-            attribution: ingest_attribution(context)?,
-            payload: OtlpPayload::Decoded(Box::new(decoded)),
-            capacity: Some(capacity),
-        })
-    }
-
-    fn admit(
-        context: AuthorizedContext,
-        governor: ResourceGovernor<'authority>,
-        payload: OtlpPayload,
-    ) -> Result<Self, ReceiveFailure> {
-        let attribution = ingest_attribution(context)?;
-        let maximum_request_bytes = usize::try_from(
-            ValueLimitProfile::release_1_system_maximum()
-                .system_limits()
-                .request()
-                .compressed_bytes()
-                .value(),
-        )
-        .map_err(|_| ReceiveFailure::TransportLimitExceeded)?;
-        if payload.encoded_len() > maximum_request_bytes {
-            return Err(ReceiveFailure::TransportLimitExceeded);
-        }
-        let capacity = reserve_otlp_logs_transport(context, governor)?;
-        Ok(Self {
-            attribution,
-            payload,
-            capacity: Some(capacity),
-        })
-    }
-
-    #[cfg(any(test, fuzzing))]
-    #[must_use]
-    pub fn test_only_protobuf(attribution: TenantAttribution, protobuf: Vec<u8>) -> Self {
-        Self {
-            attribution,
-            payload: OtlpPayload::Protobuf(protobuf),
-            capacity: None,
-        }
-    }
-
-    #[cfg(any(test, fuzzing))]
-    #[must_use]
-    pub fn test_only_gzip(attribution: TenantAttribution, gzip_protobuf: Vec<u8>) -> Self {
-        Self {
-            attribution,
-            payload: OtlpPayload::GzipProtobuf(gzip_protobuf),
-            capacity: None,
-        }
-    }
-}
 
 /// Reserves the canonical receiver budget before an authenticated transport
 /// begins structural decode or decompression.
@@ -141,6 +47,11 @@ pub fn reserve_otlp_logs_transport<'authority>(
 /// Validates the Release 1 OTLP Logs protobuf shape before structural decoding.
 pub fn preflight_otlp_logs_protobuf(protobuf: &[u8]) -> Result<(), ReceiveFailure> {
     validate_record_count(protobuf, ValueLimitProfile::release_1_system_maximum())
+}
+
+/// Validates the Release 1 OTLP Logs ProtoJSON shape before materializing decode.
+pub fn preflight_otlp_logs_json(json: &[u8]) -> Result<(), ReceiveFailure> {
+    validate_json(json, ValueLimitProfile::release_1_system_maximum())
 }
 
 fn ingest_attribution(context: AuthorizedContext) -> Result<TenantAttribution, ReceiveFailure> {
@@ -339,25 +250,21 @@ impl OtlpLogsReceiver {
         } = request;
         let decoded = match payload {
             OtlpPayload::Decoded(decoded) => *decoded,
-            encoded => {
-                let protobuf = bounded_protobuf(encoded, self.value_limit_profile)?;
-                validate_record_count(&protobuf, self.value_limit_profile)?;
-                ExportLogsServiceRequest::decode(protobuf.as_slice())
-                    .map_err(|_| ReceiveFailure::MalformedPayload)?
+            encoded => match bounded_payload(encoded, self.value_limit_profile)? {
+                transport::BoundedOtlpPayload::Protobuf(protobuf) => {
+                    validate_record_count(&protobuf, self.value_limit_profile)?;
+                    ExportLogsServiceRequest::decode(protobuf.as_slice())
+                        .map_err(|_| ReceiveFailure::MalformedPayload)?
+                },
+                transport::BoundedOtlpPayload::Json(json) => {
+                    validate_json(&json, self.value_limit_profile)?;
+                    serde_json::from_slice(&json).map_err(|_| ReceiveFailure::MalformedPayload)?
+                },
             },
         };
         let mut batch =
             decoded::native_batch(attribution, decoded, self.value_limit_profile, capacity)?;
         batch.resize_after_decode()?;
         Ok(batch)
-    }
-}
-
-impl OtlpPayload {
-    fn encoded_len(&self) -> usize {
-        match self {
-            Self::Protobuf(bytes) | Self::GzipProtobuf(bytes) => bytes.len(),
-            Self::Decoded(message) => message.encoded_len(),
-        }
     }
 }

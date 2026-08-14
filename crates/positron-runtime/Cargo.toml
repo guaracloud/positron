@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 http = { version = "=1.5.0", default-features = false }
-opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs"] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs", "with-serde"] }
 positron-api = { path = "../positron-api" }
 positron-domain = { path = "../positron-domain" }
 positron-governance = { path = "../positron-governance" }
@@ -20,6 +20,7 @@ positron-ingest = { path = "../positron-ingest" }
 positron-kernel = { path = "../positron-kernel" }
 positron-query = { path = "../positron-query" }
 prost = "=0.14.3"
+serde_json = "=1.0.149"
 tokio = { version = "=1.53.1", default-features = false, features = ["net", "rt", "time"] }
 tokio-stream = { version = "=0.1.19", default-features = false, features = ["net"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["gzip", "router", "transport"] }
@@ -27,10 +28,13 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+async-trait = "=0.1.89"
 bytes = "=1.12.1"
+flate2 = { version = "=1.0.24", default-features = false, features = ["rust_backend"] }
 h2 = "=0.4.15"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["logs"] }
-opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "logs"] }
+opentelemetry-http = { version = "=0.32.0", default-features = false }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "logs"] }
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "time"] }
@@ -63,6 +67,10 @@ path = "tests/listener_contract.rs"
 [[test]]
 name = "otlp_logs_grpc"
 path = "tests/otlp_logs_grpc.rs"
+
+[[test]]
+name = "otlp_logs_http"
+path = "tests/otlp_logs_http/tests/mod.rs"
 
 
 [lints]

@@ -18,6 +18,7 @@ use crate::{
 
 mod native_http;
 mod otlp_grpc;
+mod otlp_http;
 
 #[derive(Clone, Debug)]
 pub struct NativeBindings {
