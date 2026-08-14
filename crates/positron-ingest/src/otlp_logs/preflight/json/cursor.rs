@@ -1,12 +1,12 @@
 use crate::ReceiveFailure;
 
-pub(super) struct StringToken<'json> {
+pub(crate) struct StringToken<'json> {
     raw: &'json [u8],
-    pub(super) decoded_len: usize,
+    pub(crate) decoded_len: usize,
 }
 
 impl StringToken<'_> {
-    pub(super) fn is(&self, expected: &str) -> bool {
+    pub(crate) fn is(&self, expected: &str) -> bool {
         let mut expected = expected.as_bytes().iter().copied();
         let mut offset = 0;
         while offset < self.raw.len() {
@@ -20,7 +20,11 @@ impl StringToken<'_> {
         expected.next().is_none()
     }
 
-    pub(super) fn base64_decoded_len(&self) -> Result<usize, ReceiveFailure> {
+    pub(crate) fn raw(&self) -> &[u8] {
+        self.raw
+    }
+
+    pub(crate) fn base64_decoded_len(&self) -> Result<usize, ReceiveFailure> {
         let mut offset = 0;
         let mut characters = 0usize;
         let mut padding = 0usize;
@@ -74,7 +78,7 @@ fn decoded_ascii(raw: &[u8], offset: &mut usize) -> Option<u8> {
     }
 }
 
-pub(super) struct Cursor<'json> {
+pub(crate) struct Cursor<'json> {
     input: &'json [u8],
     offset: usize,
     first: [bool; 512],
@@ -82,7 +86,7 @@ pub(super) struct Cursor<'json> {
 }
 
 impl<'json> Cursor<'json> {
-    pub(super) const fn new(input: &'json [u8]) -> Self {
+    pub(crate) const fn new(input: &'json [u8]) -> Self {
         Self {
             input,
             offset: 0,
@@ -91,7 +95,7 @@ impl<'json> Cursor<'json> {
         }
     }
 
-    pub(super) fn finish(&mut self) -> Result<(), ReceiveFailure> {
+    pub(crate) fn finish(&mut self) -> Result<(), ReceiveFailure> {
         self.whitespace();
         if self.offset == self.input.len() && self.depth == 0 {
             Ok(())
@@ -100,17 +104,17 @@ impl<'json> Cursor<'json> {
         }
     }
 
-    pub(super) fn object_start(&mut self) -> Result<(), ReceiveFailure> {
+    pub(crate) fn object_start(&mut self) -> Result<(), ReceiveFailure> {
         self.punctuation(b'{')?;
         self.push_container()
     }
 
-    pub(super) fn array_start(&mut self) -> Result<(), ReceiveFailure> {
+    pub(crate) fn array_start(&mut self) -> Result<(), ReceiveFailure> {
         self.punctuation(b'[')?;
         self.push_container()
     }
 
-    pub(super) fn field(&mut self) -> Result<Option<StringToken<'json>>, ReceiveFailure> {
+    pub(crate) fn field(&mut self) -> Result<Option<StringToken<'json>>, ReceiveFailure> {
         if !self.next_entry(b'}')? {
             return Ok(None);
         }
@@ -119,7 +123,7 @@ impl<'json> Cursor<'json> {
         Ok(Some(field))
     }
 
-    pub(super) fn element(&mut self) -> Result<bool, ReceiveFailure> {
+    pub(crate) fn element(&mut self) -> Result<bool, ReceiveFailure> {
         self.next_entry(b']')
     }
 
@@ -156,7 +160,7 @@ impl<'json> Cursor<'json> {
         Ok(true)
     }
 
-    pub(super) fn string(&mut self) -> Result<StringToken<'json>, ReceiveFailure> {
+    pub(crate) fn string(&mut self) -> Result<StringToken<'json>, ReceiveFailure> {
         self.whitespace();
         if self.input.get(self.offset) != Some(&b'"') {
             return Err(ReceiveFailure::MalformedPayload);
@@ -250,7 +254,7 @@ impl<'json> Cursor<'json> {
         }
     }
 
-    pub(super) fn skip_value(
+    pub(crate) fn skip_value(
         &mut self,
         depth: usize,
         maximum: usize,

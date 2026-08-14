@@ -159,6 +159,7 @@ impl LogRecord {
         for (namespace, key, value) in attributes {
             let namespace = match namespace {
                 "resource" => AttributeNamespace::Resource,
+                "stream" => AttributeNamespace::Stream,
                 "scope" | "instrumentation-scope" => AttributeNamespace::InstrumentationScope,
                 "record" => AttributeNamespace::Record,
                 _ => return Err(LogStoreFailure::invalid_input()),
@@ -201,12 +202,13 @@ impl LogRecord {
                 .value(),
         )
         .map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let mut occurrences_by_namespace = [0_usize; 3];
+        let mut occurrences_by_namespace = [0_usize; 4];
         for attribute in &attributes {
             let index = match attribute.occurrences().namespace() {
-                AttributeNamespace::Resource => 0,
-                AttributeNamespace::InstrumentationScope => 1,
-                AttributeNamespace::Record => 2,
+                AttributeNamespace::Stream => 0,
+                AttributeNamespace::Resource => 1,
+                AttributeNamespace::InstrumentationScope => 2,
+                AttributeNamespace::Record => 3,
             };
             let count = occurrences_by_namespace
                 .get_mut(index)

@@ -67,6 +67,12 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         )?),
         StoredLogAttribute::generic(occurrences(
             profile,
+            AttributeNamespace::Stream,
+            "same-key",
+            vec![CandidateAttributeValue::string("stream".to_owned())],
+        )?),
+        StoredLogAttribute::generic(occurrences(
+            profile,
             AttributeNamespace::Record,
             "same-key",
             vec![
@@ -151,6 +157,12 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
     assert_eq!(
         StoredLogAttribute::generic(result.records()[0].attributes()[1].occurrences().clone()),
         result.records()[0].attributes()[1]
+    );
+    assert_eq!(
+        result.records()[0].attributes()[2]
+            .occurrences()
+            .namespace(),
+        AttributeNamespace::Stream
     );
     Ok(())
 }

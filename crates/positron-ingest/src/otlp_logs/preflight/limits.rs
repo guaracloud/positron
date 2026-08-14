@@ -3,20 +3,20 @@ use positron_domain::value::ValueLimitProfile;
 use crate::ReceiveFailure;
 
 #[derive(Clone, Copy)]
-pub(super) struct StructuralLimits {
-    pub(super) containers: usize,
-    pub(super) records: usize,
-    pub(super) attributes: usize,
-    pub(super) attribute_entries: usize,
-    pub(super) array_entries: usize,
-    pub(super) key_value_entries: usize,
-    pub(super) nesting_depth: usize,
-    pub(super) value_bytes: usize,
-    pub(super) key_bytes: usize,
+pub(crate) struct StructuralLimits {
+    pub(crate) containers: usize,
+    pub(crate) records: usize,
+    pub(crate) attributes: usize,
+    pub(crate) attribute_entries: usize,
+    pub(crate) array_entries: usize,
+    pub(crate) key_value_entries: usize,
+    pub(crate) nesting_depth: usize,
+    pub(crate) value_bytes: usize,
+    pub(crate) key_bytes: usize,
 }
 
 impl StructuralLimits {
-    pub(super) fn from_profile(profile: ValueLimitProfile) -> Result<Self, ReceiveFailure> {
+    pub(crate) fn from_profile(profile: ValueLimitProfile) -> Result<Self, ReceiveFailure> {
         let limits = profile.system_limits();
         let request = limits.request();
         let dynamic = limits.dynamic_value();
@@ -42,7 +42,7 @@ impl StructuralLimits {
     }
 }
 
-pub(super) fn increment(value: &mut usize, limit: usize) -> Result<(), ReceiveFailure> {
+pub(crate) fn increment(value: &mut usize, limit: usize) -> Result<(), ReceiveFailure> {
     *value = value
         .checked_add(1)
         .filter(|next| *next <= limit)

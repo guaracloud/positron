@@ -91,6 +91,11 @@ fn authenticated_malformed_record_shapes_fail_closed_at_their_exact_boundaries()
             LogStoreFailureCode::MalformedBlock,
         ),
         (
+            "version one stream namespace",
+            replaced_byte(&valid, 42, 4)?,
+            LogStoreFailureCode::MalformedBlock,
+        ),
+        (
             "empty occurrence set",
             replaced_bytes(&valid, 48, [0, 0])?,
             LogStoreFailureCode::MalformedBlock,

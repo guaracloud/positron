@@ -6,7 +6,7 @@ impl ApplicationRuntime {
         host: HostInputs<'_>,
     ) -> Result<RunningProcess, ExitOutcome> {
         let state = ProcessState::starting();
-        let mut listeners = Vec::with_capacity(5);
+        let mut listeners = Vec::with_capacity(6);
         bind(
             ListenerRole::Control,
             &state,
@@ -142,6 +142,7 @@ impl ApplicationRuntime {
             ListenerRole::Api,
             ListenerRole::OtlpGrpc,
             ListenerRole::OtlpHttp,
+            ListenerRole::LokiPush,
         ] {
             if let Err(failure) = bind(role, &state, host.listeners, &mut listeners) {
                 return Err(cleanup_startup(
@@ -193,6 +194,7 @@ fn register_tasks(registrar: &dyn TaskRegistrar) -> Result<RegisteredTasks, Exit
         TaskRole::Api,
         TaskRole::OtlpGrpc,
         TaskRole::OtlpHttp,
+        TaskRole::LokiPush,
     ]
     .into_iter()
     .map(|role| {

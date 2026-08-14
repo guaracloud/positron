@@ -209,7 +209,7 @@ fn decode_record(
             2 => AttributeRepresentation::SchemaOverflow,
             _ => return Err(LogStoreFailure::malformed_block()),
         };
-        let namespace = decode_namespace(input.u8()?)?;
+        let namespace = decode_namespace(input.u8()?, version)?;
         let key = input.string(limits.key_bytes)?;
         let occurrence_count = input.count(limits.occurrences)?;
         if occurrence_count == 0 {
@@ -308,14 +308,16 @@ fn namespace_tag(namespace: AttributeNamespace) -> u8 {
         AttributeNamespace::Resource => 1,
         AttributeNamespace::InstrumentationScope => 2,
         AttributeNamespace::Record => 3,
+        AttributeNamespace::Stream => 4,
     }
 }
 
-fn decode_namespace(tag: u8) -> Result<AttributeNamespace, LogStoreFailure> {
-    match tag {
-        1 => Ok(AttributeNamespace::Resource),
-        2 => Ok(AttributeNamespace::InstrumentationScope),
-        3 => Ok(AttributeNamespace::Record),
+fn decode_namespace(tag: u8, version: u16) -> Result<AttributeNamespace, LogStoreFailure> {
+    match (tag, version) {
+        (1, _) => Ok(AttributeNamespace::Resource),
+        (2, _) => Ok(AttributeNamespace::InstrumentationScope),
+        (3, _) => Ok(AttributeNamespace::Record),
+        (4, VERSION) => Ok(AttributeNamespace::Stream),
         _ => Err(LogStoreFailure::malformed_block()),
     }
 }

@@ -14,6 +14,7 @@ Precedence: compiled defaults, TOML file, non-secret POSITRON__ overrides, then 
 | `listener.api_bind_address` | string | `127.0.0.1:8080` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `listener.otlp_grpc_bind_address` | string | `127.0.0.1:4317` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `listener.otlp_http_bind_address` | string | `127.0.0.1:4318` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
+| `listener.loki_push_bind_address` | string | `127.0.0.1:3100` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `storage.data_directory` | string | `/var/lib/positron` | absolute path; at most 256 bytes | public | compiled default, configuration file | immutable after initialization |
 | `storage.secrets_directory` | string | `/var/lib/positron-secrets` | absolute path; at most 256 bytes | public | compiled default, configuration file | immutable after initialization |
 | `security.local_key_file` | string | `<redacted protected-file reference>` | protected absolute path under `storage.secrets_directory`, named `local-root-key.v1`; at most 256 bytes | secret-bearing (redacted) | compiled default, protected configuration-file reference | immutable after initialization |

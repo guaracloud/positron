@@ -1,6 +1,6 @@
 use positron_domain::value::ValueLimitProfile;
 
-mod cursor;
+pub(crate) mod cursor;
 
 use super::limits::{StructuralLimits, increment};
 use crate::ReceiveFailure;

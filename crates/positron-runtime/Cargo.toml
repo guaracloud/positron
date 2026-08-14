@@ -39,6 +39,9 @@ opentelemetry-proto = { version = "=0.32.0", default-features = false, features 
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "time"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["router", "transport"] }
+tracing = "=0.1.44"
+tracing-loki = { version = "=0.2.7", default-features = false, features = ["compat-0-2-1"] }
+tracing-subscriber = { version = "=0.3.22", default-features = false, features = ["registry"] }
 
 [[test]]
 name = "instance_bootstrap"

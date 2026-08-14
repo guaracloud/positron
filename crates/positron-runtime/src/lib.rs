@@ -39,12 +39,13 @@ pub fn fuzz_process_inputs(data: &[u8]) {
     use std::path::PathBuf;
 
     for byte in data.iter().copied().take(4_096) {
-        let role = match byte % 5 {
+        let role = match byte % 6 {
             0 => ListenerRole::Control,
             1 => ListenerRole::Operations,
             2 => ListenerRole::Api,
             3 => ListenerRole::OtlpGrpc,
-            _ => ListenerRole::OtlpHttp,
+            4 => ListenerRole::OtlpHttp,
+            _ => ListenerRole::LokiPush,
         };
         let address = SocketAddr::V4(SocketAddrV4::new(
             if byte & 0x80 == 0 {

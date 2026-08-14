@@ -128,9 +128,9 @@ fn authenticate(mut request: Request<()>, services: &ServiceHandle) -> Result<Re
         .map_err(|_| authentication_rejected())?
         .unwrap_or_else(CompatibilityHints::none);
     let context = services
-        .authorize_otlp_logs_with_hints(bearer, hints)
+        .authorize_logs_with_hints(bearer, hints)
         .map_err(|_| authentication_rejected())?;
-    let admission = services.admit_otlp_logs(context).map_err(service_status)?;
+    let admission = services.admit_logs(context).map_err(service_status)?;
     request.extensions_mut().insert(context);
     request.extensions_mut().insert(admission);
     Ok(request)
@@ -159,7 +159,7 @@ impl LogsService for OtlpLogsGrpc {
             .ok_or_else(authentication_rejected)?;
         let admission = request
             .extensions_mut()
-            .remove::<crate::services::OtlpAdmissionLease>()
+            .remove::<crate::services::ReceiverAdmissionLease>()
             .ok_or_else(|| Status::internal("OTLP Logs admission context was unavailable"))?;
         let reservation = admission.take().map_err(service_status)?;
         if request.get_ref().resource_logs.iter().all(|resource| {

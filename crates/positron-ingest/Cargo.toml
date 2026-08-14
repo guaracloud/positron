@@ -22,6 +22,7 @@ positron-kernel = { path = "../positron-kernel" }
 positron-signals = { path = "../positron-signals" }
 prost = "=0.14.3"
 serde_json = "=1.0.149"
+snap = "=1.1.1"
 
 [dev-dependencies]
 positron-runtime = { path = "../positron-runtime" }

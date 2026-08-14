@@ -262,6 +262,16 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             MutabilityClass::DrainAndReload,
         ),
         (
+            Setting::ListenerLokiPushBindAddress,
+            "listener.loki_push_bind_address",
+            SettingKind::String,
+            "127.0.0.1:3100",
+            ValueDomain::LoopbackSocketAddress(256),
+            SecrecyClass::Public,
+            ProvenancePolicy::NonSecretOverrides,
+            MutabilityClass::DrainAndReload,
+        ),
+        (
             Setting::StorageDataDirectory,
             "storage.data_directory",
             SettingKind::String,
@@ -326,6 +336,10 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
         effective.otlp_http_bind_address().to_string(),
         "127.0.0.1:4318"
     );
+    assert_eq!(
+        effective.loki_push_bind_address().to_string(),
+        "127.0.0.1:3100"
+    );
     for setting in expected.map(|(setting, ..)| setting) {
         assert_eq!(
             effective.source_for(setting.path()),
@@ -342,7 +356,8 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
          operations_bind_address = \"127.0.0.1:13133\"\n\
          api_bind_address = \"127.0.0.1:8080\"\n\
          otlp_grpc_bind_address = \"127.0.0.1:4317\"\n\
-         otlp_http_bind_address = \"127.0.0.1:4318\"\n\n\
+         otlp_http_bind_address = \"127.0.0.1:4318\"\n\
+         loki_push_bind_address = \"127.0.0.1:3100\"\n\n\
          [storage]\ndata_directory = \"/var/lib/positron\"\n\
          secrets_directory = \"/var/lib/positron-secrets\"\n\n\
          [security]\nlocal_key_file = \"<redacted>\"\n"

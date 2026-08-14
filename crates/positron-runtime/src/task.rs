@@ -15,6 +15,7 @@ pub enum TaskRole {
     Api,
     OtlpGrpc,
     OtlpHttp,
+    LokiPush,
 }
 
 #[derive(Clone, Debug)]

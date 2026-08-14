@@ -26,3 +26,4 @@ include!("configuration_foundation/preflight.rs");
 include!("configuration_foundation/quoting.rs");
 include!("configuration_foundation/overrides.rs");
 include!("configuration_foundation/runtime_wiring.rs");
+include!("configuration_foundation/loki_listener.rs");

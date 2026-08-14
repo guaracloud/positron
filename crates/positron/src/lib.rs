@@ -70,6 +70,7 @@ fn run(
         effective.api_bind_address(),
         effective.otlp_grpc_bind_address(),
         effective.otlp_http_bind_address(),
+        effective.loki_push_bind_address(),
     )
     .map_err(|_| LaunchFailure::Configuration)?;
     let host = NativeHost::new(bindings);

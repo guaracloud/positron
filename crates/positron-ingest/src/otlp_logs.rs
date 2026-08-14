@@ -13,7 +13,7 @@ mod admission_groups;
 mod bounds;
 mod decoded;
 mod mapping;
-mod preflight;
+pub(crate) mod preflight;
 mod request;
 mod transport;
 
@@ -36,6 +36,14 @@ pub fn reserve_otlp_logs_transport<'authority>(
     context: AuthorizedContext,
     governor: ResourceGovernor<'authority>,
 ) -> Result<ResourceReservation<'authority>, ReceiveFailure> {
+    reserve_log_receiver_transport(context, governor)
+}
+
+/// Reserves the shared bounded Log Receiver budget before protocol-specific work.
+pub fn reserve_log_receiver_transport<'authority>(
+    context: AuthorizedContext,
+    governor: ResourceGovernor<'authority>,
+) -> Result<ResourceReservation<'authority>, ReceiveFailure> {
     let attribution = ingest_attribution(context)?;
     let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
         .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
@@ -54,7 +62,9 @@ pub fn preflight_otlp_logs_json(json: &[u8]) -> Result<(), ReceiveFailure> {
     validate_json(json, ValueLimitProfile::release_1_system_maximum())
 }
 
-fn ingest_attribution(context: AuthorizedContext) -> Result<TenantAttribution, ReceiveFailure> {
+pub(crate) fn ingest_attribution(
+    context: AuthorizedContext,
+) -> Result<TenantAttribution, ReceiveFailure> {
     context
         .tenant_attribution()
         .filter(|attribution| attribution.scope() == positron_domain::identity::Scope::Ingest)
@@ -92,6 +102,19 @@ pub struct NativeLogAttribute {
 
 impl NativeLogAttribute {
     #[must_use]
+    pub(crate) fn new(
+        namespace: AttributeNamespace,
+        key: String,
+        occurrences: Vec<CandidateAttributeValue>,
+    ) -> Self {
+        Self {
+            namespace,
+            key,
+            occurrences,
+        }
+    }
+
+    #[must_use]
     pub const fn namespace(&self) -> AttributeNamespace {
         self.namespace
     }
@@ -119,6 +142,23 @@ pub struct NativeLogCandidate {
 
 impl NativeLogCandidate {
     #[must_use]
+    pub(crate) fn new(
+        event_time_unix_nanos: Option<i64>,
+        observed_time_unix_nanos: Option<i64>,
+        body: Option<CandidateAttributeValue>,
+        attributes: Vec<NativeLogAttribute>,
+        metadata: positron_signals::LogMetadata,
+    ) -> Self {
+        Self {
+            event_time_unix_nanos,
+            observed_time_unix_nanos,
+            body,
+            attributes,
+            metadata,
+        }
+    }
+
+    #[must_use]
     pub const fn event_time_unix_nanos(&self) -> Option<i64> {
         self.event_time_unix_nanos
     }
@@ -136,6 +176,11 @@ impl NativeLogCandidate {
     #[must_use]
     pub fn attributes(&self) -> &[NativeLogAttribute] {
         &self.attributes
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> &positron_signals::LogMetadata {
+        &self.metadata
     }
 
     pub(crate) fn into_parts(
@@ -168,6 +213,24 @@ pub struct NativeLogBatch<'authority> {
 }
 
 impl<'authority> NativeLogBatch<'authority> {
+    pub(crate) fn new(
+        attribution: TenantAttribution,
+        records: Vec<NativeLogCandidate>,
+        value_limit_profile: ValueLimitProfile,
+        decoded_bytes: u64,
+        capacity: Option<ResourceReservation<'authority>>,
+    ) -> Result<Self, ReceiveFailure> {
+        let mut batch = Self {
+            attribution,
+            records,
+            value_limit_profile,
+            decoded_bytes,
+            capacity,
+        };
+        batch.resize_after_decode()?;
+        Ok(batch)
+    }
+
     #[must_use]
     pub const fn attribution(&self) -> TenantAttribution {
         self.attribution

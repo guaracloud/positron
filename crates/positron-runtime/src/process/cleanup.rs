@@ -221,6 +221,7 @@ const fn task_bit(role: TaskRole) -> u8 {
         TaskRole::Api => 2,
         TaskRole::OtlpGrpc => 3,
         TaskRole::OtlpHttp => 4,
+        TaskRole::LokiPush => 5,
     }
 }
 
@@ -231,6 +232,7 @@ const fn listener_bit(role: ListenerRole) -> u8 {
         ListenerRole::Api => 2,
         ListenerRole::OtlpGrpc => 3,
         ListenerRole::OtlpHttp => 4,
+        ListenerRole::LokiPush => 5,
     }
 }
 

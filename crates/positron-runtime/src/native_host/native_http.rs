@@ -69,9 +69,20 @@ fn route(
             let services = services.ok_or_else(|| Response::empty(503))?;
             super::otlp_http::receive(stream, head, services)
         },
+        (ListenerRole::LokiPush, "POST", "/loki/api/v1/push") => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            super::loki_http::receive_push(stream, head, services)
+        },
+        (ListenerRole::LokiPush, "POST", "/otlp/v1/logs") => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            super::otlp_http::receive(stream, head, services)
+        },
         (ListenerRole::Operations, _, "/health/live" | "/health/ready")
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
         | (ListenerRole::OtlpHttp, _, "/v1/logs") => Ok(Response::empty(405)),
+        (ListenerRole::LokiPush, _, "/loki/api/v1/push" | "/otlp/v1/logs") => {
+            Ok(Response::empty(405))
+        },
         (ListenerRole::Control, _, _) | (_, _, _) => Ok(Response::empty(404)),
     }
 }

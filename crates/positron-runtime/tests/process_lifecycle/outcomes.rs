@@ -91,16 +91,16 @@ fn second_signal_cleanup_overflow_is_bounded_and_deterministic()
     else {
         panic!("cleanup overflow must remain typed");
     };
-    assert_eq!(cleanup.task_failures(), 5);
+    assert_eq!(cleanup.task_failures(), 6);
     assert_eq!(cleanup.listener_failures(), 1);
     assert!(cleanup.overflowed());
     assert_eq!(
         cleanup.failed_roles().collect::<Vec<_>>(),
         [
+            positron_runtime::CleanupRole::Task(TaskRole::LokiPush),
             positron_runtime::CleanupRole::Task(TaskRole::OtlpHttp),
             positron_runtime::CleanupRole::Task(TaskRole::OtlpGrpc),
             positron_runtime::CleanupRole::Task(TaskRole::Api),
-            positron_runtime::CleanupRole::Task(TaskRole::Operations),
         ]
     );
     assert!(roots.acquire_volume_again().is_ok());
@@ -165,6 +165,7 @@ fn deadline_aborts_every_task_and_never_reports_graceful_completion()
             .cloned()
             .collect::<Vec<_>>(),
         [
+            TaskEvent::Aborted(TaskRole::LokiPush, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpGrpc, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
@@ -288,10 +289,10 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     assert_eq!(health.readiness(), Readiness::NotReady);
     assert!(roots.acquire_volume_again().is_ok());
     let events = tasks.events.borrow();
-    assert_eq!(events.len(), 15);
+    assert_eq!(events.len(), 18);
     assert!(matches!(
         events.last(),
-        Some(TaskEvent::Joined(TaskRole::OtlpHttp, ..))
+        Some(TaskEvent::Joined(TaskRole::LokiPush, ..))
     ));
     Ok(())
 }
@@ -312,6 +313,7 @@ impl TestPort for ListenerRole {
             ListenerRole::Api => 42_401,
             ListenerRole::OtlpGrpc => 42_402,
             ListenerRole::OtlpHttp => 42_403,
+            ListenerRole::LokiPush => 42_404,
         }
     }
 }
