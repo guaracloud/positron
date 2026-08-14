@@ -110,6 +110,7 @@ impl ServiceHandle {
         &self,
         context: AuthorizedContext,
         encoding: OtlpLogsRequestEncoding,
+        receiver: positron_ingest::PolicyReceiver,
         body: Vec<u8>,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
@@ -117,7 +118,7 @@ impl ServiceHandle {
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
         let request = AuthenticatedOtlpLogsRequest::encoded_after_transport_admission(
-            context, encoding, body, capacity,
+            context, encoding, receiver, body, capacity,
         )
         .map_err(map_receive_failure)?;
         ingest_authenticated(self, request)
@@ -285,10 +286,7 @@ fn ingest_native_batch(
     batch: NativeLogBatch<'_>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     let instance = &services.instance;
-    let policy = instance
-        .ingest_policy
-        .snapshot()
-        .map_err(|_| ServiceFailure::Internal)?;
+    let policy = &instance.ingest_policy;
     let groups = batch
         .into_admission_groups(instance.admission_group_planner.as_ref())
         .map_err(map_admission_group_plan_failure)?;
@@ -333,7 +331,7 @@ fn ingest_native_batch(
                                 &instance._authority,
                                 &ledger,
                                 &clock,
-                                policy.policy(),
+                                policy,
                                 instance.tenant,
                                 shard,
                             )

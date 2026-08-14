@@ -3,12 +3,17 @@ use std::error::Error;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
+use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
     LifecycleClock, MountQualification, PrimaryDataVolume, SegmentProtectionKey, SegmentScope,
     StoreBlockIdentity,
 };
-use positron_signals::{LogRecord, LogScan, LogStore, PolicyProvenance, ScanLimit};
+use positron_policy::{
+    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
+    PolicyReceiver,
+};
+use positron_signals::{LogRecord, LogScan, LogStore, ScanLimit};
 
 #[path = "support.rs"]
 mod support;
@@ -28,15 +33,27 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(8)?);
     let store = LogStore::new();
-    let record = LogRecord::checked_minimal(
+    let candidate = NativeLogCandidate::new(
         None,
-        Some("public outcome".to_owned()),
-        vec![
-            ("record", "duplicate", "first"),
-            ("record", "duplicate", "second"),
-        ],
-        PolicyProvenance::new(1, [0x78; 32], vec![])?,
-    )?;
+        None,
+        Some(CandidateAttributeValue::string("public outcome".to_owned())),
+        vec![NativeLogAttribute::new(
+            AttributeNamespace::Record,
+            "duplicate".to_owned(),
+            vec![
+                CandidateAttributeValue::string("first".to_owned()),
+                CandidateAttributeValue::string("second".to_owned()),
+            ],
+        )],
+        LogMetadata::empty(),
+    );
+    let PolicyEvaluation::Accepted(evaluated) =
+        IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+    else {
+        return Err("preserving policy rejected the public fixture".into());
+    };
+    let record =
+        LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
     let ledger = ActiveSegmentLedger::open(
         &authority,
         &catalog,

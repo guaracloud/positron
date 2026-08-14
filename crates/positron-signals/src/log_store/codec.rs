@@ -11,7 +11,7 @@ use positron_kernel::LedgerSnapshot;
 const MAGIC: &[u8; 8] = b"PLOGBL01";
 const LEGACY_VERSION: u16 = 1;
 const METADATA_VERSION: u16 = 2;
-const VERSION: u16 = 3;
+const VERSION: u16 = METADATA_VERSION;
 #[cfg(fuzzing)]
 mod fuzz;
 mod limits;
@@ -126,7 +126,7 @@ pub(super) fn decode_block(
         return Err(LogStoreFailure::malformed_block());
     }
     let version = input.u16()?;
-    if !matches!(version, LEGACY_VERSION | METADATA_VERSION | VERSION) {
+    if !matches!(version, LEGACY_VERSION | METADATA_VERSION) {
         return Err(LogStoreFailure::malformed_block());
     }
     let tenant: [u8; 16] = input
@@ -325,7 +325,7 @@ fn decode_namespace(tag: u8, version: u16) -> Result<AttributeNamespace, LogStor
         (1, _) => Ok(AttributeNamespace::Resource),
         (2, _) => Ok(AttributeNamespace::InstrumentationScope),
         (3, _) => Ok(AttributeNamespace::Record),
-        (4, METADATA_VERSION | VERSION) => Ok(AttributeNamespace::Stream),
+        (4, METADATA_VERSION) => Ok(AttributeNamespace::Stream),
         _ => Err(LogStoreFailure::malformed_block()),
     }
 }

@@ -34,7 +34,7 @@ fn durable_outcome_carries_the_kernel_receipt_and_is_readable_through_the_log_st
         .decode(protobuf_request())
         .expect("valid OTLP");
 
-    let policy = IngestPolicy::preserving(1, [0x48; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let outcome = LogIngest::new(&fixture.authority, &ledger, &clock, &policy, tenant, shard)
         .accept(
             batch,

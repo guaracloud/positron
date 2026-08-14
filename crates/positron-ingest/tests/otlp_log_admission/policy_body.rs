@@ -1,8 +1,7 @@
 use std::error::Error;
 
 use positron_domain::value::{
-    ByteLimit, PolicyValueMarker, RecordLimits, ValueLimitProfile, ValueLimitProfileCandidate,
-    ValueLimitSet,
+    ByteLimit, RecordLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
 use positron_ingest::{
     AuthenticatedOtlpLogsRequest, IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest,
@@ -29,7 +28,6 @@ fn body_remove_redact_and_utf8_truncate_persist_typed_evidence() -> Result<(), B
     let batch = OtlpLogsReceiver::new().decode(request)?;
     let policy = IngestPolicy::compile(
         24,
-        [0x24; 32],
         vec![
             PolicyRule::new(
                 "remove-body",
@@ -51,17 +49,10 @@ fn body_remove_redact_and_utf8_truncate_persist_typed_evidence() -> Result<(), B
     let result = ingest_and_scan(&fixture, batch, &policy, 52)?;
     let records = result.records();
     assert_eq!(records.len(), 3);
-    assert_eq!(
-        records[0].body().and_then(|body| body.policy_marker()),
-        Some(PolicyValueMarker::Removed)
-    );
-    assert_eq!(
-        records[1].body().and_then(|body| body.policy_marker()),
-        Some(PolicyValueMarker::Redacted)
-    );
+    assert!(records[0].body().is_none());
+    assert!(records[1].body().is_some_and(|body| body.is_null()));
     let truncated = records[2].body().ok_or("truncated body disappeared")?;
     assert_eq!(truncated.as_str(), Some("ol\u{00e1}-"));
-    assert!(truncated.was_truncated());
     assert_eq!(
         records[0].policy_provenance().applied_rules(),
         &["remove-body"]
@@ -100,7 +91,6 @@ fn body_truncation_precedes_the_post_policy_value_limit_profile() -> Result<(), 
     let batch = OtlpLogsReceiver::with_value_limit_profile(profile).decode(request)?;
     let policy = IngestPolicy::compile(
         26,
-        [0x26; 32],
         vec![PolicyRule::new(
             "fit-body-limit",
             Vec::new(),
@@ -110,7 +100,6 @@ fn body_truncation_precedes_the_post_policy_value_limit_profile() -> Result<(), 
     let result = ingest_and_scan(&fixture, batch, &policy, 102)?;
     let body = result.records()[0].body().ok_or("truncated body missing")?;
     assert_eq!(body.as_str(), Some("1234"));
-    assert!(body.was_truncated());
     Ok(())
 }
 
@@ -135,7 +124,7 @@ fn unchanged_body_that_exceeds_the_post_policy_limit_is_rejected() -> Result<(),
         bodies_request(&["12345"]).encode_to_vec(),
     )?;
     let batch = OtlpLogsReceiver::with_value_limit_profile(profile).decode(request)?;
-    let policy = IngestPolicy::preserving(27, [0x27; 32])?;
+    let policy = IngestPolicy::preserving(27)?;
     let catalog = Catalog::open(
         &fixture.authority,
         InstanceId::new([0x68; 16])?,

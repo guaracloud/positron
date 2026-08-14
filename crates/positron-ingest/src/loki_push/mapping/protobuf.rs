@@ -77,6 +77,6 @@ pub(crate) fn protobuf_batch<'authority>(
         profile,
         u64::try_from(retained).map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
         capacity,
-        crate::PolicyReceiver::LokiPush,
+        crate::PolicyReceiver::LokiPushProtobuf,
     )
 }

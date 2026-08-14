@@ -554,8 +554,8 @@ The Log Store hides full-text structures, scalar attribute indexes, generic
 typed overflow, and workload-driven Attribute Promotion.
 
 The canonical Log Store Block layout and bounded logical scan are defined by
-the current [`log-store-block-format-v3.md`](log-store-block-format-v3.md),
-which preserves the complete version 1 reader contract in
+[`log-store-block-format-v2.md`](log-store-block-format-v2.md), which preserves
+the complete version 1 reader contract in
 [`log-store-block-format-v1.md`](log-store-block-format-v1.md).
 
 The Trace Store hides immutable Span Observations, logical-span consolidation,
@@ -1221,6 +1221,7 @@ crates/
   positron-kernel/           Storage Kernel and private internal modules
   positron-signals/          Signal Store seam plus Log and Trace adapters
   positron-governance/       Identity, Administration, audit intent, operations
+  positron-policy/           bounded producer-neutral policy and evaluated type-state
   positron-ingest/           native ingest orchestration and receiver adapters
   positron-query/            planning, execution, cursor, tail, and export
   positron-backup/           repositories, backup, restore, and purge support
@@ -1245,6 +1246,7 @@ flowchart TD
     kernel["positron-kernel"]
     signals["positron-signals"]
     governance["positron-governance"]
+    policy["positron-policy"]
     ingest["positron-ingest"]
     query["positron-query"]
     backup["positron-backup"]
@@ -1271,8 +1273,11 @@ flowchart TD
     kernel --> domain
     signals --> kernel
     signals --> domain
+    signals --> policy
     governance --> kernel
     governance --> domain
+    policy --> domain
+    ingest --> policy
     ingest --> signals
     ingest --> kernel
     ingest --> domain
@@ -1324,7 +1329,8 @@ than comments:
 | accepted socket | Connection Admission | bounded connection |
 | presented credential | Identity and Attribution | authorized context |
 | bounded attributed bytes | Receiver Adapter | native batch |
-| native batch | Ingest Policy and validation | validated records |
+| native batch | Ingest Policy | opaque evaluated records with provenance |
+| opaque evaluated records | Signal Store validation | validated records |
 | validated records | Resource Governor | admitted groups with reservations |
 | admitted records | Signal Store | prepared canonical blocks |
 | prepared blocks | Storage Kernel durability | commit receipt |

@@ -7,6 +7,8 @@ use positron_kernel::{IngestTime, PreparedStoreBlock};
 
 use super::{LogMetadata, PolicyProvenance, failure::LogStoreFailure};
 
+mod evaluated;
+
 /// The M1 physical dynamic-attribute representation carried by a Log Block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttributeRepresentation {
@@ -73,7 +75,8 @@ pub struct LogRecord {
 impl LogRecord {
     /// Applies the Log Store's authoritative semantic Value Limits to a
     /// receiver-native candidate after Ingest Policy evaluation.
-    pub fn checked_receiver_candidate(
+    #[cfg(test)]
+    pub(crate) fn checked_receiver_candidate(
         profile: ValueLimitProfile,
         event_time_unix_nanos: Option<i64>,
         observed_time_unix_nanos: Option<i64>,
@@ -93,7 +96,7 @@ impl LogRecord {
     }
 
     /// Applies semantic limits while preserving receiver-native intrinsic metadata.
-    pub fn checked_receiver_candidate_with_metadata(
+    pub(crate) fn checked_receiver_candidate_with_metadata(
         profile: ValueLimitProfile,
         event_time_unix_nanos: Option<i64>,
         observed_time_unix_nanos: Option<i64>,
@@ -140,7 +143,8 @@ impl LogRecord {
         )
     }
 
-    pub fn checked_minimal(
+    #[cfg(test)]
+    pub(crate) fn checked_minimal(
         event_time_unix_nanos: Option<i64>,
         body: Option<String>,
         attributes: Vec<(&str, &str, &str)>,
@@ -245,7 +249,11 @@ impl LogRecord {
             }
         }
         decoded_bytes = decoded_bytes
-            .checked_add(metadata.decoded_size_bytes()?)
+            .checked_add(
+                metadata
+                    .decoded_size_bytes()
+                    .ok_or_else(LogStoreFailure::limit_exceeded)?,
+            )
             .ok_or_else(LogStoreFailure::limit_exceeded)?;
         if decoded_bytes > decoded_limit {
             return Err(LogStoreFailure::limit_exceeded());

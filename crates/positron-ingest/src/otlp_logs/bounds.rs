@@ -2,8 +2,9 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 
 use super::ReceiveFailure;
-use super::{NativeLogAttribute, NativeLogBatch, NativeLogCandidate};
+use super::{NativeLogBatch, NativeLogCandidate};
 use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue};
+use positron_policy::NativeLogAttribute;
 
 pub(super) fn decoded_record_bytes(
     resource: &[KeyValue],

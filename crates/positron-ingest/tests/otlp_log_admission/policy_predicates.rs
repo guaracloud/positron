@@ -5,7 +5,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use positron_domain::routing::SignalKind;
-use positron_domain::value::{AttributeNamespace, AttributeValueKind, PolicyValueMarker};
+use positron_domain::value::{AttributeNamespace, AttributeValueKind};
 use positron_ingest::{
     AuthenticatedOtlpLogsRequest, IngestPolicy, OtlpLogsReceiver, PolicyAction,
     PolicyAttributePath, PolicyPredicate, PolicyReceiver, PolicyRule, PolicyTarget,
@@ -29,12 +29,11 @@ fn predicates_match_signal_receiver_service_severity_path_and_native_type()
     let secret = PolicyAttributePath::new(AttributeNamespace::Record, "secret.bytes")?;
     let policy = IngestPolicy::compile(
         25,
-        [0x25; 32],
         vec![PolicyRule::new(
             "redact-warn-checkout-bytes",
             vec![
                 PolicyPredicate::signal_store(SignalKind::Logs),
-                PolicyPredicate::receiver(PolicyReceiver::OtlpLogs),
+                PolicyPredicate::receiver(PolicyReceiver::OtlpGrpc),
                 PolicyPredicate::service_identity("checkout")?,
                 PolicyPredicate::log_severity(13),
                 PolicyPredicate::attribute_type(secret.clone(), AttributeValueKind::Bytes),
@@ -51,7 +50,7 @@ fn predicates_match_signal_receiver_service_severity_path_and_native_type()
         .find(|attribute| attribute.key() == "secret.bytes")
         .and_then(|attribute| attribute.occurrence(0))
         .ok_or("missing redaction marker")?;
-    assert_eq!(secret.policy_marker(), Some(PolicyValueMarker::Redacted));
+    assert!(secret.is_null());
     assert_eq!(
         record.policy_provenance().applied_rules(),
         &["redact-warn-checkout-bytes"]

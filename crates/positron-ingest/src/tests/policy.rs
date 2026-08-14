@@ -43,13 +43,8 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
     let batch = OtlpLogsReceiver::new()
         .decode(request)
         .expect("structural decode");
-    let policy = IngestPolicy::reject_exact_text_body(
-        7,
-        [0x75; 32],
-        "reject-oversized",
-        &oversized_rejected,
-    )
-    .expect("policy");
+    let policy = IngestPolicy::reject_exact_text_body(7, "reject-oversized", &oversized_rejected)
+        .expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
 
     let partial = match LogIngest::new(
@@ -99,7 +94,6 @@ fn later_predicates_observe_prior_ordered_transformations() {
     let (_, mut records, _, _, receiver) = batch.into_parts();
     let policy = IngestPolicy::compile(
         8,
-        [0x85; 32],
         vec![
             PolicyRule::new(
                 "truncate",
@@ -118,7 +112,7 @@ fn later_predicates_observe_prior_ordered_transformations() {
     .expect("policy");
     assert!(matches!(
         policy.evaluate(records.remove(0), receiver),
-        Ok(crate::policy::PolicyDecision::Reject)
+        Ok(crate::PolicyEvaluation::Rejected)
     ));
 }
 
@@ -147,8 +141,7 @@ fn partial_admission_preserves_each_permanent_rejection_class() {
             "accepted",
         ]))
         .expect("structural decode");
-    let policy =
-        IngestPolicy::reject_exact_text_body(3, [0x45; 32], "reject", "reject-me").expect("policy");
+    let policy = IngestPolicy::reject_exact_text_body(3, "reject", "reject-me").expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(3)));
     let outcome = LogIngest::new(
         &fixture.authority,
@@ -201,7 +194,7 @@ fn value_limit_rejection_never_claims_durability() {
     let batch = OtlpLogsReceiver::new()
         .decode(protobuf_with_bodies(&[oversized.as_str()]))
         .expect("structural decode");
-    let policy = IngestPolicy::preserving(1, [0x7b; 32]).expect("policy");
+    let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
     assert!(matches!(
         LogIngest::new(
@@ -241,8 +234,7 @@ fn complete_policy_rejection_is_permanent_and_has_no_receipt() {
     let batch = OtlpLogsReceiver::new()
         .decode(protobuf_with_bodies(&["reject-me"]))
         .expect("decode");
-    let policy =
-        IngestPolicy::reject_exact_text_body(2, [0x81; 32], "reject", "reject-me").expect("policy");
+    let policy = IngestPolicy::reject_exact_text_body(2, "reject", "reject-me").expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
     assert_eq!(
         LogIngest::new(

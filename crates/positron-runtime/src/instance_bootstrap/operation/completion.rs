@@ -92,13 +92,10 @@ pub(super) fn outcome(
     generation: u64,
     audit_frontier: u64,
     claim_available: bool,
+    ingest_policy: positron_ingest::IngestPolicy,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     let logs_shard = VirtualShardId::new(1)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-    let ingest_policy = positron_ingest::IngestPolicyAuthority::new(
-        positron_ingest::IngestPolicy::release_1_default()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
-    );
     let admission_group_planner =
         Arc::new(positron_ingest::FixedAdmissionGroupPlanner::new(logs_shard));
     Ok(InitializedInstance {

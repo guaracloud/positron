@@ -11,17 +11,13 @@ use positron_ingest::{
 fn compiler_rejects_identity_rule_predicate_path_and_byte_bound_violations()
 -> Result<(), Box<dyn Error>> {
     assert_eq!(
-        IngestPolicy::compile(0, [1; 32], Vec::new()).expect_err("zero generation"),
-        PolicyCompileFailure::InvalidIdentity
-    );
-    assert_eq!(
-        IngestPolicy::compile(1, [0; 32], Vec::new()).expect_err("zero digest"),
+        IngestPolicy::compile(0, Vec::new()).expect_err("zero generation"),
         PolicyCompileFailure::InvalidIdentity
     );
 
     let accept = PolicyRule::new("accept", Vec::new(), PolicyAction::Accept)?;
     assert_eq!(
-        IngestPolicy::compile(1, [1; 32], vec![accept.clone(); 65]).expect_err("65 rules"),
+        IngestPolicy::compile(1, vec![accept.clone(); 65]).expect_err("65 rules"),
         PolicyCompileFailure::RuleBoundExceeded
     );
     assert_eq!(
@@ -38,8 +34,7 @@ fn compiler_rejects_identity_rule_predicate_path_and_byte_bound_violations()
         PolicyCompileFailure::InvalidRuleId
     );
     assert_eq!(
-        IngestPolicy::compile(1, [1; 32], vec![accept.clone(), accept])
-            .expect_err("duplicate rule ID"),
+        IngestPolicy::compile(1, vec![accept.clone(), accept]).expect_err("duplicate rule ID"),
         PolicyCompileFailure::InvalidRuleId
     );
 
@@ -66,7 +61,7 @@ fn compiler_rejects_identity_rule_predicate_path_and_byte_bound_violations()
         )?);
     }
     assert_eq!(
-        IngestPolicy::compile(1, [1; 32], byte_heavy).expect_err("policy byte budget"),
+        IngestPolicy::compile(1, byte_heavy).expect_err("policy byte budget"),
         PolicyCompileFailure::PolicyBytesExceeded
     );
     let service = PolicyAttributePath::new(AttributeNamespace::Resource, "service.name")?;
@@ -76,8 +71,7 @@ fn compiler_rejects_identity_rule_predicate_path_and_byte_bound_violations()
         PolicyAction::Redact(PolicyTarget::attribute(service)),
     )?;
     assert_eq!(
-        IngestPolicy::compile(1, [1; 32], vec![protected])
-            .expect_err("service identity is intrinsic"),
+        IngestPolicy::compile(1, vec![protected]).expect_err("service identity is intrinsic"),
         PolicyCompileFailure::ProtectedTarget
     );
     Ok(())

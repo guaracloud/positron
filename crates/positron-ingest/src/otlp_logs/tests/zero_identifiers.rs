@@ -24,10 +24,11 @@ fn all_zero_trace_and_span_ids_map_to_absent_association() -> Result<(), Box<dyn
         attribution: attribution(),
         payload: OtlpPayload::Decoded(Box::new(decoded)),
         capacity: None,
+        receiver: crate::PolicyReceiver::OtlpGrpc,
     };
 
     let batch = OtlpLogsReceiver::new().decode(request)?;
-    let metadata = &batch.records[0].metadata;
+    let metadata = &batch.records[0].metadata();
 
     assert_eq!(metadata.trace_id(), None);
     assert_eq!(metadata.span_id(), None);

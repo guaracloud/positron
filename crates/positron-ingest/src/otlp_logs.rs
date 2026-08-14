@@ -2,11 +2,12 @@ use std::fmt::{Display, Formatter};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use positron_domain::identity::TenantAttribution;
-use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
+use positron_domain::value::ValueLimitProfile;
 use positron_governance::AuthorizedContext;
 use positron_kernel::{
     ResourceAmounts, ResourceGovernor, ResourceReservation, WorkClaim, WorkKind,
 };
+use positron_policy::NativeLogCandidate;
 use prost::Message;
 
 mod admission_groups;
@@ -92,132 +93,6 @@ impl Display for ReceiveFailure {
 
 impl std::error::Error for ReceiveFailure {}
 
-/// One native dynamic attribute before policy and semantic Value Limits.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeLogAttribute {
-    namespace: AttributeNamespace,
-    key: String,
-    occurrences: Vec<CandidateAttributeValue>,
-}
-
-impl NativeLogAttribute {
-    #[must_use]
-    pub(crate) fn new(
-        namespace: AttributeNamespace,
-        key: String,
-        occurrences: Vec<CandidateAttributeValue>,
-    ) -> Self {
-        Self {
-            namespace,
-            key,
-            occurrences,
-        }
-    }
-
-    #[must_use]
-    pub const fn namespace(&self) -> AttributeNamespace {
-        self.namespace
-    }
-
-    #[must_use]
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    #[must_use]
-    pub fn occurrences(&self) -> &[CandidateAttributeValue] {
-        &self.occurrences
-    }
-
-    pub(crate) fn occurrences_mut(&mut self) -> &mut [CandidateAttributeValue] {
-        &mut self.occurrences
-    }
-
-    pub(crate) fn replace_occurrences(&mut self, occurrences: Vec<CandidateAttributeValue>) {
-        self.occurrences = occurrences;
-    }
-}
-
-/// One structurally decoded native Log candidate awaiting policy and limits.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeLogCandidate {
-    event_time_unix_nanos: Option<i64>,
-    observed_time_unix_nanos: Option<i64>,
-    body: Option<CandidateAttributeValue>,
-    attributes: Vec<NativeLogAttribute>,
-    metadata: positron_signals::LogMetadata,
-}
-
-impl NativeLogCandidate {
-    #[must_use]
-    pub(crate) fn new(
-        event_time_unix_nanos: Option<i64>,
-        observed_time_unix_nanos: Option<i64>,
-        body: Option<CandidateAttributeValue>,
-        attributes: Vec<NativeLogAttribute>,
-        metadata: positron_signals::LogMetadata,
-    ) -> Self {
-        Self {
-            event_time_unix_nanos,
-            observed_time_unix_nanos,
-            body,
-            attributes,
-            metadata,
-        }
-    }
-
-    #[must_use]
-    pub const fn event_time_unix_nanos(&self) -> Option<i64> {
-        self.event_time_unix_nanos
-    }
-
-    #[must_use]
-    pub const fn observed_time_unix_nanos(&self) -> Option<i64> {
-        self.observed_time_unix_nanos
-    }
-
-    #[must_use]
-    pub const fn body(&self) -> Option<&CandidateAttributeValue> {
-        self.body.as_ref()
-    }
-
-    pub(crate) fn body_mut(&mut self) -> Option<&mut CandidateAttributeValue> {
-        self.body.as_mut()
-    }
-
-    #[must_use]
-    pub fn attributes(&self) -> &[NativeLogAttribute] {
-        &self.attributes
-    }
-
-    pub(crate) fn attributes_mut(&mut self) -> &mut [NativeLogAttribute] {
-        &mut self.attributes
-    }
-
-    #[must_use]
-    pub const fn metadata(&self) -> &positron_signals::LogMetadata {
-        &self.metadata
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Option<i64>,
-        Option<i64>,
-        Option<CandidateAttributeValue>,
-        Vec<NativeLogAttribute>,
-        positron_signals::LogMetadata,
-    ) {
-        (
-            self.event_time_unix_nanos,
-            self.observed_time_unix_nanos,
-            self.body,
-            self.attributes,
-            self.metadata,
-        )
-    }
-}
-
 /// One tenant-bound native batch after protocol mapping.
 #[derive(Debug)]
 pub struct NativeLogBatch<'authority> {
@@ -263,6 +138,11 @@ impl<'authority> NativeLogBatch<'authority> {
     #[must_use]
     pub const fn value_limit_profile(&self) -> ValueLimitProfile {
         self.value_limit_profile
+    }
+
+    #[must_use]
+    pub const fn receiver(&self) -> crate::PolicyReceiver {
+        self.receiver
     }
 
     pub(crate) fn into_parts(
@@ -331,6 +211,7 @@ impl OtlpLogsReceiver {
             attribution,
             payload,
             capacity,
+            receiver,
         } = request;
         let decoded = match payload {
             OtlpPayload::Decoded(decoded) => *decoded,
@@ -351,7 +232,7 @@ impl OtlpLogsReceiver {
             decoded,
             self.value_limit_profile,
             capacity,
-            crate::PolicyReceiver::OtlpLogs,
+            receiver,
         )?;
         batch.resize_after_decode()?;
         Ok(batch)

@@ -151,13 +151,13 @@ pub(super) fn native_batch<'authority>(
                     scope_dropped_attributes_count,
                     scope_schema_url.clone(),
                 );
-                records.push(NativeLogCandidate {
-                    event_time_unix_nanos: Some(checked_timestamp(log.time_unix_nano)?),
-                    observed_time_unix_nanos: Some(checked_timestamp(log.observed_time_unix_nano)?),
+                records.push(NativeLogCandidate::new(
+                    Some(checked_timestamp(log.time_unix_nano)?),
+                    Some(checked_timestamp(log.observed_time_unix_nano)?),
                     body,
                     attributes,
                     metadata,
-                });
+                ));
             }
         }
     }

@@ -1091,6 +1091,7 @@ dependencies = [
  "positron-domain",
  "positron-governance",
  "positron-kernel",
+ "positron-policy",
  "positron-runtime",
  "positron-signals",
  "prost 0.14.3",
@@ -1121,12 +1122,21 @@ name = "positron-operator"
 version = "0.0.0"
 
 [[package]]
+name = "positron-policy"
+version = "0.0.0"
+dependencies = [
+ "positron-domain",
+ "sha2",
+]
+
+[[package]]
 name = "positron-query"
 version = "0.0.0"
 dependencies = [
  "positron-domain",
  "positron-governance",
  "positron-kernel",
+ "positron-policy",
  "positron-runtime",
  "positron-signals",
 ]
@@ -1173,6 +1183,7 @@ version = "0.0.0"
 dependencies = [
  "positron-domain",
  "positron-kernel",
+ "positron-policy",
 ]
 
 [[package]]

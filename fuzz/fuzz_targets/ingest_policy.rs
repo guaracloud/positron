@@ -159,11 +159,7 @@ fn compile_policy(data: &[u8]) -> Result<IngestPolicy, Box<dyn Error>> {
             0 => PolicyPredicate::attribute_exists(path.clone()),
             1 => PolicyPredicate::body_exact_text(body_text(data))?,
             2 => PolicyPredicate::signal_store(SignalKind::Logs),
-            3 => PolicyPredicate::receiver(if selector & 0x80 == 0 {
-                PolicyReceiver::OtlpLogs
-            } else {
-                PolicyReceiver::LokiPush
-            }),
+            3 => PolicyPredicate::receiver(receiver(selector)),
             4 => PolicyPredicate::attribute_type(path.clone(), AttributeValueKind::String),
             5 => PolicyPredicate::service_identity("fuzz-service")?,
             _ => PolicyPredicate::log_severity(i32::from(selector)),
@@ -190,7 +186,19 @@ fn compile_policy(data: &[u8]) -> Result<IngestPolicy, Box<dyn Error>> {
         Vec::new(),
         PolicyAction::Reject,
     )?);
-    Ok(IngestPolicy::compile(81, [0x81; 32], rules)?)
+    Ok(IngestPolicy::compile(81, rules)?)
+}
+
+fn receiver(selector: u8) -> PolicyReceiver {
+    match (selector / 7) % 7 {
+        0 => PolicyReceiver::OtlpGrpc,
+        1 => PolicyReceiver::OtlpHttpProtobuf,
+        2 => PolicyReceiver::OtlpHttpJson,
+        3 => PolicyReceiver::LokiPushJson,
+        4 => PolicyReceiver::LokiPushProtobuf,
+        5 => PolicyReceiver::LokiOtlpProtobuf,
+        _ => PolicyReceiver::LokiOtlpJson,
+    }
 }
 
 fn policy_path(selector: u8) -> Result<PolicyAttributePath, Box<dyn Error>> {

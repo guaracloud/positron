@@ -16,7 +16,7 @@ mod identity;
 
 pub use audit::{
     CatalogRootRotationAuditEntry, CatalogRootRotationStage, GovernanceAuditEntry,
-    InitialAuditMetadata, InitializationAuditEntry,
+    IngestPolicyActivationAuditEntry, InitialAuditMetadata, InitializationAuditEntry,
 };
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,

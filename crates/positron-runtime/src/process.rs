@@ -21,7 +21,6 @@ pub enum InitializationMode {
 pub struct ServeConfiguration {
     paths: BootstrapPaths,
     initialization: InitializationMode,
-    ingest_policy: Option<positron_ingest::IngestPolicy>,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
 }
 
@@ -31,15 +30,8 @@ impl ServeConfiguration {
         Self {
             paths,
             initialization,
-            ingest_policy: None,
             admission_group_planner: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_ingest_policy(mut self, policy: positron_ingest::IngestPolicy) -> Self {
-        self.ingest_policy = Some(policy);
-        self
     }
 
     #[must_use]
@@ -58,7 +50,6 @@ impl std::fmt::Debug for ServeConfiguration {
             .debug_struct("ServeConfiguration")
             .field("paths", &self.paths)
             .field("initialization", &self.initialization)
-            .field("ingest_policy", &self.ingest_policy.is_some())
             .field(
                 "admission_group_planner",
                 &self.admission_group_planner.is_some(),

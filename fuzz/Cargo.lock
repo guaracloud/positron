@@ -904,6 +904,7 @@ dependencies = [
  "positron-domain",
  "positron-governance",
  "positron-kernel",
+ "positron-policy",
  "positron-signals",
  "prost",
  "serde_json",
@@ -926,6 +927,14 @@ dependencies = [
  "sha2",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "positron-policy"
+version = "0.0.0"
+dependencies = [
+ "positron-domain",
+ "sha2",
 ]
 
 [[package]]
@@ -965,6 +974,7 @@ version = "0.0.0"
 dependencies = [
  "positron-domain",
  "positron-kernel",
+ "positron-policy",
 ]
 
 [[package]]

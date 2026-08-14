@@ -1,65 +1,73 @@
-use positron_domain::value::{CandidateAttributeValue, PolicyValueMarker};
-use positron_signals::{LogStoreFailure, PolicyProvenance};
+use positron_domain::value::{AttributeValueKind, CandidateAttributeValue};
 
 use super::{
-    IngestPolicy, PolicyAction, PolicyAttributePath, PolicyDecision, PolicyOccurrence,
-    PolicyPathSegment, PolicyPredicate, PolicyRule, PolicyTarget,
+    IngestPolicy, PolicyAction, PolicyAttributePath, PolicyEvaluation, PolicyEvaluationFailure,
+    PolicyOccurrence, PolicyPathSegment, PolicyPredicate, PolicyReceiver, PolicyRule, PolicyTarget,
 };
-use crate::{NativeLogAttribute, NativeLogCandidate};
-
-#[cfg(test)]
-#[path = "evaluation/tests.rs"]
-mod tests;
+use crate::{EvaluatedLogRecord, NativeLogAttribute, NativeLogCandidate, PolicyProvenance};
 
 impl IngestPolicy {
-    pub(crate) fn evaluate(
+    pub fn evaluate(
         &self,
-        record: NativeLogCandidate,
-        receiver: super::PolicyReceiver,
-    ) -> Result<PolicyDecision, LogStoreFailure> {
-        let mut record = record;
-        let mut applied = Vec::new();
+        mut record: NativeLogCandidate,
+        receiver: PolicyReceiver,
+    ) -> Result<PolicyEvaluation, PolicyEvaluationFailure> {
+        let mut applied = Vec::with_capacity(self.rules.len());
+        let mut steps = StepBudget(self.budget.evaluation_steps());
         for rule in &self.rules {
+            let charge = rule
+                .worst_case_steps()
+                .map_err(|_| PolicyEvaluationFailure::StepBudgetExhausted)?;
+            steps.consume(charge)?;
             if !rule.matches(&record, receiver) {
                 continue;
             }
-            let applied_action = match &rule.action {
+            let changed = match &rule.action {
                 PolicyAction::Accept => {
                     applied.push(rule.id.clone());
                     break;
                 },
-                PolicyAction::Reject => return Ok(PolicyDecision::Reject),
-                PolicyAction::Remove(path) => {
-                    transform_target(&mut record, path, Transformation::Remove)
+                PolicyAction::Reject => return Ok(PolicyEvaluation::Rejected),
+                PolicyAction::Remove(target) => remove_target(&mut record, target),
+                PolicyAction::Redact(target) => {
+                    transform_target(&mut record, target, Transformation::Redact)
                 },
-                PolicyAction::Redact(path) => {
-                    transform_target(&mut record, path, Transformation::Redact)
+                PolicyAction::TruncateBytes(target, limit) => {
+                    transform_target(&mut record, target, Transformation::TruncateBytes(*limit))
                 },
-                PolicyAction::TruncateBytes(path, limit) => {
-                    transform_target(&mut record, path, Transformation::TruncateBytes(*limit))
-                },
-                PolicyAction::TruncateElements(path, limit) => {
-                    transform_target(&mut record, path, Transformation::TruncateElements(*limit))
-                },
+                PolicyAction::TruncateElements(target, limit) => transform_target(
+                    &mut record,
+                    target,
+                    Transformation::TruncateElements(*limit),
+                ),
             };
-            if applied_action {
+            if changed {
                 applied.push(rule.id.clone());
             }
         }
-        let provenance = PolicyProvenance::new(
-            self.provenance.generation(),
-            self.provenance.digest(),
-            applied,
-        )?;
-        Ok(PolicyDecision::Accept {
-            record: Box::new(record),
-            provenance,
-        })
+        Ok(PolicyEvaluation::Accepted(Box::new(
+            EvaluatedLogRecord::new(
+                record,
+                PolicyProvenance::new(self.generation, self.digest, applied),
+            ),
+        )))
+    }
+}
+
+struct StepBudget(u64);
+
+impl StepBudget {
+    fn consume(&mut self, amount: u64) -> Result<(), PolicyEvaluationFailure> {
+        self.0 = self
+            .0
+            .checked_sub(amount)
+            .ok_or(PolicyEvaluationFailure::StepBudgetExhausted)?;
+        Ok(())
     }
 }
 
 impl PolicyRule {
-    fn matches(&self, record: &NativeLogCandidate, receiver: super::PolicyReceiver) -> bool {
+    fn matches(&self, record: &NativeLogCandidate, receiver: PolicyReceiver) -> bool {
         self.predicates.iter().all(|predicate| match predicate {
             PolicyPredicate::AttributeExists(path) => path_exists(record, path),
             PolicyPredicate::BodyExactText(expected) => record
@@ -90,14 +98,12 @@ impl PolicyRule {
 fn candidate_text(value: &CandidateAttributeValue) -> Option<&str> {
     match value {
         CandidateAttributeValue::String(value) => Some(value),
-        CandidateAttributeValue::Truncated(value) => candidate_text(value),
         _ => None,
     }
 }
 
 #[derive(Clone, Copy)]
 enum Transformation {
-    Remove,
     Redact,
     TruncateBytes(u32),
     TruncateElements(u16),
@@ -114,29 +120,27 @@ fn find_attribute<'record>(
 }
 
 fn path_exists(record: &NativeLogCandidate, path: &PolicyAttributePath) -> bool {
-    let Some(attribute) = find_attribute(record, path) else {
-        return false;
-    };
-    selected(attribute.occurrences(), path.occurrence)
-        .any(|value| value_path_exists(value, &path.segments))
+    find_attribute(record, path).is_some_and(|attribute| {
+        selected(attribute.occurrences(), path.occurrence)
+            .any(|value| value_path_exists(value, &path.segments))
+    })
 }
 
 fn path_has_type(
     record: &NativeLogCandidate,
     path: &PolicyAttributePath,
-    expected: positron_domain::value::AttributeValueKind,
+    expected: AttributeValueKind,
 ) -> bool {
-    let Some(attribute) = find_attribute(record, path) else {
-        return false;
-    };
-    selected(attribute.occurrences(), path.occurrence)
-        .any(|value| value_path_has_type(value, &path.segments, expected))
+    find_attribute(record, path).is_some_and(|attribute| {
+        selected(attribute.occurrences(), path.occurrence)
+            .any(|value| value_path_has_type(value, &path.segments, expected))
+    })
 }
 
 fn value_path_has_type(
     value: &CandidateAttributeValue,
     segments: &[PolicyPathSegment],
-    expected: positron_domain::value::AttributeValueKind,
+    expected: AttributeValueKind,
 ) -> bool {
     let Some((first, rest)) = segments.split_first() else {
         return candidate_kind(value) == expected;
@@ -148,15 +152,11 @@ fn value_path_has_type(
         (PolicyPathSegment::ArrayIndex(index), CandidateAttributeValue::Array(values)) => values
             .get(usize::from(*index))
             .is_some_and(|value| value_path_has_type(value, rest, expected)),
-        (_, CandidateAttributeValue::Truncated(value)) => {
-            value_path_has_type(value, segments, expected)
-        },
         _ => false,
     }
 }
 
-fn candidate_kind(value: &CandidateAttributeValue) -> positron_domain::value::AttributeValueKind {
-    use positron_domain::value::AttributeValueKind;
+fn candidate_kind(value: &CandidateAttributeValue) -> AttributeValueKind {
     match value {
         CandidateAttributeValue::Null => AttributeValueKind::Null,
         CandidateAttributeValue::Boolean(_) => AttributeValueKind::Boolean,
@@ -166,8 +166,6 @@ fn candidate_kind(value: &CandidateAttributeValue) -> positron_domain::value::At
         CandidateAttributeValue::Bytes(_) => AttributeValueKind::Bytes,
         CandidateAttributeValue::Array(_) => AttributeValueKind::Array,
         CandidateAttributeValue::KeyValueList(_) => AttributeValueKind::KeyValueList,
-        CandidateAttributeValue::PolicyMarker(_) => AttributeValueKind::PolicyMarker,
-        CandidateAttributeValue::Truncated(value) => candidate_kind(value),
     }
 }
 
@@ -182,7 +180,6 @@ fn value_path_exists(value: &CandidateAttributeValue, segments: &[PolicyPathSegm
         (PolicyPathSegment::ArrayIndex(index), CandidateAttributeValue::Array(values)) => values
             .get(usize::from(*index))
             .is_some_and(|value| value_path_exists(value, rest)),
-        (_, CandidateAttributeValue::Truncated(value)) => value_path_exists(value, segments),
         _ => false,
     }
 }
@@ -201,27 +198,70 @@ fn selected(
     })
 }
 
-fn transform_path(
-    record: &mut NativeLogCandidate,
-    path: &PolicyAttributePath,
-    transformation: Transformation,
-) -> bool {
-    let Some(attribute) = record
-        .attributes_mut()
-        .iter_mut()
-        .find(|attribute| attribute.namespace() == path.namespace && attribute.key() == path.key)
-    else {
+fn remove_target(record: &mut NativeLogCandidate, target: &PolicyTarget) -> bool {
+    match target {
+        PolicyTarget::Body => record.body_mut().take().is_some(),
+        PolicyTarget::Attribute(path) => remove_path(record, path),
+    }
+}
+
+fn remove_path(record: &mut NativeLogCandidate, path: &PolicyAttributePath) -> bool {
+    let Some(position) = record.attributes().iter().position(|attribute| {
+        attribute.namespace() == path.namespace && attribute.key() == path.key
+    }) else {
         return false;
     };
-    if path.segments.is_empty()
-        && matches!(path.occurrence, PolicyOccurrence::All)
-        && matches!(transformation, Transformation::Remove)
-    {
-        attribute.replace_occurrences(vec![CandidateAttributeValue::policy_marker(
-            PolicyValueMarker::Removed,
-        )]);
+    if path.segments.is_empty() && matches!(path.occurrence, PolicyOccurrence::All) {
+        record.attributes_mut().remove(position);
         return true;
     }
+    let attribute = &mut record.attributes_mut()[position];
+    let changed = if path.segments.is_empty() {
+        match path.occurrence {
+            PolicyOccurrence::All => false,
+            PolicyOccurrence::Index(index)
+                if usize::from(index) < attribute.occurrences().len() =>
+            {
+                attribute.occurrences_mut().remove(usize::from(index));
+                true
+            },
+            PolicyOccurrence::Index(_) => false,
+        }
+    } else {
+        transform_selected(attribute, path, None)
+    };
+    if attribute.occurrences().is_empty() {
+        record.attributes_mut().remove(position);
+    }
+    changed
+}
+
+fn transform_target(
+    record: &mut NativeLogCandidate,
+    target: &PolicyTarget,
+    transformation: Transformation,
+) -> bool {
+    match target {
+        PolicyTarget::Body => record
+            .body_mut()
+            .as_mut()
+            .is_some_and(|body| transform_leaf(body, transformation)),
+        PolicyTarget::Attribute(path) => {
+            let Some(attribute) = record.attributes_mut().iter_mut().find(|attribute| {
+                attribute.namespace() == path.namespace && attribute.key() == path.key
+            }) else {
+                return false;
+            };
+            transform_selected(attribute, path, Some(transformation))
+        },
+    }
+}
+
+fn transform_selected(
+    attribute: &mut NativeLogAttribute,
+    path: &PolicyAttributePath,
+    transformation: Option<Transformation>,
+) -> bool {
     let occurrence = path.occurrence;
     attribute
         .occurrences_mut()
@@ -236,76 +276,67 @@ fn transform_path(
         })
 }
 
-fn transform_target(
-    record: &mut NativeLogCandidate,
-    target: &PolicyTarget,
-    transformation: Transformation,
-) -> bool {
-    match target {
-        PolicyTarget::Body => record
-            .body_mut()
-            .is_some_and(|body| transform_leaf(body, transformation)),
-        PolicyTarget::Attribute(path) => transform_path(record, path, transformation),
-    }
-}
-
+#[expect(
+    clippy::unnecessary_fold,
+    reason = "every duplicate key must be transformed; Iterator::any would short-circuit"
+)]
 fn transform_value(
     value: &mut CandidateAttributeValue,
     segments: &[PolicyPathSegment],
-    transformation: Transformation,
+    transformation: Option<Transformation>,
 ) -> bool {
     let Some((first, rest)) = segments.split_first() else {
-        return transform_leaf(value, transformation);
+        return transformation.is_some_and(|transformation| transform_leaf(value, transformation));
     };
-    match first {
-        PolicyPathSegment::Key(key) => match value {
-            CandidateAttributeValue::KeyValueList(entries) => {
-                let mut changed = false;
-                for entry in entries.iter_mut().filter(|entry| entry.key() == key) {
-                    changed |= transform_value(entry.value_mut(), rest, transformation);
-                }
-                changed
-            },
-            CandidateAttributeValue::Truncated(value) => {
-                transform_value(value, segments, transformation)
-            },
-            _ => false,
+    match (first, value) {
+        (PolicyPathSegment::Key(key), CandidateAttributeValue::KeyValueList(entries))
+            if rest.is_empty() && transformation.is_none() =>
+        {
+            let before = entries.len();
+            entries.retain(|entry| entry.key() != key);
+            entries.len() != before
         },
-        PolicyPathSegment::ArrayIndex(index) => match value {
-            CandidateAttributeValue::Array(values) => values
-                .get_mut(usize::from(*index))
-                .is_some_and(|value| transform_value(value, rest, transformation)),
-            CandidateAttributeValue::Truncated(value) => {
-                transform_value(value, segments, transformation)
-            },
-            _ => false,
+        (PolicyPathSegment::Key(key), CandidateAttributeValue::KeyValueList(entries)) => entries
+            .iter_mut()
+            .filter(|entry| entry.key() == key)
+            .fold(false, |changed, entry| {
+                transform_value(entry.value_mut(), rest, transformation) || changed
+            }),
+        (PolicyPathSegment::ArrayIndex(index), CandidateAttributeValue::Array(values))
+            if rest.is_empty() && transformation.is_none() =>
+        {
+            let index = usize::from(*index);
+            if index < values.len() {
+                values.remove(index);
+                true
+            } else {
+                false
+            }
         },
+        (PolicyPathSegment::ArrayIndex(index), CandidateAttributeValue::Array(values)) => values
+            .get_mut(usize::from(*index))
+            .is_some_and(|value| transform_value(value, rest, transformation)),
+        _ => false,
     }
 }
 
 fn transform_leaf(value: &mut CandidateAttributeValue, transformation: Transformation) -> bool {
     match transformation {
-        Transformation::Remove => {
-            *value = CandidateAttributeValue::policy_marker(PolicyValueMarker::Removed);
+        Transformation::Redact if !matches!(value, CandidateAttributeValue::Null) => {
+            *value = CandidateAttributeValue::null();
             true
         },
-        Transformation::Redact => {
-            *value = CandidateAttributeValue::policy_marker(PolicyValueMarker::Redacted);
-            true
-        },
+        Transformation::Redact => false,
         Transformation::TruncateBytes(limit) => truncate_bytes(value, limit),
         Transformation::TruncateElements(limit) => truncate_elements(value, limit),
     }
 }
 
 fn truncate_bytes(value: &mut CandidateAttributeValue, limit: u32) -> bool {
-    if let CandidateAttributeValue::Truncated(value) = value {
-        return truncate_bytes(value, limit);
-    }
     let Ok(limit) = usize::try_from(limit) else {
         return false;
     };
-    let changed = match value {
+    match value {
         CandidateAttributeValue::String(text) if text.len() > limit => {
             let mut boundary = limit;
             while !text.is_char_boundary(boundary) {
@@ -319,16 +350,12 @@ fn truncate_bytes(value: &mut CandidateAttributeValue, limit: u32) -> bool {
             true
         },
         _ => false,
-    };
-    wrap_truncated(value, changed)
+    }
 }
 
 fn truncate_elements(value: &mut CandidateAttributeValue, limit: u16) -> bool {
-    if let CandidateAttributeValue::Truncated(value) = value {
-        return truncate_elements(value, limit);
-    }
     let limit = usize::from(limit);
-    let changed = match value {
+    match value {
         CandidateAttributeValue::Array(values) if values.len() > limit => {
             values.truncate(limit);
             true
@@ -338,14 +365,5 @@ fn truncate_elements(value: &mut CandidateAttributeValue, limit: u16) -> bool {
             true
         },
         _ => false,
-    };
-    wrap_truncated(value, changed)
-}
-
-fn wrap_truncated(value: &mut CandidateAttributeValue, changed: bool) -> bool {
-    if changed {
-        let retained = std::mem::replace(value, CandidateAttributeValue::null());
-        *value = CandidateAttributeValue::truncated(retained);
     }
-    changed
 }

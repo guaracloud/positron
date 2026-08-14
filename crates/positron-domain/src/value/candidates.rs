@@ -21,17 +21,6 @@ pub enum CandidateAttributeValue {
     Array(Vec<CandidateAttributeValue>),
     /// An ordered key/value list whose keys and values require validation.
     KeyValueList(Vec<CandidateKeyValue>),
-    /// A policy-authored typed marker that never contains producer content.
-    PolicyMarker(PolicyValueMarker),
-    /// A policy-truncated value retaining its native kind and typed evidence.
-    Truncated(Box<CandidateAttributeValue>),
-}
-
-/// Typed evidence that Ingest Policy intentionally removed or replaced content.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PolicyValueMarker {
-    Removed,
-    Redacted,
 }
 /// One unvalidated key/value entry in a native dynamic value list.
 ///
@@ -114,18 +103,6 @@ impl CandidateAttributeValue {
     #[must_use]
     pub fn key_value_list(value: Vec<CandidateKeyValue>) -> Self {
         Self::KeyValueList(value)
-    }
-
-    /// Builds a trusted policy marker for post-policy semantic validation.
-    #[must_use]
-    pub const fn policy_marker(value: PolicyValueMarker) -> Self {
-        Self::PolicyMarker(value)
-    }
-
-    /// Wraps the retained native prefix with typed truncation evidence.
-    #[must_use]
-    pub fn truncated(value: CandidateAttributeValue) -> Self {
-        Self::Truncated(Box::new(value))
     }
 
     /// Validates one dynamic attribute value under the profile's individual-value ceiling.

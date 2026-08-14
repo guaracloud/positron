@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
+use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, FixedLifecycleClockSource,
     GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
@@ -18,7 +19,10 @@ use positron_kernel::{
     SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity,
     TenantQuota, WorkClaim, WorkKind,
 };
-use positron_signals::{LogRecord, LogStore, PolicyProvenance};
+use positron_policy::{
+    IngestPolicy, LogMetadata, NativeLogCandidate, PolicyEvaluation, PolicyReceiver,
+};
+use positron_signals::{LogRecord, LogStore};
 
 pub struct TestClock(AtomicU64);
 
@@ -224,11 +228,21 @@ impl KernelFixture {
         event_time: i64,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
-        let record = LogRecord::checked_minimal(
+        let candidate = NativeLogCandidate::new(
             Some(event_time),
-            Some(body.to_owned()),
+            None,
+            Some(CandidateAttributeValue::string(body.to_owned())),
             vec![],
-            PolicyProvenance::new(1, [0x41; 32], vec![])?,
+            LogMetadata::empty(),
+        );
+        let PolicyEvaluation::Accepted(evaluated) =
+            IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+        else {
+            return Err("preserving policy rejected the query fixture".into());
+        };
+        let record = LogRecord::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            *evaluated,
         )?;
         let capacity = self.authority.governor().reserve(WorkClaim::tenant(
             self.tenant,

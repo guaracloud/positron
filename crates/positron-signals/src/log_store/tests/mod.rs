@@ -27,7 +27,6 @@ mod body;
 mod capacity;
 mod codec;
 mod malformed;
-mod policy_format;
 mod public_contract;
 mod scan;
 mod support;

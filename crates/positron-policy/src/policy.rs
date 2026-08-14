@@ -1,56 +1,73 @@
-use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use positron_domain::routing::SignalKind;
 use positron_domain::value::{AttributeNamespace, AttributeValueKind};
-use positron_signals::{LogStoreFailure, PolicyProvenance};
 
-use crate::NativeLogCandidate;
-
-mod authority;
+pub(crate) mod canonical;
 mod compile;
 mod evaluation;
-pub use authority::{IngestPolicyAuthority, IngestPolicySnapshot, PolicyPublicationFailure};
 
-const MAX_RULES: usize = 64;
-const MAX_PREDICATES_PER_RULE: usize = 16;
-const MAX_RULE_ID_BYTES: usize = 256;
-const MAX_POLICY_PATH_BYTES: usize = 1_024;
-const MAX_COMPILED_POLICY_BYTES: usize = 1_048_576;
-const RELEASE_1_DEFAULT_POLICY_DIGEST: [u8; 32] = [
-    0xd7, 0x16, 0x14, 0x7f, 0xd9, 0xe5, 0xe7, 0xf4, 0xd2, 0x0d, 0xe7, 0x45, 0x05, 0xcb, 0x1b, 0x18,
-    0x2f, 0x91, 0x44, 0x17, 0x7d, 0x95, 0xc3, 0x54, 0xd8, 0xb9, 0x9d, 0x29, 0x9c, 0x8f, 0x0f, 0xe1,
-];
+pub(crate) const MAX_RULES: usize = 64;
+pub(crate) const MAX_PREDICATES_PER_RULE: usize = 16;
+pub(crate) const MAX_RULE_ID_BYTES: usize = 256;
+pub(crate) const MAX_POLICY_PATH_BYTES: usize = 1_024;
+pub(crate) const MAX_COMPILED_POLICY_BYTES: usize = 1_048_576;
+pub(crate) const MAX_EVALUATION_STEPS: u64 = 100_000_000;
+pub(crate) const MAX_NATIVE_RECORD_BYTES: u64 = 1_048_576;
 
-/// A compiled immutable policy generation safe to snapshot for a request.
 #[derive(Clone, Debug)]
 pub struct IngestPolicy {
-    provenance: PolicyProvenance,
-    rules: Vec<PolicyRule>,
+    pub(crate) generation: u64,
+    pub(crate) digest: [u8; 32],
+    pub(crate) rules: Vec<PolicyRule>,
+    pub(crate) budget: PolicyBudget,
 }
 
-/// One root attribute path in a source namespace.
+/// Conservative per-record resources reserved before policy evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyBudget {
+    evaluation_steps: u64,
+    retained_bytes: u64,
+    scratch_bytes: u64,
+    provenance_bytes: u64,
+    mutation_bytes: u64,
+}
+
+impl PolicyBudget {
+    #[must_use]
+    pub const fn evaluation_steps(self) -> u64 {
+        self.evaluation_steps
+    }
+
+    #[must_use]
+    pub fn reserved_memory_bytes(self) -> Option<u64> {
+        self.retained_bytes
+            .checked_add(self.scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(self.provenance_bytes))
+            .and_then(|bytes| bytes.checked_add(self.mutation_bytes))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyAttributePath {
-    namespace: AttributeNamespace,
-    key: String,
-    occurrence: PolicyOccurrence,
-    segments: Vec<PolicyPathSegment>,
+    pub(crate) namespace: AttributeNamespace,
+    pub(crate) key: String,
+    pub(crate) occurrence: PolicyOccurrence,
+    pub(crate) segments: Vec<PolicyPathSegment>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PolicyOccurrence {
+pub(crate) enum PolicyOccurrence {
     All,
     Index(u16),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PolicyPathSegment {
+pub(crate) enum PolicyPathSegment {
     Key(String),
     ArrayIndex(u16),
 }
 
-/// A bounded declarative predicate. Predicates in one rule are conjunctive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyPredicate {
     AttributeExists(PolicyAttributePath),
@@ -62,14 +79,18 @@ pub enum PolicyPredicate {
     LogSeverity(i32),
 }
 
-/// Stable identity of the Receiver Adapter that produced a native batch.
+/// Exact semantic Receiver Adapter identity; compression does not change it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyReceiver {
-    OtlpLogs,
-    LokiPush,
+    OtlpGrpc,
+    OtlpHttpProtobuf,
+    OtlpHttpJson,
+    LokiPushJson,
+    LokiPushProtobuf,
+    LokiOtlpProtobuf,
+    LokiOtlpJson,
 }
 
-/// A Release 1 policy action.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyAction {
     Accept,
@@ -80,22 +101,19 @@ pub enum PolicyAction {
     TruncateElements(PolicyTarget, u16),
 }
 
-/// The complete mutable policy surface: producer body content or dynamic attributes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyTarget {
     Body,
     Attribute(PolicyAttributePath),
 }
 
-/// One ordered declarative rule compiled before policy publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyRule {
-    id: String,
-    predicates: Vec<PolicyPredicate>,
-    action: PolicyAction,
+    pub(crate) id: String,
+    pub(crate) predicates: Vec<PolicyPredicate>,
+    pub(crate) action: PolicyAction,
 }
 
-/// Stable secret-free policy compilation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyCompileFailure {
     InvalidIdentity,
@@ -106,6 +124,7 @@ pub enum PolicyCompileFailure {
     InvalidPredicate,
     PolicyBytesExceeded,
     ProtectedTarget,
+    EvaluationBudgetExceeded,
 }
 
 impl Display for PolicyCompileFailure {
@@ -114,14 +133,25 @@ impl Display for PolicyCompileFailure {
     }
 }
 
-impl Error for PolicyCompileFailure {}
+impl std::error::Error for PolicyCompileFailure {}
 
-pub(crate) enum PolicyDecision {
-    Accept {
-        record: Box<NativeLogCandidate>,
-        provenance: PolicyProvenance,
-    },
-    Reject,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyEvaluationFailure {
+    StepBudgetExhausted,
+    EvidenceBoundExceeded,
+}
+
+impl Display for PolicyEvaluationFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Ingest Policy evaluation failed")
+    }
+}
+
+impl std::error::Error for PolicyEvaluationFailure {}
+
+pub enum PolicyEvaluation {
+    Accepted(Box<crate::EvaluatedLogRecord>),
+    Rejected,
 }
 
 impl PolicyAttributePath {
@@ -141,21 +171,17 @@ impl PolicyAttributePath {
         })
     }
 
-    /// Selects one source-ordered occurrence instead of every occurrence.
     #[must_use]
     pub const fn at_occurrence(mut self, index: u16) -> Self {
         self.occurrence = PolicyOccurrence::Index(index);
         self
     }
 
-    /// Descends through every matching key in an ordered native key/value list.
     pub fn key(mut self, key: impl Into<String>) -> Result<Self, PolicyCompileFailure> {
-        let key = key.into();
-        self.push_segment(PolicyPathSegment::Key(key))?;
+        self.push_segment(PolicyPathSegment::Key(key.into()))?;
         Ok(self)
     }
 
-    /// Descends through one explicit source-ordered native array entry.
     pub fn array_index(mut self, index: u16) -> Result<Self, PolicyCompileFailure> {
         self.push_segment(PolicyPathSegment::ArrayIndex(index))?;
         Ok(self)
@@ -170,24 +196,22 @@ impl PolicyAttributePath {
                 return Err(PolicyCompileFailure::InvalidPath);
             },
             PolicyPathSegment::Key(key) => key.len(),
-            PolicyPathSegment::ArrayIndex(_) => std::mem::size_of::<u16>(),
+            PolicyPathSegment::ArrayIndex(_) => 2,
         };
-        let total = self
-            .segments
-            .iter()
-            .try_fold(self.key.len(), |bytes, segment| {
-                bytes.checked_add(match segment {
-                    PolicyPathSegment::Key(key) => key.len(),
-                    PolicyPathSegment::ArrayIndex(_) => std::mem::size_of::<u16>(),
-                })
-            })
-            .and_then(|bytes| bytes.checked_add(added))
-            .ok_or(PolicyCompileFailure::InvalidPath)?;
-        if total > MAX_POLICY_PATH_BYTES {
+        if self.bounded_bytes().saturating_add(added) > MAX_POLICY_PATH_BYTES {
             return Err(PolicyCompileFailure::InvalidPath);
         }
         self.segments.push(segment);
         Ok(())
+    }
+
+    pub(crate) fn bounded_bytes(&self) -> usize {
+        self.segments.iter().fold(self.key.len(), |bytes, segment| {
+            bytes.saturating_add(match segment {
+                PolicyPathSegment::Key(key) => key.len(),
+                PolicyPathSegment::ArrayIndex(_) => 2,
+            })
+        })
     }
 }
 
@@ -264,35 +288,5 @@ impl PolicyRule {
             predicates,
             action,
         })
-    }
-}
-
-impl IngestPolicy {
-    /// Returns the preserving default policy snapshot.
-    pub fn release_1_default() -> Result<Self, LogStoreFailure> {
-        Self::preserving(1, RELEASE_1_DEFAULT_POLICY_DIGEST)
-    }
-
-    #[must_use]
-    pub const fn provenance(&self) -> &PolicyProvenance {
-        &self.provenance
-    }
-
-    pub fn preserving(generation: u64, digest: [u8; 32]) -> Result<Self, LogStoreFailure> {
-        Ok(Self {
-            provenance: PolicyProvenance::new(generation, digest, Vec::new())?,
-            rules: Vec::new(),
-        })
-    }
-
-    pub fn reject_exact_text_body(
-        generation: u64,
-        digest: [u8; 32],
-        rule_id: &str,
-        body: &str,
-    ) -> Result<Self, PolicyCompileFailure> {
-        let predicate = PolicyPredicate::body_exact_text(body)?;
-        let rule = PolicyRule::new(rule_id, vec![predicate], PolicyAction::Reject)?;
-        Self::compile(generation, digest, vec![rule])
     }
 }

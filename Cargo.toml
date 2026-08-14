@@ -12,6 +12,7 @@ members = [
     "crates/positron-ingest",
     "crates/positron-kernel",
     "crates/positron-operator",
+    "crates/positron-policy",
     "crates/positron-query",
     "crates/positron-release",
     "crates/positron-runtime",

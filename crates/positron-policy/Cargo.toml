@@ -1,0 +1,18 @@
+[package]
+name = "positron-policy"
+description = "Positron bounded ingest-policy compilation and type-state transition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+positron-domain = { path = "../positron-domain" }
+sha2 = { version = "=0.11.0", default-features = false }

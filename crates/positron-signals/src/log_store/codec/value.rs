@@ -1,6 +1,5 @@
 use positron_domain::value::{
-    AttributeValueKind, CandidateAttributeValue, CandidateKeyValue, PolicyValueMarker,
-    ValidatedAttributeValue,
+    AttributeValueKind, CandidateAttributeValue, CandidateKeyValue, ValidatedAttributeValue,
 };
 
 use super::limits::CodecLimits;
@@ -12,12 +11,6 @@ pub(super) fn encoded_length(
     value: &ValidatedAttributeValue,
     depth: u8,
 ) -> Result<usize, LogStoreFailure> {
-    if let Some(retained) = value.truncated_value() {
-        let next = depth
-            .checked_sub(1)
-            .ok_or_else(LogStoreFailure::limit_exceeded)?;
-        return bounded_add(1, encoded_length(retained, next)?);
-    }
     Ok(match value.kind() {
         AttributeValueKind::Null => 1,
         AttributeValueKind::Boolean => 2,
@@ -71,7 +64,6 @@ pub(super) fn encoded_length(
                 bounded_add(total, encoded_length(entry.value(), next)?)
             })?
         },
-        AttributeValueKind::PolicyMarker => 1,
     })
 }
 
@@ -80,13 +72,6 @@ pub(super) fn encode(
     value: &ValidatedAttributeValue,
     depth: u8,
 ) -> Result<(), LogStoreFailure> {
-    if let Some(retained) = value.truncated_value() {
-        output.push(10);
-        let next = depth
-            .checked_sub(1)
-            .ok_or_else(LogStoreFailure::limit_exceeded)?;
-        return encode(output, retained, next);
-    }
     match value.kind() {
         AttributeValueKind::Null => output.push(0),
         AttributeValueKind::Boolean => {
@@ -136,15 +121,6 @@ pub(super) fn encode(
         },
         AttributeValueKind::Array => encode_array(output, value, depth)?,
         AttributeValueKind::KeyValueList => encode_key_value_list(output, value, depth)?,
-        AttributeValueKind::PolicyMarker => output.push(
-            match value
-                .policy_marker()
-                .ok_or_else(LogStoreFailure::invalid_input)?
-            {
-                PolicyValueMarker::Removed => 8,
-                PolicyValueMarker::Redacted => 9,
-            },
-        ),
     }
     Ok(())
 }
@@ -225,17 +201,6 @@ pub(super) fn decode(
         7 => CandidateAttributeValue::key_value_list(decode_key_value_list(
             input,
             depth,
-            value_bytes,
-            limits,
-            version,
-        )?),
-        8 if version >= 3 => CandidateAttributeValue::policy_marker(PolicyValueMarker::Removed),
-        9 if version >= 3 => CandidateAttributeValue::policy_marker(PolicyValueMarker::Redacted),
-        10 if version >= 3 => CandidateAttributeValue::truncated(decode(
-            input,
-            depth
-                .checked_sub(1)
-                .ok_or_else(LogStoreFailure::malformed_block)?,
             value_bytes,
             limits,
             version,

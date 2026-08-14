@@ -37,6 +37,7 @@ pub struct AuthenticatedOtlpLogsRequest<'authority> {
     pub(super) attribution: TenantAttribution,
     pub(super) payload: OtlpPayload,
     pub(super) capacity: Option<ResourceReservation<'authority>>,
+    pub(super) receiver: crate::PolicyReceiver,
 }
 
 impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
@@ -66,6 +67,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             attribution: ingest_attribution(context)?,
             payload: OtlpPayload::Decoded(Box::new(decoded)),
             capacity: Some(capacity),
+            receiver: crate::PolicyReceiver::OtlpGrpc,
         })
     }
 
@@ -73,6 +75,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
     pub fn encoded_after_transport_admission(
         context: AuthorizedContext,
         encoding: OtlpLogsRequestEncoding,
+        receiver: crate::PolicyReceiver,
         body: Vec<u8>,
         capacity: ResourceReservation<'authority>,
     ) -> Result<Self, ReceiveFailure> {
@@ -86,6 +89,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             attribution: ingest_attribution(context)?,
             payload,
             capacity: Some(capacity),
+            receiver,
         })
     }
 
@@ -111,6 +115,7 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             attribution,
             payload,
             capacity: Some(capacity),
+            receiver: crate::PolicyReceiver::OtlpGrpc,
         })
     }
 
@@ -144,6 +149,21 @@ impl<'authority> AuthenticatedOtlpLogsRequest<'authority> {
             attribution,
             payload,
             capacity: None,
+            receiver: crate::PolicyReceiver::OtlpGrpc,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_only_with_receiver(
+        attribution: TenantAttribution,
+        payload: OtlpPayload,
+        receiver: crate::PolicyReceiver,
+    ) -> Self {
+        Self {
+            attribution,
+            payload,
+            capacity: None,
+            receiver,
         }
     }
 }

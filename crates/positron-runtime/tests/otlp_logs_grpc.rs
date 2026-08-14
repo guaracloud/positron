@@ -12,8 +12,6 @@ mod empty_export;
 mod forced_shutdown;
 #[path = "otlp_logs_grpc/malformed_transport.rs"]
 mod malformed_transport;
-#[path = "otlp_logs_grpc/policy.rs"]
-mod policy;
 #[path = "otlp_logs_grpc/resource_governance.rs"]
 mod resource_governance;
 #[path = "otlp_logs_grpc/retry_semantics.rs"]

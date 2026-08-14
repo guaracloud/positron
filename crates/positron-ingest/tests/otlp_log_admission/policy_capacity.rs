@@ -56,12 +56,7 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
         CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32])),
     )?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(900)));
-    let policy = IngestPolicy::reject_exact_text_body(
-        33,
-        [0x94; 32],
-        "reject-later",
-        "policy-reject-later",
-    )?;
+    let policy = IngestPolicy::reject_exact_text_body(33, "reject-later", "policy-reject-later")?;
     let first = groups.next().ok_or("missing first group")?;
     let second = groups.next().ok_or("missing second group")?;
     let first_ledger = ledger(&fixture, &catalog, first.shard(), 0x95)?;
