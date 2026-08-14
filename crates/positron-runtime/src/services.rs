@@ -285,6 +285,10 @@ fn ingest_native_batch(
     batch: NativeLogBatch<'_>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     let instance = &services.instance;
+    let policy = instance
+        .ingest_policy
+        .snapshot()
+        .map_err(|_| ServiceFailure::Internal)?;
     let groups = batch
         .into_admission_groups(instance.admission_group_planner.as_ref())
         .map_err(map_admission_group_plan_failure)?;
@@ -329,7 +333,7 @@ fn ingest_native_batch(
                                 &instance._authority,
                                 &ledger,
                                 &clock,
-                                &instance.ingest_policy,
+                                policy.policy(),
                                 instance.tenant,
                                 shard,
                             )

@@ -875,6 +875,7 @@ name = "positron-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "opentelemetry-proto",
  "positron-domain",
  "positron-governance",
  "positron-ingest",
@@ -882,6 +883,7 @@ dependencies = [
  "positron-query",
  "positron-runtime",
  "positron-signals",
+ "prost",
 ]
 
 [[package]]

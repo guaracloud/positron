@@ -554,7 +554,7 @@ The Log Store hides full-text structures, scalar attribute indexes, generic
 typed overflow, and workload-driven Attribute Promotion.
 
 The canonical Log Store Block layout and bounded logical scan are defined by
-the current [`log-store-block-format-v2.md`](log-store-block-format-v2.md),
+the current [`log-store-block-format-v3.md`](log-store-block-format-v3.md),
 which preserves the complete version 1 reader contract in
 [`log-store-block-format-v1.md`](log-store-block-format-v1.md).
 

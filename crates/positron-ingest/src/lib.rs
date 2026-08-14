@@ -21,7 +21,11 @@ pub use otlp_logs::{
     preflight_otlp_logs_protobuf, reserve_log_receiver_transport, reserve_otlp_logs_transport,
 };
 pub use planning::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, FixedAdmissionGroupPlanner};
-pub use policy::IngestPolicy;
+pub use policy::{
+    IngestPolicy, IngestPolicyAuthority, IngestPolicySnapshot, PolicyAction, PolicyAttributePath,
+    PolicyCompileFailure, PolicyPredicate, PolicyPublicationFailure, PolicyReceiver, PolicyRule,
+    PolicyTarget,
+};
 pub use request_outcome::{AdmissionGroupOutcome, IngestRequestOutcome};
 
 #[cfg(test)]

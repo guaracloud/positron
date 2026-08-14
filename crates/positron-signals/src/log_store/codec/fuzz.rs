@@ -1,7 +1,7 @@
 use positron_domain::identity::TenantId;
 
 use super::limits::CodecLimits;
-use super::{Input, LEGACY_VERSION, MAGIC, VERSION, decode_record};
+use super::{Input, LEGACY_VERSION, MAGIC, METADATA_VERSION, VERSION, decode_record};
 use crate::log_store::LogStoreFailure;
 
 pub(in crate::log_store) fn fuzz_decode_block(
@@ -13,7 +13,7 @@ pub(in crate::log_store) fn fuzz_decode_block(
         return Err(LogStoreFailure::malformed_block());
     }
     let version = input.u16()?;
-    if version != LEGACY_VERSION && version != VERSION {
+    if !matches!(version, LEGACY_VERSION | METADATA_VERSION | VERSION) {
         return Err(LogStoreFailure::malformed_block());
     }
     let tenant: [u8; 16] = input

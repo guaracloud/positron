@@ -6,7 +6,10 @@ use positron_kernel::{
 };
 use positron_signals::{LogScan, LogStore, ScanLimit};
 
-use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
+use crate::{
+    IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver, PolicyAction,
+    PolicyPredicate, PolicyRule, PolicyTarget,
+};
 
 #[test]
 fn release_one_default_policy_has_one_canonical_non_placeholder_snapshot() {
@@ -84,8 +87,39 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
     assert_eq!(result.records()[0].policy_provenance().generation(), 7);
     assert_eq!(
         result.records()[0].policy_provenance().applied_rules(),
-        &["reject-oversized"]
+        &[] as &[String]
     );
+}
+
+#[test]
+fn later_predicates_observe_prior_ordered_transformations() {
+    let batch = OtlpLogsReceiver::new()
+        .decode(protobuf_with_bodies(&["12345"]))
+        .expect("decode");
+    let (_, mut records, _, _, receiver) = batch.into_parts();
+    let policy = IngestPolicy::compile(
+        8,
+        [0x85; 32],
+        vec![
+            PolicyRule::new(
+                "truncate",
+                Vec::new(),
+                PolicyAction::TruncateBytes(PolicyTarget::body(), 4),
+            )
+            .expect("truncate rule"),
+            PolicyRule::new(
+                "reject-truncated",
+                vec![PolicyPredicate::body_exact_text("1234").expect("predicate")],
+                PolicyAction::Reject,
+            )
+            .expect("reject rule"),
+        ],
+    )
+    .expect("policy");
+    assert!(matches!(
+        policy.evaluate(records.remove(0), receiver),
+        Ok(crate::policy::PolicyDecision::Reject)
+    ));
 }
 
 #[test]

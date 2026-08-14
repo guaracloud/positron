@@ -183,7 +183,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         identity: StoreBlockIdentity,
         cancellation: Option<&AppendCancellation>,
     ) -> IngestOutcome {
-        let (attribution, records, value_profile, capacity) = batch.into_parts();
+        let (attribution, records, value_profile, capacity, receiver) = batch.into_parts();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
         }
@@ -228,8 +228,8 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         let mut rejection_counts = [0_usize; 3];
         let mut rejection_code = IngestFailureCode::InvalidRecord;
         for candidate in records {
-            let policy = match self.policy.evaluate(&candidate) {
-                Ok(PolicyDecision::Accept(policy)) => policy,
+            let (candidate, policy) = match self.policy.evaluate(candidate, receiver) {
+                Ok(PolicyDecision::Accept { record, provenance }) => (*record, provenance),
                 Ok(PolicyDecision::Reject) => {
                     increment_rejection(&mut rejection_counts, IngestFailureCode::PolicyRejected);
                     rejection_code = IngestFailureCode::PolicyRejected;

@@ -142,6 +142,20 @@ fn validate_attribute_value(
                 remaining_depth,
             )?)
         },
+        CandidateAttributeValue::PolicyMarker(marker) => {
+            ValidatedAttributeValueInner::PolicyMarker(marker)
+        },
+        CandidateAttributeValue::Truncated(value) => {
+            let child_depth = remaining_depth
+                .checked_sub(1)
+                .ok_or_else(DomainFailure::value_limit_exceeded)?;
+            ValidatedAttributeValueInner::Truncated(Box::new(validate_attribute_value(
+                *value,
+                limits,
+                value_bytes,
+                child_depth,
+            )?))
+        },
     };
     let validated = ValidatedAttributeValue { inner };
     if exceeds_byte_limit(validated.value_size_bytes()?, value_bytes) {

@@ -13,6 +13,7 @@ pub(super) fn native_batch<'authority>(
     decoded: ExportLogsServiceRequest,
     value_limit_profile: ValueLimitProfile,
     capacity: Option<ResourceReservation<'authority>>,
+    receiver: crate::PolicyReceiver,
 ) -> Result<NativeLogBatch<'authority>, ReceiveFailure> {
     let mut records = Vec::new();
     let mut attribute_count = 0_usize;
@@ -171,5 +172,6 @@ pub(super) fn native_batch<'authority>(
         decoded_bytes: u64::try_from(retained_bytes)
             .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
         capacity,
+        receiver,
     })
 }

@@ -128,6 +128,14 @@ impl NativeLogAttribute {
     pub fn occurrences(&self) -> &[CandidateAttributeValue] {
         &self.occurrences
     }
+
+    pub(crate) fn occurrences_mut(&mut self) -> &mut [CandidateAttributeValue] {
+        &mut self.occurrences
+    }
+
+    pub(crate) fn replace_occurrences(&mut self, occurrences: Vec<CandidateAttributeValue>) {
+        self.occurrences = occurrences;
+    }
 }
 
 /// One structurally decoded native Log candidate awaiting policy and limits.
@@ -173,9 +181,17 @@ impl NativeLogCandidate {
         self.body.as_ref()
     }
 
+    pub(crate) fn body_mut(&mut self) -> Option<&mut CandidateAttributeValue> {
+        self.body.as_mut()
+    }
+
     #[must_use]
     pub fn attributes(&self) -> &[NativeLogAttribute] {
         &self.attributes
+    }
+
+    pub(crate) fn attributes_mut(&mut self) -> &mut [NativeLogAttribute] {
+        &mut self.attributes
     }
 
     #[must_use]
@@ -210,6 +226,7 @@ pub struct NativeLogBatch<'authority> {
     value_limit_profile: ValueLimitProfile,
     decoded_bytes: u64,
     capacity: Option<ResourceReservation<'authority>>,
+    receiver: crate::PolicyReceiver,
 }
 
 impl<'authority> NativeLogBatch<'authority> {
@@ -219,6 +236,7 @@ impl<'authority> NativeLogBatch<'authority> {
         value_limit_profile: ValueLimitProfile,
         decoded_bytes: u64,
         capacity: Option<ResourceReservation<'authority>>,
+        receiver: crate::PolicyReceiver,
     ) -> Result<Self, ReceiveFailure> {
         let mut batch = Self {
             attribution,
@@ -226,6 +244,7 @@ impl<'authority> NativeLogBatch<'authority> {
             value_limit_profile,
             decoded_bytes,
             capacity,
+            receiver,
         };
         batch.resize_after_decode()?;
         Ok(batch)
@@ -253,12 +272,14 @@ impl<'authority> NativeLogBatch<'authority> {
         Vec<NativeLogCandidate>,
         ValueLimitProfile,
         Option<ResourceReservation<'authority>>,
+        crate::PolicyReceiver,
     ) {
         (
             self.attribution,
             self.records,
             self.value_limit_profile,
             self.capacity,
+            self.receiver,
         )
     }
 
@@ -325,8 +346,13 @@ impl OtlpLogsReceiver {
                 },
             },
         };
-        let mut batch =
-            decoded::native_batch(attribution, decoded, self.value_limit_profile, capacity)?;
+        let mut batch = decoded::native_batch(
+            attribution,
+            decoded,
+            self.value_limit_profile,
+            capacity,
+            crate::PolicyReceiver::OtlpLogs,
+        )?;
         batch.resize_after_decode()?;
         Ok(batch)
     }

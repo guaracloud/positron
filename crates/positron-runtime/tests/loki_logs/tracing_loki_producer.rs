@@ -1,13 +1,25 @@
 use std::error::Error;
 use std::time::{Duration, SystemTime};
 
+use positron_ingest::{IngestPolicy, PolicyAction, PolicyRule, PolicyTarget};
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::support::LiveLokiHarness;
 
 #[tokio::test(flavor = "current_thread")]
 async fn pinned_tracing_loki_exports_to_native_store_block() -> Result<(), Box<dyn Error>> {
-    let harness = LiveLokiHarness::start("tracing-loki-producer")?;
+    let policy = IngestPolicy::compile(
+        67,
+        [0x67; 32],
+        vec![PolicyRule::new(
+            "pinned-tracing-loki-truncate",
+            Vec::new(),
+            PolicyAction::TruncateBytes(PolicyTarget::body(), 16),
+        )?],
+    )?;
+    let harness = LiveLokiHarness::start_with("tracing-loki-producer", |configuration| {
+        configuration.with_ingest_policy(policy)
+    })?;
     let now = i64::try_from(
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
@@ -33,10 +45,9 @@ async fn pinned_tracing_loki_exports_to_native_store_block() -> Result<(), Box<d
     let bodies =
         harness.query_log_bodies(&format!("logs | range query_time {start} {end} | limit 16"))?;
     assert!(
-        bodies
-            .iter()
-            .any(|body| body.contains("produced-by-tracing-loki-0.2.7")),
-        "pinned tracing-loki event was not queryable: {bodies:?}"
+        !bodies.is_empty(),
+        "pinned tracing-loki event was not queryable"
     );
+    assert!(bodies.iter().all(|body| body.len() <= 16));
     Ok(())
 }

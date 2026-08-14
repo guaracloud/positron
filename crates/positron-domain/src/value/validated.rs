@@ -20,6 +20,8 @@ pub enum AttributeValueKind {
     Array,
     /// An ordered key/value list.
     KeyValueList,
+    /// A trusted Ingest Policy transformation marker.
+    PolicyMarker,
 }
 /// A profile-bounded typed dynamic attribute value.
 ///
@@ -42,6 +44,8 @@ enum ValidatedAttributeValueInner {
     Bytes(Vec<u8>),
     Array(Vec<ValidatedAttributeValue>),
     KeyValueList(Vec<ValidatedKeyValue>),
+    PolicyMarker(PolicyValueMarker),
+    Truncated(Box<ValidatedAttributeValue>),
 }
 
 /// A profile-bounded ordered key/value entry.
@@ -81,6 +85,8 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::Bytes(_) => AttributeValueKind::Bytes,
             ValidatedAttributeValueInner::Array(_) => AttributeValueKind::Array,
             ValidatedAttributeValueInner::KeyValueList(_) => AttributeValueKind::KeyValueList,
+            ValidatedAttributeValueInner::PolicyMarker(_) => AttributeValueKind::PolicyMarker,
+            ValidatedAttributeValueInner::Truncated(value) => value.kind(),
         }
     }
 
@@ -95,6 +101,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
             | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.as_signed_integer(),
             ValidatedAttributeValueInner::SignedInteger(value) => Some(*value),
         }
     }
@@ -117,6 +125,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
             | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.as_boolean(),
         }
     }
 
@@ -132,6 +142,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
             | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.as_floating_point_bits(),
         }
     }
 
@@ -146,6 +158,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
             | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.as_str(),
             ValidatedAttributeValueInner::String(value) => Some(value),
         }
     }
@@ -162,6 +176,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Array(_)
             | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.as_bytes(),
         }
     }
 
@@ -177,6 +193,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.array_len(),
         }
     }
 
@@ -192,6 +210,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.array_entry(index),
         }
     }
 
@@ -207,6 +227,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.key_value_list_len(),
         }
     }
 
@@ -222,6 +244,8 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_) => None,
+            ValidatedAttributeValueInner::PolicyMarker(_) => None,
+            ValidatedAttributeValueInner::Truncated(value) => value.key_value_entry(index),
         }
     }
 
@@ -245,6 +269,8 @@ impl ValidatedAttributeValue {
                     checked_decoded_add(total, entry.value.decoded_size_bytes()?)
                 })
             },
+            ValidatedAttributeValueInner::PolicyMarker(_) => Ok(0),
+            ValidatedAttributeValueInner::Truncated(value) => value.decoded_size_bytes(),
         }
     }
 
@@ -266,6 +292,33 @@ impl ValidatedAttributeValue {
                     checked_decoded_add(total, entry.value.value_size_bytes()?)
                 })
             },
+            ValidatedAttributeValueInner::PolicyMarker(_) => Ok(0),
+            ValidatedAttributeValueInner::Truncated(value) => value.value_size_bytes(),
+        }
+    }
+
+    /// Returns typed transformation evidence only for policy-authored markers.
+    #[must_use]
+    pub const fn policy_marker(&self) -> Option<PolicyValueMarker> {
+        match &self.inner {
+            ValidatedAttributeValueInner::PolicyMarker(marker) => Some(*marker),
+            ValidatedAttributeValueInner::Truncated(value) => value.policy_marker(),
+            _ => None,
+        }
+    }
+
+    /// Reports that this value carries an explicit policy truncation marker.
+    #[must_use]
+    pub const fn was_truncated(&self) -> bool {
+        matches!(self.inner, ValidatedAttributeValueInner::Truncated(_))
+    }
+
+    /// Returns the retained checked prefix behind truncation evidence.
+    #[must_use]
+    pub const fn truncated_value(&self) -> Option<&ValidatedAttributeValue> {
+        match &self.inner {
+            ValidatedAttributeValueInner::Truncated(value) => Some(value),
+            _ => None,
         }
     }
 }

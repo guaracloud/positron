@@ -4,6 +4,7 @@ mod compression;
 mod empty;
 mod errors;
 mod json;
+mod policy;
 mod producer;
 mod protobuf;
 mod recovery;
