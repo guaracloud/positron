@@ -79,6 +79,7 @@ impl<'source> Parser<'source> {
         self.take(b'{')?;
         self.whitespace();
         let mut names: Vec<&str> = Vec::new();
+        let mut count = 0usize;
         let mut bytes = 0usize;
         if self.peek() == Some(b'}') {
             return Err(ReceiveFailure::MalformedPayload);
@@ -100,26 +101,33 @@ impl<'source> Parser<'source> {
             self.whitespace();
             let value_start = self.offset;
             let value_bytes = self.value(None)?;
-            bytes = bytes
-                .checked_add(name.len())
-                .and_then(|total| total.checked_add(value_bytes))
-                .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-            if let Some(labels) = output.as_deref_mut() {
-                let mut value = String::new();
-                value
-                    .try_reserve_exact(value_bytes)
-                    .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
-                let end = self.offset;
-                let mut materializer = Parser::new(
-                    self.source
-                        .get(value_start..end)
-                        .ok_or(ReceiveFailure::MalformedPayload)?,
-                    self.maximum_pairs,
-                    self.maximum_key_bytes,
-                    self.maximum_value_bytes,
-                );
-                materializer.value(Some(&mut value))?;
-                labels.push((name.to_owned(), value));
+            if value_bytes != 0 {
+                count = count
+                    .checked_add(1)
+                    .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+                bytes = bytes
+                    .checked_add(name.len())
+                    .and_then(|total| total.checked_add(value_bytes))
+                    .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+                if let Some(labels) = output.as_deref_mut() {
+                    let mut value = Vec::new();
+                    value
+                        .try_reserve_exact(value_bytes)
+                        .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+                    let end = self.offset;
+                    let mut materializer = Parser::new(
+                        self.source
+                            .get(value_start..end)
+                            .ok_or(ReceiveFailure::MalformedPayload)?,
+                        self.maximum_pairs,
+                        self.maximum_key_bytes,
+                        self.maximum_value_bytes,
+                    );
+                    materializer.value(Some(&mut value))?;
+                    let value =
+                        String::from_utf8(value).map_err(|_| ReceiveFailure::MalformedPayload)?;
+                    labels.push((name.to_owned(), value));
+                }
             }
             self.whitespace();
             match self.peek() {
@@ -136,10 +144,10 @@ impl<'source> Parser<'source> {
                     if self.offset != self.source.len() {
                         return Err(ReceiveFailure::MalformedPayload);
                     }
-                    return Ok(LabelSummary {
-                        count: names.len(),
-                        bytes,
-                    });
+                    if count == 0 {
+                        return Err(ReceiveFailure::MalformedPayload);
+                    }
+                    return Ok(LabelSummary { count, bytes });
                 },
                 _ => return Err(ReceiveFailure::MalformedPayload),
             }
@@ -169,7 +177,7 @@ impl<'source> Parser<'source> {
         Ok(name)
     }
 
-    fn value(&mut self, output: Option<&mut String>) -> Result<usize, ReceiveFailure> {
+    fn value(&mut self, output: Option<&mut Vec<u8>>) -> Result<usize, ReceiveFailure> {
         match self.peek() {
             Some(b'"') => self.quoted(output),
             Some(b'`') => self.raw(output),
@@ -177,7 +185,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn quoted(&mut self, mut output: Option<&mut String>) -> Result<usize, ReceiveFailure> {
+    fn quoted(&mut self, mut output: Option<&mut Vec<u8>>) -> Result<usize, ReceiveFailure> {
         self.offset += 1;
         let mut bytes = 0usize;
         loop {
@@ -188,25 +196,25 @@ impl<'source> Parser<'source> {
                 },
                 b'\\' => {
                     self.offset += 1;
-                    let scalar = self.escape()?;
-                    bytes = add_scalar(bytes, scalar, self.maximum_value_bytes)?;
+                    let escape = self.escape()?;
+                    bytes = add_bytes(bytes, escape.len(), self.maximum_value_bytes)?;
                     if let Some(value) = output.as_deref_mut() {
-                        value.push(scalar);
+                        escape.append(value);
                     }
                 },
                 0..=0x1f => return Err(ReceiveFailure::MalformedPayload),
                 _ => {
                     let scalar = self.scalar()?;
-                    bytes = add_scalar(bytes, scalar, self.maximum_value_bytes)?;
+                    bytes = add_bytes(bytes, scalar.len_utf8(), self.maximum_value_bytes)?;
                     if let Some(value) = output.as_deref_mut() {
-                        value.push(scalar);
+                        append_scalar(value, scalar);
                     }
                 },
             }
         }
     }
 
-    fn raw(&mut self, mut output: Option<&mut String>) -> Result<usize, ReceiveFailure> {
+    fn raw(&mut self, mut output: Option<&mut Vec<u8>>) -> Result<usize, ReceiveFailure> {
         self.offset += 1;
         let mut bytes = 0usize;
         loop {
@@ -218,37 +226,41 @@ impl<'source> Parser<'source> {
                 b'\r' => self.offset += 1,
                 _ => {
                     let scalar = self.scalar()?;
-                    bytes = add_scalar(bytes, scalar, self.maximum_value_bytes)?;
+                    bytes = add_bytes(bytes, scalar.len_utf8(), self.maximum_value_bytes)?;
                     if let Some(value) = output.as_deref_mut() {
-                        value.push(scalar);
+                        append_scalar(value, scalar);
                     }
                 },
             }
         }
     }
 
-    fn escape(&mut self) -> Result<char, ReceiveFailure> {
+    fn escape(&mut self) -> Result<Escape, ReceiveFailure> {
         let escape = self.peek().ok_or(ReceiveFailure::MalformedPayload)?;
         self.offset += 1;
         match escape {
-            b'a' => Ok('\u{0007}'),
-            b'b' => Ok('\u{0008}'),
-            b'f' => Ok('\u{000c}'),
-            b'n' => Ok('\n'),
-            b'r' => Ok('\r'),
-            b't' => Ok('\t'),
-            b'v' => Ok('\u{000b}'),
-            b'\\' => Ok('\\'),
-            b'"' => Ok('"'),
-            b'x' => self.hex_scalar(2),
-            b'u' => self.hex_scalar(4),
-            b'U' => self.hex_scalar(8),
-            b'0'..=b'7' => self.octal_scalar(escape),
+            b'a' => Ok(Escape::Scalar('\u{0007}')),
+            b'b' => Ok(Escape::Scalar('\u{0008}')),
+            b'f' => Ok(Escape::Scalar('\u{000c}')),
+            b'n' => Ok(Escape::Scalar('\n')),
+            b'r' => Ok(Escape::Scalar('\r')),
+            b't' => Ok(Escape::Scalar('\t')),
+            b'v' => Ok(Escape::Scalar('\u{000b}')),
+            b'\\' => Ok(Escape::Scalar('\\')),
+            b'"' => Ok(Escape::Scalar('"')),
+            b'x' => Ok(Escape::Byte(
+                self.hex_value(2)?
+                    .try_into()
+                    .map_err(|_| ReceiveFailure::MalformedPayload)?,
+            )),
+            b'u' => Ok(Escape::Scalar(valid_scalar(self.hex_value(4)?)?)),
+            b'U' => Ok(Escape::Scalar(valid_scalar(self.hex_value(8)?)?)),
+            b'0'..=b'7' => Ok(Escape::Byte(self.octal_byte(escape)?)),
             _ => Err(ReceiveFailure::MalformedPayload),
         }
     }
 
-    fn hex_scalar(&mut self, digits: usize) -> Result<char, ReceiveFailure> {
+    fn hex_value(&mut self, digits: usize) -> Result<u32, ReceiveFailure> {
         let mut value = 0u32;
         for _ in 0..digits {
             let digit = hex(self.take_any()?).ok_or(ReceiveFailure::MalformedPayload)?;
@@ -257,10 +269,10 @@ impl<'source> Parser<'source> {
                 .and_then(|value| value.checked_add(u32::from(digit)))
                 .ok_or(ReceiveFailure::MalformedPayload)?;
         }
-        valid_scalar(value)
+        Ok(value)
     }
 
-    fn octal_scalar(&mut self, first: u8) -> Result<char, ReceiveFailure> {
+    fn octal_byte(&mut self, first: u8) -> Result<u8, ReceiveFailure> {
         let mut value = u32::from(first - b'0');
         for _ in 0..2 {
             let byte = self.take_any()?;
@@ -269,10 +281,9 @@ impl<'source> Parser<'source> {
             }
             value = value * 8 + u32::from(byte - b'0');
         }
-        if value > u32::from(u8::MAX) {
-            return Err(ReceiveFailure::MalformedPayload);
-        }
-        valid_scalar(value)
+        value
+            .try_into()
+            .map_err(|_| ReceiveFailure::MalformedPayload)
     }
 
     fn scalar(&mut self) -> Result<char, ReceiveFailure> {
@@ -307,15 +318,45 @@ impl<'source> Parser<'source> {
     }
 
     fn whitespace(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        {
             self.offset += 1;
         }
     }
 }
 
-fn add_scalar(bytes: usize, scalar: char, maximum: usize) -> Result<usize, ReceiveFailure> {
+#[derive(Clone, Copy)]
+enum Escape {
+    Byte(u8),
+    Scalar(char),
+}
+
+impl Escape {
+    const fn len(self) -> usize {
+        match self {
+            Self::Byte(_) => 1,
+            Self::Scalar(value) => value.len_utf8(),
+        }
+    }
+
+    fn append(self, output: &mut Vec<u8>) {
+        match self {
+            Self::Byte(value) => output.push(value),
+            Self::Scalar(value) => append_scalar(output, value),
+        }
+    }
+}
+
+fn append_scalar(output: &mut Vec<u8>, scalar: char) {
+    let mut encoded = [0_u8; 4];
+    output.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+}
+
+fn add_bytes(bytes: usize, additional: usize, maximum: usize) -> Result<usize, ReceiveFailure> {
     bytes
-        .checked_add(scalar.len_utf8())
+        .checked_add(additional)
         .filter(|bytes| *bytes <= maximum)
         .ok_or(ReceiveFailure::ValueLimitExceeded)
 }

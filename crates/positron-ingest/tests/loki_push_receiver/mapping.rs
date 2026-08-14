@@ -122,7 +122,8 @@ fn protobuf_push_decodes_raw_snappy_and_preserves_repeated_metadata() -> Result<
     let fixture = fixture(instance.default_tenant_id())?;
     let protobuf = PushRequest {
         streams: vec![StreamAdapter {
-            labels: "{app=\"api\",trace_id=\"00112233445566778899aabbccddeeff\"}".to_owned(),
+            labels: r#"{app="api",empty="",escaped="\xC3\xA9",trace_id="00112233445566778899aabbccddeeff"}"#
+                .to_owned(),
             entries: vec![EntryAdapter {
                 timestamp: Some(Timestamp {
                     seconds: 1,
@@ -176,6 +177,16 @@ fn protobuf_push_decodes_raw_snappy_and_preserves_repeated_metadata() -> Result<
             CandidateAttributeValue::string("first".to_owned()),
             CandidateAttributeValue::string("second".to_owned()),
         ]
+    );
+    assert_string(record, AttributeNamespace::Stream, "escaped", "é")?;
+    assert!(
+        !record
+            .attributes()
+            .iter()
+            .any(
+                |attribute| attribute.namespace() == AttributeNamespace::Stream
+                    && attribute.key() == "empty"
+            )
     );
     assert_eq!(
         record.metadata().trace_id(),

@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{AuthenticatedLokiPushRequest, LokiPushReceiver, ReceiveFailure};
 use positron_kernel::MountQualification;
@@ -102,7 +103,7 @@ fn protobuf_labels_follow_pinned_prometheus_name_and_uniqueness_rules() -> Resul
 
     for labels in [
         " \t{ app = \"api\" , _env9 = `prod,blue` }\n",
-        r#"{esc="a\n\t\xAF\u263a\U0001F600\101\377\a\b\f\r\v\\\""}"#,
+        r#"{esc="a\n\t\xC3\xA9\303\251\u263a\U0001F600\a\b\f\r\v\\\""}"#,
         "{raw=\x60left\rright\x60}",
     ] {
         let credential = PresentedCredential::parse(ingest_secret)?;
@@ -126,10 +127,25 @@ fn protobuf_labels_follow_pinned_prometheus_name_and_uniqueness_rules() -> Resul
             RequestedIntent::Ingest,
             CompatibilityHints::none(),
         )?;
-        let labels = format!(r#"{{app="{}"}}"#, "x".repeat(length));
+        let labels = format!(r#"{{app="{}"}}"#, r"\x61".repeat(length));
         let request = admitted(context, governor, request(1, 0, &labels))?;
         match expected {
-            None => assert_eq!(LokiPushReceiver::new().decode(request)?.records().len(), 1),
+            None => {
+                let batch = LokiPushReceiver::new().decode(request)?;
+                let record = batch.records().first().ok_or("missing boundary record")?;
+                let attribute = record
+                    .attributes()
+                    .iter()
+                    .find(|attribute| {
+                        attribute.namespace() == AttributeNamespace::Stream
+                            && attribute.key() == "app"
+                    })
+                    .ok_or("missing boundary label")?;
+                assert_eq!(
+                    attribute.occurrences(),
+                    [CandidateAttributeValue::string("a".repeat(length))]
+                );
+            },
             Some(expected) => assert_eq!(
                 LokiPushReceiver::new()
                     .decode(request)
@@ -142,6 +158,8 @@ fn protobuf_labels_follow_pinned_prometheus_name_and_uniqueness_rules() -> Resul
 
     for labels in [
         "{}",
+        r#"{app=""}"#,
+        r#"{app="",env=""}"#,
         r#"{1bad="value"}"#,
         r#"{bad.name="value"}"#,
         r#"{bad:name="value"}"#,
@@ -157,8 +175,12 @@ fn protobuf_labels_follow_pinned_prometheus_name_and_uniqueness_rules() -> Resul
         r#"{bad="\12"}"#,
         r#"{bad="\400"}"#,
         r#"{bad="\xG0"}"#,
+        r#"{bad="\xAF"}"#,
+        r#"{bad="\377"}"#,
         r#"{bad="\U00110000"}"#,
         r#"{bad="value"} trailing"#,
+        "\x0b{app=\"value\"}",
+        "{app=\"value\"}\x0c",
     ] {
         let credential = PresentedCredential::parse(ingest_secret)?;
         let context = instance.attribute(

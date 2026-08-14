@@ -128,16 +128,23 @@ fn invalid_label_sets_fail_without_storage_and_valid_follow_up_succeeds()
         ("Content-Type", "application/x-protobuf"),
         ("Content-Encoding", "snappy"),
     ];
-    support::assert_status(
-        harness.http(
-            ListenerRole::LokiPush,
-            "POST",
-            "/loki/api/v1/push",
-            &protobuf_headers,
-            &producer::snappy_push_with_labels("invalid-protobuf", r#"{app="bad\z"}"#)?,
-        )?,
-        400,
-    );
+    for labels in [
+        r#"{app="bad\z"}"#,
+        r#"{app=""}"#,
+        r#"{app="\xAF"}"#,
+        "\x0b{app=\"api\"}",
+    ] {
+        support::assert_status(
+            harness.http(
+                ListenerRole::LokiPush,
+                "POST",
+                "/loki/api/v1/push",
+                &protobuf_headers,
+                &producer::snappy_push_with_labels("invalid-protobuf", labels)?,
+            )?,
+            400,
+        );
+    }
     let query = "logs | range query_time 0 2000000000 | limit 16";
     assert!(harness.query_log_bodies(query)?.is_empty());
 
@@ -157,7 +164,10 @@ fn invalid_label_sets_fail_without_storage_and_valid_follow_up_succeeds()
             "POST",
             "/loki/api/v1/push",
             &protobuf_headers,
-            &producer::snappy_push_with_labels("protobuf-follow-up", " { app = `api,blue` } ")?,
+            &producer::snappy_push_with_labels(
+                "protobuf-follow-up",
+                r#"{app="",env="\x70\x72\x6f\x64"}"#,
+            )?,
         )?,
         204,
     );
