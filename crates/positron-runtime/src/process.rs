@@ -145,39 +145,6 @@ pub enum ExitOutcome {
     Fenced,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CleanupFailure {
-    first_task: Option<TaskRole>,
-    task_failures: u8,
-    listener_failures: u8,
-}
-
-impl CleanupFailure {
-    #[must_use]
-    pub const fn none() -> Self {
-        Self {
-            first_task: None,
-            task_failures: 0,
-            listener_failures: 0,
-        }
-    }
-
-    #[must_use]
-    pub const fn first_task(self) -> Option<TaskRole> {
-        self.first_task
-    }
-
-    #[must_use]
-    pub const fn task_failures(self) -> u8 {
-        self.task_failures
-    }
-
-    #[must_use]
-    pub const fn listener_failures(self) -> u8 {
-        self.listener_failures
-    }
-}
-
 impl std::fmt::Display for ExitOutcome {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Positron process exited")
@@ -202,12 +169,18 @@ pub struct RunningProcess {
     instance: Option<Arc<Mutex<crate::InitializedInstance>>>,
     fenced_volume: Option<OwnedPrimaryDataVolume>,
     services: Option<ServiceHandle>,
+    cleanup: CleanupAccumulator,
+    terminal_cleanup_complete: bool,
 }
 
 /// A process that has stopped data admission and awaits one terminal trigger.
 pub struct DrainingProcess(RunningProcess);
 
 type RunningTasks = Vec<(TaskRole, Box<dyn RunningTask>)>;
+
+mod cleanup;
+use cleanup::CleanupAccumulator;
+pub use cleanup::{CleanupFailure, CleanupPrimary, CleanupRole};
 
 impl std::fmt::Debug for RunningProcess {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -253,7 +226,10 @@ impl RunningProcess {
         let mut listener_close_failed = false;
         self.listeners.retain_mut(|listener| {
             if listener.endpoint().role().is_data() {
-                listener_close_failed |= listener.close().is_err();
+                if listener.close().is_err() && listener.close().is_err() {
+                    listener_close_failed = true;
+                    self.cleanup.record_listener(listener.endpoint().role());
+                }
                 false
             } else {
                 true
@@ -311,60 +287,51 @@ impl DrainingProcess {
         }
         self.0.state.transition(ProcessPhase::Stopping);
         self.0.tasks.clear();
-        if close_listeners(&mut self.0.listeners) {
-            return self.0.abort_shutdown();
-        }
+        self.0.cleanup.set_primary(ExitOutcome::Graceful);
+        self.0.cleanup.cleanup_listeners(&mut self.0.listeners);
         self.0.instance.take();
         self.0.fenced_volume.take();
         self.0.services.take();
         self.0.state.transition(ProcessPhase::Stopped);
-        ExitOutcome::Graceful
+        self.0.terminal_cleanup_complete = true;
+        self.0.cleanup.outcome()
     }
 }
 
 impl RunningProcess {
     fn abort_shutdown(&mut self) -> ExitOutcome {
         self.state.transition(ProcessPhase::Stopping);
-        self.cancellation.cancel();
-        for (_, task) in &mut self.tasks {
-            match task.abort() {
-                Ok(()) | Err(_) => {},
-            }
-        }
-        self.tasks.clear();
-        close_listeners(&mut self.listeners);
+        self.cleanup.set_primary(ExitOutcome::Forced);
+        self.cleanup
+            .cleanup_tasks(&self.cancellation, &mut self.tasks);
+        self.cleanup.cleanup_listeners(&mut self.listeners);
         self.instance.take();
         self.fenced_volume.take();
         self.services.take();
         self.state.transition(ProcessPhase::Stopped);
-        ExitOutcome::Forced
+        self.terminal_cleanup_complete = true;
+        self.cleanup.outcome()
     }
 }
 
 impl Drop for RunningProcess {
     fn drop(&mut self) {
-        self.state.transition(ProcessPhase::Stopping);
-        close_listeners(&mut self.listeners);
-        for (_, task) in &mut self.tasks {
-            match task.abort() {
-                Ok(()) | Err(_) => {},
-            }
+        if self.terminal_cleanup_complete {
+            return;
         }
-        self.tasks.clear();
+        self.state.transition(ProcessPhase::Stopping);
+        self.cleanup
+            .cleanup_tasks(&self.cancellation, &mut self.tasks);
+        self.cleanup.cleanup_listeners(&mut self.listeners);
         self.instance.take();
         self.fenced_volume.take();
         self.services.take();
-        self.state.transition(ProcessPhase::Stopped);
+        self.state.transition(if self.cleanup.has_failures() {
+            ProcessPhase::Fenced
+        } else {
+            ProcessPhase::Stopped
+        });
     }
-}
-
-fn close_listeners(listeners: &mut Vec<Box<dyn BoundListener>>) -> bool {
-    let mut failed = false;
-    for listener in listeners.iter_mut() {
-        failed |= listener.close().is_err();
-    }
-    listeners.clear();
-    failed
 }
 
 /// Sole owner of the runnable database lifecycle.

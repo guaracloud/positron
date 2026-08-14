@@ -21,11 +21,116 @@ fn cleanup_failures_never_report_graceful_completion_or_retain_ownership()
     )?;
     let health = process.health();
 
-    assert_eq!(
-        process.shutdown(ShutdownTrigger::FirstSignal),
-        positron_runtime::ExitOutcome::Forced
-    );
+    let positron_runtime::ExitOutcome::InternalCleanupFailure(cleanup) =
+        process.shutdown(ShutdownTrigger::FirstSignal)
+    else {
+        panic!("graceful cleanup ambiguity must be typed");
+    };
+    assert_eq!(cleanup.primary(), positron_runtime::CleanupPrimary::Forced);
     assert_eq!(health.phase(), ProcessPhase::Stopped);
+    assert!(roots.acquire_volume_again().is_ok());
+    Ok(())
+}
+
+#[test]
+fn forced_shutdown_reports_abort_and_listener_cleanup_ambiguity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("forced-cleanup-truth")?;
+    let listeners = ObservingListeners {
+        fail_close: Some(ListenerRole::Api),
+        ..ObservingListeners::default()
+    };
+    let tasks = ObservingTasks {
+        fail_abort: Some(TaskRole::Control),
+        fail_abort_also: Some(TaskRole::Api),
+        ..ObservingTasks::default()
+    };
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&listeners, &tasks),
+    )?;
+
+    let positron_runtime::ExitOutcome::InternalCleanupFailure(cleanup) =
+        process.shutdown(ShutdownTrigger::DeadlineExpired)
+    else {
+        panic!("forced cleanup ambiguity must be typed");
+    };
+    assert_eq!(cleanup.task_failures(), 2);
+    assert_eq!(cleanup.listener_failures(), 1);
+    assert_eq!(cleanup.first_task(), Some(TaskRole::Api));
+    assert_eq!(cleanup.primary(), positron_runtime::CleanupPrimary::Forced);
+    assert!(roots.acquire_volume_again().is_ok());
+    Ok(())
+}
+
+#[test]
+fn second_signal_cleanup_overflow_is_bounded_and_deterministic()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("cleanup-overflow")?;
+    let listeners = ObservingListeners {
+        fail_close: Some(ListenerRole::Api),
+        ..ObservingListeners::default()
+    };
+    let tasks = ObservingTasks {
+        fail_abort_all: true,
+        ..ObservingTasks::default()
+    };
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&listeners, &tasks),
+    )?;
+
+    let positron_runtime::ExitOutcome::InternalCleanupFailure(cleanup) =
+        process.shutdown(ShutdownTrigger::SecondSignal)
+    else {
+        panic!("cleanup overflow must remain typed");
+    };
+    assert_eq!(cleanup.task_failures(), 4);
+    assert_eq!(cleanup.listener_failures(), 1);
+    assert!(cleanup.overflowed());
+    assert_eq!(
+        cleanup.failed_roles().collect::<Vec<_>>(),
+        [
+            positron_runtime::CleanupRole::Task(TaskRole::OtlpHttp),
+            positron_runtime::CleanupRole::Task(TaskRole::Api),
+            positron_runtime::CleanupRole::Task(TaskRole::Operations),
+            positron_runtime::CleanupRole::Task(TaskRole::Control),
+        ]
+    );
+    assert!(roots.acquire_volume_again().is_ok());
+    Ok(())
+}
+
+#[test]
+fn drop_cleanup_failure_remains_observable_and_releases_ownership()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("drop-cleanup-truth")?;
+    let listeners = ObservingListeners {
+        fail_close: Some(ListenerRole::Api),
+        ..ObservingListeners::default()
+    };
+    let tasks = ObservingTasks {
+        fail_abort: Some(TaskRole::Control),
+        ..ObservingTasks::default()
+    };
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&listeners, &tasks),
+    )?;
+    let health = process.health();
+
+    drop(process);
+
+    assert_eq!(health.phase(), ProcessPhase::Fenced);
     assert!(roots.acquire_volume_again().is_ok());
     Ok(())
 }
@@ -60,10 +165,10 @@ fn deadline_aborts_every_task_and_never_reports_graceful_completion()
             .cloned()
             .collect::<Vec<_>>(),
         [
-            TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Stopping, true),
-            TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Stopping, true),
-            TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
+            TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
+            TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Stopping, true),
+            TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Stopping, true),
         ]
     );
     Ok(())

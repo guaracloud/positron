@@ -86,6 +86,8 @@ impl ApplicationRuntime {
                         instance: None,
                         fenced_volume: Some(fenced_volume),
                         services: None,
+                        cleanup: CleanupAccumulator::empty(),
+                        terminal_cleanup_complete: false,
                     });
                 }
                 return Err(cleanup_startup(
@@ -166,6 +168,8 @@ impl ApplicationRuntime {
             instance: Some(instance),
             fenced_volume: None,
             services: Some(services),
+            cleanup: CleanupAccumulator::empty(),
+            terminal_cleanup_complete: false,
         })
     }
 }
@@ -200,9 +204,9 @@ fn spawn_registered(
         match registered.spawn(cancellation.clone(), state.health(), services.cloned()) {
             Ok(task) => running.push((role, task)),
             Err(_) => {
-                return Err(cancel_and_abort(cancellation, &mut running)
-                    .err()
-                    .unwrap_or(ExitOutcome::TaskUnavailable(role)));
+                let mut cleanup = CleanupAccumulator::new(ExitOutcome::TaskUnavailable(role));
+                cleanup.cleanup_tasks(cancellation, &mut running);
+                return Err(cleanup.outcome());
             },
         }
     }
@@ -221,54 +225,16 @@ fn spawn_tasks(
     Ok(())
 }
 
-fn cancel_and_abort(
-    cancellation: &TaskCancellation,
-    running: &mut RunningTasks,
-) -> Result<(), ExitOutcome> {
-    cancellation.cancel();
-    let mut cleanup = CleanupFailure::none();
-    let mut failed = Vec::new();
-    for (index, (role, task)) in running.iter_mut().enumerate().rev() {
-        if task.abort().is_err() {
-            cleanup.first_task.get_or_insert(*role);
-            failed.push(index);
-        }
-    }
-    for index in failed {
-        let (_, task) = &mut running[index];
-        if task.abort().is_err() {
-            cleanup.task_failures = cleanup.task_failures.saturating_add(1);
-        }
-    }
-    running.clear();
-    if cleanup.task_failures > 0 {
-        Err(ExitOutcome::InternalCleanupFailure(cleanup))
-    } else {
-        Ok(())
-    }
-}
-
 fn cleanup_startup(
     primary: ExitOutcome,
     cancellation: &TaskCancellation,
     listeners: &mut Vec<Box<dyn BoundListener>>,
     tasks: &mut RunningTasks,
 ) -> ExitOutcome {
-    let mut cleanup = match cancel_and_abort(cancellation, tasks) {
-        Err(ExitOutcome::InternalCleanupFailure(cleanup)) => cleanup,
-        Ok(()) | Err(_) => CleanupFailure::none(),
-    };
-    for listener in listeners.iter_mut().rev() {
-        if listener.close().is_err() {
-            cleanup.listener_failures = cleanup.listener_failures.saturating_add(1);
-        }
-    }
-    listeners.clear();
-    if cleanup.task_failures > 0 || cleanup.listener_failures > 0 {
-        ExitOutcome::InternalCleanupFailure(cleanup)
-    } else {
-        primary
-    }
+    let mut cleanup = CleanupAccumulator::new(primary);
+    cleanup.cleanup_tasks(cancellation, tasks);
+    cleanup.cleanup_listeners(listeners);
+    cleanup.outcome()
 }
 
 struct BootstrapAttemptFailure {

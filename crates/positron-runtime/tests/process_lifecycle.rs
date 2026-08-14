@@ -1,5 +1,3 @@
-//! Public process-lifecycle contract tests for the runnable M1 database.
-
 use positron_runtime::{
     ApplicationRuntime, BoundEndpoint, BoundListener, HostInputs, InitializationMode,
     ListenerFactory, ListenerFailure, ListenerRequest, ListenerRole, ProcessPhase, Readiness,
@@ -21,6 +19,7 @@ pub struct ObservingListeners {
     pub health: RefCell<Vec<positron_runtime::HealthState>>,
     fail_role: Option<ListenerRole>,
     fail_close: Option<ListenerRole>,
+    mismatched_role: Option<ListenerRole>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +37,9 @@ pub struct ObservingTasks {
     fail_spawn: Option<TaskRole>,
     fail_join: Option<TaskRole>,
     fail_abort: Option<TaskRole>,
+    fail_abort_also: Option<TaskRole>,
+    fail_abort_all: bool,
+    fail_abort_once: Option<TaskRole>,
 }
 
 impl ObservingTasks {
@@ -66,10 +68,21 @@ impl ListenerFactory for ObservingListeners {
             return Err(ListenerFailure::BindUnavailable);
         }
         let endpoint = if role == ListenerRole::Control {
-            BoundEndpoint::control(PathBuf::from("/tmp/positron-test-control.sock"))?
+            if self.mismatched_role == Some(role) {
+                BoundEndpoint::tcp(
+                    ListenerRole::Api,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42_401)),
+                )?
+            } else {
+                BoundEndpoint::control(PathBuf::from("/tmp/positron-test-control.sock"))?
+            }
         } else {
             BoundEndpoint::tcp(
-                role,
+                if self.mismatched_role == Some(role) {
+                    ListenerRole::Api
+                } else {
+                    role
+                },
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, role.test_port())),
             )?
         };
@@ -78,45 +91,6 @@ impl ListenerFactory for ObservingListeners {
             fail_close: self.fail_close == Some(role),
         }))
     }
-}
-
-#[test]
-fn listener_bind_failure_is_typed_and_releases_the_volume_claim()
--> Result<(), Box<dyn std::error::Error>> {
-    let roots = TestRoots::new("bind-fault")?;
-    let listeners = ObservingListeners {
-        fail_role: Some(ListenerRole::OtlpHttp),
-        ..ObservingListeners::default()
-    };
-    let tasks = ObservingTasks::default();
-
-    let failure = ApplicationRuntime::start(
-        ServeConfiguration::new(
-            roots.bootstrap_paths()?,
-            InitializationMode::InitializeIfEmpty,
-        ),
-        HostInputs::new(&listeners, &tasks),
-    )
-    .expect_err("listener bind failure must fail startup");
-
-    assert_eq!(
-        failure,
-        positron_runtime::ExitOutcome::ListenerUnavailable(ListenerRole::OtlpHttp)
-    );
-    assert!(roots.acquire_volume_again().is_ok());
-    assert_eq!(
-        tasks
-            .events
-            .borrow()
-            .iter()
-            .filter_map(|event| match event {
-                TaskEvent::Spawned(role) => Some(*role),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        [TaskRole::Control, TaskRole::Operations]
-    );
-    Ok(())
 }
 
 struct ObservedListener {
@@ -149,7 +123,10 @@ impl TaskRegistrar for ObservingTasks {
             events: Rc::clone(&self.events),
             fail_spawn: self.fail_spawn == Some(role),
             fail_join: self.fail_join == Some(role),
-            fail_abort: self.fail_abort == Some(role),
+            fail_abort: self.fail_abort_all
+                || self.fail_abort == Some(role)
+                || self.fail_abort_also == Some(role),
+            fail_abort_once: self.fail_abort_once == Some(role),
         }))
     }
 }
@@ -160,6 +137,7 @@ struct ObservedRegisteredTask {
     fail_spawn: bool,
     fail_join: bool,
     fail_abort: bool,
+    fail_abort_once: bool,
 }
 
 impl RegisteredTask for ObservedRegisteredTask {
@@ -180,6 +158,8 @@ impl RegisteredTask for ObservedRegisteredTask {
             health,
             fail_join: self.fail_join,
             fail_abort: self.fail_abort,
+            fail_abort_once: self.fail_abort_once,
+            abort_attempts: 0,
         }))
     }
 }
@@ -276,6 +256,50 @@ fn partial_spawn_with_failed_rollback_reports_internal_cleanup_failure()
 }
 
 #[test]
+fn nested_spawn_rollback_merges_data_control_and_listener_cleanup_truth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("nested-cleanup")?;
+    let listeners = ObservingListeners {
+        fail_close: Some(ListenerRole::Api),
+        ..ObservingListeners::default()
+    };
+    let tasks = ObservingTasks {
+        fail_spawn: Some(TaskRole::OtlpHttp),
+        fail_abort: Some(TaskRole::Api),
+        fail_abort_also: Some(TaskRole::Control),
+        ..ObservingTasks::default()
+    };
+
+    let failure = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&listeners, &tasks),
+    )
+    .expect_err("nested cleanup ambiguity must be preserved");
+    let positron_runtime::ExitOutcome::InternalCleanupFailure(cleanup) = failure else {
+        panic!("unexpected outcome: {failure:?}");
+    };
+    assert_eq!(cleanup.task_failures(), 2);
+    assert_eq!(cleanup.listener_failures(), 1);
+    assert_eq!(
+        cleanup.primary(),
+        positron_runtime::CleanupPrimary::TaskUnavailable(TaskRole::OtlpHttp)
+    );
+    assert_eq!(
+        cleanup.failed_roles().collect::<Vec<_>>(),
+        [
+            positron_runtime::CleanupRole::Task(TaskRole::Api),
+            positron_runtime::CleanupRole::Task(TaskRole::Control),
+            positron_runtime::CleanupRole::Listener(ListenerRole::Api),
+        ]
+    );
+    assert!(roots.acquire_volume_again().is_ok());
+    Ok(())
+}
+
+#[test]
 fn fenced_partial_task_spawn_failure_aborts_started_tasks_and_releases_ownership()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = TestRoots::new("fenced-spawn-fault")?;
@@ -314,6 +338,8 @@ struct ObservedRunningTask {
     health: positron_runtime::HealthState,
     fail_join: bool,
     fail_abort: bool,
+    fail_abort_once: bool,
+    abort_attempts: u8,
 }
 
 impl RunningTask for ObservedRunningTask {
@@ -335,12 +361,13 @@ impl RunningTask for ObservedRunningTask {
     }
 
     fn abort(&mut self) -> Result<(), TaskFailure> {
+        self.abort_attempts = self.abort_attempts.saturating_add(1);
         self.events.borrow_mut().push(TaskEvent::Aborted(
             self.role,
             self.health.phase(),
             self.cancellation.is_cancelled(),
         ));
-        if self.fail_abort {
+        if self.fail_abort || (self.fail_abort_once && self.abort_attempts == 1) {
             Err(TaskFailure::AbortUnavailable)
         } else {
             Ok(())
@@ -348,6 +375,10 @@ impl RunningTask for ObservedRunningTask {
     }
 }
 
+#[path = "process_lifecycle/cleanup_outcomes.rs"]
+mod cleanup_outcomes;
+#[path = "process_lifecycle/listeners.rs"]
+mod listeners;
 #[path = "process_lifecycle/outcomes.rs"]
 mod outcomes;
 use outcomes::TestPort;
