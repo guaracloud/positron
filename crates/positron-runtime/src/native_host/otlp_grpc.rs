@@ -238,10 +238,15 @@ fn service_status(failure: ServiceFailure) -> Status {
         ServiceFailure::InvalidRequest => {
             Status::invalid_argument("OTLP Logs request was rejected")
         },
-        ServiceFailure::KeyUnavailable | ServiceFailure::StorageUnavailable => {
+        ServiceFailure::KeyUnavailable
+        | ServiceFailure::CatalogUnavailable
+        | ServiceFailure::LedgerUnavailable
+        | ServiceFailure::StorageUnavailable => {
             Status::unavailable("OTLP Logs ingest is temporarily unavailable")
         },
-        ServiceFailure::Internal => Status::internal("OTLP Logs ingest failed"),
+        ServiceFailure::CorruptState | ServiceFailure::Internal => {
+            Status::internal("OTLP Logs ingest failed")
+        },
     }
 }
 

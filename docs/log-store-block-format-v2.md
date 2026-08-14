@@ -66,8 +66,11 @@ index-byte budgets, overflow record and byte counters, and deterministic
 namespace-qualified path entries. Each entry preserves observed typed
 variants, observation and conflict counts, query-use count, promotion state,
 and index bytes. The object is content-addressed and published only through
-the Storage Kernel Catalog Writer with the generation precondition and
-governance evidence required by ADR-0069.
+the Storage Kernel Catalog Writer with the generation precondition and typed
+governance evidence required by ADR-0069. It is rebuildable optimization state,
+published only after bootstrap replay before Serving or during graceful
+shutdown after ingest drains. A process crash leaves version 2 blocks as the
+authoritative replay source and does not require a new block version or tag.
 
 Discovery spends bounded work and admits an entry only when every applicable
 catalog and index budget remains available. A valid attribute that cannot be
@@ -76,4 +79,10 @@ Schema Overflow. Its namespace, key, ordered occurrences, and complete native
 values remain unchanged; overflow updates only bounded evidence and never
 allocates catalog, statistics, dictionary, or automatic-index state. Generic
 and overflow records therefore have identical logical scan and typed-query
-semantics, while overflow scans report reduced pruning.
+semantics, while overflow scans report reduced pruning. Promoted scalar paths
+carry a canonical typed-variant dictionary whose byte cost is two framing bytes
+plus one byte per variant. Dictionary budget exhaustion overflows the complete
+attribute root atomically. The dictionary can reject an impossible type before
+value traversal; exact value comparison, ordered nested duplicates, and
+explicit `index`, `any`, and `all` selection still use the source-of-truth
+record values with no coercion.

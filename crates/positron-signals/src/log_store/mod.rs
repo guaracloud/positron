@@ -8,6 +8,7 @@ mod metadata;
 mod policy_provenance;
 mod scan;
 mod schema;
+mod schema_scan;
 mod types;
 
 #[cfg(fuzzing)]
@@ -16,9 +17,9 @@ pub use fuzzing::fuzz_log_store_block;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
-    LedgerSnapshot, LifecycleClock, LifecycleClockSource, PreparedStoreBlock, ResourceAmounts,
-    ResourceDimension, ResourceGovernor, ResourceReservation, SegmentScope, StoreBlockIdentity,
-    WorkClaim, WorkKind,
+    CommittedBlock, LedgerSnapshot, LifecycleClock, LifecycleClockSource, PreparedStoreBlock,
+    ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation, SegmentScope,
+    StoreBlockIdentity, WorkClaim, WorkKind,
 };
 
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
@@ -26,8 +27,9 @@ pub use metadata::LogMetadata;
 pub use policy_provenance::PolicyProvenance;
 pub use scan::{LogScan, LogScanResult, ScanLimit, ScannedLogRecord};
 pub use schema::{
-    OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaEntry, SchemaFailure, SchemaObservation,
-    SchemaPath, SchemaQuery, SchemaQueryResult, SchemaRepresentation, SchemaValue,
+    OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta,
+    SchemaEntry, SchemaFailure, SchemaObservation, SchemaPath, SchemaQuery, SchemaQueryResult,
+    SchemaRepresentation, SchemaValue,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
@@ -59,30 +61,90 @@ impl LogStore {
         identity: StoreBlockIdentity,
         records: Vec<LogRecord>,
     ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
-        self.prepare_internal(capacity, clock, tenant, shard, identity, records, None)
+        self.prepare_internal(capacity, clock, tenant, shard, identity, records)
     }
 
-    /// Prepares a block while atomically observing bounded schema state for its records.
+    /// Prepares a block and its bounded schema delta without mutating live schema state.
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_with_schema<'capacity, S: LifecycleClockSource>(
+    pub fn prepare_with_schema_delta<'capacity, S: LifecycleClockSource>(
         &self,
         capacity: ResourceReservation<'capacity>,
         clock: &LifecycleClock<S>,
         tenant: TenantId,
         shard: VirtualShardId,
         identity: StoreBlockIdentity,
-        records: Vec<LogRecord>,
+        mut records: Vec<LogRecord>,
+        schema: &SchemaCatalog,
+    ) -> Result<(PreparedLogBlock<'capacity>, SchemaDelta), LogStoreFailure> {
+        let delta = self.stage_schema_group(&mut records, schema)?;
+        self.prepare_internal(capacity, clock, tenant, shard, identity, records)
+            .map(|prepared| (prepared, delta))
+    }
+
+    /// Stages one complete group's root-atomic schema decisions against an immutable view.
+    pub fn stage_schema_group(
+        &self,
+        records: &mut [LogRecord],
+        schema: &SchemaCatalog,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        let mut delta = SchemaDelta::empty();
+        let mut meter = schema::delta::DiscoveryMeter::new();
+        for record in records.iter_mut() {
+            let mut attributes = Vec::new();
+            attributes
+                .try_reserve_exact(record.attributes().len())
+                .map_err(|_| LogStoreFailure::resource_exhausted())?;
+            for attribute in record.attributes() {
+                attributes.push(
+                    attribute
+                        .occurrences()
+                        .try_clone()
+                        .map_err(LogStoreFailure::domain)?,
+                );
+            }
+            let observation = schema
+                .stage_record(&attributes, &mut delta, &mut meter)
+                .map_err(map_schema_failure)?;
+            for (attribute, (_, representation)) in record
+                .attributes_mut()
+                .iter_mut()
+                .zip(observation.attributes())
+            {
+                attribute.set_representation(match representation {
+                    SchemaRepresentation::Cataloged => AttributeRepresentation::Generic,
+                    SchemaRepresentation::Overflow => AttributeRepresentation::SchemaOverflow,
+                });
+            }
+        }
+        Ok(delta)
+    }
+
+    /// Applies a previously staged delta after its v2 block is durably resolved.
+    pub fn apply_schema_delta(
+        &self,
         schema: &mut SchemaCatalog,
-    ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
-        self.prepare_internal(
-            capacity,
-            clock,
-            tenant,
-            shard,
-            identity,
-            records,
-            Some(schema),
-        )
+        delta: SchemaDelta,
+    ) -> Result<(), LogStoreFailure> {
+        schema.apply_delta(delta).map_err(map_schema_failure)
+    }
+
+    /// Reconstructs one committed v2 block's schema delta without changing Store Block grammar.
+    pub fn replay_schema_block(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        schema: &SchemaCatalog,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        let decoded = codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?;
+        let mut delta = SchemaDelta::empty();
+        let mut meter = schema::delta::DiscoveryMeter::new();
+        for record in decoded.records {
+            schema
+                .stage_replayed_record(record.attributes(), &mut delta, &mut meter)
+                .map_err(map_schema_failure)?;
+        }
+        Ok(delta)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -93,33 +155,12 @@ impl LogStore {
         tenant: TenantId,
         shard: VirtualShardId,
         identity: StoreBlockIdentity,
-        mut records: Vec<LogRecord>,
-        schema: Option<&mut SchemaCatalog>,
+        records: Vec<LogRecord>,
     ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
         if !capacity.authorizes_ingest_preparation(tenant, 1_048_576) {
             return Err(LogStoreFailure::resource_admission_refused());
         }
         let encoded_bytes = codec::encoded_block_length(&records)?;
-        if let Some(schema) = schema {
-            for record in &mut records {
-                let attributes = record
-                    .attributes()
-                    .iter()
-                    .map(|attribute| attribute.occurrences().clone())
-                    .collect::<Vec<_>>();
-                let observation = schema.observe(&attributes).map_err(map_schema_failure)?;
-                for (attribute, (_, representation)) in record
-                    .attributes_mut()
-                    .iter_mut()
-                    .zip(observation.attributes())
-                {
-                    attribute.set_representation(match representation {
-                        SchemaRepresentation::Cataloged => AttributeRepresentation::Generic,
-                        SchemaRepresentation::Overflow => AttributeRepresentation::SchemaOverflow,
-                    });
-                }
-            }
-        }
         let stored = records
             .into_iter()
             .map(|record| {
@@ -212,6 +253,7 @@ impl LogStore {
             records,
             complete,
             scanned_bytes,
+            false,
             capacity,
         ))
     }
@@ -226,9 +268,7 @@ fn map_schema_failure(failure: SchemaFailure) -> LogStoreFailure {
         SchemaFailure::InvalidPath | SchemaFailure::InvalidValue => {
             LogStoreFailure::invalid_input()
         },
-        SchemaFailure::MalformedCatalog | SchemaFailure::CatalogUnavailable => {
-            LogStoreFailure::invalid_input()
-        },
+        SchemaFailure::MalformedCatalog => LogStoreFailure::invalid_input(),
     }
 }
 

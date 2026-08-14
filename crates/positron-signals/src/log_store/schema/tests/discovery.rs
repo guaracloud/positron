@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn discovery_keeps_namespaces_and_counts_typed_conflicts() -> Result<(), Box<dyn Error>> {
-    let mut catalog = SchemaCatalog::new(SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
     let resource = occurrence(
         AttributeNamespace::Resource,
         "same",
@@ -53,7 +53,7 @@ fn discovery_keeps_namespaces_and_counts_typed_conflicts() -> Result<(), Box<dyn
 #[test]
 fn discovery_preserves_nested_key_paths_without_enumerating_array_indexes()
 -> Result<(), Box<dyn Error>> {
-    let mut catalog = SchemaCatalog::new(SchemaBudget::new(16, 8_192, 8_192, 4_096)?)?;
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(16, 8_192, 8_192, 4_096)?)?;
     let nested = CandidateAttributeValue::key_value_list(vec![
         positron_domain::value::CandidateKeyValue::new(
             "child".to_owned(),
@@ -85,5 +85,24 @@ fn discovery_preserves_nested_key_paths_without_enumerating_array_indexes()
             .entry(&path(AttributeNamespace::Record, "root.items[0]"))
             .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn discovery_overflows_a_whole_root_when_only_its_prefix_fits() -> Result<(), Box<dyn Error>> {
+    let mut catalog = catalog_with_small_budget();
+    let nested = CandidateAttributeValue::key_value_list(vec![
+        positron_domain::value::CandidateKeyValue::new(
+            "child".to_owned(),
+            CandidateAttributeValue::signed_integer(7),
+        ),
+    ]);
+
+    let observation =
+        catalog.observe(&[occurrence(AttributeNamespace::Record, "root", nested)?])?;
+
+    assert_eq!(observation.overflow_records(), 1);
+    assert_eq!(catalog.entry_count(), 0);
+    assert_eq!(catalog.overflow_record_count(), 1);
     Ok(())
 }

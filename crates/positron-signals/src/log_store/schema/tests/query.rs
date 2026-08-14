@@ -3,7 +3,7 @@ use positron_domain::value::AttributeValueKind;
 
 #[test]
 fn occurrence_queries_are_explicit_and_preserve_order() -> Result<(), Box<dyn Error>> {
-    let mut catalog = SchemaCatalog::new(SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
     let values = vec![
         CandidateAttributeValue::string("first".to_owned()),
         CandidateAttributeValue::string("second".to_owned()),
@@ -68,7 +68,7 @@ fn occurrence_queries_are_explicit_and_preserve_order() -> Result<(), Box<dyn Er
 
 #[test]
 fn typed_values_do_not_coerce() -> Result<(), Box<dyn Error>> {
-    let mut catalog = SchemaCatalog::new(SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
     let set = occurrence(
         AttributeNamespace::Record,
         "number",
@@ -92,7 +92,7 @@ fn typed_values_do_not_coerce() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn every_native_query_value_is_typed_and_nested_paths_are_explicit() -> Result<(), Box<dyn Error>> {
-    let mut catalog = SchemaCatalog::new(SchemaBudget::new(16, 16_384, 16_384, 4_096)?)?;
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(16, 16_384, 16_384, 4_096)?)?;
     let values = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "values".to_owned(),
@@ -205,5 +205,44 @@ fn every_native_query_value_is_typed_and_nested_paths_are_explicit() -> Result<(
             )
             .is_match()
     );
+    Ok(())
+}
+
+#[test]
+fn nested_duplicate_occurrences_are_selected_in_source_order() -> Result<(), Box<dyn Error>> {
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
+    let nested = occurrence(
+        AttributeNamespace::Record,
+        "root",
+        CandidateAttributeValue::key_value_list(vec![
+            positron_domain::value::CandidateKeyValue::new(
+                "child".to_owned(),
+                CandidateAttributeValue::string("first".to_owned()),
+            ),
+            positron_domain::value::CandidateKeyValue::new(
+                "child".to_owned(),
+                CandidateAttributeValue::string("second".to_owned()),
+            ),
+        ]),
+    )?;
+    let observation = catalog.observe(std::slice::from_ref(&nested))?;
+    let child = path(AttributeNamespace::Record, "root.child");
+
+    for (selector, value, expected) in [
+        (OccurrenceSelector::Index(0), "first", true),
+        (OccurrenceSelector::Index(1), "second", true),
+        (OccurrenceSelector::Any, "second", true),
+        (OccurrenceSelector::All, "first", false),
+    ] {
+        assert_eq!(
+            catalog
+                .query(
+                    &observation,
+                    &query(child.clone(), SchemaValue::string(value), selector),
+                )
+                .is_match(),
+            expected
+        );
+    }
     Ok(())
 }

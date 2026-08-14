@@ -1,6 +1,9 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 
-use super::{CatalogRootRotationStage, GovernanceAuditEntry, InitializationAuditEntry};
+use super::{
+    CatalogRootRotationStage, GovernanceAuditEntry, InitializationAuditEntry,
+    schema_checkpoint_audit_intent,
+};
 use crate::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 
 fn audit_intent() -> Vec<u8> {
@@ -116,4 +119,26 @@ fn audit_schema_router_returns_one_typed_redacted_rotation_entry_or_refuses() {
     let mut zero_provider = valid;
     zero_provider[epoch_start - 16..epoch_start].fill(0);
     assert!(GovernanceAuditEntry::decode_fields(1, [1; 16], &zero_provider).is_err());
+}
+
+#[test]
+fn schema_checkpoint_audit_is_typed_tenant_bound_and_strict() {
+    let tenant = TenantId::from_bytes([21; 16]).expect("tenant");
+    let transaction = [22; 16];
+    let intent = schema_checkpoint_audit_intent(tenant, b"bounded checkpoint").expect("intent");
+    let entry = GovernanceAuditEntry::decode_fields(9, transaction, &intent).expect("entry");
+    let checkpoint = entry.as_schema_checkpoint().expect("checkpoint");
+    assert_eq!(entry.action(), "schema-checkpoint.replace");
+    assert_eq!(entry.outcome(), "succeeded");
+    assert_eq!(checkpoint.position(), 9);
+    assert_eq!(checkpoint.transaction_id(), transaction);
+    assert_eq!(checkpoint.tenant_id(), tenant);
+    assert_ne!(checkpoint.checkpoint_digest(), [0; 32]);
+
+    for length in [0, 7, 8, intent.len() - 1] {
+        assert!(GovernanceAuditEntry::decode_fields(9, transaction, &intent[..length]).is_err());
+    }
+    let mut trailing = intent;
+    trailing.push(0);
+    assert!(GovernanceAuditEntry::decode_fields(9, transaction, &trailing).is_err());
 }

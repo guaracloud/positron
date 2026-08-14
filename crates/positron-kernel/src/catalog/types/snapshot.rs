@@ -44,6 +44,9 @@ impl CatalogSnapshot {
     pub(crate) fn plaintext_objects(&self) -> impl Iterator<Item = &[u8]> {
         self.0.objects.values().map(AsRef::as_ref)
     }
+    pub(crate) fn plaintext_object_count(&self) -> usize {
+        self.0.objects.len()
+    }
     #[must_use]
     pub fn governance_audit_frontier(&self) -> u64 {
         self.0.audit_frontier.position

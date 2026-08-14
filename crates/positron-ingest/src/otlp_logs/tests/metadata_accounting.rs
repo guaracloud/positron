@@ -5,6 +5,7 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::CandidateAttributeValue;
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 
+use super::super::bounds::grouped_retained_bytes;
 use super::super::{AuthenticatedOtlpLogsRequest, OtlpLogsReceiver, OtlpPayload, ReceiveFailure};
 use crate::tests::support::{Fixture, attribution, fixture};
 use crate::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, NativeLogCandidate};
@@ -39,7 +40,10 @@ fn shared_metadata_fanout_is_reserved_per_clone_and_one_byte_per_record_over_is_
         .governor()
         .inspect()?
         .usage(ResourceDimension::MemoryBytes);
-    assert_eq!(retained_bytes, batch.decoded_bytes);
+    assert_eq!(
+        retained_bytes,
+        grouped_retained_bytes(batch.decoded_bytes, batch.records().len())?
+    );
     assert!(retained_bytes > EXACT_CLONED_METADATA_BYTES);
     drop(batch);
     assert_eq!(
@@ -90,7 +94,10 @@ fn empty_record_structures_and_group_planning_are_retained_in_memory_charge()
         .governor()
         .inspect()?
         .usage(ResourceDimension::MemoryBytes);
-    assert!(grouped_usage > decoded_usage);
+    assert_eq!(
+        grouped_usage, decoded_usage,
+        "decode must retain the known group-planning peak so grouping never regrows capacity"
+    );
     drop(groups);
     assert_eq!(
         fixture

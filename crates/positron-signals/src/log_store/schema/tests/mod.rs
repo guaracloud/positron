@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use positron_domain::identity::TenantId;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue, ValueLimitProfile,
 };
@@ -8,14 +9,21 @@ use super::super::{
     OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery, SchemaValue,
 };
 
+mod bounds;
+mod checkpoint;
 mod codec;
 mod discovery;
 mod overflow;
+mod promotion;
 mod query;
 mod recovery;
 
 fn profile() -> ValueLimitProfile {
     ValueLimitProfile::release_1_system_maximum()
+}
+
+fn tenant() -> TenantId {
+    TenantId::from_bytes([0x71; 16]).expect("nonzero tenant")
 }
 
 fn occurrence(
@@ -34,7 +42,7 @@ fn path(namespace: AttributeNamespace, key: &str) -> SchemaPath {
 }
 
 fn small_budget() -> SchemaBudget {
-    SchemaBudget::new(1, 128, 256, 64).expect("bounded test budget")
+    SchemaBudget::new(1, 512, 256, 64).expect("bounded test budget")
 }
 
 fn query(path: SchemaPath, value: SchemaValue, selector: OccurrenceSelector) -> SchemaQuery {
@@ -42,5 +50,5 @@ fn query(path: SchemaPath, value: SchemaValue, selector: OccurrenceSelector) -> 
 }
 
 fn catalog_with_small_budget() -> SchemaCatalog {
-    SchemaCatalog::new(small_budget()).expect("bounded catalog")
+    SchemaCatalog::new(tenant(), small_budget()).expect("bounded catalog")
 }

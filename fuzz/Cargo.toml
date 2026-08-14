@@ -111,6 +111,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "schema_discovery_query"
+path = "fuzz_targets/schema_discovery_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "query_inputs"
 path = "fuzz_targets/query_inputs.rs"
 test = false

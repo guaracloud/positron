@@ -108,7 +108,12 @@ impl LiveLokiHarness {
             .process
             .as_ref()
             .and_then(RunningProcess::services)
-            .ok_or("runtime services missing")?;
+            .ok_or_else(|| {
+                format!(
+                    "runtime services missing in phase {:?}",
+                    self.process.as_ref().map(RunningProcess::health)
+                )
+            })?;
         Ok(services.query_log_bodies(
             &self.query_secret,
             query,

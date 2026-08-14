@@ -558,7 +558,19 @@ Overflow placement decision. Catalog state is immutable to the Signal Store
 and is published only through the Storage Kernel Catalog Writer; no receiver
 or private schema publisher may bypass that authority. Generic and overflow
 representations use the same logical scan and explicit typed occurrence query
-semantics.
+semantics. Scalar paths consume an exact bounded typed-variant dictionary
+budget; an unavailable dictionary or Schema Overflow selects the generic scan
+and exposes reduced pruning without changing `index`, `any`, or `all` results.
+
+Committed version 2 blocks, including their generic versus Schema Overflow
+root tags, are authoritative. The tenant-bound `PSCHEMA1` object is rebuildable
+optimization state. Runtime loads it and replays authenticated blocks before
+Serving, then publishes a changed checkpoint through the existing Catalog
+Writer before opening data admission. During Serving, ingest changes only the
+governed live session. The next publication occurs during graceful shutdown
+after listeners and admitted ingest drain; a crash instead rebuilds on the next
+bootstrap. No per-ingest publisher, queue, or competing Catalog authority
+exists.
 
 The canonical Log Store Block layout and bounded logical scan are defined by
 [`log-store-block-format-v2.md`](log-store-block-format-v2.md), which preserves

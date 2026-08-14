@@ -152,6 +152,7 @@ fn unchanged_body_that_exceeds_the_post_policy_limit_is_rejected() -> Result<(),
             &policy,
             fixture.tenant,
             shard,
+            super::schema_support::session(&fixture)?,
         )
         .accept(batch, StoreBlockIdentity::new([0x6c; 16])?),
         IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)

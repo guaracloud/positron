@@ -1,126 +1,28 @@
 use positron_domain::identity::{Scope, TenantId};
 use positron_domain::routing::VirtualShardId;
 use positron_kernel::{
-    ActiveSegmentLedger, AppendCancellation, CommitReceipt, LifecycleClock, LifecycleClockSource,
-    StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, AppendCancellation, LedgerCompletionState, LifecycleClock,
+    LifecycleClockSource, ResourceAmounts, ResourceDimension, StorageKernelResourceAuthority,
+    StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_signals::LogStore;
 
-use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation};
+use crate::schema_session::DurableSchemaOutcome;
+use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation, TenantSchemaSession};
 
 mod capacity;
 mod failure;
+mod outcome;
+mod schema_resolution;
 
-use capacity::group_work_amounts;
+use capacity::{group_work_amounts, schema_admission_estimate};
 pub(crate) use failure::classify_log_store_failure_code;
 use failure::map_ledger_failure;
-
-/// One independently committed Admission Group.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CommittedAdmission {
-    receipt: CommitReceipt,
-    records: usize,
-}
-
-/// A durable accepted subset plus explicit permanent rejections.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PartialAdmission {
-    committed: CommittedAdmission,
-    rejections: [RejectionDetail; 3],
-    rejection_class_count: u8,
-}
-
-/// One deterministic permanent-rejection class and its bounded record count.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RejectionDetail {
-    code: IngestFailureCode,
-    records: usize,
-}
-
-impl RejectionDetail {
-    const EMPTY: Self = Self {
-        code: IngestFailureCode::PolicyRejected,
-        records: 0,
-    };
-
-    #[must_use]
-    pub const fn code(self) -> IngestFailureCode {
-        self.code
-    }
-
-    #[must_use]
-    pub const fn records(self) -> usize {
-        self.records
-    }
-}
-
-impl PartialAdmission {
-    #[must_use]
-    pub const fn committed(self) -> CommittedAdmission {
-        self.committed
-    }
-
-    #[must_use]
-    pub fn permanently_rejected(self) -> usize {
-        self.rejections().iter().map(|detail| detail.records).sum()
-    }
-
-    #[must_use]
-    pub fn rejections(&self) -> &[RejectionDetail] {
-        self.rejections
-            .get(..usize::from(self.rejection_class_count))
-            .unwrap_or_default()
-    }
-}
-
-impl CommittedAdmission {
-    #[must_use]
-    pub const fn receipt(self) -> CommitReceipt {
-        self.receipt
-    }
-
-    #[must_use]
-    pub const fn records(self) -> usize {
-        self.records
-    }
-}
-
-/// Stable secret-free failure classes at the native ingest seam.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IngestFailureCode {
-    TenantConflict,
-    PolicyRejected,
-    InvalidRecord,
-    ValueLimitExceeded,
-    CapacityUnavailable,
-    StorageUnavailable,
-    Cancelled,
-    IdempotencyConflict,
-}
-
-/// Complete outcome for one independently admitted group.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IngestOutcome {
-    Full(CommittedAdmission),
-    Partial(PartialAdmission),
-    Retryable(IngestFailureCode),
-    Permanent(IngestFailureCode),
-    Ambiguous(IngestFailureCode),
-}
-
-impl IngestOutcome {
-    /// Converts only a known post-commit producer disconnect into explicit
-    /// ambiguity. Pre-commit failures retain their original classification.
-    #[must_use]
-    pub const fn producer_disconnected_after_commit(self) -> Self {
-        match self {
-            Self::Full(_) | Self::Partial(_) => {
-                Self::Ambiguous(IngestFailureCode::StorageUnavailable)
-            },
-            other => other,
-        }
-    }
-}
+pub use outcome::{
+    CommittedAdmission, IngestFailureCode, IngestOutcome, PartialAdmission, RejectionDetail,
+};
+use outcome::{increment_rejection, partial_admission};
+use schema_resolution::{map_schema_session_failure, retain_schema_capacity, rollback_schema};
 
 /// Concrete receiver-independent Log ingestion path.
 pub struct LogIngest<'service, 'kernel, 'catalog, S> {
@@ -130,19 +32,21 @@ pub struct LogIngest<'service, 'kernel, 'catalog, S> {
     policy: &'service IngestPolicy,
     tenant: TenantId,
     shard: VirtualShardId,
+    schema: TenantSchemaSession,
 }
 
 impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
     LogIngest<'service, 'kernel, 'catalog, S>
 {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         authority: &'kernel StorageKernelResourceAuthority,
         ledger: &'service ActiveSegmentLedger<'kernel, 'catalog>,
         clock: &'service LifecycleClock<S>,
         policy: &'service IngestPolicy,
         tenant: TenantId,
         shard: VirtualShardId,
+        schema: TenantSchemaSession,
     ) -> Self {
         Self {
             authority,
@@ -151,6 +55,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             policy,
             tenant,
             shard,
+            schema,
         }
     }
 
@@ -193,7 +98,11 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             Ok(count) => count,
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
-        let Some(group_amounts) = group_work_amounts(input_record_count, self.policy.budget())
+        let Some(schema_estimate) = schema_admission_estimate(&records) else {
+            return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+        };
+        let Some(group_amounts) =
+            group_work_amounts(input_record_count, self.policy.budget(), schema_estimate)
         else {
             return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
         };
@@ -218,6 +127,20 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     },
                 }
             },
+        };
+        let schema_claim = match ResourceAmounts::only(
+            ResourceDimension::MemoryBytes,
+            schema_estimate.retained_memory_bytes(),
+        )
+        .ok()
+        .and_then(|amounts| WorkClaim::tenant(self.tenant, WorkKind::Ingest, amounts).ok())
+        {
+            Some(claim) => claim,
+            None => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+        };
+        let schema_capacity = match self.authority.governor().reserve(schema_claim) {
+            Ok(capacity) => capacity,
+            Err(_) => return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable),
         };
         let mut accepted = Vec::new();
         let mut accepted_attributes = 0_usize;
@@ -298,17 +221,54 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             Ok(count) => count,
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
-        if capacity
-            .try_resize(
-                match group_work_amounts(record_count, self.policy.budget()) {
-                    Some(amounts) => amounts,
-                    None => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
-                },
-            )
-            .is_err()
-        {
+        let Some(accepted_amounts) =
+            group_work_amounts(record_count, self.policy.budget(), schema_estimate)
+        else {
+            return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
+        };
+        if capacity.try_resize(accepted_amounts).is_err() {
             return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
         }
+        let snapshot = match self.ledger.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(failure) => return map_ledger_failure(&failure),
+        };
+        let staged_schema = match self.schema.stage_group(
+            self.tenant,
+            self.shard,
+            identity,
+            &snapshot,
+            &mut accepted,
+            self.authority.governor(),
+        ) {
+            Ok(staged) => staged,
+            Err(failure) => return map_schema_session_failure(failure),
+        };
+        let staged_bytes = match u64::try_from(staged_schema.staged_memory_bytes()) {
+            Ok(bytes) if bytes <= schema_estimate.staging_memory_bytes() => bytes,
+            _ => {
+                return rollback_schema(
+                    &self.schema,
+                    identity,
+                    self.shard,
+                    staged_schema,
+                    IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+                );
+            },
+        };
+        let retained_bytes = match u64::try_from(staged_schema.retained_memory_bytes()) {
+            Ok(bytes) if bytes <= schema_estimate.retained_memory_bytes() => bytes,
+            _ => {
+                return rollback_schema(
+                    &self.schema,
+                    identity,
+                    self.shard,
+                    staged_schema,
+                    IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+                );
+            },
+        };
+        drop(snapshot);
         let prepared = match LogStore::new().prepare(
             capacity,
             self.clock,
@@ -318,57 +278,101 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             accepted,
         ) {
             Ok(prepared) => prepared,
-            Err(failure) => return classify_log_store_failure_code(failure.code()),
+            Err(failure) => {
+                return rollback_schema(
+                    &self.schema,
+                    identity,
+                    self.shard,
+                    staged_schema,
+                    classify_log_store_failure_code(failure.code()),
+                );
+            },
         };
         let block = prepared.into_store_block();
+        let block_digest = match block.content_digest() {
+            Ok(digest) => digest,
+            Err(_) => {
+                return rollback_schema(
+                    &self.schema,
+                    identity,
+                    self.shard,
+                    staged_schema,
+                    IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
+                );
+            },
+        };
         let result = match cancellation {
             Some(cancellation) => self.ledger.append_cancellable(block, cancellation),
             None => self.ledger.append(block),
         };
         match result {
-            Ok(receipt) if rejection_counts.iter().all(|count| *count == 0) => {
-                IngestOutcome::Full(CommittedAdmission { receipt, records })
+            Ok(receipt) => {
+                let retained_capacity =
+                    match retain_schema_capacity(schema_capacity, retained_bytes) {
+                        Ok(capacity) => capacity,
+                        Err(outcome) => return outcome,
+                    };
+                if self
+                    .schema
+                    .resolve_durable_outcome(
+                        identity,
+                        self.shard,
+                        staged_schema,
+                        retained_capacity,
+                        retained_bytes,
+                        DurableSchemaOutcome::Committed {
+                            position: receipt.position(),
+                            digest: block_digest,
+                        },
+                    )
+                    .is_err()
+                {
+                    return IngestOutcome::Ambiguous(IngestFailureCode::StorageUnavailable);
+                }
+                if rejection_counts.iter().all(|count| *count == 0) {
+                    IngestOutcome::Full(CommittedAdmission { receipt, records })
+                } else {
+                    IngestOutcome::Partial(partial_admission(
+                        CommittedAdmission { receipt, records },
+                        rejection_counts,
+                    ))
+                }
             },
-            Ok(receipt) => IngestOutcome::Partial(partial_admission(
-                CommittedAdmission { receipt, records },
-                rejection_counts,
-            )),
-            Err(failure) => map_ledger_failure(&failure),
+            Err(failure) => {
+                let schema_outcome =
+                    if failure.completion_state() == LedgerCompletionState::CommitAmbiguous {
+                        DurableSchemaOutcome::Ambiguous {
+                            digest: block_digest,
+                        }
+                    } else {
+                        DurableSchemaOutcome::DefiniteFailure
+                    };
+                let pending_capacity =
+                    if matches!(schema_outcome, DurableSchemaOutcome::Ambiguous { .. }) {
+                        match retain_schema_capacity(schema_capacity, staged_bytes) {
+                            Ok(capacity) => capacity,
+                            Err(outcome) => return outcome,
+                        }
+                    } else {
+                        drop(schema_capacity);
+                        None
+                    };
+                if self
+                    .schema
+                    .resolve_durable_outcome(
+                        identity,
+                        self.shard,
+                        staged_schema,
+                        pending_capacity,
+                        staged_bytes,
+                        schema_outcome,
+                    )
+                    .is_err()
+                {
+                    return IngestOutcome::Ambiguous(IngestFailureCode::StorageUnavailable);
+                }
+                map_ledger_failure(&failure)
+            },
         }
-    }
-}
-
-fn increment_rejection(counts: &mut [usize; 3], code: IngestFailureCode) {
-    let index = match code {
-        IngestFailureCode::PolicyRejected => 0,
-        IngestFailureCode::InvalidRecord => 1,
-        IngestFailureCode::ValueLimitExceeded => 2,
-        _ => return,
-    };
-    if let Some(count) = counts.get_mut(index) {
-        *count = count.saturating_add(1);
-    }
-}
-
-fn partial_admission(committed: CommittedAdmission, counts: [usize; 3]) -> PartialAdmission {
-    let codes = [
-        IngestFailureCode::PolicyRejected,
-        IngestFailureCode::InvalidRecord,
-        IngestFailureCode::ValueLimitExceeded,
-    ];
-    let mut rejections = [RejectionDetail::EMPTY; 3];
-    let mut used = 0_u8;
-    for (code, records) in codes.into_iter().zip(counts) {
-        if records > 0
-            && let Some(detail) = rejections.get_mut(usize::from(used))
-        {
-            *detail = RejectionDetail { code, records };
-            used = used.saturating_add(1);
-        }
-    }
-    PartialAdmission {
-        committed,
-        rejections,
-        rejection_class_count: used,
     }
 }

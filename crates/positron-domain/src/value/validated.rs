@@ -69,6 +69,57 @@ impl ValidatedKeyValue {
 }
 
 impl ValidatedAttributeValue {
+    /// Fallibly clones a previously bounded value without an unchecked heap allocation.
+    pub fn try_clone(&self) -> Result<Self, DomainFailure> {
+        let inner = match &self.inner {
+            ValidatedAttributeValueInner::Null => ValidatedAttributeValueInner::Null,
+            ValidatedAttributeValueInner::Boolean(value) => {
+                ValidatedAttributeValueInner::Boolean(*value)
+            },
+            ValidatedAttributeValueInner::SignedInteger(value) => {
+                ValidatedAttributeValueInner::SignedInteger(*value)
+            },
+            ValidatedAttributeValueInner::FloatingPointBits(value) => {
+                ValidatedAttributeValueInner::FloatingPointBits(*value)
+            },
+            ValidatedAttributeValueInner::String(value) => {
+                ValidatedAttributeValueInner::String(try_string(value)?)
+            },
+            ValidatedAttributeValueInner::Bytes(value) => {
+                let mut cloned = Vec::new();
+                cloned
+                    .try_reserve_exact(value.len())
+                    .map_err(|_| DomainFailure::allocation_unavailable())?;
+                cloned.extend_from_slice(value);
+                ValidatedAttributeValueInner::Bytes(cloned)
+            },
+            ValidatedAttributeValueInner::Array(values) => {
+                let mut cloned = Vec::new();
+                cloned
+                    .try_reserve_exact(values.len())
+                    .map_err(|_| DomainFailure::allocation_unavailable())?;
+                for value in values {
+                    cloned.push(value.try_clone()?);
+                }
+                ValidatedAttributeValueInner::Array(cloned)
+            },
+            ValidatedAttributeValueInner::KeyValueList(values) => {
+                let mut cloned = Vec::new();
+                cloned
+                    .try_reserve_exact(values.len())
+                    .map_err(|_| DomainFailure::allocation_unavailable())?;
+                for entry in values {
+                    cloned.push(ValidatedKeyValue {
+                        key: try_string(&entry.key)?,
+                        value: entry.value.try_clone()?,
+                    });
+                }
+                ValidatedAttributeValueInner::KeyValueList(cloned)
+            },
+        };
+        Ok(Self { inner })
+    }
+
     /// Returns the preserved native value kind.
     #[must_use]
     pub const fn kind(&self) -> AttributeValueKind {
@@ -268,6 +319,15 @@ impl ValidatedAttributeValue {
             },
         }
     }
+}
+
+fn try_string(value: &str) -> Result<String, DomainFailure> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(value.len())
+        .map_err(|_| DomainFailure::allocation_unavailable())?;
+    cloned.push_str(value);
+    Ok(cloned)
 }
 
 fn checked_decoded_add(left: usize, right: usize) -> Result<usize, DomainFailure> {

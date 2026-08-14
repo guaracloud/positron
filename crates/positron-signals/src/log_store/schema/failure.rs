@@ -8,7 +8,6 @@ pub enum SchemaFailure {
     LimitExceeded,
     AllocationUnavailable,
     MalformedCatalog,
-    CatalogUnavailable,
 }
 
 impl std::fmt::Display for SchemaFailure {
@@ -21,7 +20,6 @@ impl std::fmt::Display for SchemaFailure {
             Self::LimitExceeded => "schema limit exceeded",
             Self::AllocationUnavailable => "schema allocation unavailable",
             Self::MalformedCatalog => "malformed schema catalog",
-            Self::CatalogUnavailable => "schema catalog unavailable",
         })
     }
 }

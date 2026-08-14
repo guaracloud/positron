@@ -294,13 +294,18 @@ fn service_response_with_encoding(
             "OTLP Logs request was rejected",
             encoding,
         ),
-        ServiceFailure::KeyUnavailable | ServiceFailure::StorageUnavailable => failure(
+        ServiceFailure::KeyUnavailable
+        | ServiceFailure::CatalogUnavailable
+        | ServiceFailure::LedgerUnavailable
+        | ServiceFailure::StorageUnavailable => failure(
             503,
             UNAVAILABLE,
             "OTLP Logs ingest is temporarily unavailable",
             encoding,
         ),
-        ServiceFailure::Internal => failure(500, INTERNAL, "OTLP Logs ingest failed", encoding),
+        ServiceFailure::CorruptState | ServiceFailure::Internal => {
+            failure(500, INTERNAL, "OTLP Logs ingest failed", encoding)
+        },
     }
 }
 

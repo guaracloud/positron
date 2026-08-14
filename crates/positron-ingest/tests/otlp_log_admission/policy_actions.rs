@@ -18,7 +18,7 @@ use positron_kernel::{
     LifecycleClock, MountQualification, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
-use positron_signals::{LogScan, LogStore, ScanLimit};
+use positron_signals::{LogScan, LogStore, ScanLimit, SchemaCatalog, SchemaPath};
 use prost::Message;
 
 use super::support::{fixture, temporary_roots};
@@ -74,6 +74,7 @@ fn remove_erases_source_content_and_persists_typed_provenance() -> Result<(), Bo
         SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
     )?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(500)));
+    let schema = super::schema_support::session(&fixture)?;
     assert!(matches!(
         LogIngest::new(
             &fixture.authority,
@@ -82,6 +83,7 @@ fn remove_erases_source_content_and_persists_typed_provenance() -> Result<(), Bo
             &policy,
             fixture.tenant,
             shard,
+            schema.clone(),
         )
         .accept(batch, StoreBlockIdentity::new([0x35; 16])?),
         IngestOutcome::Full(_)
@@ -100,6 +102,14 @@ fn remove_erases_source_content_and_persists_typed_provenance() -> Result<(), Bo
         .map(positron_signals::StoredLogAttribute::occurrences)
         .find(|attribute| attribute.key() == "credentials.password");
     assert!(removed.is_none());
+    let schema_checkpoint = schema.checkpoint()?;
+    let discovered = SchemaCatalog::decode_catalog_object(schema_checkpoint.catalog_bytes())?;
+    let removed_path = SchemaPath::root(
+        AttributeNamespace::Record,
+        "credentials.password".to_owned(),
+    )?;
+    assert!(discovered.entry(&removed_path).is_none());
+    assert_eq!(discovered.overflow_record_count(), 0);
     assert_eq!(record.policy_provenance().generation(), 21);
     assert_eq!(record.policy_provenance().digest(), policy.digest());
     assert_eq!(

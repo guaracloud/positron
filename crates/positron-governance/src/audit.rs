@@ -1,4 +1,5 @@
 mod rotation;
+mod schema_checkpoint;
 
 use std::fmt::{Display, Formatter};
 
@@ -43,6 +44,7 @@ pub enum GovernanceAuditEntry {
     Initialization(InitializationAuditEntry),
     CatalogRootRotation(CatalogRootRotationAuditEntry),
     IngestPolicyActivation(IngestPolicyActivationAuditEntry),
+    SchemaCheckpoint(SchemaCheckpointAuditEntry),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +125,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.position(),
             Self::CatalogRootRotation(entry) => entry.position(),
             Self::IngestPolicyActivation(entry) => entry.position,
+            Self::SchemaCheckpoint(entry) => entry.position(),
         }
     }
 
@@ -132,6 +135,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.action(),
             Self::CatalogRootRotation(entry) => entry.action(),
             Self::IngestPolicyActivation(_) => "ingest-policy.activate",
+            Self::SchemaCheckpoint(_) => "schema-checkpoint.replace",
         }
     }
 
@@ -141,6 +145,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.outcome(),
             Self::CatalogRootRotation(entry) => entry.outcome(),
             Self::IngestPolicyActivation(_) => "succeeded",
+            Self::SchemaCheckpoint(_) => "succeeded",
         }
     }
 
@@ -148,7 +153,9 @@ impl GovernanceAuditEntry {
     pub const fn as_initialization(&self) -> Option<&InitializationAuditEntry> {
         match self {
             Self::Initialization(entry) => Some(entry),
-            Self::CatalogRootRotation(_) | Self::IngestPolicyActivation(_) => None,
+            Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::SchemaCheckpoint(_) => None,
         }
     }
 
@@ -156,7 +163,19 @@ impl GovernanceAuditEntry {
     pub const fn as_catalog_root_rotation(&self) -> Option<&CatalogRootRotationAuditEntry> {
         match self {
             Self::CatalogRootRotation(entry) => Some(entry),
-            Self::Initialization(_) | Self::IngestPolicyActivation(_) => None,
+            Self::Initialization(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::SchemaCheckpoint(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_schema_checkpoint(&self) -> Option<&SchemaCheckpointAuditEntry> {
+        match self {
+            Self::SchemaCheckpoint(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_) => None,
         }
     }
 
@@ -212,9 +231,15 @@ impl GovernanceAuditEntry {
                 },
             ));
         }
+        if intent.starts_with(&schema_checkpoint::MAGIC) {
+            return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
+                .map(Self::SchemaCheckpoint);
+        }
         Err(IdentityFailure)
     }
 }
+
+pub use schema_checkpoint::{SchemaCheckpointAuditEntry, schema_checkpoint_audit_intent};
 
 impl Display for GovernanceAuditEntry {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {

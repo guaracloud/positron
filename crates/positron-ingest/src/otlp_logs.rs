@@ -28,8 +28,21 @@ use transport::bounded_payload;
 pub use admission_groups::{NativeLogAdmissionGroup, NativeLogAdmissionGroups};
 pub use request::{AuthenticatedOtlpLogsRequest, OtlpLogsRequestEncoding};
 
-const RECEIVER_CAPACITY: ResourceAmounts =
-    ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 1, 0]);
+const MAX_RETAINED_BYTES: u64 = 4_194_304;
+const MAX_RECORDS: u64 = 1_024;
+const RECEIVER_CAPACITY: ResourceAmounts = ResourceAmounts::new([
+    MAX_RETAINED_BYTES,
+    1,
+    1,
+    1_048_576,
+    MAX_RECORDS,
+    0,
+    0,
+    0,
+    1,
+    1,
+    0,
+]);
 
 /// Reserves the canonical receiver budget before an authenticated transport
 /// begins structural decode or decompression.
@@ -166,8 +179,12 @@ impl<'authority> NativeLogBatch<'authority> {
     fn resize_after_decode(&mut self) -> Result<(), ReceiveFailure> {
         let record_count =
             u64::try_from(self.records.len()).map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
+        let retained_peak = bounds::grouped_retained_bytes(self.decoded_bytes, self.records.len())?;
+        if retained_peak > MAX_RETAINED_BYTES {
+            return Err(ReceiveFailure::ValueLimitExceeded);
+        }
         let amounts =
-            ResourceAmounts::new([self.decoded_bytes, 1, 1, 0, record_count, 0, 0, 0, 1, 1, 0]);
+            ResourceAmounts::new([retained_peak, 1, 1, 0, record_count, 0, 0, 0, 1, 1, 0]);
         if let Some(capacity) = self.capacity.as_mut() {
             capacity
                 .try_resize(amounts)

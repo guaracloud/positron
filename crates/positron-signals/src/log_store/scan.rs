@@ -64,6 +64,7 @@ pub struct LogScanResult<'kernel> {
     records: Vec<ScannedLogRecord>,
     complete: bool,
     scanned_bytes: u64,
+    reduced_pruning: bool,
     _capacity: ResourceReservation<'kernel>,
 }
 
@@ -72,12 +73,14 @@ impl<'kernel> LogScanResult<'kernel> {
         records: Vec<ScannedLogRecord>,
         complete: bool,
         scanned_bytes: u64,
+        reduced_pruning: bool,
         capacity: ResourceReservation<'kernel>,
     ) -> Self {
         Self {
             records,
             complete,
             scanned_bytes,
+            reduced_pruning,
             _capacity: capacity,
         }
     }
@@ -95,6 +98,12 @@ impl<'kernel> LogScanResult<'kernel> {
     #[must_use]
     pub const fn scanned_bytes(&self) -> u64 {
         self.scanned_bytes
+    }
+
+    /// Reports that generic or Schema Overflow records required fallback decoding.
+    #[must_use]
+    pub const fn reduced_pruning(&self) -> bool {
+        self.reduced_pruning
     }
 }
 

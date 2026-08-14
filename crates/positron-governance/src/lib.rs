@@ -18,6 +18,7 @@ mod policy_administration;
 pub use audit::{
     CatalogRootRotationAuditEntry, CatalogRootRotationStage, GovernanceAuditEntry,
     IngestPolicyActivationAuditEntry, InitialAuditMetadata, InitializationAuditEntry,
+    SchemaCheckpointAuditEntry, schema_checkpoint_audit_intent,
 };
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,

@@ -12,6 +12,13 @@ Run a target with:
 cargo +nightly fuzz run <target>
 ```
 
+Dynamic schema discovery, whole-root overflow, typed duplicate selection, and
+checkpoint round trips share one bounded production-API target:
+
+```console
+cargo +nightly fuzz run schema_discovery_query
+```
+
 The repository's production toolchain remains pinned; `cargo-fuzz` uses an
 installed nightly toolchain only for sanitizer instrumentation.
 

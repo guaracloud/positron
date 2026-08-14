@@ -263,11 +263,11 @@ impl RunningProcess {
             self.state.transition(ProcessPhase::Stopping);
         }
         if self
-            .instance
+            .services
             .as_ref()
-            .is_some_and(|instance| instance.begin_shutdown().is_err())
+            .is_some_and(|services| services.prepare_shutdown_schema_checkpoint().is_err())
         {
-            self.state.transition(ProcessPhase::Stopping);
+            self.cleanup.record_schema_checkpoint();
         }
         self.cancellation.cancel();
         DrainingProcess(self)
@@ -309,10 +309,25 @@ impl DrainingProcess {
                 }
             }
         }
-        self.0.state.transition(ProcessPhase::Stopping);
         self.0.tasks.clear();
-        self.0.cleanup.set_primary(ExitOutcome::Graceful);
         self.0.cleanup.cleanup_listeners(&mut self.0.listeners);
+        if self.0.services.as_ref().is_some_and(|services| {
+            services
+                .publish_prepared_shutdown_schema_checkpoint()
+                .is_err()
+        }) {
+            self.0.cleanup.record_schema_checkpoint();
+        }
+        if self
+            .0
+            .instance
+            .as_ref()
+            .is_some_and(|instance| instance.begin_shutdown().is_err())
+        {
+            return self.0.abort_shutdown();
+        }
+        self.0.state.transition(ProcessPhase::Stopping);
+        self.0.cleanup.set_primary(ExitOutcome::Graceful);
         self.0.instance.take();
         self.0.fenced_volume.take();
         self.0.services.take();

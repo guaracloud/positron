@@ -16,6 +16,8 @@ mod policy_capacity;
 mod policy_predicates;
 #[path = "otlp_log_admission/policy_snapshot.rs"]
 mod policy_snapshot;
+#[path = "otlp_log_admission/schema_support.rs"]
+mod schema_support;
 #[path = "otlp_log_admission/support.rs"]
 mod support;
 #[path = "otlp_log_admission/value_limits.rs"]
