@@ -138,6 +138,11 @@ pub fn reserve_otlp_logs_transport<'authority>(
         .map_err(|_| ReceiveFailure::CapacityUnavailable)
 }
 
+/// Validates the Release 1 OTLP Logs protobuf shape before structural decoding.
+pub fn preflight_otlp_logs_protobuf(protobuf: &[u8]) -> Result<(), ReceiveFailure> {
+    validate_record_count(protobuf, ValueLimitProfile::release_1_system_maximum())
+}
+
 fn ingest_attribution(context: AuthorizedContext) -> Result<TenantAttribution, ReceiveFailure> {
     context
         .tenant_attribution()

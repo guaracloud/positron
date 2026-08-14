@@ -8,6 +8,7 @@ use super::{map_decode_failure, render, service_status};
 use crate::ServiceFailure;
 
 mod blocking_executor;
+mod persistence_outcomes;
 
 #[test]
 fn retryable_outcomes_have_stable_public_statuses() {

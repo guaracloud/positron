@@ -19,6 +19,7 @@ positron-governance = { path = "../positron-governance" }
 positron-ingest = { path = "../positron-ingest" }
 positron-kernel = { path = "../positron-kernel" }
 positron-query = { path = "../positron-query" }
+prost = "=0.14.3"
 tokio = { version = "=1.53.1", default-features = false, features = ["net", "rt", "time"] }
 tokio-stream = { version = "=0.1.19", default-features = false, features = ["net"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["gzip", "router", "transport"] }
@@ -32,7 +33,6 @@ opentelemetry = { version = "=0.32.0", default-features = false, features = ["lo
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "logs"] }
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs"] }
-prost = "=0.14.3"
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "time"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["router", "transport"] }
 

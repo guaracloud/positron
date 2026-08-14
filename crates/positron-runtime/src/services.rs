@@ -25,6 +25,14 @@ mod tests;
 #[derive(Clone)]
 pub struct ServiceHandle {
     instance: Arc<InitializedInstance>,
+    #[cfg(test)]
+    receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
+}
+
+#[cfg(test)]
+pub(crate) trait ReceiverTestBackend: Send + Sync {
+    fn ingest(&self, groups: positron_ingest::NativeLogAdmissionGroups<'_>)
+    -> IngestRequestOutcome;
 }
 
 impl std::fmt::Debug for ServiceHandle {
@@ -35,7 +43,11 @@ impl std::fmt::Debug for ServiceHandle {
 
 impl ServiceHandle {
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Self {
-        Self { instance }
+        Self {
+            instance,
+            #[cfg(test)]
+            receiver_test_backend: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn ingest_otlp_logs(
@@ -51,7 +63,7 @@ impl ServiceHandle {
             protobuf,
         )
         .map_err(map_receive_failure)?;
-        ingest_authenticated(instance, request)
+        ingest_authenticated(self, request)
     }
 
     pub(crate) fn authorize_otlp_logs(
@@ -90,7 +102,19 @@ impl ServiceHandle {
             context, decoded, capacity,
         )
         .map_err(map_receive_failure)?;
-        ingest_authenticated(instance, request)
+        ingest_authenticated(self, request)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_receiver_test_backend(
+        &self,
+        backend: Arc<dyn ReceiverTestBackend>,
+    ) -> Result<(), ServiceFailure> {
+        *self
+            .receiver_test_backend
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)? = Some(backend);
+        Ok(())
     }
 
     pub(crate) fn admit_otlp_grpc(
@@ -138,8 +162,7 @@ impl ServiceHandle {
         self.query_log_bodies_on_shard(bearer, self.instance.logs_shard, source, budget)
     }
 
-    #[doc(hidden)]
-    pub fn query_log_bodies_on_shard(
+    fn query_log_bodies_on_shard(
         &self,
         bearer: &str,
         shard: positron_domain::routing::VirtualShardId,
@@ -194,9 +217,10 @@ impl ServiceHandle {
 }
 
 fn ingest_authenticated<'authority>(
-    instance: &'authority InitializedInstance,
+    services: &'authority ServiceHandle,
     request: AuthenticatedOtlpLogsRequest<'authority>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
+    let instance = &services.instance;
     let batch = OtlpLogsReceiver::new()
         .decode(request)
         .map_err(map_receive_failure)?;
@@ -209,6 +233,15 @@ fn ingest_authenticated<'authority>(
             0,
             IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
         )]));
+    }
+    #[cfg(test)]
+    if let Some(backend) = services
+        .receiver_test_backend
+        .lock()
+        .map_err(|_| ServiceFailure::Internal)?
+        .clone()
+    {
+        return Ok(backend.ingest(groups));
     }
     let catalog = Catalog::open(
         &instance._authority,

@@ -18,6 +18,8 @@ mod resource_governance;
 mod retry_semantics;
 #[path = "otlp_logs_grpc/sdk_producer.rs"]
 mod sdk_producer;
+#[path = "otlp_logs_grpc/structural_amplification.rs"]
+mod structural_amplification;
 #[path = "otlp_logs_grpc/support.rs"]
 mod support;
 #[path = "otlp_logs_grpc/transport_bounds.rs"]

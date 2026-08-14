@@ -15,7 +15,7 @@ pub use ingest::{
 pub use otlp_logs::{
     AuthenticatedOtlpLogsRequest, NativeLogAdmissionGroup, NativeLogAdmissionGroups,
     NativeLogAttribute, NativeLogBatch, NativeLogCandidate, OtlpLogsReceiver, ReceiveFailure,
-    reserve_otlp_logs_transport,
+    preflight_otlp_logs_protobuf, reserve_otlp_logs_transport,
 };
 pub use planning::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, FixedAdmissionGroupPlanner};
 pub use policy::IngestPolicy;

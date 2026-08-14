@@ -1,0 +1,287 @@
+use std::collections::VecDeque;
+use std::fs;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use positron_ingest::{
+    AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
+    NativeLogAdmissionGroups,
+};
+use positron_kernel::MountQualification;
+use tonic::Code;
+
+use super::super::serve;
+use crate::native_host::{Admission, NativeListener};
+use crate::services::ReceiverTestBackend;
+use crate::{
+    BootstrapPaths, InitializationPlan, InstanceBootstrap, ListenerRole, ServiceHandle,
+    TaskCancellation,
+};
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_receiver_distinguishes_precommit_retry_from_postcommit_ambiguity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let backend = Arc::new(ScriptedBackend::new([
+        Completion::RetryableBeforeCommit,
+        Completion::Committed,
+        Completion::AmbiguousAfterCommit,
+        Completion::Committed,
+    ]));
+    let harness = ReceiverHarness::start(backend.clone())?;
+    let mut client = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        LogsServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+
+    let retryable = harness.authorize(request("retryable"))?;
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(2), client.export(retryable))
+        .await?
+        .expect_err("pre-commit failure must remain retryable");
+    assert_eq!(failure.code(), Code::Unavailable);
+    assert_eq!(
+        failure.message(),
+        "OTLP Logs ingest is temporarily unavailable"
+    );
+    assert_eq!(backend.committed_records(), 0);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.export(harness.authorize(request("retryable"))?),
+    )
+    .await??;
+    assert_eq!(backend.committed_records(), 1);
+
+    let ambiguous = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.export(harness.authorize(request("ambiguous"))?),
+    )
+    .await?
+    .expect_err("post-commit failure must expose ambiguity");
+    assert_eq!(ambiguous.code(), Code::Unavailable);
+    assert_eq!(
+        ambiguous.message(),
+        "OTLP Logs commit outcome is ambiguous; retry may duplicate records"
+    );
+    assert_eq!(backend.committed_records(), 2);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.export(harness.authorize(request("ambiguous"))?),
+    )
+    .await??;
+    assert_eq!(backend.committed_records(), 3);
+    drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Completion {
+    RetryableBeforeCommit,
+    Committed,
+    AmbiguousAfterCommit,
+}
+
+struct ScriptedBackend {
+    completions: Mutex<VecDeque<Completion>>,
+    committed: AtomicUsize,
+}
+
+impl ScriptedBackend {
+    fn new(completions: impl IntoIterator<Item = Completion>) -> Self {
+        Self {
+            completions: Mutex::new(completions.into_iter().collect()),
+            committed: AtomicUsize::new(0),
+        }
+    }
+
+    fn committed_records(&self) -> usize {
+        self.committed.load(Ordering::Acquire)
+    }
+}
+
+impl ReceiverTestBackend for ScriptedBackend {
+    fn ingest(&self, groups: NativeLogAdmissionGroups<'_>) -> IngestRequestOutcome {
+        let groups = groups
+            .map(|group| (group.shard(), group.records()))
+            .collect::<Vec<_>>();
+        let completion = self
+            .completions
+            .lock()
+            .expect("script lock")
+            .pop_front()
+            .expect("scripted completion");
+        if matches!(
+            completion,
+            Completion::Committed | Completion::AmbiguousAfterCommit
+        ) {
+            self.committed.fetch_add(
+                groups.iter().map(|(_, records)| records).sum(),
+                Ordering::AcqRel,
+            );
+        }
+        let outcome = match completion {
+            Completion::RetryableBeforeCommit => Some(IngestOutcome::Retryable(
+                IngestFailureCode::StorageUnavailable,
+            )),
+            Completion::AmbiguousAfterCommit => Some(IngestOutcome::Ambiguous(
+                IngestFailureCode::StorageUnavailable,
+            )),
+            Completion::Committed => None,
+        };
+        IngestRequestOutcome::new(
+            outcome
+                .into_iter()
+                .flat_map(|outcome| {
+                    groups.iter().map(move |(shard, records)| {
+                        AdmissionGroupOutcome::new(*shard, *records, outcome)
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+struct ReceiverHarness {
+    endpoint: SocketAddr,
+    bearer: String,
+    cancellation: TaskCancellation,
+    force: TaskCancellation,
+    server: Option<JoinHandle<()>>,
+    _roots: TestRoots,
+}
+
+impl ReceiverHarness {
+    fn start(backend: Arc<dyn ReceiverTestBackend>) -> Result<Self, Box<dyn std::error::Error>> {
+        let roots = TestRoots::new()?;
+        let paths = roots.paths()?;
+        drop(InstanceBootstrap::initialize(
+            &paths,
+            InitializationPlan::non_interactive(),
+        )?);
+        let bearer = InstanceBootstrap::claim(&paths)?
+            .ingest_secret()
+            .ok_or("ingest secret missing")?
+            .to_owned();
+        let services = ServiceHandle::new(Arc::new(InstanceBootstrap::reopen(&paths)?));
+        services.install_receiver_test_backend(backend)?;
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let endpoint = listener.local_addr()?;
+        let admission = Arc::new(Admission {
+            role: ListenerRole::OtlpGrpc,
+            listener: NativeListener::Tcp(listener),
+            accepting: AtomicBool::new(true),
+            control_path: None,
+        });
+        let cancellation = TaskCancellation::new();
+        let serve_cancellation = cancellation.clone();
+        let force = TaskCancellation::new();
+        let serve_force = force.clone();
+        let server = std::thread::spawn(move || {
+            serve(admission, serve_cancellation, serve_force, Some(services))
+                .expect("test OTLP gRPC server");
+        });
+        Ok(Self {
+            endpoint,
+            bearer,
+            cancellation,
+            force,
+            server: Some(server),
+            _roots: roots,
+        })
+    }
+
+    fn authorize(
+        &self,
+        mut request: tonic::Request<ExportLogsServiceRequest>,
+    ) -> Result<tonic::Request<ExportLogsServiceRequest>, Box<dyn std::error::Error>> {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {}", self.bearer).parse()?);
+        Ok(request)
+    }
+
+    fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.cancellation.cancel();
+        self.force.cancel();
+        self.server
+            .take()
+            .ok_or("server missing")?
+            .join()
+            .map_err(|_| "server panicked")?;
+        Ok(())
+    }
+}
+
+fn request(body: &str) -> tonic::Request<ExportLogsServiceRequest> {
+    tonic::Request::new(ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 42,
+                    observed_time_unix_nano: 84,
+                    body: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(body.to_owned())),
+                    }),
+                    ..LogRecord::default()
+                }],
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    })
+}
+
+struct TestRoots {
+    parent: PathBuf,
+    data: PathBuf,
+    secrets: PathBuf,
+}
+
+impl TestRoots {
+    fn new() -> Result<Self, std::io::Error> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let parent =
+            PathBuf::from("/tmp").join(format!("p-grpc-private-{}-{nonce}", std::process::id()));
+        let data = parent.join("data");
+        let secrets = parent.join("secrets");
+        fs::create_dir_all(&data)?;
+        fs::create_dir_all(&secrets)?;
+        set_owner_only(&secrets)?;
+        Ok(Self {
+            parent,
+            data,
+            secrets,
+        })
+    }
+
+    fn paths(&self) -> Result<BootstrapPaths, crate::BootstrapFailure> {
+        BootstrapPaths::new(&self.data, &self.secrets, MountQualification::LocalHost)
+    }
+}
+
+impl Drop for TestRoots {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.parent);
+    }
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}

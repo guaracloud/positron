@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
-    LogsService, LogsServiceServer,
-};
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
@@ -24,6 +22,8 @@ const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
 mod blocking;
 use blocking::{BlockingIngestExecutor, BlockingIngestHandle};
+mod codec;
+use codec::OtlpLogsServer;
 
 #[cfg(test)]
 mod tests;
@@ -49,7 +49,7 @@ pub(super) fn serve(
         };
         let incoming = TcpListenerStream::new(listener);
         let authentication = services.clone();
-        let receiver = LogsServiceServer::new(OtlpLogsGrpc {
+        let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
             services,
             blocking: blocking_handle,
         })
