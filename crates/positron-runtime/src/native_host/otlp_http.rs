@@ -76,7 +76,7 @@ pub(super) fn receive(
         })?
         .unwrap_or_else(CompatibilityHints::none);
     let context = services
-        .authorize_otlp_logs_with_hints(&bearer, hints)
+        .authorize_logs_with_hints(&bearer, hints)
         .map_err(|_| {
             failure(
                 401,
@@ -86,10 +86,10 @@ pub(super) fn receive(
             )
         })?;
     let admission = services
-        .admit_otlp_logs(context)
+        .admit_logs(context)
         .map_err(|failure| service_response_with_encoding(failure, response_encoding))?;
     let (encoded_limit, decoded_limit) = services
-        .otlp_logs_transport_limits()
+        .logs_transport_limits()
         .map_err(|failure| service_response_with_encoding(failure, response_encoding))?;
     let body_limit = match request_encoding {
         OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::Json => {

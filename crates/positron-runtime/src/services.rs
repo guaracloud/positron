@@ -1,5 +1,3 @@
-use std::error::Error;
-use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 
 use positron_domain::routing::SignalKind;
@@ -7,9 +5,10 @@ use positron_governance::{
     AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
 };
 use positron_ingest::{
-    AdmissionGroupOutcome, AdmissionGroupPlanFailure, AuthenticatedOtlpLogsRequest,
-    IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, OtlpLogsReceiver,
-    OtlpLogsRequestEncoding, reserve_otlp_logs_transport,
+    AdmissionGroupOutcome, AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest,
+    IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, LokiPushReceiver,
+    LokiPushRequestEncoding, NativeLogBatch, OtlpLogsReceiver, OtlpLogsRequestEncoding,
+    reserve_log_receiver_transport,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
@@ -18,6 +17,11 @@ use positron_kernel::{
 use positron_query::{QueryBudget, QueryEvent, QueryService};
 
 use crate::InitializedInstance;
+
+mod failure;
+
+pub use failure::ServiceFailure;
+use failure::{map_admission_group_plan_failure, map_receive_failure};
 
 #[cfg(test)]
 mod tests;
@@ -36,7 +40,7 @@ pub(crate) trait ReceiverTestBackend: Send + Sync {
 }
 
 impl std::fmt::Debug for ServiceHandle {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ServiceHandle { <authorized runtime services> }")
     }
 }
@@ -55,7 +59,7 @@ impl ServiceHandle {
         bearer: &str,
         protobuf: Vec<u8>,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
-        let context = self.authorize_otlp_logs(bearer)?;
+        let context = self.authorize_logs(bearer)?;
         let instance = &self.instance;
         let request = AuthenticatedOtlpLogsRequest::protobuf(
             context,
@@ -66,14 +70,11 @@ impl ServiceHandle {
         ingest_authenticated(self, request)
     }
 
-    pub(crate) fn authorize_otlp_logs(
-        &self,
-        bearer: &str,
-    ) -> Result<AuthorizedContext, ServiceFailure> {
-        self.authorize_otlp_logs_with_hints(bearer, CompatibilityHints::none())
+    pub(crate) fn authorize_logs(&self, bearer: &str) -> Result<AuthorizedContext, ServiceFailure> {
+        self.authorize_logs_with_hints(bearer, CompatibilityHints::none())
     }
 
-    pub(crate) fn authorize_otlp_logs_with_hints(
+    pub(crate) fn authorize_logs_with_hints(
         &self,
         bearer: &str,
         hints: CompatibilityHints,
@@ -122,7 +123,27 @@ impl ServiceHandle {
         ingest_authenticated(self, request)
     }
 
-    pub(crate) fn otlp_logs_transport_limits(&self) -> Result<(usize, usize), ServiceFailure> {
+    pub(crate) fn ingest_encoded_loki_push(
+        &self,
+        context: AuthorizedContext,
+        encoding: LokiPushRequestEncoding,
+        body: Vec<u8>,
+        reservation: TransferredResourceReservation,
+    ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        let capacity = reservation
+            .reclaim(self.instance.resource_governor())
+            .map_err(|_| ServiceFailure::Internal)?;
+        let request = AuthenticatedLokiPushRequest::encoded_after_transport_admission(
+            context, encoding, body, capacity,
+        )
+        .map_err(map_receive_failure)?;
+        let batch = LokiPushReceiver::with_value_limit_profile(self.instance.value_limit_profile)
+            .decode(request)
+            .map_err(map_receive_failure)?;
+        ingest_native_batch(self, batch)
+    }
+
+    pub(crate) fn logs_transport_limits(&self) -> Result<(usize, usize), ServiceFailure> {
         let request = self
             .instance
             .value_limit_profile
@@ -148,20 +169,21 @@ impl ServiceHandle {
         Ok(())
     }
 
-    pub(crate) fn admit_otlp_logs(
+    pub(crate) fn admit_logs(
         &self,
         context: AuthorizedContext,
-    ) -> Result<OtlpAdmissionLease, ServiceFailure> {
-        let reservation = reserve_otlp_logs_transport(context, self.instance.resource_governor())
-            .map_err(|failure| match failure {
-                positron_ingest::ReceiveFailure::CapacityUnavailable => {
-                    ServiceFailure::CapacityUnavailable
-                },
-                _ => ServiceFailure::InvalidRequest,
-            })?
-            .transfer();
-        Ok(OtlpAdmissionLease {
-            inner: Arc::new(OtlpAdmissionLeaseInner {
+    ) -> Result<ReceiverAdmissionLease, ServiceFailure> {
+        let reservation =
+            reserve_log_receiver_transport(context, self.instance.resource_governor())
+                .map_err(|failure| match failure {
+                    positron_ingest::ReceiveFailure::CapacityUnavailable => {
+                        ServiceFailure::CapacityUnavailable
+                    },
+                    _ => ServiceFailure::InvalidRequest,
+                })?
+                .transfer();
+        Ok(ReceiverAdmissionLease {
+            inner: Arc::new(ReceiverAdmissionLeaseInner {
                 services: self.clone(),
                 reservation: Mutex::new(Some(reservation)),
             }),
@@ -255,6 +277,14 @@ fn ingest_authenticated<'authority>(
     let batch = OtlpLogsReceiver::with_value_limit_profile(instance.value_limit_profile)
         .decode(request)
         .map_err(map_receive_failure)?;
+    ingest_native_batch(services, batch)
+}
+
+fn ingest_native_batch(
+    services: &ServiceHandle,
+    batch: NativeLogBatch<'_>,
+) -> Result<IngestRequestOutcome, ServiceFailure> {
+    let instance = &services.instance;
     let groups = batch
         .into_admission_groups(instance.admission_group_planner.as_ref())
         .map_err(map_admission_group_plan_failure)?;
@@ -323,36 +353,17 @@ fn ingest_authenticated<'authority>(
     Ok(IngestRequestOutcome::new(outcomes))
 }
 
-fn map_admission_group_plan_failure(failure: AdmissionGroupPlanFailure) -> ServiceFailure {
-    match failure {
-        AdmissionGroupPlanFailure::UnsupportedSignal => ServiceFailure::InvalidRequest,
-        AdmissionGroupPlanFailure::AssignmentUnavailable => ServiceFailure::CapacityUnavailable,
-        AdmissionGroupPlanFailure::RecordCountExceeded => ServiceFailure::Internal,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ServiceFailure {
-    Unauthorized,
-    CapacityUnavailable,
-    RequestTooLarge,
-    InvalidRequest,
-    KeyUnavailable,
-    StorageUnavailable,
-    Internal,
-}
-
 #[derive(Clone)]
-pub(crate) struct OtlpAdmissionLease {
-    inner: Arc<OtlpAdmissionLeaseInner>,
+pub(crate) struct ReceiverAdmissionLease {
+    inner: Arc<ReceiverAdmissionLeaseInner>,
 }
 
-struct OtlpAdmissionLeaseInner {
+struct ReceiverAdmissionLeaseInner {
     services: ServiceHandle,
     reservation: Mutex<Option<TransferredResourceReservation>>,
 }
 
-impl OtlpAdmissionLease {
+impl ReceiverAdmissionLease {
     pub(crate) fn take(&self) -> Result<TransferredResourceReservation, ServiceFailure> {
         self.inner
             .reservation
@@ -363,7 +374,7 @@ impl OtlpAdmissionLease {
     }
 }
 
-impl Drop for OtlpAdmissionLeaseInner {
+impl Drop for ReceiverAdmissionLeaseInner {
     fn drop(&mut self) {
         let reservation = match self.reservation.get_mut() {
             Ok(reservation) => reservation,
@@ -374,20 +385,3 @@ impl Drop for OtlpAdmissionLeaseInner {
         }
     }
 }
-
-fn map_receive_failure(failure: positron_ingest::ReceiveFailure) -> ServiceFailure {
-    match failure {
-        positron_ingest::ReceiveFailure::AuthenticationRejected => ServiceFailure::Unauthorized,
-        positron_ingest::ReceiveFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
-        positron_ingest::ReceiveFailure::TransportLimitExceeded => ServiceFailure::RequestTooLarge,
-        _ => ServiceFailure::InvalidRequest,
-    }
-}
-
-impl Display for ServiceFailure {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("runtime service request failed")
-    }
-}
-
-impl Error for ServiceFailure {}

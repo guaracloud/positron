@@ -294,6 +294,7 @@ fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn
             loopback,
             loopback,
             loopback,
+            loopback,
         )
         .is_err()
     );
@@ -301,6 +302,7 @@ fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn
         NativeBindings::new(
             PathBuf::from("/tmp/control.sock"),
             wildcard,
+            loopback,
             loopback,
             loopback,
             loopback
@@ -314,6 +316,7 @@ fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn
     let bindings = NativeBindings::new(
         roots.parent.join("collision.sock"),
         occupied_address,
+        loopback,
         loopback,
         loopback,
         loopback,

@@ -7,6 +7,8 @@ use crate::outcome::{DomainFailure, FailureSource};
 /// and never allows an attribute to shadow a signal-defined intrinsic field.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AttributeNamespace {
+    /// String attributes shared by records received in one stream.
+    Stream,
     /// Attributes attached to the telemetry resource.
     Resource,
     /// Attributes attached to the instrumentation scope.
@@ -19,6 +21,7 @@ impl AttributeNamespace {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Stream => "stream",
             Self::Resource => "resource",
             Self::InstrumentationScope => "instrumentation-scope",
             Self::Record => "record",

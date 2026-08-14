@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod ingest;
+mod loki_push;
 mod otlp_logs;
 mod planning;
 mod policy;
@@ -12,11 +13,12 @@ pub use ingest::{
     CommittedAdmission, IngestFailureCode, IngestOutcome, LogIngest, PartialAdmission,
     RejectionDetail,
 };
+pub use loki_push::{AuthenticatedLokiPushRequest, LokiPushReceiver, LokiPushRequestEncoding};
 pub use otlp_logs::{
     AuthenticatedOtlpLogsRequest, NativeLogAdmissionGroup, NativeLogAdmissionGroups,
     NativeLogAttribute, NativeLogBatch, NativeLogCandidate, OtlpLogsReceiver,
     OtlpLogsRequestEncoding, ReceiveFailure, preflight_otlp_logs_json,
-    preflight_otlp_logs_protobuf, reserve_otlp_logs_transport,
+    preflight_otlp_logs_protobuf, reserve_log_receiver_transport, reserve_otlp_logs_transport,
 };
 pub use planning::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, FixedAdmissionGroupPlanner};
 pub use policy::IngestPolicy;

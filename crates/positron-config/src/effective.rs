@@ -17,10 +17,11 @@ pub struct EffectiveConfiguration {
     pub(crate) api_bind_address: SocketAddr,
     pub(crate) otlp_grpc_bind_address: SocketAddr,
     pub(crate) otlp_http_bind_address: SocketAddr,
+    pub(crate) loki_push_bind_address: SocketAddr,
     pub(crate) data_directory: String,
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
-    pub(crate) sources: [SettingSource; 11],
+    pub(crate) sources: [SettingSource; 12],
 }
 
 impl EffectiveConfiguration {
@@ -65,6 +66,11 @@ impl EffectiveConfiguration {
     }
 
     #[must_use]
+    pub const fn loki_push_bind_address(&self) -> SocketAddr {
+        self.loki_push_bind_address
+    }
+
+    #[must_use]
     pub fn data_directory(&self) -> &str {
         &self.data_directory
     }
@@ -103,6 +109,8 @@ impl EffectiveConfiguration {
         rendered.push_str(&self.otlp_grpc_bind_address.to_string());
         rendered.push_str("\"\notlp_http_bind_address = \"");
         rendered.push_str(&self.otlp_http_bind_address.to_string());
+        rendered.push_str("\"\nloki_push_bind_address = \"");
+        rendered.push_str(&self.loki_push_bind_address.to_string());
         rendered.push_str("\"\n\n[storage]\ndata_directory = \"");
         rendered.push_str(&self.data_directory);
         rendered.push_str("\"\nsecrets_directory = \"");
@@ -112,7 +120,7 @@ impl EffectiveConfiguration {
     }
 
     pub fn plan_update(&self, candidate: &Self) -> Result<ConfigurationPlan, ConfigurationFailure> {
-        let mut changes = Vec::with_capacity(11);
+        let mut changes = Vec::with_capacity(12);
         for definition in contract::SETTING_DEFINITIONS {
             let setting = definition.setting();
             if self.setting_differs(candidate, setting) {
@@ -146,6 +154,9 @@ impl EffectiveConfiguration {
             Setting::ListenerOtlpHttpBindAddress => {
                 self.otlp_http_bind_address != other.otlp_http_bind_address
             },
+            Setting::ListenerLokiPushBindAddress => {
+                self.loki_push_bind_address != other.loki_push_bind_address
+            },
             Setting::StorageDataDirectory => self.data_directory != other.data_directory,
             Setting::StorageSecretsDirectory => self.secrets_directory != other.secrets_directory,
             Setting::SecurityLocalKeyFile => self.local_key_file != other.local_key_file,
@@ -165,6 +176,7 @@ impl Debug for EffectiveConfiguration {
             .field("api_bind_address", &self.api_bind_address)
             .field("otlp_grpc_bind_address", &self.otlp_grpc_bind_address)
             .field("otlp_http_bind_address", &self.otlp_http_bind_address)
+            .field("loki_push_bind_address", &self.loki_push_bind_address)
             .field("data_directory", &self.data_directory)
             .field("secrets_directory", &self.secrets_directory)
             .field("local_key_file", &"<redacted>")

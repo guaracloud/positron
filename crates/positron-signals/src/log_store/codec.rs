@@ -308,6 +308,7 @@ fn namespace_tag(namespace: AttributeNamespace) -> u8 {
         AttributeNamespace::Resource => 1,
         AttributeNamespace::InstrumentationScope => 2,
         AttributeNamespace::Record => 3,
+        AttributeNamespace::Stream => 4,
     }
 }
 
@@ -316,6 +317,7 @@ fn decode_namespace(tag: u8) -> Result<AttributeNamespace, LogStoreFailure> {
         1 => Ok(AttributeNamespace::Resource),
         2 => Ok(AttributeNamespace::InstrumentationScope),
         3 => Ok(AttributeNamespace::Record),
+        4 => Ok(AttributeNamespace::Stream),
         _ => Err(LogStoreFailure::malformed_block()),
     }
 }

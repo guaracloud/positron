@@ -16,6 +16,7 @@ use crate::{
     TaskJoinOutcome, TaskRegistrar, TaskRole,
 };
 
+mod loki_http;
 mod native_http;
 mod otlp_grpc;
 mod otlp_http;
@@ -27,6 +28,7 @@ pub struct NativeBindings {
     api: SocketAddr,
     otlp_grpc: SocketAddr,
     otlp_http: SocketAddr,
+    loki_push: SocketAddr,
 }
 
 impl NativeBindings {
@@ -36,6 +38,7 @@ impl NativeBindings {
         api: SocketAddr,
         otlp_grpc: SocketAddr,
         otlp_http: SocketAddr,
+        loki_push: SocketAddr,
     ) -> Result<Self, NativeHostFailure> {
         BoundEndpoint::control(control.clone()).map_err(|_| NativeHostFailure::InvalidBinding)?;
         for (role, address) in [
@@ -43,6 +46,7 @@ impl NativeBindings {
             (ListenerRole::Api, api),
             (ListenerRole::OtlpGrpc, otlp_grpc),
             (ListenerRole::OtlpHttp, otlp_http),
+            (ListenerRole::LokiPush, loki_push),
         ] {
             BoundEndpoint::tcp(role, address).map_err(|_| NativeHostFailure::InvalidBinding)?;
         }
@@ -52,6 +56,7 @@ impl NativeBindings {
             api,
             otlp_grpc,
             otlp_http,
+            loki_push,
         })
     }
 
@@ -61,6 +66,7 @@ impl NativeBindings {
             ListenerRole::Api => Some(self.api),
             ListenerRole::OtlpGrpc => Some(self.otlp_grpc),
             ListenerRole::OtlpHttp => Some(self.otlp_http),
+            ListenerRole::LokiPush => Some(self.loki_push),
             ListenerRole::Control => None,
         }
     }
@@ -89,7 +95,7 @@ impl NativeHost {
     pub fn new(bindings: NativeBindings) -> Self {
         Self {
             bindings,
-            admissions: Arc::new(Mutex::new(Vec::with_capacity(4))),
+            admissions: Arc::new(Mutex::new(Vec::with_capacity(6))),
         }
     }
 }
@@ -253,6 +259,7 @@ impl RegisteredTask for NativeRegisteredTask {
             TaskRole::Api => ListenerRole::Api,
             TaskRole::OtlpGrpc => ListenerRole::OtlpGrpc,
             TaskRole::OtlpHttp => ListenerRole::OtlpHttp,
+            TaskRole::LokiPush => ListenerRole::LokiPush,
         };
         let mut admissions = self
             .admissions

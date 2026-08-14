@@ -223,7 +223,7 @@ pub(super) fn bindings(
     let ephemeral = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let control = roots.parent.join("control.sock");
     Ok(NativeBindings::new(
-        control, ephemeral, ephemeral, ephemeral, ephemeral,
+        control, ephemeral, ephemeral, ephemeral, ephemeral, ephemeral,
     )?)
 }
 

@@ -335,6 +335,7 @@ fn bindings(roots: &TestRoots) -> Result<NativeBindings, TestError> {
         ephemeral,
         ephemeral,
         ephemeral,
+        ephemeral,
     )?)
 }
 

@@ -64,10 +64,11 @@ struct Candidate {
     api_bind_address: SocketAddr,
     otlp_grpc_bind_address: SocketAddr,
     otlp_http_bind_address: SocketAddr,
+    loki_push_bind_address: SocketAddr,
     data_directory: String,
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
-    sources: [SettingSource; 11],
+    sources: [SettingSource; 12],
 }
 
 impl Candidate {
@@ -80,6 +81,7 @@ impl Candidate {
         let api = setting_definition(Setting::ListenerApiBindAddress).default_value();
         let otlp_grpc = setting_definition(Setting::ListenerOtlpGrpcBindAddress).default_value();
         let otlp_http = setting_definition(Setting::ListenerOtlpHttpBindAddress).default_value();
+        let loki_push = setting_definition(Setting::ListenerLokiPushBindAddress).default_value();
         let data = setting_definition(Setting::StorageDataDirectory).default_value();
         let secrets = setting_definition(Setting::StorageSecretsDirectory).default_value();
         let local_key = setting_definition(Setting::SecurityLocalKeyFile).default_value();
@@ -101,10 +103,14 @@ impl Candidate {
                 otlp_http,
                 Setting::ListenerOtlpHttpBindAddress,
             )?,
+            loki_push_bind_address: parse_loopback_address(
+                loki_push,
+                Setting::ListenerLokiPushBindAddress,
+            )?,
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
             secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
             local_key_file: ProtectedFileReference::parse(local_key)?,
-            sources: [SettingSource::CompiledDefault; 11],
+            sources: [SettingSource::CompiledDefault; 12],
         })
     }
 
@@ -146,6 +152,9 @@ impl Candidate {
             Setting::ListenerOtlpHttpBindAddress => {
                 self.otlp_http_bind_address = parse_loopback_address(value, setting)?;
             },
+            Setting::ListenerLokiPushBindAddress => {
+                self.loki_push_bind_address = parse_loopback_address(value, setting)?;
+            },
             Setting::StorageDataDirectory => {
                 self.data_directory = checked_path(value, setting)?;
             },
@@ -182,6 +191,7 @@ impl Candidate {
             api_bind_address: self.api_bind_address,
             otlp_grpc_bind_address: self.otlp_grpc_bind_address,
             otlp_http_bind_address: self.otlp_http_bind_address,
+            loki_push_bind_address: self.loki_push_bind_address,
             data_directory: self.data_directory,
             secrets_directory: self.secrets_directory,
             local_key_file: self.local_key_file,
@@ -306,9 +316,10 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::ListenerApiBindAddress => 5,
         Setting::ListenerOtlpGrpcBindAddress => 6,
         Setting::ListenerOtlpHttpBindAddress => 7,
-        Setting::StorageDataDirectory => 8,
-        Setting::StorageSecretsDirectory => 9,
-        Setting::SecurityLocalKeyFile => 10,
+        Setting::ListenerLokiPushBindAddress => 8,
+        Setting::StorageDataDirectory => 9,
+        Setting::StorageSecretsDirectory => 10,
+        Setting::SecurityLocalKeyFile => 11,
     }
 }
 
@@ -329,6 +340,7 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerApiBindAddress => FailureSource::ListenerApiBindAddress,
         Setting::ListenerOtlpGrpcBindAddress => FailureSource::ListenerOtlpGrpcBindAddress,
         Setting::ListenerOtlpHttpBindAddress => FailureSource::ListenerOtlpHttpBindAddress,
+        Setting::ListenerLokiPushBindAddress => FailureSource::ListenerLokiPushBindAddress,
         Setting::StorageDataDirectory => FailureSource::StorageDataDirectory,
         Setting::StorageSecretsDirectory => FailureSource::StorageSecretsDirectory,
         Setting::SecurityLocalKeyFile => FailureSource::SecurityLocalKeyFile,

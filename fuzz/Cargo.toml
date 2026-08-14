@@ -88,6 +88,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "loki_push_decode"
+path = "fuzz_targets/loki_push_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "query_inputs"
 path = "fuzz_targets/query_inputs.rs"
 test = false
