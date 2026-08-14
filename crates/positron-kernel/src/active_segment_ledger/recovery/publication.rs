@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(test)]
 pub(in crate::active_segment_ledger) fn publish_frontier(
     directory: &File,
     id: SegmentId,
@@ -8,26 +7,6 @@ pub(in crate::active_segment_ledger) fn publish_frontier(
     durable_bytes: u64,
     next_sequence: u64,
     position: CommitPosition,
-) -> Result<[u8; 32], LedgerFailure> {
-    publish_frontier_with_operation_fault(
-        directory,
-        id,
-        key,
-        durable_bytes,
-        next_sequence,
-        position,
-        None,
-    )
-}
-
-pub(in crate::active_segment_ledger) fn publish_frontier_with_operation_fault(
-    directory: &File,
-    id: SegmentId,
-    key: &ObjectDataKey,
-    durable_bytes: u64,
-    next_sequence: u64,
-    position: CommitPosition,
-    fault: Option<(&dyn LedgerOperationFaultSource, super::super::SegmentScope)>,
 ) -> Result<[u8; 32], LedgerFailure> {
     let mut plaintext = Vec::with_capacity(FRONTIER_PLAINTEXT_BYTES);
     plaintext.extend_from_slice(&durable_bytes.to_be_bytes());
@@ -96,12 +75,8 @@ pub(in crate::active_segment_ledger) fn publish_frontier_with_operation_fault(
         .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
     unix_fs::renameat(directory, &temporary, directory, frontier_name(id))
         .map_err(|error| LedgerFailure::post_mutation(map_errno(error).code()))?;
-    emit_injected_event(
-        fault.map(|(source, _)| source),
-        fault.map(|(_, scope)| scope),
-        LedgerFileEvent::SynchronizeFrontierDirectory,
-    )
-    .map_err(|failure| LedgerFailure::ambiguous(failure.code()))?;
+    emit_event(LedgerFileEvent::SynchronizeFrontierDirectory)
+        .map_err(|failure| LedgerFailure::ambiguous(failure.code()))?;
     synchronize(directory).map_err(|failure| LedgerFailure::ambiguous(failure.code()))?;
     Ok(authenticator)
 }

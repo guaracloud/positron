@@ -230,18 +230,8 @@ fn ingest_authenticated<'authority>(
         let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
         let outcome = match instance.key.segment_key(instance.instance, scope) {
             Ok(protection) => {
-                let ledger = match instance.ledger_operation_fault_source.as_ref() {
-                    Some(source) => ActiveSegmentLedger::open_with_operation_fault_source(
-                        &instance._authority,
-                        &catalog,
-                        scope,
-                        protection,
-                        Arc::clone(source),
-                    ),
-                    None => {
-                        ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-                    },
-                };
+                let ledger =
+                    ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection);
                 match ledger {
                     Ok(ledger) => match instance.key.random_identifier() {
                         Ok(identifier) => match StoreBlockIdentity::new(identifier) {

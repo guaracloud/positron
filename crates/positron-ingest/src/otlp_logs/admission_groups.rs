@@ -6,6 +6,7 @@ use positron_kernel::{ResourceAmounts, ResourceReservation};
 
 use crate::{AdmissionGroupPlanFailure, AdmissionGroupPlanner};
 
+use super::bounds::grouped_retained_bytes;
 use super::{NativeLogBatch, NativeLogCandidate};
 
 /// One planned native batch sharing tenant, Logs store, and virtual shard.
@@ -73,6 +74,27 @@ impl<'authority> NativeLogBatch<'authority> {
             decoded_bytes,
             mut capacity,
         } = self;
+        let record_count = records.len();
+        let grouped_bytes = grouped_retained_bytes(decoded_bytes, record_count)
+            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+        if let Some(retained) = capacity.as_mut() {
+            retained
+                .try_resize(ResourceAmounts::new([
+                    grouped_bytes,
+                    0,
+                    0,
+                    0,
+                    u64::try_from(record_count)
+                        .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]))
+                .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?;
+        }
         let mut planned = BTreeMap::<VirtualShardId, Vec<NativeLogCandidate>>::new();
         for (ordinal, record) in records.into_iter().enumerate() {
             let ordinal = u32::try_from(ordinal)
@@ -84,27 +106,6 @@ impl<'authority> NativeLogBatch<'authority> {
                 &record,
             )?;
             planned.entry(shard).or_default().push(record);
-        }
-        let record_count = planned.values().try_fold(0_u64, |total, records| {
-            total.checked_add(u64::try_from(records.len()).ok()?)
-        });
-        let record_count = record_count.ok_or(AdmissionGroupPlanFailure::RecordCountExceeded)?;
-        if let Some(retained) = capacity.as_mut() {
-            retained
-                .try_resize(ResourceAmounts::new([
-                    decoded_bytes,
-                    0,
-                    0,
-                    0,
-                    record_count,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]))
-                .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?;
         }
         let groups = planned
             .into_iter()

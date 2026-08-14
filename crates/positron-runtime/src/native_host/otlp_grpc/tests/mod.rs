@@ -7,6 +7,8 @@ use tonic::Code;
 use super::{map_decode_failure, render, service_status};
 use crate::ServiceFailure;
 
+mod blocking_executor;
+
 #[test]
 fn retryable_outcomes_have_stable_public_statuses() {
     let capacity = render(single(IngestOutcome::Retryable(

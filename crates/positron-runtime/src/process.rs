@@ -23,7 +23,6 @@ pub struct ServeConfiguration {
     initialization: InitializationMode,
     ingest_policy: Option<positron_ingest::IngestPolicy>,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
-    ledger_operation_fault_source: Option<Arc<dyn positron_kernel::LedgerOperationFaultSource>>,
 }
 
 impl ServeConfiguration {
@@ -34,7 +33,6 @@ impl ServeConfiguration {
             initialization,
             ingest_policy: None,
             admission_group_planner: None,
-            ledger_operation_fault_source: None,
         }
     }
 
@@ -52,16 +50,6 @@ impl ServeConfiguration {
         self.admission_group_planner = Some(planner);
         self
     }
-
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_ledger_operation_fault_source(
-        mut self,
-        source: Arc<dyn positron_kernel::LedgerOperationFaultSource>,
-    ) -> Self {
-        self.ledger_operation_fault_source = Some(source);
-        self
-    }
 }
 
 impl std::fmt::Debug for ServeConfiguration {
@@ -74,10 +62,6 @@ impl std::fmt::Debug for ServeConfiguration {
             .field(
                 "admission_group_planner",
                 &self.admission_group_planner.is_some(),
-            )
-            .field(
-                "ledger_operation_fault_source",
-                &self.ledger_operation_fault_source.is_some(),
             )
             .finish()
     }

@@ -10,10 +10,7 @@ use crate::data_protection::{
     SegmentFramePurpose,
 };
 
-use super::fault::{
-    LedgerFileEvent, LedgerOperationFaultSource, emit_event, emit_injected_event,
-    injected_partial_write_length,
-};
+use super::fault::{LedgerFileEvent, emit_event, injected_partial_write_length};
 use super::format::{SegmentMetadata, position_from_value};
 use super::io::{map_errno, map_integrity_read, map_io_error, open_regular, synchronize};
 use super::receipt::receipt_authenticator;
@@ -28,9 +25,7 @@ const MAX_FRONTIER_FRAME_BYTES: u32 = 512;
 const MAX_RECOVERED_BLOCKS: usize = 1_024;
 
 mod publication;
-#[cfg(test)]
 pub(super) use publication::publish_frontier;
-pub(super) use publication::publish_frontier_with_operation_fault;
 
 pub(super) struct RecoveryState {
     pub(super) frontier: CommitPosition,

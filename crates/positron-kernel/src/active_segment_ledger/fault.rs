@@ -2,10 +2,8 @@ use super::LedgerFailure;
 #[cfg(any(test, fuzzing))]
 use super::io::map_errno;
 
-use super::SegmentScope;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LedgerFileEvent {
+pub(super) enum LedgerFileEvent {
     WriteFrame,
     PartialFrameWrite,
     SynchronizeFrame,
@@ -27,28 +25,6 @@ pub enum LedgerFileEvent {
     PartialSegmentHeaderWrite,
     SynchronizeSegmentHeader,
     SynchronizeSegmentDirectory,
-}
-
-/// Constructor-injected source for deterministic ledger operation failures.
-pub trait LedgerOperationFaultSource: Send + Sync {
-    fn take_failure(
-        &self,
-        scope: SegmentScope,
-        event: LedgerFileEvent,
-    ) -> Option<super::LedgerFailureCode>;
-}
-
-pub(super) fn emit_injected_event(
-    source: Option<&dyn LedgerOperationFaultSource>,
-    scope: Option<SegmentScope>,
-    event: LedgerFileEvent,
-) -> Result<(), LedgerFailure> {
-    if let (Some(source), Some(scope)) = (source, scope)
-        && let Some(code) = source.take_failure(scope, event)
-    {
-        return Err(LedgerFailure::new(code));
-    }
-    emit_event(event)
 }
 
 pub(super) fn emit_event(_event: LedgerFileEvent) -> Result<(), LedgerFailure> {

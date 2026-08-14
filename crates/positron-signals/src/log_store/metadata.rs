@@ -5,6 +5,7 @@ use super::LogStoreFailure;
 pub struct LogMetadata {
     severity_number: i32,
     severity_text: String,
+    event_name: String,
     trace_id: Option<[u8; 16]>,
     span_id: Option<[u8; 8]>,
     flags: u32,
@@ -34,9 +35,44 @@ impl LogMetadata {
         scope_dropped_attributes_count: u32,
         scope_schema_url: String,
     ) -> Self {
+        Self::new_with_event_name(
+            severity_number,
+            severity_text,
+            String::new(),
+            trace_id,
+            span_id,
+            flags,
+            dropped_attributes_count,
+            resource_dropped_attributes_count,
+            resource_schema_url,
+            scope_name,
+            scope_version,
+            scope_dropped_attributes_count,
+            scope_schema_url,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new_with_event_name(
+        severity_number: i32,
+        severity_text: String,
+        event_name: String,
+        trace_id: Option<[u8; 16]>,
+        span_id: Option<[u8; 8]>,
+        flags: u32,
+        dropped_attributes_count: u32,
+        resource_dropped_attributes_count: u32,
+        resource_schema_url: String,
+        scope_name: String,
+        scope_version: String,
+        scope_dropped_attributes_count: u32,
+        scope_schema_url: String,
+    ) -> Self {
         Self {
             severity_number,
             severity_text,
+            event_name,
             trace_id,
             span_id,
             flags,
@@ -76,6 +112,11 @@ impl LogMetadata {
     #[must_use]
     pub fn severity_text(&self) -> &str {
         &self.severity_text
+    }
+
+    #[must_use]
+    pub fn event_name(&self) -> &str {
+        &self.event_name
     }
 
     #[must_use]
@@ -131,6 +172,7 @@ impl LogMetadata {
     pub(super) fn decoded_size_bytes(&self) -> Result<usize, LogStoreFailure> {
         [
             self.severity_text.len(),
+            self.event_name.len(),
             self.resource_schema_url.len(),
             self.scope_name.len(),
             self.scope_version.len(),

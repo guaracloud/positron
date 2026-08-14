@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::Arc;
 
 use rustix::fs::{self as unix_fs, AtFlags, Dir, Mode, OFlags};
 
@@ -10,18 +9,13 @@ use crate::data_protection::{
     DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SegmentFramePurpose,
 };
 
-use super::fault::{
-    LedgerFileEvent, LedgerOperationFaultSource, emit_event, emit_injected_event,
-    injected_partial_write_length,
-};
+use super::fault::{LedgerFileEvent, emit_event, injected_partial_write_length};
 use super::format::{
     SegmentMetadata, SegmentState, decode_header, decode_metadata, encode_header, encode_metadata,
 };
 use super::io::{map_errno, map_io_error, open_or_create_directory, open_regular, synchronize};
 use super::recovery::frontier_temporary_name;
-use super::recovery::{
-    RecoveryState, frontier_name, publish_frontier_with_operation_fault, recover, segment_name,
-};
+use super::recovery::{RecoveryState, frontier_name, publish_frontier, recover, segment_name};
 use super::{
     LedgerFailure, LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
     map_frame_failure, object_context,
@@ -68,8 +62,6 @@ pub(super) struct LedgerStorage {
     active: File,
     sealed: File,
     current: Option<SegmentMetadata>,
-    fault_scope: Option<SegmentScope>,
-    fault_source: Option<Arc<dyn LedgerOperationFaultSource>>,
 }
 
 impl LedgerStorage {
@@ -83,20 +75,7 @@ impl LedgerStorage {
             active,
             sealed,
             current: None,
-            fault_scope: None,
-            fault_source: None,
         })
-    }
-
-    pub(super) fn open_with_operation_faults(
-        volume: &OwnedPrimaryDataVolume,
-        scope: SegmentScope,
-        source: Arc<dyn LedgerOperationFaultSource>,
-    ) -> Result<Self, LedgerFailure> {
-        let mut storage = Self::open(volume)?;
-        storage.fault_scope = Some(scope);
-        storage.fault_source = Some(source);
-        Ok(storage)
     }
 
     pub(super) fn catalog_segments(

@@ -140,6 +140,7 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
     assert_eq!(metadata.severity_text(), "warning");
     assert_eq!(metadata.trace_id(), Some([0x11; 16]));
     assert_eq!(metadata.span_id(), Some([0x22; 8]));
+    assert_eq!(metadata.event_name(), "checkout.completed");
     assert_eq!(metadata.flags(), 1);
     assert_eq!(metadata.dropped_attributes_count(), 3);
     assert_eq!(metadata.resource_dropped_attributes_count(), 5);
@@ -202,7 +203,7 @@ fn native_request() -> ExportLogsServiceRequest {
                     flags: 1,
                     trace_id: vec![0x11; 16],
                     span_id: vec![0x22; 8],
-                    ..LogRecord::default()
+                    event_name: "checkout.completed".to_owned(),
                 }],
             }],
         }],

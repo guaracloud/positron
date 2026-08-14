@@ -84,9 +84,8 @@ pub use catalog::{
 
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
-    LedgerFailure, LedgerFailureCode, LedgerFileEvent, LedgerOperationFaultSource, LedgerSnapshot,
-    PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseGrant, SnapshotLeaseId, StoreBlockIdentity,
+    LedgerFailure, LedgerFailureCode, LedgerSnapshot, PreparedStoreBlock, SealedSegment, SegmentId,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseGrant, SnapshotLeaseId, StoreBlockIdentity,
 };
 
 pub use data_protection::{

@@ -153,8 +153,6 @@ pub struct InitializedInstance {
     pub(crate) logs_shard: positron_domain::routing::VirtualShardId,
     pub(crate) ingest_policy: positron_ingest::IngestPolicy,
     pub(crate) admission_group_planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
-    pub(crate) ledger_operation_fault_source:
-        Option<Arc<dyn positron_kernel::LedgerOperationFaultSource>>,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,
     pub(super) integrity_key_fingerprint: [u8; 32],

@@ -2,6 +2,7 @@ use super::{OtlpLogsReceiver, ReceiveFailure};
 
 mod group_capacity;
 mod metadata_accounting;
+mod zero_identifiers;
 
 #[test]
 fn receiver_defaults_and_failures_keep_the_public_contract() {

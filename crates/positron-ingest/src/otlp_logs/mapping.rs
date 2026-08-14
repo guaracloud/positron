@@ -15,10 +15,13 @@ pub(super) fn checked_identifier<const N: usize>(
     if value.is_empty() {
         return Ok(None);
     }
-    value
+    let identifier: [u8; N] = value
         .try_into()
-        .map(Some)
-        .map_err(|_| ReceiveFailure::MalformedPayload)
+        .map_err(|_| ReceiveFailure::MalformedPayload)?;
+    Ok(identifier
+        .iter()
+        .any(|byte| *byte != 0)
+        .then_some(identifier))
 }
 
 pub(super) fn grouped_attributes(

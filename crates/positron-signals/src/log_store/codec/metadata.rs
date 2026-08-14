@@ -5,6 +5,7 @@ use super::{CodecLimits, Input, put_bytes, put_i32, put_u32};
 pub(super) fn encode(output: &mut Vec<u8>, metadata: &LogMetadata) -> Result<(), LogStoreFailure> {
     put_i32(output, metadata.severity_number());
     put_bytes(output, metadata.severity_text().as_bytes())?;
+    put_bytes(output, metadata.event_name().as_bytes())?;
     encode_optional_id(output, metadata.trace_id().as_ref());
     encode_optional_id(output, metadata.span_id().as_ref());
     put_u32(output, metadata.flags());
@@ -24,6 +25,7 @@ pub(super) fn decode(
 ) -> Result<LogMetadata, LogStoreFailure> {
     let severity_number = input.i32()?;
     let severity_text = input.string(limits.record_bytes)?;
+    let event_name = input.string(limits.record_bytes)?;
     let trace_id = decode_optional_id(input)?;
     let span_id = decode_optional_id(input)?;
     let flags = input.u32()?;
@@ -34,9 +36,10 @@ pub(super) fn decode(
     let scope_version = input.string(limits.record_bytes)?;
     let scope_dropped_attributes_count = input.u32()?;
     let scope_schema_url = input.string(limits.record_bytes)?;
-    Ok(LogMetadata::new(
+    Ok(LogMetadata::new_with_event_name(
         severity_number,
         severity_text,
+        event_name,
         trace_id,
         span_id,
         flags,
@@ -51,12 +54,13 @@ pub(super) fn decode(
 }
 
 pub(super) fn encoded_length(metadata: &LogMetadata) -> Result<usize, LogStoreFailure> {
-    let fixed = 42_usize
+    let fixed = 46_usize
         .checked_add(metadata.trace_id().map_or(0, |_| 16))
         .and_then(|bytes| bytes.checked_add(metadata.span_id().map_or(0, |_| 8)))
         .ok_or_else(LogStoreFailure::limit_exceeded)?;
     [
         metadata.severity_text().len(),
+        metadata.event_name().len(),
         metadata.resource_schema_url().len(),
         metadata.scope_name().len(),
         metadata.scope_version().len(),

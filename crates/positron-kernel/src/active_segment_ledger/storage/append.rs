@@ -24,12 +24,7 @@ impl LedgerStorage {
         file.seek(SeekFrom::End(0))
             .map_err(map_io_error)
             .map_err(|failure| unchanged.failure(failure))?;
-        emit_injected_event(
-            self.fault_source.as_deref(),
-            self.fault_scope,
-            LedgerFileEvent::WriteFrame,
-        )
-        .map_err(|failure| unchanged.failure(failure))?;
+        emit_event(LedgerFileEvent::WriteFrame).map_err(|failure| unchanged.failure(failure))?;
         let prefix = frame_bytes.to_be_bytes();
         let partial = injected_partial_write_length(LedgerFileEvent::PartialFrameWrite, 4);
         let prefix_bytes = partial.map_or(prefix.as_slice(), |length| &prefix[..length]);
@@ -50,7 +45,7 @@ impl LedgerStorage {
             .map_err(map_io_error)
             .map_err(|failure| mutation.failure(failure))?
             .len();
-        publish_frontier_with_operation_fault(
+        publish_frontier(
             &self.active,
             metadata.id,
             key,
@@ -60,7 +55,6 @@ impl LedgerStorage {
                 .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
                 .map_err(|failure| mutation.failure(failure))?,
             position,
-            self.fault_source.as_deref().zip(self.fault_scope),
         )
         .map_err(|failure| mutation.failure(failure))
     }

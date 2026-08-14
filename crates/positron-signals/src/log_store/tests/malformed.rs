@@ -183,11 +183,15 @@ fn version_two_metadata_tags_and_truncation_fail_closed() -> Result<(), Box<dyn 
     let stored = StoredLogRecord::new(record, clock(1).assign_ingest_time()?);
     let valid = crate::log_store::codec::encode_block(tenant, &[stored], encoded_bytes)?;
     let cases = [
-        ("unknown trace ID tag", replaced_byte(&valid, 38, 9)?),
+        (
+            "oversized event name",
+            replaced_bytes(&valid, 38, u32::MAX.to_be_bytes())?,
+        ),
+        ("unknown trace ID tag", replaced_byte(&valid, 42, 9)?),
         (
             "truncated metadata",
             valid
-                .get(..39)
+                .get(..43)
                 .ok_or("v2 metadata fixture was shorter than expected")?
                 .to_vec(),
         ),

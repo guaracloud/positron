@@ -1,13 +1,13 @@
 //! OTLP Logs gRPC public-boundary integration tests.
 
-#[path = "otlp_logs_grpc/admission_group_faults.rs"]
-mod admission_group_faults;
 #[path = "otlp_logs_grpc/admission_groups.rs"]
 mod admission_groups;
 #[path = "otlp_logs_grpc/authenticated_export.rs"]
 mod authenticated_export;
 #[path = "otlp_logs_grpc/authentication.rs"]
 mod authentication;
+#[path = "otlp_logs_grpc/empty_export.rs"]
+mod empty_export;
 #[path = "otlp_logs_grpc/forced_shutdown.rs"]
 mod forced_shutdown;
 #[path = "otlp_logs_grpc/malformed_transport.rs"]

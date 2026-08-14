@@ -22,6 +22,9 @@ use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
 
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
+mod blocking;
+use blocking::{BlockingIngestExecutor, BlockingIngestHandle};
+
 #[cfg(test)]
 mod tests;
 
@@ -37,13 +40,21 @@ pub(super) fn serve(
         .enable_all()
         .build()
         .map_err(|_| GrpcFailure)?;
-    runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::from_std(listener).map_err(|_| GrpcFailure)?;
+    let mut blocking = BlockingIngestExecutor::start()?;
+    let blocking_handle = blocking.handle()?;
+    let (result, forced) = runtime.block_on(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(_) => return (Err(GrpcFailure), false),
+        };
         let incoming = TcpListenerStream::new(listener);
         let authentication = services.clone();
-        let receiver = LogsServiceServer::new(OtlpLogsGrpc { services })
-            .accept_compressed(CompressionEncoding::Gzip)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        let receiver = LogsServiceServer::new(OtlpLogsGrpc {
+            services,
+            blocking: blocking_handle,
+        })
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES);
         let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
         let receiver = InterceptedService::new(receiver, move |request| {
             authenticate(request, &authentication)
@@ -58,10 +69,16 @@ pub(super) fn serve(
             });
         tokio::pin!(serving);
         tokio::select! {
-            result = &mut serving => result.map_err(|_| GrpcFailure),
-            () = wait_for(force) => Ok(()),
+            result = &mut serving => (result.map_err(|_| GrpcFailure), false),
+            () = wait_for(force) => (Ok(()), true),
         }
-    })
+    });
+    if forced {
+        let _worker_joined = blocking.shutdown_within(Duration::from_millis(100))?;
+    } else {
+        blocking.shutdown()?;
+    }
+    result
 }
 
 fn map_decode_failure<B>(mut response: http::Response<B>) -> http::Response<B> {
@@ -126,6 +143,7 @@ fn authentication_rejected() -> Status {
 #[derive(Clone, Debug)]
 struct OtlpLogsGrpc {
     services: ServiceHandle,
+    blocking: BlockingIngestHandle,
 }
 
 #[tonic::async_trait]
@@ -144,9 +162,24 @@ impl LogsService for OtlpLogsGrpc {
             .remove::<crate::services::GrpcAdmissionLease>()
             .ok_or_else(|| Status::internal("OTLP Logs admission context was unavailable"))?;
         let reservation = admission.take().map_err(service_status)?;
+        if request.get_ref().resource_logs.iter().all(|resource| {
+            resource
+                .scope_logs
+                .iter()
+                .all(|scope| scope.log_records.is_empty())
+        }) {
+            drop(reservation);
+            return render(IngestRequestOutcome::new(Vec::new()));
+        }
         let outcome = self
-            .services
-            .ingest_decoded_otlp_logs(context, request.into_inner(), reservation)
+            .blocking
+            .ingest(
+                self.services.clone(),
+                context,
+                request.into_inner(),
+                reservation,
+            )
+            .await
             .map_err(service_status)?;
         render(outcome)
     }

@@ -22,7 +22,7 @@ mod types;
 mod tests;
 
 use std::fmt::Formatter;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use positron_domain::routing::CommitPosition;
 
@@ -34,7 +34,6 @@ use crate::{
 };
 
 use capacity::{recovery_claim, retained_claim, snapshot_claim};
-pub use fault::{LedgerFileEvent, LedgerOperationFaultSource};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
@@ -84,31 +83,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         scope: SegmentScope,
         protection: SegmentProtectionKey,
     ) -> Result<Self, LedgerFailure> {
-        Self::open_with_clock_and_fault_source(
+        Self::open_with_clock(
             authority,
             catalog,
             scope,
             protection,
             &crate::LifecycleClock::new(crate::lifecycle_clock::SystemLifecycleClockSource),
-            None,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn open_with_operation_fault_source(
-        authority: &'kernel StorageKernelResourceAuthority,
-        catalog: &'catalog Catalog<'kernel>,
-        scope: SegmentScope,
-        protection: SegmentProtectionKey,
-        source: Arc<dyn LedgerOperationFaultSource>,
-    ) -> Result<Self, LedgerFailure> {
-        Self::open_with_clock_and_fault_source(
-            authority,
-            catalog,
-            scope,
-            protection,
-            &crate::LifecycleClock::new(crate::lifecycle_clock::SystemLifecycleClockSource),
-            Some(source),
         )
     }
 
@@ -119,17 +99,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         protection: SegmentProtectionKey,
         clock: &crate::LifecycleClock<S>,
     ) -> Result<Self, LedgerFailure> {
-        Self::open_with_clock_and_fault_source(authority, catalog, scope, protection, clock, None)
-    }
-
-    fn open_with_clock_and_fault_source<S: crate::LifecycleClockSource>(
-        authority: &'kernel StorageKernelResourceAuthority,
-        catalog: &'catalog Catalog<'kernel>,
-        scope: SegmentScope,
-        protection: SegmentProtectionKey,
-        clock: &crate::LifecycleClock<S>,
-        fault_source: Option<Arc<dyn LedgerOperationFaultSource>>,
-    ) -> Result<Self, LedgerFailure> {
         let now = clock
             .assign_ingest_time()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?
@@ -138,7 +107,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .checked_div(1_000_000_000)
             .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-        Self::open_at(authority, catalog, scope, protection, now, fault_source)
+        Self::open_at(authority, catalog, scope, protection, now)
     }
 
     fn open_at(
@@ -147,7 +116,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         scope: SegmentScope,
         protection: SegmentProtectionKey,
         now: u64,
-        fault_source: Option<Arc<dyn LedgerOperationFaultSource>>,
     ) -> Result<Self, LedgerFailure> {
         let writer = authority
             .acquire_active_segment_ledger(scope.lease_key())
@@ -175,10 +143,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let volume = authority
             .primary_data_volume()
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-        let mut storage = match fault_source {
-            Some(source) => LedgerStorage::open_with_operation_faults(volume, scope, source)?,
-            None => LedgerStorage::open(volume)?,
-        };
+        let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
         let recovered_leases = snapshot_lease_recovery::recover_reservations(
             authority, catalog, scope, &snapshot, now,

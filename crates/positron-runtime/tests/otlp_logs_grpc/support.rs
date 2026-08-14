@@ -183,24 +183,6 @@ impl LiveGrpcHarness {
         )?)
     }
 
-    pub(super) fn query_log_bodies_on_shard(
-        &self,
-        shard: positron_domain::routing::VirtualShardId,
-        query: &str,
-    ) -> Result<Vec<String>, TestError> {
-        let services = self
-            .process
-            .as_ref()
-            .and_then(RunningProcess::services)
-            .ok_or("runtime services missing")?;
-        Ok(services.query_log_bodies_on_shard(
-            &self.query_secret,
-            shard,
-            query,
-            positron_query::QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
-        )?)
-    }
-
     pub(super) async fn shutdown(
         mut self,
         trigger: ShutdownTrigger,

@@ -4,7 +4,7 @@ use positron_domain::value::ValueLimitProfile;
 use positron_kernel::ResourceReservation;
 use prost::Message;
 
-use super::bounds::decoded_record_bytes;
+use super::bounds::{decoded_record_bytes, retained_batch_bytes, retained_record_heap_bytes};
 use super::mapping::{candidate_value, checked_identifier, checked_timestamp, grouped_attributes};
 use super::{NativeLogBatch, NativeLogCandidate, ReceiveFailure};
 
@@ -17,6 +17,7 @@ pub(super) fn native_batch<'authority>(
     let mut records = Vec::new();
     let mut attribute_count = 0_usize;
     let mut decoded_batch_bytes = 0_usize;
+    let mut retained_heap_bytes = 0_usize;
     let encoded_record_limit = usize::try_from(
         value_limit_profile
             .effective_limits()
@@ -101,6 +102,19 @@ pub(super) fn native_batch<'authority>(
                     structural_nesting_depth,
                     structural_decoded_record_bytes,
                 )?;
+                retained_heap_bytes = retained_heap_bytes
+                    .checked_add(retained_record_heap_bytes(
+                        &resource,
+                        &scope,
+                        &log,
+                        [
+                            &resource_schema_url,
+                            &scope_name,
+                            &scope_version,
+                            &scope_schema_url,
+                        ],
+                    )?)
+                    .ok_or(ReceiveFailure::ValueLimitExceeded)?;
                 decoded_batch_bytes = decoded_batch_bytes
                     .checked_add(decoded_record_bytes)
                     .filter(|bytes| *bytes <= structural_decoded_batch_bytes)
@@ -121,9 +135,10 @@ pub(super) fn native_batch<'authority>(
                     &log.attributes,
                     structural_nesting_depth,
                 )?;
-                let metadata = positron_signals::LogMetadata::new(
+                let metadata = positron_signals::LogMetadata::new_with_event_name(
                     log.severity_number,
                     log.severity_text.clone(),
+                    log.event_name.clone(),
                     checked_identifier(&log.trace_id)?,
                     checked_identifier(&log.span_id)?,
                     log.flags,
@@ -145,11 +160,15 @@ pub(super) fn native_batch<'authority>(
             }
         }
     }
+    let retained_bytes = retained_batch_bytes(records.capacity(), retained_heap_bytes)?;
+    if retained_bytes > 4_194_304 {
+        return Err(ReceiveFailure::ValueLimitExceeded);
+    }
     Ok(NativeLogBatch {
         attribution,
         records,
         value_limit_profile,
-        decoded_bytes: u64::try_from(decoded_batch_bytes)
+        decoded_bytes: u64::try_from(retained_bytes)
             .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
         capacity,
     })

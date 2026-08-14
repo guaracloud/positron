@@ -78,7 +78,11 @@ fn replaced_byte(bytes: &[u8], offset: usize, value: u8) -> Result<Vec<u8>, Box<
     Ok(replaced)
 }
 
-fn replaced_bytes(bytes: &[u8], offset: usize, values: [u8; 2]) -> Result<Vec<u8>, Box<dyn Error>> {
+fn replaced_bytes<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+    values: [u8; N],
+) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut replaced = bytes.to_vec();
     replaced
         .get_mut(offset..offset + values.len())
