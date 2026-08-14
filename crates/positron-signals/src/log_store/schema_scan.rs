@@ -21,11 +21,14 @@ impl LogStore {
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
         scan: LogScan,
-        schema: &mut SchemaCatalog,
+        schema: &SchemaCatalog,
         query: &SchemaQuery,
     ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
         let scope = snapshot.scope();
-        if scope.tenant_id() != tenant || scope.signal_kind() != SignalKind::Logs {
+        if scope.tenant_id() != tenant
+            || scope.signal_kind() != SignalKind::Logs
+            || schema.tenant() != tenant
+        {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
         let encoded_bytes = snapshot
@@ -55,7 +58,6 @@ impl LogStore {
             .reserve(claim)
             .map_err(|_| LogStoreFailure::resource_admission_refused())?;
 
-        schema.record_query_use(query);
         let mut records = Vec::new();
         records
             .try_reserve_exact(scan.limit().value())
@@ -69,6 +71,17 @@ impl LogStore {
                 .is_some_and(|frontier| block.position() > frontier)
             {
                 continue;
+            }
+            let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
+            match schema.verified_block_kind(
+                block.identity(),
+                digest,
+                query.path(),
+                query.expected_kind(),
+            ) {
+                Some(false) => continue,
+                Some(true) => {},
+                None => reduced_pruning = true,
             }
             scanned_bytes = scanned_bytes
                 .checked_add(

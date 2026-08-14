@@ -26,13 +26,14 @@ pub(super) fn recover(
     let basis = catalog
         .pin()
         .map_err(|_| ServiceFailure::CatalogUnavailable)?;
-    let checkpoint = load_schema_checkpoint(&basis, instance.tenant).map_err(|failure| {
-        if failure.catalog_code().is_some() {
-            ServiceFailure::CatalogUnavailable
-        } else {
-            ServiceFailure::CorruptState
-        }
-    })?;
+    let checkpoint = load_schema_checkpoint(&basis, instance.tenant, instance.resource_governor())
+        .map_err(|failure| {
+            if failure.catalog_code().is_some() {
+                ServiceFailure::CatalogUnavailable
+            } else {
+                ServiceFailure::CorruptState
+            }
+        })?;
     let mut replay = SchemaReplayBuilder::new(
         instance.tenant,
         checkpoint.as_deref(),

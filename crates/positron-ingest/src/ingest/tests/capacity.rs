@@ -3,7 +3,7 @@ use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::ResourceDimension;
 use positron_policy::IngestPolicy;
 use positron_policy::{NativeLogAttribute, NativeLogCandidate, PolicyEvaluation, PolicyReceiver};
-use positron_signals::{LogRecord, LogStore, SchemaBudget, SchemaCatalog};
+use positron_signals::{LogRecord, LogStore, SchemaBudget};
 
 use super::{
     SchemaAdmissionEstimate, group_work_amounts, schema_admission_estimate,
@@ -126,14 +126,12 @@ fn valid_loki_stream_attribute_fits_the_conservative_schema_estimate() {
         LogRecord::checked_evaluated(LogStore::value_limit_profile(), *evaluated)
             .expect("valid record"),
     ];
-    let catalog = SchemaCatalog::new(
+    let catalog = positron_signals::TenantSchemaState::new(
         TenantId::from_bytes([0xb1; 16]).expect("tenant"),
         SchemaBudget::release_1().expect("budget"),
     )
     .expect("catalog");
-    let delta = LogStore::new()
-        .stage_schema_group(&mut records, &catalog)
-        .expect("schema stage");
+    let delta = catalog.stage_group(&mut records).expect("schema stage");
     assert!(
         u64::try_from(delta.staged_memory_bytes()).expect("staged bytes")
             <= estimate.staging_memory_bytes(),

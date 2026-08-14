@@ -17,6 +17,7 @@ positron-ingest = { path = "../crates/positron-ingest" }
 positron-runtime = { path = "../crates/positron-runtime" }
 positron-signals = { path = "../crates/positron-signals" }
 positron-query = { path = "../crates/positron-query" }
+positron-policy = { path = "../crates/positron-policy" }
 prost = "=0.14.3"
 
 [[bin]]

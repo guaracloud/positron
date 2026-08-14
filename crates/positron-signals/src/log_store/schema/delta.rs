@@ -1,17 +1,23 @@
+use positron_domain::identity::TenantId;
 use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
 
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
+use super::index::{SchemaBlockIndex, SchemaIndexPath};
 use super::model::{MAX_DISCOVERY_NODES, SchemaEntry, SchemaPath, promoted_index_bytes};
 use super::observation::{ObservedAttribute, SchemaObservation};
 use super::representation::SchemaRepresentation;
 use crate::log_store::{AttributeRepresentation, StoredLogAttribute};
 
 mod accounting;
+mod indexing;
 use accounting::{attribute_bytes, projected_cost, root_fits, staged_memory_bytes};
+pub(super) use indexing::additional_physical_cost;
+use indexing::stage_index_root;
 
 /// Opaque, bounded schema mutation staged before Store Block preparation.
 pub struct SchemaDelta {
+    tenant: TenantId,
     entries: Vec<SchemaEntry>,
     overflow_records: u64,
     overflow_bytes: u64,
@@ -19,11 +25,16 @@ pub struct SchemaDelta {
     staged_memory_bytes: usize,
     persistent_bytes: usize,
     index_bytes: usize,
+    index_paths: Vec<SchemaIndexPath>,
+    physical_index_bytes: usize,
+    physical_memory_bytes: usize,
+    build_physical_index: bool,
 }
 
 impl SchemaDelta {
-    pub(crate) const fn empty() -> Self {
+    pub(crate) const fn empty(tenant: TenantId, build_physical_index: bool) -> Self {
         Self {
+            tenant,
             entries: Vec::new(),
             overflow_records: 0,
             overflow_bytes: 0,
@@ -31,7 +42,15 @@ impl SchemaDelta {
             staged_memory_bytes: 0,
             persistent_bytes: 0,
             index_bytes: 0,
+            index_paths: Vec::new(),
+            physical_index_bytes: 0,
+            physical_memory_bytes: 0,
+            build_physical_index,
         }
+    }
+
+    pub(crate) const fn tenant(&self) -> TenantId {
+        self.tenant
     }
 
     #[must_use]
@@ -42,6 +61,34 @@ impl SchemaDelta {
     #[must_use]
     pub const fn staged_memory_bytes(&self) -> usize {
         self.staged_memory_bytes
+    }
+
+    pub(crate) const fn physical_index_bytes(&self) -> usize {
+        self.physical_index_bytes
+    }
+
+    pub(crate) const fn physical_memory_bytes(&self) -> usize {
+        self.physical_memory_bytes
+    }
+
+    pub(crate) fn into_block_index(
+        self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> (Self, Option<SchemaBlockIndex>) {
+        if self.index_paths.is_empty() {
+            return (self, None);
+        }
+        let mut delta = self;
+        let paths = std::mem::take(&mut delta.index_paths);
+        (
+            delta,
+            Some(SchemaBlockIndex {
+                identity,
+                digest,
+                paths,
+            }),
+        )
     }
 }
 
@@ -129,6 +176,7 @@ impl SchemaCatalog {
             }
             let cataloged = complete && root_fits(self, delta, &root)?;
             if cataloged {
+                stage_index_root(self, delta, &root)?;
                 merge_root(delta, root)?;
                 let (memory, persistent, index, _) = projected_cost(self, delta, None)?;
                 delta.retained_memory_bytes = memory;
@@ -158,7 +206,36 @@ impl SchemaCatalog {
         Ok(SchemaObservation::new(observed, record_overflow_bytes))
     }
 
-    pub(crate) fn apply_delta(&mut self, delta: SchemaDelta) -> Result<(), SchemaFailure> {
+    pub(crate) fn apply_delta(
+        &mut self,
+        delta: SchemaDelta,
+        block_index: Option<SchemaBlockIndex>,
+    ) -> Result<(), SchemaFailure> {
+        if delta.tenant != self.tenant {
+            return Err(SchemaFailure::InvalidValue);
+        }
+        let insertion = if let Some(index) = block_index.as_ref() {
+            match self
+                .block_indexes
+                .binary_search_by_key(&index.identity, |known| known.identity)
+            {
+                Ok(position) => {
+                    return if self.block_indexes.get(position) == Some(index) {
+                        Ok(())
+                    } else {
+                        Err(SchemaFailure::InvalidValue)
+                    };
+                },
+                Err(position) => {
+                    self.block_indexes
+                        .try_reserve_exact(1)
+                        .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+                    Some(position)
+                },
+            }
+        } else {
+            None
+        };
         for staged in delta.entries {
             match self
                 .entries
@@ -193,6 +270,10 @@ impl SchemaCatalog {
             .ok_or(SchemaFailure::LimitExceeded)?;
         self.overflow_records = self.overflow_records.saturating_add(delta.overflow_records);
         self.overflow_bytes = self.overflow_bytes.saturating_add(delta.overflow_bytes);
+        if let Some(index) = block_index {
+            self.block_indexes
+                .insert(insertion.ok_or(SchemaFailure::InvalidValue)?, index);
+        }
         Ok(())
     }
 }

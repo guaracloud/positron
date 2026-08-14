@@ -47,6 +47,10 @@ pub(super) fn schema_admission_estimate(
             }
         }
     }
+    if discovery_nodes > 0 {
+        schema_bytes = schema_bytes
+            .checked_add(u64::try_from(SchemaBudget::block_index_memory_bytes()).ok()?)?;
+    }
     let retained_memory_bytes =
         schema_bytes.min(u64::try_from(SchemaBudget::system_max_memory_bytes()).ok()?);
     let staging_memory_bytes = clone_bytes
@@ -182,6 +186,9 @@ fn accumulate_schema_bytes(
 ) -> Option<()> {
     use positron_domain::value::CandidateAttributeValue as Value;
     *bytes = bytes.checked_add(schema_entry_copy_bytes(path_bytes, depth)?)?;
+    *bytes = bytes.checked_add(
+        u64::try_from(SchemaBudget::index_path_memory_bytes(path_bytes, depth)?).ok()?,
+    )?;
     if let Value::KeyValueList(entries) = value {
         for entry in entries {
             accumulate_schema_bytes(

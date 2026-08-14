@@ -10,20 +10,48 @@ use crate::{SchemaSessionFailure, TenantSchemaSession};
 
 use super::{IngestFailureCode, IngestOutcome};
 
+pub(super) struct SchemaCapacityRetentionFailure<'authority> {
+    reservation: ResourceReservation<'authority>,
+    outcome: IngestOutcome,
+}
+
+pub(super) enum SchemaCapacityRetention<'authority> {
+    Retained(Option<TransferredResourceReservation>),
+    Failed(SchemaCapacityRetentionFailure<'authority>),
+}
+
+impl<'authority> SchemaCapacityRetentionFailure<'authority> {
+    pub(super) fn into_parts(self) -> (ResourceReservation<'authority>, IngestOutcome) {
+        (self.reservation, self.outcome)
+    }
+}
+
 pub(super) fn retain_schema_capacity(
     mut reservation: ResourceReservation<'_>,
     bytes: u64,
-) -> Result<Option<TransferredResourceReservation>, IngestOutcome> {
+) -> SchemaCapacityRetention<'_> {
     if bytes == 0 {
         drop(reservation);
-        return Ok(None);
+        return SchemaCapacityRetention::Retained(None);
     }
-    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
-        .map_err(|_| IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded))?;
-    reservation
-        .try_resize(amounts)
-        .map_err(|_| IngestOutcome::Ambiguous(IngestFailureCode::CapacityUnavailable))?;
-    Ok(Some(reservation.transfer()))
+    let amounts = match ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes) {
+        Ok(amounts) => amounts,
+        Err(_) => {
+            return SchemaCapacityRetention::Failed(SchemaCapacityRetentionFailure {
+                reservation,
+                outcome: IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+            });
+        },
+    };
+    if reservation.granted().get(ResourceDimension::MemoryBytes) < bytes
+        || reservation.try_resize(amounts).is_err()
+    {
+        return SchemaCapacityRetention::Failed(SchemaCapacityRetentionFailure {
+            reservation,
+            outcome: IngestOutcome::Ambiguous(IngestFailureCode::CapacityUnavailable),
+        });
+    }
+    SchemaCapacityRetention::Retained(Some(reservation.transfer()))
 }
 
 pub(super) fn rollback_schema(
@@ -41,6 +69,33 @@ pub(super) fn rollback_schema(
             None,
             0,
             DurableSchemaOutcome::DefiniteFailure,
+        )
+        .is_err()
+    {
+        IngestOutcome::Ambiguous(IngestFailureCode::StorageUnavailable)
+    } else {
+        outcome
+    }
+}
+
+pub(super) fn resolve_after_retention_failure(
+    schema: &TenantSchemaSession,
+    identity: StoreBlockIdentity,
+    shard: VirtualShardId,
+    staged: SchemaDelta,
+    capacity_bytes: u64,
+    digest: [u8; 32],
+    failure: SchemaCapacityRetentionFailure<'_>,
+) -> IngestOutcome {
+    let (capacity, outcome) = failure.into_parts();
+    if schema
+        .resolve_durable_outcome(
+            identity,
+            shard,
+            staged,
+            Some(capacity.transfer()),
+            capacity_bytes,
+            DurableSchemaOutcome::Ambiguous { digest },
         )
         .is_err()
     {

@@ -79,7 +79,7 @@ impl SchemaQuery {
     pub const fn selector(&self) -> OccurrenceSelector {
         self.selector
     }
-    const fn expected_kind(&self) -> AttributeValueKind {
+    pub(crate) const fn expected_kind(&self) -> AttributeValueKind {
         match &self.value {
             SchemaValue::Null => AttributeValueKind::Null,
             SchemaValue::Boolean(_) => AttributeValueKind::Boolean,
@@ -112,27 +112,12 @@ impl SchemaQueryResult {
 
 impl SchemaCatalog {
     /// Evaluates one explicit typed path query without coercion.
-    pub fn query(
-        &mut self,
-        observation: &SchemaObservation,
-        query: &SchemaQuery,
-    ) -> SchemaQueryResult {
-        self.record_query_use(query);
+    pub fn query(&self, observation: &SchemaObservation, query: &SchemaQuery) -> SchemaQueryResult {
         evaluate(
             self.entry(query.path()),
             observation.root_attributes(query.path()),
             query,
         )
-    }
-
-    pub(crate) fn record_query_use(&mut self, query: &SchemaQuery) {
-        if let Ok(index) = self
-            .entries
-            .binary_search_by(|entry| entry.path.cmp(query.path()))
-            && let Some(entry) = self.entries.get_mut(index)
-        {
-            entry.query_uses = entry.query_uses.saturating_add(1);
-        }
     }
 
     pub(crate) fn query_stored_record(
@@ -168,12 +153,6 @@ fn evaluate<'a>(
     query: &SchemaQuery,
 ) -> SchemaQueryResult {
     let indexed = entry.is_some_and(super::SchemaEntry::promoted);
-    if indexed && entry.is_some_and(|entry| !entry.variants().contains(&query.expected_kind())) {
-        return SchemaQueryResult {
-            matched: false,
-            reduced_pruning: false,
-        };
-    }
     let mut state = SelectionState::new(query.selector, &query.value);
     let mut reduced_pruning = !indexed;
     for (attribute, representation) in attributes {

@@ -25,9 +25,10 @@ fn bootstrap_rejects_a_structurally_valid_mismatched_replay_frontier() -> Result
 
     let catalog = open_catalog(&initialized)?;
     let basis = catalog.pin()?;
-    let current = load_schema_checkpoint(&basis, initialized.tenant)
-        .map_err(|_| "schema checkpoint")?
-        .ok_or("missing schema checkpoint")?;
+    let current =
+        load_schema_checkpoint(&basis, initialized.tenant, initialized.resource_governor())
+            .map_err(|_| "schema checkpoint")?
+            .ok_or("missing schema checkpoint")?;
     let scope = basis
         .reachable_ledger_scopes(
             initialized.tenant,

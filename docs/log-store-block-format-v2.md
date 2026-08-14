@@ -65,7 +65,12 @@ version `1`, followed by the tenant identity, entry/memory/persistent-byte/
 index-byte budgets, overflow record and byte counters, and deterministic
 namespace-qualified path entries. Each entry preserves observed typed
 variants, observation and conflict counts, query-use count, promotion state,
-and index bytes. The object is content-addressed and published only through
+index bytes, and canonical bounded per-block typed dictionaries. Each physical
+dictionary is keyed by the exact Store Block identity and authenticated payload
+digest. A query may prune only when both match; missing, stale, replacement, or
+demoted coverage falls back to the authoritative v2 value and reports reduced
+pruning. These sidecars do not add a Store Block tag or version. The object is
+content-addressed and published only through
 the Storage Kernel Catalog Writer with the generation precondition and typed
 governance evidence required by ADR-0069. It is rebuildable optimization state,
 published only after bootstrap replay before Serving or during graceful
@@ -80,9 +85,10 @@ values remain unchanged; overflow updates only bounded evidence and never
 allocates catalog, statistics, dictionary, or automatic-index state. Generic
 and overflow records therefore have identical logical scan and typed-query
 semantics, while overflow scans report reduced pruning. Promoted scalar paths
-carry a canonical typed-variant dictionary whose byte cost is two framing bytes
-plus one byte per variant. Dictionary budget exhaustion overflows the complete
-attribute root atomically. The dictionary can reject an impossible type before
+carry a canonical typed-variant dictionary whose entry, per-block
+identity/digest framing, path, and type-mask bytes all consume the same checked
+index and persistent budgets. Dictionary budget exhaustion overflows the
+complete attribute root atomically. Verified coverage can reject an impossible type before
 value traversal; exact value comparison, ordered nested duplicates, and
 explicit `index`, `any`, and `all` selection still use the source-of-truth
 record values with no coercion.

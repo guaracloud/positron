@@ -6,8 +6,8 @@ use positron_kernel::{
     LedgerSnapshot, ResourceGovernor, StoreBlockIdentity, TransferredResourceReservation,
 };
 use positron_signals::{
-    LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta,
-    SchemaFailure,
+    LogRecord, SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta, SchemaFailure,
+    TenantSchemaState,
 };
 
 mod checkpoint;
@@ -26,7 +26,7 @@ pub struct TenantSchemaSession {
 
 pub(super) struct SessionState {
     pub(super) tenant: TenantId,
-    pub(super) catalog: SchemaCatalog,
+    pub(super) catalog: TenantSchemaState,
     pub(super) frontiers: Vec<SchemaCheckpointFrontier>,
     pub(super) retained_capacity: Vec<TransferredResourceReservation>,
     pub(super) base_capacity: Option<TransferredResourceReservation>,
@@ -83,8 +83,33 @@ impl TenantSchemaSession {
         Self::with_budget(tenant, budget)
     }
 
+    pub(crate) fn release_1_base_memory_bytes() -> Result<u64, SchemaSessionFailure> {
+        let budget = SchemaBudget::release_1().map_err(SchemaSessionFailure::Schema)?;
+        let bytes = SchemaCatalog::base_memory_bound(budget)
+            .map_err(SchemaSessionFailure::Schema)?
+            .checked_add(
+                MAX_REPLAY_SHARDS
+                    .checked_mul(std::mem::size_of::<SchemaCheckpointFrontier>())
+                    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    budget
+                        .max_entries()
+                        .checked_mul(std::mem::size_of::<TransferredResourceReservation>())?,
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SessionState>()))
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<(TenantId, TenantSchemaSession)>())
+            })
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        u64::try_from(bytes).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
+    }
+
     fn with_budget(tenant: TenantId, budget: SchemaBudget) -> Result<Self, SchemaSessionFailure> {
-        let catalog = SchemaCatalog::new(tenant, budget).map_err(SchemaSessionFailure::Schema)?;
+        let catalog =
+            TenantSchemaState::new(tenant, budget).map_err(SchemaSessionFailure::Schema)?;
         let mut frontiers = Vec::new();
         frontiers
             .try_reserve_exact(MAX_REPLAY_SHARDS)
@@ -115,6 +140,7 @@ impl TenantSchemaSession {
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         let bytes = state
             .catalog
+            .catalog()
             .memory_bytes()
             .checked_add(
                 state
@@ -177,8 +203,9 @@ impl TenantSchemaSession {
         }
         reconcile_pending(&mut state, snapshot, governor)?;
         ensure_frontier_slot(&state, shard)?;
-        let delta = LogStore::new()
-            .stage_schema_group(records, &state.catalog)
+        let delta = state
+            .catalog
+            .stage_group(records)
             .map_err(|failure| match failure.code() {
                 positron_signals::LogStoreFailureCode::InvalidInput
                 | positron_signals::LogStoreFailureCode::MalformedBlock
@@ -218,8 +245,9 @@ impl TenantSchemaSession {
         state.in_flight = None;
         match outcome {
             DurableSchemaOutcome::Committed { position, digest } => {
-                LogStore::new()
-                    .apply_schema_delta(&mut state.catalog, staged)
+                state
+                    .catalog
+                    .commit(staged, identity, digest)
                     .map_err(|_| SchemaSessionFailure::Schema(SchemaFailure::InvalidValue))?;
                 set_frontier(&mut state, shard, position, identity, digest)?;
                 if let Some(capacity) = capacity {

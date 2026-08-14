@@ -27,9 +27,11 @@ pub use metadata::LogMetadata;
 pub use policy_provenance::PolicyProvenance;
 pub use scan::{LogScan, LogScanResult, ScanLimit, ScannedLogRecord};
 pub use schema::{
-    OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta,
-    SchemaEntry, SchemaFailure, SchemaObservation, SchemaPath, SchemaQuery, SchemaQueryResult,
-    SchemaRepresentation, SchemaValue,
+    OccurrenceSelector, SchemaBudget, SchemaBudgetPressure, SchemaCatalog,
+    SchemaCheckpointFrontier, SchemaDelta, SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry,
+    SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
+    SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
+    SchemaRepresentation, SchemaValue, TenantSchemaState,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
@@ -65,8 +67,9 @@ impl LogStore {
     }
 
     /// Prepares a block and its bounded schema delta without mutating live schema state.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_with_schema_delta<'capacity, S: LifecycleClockSource>(
+    pub(crate) fn prepare_with_schema_delta<'capacity, S: LifecycleClockSource>(
         &self,
         capacity: ResourceReservation<'capacity>,
         clock: &LifecycleClock<S>,
@@ -82,12 +85,12 @@ impl LogStore {
     }
 
     /// Stages one complete group's root-atomic schema decisions against an immutable view.
-    pub fn stage_schema_group(
+    pub(crate) fn stage_schema_group(
         &self,
         records: &mut [LogRecord],
         schema: &SchemaCatalog,
     ) -> Result<SchemaDelta, LogStoreFailure> {
-        let mut delta = SchemaDelta::empty();
+        let mut delta = SchemaDelta::empty(schema.tenant(), true);
         let mut meter = schema::delta::DiscoveryMeter::new();
         for record in records.iter_mut() {
             let mut attributes = Vec::new();
@@ -120,16 +123,24 @@ impl LogStore {
     }
 
     /// Applies a previously staged delta after its v2 block is durably resolved.
-    pub fn apply_schema_delta(
+    pub(crate) fn apply_schema_delta(
         &self,
         schema: &mut SchemaCatalog,
         delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
     ) -> Result<(), LogStoreFailure> {
-        schema.apply_delta(delta).map_err(map_schema_failure)
+        if schema.tenant() != delta.tenant() {
+            return Err(LogStoreFailure::physical_scope_mismatch());
+        }
+        let (delta, block_index) = delta.into_block_index(identity, digest);
+        schema
+            .apply_delta(delta, block_index)
+            .map_err(map_schema_failure)
     }
 
     /// Reconstructs one committed v2 block's schema delta without changing Store Block grammar.
-    pub fn replay_schema_block(
+    pub(crate) fn replay_schema_block(
         &self,
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
@@ -137,7 +148,10 @@ impl LogStore {
         schema: &SchemaCatalog,
     ) -> Result<SchemaDelta, LogStoreFailure> {
         let decoded = codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?;
-        let mut delta = SchemaDelta::empty();
+        if schema.tenant() != tenant {
+            return Err(LogStoreFailure::physical_scope_mismatch());
+        }
+        let mut delta = SchemaDelta::empty(tenant, true);
         let mut meter = schema::delta::DiscoveryMeter::new();
         for record in decoded.records {
             schema

@@ -4,6 +4,10 @@ use super::super::{SchemaSessionFailure, TenantSchemaRegistry};
 
 #[test]
 fn session_failures_have_one_bounded_public_diagnostic() {
+    assert!(matches!(
+        TenantSchemaRegistry::new(0),
+        Err(SchemaSessionFailure::RegistryLimitExceeded)
+    ));
     for failure in [
         SchemaSessionFailure::TenantConflict,
         SchemaSessionFailure::ReplayIntegrity,

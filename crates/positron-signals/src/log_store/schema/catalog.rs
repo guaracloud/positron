@@ -1,11 +1,15 @@
 use positron_domain::identity::TenantId;
+#[cfg(test)]
 use positron_domain::value::AttributeOccurrenceSet;
 
+#[cfg(test)]
 use super::delta::{DiscoveryMeter, SchemaDelta};
 use super::failure::SchemaFailure;
+use super::index::SchemaBlockIndex;
 use super::model::{
     CATALOG_HEADER_BYTES, SchemaBudget, SchemaEntry, SchemaPath, catalog_base_memory_bytes,
 };
+#[cfg(test)]
 use super::observation::SchemaObservation;
 
 /// Observable typed schema and overflow state for one tenant.
@@ -19,17 +23,22 @@ pub struct SchemaCatalog {
     pub(crate) index_bytes: usize,
     pub(crate) overflow_records: u64,
     pub(crate) overflow_bytes: u64,
+    pub(crate) block_indexes: Vec<SchemaBlockIndex>,
 }
 
 impl SchemaCatalog {
+    pub fn base_memory_bound(budget: SchemaBudget) -> Result<usize, SchemaFailure> {
+        catalog_base_memory_bytes(budget.max_entries())
+            .filter(|bytes| *bytes <= budget.max_memory_bytes())
+            .ok_or(SchemaFailure::InvalidBudget)
+    }
+
     pub fn new(tenant: TenantId, budget: SchemaBudget) -> Result<Self, SchemaFailure> {
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(budget.max_entries())
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-        let memory_bytes = catalog_base_memory_bytes(entries.capacity())
-            .filter(|bytes| *bytes <= budget.max_memory_bytes())
-            .ok_or(SchemaFailure::InvalidBudget)?;
+        let memory_bytes = Self::base_memory_bound(budget)?;
         Ok(Self {
             tenant,
             budget,
@@ -39,6 +48,7 @@ impl SchemaCatalog {
             index_bytes: 0,
             overflow_records: 0,
             overflow_bytes: 0,
+            block_indexes: Vec::new(),
         })
     }
 
@@ -93,18 +103,34 @@ impl SchemaCatalog {
         self.entries.iter()
     }
 
+    pub(crate) fn verified_block_kind(
+        &self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+        path: &SchemaPath,
+        kind: positron_domain::value::AttributeValueKind,
+    ) -> Option<bool> {
+        self.block_indexes
+            .binary_search_by_key(&identity, |index| index.identity)
+            .ok()
+            .and_then(|position| self.block_indexes.get(position))
+            .filter(|index| index.digest == digest)
+            .and_then(|index| index.covers_kind(path, kind))
+    }
+
     fn entry_index(&self, path: &SchemaPath) -> Result<usize, usize> {
         self.entries.binary_search_by(|entry| entry.path.cmp(path))
     }
 
     /// Observes one record's already validated occurrence sets.
-    pub fn observe(
+    #[cfg(test)]
+    pub(crate) fn observe(
         &mut self,
         attributes: &[AttributeOccurrenceSet],
     ) -> Result<SchemaObservation, SchemaFailure> {
-        let mut delta = SchemaDelta::empty();
+        let mut delta = SchemaDelta::empty(self.tenant, false);
         let observation = self.stage_record(attributes, &mut delta, &mut DiscoveryMeter::new())?;
-        self.apply_delta(delta)?;
+        self.apply_delta(delta, None)?;
         Ok(observation)
     }
 }

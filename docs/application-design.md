@@ -559,8 +559,13 @@ and is published only through the Storage Kernel Catalog Writer; no receiver
 or private schema publisher may bypass that authority. Generic and overflow
 representations use the same logical scan and explicit typed occurrence query
 semantics. Scalar paths consume an exact bounded typed-variant dictionary
-budget; an unavailable dictionary or Schema Overflow selects the generic scan
-and exposes reduced pruning without changing `index`, `any`, or `all` results.
+budget. `PSCHEMA1` binds each physical dictionary to the exact Store Block
+identity and authenticated payload digest; only matching coverage may prune an
+impossible type. Missing, stale, replaced, demoted, generic, or Schema Overflow
+coverage selects the generic scan and exposes reduced pruning without changing
+`index`, `any`, or `all` results. Discovery returns tenant-bound bounded top
+paths, typed conflicts and variants, promotion decisions, budget pressure,
+overflow counts, and sampled path digests without exposing mutation authority.
 
 Committed version 2 blocks, including their generic versus Schema Overflow
 root tags, are authoritative. The tenant-bound `PSCHEMA1` object is rebuildable

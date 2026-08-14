@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use positron_domain::identity::TenantId;
 use positron_kernel::TransferredResourceReservation;
-use positron_signals::{SchemaCatalog, SchemaFailure};
+use positron_signals::{SchemaCatalog, SchemaFailure, TenantSchemaState};
 
 use super::{MAX_REPLAY_SHARDS, SchemaSessionFailure, SessionState, TenantSchemaSession};
 
@@ -40,7 +40,7 @@ impl TenantSchemaSession {
         Ok(Self {
             state: Arc::new(Mutex::new(SessionState {
                 tenant,
-                catalog,
+                catalog: TenantSchemaState::from_catalog(catalog),
                 frontiers,
                 retained_capacity,
                 base_capacity: None,
@@ -61,10 +61,11 @@ impl TenantSchemaSession {
             tenant: state.tenant,
             catalog_bytes: state
                 .catalog
+                .catalog()
                 .encode_checkpoint_object(&state.frontiers)
                 .map_err(SchemaSessionFailure::Schema)?,
-            entry_count: state.catalog.entry_count(),
-            overflow_record_count: state.catalog.overflow_record_count(),
+            entry_count: state.catalog.catalog().entry_count(),
+            overflow_record_count: state.catalog.catalog().overflow_record_count(),
             retained_charge_bytes: state.retained_charge_bytes,
             pending_bytes: state
                 .pending

@@ -75,6 +75,10 @@ fn typed_values_do_not_coerce() -> Result<(), Box<dyn Error>> {
         CandidateAttributeValue::signed_integer(42),
     )?;
     let observation = catalog.observe(std::slice::from_ref(&set))?;
+    let before = catalog
+        .entry(&path(AttributeNamespace::Record, "number"))
+        .ok_or("entry")?
+        .query_uses();
     assert!(
         !catalog
             .query(
@@ -86,6 +90,14 @@ fn typed_values_do_not_coerce() -> Result<(), Box<dyn Error>> {
                 ),
             )
             .is_match()
+    );
+    assert_eq!(
+        catalog
+            .entry(&path(AttributeNamespace::Record, "number"))
+            .ok_or("entry")?
+            .query_uses(),
+        before,
+        "immutable query evaluation cannot mutate catalog evidence"
     );
     Ok(())
 }

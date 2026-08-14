@@ -86,6 +86,23 @@ fn ambiguous_delta_retains_one_exact_bounded_reservation_until_reconciliation() 
         session.checkpoint().expect("pending").pending_bytes(),
         staged_bytes
     );
+
+    let mut same_shard_retry = records();
+    assert!(matches!(
+        session.stage_group(
+            fixture.tenant,
+            first_shard,
+            StoreBlockIdentity::new([0xc9; 16]).expect("identity"),
+            &first_ledger.snapshot().expect("empty snapshot"),
+            &mut same_shard_retry,
+            fixture.authority.governor(),
+        ),
+        Err(SchemaSessionFailure::PendingReconciliationRequired)
+    ));
+    assert_eq!(
+        session.checkpoint().expect("pending").pending_bytes(),
+        staged_bytes
+    );
 }
 
 #[test]

@@ -1,0 +1,135 @@
+use positron_domain::value::AttributeValueKind;
+use positron_kernel::StoreBlockIdentity;
+use std::cmp::Ordering;
+
+use super::{SchemaBudget, SchemaEntry, SchemaFailure, SchemaPath};
+
+pub(crate) const INDEX_MAGIC: &[u8; 8] = b"PINDEX1\0";
+pub(crate) const INDEX_HEADER_BYTES: usize = 16;
+pub(crate) const BLOCK_INDEX_HEADER_BYTES: usize = 16 + 32 + 8;
+pub(crate) const MAX_BLOCK_INDEXES: usize = 4_096;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SchemaIndexPath {
+    pub(crate) path: SchemaPath,
+    pub(crate) kind_mask: u8,
+}
+
+impl SchemaIndexPath {
+    pub(crate) fn from_variants(
+        path: &SchemaPath,
+        variants: &[AttributeValueKind],
+    ) -> Result<Self, SchemaFailure> {
+        let kind_mask = variants
+            .iter()
+            .fold(0_u8, |mask, kind| mask | kind_bit(*kind));
+        Ok(Self {
+            path: path.try_clone()?,
+            kind_mask,
+        })
+    }
+
+    pub(crate) fn encoded_bytes(&self) -> Result<usize, SchemaFailure> {
+        self.path
+            .segments()
+            .iter()
+            .try_fold(4_usize, |total, segment| {
+                total.checked_add(8)?.checked_add(segment.len())
+            })
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
+    pub(crate) fn memory_bytes(&self) -> Result<usize, SchemaFailure> {
+        super::model::path_memory_bytes(&self.path)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
+    pub(crate) fn wire_cmp_path(&self, path: &SchemaPath) -> Ordering {
+        path_wire_cmp(&self.path, path)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SchemaBlockIndex {
+    pub(crate) identity: StoreBlockIdentity,
+    pub(crate) digest: [u8; 32],
+    pub(crate) paths: Vec<SchemaIndexPath>,
+}
+
+impl SchemaBlockIndex {
+    pub(crate) fn covers_kind(&self, path: &SchemaPath, kind: AttributeValueKind) -> Option<bool> {
+        self.paths
+            .binary_search_by(|known| known.wire_cmp_path(path))
+            .ok()
+            .and_then(|index| self.paths.get(index))
+            .map(|known| known.kind_mask & kind_bit(kind) != 0)
+    }
+}
+
+fn path_wire_cmp(left: &SchemaPath, right: &SchemaPath) -> Ordering {
+    namespace_tag(left)
+        .cmp(&namespace_tag(right))
+        .then_with(|| left.segments().len().cmp(&right.segments().len()))
+        .then_with(|| {
+            left.segments()
+                .iter()
+                .zip(right.segments())
+                .find_map(|(left, right)| {
+                    let order = left
+                        .len()
+                        .cmp(&right.len())
+                        .then_with(|| left.as_bytes().cmp(right.as_bytes()));
+                    (order != Ordering::Equal).then_some(order)
+                })
+                .unwrap_or(Ordering::Equal)
+        })
+}
+
+const fn namespace_tag(path: &SchemaPath) -> u8 {
+    match path.namespace() {
+        positron_domain::value::AttributeNamespace::Stream => 1,
+        positron_domain::value::AttributeNamespace::Resource => 2,
+        positron_domain::value::AttributeNamespace::InstrumentationScope => 3,
+        positron_domain::value::AttributeNamespace::Record => 4,
+    }
+}
+
+pub(crate) const fn kind_bit(kind: AttributeValueKind) -> u8 {
+    1_u8 << (kind as u8)
+}
+
+impl SchemaBudget {
+    /// Conservative retained-memory cost of one physical block-index owner.
+    #[must_use]
+    pub const fn block_index_memory_bytes() -> usize {
+        std::mem::size_of::<SchemaBlockIndex>() + std::mem::size_of::<Vec<SchemaIndexPath>>()
+    }
+
+    /// Conservative retained-memory cost of one indexed path copy.
+    pub fn index_path_memory_bytes(path_bytes: usize, depth: usize) -> Option<usize> {
+        let overhead = 2_usize.checked_mul(std::mem::size_of::<usize>())?;
+        overhead
+            .checked_add(depth.checked_mul(std::mem::size_of::<String>())?)?
+            .checked_add(depth.checked_mul(overhead)?)?
+            .checked_add(path_bytes)?
+            .checked_add(std::mem::size_of::<SchemaIndexPath>())
+    }
+
+    /// Conservative peak for decoding one authenticated v2 block and staging its schema delta.
+    pub fn replay_working_memory_bytes(payload_bytes: usize) -> Option<usize> {
+        let decoded_and_staged = payload_bytes
+            .checked_mul(4)?
+            .checked_add(1)?
+            .checked_add(payload_bytes.checked_mul(SchemaPath::system_max_segments())?)?
+            .checked_add(
+                Self::system_max_entries().checked_mul(
+                    std::mem::size_of::<SchemaEntry>()
+                        .checked_add(std::mem::size_of::<SchemaIndexPath>())?
+                        .checked_add(64)?,
+                )?,
+            )?
+            .checked_add(std::mem::size_of::<Vec<SchemaEntry>>())?;
+        Some(decoded_and_staged.min(Self::system_max_memory_bytes()))
+    }
+}

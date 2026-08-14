@@ -49,7 +49,7 @@ impl<'authority> SchemaReplayBuilder<'authority> {
             .try_resize(peak_resources(self.source_bytes)?)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         self.session
-            .replay_snapshot_for_bootstrap(self.tenant, snapshot)?;
+            .replay_snapshot_for_bootstrap(self.tenant, snapshot, &mut self.recovery)?;
         let retained = self
             .session
             .base_memory_bytes()?
@@ -67,10 +67,13 @@ impl<'authority> SchemaReplayBuilder<'authority> {
 }
 
 fn peak_resources(source_bytes: u64) -> Result<ResourceAmounts, SchemaSessionFailure> {
-    let memory = u64::try_from(SchemaBudget::system_max_memory_bytes())
-        .ok()
-        .and_then(|bytes| bytes.checked_add(source_bytes))
-        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let memory = u64::try_from(
+        SchemaBudget::replay_working_memory_bytes(1_048_576)
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+    )
+    .ok()
+    .and_then(|bytes| bytes.checked_add(source_bytes))
+    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     active_resources(memory)
 }
 

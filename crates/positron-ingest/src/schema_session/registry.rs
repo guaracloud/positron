@@ -23,12 +23,11 @@ impl TenantSchemaRegistry {
         if maximum == 0 || maximum > MAX_TENANT_SCHEMA_SESSIONS {
             return Err(SchemaSessionFailure::RegistryLimitExceeded);
         }
-        let mut sessions = Vec::new();
-        sessions
-            .try_reserve_exact(maximum)
-            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         Ok(Self {
-            state: Arc::new(Mutex::new(RegistryState { sessions, maximum })),
+            state: Arc::new(Mutex::new(RegistryState {
+                sessions: Vec::new(),
+                maximum,
+            })),
         })
     }
 
@@ -72,19 +71,30 @@ impl TenantSchemaRegistry {
                 if state.sessions.len() >= state.maximum {
                     return Err(SchemaSessionFailure::RegistryLimitExceeded);
                 }
-                let session = match checkpoint {
-                    Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes)?,
-                    None => TenantSchemaSession::release_1(tenant)?,
-                };
-                let base_bytes = session.base_memory_bytes()?;
+                let base_bytes = TenantSchemaSession::release_1_base_memory_bytes()?;
                 let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, base_bytes)
                     .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
                 let claim = WorkClaim::tenant(tenant, WorkKind::Ingest, amounts)
                     .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-                let capacity = governor
+                let mut capacity = governor
                     .reserve(claim)
                     .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-                session.attach_base_capacity(capacity.transfer(), base_bytes)?;
+                state
+                    .sessions
+                    .try_reserve_exact(1)
+                    .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+                let session = match checkpoint {
+                    Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes)?,
+                    None => TenantSchemaSession::release_1(tenant)?,
+                };
+                let actual_bytes = session.base_memory_bytes()?;
+                capacity
+                    .try_resize(
+                        ResourceAmounts::only(ResourceDimension::MemoryBytes, actual_bytes)
+                            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?,
+                    )
+                    .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+                session.attach_base_capacity(capacity.transfer(), actual_bytes)?;
                 state.sessions.insert(index, (tenant, session.clone()));
                 Ok(session)
             },

@@ -33,9 +33,13 @@ fn startup_rebuild_publishes_before_service_and_preserves_unrelated_objects()
         Some(b"unrelated-runtime-state".as_slice())
     );
     assert!(
-        load_schema_checkpoint(&snapshot, initialized.tenant)
-            .map_err(|_| "schema checkpoint load failed")?
-            .is_some()
+        load_schema_checkpoint(
+            &snapshot,
+            initialized.tenant,
+            initialized.resource_governor()
+        )
+        .map_err(|_| "schema checkpoint load failed")?
+        .is_some()
     );
     drop((snapshot, catalog, services));
     Ok(())

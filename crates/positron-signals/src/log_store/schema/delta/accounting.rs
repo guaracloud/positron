@@ -1,6 +1,6 @@
 use positron_domain::value::AttributeOccurrenceSet;
 
-use super::SchemaDelta;
+use super::{SchemaDelta, additional_physical_cost};
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
 use crate::log_store::schema::model::{
@@ -13,6 +13,7 @@ pub(super) fn root_fits(
     root: &[SchemaEntry],
 ) -> Result<bool, SchemaFailure> {
     let (memory, persistent, index, new_entries) = projected_cost(catalog, delta, Some(root))?;
+    let (physical_memory, physical_bytes) = additional_physical_cost(catalog, delta, root)?;
     let entries = catalog
         .entries
         .len()
@@ -22,14 +23,17 @@ pub(super) fn root_fits(
         && catalog
             .memory_bytes
             .checked_add(memory)
+            .and_then(|value| value.checked_add(physical_memory))
             .is_some_and(|value| value <= catalog.budget.max_memory_bytes())
         && catalog
             .persistent_bytes
             .checked_add(persistent)
+            .and_then(|value| value.checked_add(physical_bytes))
             .is_some_and(|value| value <= catalog.budget.max_persistent_bytes())
         && catalog
             .index_bytes
             .checked_add(index)
+            .and_then(|value| value.checked_add(physical_bytes))
             .is_some_and(|value| value <= catalog.budget.max_index_bytes())
         && catalog.persistent_bytes >= CATALOG_HEADER_BYTES)
 }
@@ -39,9 +43,9 @@ pub(super) fn projected_cost(
     delta: &SchemaDelta,
     root: Option<&[SchemaEntry]>,
 ) -> Result<(usize, usize, usize, usize), SchemaFailure> {
-    let mut memory = 0_usize;
-    let mut persistent = 0_usize;
-    let mut index = 0_usize;
+    let mut memory = delta.physical_memory_bytes();
+    let mut persistent = delta.physical_index_bytes();
+    let mut index = delta.physical_index_bytes();
     let mut new_entries = 0_usize;
     for staged in &delta.entries {
         let selected = root
@@ -129,22 +133,27 @@ fn add_entry_cost(
 }
 
 pub(super) fn staged_memory_bytes(delta: &SchemaDelta) -> Result<usize, SchemaFailure> {
-    delta.entries.iter().try_fold(
-        delta
-            .entries
-            .capacity()
-            .checked_mul(std::mem::size_of::<SchemaEntry>())
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaEntry>>()))
-            .ok_or(SchemaFailure::LimitExceeded)?,
-        |total, entry| {
-            total
-                .checked_add(
-                    entry_memory_bytes(&entry.path, entry.variants.capacity())
-                        .ok_or(SchemaFailure::LimitExceeded)?,
-                )
-                .ok_or(SchemaFailure::LimitExceeded)
-        },
-    )
+    delta
+        .entries
+        .iter()
+        .try_fold(
+            delta
+                .entries
+                .capacity()
+                .checked_mul(std::mem::size_of::<SchemaEntry>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaEntry>>()))
+                .ok_or(SchemaFailure::LimitExceeded)?,
+            |total, entry| {
+                total
+                    .checked_add(
+                        entry_memory_bytes(&entry.path, entry.variants.capacity())
+                            .ok_or(SchemaFailure::LimitExceeded)?,
+                    )
+                    .ok_or(SchemaFailure::LimitExceeded)
+            },
+        )?
+        .checked_add(delta.physical_memory_bytes())
+        .ok_or(SchemaFailure::LimitExceeded)
 }
 
 pub(super) fn attribute_bytes(set: &AttributeOccurrenceSet) -> Result<u64, SchemaFailure> {

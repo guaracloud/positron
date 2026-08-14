@@ -31,7 +31,7 @@ pub(super) fn reserve_shutdown_capacity(
 ) -> Result<TransferredResourceReservation, ServiceFailure> {
     let catalog = open_catalog(instance)?;
     let snapshot = catalog.pin().map_err(map_catalog)?;
-    let current = load_schema_checkpoint(&snapshot, instance.tenant)
+    let current = load_schema_checkpoint(&snapshot, instance.tenant, instance.resource_governor())
         .map_err(|_| ServiceFailure::CorruptState)?;
     let maximum = SchemaBudget::release_1()
         .map_err(|_| ServiceFailure::Internal)?
@@ -62,13 +62,15 @@ pub(super) fn publish_with_capacity(
 
     for _ in 0..MAX_ATTEMPTS {
         let snapshot = catalog.pin().map_err(map_catalog)?;
-        let current = load_schema_checkpoint(&snapshot, instance.tenant).map_err(|failure| {
-            if failure.catalog_code().is_some() {
-                ServiceFailure::CatalogUnavailable
-            } else {
-                ServiceFailure::CorruptState
-            }
-        })?;
+        let current =
+            load_schema_checkpoint(&snapshot, instance.tenant, instance.resource_governor())
+                .map_err(|failure| {
+                    if failure.catalog_code().is_some() {
+                        ServiceFailure::CatalogUnavailable
+                    } else {
+                        ServiceFailure::CorruptState
+                    }
+                })?;
         if current.as_deref() == Some(bytes.as_slice()) {
             return Ok(());
         }

@@ -2,6 +2,7 @@ use super::super::SchemaFailure;
 use super::*;
 use positron_domain::identity::TenantId;
 use positron_domain::value::AttributeValueKind;
+use positron_kernel::StoreBlockIdentity;
 
 fn header(tenant: TenantId, budget: SchemaBudget, count: u64) -> Vec<u8> {
     let mut bytes = b"PSCHEMA1".to_vec();
@@ -40,7 +41,7 @@ fn entry(mut bytes: Vec<u8>, variants: &[u8]) -> Vec<u8> {
 fn catalog_codec_round_trips_all_entry_metadata() -> Result<(), Box<dyn Error>> {
     let tenant = TenantId::from_bytes([0x52; 16])?;
     let budget = SchemaBudget::new(8, 8_192, 8_192, 4_096)?;
-    let bytes = entry(header(tenant, budget, 1), &[4, 2]);
+    let bytes = entry(header(tenant, budget, 1), &[2, 4]);
     let catalog = SchemaCatalog::decode_catalog_object(&bytes)?;
     assert_eq!(catalog.tenant(), tenant);
     assert_eq!(catalog.budget(), budget);
@@ -56,8 +57,8 @@ fn catalog_codec_round_trips_all_entry_metadata() -> Result<(), Box<dyn Error>> 
     assert_eq!(
         decoded.variants(),
         &[
-            AttributeValueKind::String,
-            AttributeValueKind::SignedInteger
+            AttributeValueKind::SignedInteger,
+            AttributeValueKind::String
         ]
     );
     assert_eq!(decoded.observations(), 2);
@@ -125,6 +126,9 @@ fn catalog_decoder_rejects_structural_and_budget_failures() -> Result<(), Box<dy
 
     let duplicate_variants = entry(header(tenant, budget, 1), &[4, 4]);
     assert!(SchemaCatalog::decode_catalog_object(&duplicate_variants).is_err());
+
+    let unsorted_variants = entry(header(tenant, budget, 1), &[4, 2]);
+    assert!(SchemaCatalog::decode_catalog_object(&unsorted_variants).is_err());
 
     let mut bad_promoted = entry(header(tenant, budget, 1), &[4]);
     bad_promoted[130] = 2;
@@ -226,5 +230,63 @@ fn catalog_decoder_rejects_invalid_variant_and_index_contracts() -> Result<(), B
     let index = container_only.len() - 8;
     container_only[index..].copy_from_slice(&0_u64.to_be_bytes());
     assert!(SchemaCatalog::decode_catalog_object(&container_only).is_ok());
+    Ok(())
+}
+
+#[test]
+fn physical_index_decoder_rejects_noncanonical_or_unverifiable_entries()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x56; 16])?;
+    let budget = SchemaBudget::new(8, 8_192, 8_192, 4_096)?;
+    let mut catalog = SchemaCatalog::new(tenant, budget)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    let mut delta = super::super::SchemaDelta::empty(tenant, true);
+    catalog.stage_record(
+        &[attribute],
+        &mut delta,
+        &mut super::super::delta::DiscoveryMeter::new(),
+    )?;
+    let (delta, block_index) =
+        delta.into_block_index(StoreBlockIdentity::new([0x57; 16])?, [0x58; 32]);
+    catalog.apply_delta(delta, block_index)?;
+    let valid = catalog.encode_catalog_object()?;
+    let sidecar = valid
+        .windows(8)
+        .position(|window| window == b"PINDEX1\0")
+        .ok_or("physical index missing")?;
+    let path_start = sidecar + 72;
+    let kind_offset = path_start + 1 + 2 + 8 + "indexed".len();
+
+    let mut malformed = Vec::new();
+    let mut zero_count = valid.clone();
+    zero_count[sidecar + 8..sidecar + 16].copy_from_slice(&0_u64.to_be_bytes());
+    malformed.push(zero_count);
+    let mut zero_identity = valid.clone();
+    zero_identity[sidecar + 16..sidecar + 32].fill(0);
+    malformed.push(zero_identity);
+    let mut zero_paths = valid.clone();
+    zero_paths[sidecar + 64..sidecar + 72].copy_from_slice(&0_u64.to_be_bytes());
+    malformed.push(zero_paths);
+    let mut zero_segments = valid.clone();
+    zero_segments[path_start + 1..path_start + 3].copy_from_slice(&0_u16.to_be_bytes());
+    malformed.push(zero_segments);
+    let mut invalid_utf8 = valid.clone();
+    invalid_utf8[path_start + 11] = 0xff;
+    malformed.push(invalid_utf8);
+    let mut zero_kind = valid.clone();
+    zero_kind[kind_offset] = 0;
+    malformed.push(zero_kind);
+    let mut duplicate_path = valid.clone();
+    duplicate_path[sidecar + 64..sidecar + 72].copy_from_slice(&2_u64.to_be_bytes());
+    duplicate_path.extend_from_within(path_start..);
+    malformed.push(duplicate_path);
+
+    for bytes in malformed {
+        assert!(SchemaCatalog::decode_catalog_object(&bytes).is_err());
+    }
     Ok(())
 }

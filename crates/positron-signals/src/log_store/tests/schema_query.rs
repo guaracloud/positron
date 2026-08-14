@@ -4,7 +4,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
-    AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue,
+    AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind,
+    CandidateAttributeValue,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
@@ -41,21 +42,24 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
     )?;
     let store = LogStore::new();
-    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 512, 512, 8)?)?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 256)?)?;
     let records = vec![record("indexed", "one")?, record("overflow", "two")?];
+    let identity = StoreBlockIdentity::new([0x69; 16])?;
     let (prepared, delta) = store.prepare_with_schema_delta(
         preparation_capacity(&authority, tenant)?,
         &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
         tenant,
         shard,
-        StoreBlockIdentity::new([0x69; 16])?,
+        identity,
         records,
         &schema,
     )?;
-    ledger.append(prepared.into_store_block())?;
-    store.apply_schema_delta(&mut schema, delta)?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
     let checkpoint = schema.encode_catalog_object()?;
-    let mut reopened = SchemaCatalog::decode_catalog_object(&checkpoint)?;
+    let reopened = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     let snapshot = ledger.snapshot()?;
 
     let indexed = store.scan_schema(
@@ -63,7 +67,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         tenant,
         &snapshot,
         LogScan::all(ScanLimit::new(2)?),
-        &mut schema,
+        &schema,
         &query("indexed", "one")?,
     )?;
     assert_eq!(indexed.records().len(), 1);
@@ -73,7 +77,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         tenant,
         &snapshot,
         LogScan::all(ScanLimit::new(2)?),
-        &mut reopened,
+        &reopened,
         &query("indexed", "one")?,
     )?;
     assert_eq!(indexed_reopened.records(), indexed.records());
@@ -81,13 +85,89 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         indexed_reopened.reduced_pruning(),
         indexed.reduced_pruning()
     );
+    let mut stale_digest = SchemaCatalog::decode_catalog_object(&checkpoint)?;
+    stale_digest.block_indexes[0].digest[0] ^= 1;
+    let stale = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &stale_digest,
+        &query("indexed", "one")?,
+    )?;
+    assert_eq!(stale.records(), indexed.records());
+    assert!(stale.reduced_pruning());
+
+    let mut replacement_identity = SchemaCatalog::decode_catalog_object(&checkpoint)?;
+    replacement_identity.block_indexes[0].identity = StoreBlockIdentity::new([0x7a; 16])?;
+    let replacement = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &replacement_identity,
+        &query("indexed", "one")?,
+    )?;
+    assert_eq!(replacement.records(), indexed.records());
+    assert!(replacement.reduced_pruning());
+
+    let generic = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let demoted = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &generic,
+        &query("indexed", "one")?,
+    )?;
+    assert_eq!(demoted.records(), indexed.records());
+    assert!(demoted.reduced_pruning());
+    let pruned = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &schema,
+        &SchemaQuery::value(
+            SchemaPath::new(AttributeNamespace::Record, "indexed".to_owned())?,
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(1),
+        ),
+    )?;
+    assert!(pruned.records().is_empty());
+    assert_eq!(pruned.scanned_bytes(), 0);
+    assert!(!pruned.reduced_pruning());
+
+    for value in [
+        SchemaValue::null(),
+        SchemaValue::boolean(true),
+        SchemaValue::floating_point_bits(1.0_f64.to_bits()),
+        SchemaValue::bytes(vec![1]),
+        SchemaValue::kind(AttributeValueKind::Array),
+    ] {
+        let other_type = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(2)?),
+            &schema,
+            &SchemaQuery::value(
+                SchemaPath::new(AttributeNamespace::Record, "indexed".to_owned())?,
+                OccurrenceSelector::Any,
+                value,
+            ),
+        )?;
+        assert!(other_type.records().is_empty());
+        assert_eq!(other_type.scanned_bytes(), 0);
+        assert!(!other_type.reduced_pruning());
+    }
 
     let overflow = store.scan_schema(
         authority.governor(),
         tenant,
         &snapshot,
         LogScan::all(ScanLimit::new(2)?),
-        &mut schema,
+        &schema,
         &query("overflow", "two")?,
     )?;
     assert_eq!(overflow.records().len(), 1);
@@ -97,7 +177,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         tenant,
         &snapshot,
         LogScan::all(ScanLimit::new(2)?),
-        &mut reopened,
+        &reopened,
         &query("overflow", "two")?,
     )?;
     assert_eq!(overflow_reopened.records(), overflow.records());
@@ -131,28 +211,34 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
     let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(8, 8_192, 8_192, 64)?)?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100)));
 
+    let first_identity = StoreBlockIdentity::new([0x6a; 16])?;
     let (first, first_delta) = store.prepare_with_schema_delta(
         preparation_capacity(&authority, tenant)?,
         &clock,
         tenant,
         shard,
-        StoreBlockIdentity::new([0x6a; 16])?,
+        first_identity,
         vec![record("match", "value")?],
         &schema,
     )?;
-    let first_receipt = ledger.append(first.into_store_block())?;
-    store.apply_schema_delta(&mut schema, first_delta)?;
+    let first_block = first.into_store_block();
+    let first_digest = first_block.content_digest()?;
+    let first_receipt = ledger.append(first_block)?;
+    store.apply_schema_delta(&mut schema, first_delta, first_identity, first_digest)?;
+    let second_identity = StoreBlockIdentity::new([0x6b; 16])?;
     let (second, second_delta) = store.prepare_with_schema_delta(
         preparation_capacity(&authority, tenant)?,
         &clock,
         tenant,
         shard,
-        StoreBlockIdentity::new([0x6b; 16])?,
+        second_identity,
         vec![record("match", "value")?],
         &schema,
     )?;
-    ledger.append(second.into_store_block())?;
-    store.apply_schema_delta(&mut schema, second_delta)?;
+    let second_block = second.into_store_block();
+    let second_digest = second_block.content_digest()?;
+    ledger.append(second_block)?;
+    store.apply_schema_delta(&mut schema, second_delta, second_identity, second_digest)?;
     let snapshot = ledger.snapshot()?;
 
     let through_first = store.scan_schema(
@@ -160,7 +246,7 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
         tenant,
         &snapshot,
         LogScan::through(ScanLimit::new(2)?, first_receipt.position()),
-        &mut schema,
+        &schema,
         &query("match", "value")?,
     )?;
     assert_eq!(through_first.records().len(), 1);
@@ -172,7 +258,7 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
         tenant,
         &snapshot,
         LogScan::all(ScanLimit::new(1)?),
-        &mut schema,
+        &schema,
         &query("match", "value")?,
     )?;
     assert_eq!(bounded.records().len(), 1);
@@ -186,10 +272,23 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
             foreign,
             &snapshot,
             LogScan::all(ScanLimit::new(1)?),
-            &mut schema,
+            &schema,
             &query("match", "value")?,
         )
         .expect_err("cross-tenant scan must fail before query work");
+    assert_eq!(failure.code(), LogStoreFailureCode::PhysicalScopeMismatch);
+
+    let foreign_schema = SchemaCatalog::new(foreign, SchemaBudget::release_1()?)?;
+    let failure = store
+        .scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &foreign_schema,
+            &query("match", "value")?,
+        )
+        .expect_err("cross-tenant schema must fail before query work");
     assert_eq!(failure.code(), LogStoreFailureCode::PhysicalScopeMismatch);
     Ok(())
 }

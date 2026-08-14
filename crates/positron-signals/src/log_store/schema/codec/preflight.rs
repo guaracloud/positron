@@ -4,7 +4,12 @@ use crate::log_store::schema::model::{
     CATALOG_HEADER_BYTES, MAX_VARIANTS, SchemaBudget, catalog_base_memory_bytes,
 };
 
-pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<usize, SchemaFailure> {
+pub(super) struct CatalogPrefix {
+    pub(super) offset: usize,
+    pub(super) memory_bound: usize,
+}
+
+pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailure> {
     if bytes.len() < CATALOG_HEADER_BYTES || bytes.len() > 1_048_576 {
         return Err(SchemaFailure::MalformedCatalog);
     }
@@ -70,9 +75,14 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<usize, SchemaFailure> {
         }
         let mut seen = [false; 8];
         let mut has_scalar = false;
+        let mut previous_tag = None;
         for _ in 0..variants {
             let tag = input.u8()?;
             decode_value_kind(tag)?;
+            if previous_tag.is_some_and(|previous| tag <= previous) {
+                return Err(SchemaFailure::MalformedCatalog);
+            }
+            previous_tag = Some(tag);
             has_scalar |= tag <= 5;
             let slot = seen
                 .get_mut(usize::from(tag))
@@ -113,5 +123,14 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<usize, SchemaFailure> {
             .filter(|value| *value <= budget.max_index_bytes())
             .ok_or(SchemaFailure::MalformedCatalog)?;
     }
-    Ok(bytes.len().saturating_sub(input.remaining_len()))
+    let physical_bytes = super::index::preflight(&mut input, budget)?;
+    index_bytes = index_bytes
+        .checked_add(physical_bytes)
+        .filter(|value| *value <= budget.max_index_bytes())
+        .ok_or(SchemaFailure::MalformedCatalog)?;
+    let _ = index_bytes;
+    Ok(CatalogPrefix {
+        offset: bytes.len().saturating_sub(input.remaining_len()),
+        memory_bound: memory,
+    })
 }

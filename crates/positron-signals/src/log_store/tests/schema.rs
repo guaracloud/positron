@@ -18,7 +18,7 @@ use super::{AttributeRepresentation, LogRecord, LogScan, LogStore, ScanLimit};
 use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
-use crate::{LogStoreFailureCode, SchemaBudget, SchemaCatalog};
+use crate::{LogStoreFailureCode, SchemaBudget, SchemaCatalog, TenantSchemaState};
 
 #[test]
 fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(), Box<dyn Error>> {
@@ -35,7 +35,7 @@ fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
     let first = make_record("first", "one")?;
     let second = make_record("second", "two")?;
-    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 512, 512, 256)?)?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 512, 256)?)?;
     let ledger = ActiveSegmentLedger::open(
         &authority,
         &catalog,
@@ -43,17 +43,20 @@ fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(
         SegmentProtectionKey::from_owned(Box::new([0x58; 32])),
     )?;
     let store = LogStore::new();
+    let identity = StoreBlockIdentity::new([0x68; 16])?;
     let (prepared, delta) = store.prepare_with_schema_delta(
         preparation_capacity(&authority, tenant)?,
         &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
         tenant,
         shard,
-        StoreBlockIdentity::new([0x68; 16])?,
+        identity,
         vec![first.clone(), second.clone()],
         &schema,
     )?;
-    ledger.append(prepared.into_store_block())?;
-    store.apply_schema_delta(&mut schema, delta)?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
     let snapshot = ledger.snapshot()?;
     let result = LogStore::new().scan(
         authority.governor(),
@@ -74,12 +77,12 @@ fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(
     assert_eq!(schema.overflow_record_count(), 1);
 
     let block = snapshot.blocks().first().ok_or("committed block")?;
-    let mut replayed = SchemaCatalog::new(tenant, SchemaBudget::new(1, 512, 512, 256)?)?;
-    let replay_delta = store.replay_schema_block(tenant, &snapshot, block, &replayed)?;
-    store.apply_schema_delta(&mut replayed, replay_delta)?;
-    assert_eq!(replayed, schema);
+    let mut replayed = TenantSchemaState::new(tenant, SchemaBudget::new(1, 8_192, 512, 256)?)?;
+    let replay_delta = replayed.replay(tenant, &snapshot, block)?;
+    replayed.commit(replay_delta, block.identity(), block.content_digest()?)?;
+    assert_eq!(replayed.catalog(), &schema);
 
-    let constrained = SchemaCatalog::new(tenant, SchemaBudget::new(1, 512, 512, 2)?)?;
+    let constrained = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 512, 2)?)?;
     let replay_failure = match store.replay_schema_block(tenant, &snapshot, block, &constrained) {
         Ok(_) => return Err("generic tag unexpectedly replayed as overflow".into()),
         Err(failure) => failure,
@@ -112,8 +115,36 @@ fn discovery_work_overflow_is_cumulative_across_the_whole_group() -> Result<(), 
         Some(AttributeRepresentation::SchemaOverflow)
     );
     let mut applied = schema;
-    LogStore::new().apply_schema_delta(&mut applied, delta)?;
+    LogStore::new().apply_schema_delta(
+        &mut applied,
+        delta,
+        StoreBlockIdentity::new([0x91; 16])?,
+        [0x92; 32],
+    )?;
     assert_eq!(applied.overflow_record_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn staged_schema_delta_cannot_be_applied_to_another_tenant() -> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x81; 16])?;
+    let foreign = TenantId::from_bytes([0x82; 16])?;
+    let schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let mut records = vec![make_record("tenant", "bound")?];
+    let delta = LogStore::new().stage_schema_group(&mut records, &schema)?;
+    let mut foreign_schema = SchemaCatalog::new(foreign, SchemaBudget::release_1()?)?;
+    let failure = LogStore::new()
+        .apply_schema_delta(
+            &mut foreign_schema,
+            delta,
+            StoreBlockIdentity::new([0x93; 16])?,
+            [0x94; 32],
+        )
+        .expect_err("delta must retain its staging tenant");
+    assert_eq!(
+        failure.code(),
+        super::super::LogStoreFailureCode::PhysicalScopeMismatch
+    );
     Ok(())
 }
 

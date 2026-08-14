@@ -11,6 +11,7 @@ const MAGIC: &[u8; 8] = b"PSCHEMA1";
 const VERSION: u16 = 1;
 const MAX_SEGMENTS_ON_WIRE: usize = 128;
 mod encode;
+mod index;
 mod preflight;
 
 impl SchemaCatalog {
@@ -28,6 +29,11 @@ impl SchemaCatalog {
         } else {
             Ok(None)
         }
+    }
+
+    /// Returns the allocation bound validated before a catalog object decode.
+    pub fn catalog_memory_bound(bytes: &[u8]) -> Result<usize, SchemaFailure> {
+        Ok(preflight::catalog_prefix(bytes)?.memory_bound)
     }
 
     /// Encodes this immutable tenant schema representation for Catalog publication.
@@ -61,8 +67,16 @@ fn decode_checkpoint(
     SchemaFailure,
 > {
     let prefix = preflight::catalog_prefix(bytes)?;
-    super::checkpoint::preflight(bytes.get(prefix..).ok_or(SchemaFailure::MalformedCatalog)?)?;
-    let mut input = Input::new(bytes.get(..prefix).ok_or(SchemaFailure::MalformedCatalog)?);
+    super::checkpoint::preflight(
+        bytes
+            .get(prefix.offset..)
+            .ok_or(SchemaFailure::MalformedCatalog)?,
+    )?;
+    let mut input = Input::new(
+        bytes
+            .get(..prefix.offset)
+            .ok_or(SchemaFailure::MalformedCatalog)?,
+    );
     input.take(MAGIC.len())?;
     input.u16()?;
     let tenant =
@@ -131,6 +145,20 @@ fn decode_checkpoint(
             .ok_or(SchemaFailure::MalformedCatalog)?;
         catalog.entries.push(entry);
     }
+    let (block_indexes, physical_bytes, physical_memory) = index::decode(&mut input, budget)?;
+    catalog.block_indexes = block_indexes;
+    catalog.persistent_bytes = catalog
+        .persistent_bytes
+        .checked_add(physical_bytes)
+        .ok_or(SchemaFailure::MalformedCatalog)?;
+    catalog.index_bytes = catalog
+        .index_bytes
+        .checked_add(physical_bytes)
+        .ok_or(SchemaFailure::MalformedCatalog)?;
+    catalog.memory_bytes = catalog
+        .memory_bytes
+        .checked_add(physical_memory)
+        .ok_or(SchemaFailure::MalformedCatalog)?;
     catalog.overflow_records = overflow_records;
     catalog.overflow_bytes = overflow_bytes;
     if catalog.memory_bytes > budget.max_memory_bytes()
@@ -140,7 +168,9 @@ fn decode_checkpoint(
         return Err(SchemaFailure::MalformedCatalog);
     }
     let frontiers = super::checkpoint::decode(
-        bytes.get(prefix..).ok_or(SchemaFailure::MalformedCatalog)?,
+        bytes
+            .get(prefix.offset..)
+            .ok_or(SchemaFailure::MalformedCatalog)?,
         budget,
         catalog.memory_bytes,
     )?;
@@ -261,6 +291,14 @@ impl<'a> Input<'a> {
             .take(1)?
             .first()
             .ok_or(SchemaFailure::MalformedCatalog)?)
+    }
+
+    pub(super) fn starts_with(&self, prefix: &[u8]) -> bool {
+        self.bytes.starts_with(prefix)
+    }
+
+    pub(super) const fn remaining_bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     fn u16(&mut self) -> Result<u16, SchemaFailure> {

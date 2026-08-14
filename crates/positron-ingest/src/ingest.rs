@@ -1,3 +1,5 @@
+use crate::schema_session::DurableSchemaOutcome;
+use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation, TenantSchemaSession};
 use positron_domain::identity::{Scope, TenantId};
 use positron_domain::routing::VirtualShardId;
 use positron_kernel::{
@@ -6,9 +8,6 @@ use positron_kernel::{
     StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_signals::LogStore;
-
-use crate::schema_session::DurableSchemaOutcome;
-use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation, TenantSchemaSession};
 
 mod capacity;
 mod failure;
@@ -22,7 +21,10 @@ pub use outcome::{
     CommittedAdmission, IngestFailureCode, IngestOutcome, PartialAdmission, RejectionDetail,
 };
 use outcome::{increment_rejection, partial_admission};
-use schema_resolution::{map_schema_session_failure, retain_schema_capacity, rollback_schema};
+use schema_resolution::{
+    SchemaCapacityRetention, map_schema_session_failure, resolve_after_retention_failure,
+    retain_schema_capacity, rollback_schema,
+};
 
 /// Concrete receiver-independent Log ingestion path.
 pub struct LogIngest<'service, 'kernel, 'catalog, S> {
@@ -309,8 +311,18 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             Ok(receipt) => {
                 let retained_capacity =
                     match retain_schema_capacity(schema_capacity, retained_bytes) {
-                        Ok(capacity) => capacity,
-                        Err(outcome) => return outcome,
+                        SchemaCapacityRetention::Retained(capacity) => capacity,
+                        SchemaCapacityRetention::Failed(failure) => {
+                            return resolve_after_retention_failure(
+                                &self.schema,
+                                identity,
+                                self.shard,
+                                staged_schema,
+                                retained_bytes,
+                                block_digest,
+                                failure,
+                            );
+                        },
                     };
                 if self
                     .schema
@@ -350,8 +362,18 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                 let pending_capacity =
                     if matches!(schema_outcome, DurableSchemaOutcome::Ambiguous { .. }) {
                         match retain_schema_capacity(schema_capacity, staged_bytes) {
-                            Ok(capacity) => capacity,
-                            Err(outcome) => return outcome,
+                            SchemaCapacityRetention::Retained(capacity) => capacity,
+                            SchemaCapacityRetention::Failed(failure) => {
+                                return resolve_after_retention_failure(
+                                    &self.schema,
+                                    identity,
+                                    self.shard,
+                                    staged_schema,
+                                    staged_bytes,
+                                    block_digest,
+                                    failure,
+                                );
+                            },
                         }
                     } else {
                         drop(schema_capacity);
