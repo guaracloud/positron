@@ -1,6 +1,6 @@
 use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
 
-use super::{DiscoveryMeter, SchemaDelta};
+use super::{DiscoveryMeter, SchemaDelta, projected_cost, staged_memory_bytes};
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
 use crate::log_store::schema::index::{BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES};
@@ -55,7 +55,7 @@ impl SchemaDelta {
         };
         for index in 0..count {
             if !meter.consume()? {
-                self.mark_all_paths_unverified();
+                self.mark_all_paths_unverified(catalog)?;
                 return Ok(false);
             }
             let entry = value
@@ -71,11 +71,18 @@ impl SchemaDelta {
         Ok(true)
     }
 
-    fn mark_all_paths_unverified(&mut self) {
+    fn mark_all_paths_unverified(&mut self, catalog: &SchemaCatalog) -> Result<(), SchemaFailure> {
         self.all_paths_unverified = true;
         self.index_paths = Vec::new();
+        self.unverified_paths = Vec::new();
         self.physical_index_bytes = 0;
         self.physical_memory_bytes = 0;
+        let (memory, persistent, index, _) = projected_cost(catalog, self, None)?;
+        self.retained_memory_bytes = memory;
+        self.persistent_bytes = persistent;
+        self.index_bytes = index;
+        self.staged_memory_bytes = staged_memory_bytes(self)?;
+        Ok(())
     }
 
     fn mark_path_unverified(

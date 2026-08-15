@@ -18,6 +18,7 @@ use positron_policy::{
 
 use super::support::{TemporaryRoot, establish_kernel_authority, preparation_capacity};
 use super::{AttributeRepresentation, LogRecord, LogScan, LogStore, ScanLimit};
+use crate::log_store::schema::delta::DiscoveryMeter;
 use crate::{
     OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery, SchemaValue,
 };
@@ -54,7 +55,19 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
     records.push(nested_record(CandidateAttributeValue::signed_integer(42))?);
 
     let source = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
-    let _delta = store.stage_schema_group(&mut records, &source)?;
+    for record in records.iter_mut().take(5) {
+        let _delta = store.stage_schema_group(std::slice::from_mut(record), &source)?;
+        assert_eq!(
+            record
+                .attributes()
+                .first()
+                .map(|attribute| attribute.representation()),
+            Some(AttributeRepresentation::Generic)
+        );
+    }
+    let constrained = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 512, 256)?)?;
+    let overflow = records.last_mut().ok_or("overflow fixture")?;
+    let _delta = store.stage_schema_group(std::slice::from_mut(overflow), &constrained)?;
     assert_eq!(
         records
             .last()
@@ -89,11 +102,50 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
     let mut replayed = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
     replayed.observe(std::slice::from_ref(&seed))?;
     replayed.observe(std::slice::from_ref(&seed))?;
+    let filler = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "filler".to_owned(),
+        vec![CandidateAttributeValue::string("fill".to_owned())],
+    )
+    .validate(LogStore::value_limit_profile())?;
+    replayed.observe(std::slice::from_ref(&filler))?;
+    replayed.observe(std::slice::from_ref(&filler))?;
     replayed.record_query_use(&path)?;
+    let memory_before = replayed.memory_bytes();
+    let persistent_before = replayed.persistent_bytes();
+    let index_before = replayed.index_bytes();
     let snapshot = ledger.snapshot()?;
     let committed = snapshot.blocks().first().ok_or("committed block")?;
-    let replay_delta = store.replay_schema_block(tenant, &snapshot, committed, &replayed)?;
-    store.apply_schema_delta(&mut replayed, replay_delta, identity, digest)?;
+    let mut replay_delta = store.replay_schema_block(tenant, &snapshot, committed, &replayed)?;
+    let mut no_query_evidence = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    no_query_evidence.observe(std::slice::from_ref(&seed))?;
+    no_query_evidence.observe(std::slice::from_ref(&seed))?;
+    no_query_evidence.observe(std::slice::from_ref(&filler))?;
+    no_query_evidence.observe(std::slice::from_ref(&filler))?;
+    let no_sidecar = store.replay_schema_block(tenant, &snapshot, committed, &no_query_evidence)?;
+    assert_eq!(replay_delta.retained_memory_bytes(), 0);
+    assert_eq!(replay_delta.physical_index_bytes(), 0);
+    assert_eq!(replay_delta.physical_memory_bytes(), 0);
+    assert_eq!(
+        replay_delta.staged_memory_bytes(),
+        no_sidecar.staged_memory_bytes()
+    );
+
+    replayed.stage_record(
+        std::slice::from_ref(&seed),
+        &mut replay_delta,
+        &mut DiscoveryMeter::new(),
+    )?;
+    assert_eq!(replay_delta.retained_memory_bytes(), 0);
+    assert_eq!(replay_delta.physical_index_bytes(), 0);
+    assert_eq!(replay_delta.physical_memory_bytes(), 0);
+    let (replay_delta, block_index) = replay_delta.into_block_index(identity, digest);
+    assert!(block_index.is_none());
+    replayed.apply_delta(replay_delta, block_index)?;
+    assert_eq!(replayed.memory_bytes(), memory_before);
+    assert_eq!(replayed.persistent_bytes(), persistent_before);
+    assert_eq!(replayed.index_bytes(), index_before);
+    assert!(!replayed.has_verified_block(identity, digest));
 
     let result = store.scan_schema(
         authority.governor(),
