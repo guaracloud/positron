@@ -1,24 +1,26 @@
 use positron_domain::identity::TenantId;
-use positron_kernel::{CommittedBlock, LedgerSnapshot, ResourceReservation, StoreBlockIdentity};
+use positron_kernel::{
+    CommittedBlock, LedgerSnapshot, ResourceGovernor, ResourceReservation, StoreBlockIdentity,
+    TransferredResourceReservation,
+};
 
 use super::{SchemaBudget, SchemaCatalog, SchemaDelta, SchemaFailure};
 use crate::log_store::{LogRecord, LogStore, LogStoreFailure};
 
-/// Tenant-bound mutable schema authority owned by the governed ingest session.
-pub struct TenantSchemaState {
+/// Opaque tenant-bound schema store owned by the governed ingest session.
+///
+/// Construction consumes the live governor grant, so mutable authority cannot
+/// outlive or be copied independently from its capacity.
+#[doc(hidden)]
+pub struct SchemaSessionStore {
     catalog: SchemaCatalog,
+    _capacity: TransferredResourceReservation,
+    capacity_bytes: u64,
 }
 
-/// Opaque proof that mutable schema state is owned by a live governed tenant session.
-#[derive(Clone, Copy)]
-pub struct SchemaMutationPermit {
-    tenant: TenantId,
-    _private: (),
-}
-
-impl SchemaMutationPermit {
-    pub fn for_new_catalog(
-        reservation: &ResourceReservation<'_>,
+impl SchemaSessionStore {
+    pub fn new(
+        reservation: ResourceReservation<'_>,
         tenant: TenantId,
         budget: SchemaBudget,
     ) -> Result<Self, SchemaFailure> {
@@ -27,53 +29,42 @@ impl SchemaMutationPermit {
         if !reservation.authorizes_tenant_schema_session(tenant, memory_bytes) {
             return Err(SchemaFailure::AllocationUnavailable);
         }
+        let capacity_bytes = reservation
+            .granted()
+            .get(positron_kernel::ResourceDimension::MemoryBytes);
+        let catalog = SchemaCatalog::new(tenant, budget)?;
         Ok(Self {
-            tenant,
-            _private: (),
+            catalog,
+            _capacity: reservation.transfer(),
+            capacity_bytes,
         })
     }
 
-    pub fn for_checkpoint(
-        reservation: &ResourceReservation<'_>,
+    pub fn from_checkpoint(
+        reservation: ResourceReservation<'_>,
         tenant: TenantId,
         checkpoint: &[u8],
-    ) -> Result<Self, SchemaFailure> {
+    ) -> Result<Option<(Self, Vec<super::SchemaCheckpointFrontier>)>, SchemaFailure> {
         let memory_bytes = u64::try_from(SchemaCatalog::catalog_memory_bound(checkpoint)?)
             .map_err(|_| SchemaFailure::LimitExceeded)?;
         if !reservation.authorizes_tenant_schema_session(tenant, memory_bytes) {
             return Err(SchemaFailure::AllocationUnavailable);
         }
-        Ok(Self {
-            tenant,
-            _private: (),
-        })
-    }
-
-    fn authorize(&self, tenant: TenantId) -> Result<(), SchemaFailure> {
-        if self.tenant == tenant {
-            Ok(())
-        } else {
-            Err(SchemaFailure::InvalidValue)
+        let capacity_bytes = reservation
+            .granted()
+            .get(positron_kernel::ResourceDimension::MemoryBytes);
+        let (catalog, frontiers) = SchemaCatalog::decode_checkpoint_object(checkpoint)?;
+        if catalog.tenant() != tenant {
+            return Ok(None);
         }
-    }
-}
-
-impl TenantSchemaState {
-    pub fn new(
-        permit: &SchemaMutationPermit,
-        tenant: TenantId,
-        budget: SchemaBudget,
-    ) -> Result<Self, SchemaFailure> {
-        permit.authorize(tenant)?;
-        SchemaCatalog::new(tenant, budget).map(|catalog| Self { catalog })
-    }
-
-    pub fn from_catalog(
-        permit: &SchemaMutationPermit,
-        catalog: SchemaCatalog,
-    ) -> Result<Self, SchemaFailure> {
-        permit.authorize(catalog.tenant())?;
-        Ok(Self { catalog })
+        Ok(Some((
+            Self {
+                catalog,
+                _capacity: reservation.transfer(),
+                capacity_bytes,
+            },
+            frontiers,
+        )))
     }
 
     #[must_use]
@@ -86,63 +77,49 @@ impl TenantSchemaState {
         &self.catalog
     }
 
-    pub fn stage_group(
-        &self,
-        permit: &SchemaMutationPermit,
-        records: &mut [LogRecord],
-    ) -> Result<SchemaDelta, LogStoreFailure> {
-        permit
-            .authorize(self.tenant())
-            .map_err(crate::log_store::map_schema_failure)?;
+    #[must_use]
+    pub const fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    #[must_use]
+    pub fn governed_by(&self, governor: ResourceGovernor<'_>) -> bool {
+        self._capacity.can_reclaim_with(governor)
+    }
+
+    pub fn stage_group(&self, records: &mut [LogRecord]) -> Result<SchemaDelta, LogStoreFailure> {
         LogStore::new().stage_schema_group(records, &self.catalog)
     }
 
     pub fn commit(
         &mut self,
-        permit: &SchemaMutationPermit,
         delta: SchemaDelta,
         identity: StoreBlockIdentity,
         digest: [u8; 32],
     ) -> Result<(), LogStoreFailure> {
-        permit
-            .authorize(self.tenant())
-            .map_err(crate::log_store::map_schema_failure)?;
         LogStore::new().apply_schema_delta(&mut self.catalog, delta, identity, digest)
     }
 
     pub fn replay(
         &self,
-        permit: &SchemaMutationPermit,
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
         block: &CommittedBlock,
     ) -> Result<SchemaDelta, LogStoreFailure> {
-        permit
-            .authorize(self.tenant())
-            .map_err(crate::log_store::map_schema_failure)?;
         LogStore::new().replay_schema_block(tenant, snapshot, block, &self.catalog)
     }
 
-    pub fn record_query_use(
-        &mut self,
-        permit: &SchemaMutationPermit,
-        path: &super::SchemaPath,
-    ) -> Result<(), SchemaFailure> {
-        permit.authorize(self.tenant())?;
+    pub fn record_query_use(&mut self, path: &super::SchemaPath) -> Result<(), SchemaFailure> {
         self.catalog.record_query_use(path)
     }
 
     pub fn index_replayed_query_path(
         &mut self,
-        permit: &SchemaMutationPermit,
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
         block: &CommittedBlock,
         path: &super::SchemaPath,
     ) -> Result<(), LogStoreFailure> {
-        permit
-            .authorize(self.tenant())
-            .map_err(crate::log_store::map_schema_failure)?;
         let delta = LogStore::new().replay_schema_block(tenant, snapshot, block, &self.catalog)?;
         let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
         if let Some(index) = delta
@@ -156,12 +133,7 @@ impl TenantSchemaState {
         Ok(())
     }
 
-    pub fn remove_query_evidence(
-        &mut self,
-        permit: &SchemaMutationPermit,
-        path: &super::SchemaPath,
-    ) -> Result<(), SchemaFailure> {
-        permit.authorize(self.tenant())?;
+    pub fn remove_query_evidence(&mut self, path: &super::SchemaPath) -> Result<(), SchemaFailure> {
         self.catalog.remove_query_evidence(path)
     }
 
@@ -171,20 +143,16 @@ impl TenantSchemaState {
 
     pub fn reconcile_block_identity(
         &mut self,
-        permit: &SchemaMutationPermit,
         identity: StoreBlockIdentity,
         digest: [u8; 32],
     ) -> Result<(), SchemaFailure> {
-        permit.authorize(self.tenant())?;
         self.catalog.reconcile_block_identity(identity, digest)
     }
 
     pub fn retain_reachable_indexes(
         &mut self,
-        permit: &SchemaMutationPermit,
         reachable: &[(StoreBlockIdentity, [u8; 32])],
     ) -> Result<(), SchemaFailure> {
-        permit.authorize(self.tenant())?;
         self.catalog.retain_reachable_indexes(reachable)
     }
 }

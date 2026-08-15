@@ -13,11 +13,12 @@ use positron_signals::{
     SchemaDiscoveryRequest, SchemaPath, SchemaQuery, SchemaValue,
 };
 
-use super::super::{DurableSchemaOutcome, TenantSchemaRegistry};
+use super::super::{DurableSchemaOutcome, DurableSchemaResolution, TenantSchemaRegistry};
 
 #[test]
 fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
-    let fixture = crate::tests::support::fixture().expect("fixture");
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("index-replay-capable fixture");
     let catalog = Catalog::open(
         &fixture.authority,
         InstanceId::new([0xa1; 16]).expect("instance"),
@@ -74,15 +75,18 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
     let receipt = ledger.append(prepared).expect("append");
     session
         .resolve_durable_outcome(
-            identity,
-            shard,
-            delta,
-            None,
-            0,
-            DurableSchemaOutcome::Committed {
-                position: receipt.position(),
-                digest,
+            DurableSchemaResolution {
+                identity,
+                shard,
+                staged: delta,
+                capacity: None,
+                capacity_bytes: 0,
+                outcome: DurableSchemaOutcome::Committed {
+                    position: receipt.position(),
+                    digest,
+                },
             },
+            fixture.authority.governor(),
         )
         .expect("commit schema");
 

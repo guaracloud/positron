@@ -3,6 +3,7 @@ use positron_domain::value::AttributeOccurrenceSet;
 use super::{SchemaDelta, additional_physical_cost};
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
+use crate::log_store::schema::index::MAX_BLOCK_INDEXES;
 use crate::log_store::schema::model::{
     CATALOG_HEADER_BYTES, MAX_VARIANTS, SchemaEntry, entry_memory_bytes, entry_persistent_bytes,
 };
@@ -12,6 +13,15 @@ pub(super) fn root_fits(
     delta: &SchemaDelta,
     root: &[SchemaEntry],
 ) -> Result<bool, SchemaFailure> {
+    if delta.build_physical_index
+        && delta.index_paths.is_empty()
+        && catalog.block_indexes.len() >= MAX_BLOCK_INDEXES
+        && root
+            .iter()
+            .any(|entry| entry.query_uses > 0 && entry.promoted)
+    {
+        return Ok(false);
+    }
     let (memory, persistent, index, new_entries) = projected_cost(catalog, delta, Some(root))?;
     let (physical_memory, physical_bytes) = additional_physical_cost(catalog, delta, root)?;
     let entries = catalog

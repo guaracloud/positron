@@ -8,7 +8,9 @@ use positron_kernel::{
 use positron_policy::{IngestPolicy, PolicyEvaluation};
 use positron_signals::{LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaEntry};
 
-use super::super::{DurableSchemaOutcome, SchemaSessionFailure, TenantSchemaRegistry};
+use super::super::{
+    DurableSchemaOutcome, DurableSchemaResolution, SchemaSessionFailure, TenantSchemaRegistry,
+};
 
 #[test]
 fn ambiguous_delta_retains_one_exact_bounded_reservation_until_reconciliation() {
@@ -55,12 +57,15 @@ fn ambiguous_delta_retains_one_exact_bounded_reservation_until_reconciliation() 
         .transfer();
     session
         .resolve_durable_outcome(
-            identity,
-            first_shard,
-            delta,
-            Some(capacity),
-            staged_bytes,
-            DurableSchemaOutcome::Ambiguous { digest: [0xc8; 32] },
+            DurableSchemaResolution {
+                identity,
+                shard: first_shard,
+                staged: delta,
+                capacity: Some(capacity),
+                capacity_bytes: staged_bytes,
+                outcome: DurableSchemaOutcome::Ambiguous { digest: [0xc8; 32] },
+            },
+            fixture.authority.governor(),
         )
         .expect("ambiguous state");
 
@@ -107,7 +112,8 @@ fn ambiguous_delta_retains_one_exact_bounded_reservation_until_reconciliation() 
 
 #[test]
 fn committed_ambiguity_reconciles_from_v2_and_shrinks_to_exact_retained_charge() {
-    let fixture = crate::tests::support::fixture().expect("fixture");
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
     let catalog = Catalog::open(
         &fixture.authority,
         InstanceId::new([0xd1; 16]).expect("instance"),
@@ -149,12 +155,15 @@ fn committed_ambiguity_reconciles_from_v2_and_shrinks_to_exact_retained_charge()
     ledger.append(block).expect("durable append");
     session
         .resolve_durable_outcome(
-            identity,
-            shard,
-            staged,
-            Some(pending_capacity),
-            staged_bytes,
-            DurableSchemaOutcome::Ambiguous { digest },
+            DurableSchemaResolution {
+                identity,
+                shard,
+                staged,
+                capacity: Some(pending_capacity),
+                capacity_bytes: staged_bytes,
+                outcome: DurableSchemaOutcome::Ambiguous { digest },
+            },
+            fixture.authority.governor(),
         )
         .expect("pending ambiguity");
     assert_eq!(
@@ -197,12 +206,15 @@ fn committed_ambiguity_reconciles_from_v2_and_shrinks_to_exact_retained_charge()
         .expect("reconciliation uses committed v2 block");
     session
         .resolve_durable_outcome(
-            next_identity,
-            shard,
-            next,
-            None,
-            0,
-            DurableSchemaOutcome::DefiniteFailure,
+            DurableSchemaResolution {
+                identity: next_identity,
+                shard,
+                staged: next,
+                capacity: None,
+                capacity_bytes: 0,
+                outcome: DurableSchemaOutcome::DefiniteFailure,
+            },
+            fixture.authority.governor(),
         )
         .expect("clear staged retry");
     let reconciled = session.checkpoint().expect("reconciled");
@@ -221,6 +233,78 @@ fn committed_ambiguity_reconciles_from_v2_and_shrinks_to_exact_retained_charge()
     assert_eq!(reconciled.retained_charge_bytes(), exact);
     assert!(exact > 0);
     assert!(exact < staged_bytes);
+}
+
+#[test]
+fn committed_resolution_capacity_failure_retains_exact_pending_state() {
+    let fixture = crate::tests::support::fixture().expect("fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xa1; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xa2; 32]), Box::new([0xa3; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(204).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xa4);
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let session = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("session");
+    let identity = StoreBlockIdentity::new([0xa5; 16]).expect("identity");
+    let mut staged_records = records();
+    let delta = session
+        .stage_group(
+            fixture.tenant,
+            shard,
+            identity,
+            &ledger.snapshot().expect("snapshot"),
+            &mut staged_records,
+            fixture.authority.governor(),
+        )
+        .expect("stage");
+    let retained = u64::try_from(delta.retained_memory_bytes()).expect("retained");
+    let capacity = reserve_memory(&fixture, retained).transfer();
+    let foreign = crate::tests::support::fixture_for_tenant(fixture.tenant).expect("foreign");
+
+    assert_eq!(
+        session.resolve_durable_outcome(
+            DurableSchemaResolution {
+                identity,
+                shard,
+                staged: delta,
+                capacity: Some(capacity),
+                capacity_bytes: retained,
+                outcome: DurableSchemaOutcome::Committed {
+                    position: positron_domain::routing::CommitPosition::origin()
+                        .advance_by(std::num::NonZeroU64::new(1).expect("nonzero"))
+                        .expect("position"),
+                    digest: [0xa6; 32],
+                },
+            },
+            foreign.authority.governor(),
+        ),
+        Err(SchemaSessionFailure::StateUnavailable)
+    );
+    let checkpoint = session.checkpoint().expect("pending checkpoint");
+    assert_eq!(checkpoint.entry_count(), 0);
+    assert_eq!(checkpoint.pending_bytes(), retained);
+
+    let mut retry = records();
+    assert!(matches!(
+        session.stage_group(
+            fixture.tenant,
+            shard,
+            StoreBlockIdentity::new([0xa7; 16]).expect("identity"),
+            &ledger.snapshot().expect("empty snapshot"),
+            &mut retry,
+            fixture.authority.governor(),
+        ),
+        Err(SchemaSessionFailure::PendingReconciliationRequired)
+    ));
+    assert_eq!(
+        session.checkpoint().expect("still pending").pending_bytes(),
+        retained
+    );
 }
 
 fn reserve_memory<'fixture>(

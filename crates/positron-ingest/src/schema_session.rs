@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, VirtualShardId};
 use positron_kernel::{
-    LedgerSnapshot, ResourceGovernor, StoreBlockIdentity, TransferredResourceReservation,
+    LedgerSnapshot, ResourceGovernor, ResourceReservation, StoreBlockIdentity,
+    TransferredResourceReservation,
 };
 use positron_signals::{
     LogRecord, SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta, SchemaFailure,
-    SchemaMutationPermit, TenantSchemaState,
+    SchemaSessionStore,
 };
 
 mod checkpoint;
@@ -15,7 +16,9 @@ mod inspection;
 mod recovery;
 mod registry;
 pub use checkpoint::TenantSchemaCheckpoint;
-use recovery::{ensure_frontier_slot, reconcile_pending, set_frontier};
+use recovery::{
+    ensure_frontier_slot, reconcile_pending, reserve_schema_memory, validated_frontier,
+};
 pub use registry::TenantSchemaRegistry;
 
 const MAX_REPLAY_SHARDS: usize = 4_096;
@@ -27,11 +30,9 @@ pub struct TenantSchemaSession {
 
 pub(super) struct SessionState {
     pub(super) tenant: TenantId,
-    pub(super) catalog: TenantSchemaState,
-    pub(super) permit: SchemaMutationPermit,
+    pub(super) catalog: SchemaSessionStore,
     pub(super) frontiers: Vec<SchemaCheckpointFrontier>,
     pub(super) retained_capacity: Vec<TransferredResourceReservation>,
-    pub(super) base_capacity: Option<TransferredResourceReservation>,
     pub(super) base_charge_bytes: u64,
     pub(super) retained_charge_bytes: u64,
     pub(super) pending: Option<PendingStage>,
@@ -79,13 +80,22 @@ pub(crate) enum DurableSchemaOutcome {
     },
 }
 
+pub(crate) struct DurableSchemaResolution {
+    pub(crate) identity: StoreBlockIdentity,
+    pub(crate) shard: VirtualShardId,
+    pub(crate) staged: SchemaDelta,
+    pub(crate) capacity: Option<TransferredResourceReservation>,
+    pub(crate) capacity_bytes: u64,
+    pub(crate) outcome: DurableSchemaOutcome,
+}
+
 impl TenantSchemaSession {
     pub(crate) fn release_1(
         tenant: TenantId,
-        permit: SchemaMutationPermit,
+        capacity: ResourceReservation<'_>,
     ) -> Result<Self, SchemaSessionFailure> {
         let budget = SchemaBudget::release_1().map_err(SchemaSessionFailure::Schema)?;
-        Self::with_budget(tenant, budget, permit)
+        Self::with_budget(tenant, budget, capacity)
     }
 
     pub(crate) fn release_1_base_memory_bytes() -> Result<u64, SchemaSessionFailure> {
@@ -112,7 +122,9 @@ impl TenantSchemaSession {
         u64::try_from(bytes).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
     }
 
-    fn checkpoint_construction_memory_bytes(bytes: &[u8]) -> Result<u64, SchemaSessionFailure> {
+    pub(crate) fn checkpoint_construction_memory_bytes(
+        bytes: &[u8],
+    ) -> Result<u64, SchemaSessionFailure> {
         let catalog =
             SchemaCatalog::catalog_memory_bound(bytes).map_err(SchemaSessionFailure::Schema)?;
         let structural = MAX_REPLAY_SHARDS
@@ -139,10 +151,11 @@ impl TenantSchemaSession {
     fn with_budget(
         tenant: TenantId,
         budget: SchemaBudget,
-        permit: SchemaMutationPermit,
+        capacity: ResourceReservation<'_>,
     ) -> Result<Self, SchemaSessionFailure> {
-        let catalog = TenantSchemaState::new(&permit, tenant, budget)
+        let catalog = SchemaSessionStore::new(capacity, tenant, budget)
             .map_err(SchemaSessionFailure::Schema)?;
+        let base_charge_bytes = catalog.capacity_bytes();
         let mut frontiers = Vec::new();
         frontiers
             .try_reserve_exact(MAX_REPLAY_SHARDS)
@@ -155,11 +168,9 @@ impl TenantSchemaSession {
             state: Arc::new(Mutex::new(SessionState {
                 tenant,
                 catalog,
-                permit,
                 frontiers,
                 retained_capacity,
-                base_capacity: None,
-                base_charge_bytes: 0,
+                base_charge_bytes,
                 retained_charge_bytes: 0,
                 pending: None,
                 in_flight: None,
@@ -199,23 +210,6 @@ impl TenantSchemaSession {
         u64::try_from(bytes).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
     }
 
-    fn attach_base_capacity(
-        &self,
-        capacity: TransferredResourceReservation,
-        bytes: u64,
-    ) -> Result<(), SchemaSessionFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-        if state.base_capacity.is_some() {
-            return Err(SchemaSessionFailure::StateUnavailable);
-        }
-        state.base_capacity = Some(capacity);
-        state.base_charge_bytes = bytes;
-        Ok(())
-    }
-
     pub(crate) fn stage_group(
         &self,
         tenant: TenantId,
@@ -232,14 +226,19 @@ impl TenantSchemaSession {
         if tenant != state.tenant || snapshot.scope().tenant_id() != state.tenant {
             return Err(SchemaSessionFailure::TenantConflict);
         }
+        if !state.catalog.governed_by(governor) {
+            return Err(SchemaSessionFailure::StateUnavailable);
+        }
+        if state.pending.is_some() {
+            reconcile_pending(&mut state, snapshot, governor)?;
+        }
         if state.in_flight.is_some() {
             return Err(SchemaSessionFailure::InFlight);
         }
-        reconcile_pending(&mut state, snapshot, governor)?;
         ensure_frontier_slot(&state, shard)?;
         let delta = state
             .catalog
-            .stage_group(&state.permit, records)
+            .stage_group(records)
             .map_err(|failure| match failure.code() {
                 positron_signals::LogStoreFailureCode::InvalidInput
                 | positron_signals::LogStoreFailureCode::MalformedBlock
@@ -262,13 +261,17 @@ impl TenantSchemaSession {
 
     pub(crate) fn resolve_durable_outcome(
         &self,
-        identity: StoreBlockIdentity,
-        shard: VirtualShardId,
-        staged: SchemaDelta,
-        capacity: Option<TransferredResourceReservation>,
-        capacity_bytes: u64,
-        outcome: DurableSchemaOutcome,
+        resolution: DurableSchemaResolution,
+        governor: ResourceGovernor<'_>,
     ) -> Result<(), SchemaSessionFailure> {
+        let DurableSchemaResolution {
+            identity,
+            shard,
+            staged,
+            capacity,
+            capacity_bytes,
+            outcome,
+        } = resolution;
         let mut state = self
             .state
             .lock()
@@ -278,6 +281,9 @@ impl TenantSchemaSession {
         }
         match outcome {
             DurableSchemaOutcome::Committed { position, digest } => {
+                if state.pending.is_some() {
+                    return Err(SchemaSessionFailure::InFlight);
+                }
                 state.pending = Some(PendingStage {
                     identity,
                     shard,
@@ -286,12 +292,35 @@ impl TenantSchemaSession {
                     capacity_bytes,
                     digest,
                 });
-                state.in_flight = None;
+                if !state.catalog.governed_by(governor) {
+                    return Err(SchemaSessionFailure::StateUnavailable);
+                }
                 ensure_frontier_slot(&state, shard)?;
+                let frontier = validated_frontier(shard, position, identity, digest)?;
                 let next_retained = state
                     .retained_charge_bytes
                     .checked_add(capacity_bytes)
                     .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+                if state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.capacity.is_some())
+                    && state.retained_capacity.len() == state.retained_capacity.capacity()
+                {
+                    return Err(SchemaSessionFailure::ReplayLimitExceeded);
+                }
+                let staged_bytes = state
+                    .pending
+                    .as_ref()
+                    .ok_or(SchemaSessionFailure::StateUnavailable)?
+                    .delta
+                    .staged_memory_bytes();
+                let _clone_capacity = reserve_schema_memory(
+                    state.tenant,
+                    u64::try_from(staged_bytes)
+                        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?,
+                    governor,
+                )?;
                 let commit_delta = state
                     .pending
                     .as_ref()
@@ -299,12 +328,11 @@ impl TenantSchemaSession {
                     .delta
                     .try_clone()
                     .map_err(SchemaSessionFailure::Schema)?;
-                let permit = state.permit;
                 state
                     .catalog
-                    .commit(&permit, commit_delta, identity, digest)
+                    .commit(commit_delta, identity, digest)
                     .map_err(|_| SchemaSessionFailure::Schema(SchemaFailure::InvalidValue))?;
-                set_frontier(&mut state, shard, position, identity, digest)?;
+                recovery::publish_frontier(&mut state, frontier);
                 let completed = state
                     .pending
                     .take()
@@ -313,6 +341,7 @@ impl TenantSchemaSession {
                     state.retained_capacity.push(capacity);
                 }
                 state.retained_charge_bytes = next_retained;
+                state.in_flight = None;
             },
             DurableSchemaOutcome::DefiniteFailure => {
                 state.in_flight = None;

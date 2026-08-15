@@ -5,7 +5,6 @@ use positron_kernel::{
     ResourceReservation,
 };
 use positron_signals::SchemaBudget;
-use positron_signals::SchemaMutationPermit;
 
 use crate::{SchemaSessionFailure, TenantSchemaCheckpoint, TenantSchemaSession};
 
@@ -29,21 +28,25 @@ impl<'authority> SchemaReplayBuilder<'authority> {
         let peak = peak_resources(source_bytes)?;
         let claim = RecoveryWorkClaim::tenant(tenant, RecoveryWorkKind::Repair, peak)
             .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+        let base_bytes = match checkpoint {
+            Some(bytes) => TenantSchemaSession::checkpoint_construction_memory_bytes(bytes)?,
+            None => TenantSchemaSession::release_1_base_memory_bytes()?,
+        };
+        let base_claim = RecoveryWorkClaim::tenant(
+            tenant,
+            RecoveryWorkKind::Repair,
+            active_resources(base_bytes)?,
+        )
+        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+        let base_capacity = recovery
+            .reserve(base_claim)
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         let recovery = recovery
             .reserve(claim)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-        let permit = match checkpoint {
-            Some(bytes) => SchemaMutationPermit::for_checkpoint(&recovery, tenant, bytes),
-            None => SchemaMutationPermit::for_new_catalog(
-                &recovery,
-                tenant,
-                SchemaBudget::release_1().map_err(SchemaSessionFailure::Schema)?,
-            ),
-        }
-        .map_err(SchemaSessionFailure::Schema)?;
         let session = match checkpoint {
-            Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, permit)?,
-            None => TenantSchemaSession::release_1(tenant, permit)?,
+            Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, base_capacity)?,
+            None => TenantSchemaSession::release_1(tenant, base_capacity)?,
         };
         Ok(Self {
             tenant,

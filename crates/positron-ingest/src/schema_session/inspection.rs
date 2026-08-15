@@ -42,10 +42,9 @@ impl TenantSchemaSession {
             .state
             .lock()
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-        let permit = state.permit;
         state
             .catalog
-            .retain_reachable_indexes(&permit, reachable)
+            .retain_reachable_indexes(reachable)
             .map_err(SchemaSessionFailure::Schema)
     }
 
@@ -82,20 +81,22 @@ impl TenantSchemaSession {
         if state.tenant != tenant || snapshot.scope().tenant_id() != tenant {
             return Err(SchemaSessionFailure::TenantConflict);
         }
+        if !state.catalog.governed_by(governor) {
+            return Err(SchemaSessionFailure::StateUnavailable);
+        }
         if state.in_flight.is_some() || state.pending.is_some() {
             return Err(SchemaSessionFailure::InFlight);
         }
-        let permit = state.permit;
         state
             .catalog
-            .record_query_use(&permit, path)
+            .record_query_use(path)
             .map_err(SchemaSessionFailure::Schema)?;
         for block in snapshot.blocks() {
             let capacity =
                 recovery::reserve_query_index_capacity(tenant, block.payload().len(), governor)?;
             state
                 .catalog
-                .index_replayed_query_path(&permit, tenant, snapshot, block, path)
+                .index_replayed_query_path(tenant, snapshot, block, path)
                 .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
             drop(capacity);
         }
@@ -114,10 +115,9 @@ impl TenantSchemaSession {
         if state.tenant != tenant {
             return Err(SchemaSessionFailure::TenantConflict);
         }
-        let permit = state.permit;
         state
             .catalog
-            .remove_query_evidence(&permit, path)
+            .remove_query_evidence(path)
             .map_err(SchemaSessionFailure::Schema)
     }
 }

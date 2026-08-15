@@ -568,9 +568,12 @@ coverage selects the generic scan and exposes reduced pruning without changing
 `index`, `any`, or `all` results. Discovery returns tenant-bound bounded top
 paths, typed conflicts and variants, promotion decisions, budget pressure,
 overflow counts, and sampled path digests without exposing mutation authority.
-The administration service wraps discovery in a bounded completed operation;
-its cursor carries the immutable snapshot digest and next path offset, so a
-changed snapshot rejects continuation instead of mixing pages.
+The Log Store exposes only the bounded immutable discovery result. The public
+tenant-administrator request, snapshot-bound pagination, and Durable Operation
+are owned by the canonical Tenant Attribution, tenant-lifecycle, and
+administration work in tickets #69 through #71 and the recoverable Durable
+Operation authority in ticket #73. Runtime defines no schema-local operation
+or cursor authority and does not substitute system-administrator inspection.
 
 Committed version 2 blocks, including their generic versus Schema Overflow
 root tags, are authoritative. The tenant-bound `PSCHEMA1` object is rebuildable

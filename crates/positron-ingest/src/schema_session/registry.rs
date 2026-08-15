@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use positron_domain::identity::TenantId;
 use positron_kernel::{ResourceAmounts, ResourceDimension, ResourceGovernor, WorkClaim, WorkKind};
-use positron_signals::SchemaMutationPermit;
 
 use super::{SchemaSessionFailure, TenantSchemaSession};
 
@@ -82,35 +81,17 @@ impl TenantSchemaRegistry {
                     .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
                 let claim = WorkClaim::tenant(tenant, WorkKind::Ingest, amounts)
                     .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-                let mut capacity = governor
+                let capacity = governor
                     .reserve(claim)
                     .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-                let permit = match checkpoint {
-                    Some(bytes) => SchemaMutationPermit::for_checkpoint(&capacity, tenant, bytes),
-                    None => SchemaMutationPermit::for_new_catalog(
-                        &capacity,
-                        tenant,
-                        positron_signals::SchemaBudget::release_1()
-                            .map_err(SchemaSessionFailure::Schema)?,
-                    ),
-                }
-                .map_err(SchemaSessionFailure::Schema)?;
                 state
                     .sessions
                     .try_reserve_exact(1)
                     .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
                 let session = match checkpoint {
-                    Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, permit)?,
-                    None => TenantSchemaSession::release_1(tenant, permit)?,
+                    Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, capacity)?,
+                    None => TenantSchemaSession::release_1(tenant, capacity)?,
                 };
-                let actual_bytes = session.base_memory_bytes()?;
-                capacity
-                    .try_resize(
-                        ResourceAmounts::only(ResourceDimension::MemoryBytes, actual_bytes)
-                            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?,
-                    )
-                    .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-                session.attach_base_capacity(capacity.transfer(), actual_bytes)?;
                 state.sessions.insert(index, (tenant, session.clone()));
                 Ok(session)
             },

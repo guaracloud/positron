@@ -9,8 +9,7 @@ use positron_policy::{
 };
 use positron_signals::SchemaFailure;
 use positron_signals::{
-    LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaDelta, SchemaMutationPermit,
-    TenantSchemaState,
+    LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaDelta, SchemaSessionStore,
 };
 
 use super::{
@@ -101,6 +100,7 @@ fn rollback_refuses_a_delta_without_the_matching_inflight_identity() {
             VirtualShardId::new(1).expect("shard"),
             delta,
             IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
+            fixture.authority.governor(),
         ),
         IngestOutcome::Ambiguous(IngestFailureCode::StorageUnavailable)
     );
@@ -155,12 +155,15 @@ fn failed_retention_still_resolves_the_durable_schema_lifecycle() {
         .expect("session");
     let outcome = super::super::resolve_after_retention_failure(
         &session,
-        StoreBlockIdentity::new([0x62; 16]).expect("identity"),
-        VirtualShardId::new(1).expect("shard"),
-        staged_delta(&fixture),
-        9_000_000,
-        [0x63; 32],
+        super::super::RetentionResolution {
+            identity: StoreBlockIdentity::new([0x62; 16]).expect("identity"),
+            shard: VirtualShardId::new(1).expect("shard"),
+            staged: staged_delta(&fixture),
+            capacity_bytes: 9_000_000,
+            digest: [0x63; 32],
+        },
         failure,
+        fixture.authority.governor(),
     );
     assert_eq!(
         outcome,
@@ -206,10 +209,9 @@ fn staged_delta(fixture: &crate::tests::support::Fixture) -> SchemaDelta {
             .expect("claim"),
         )
         .expect("capacity");
-    let permit = SchemaMutationPermit::for_new_catalog(&capacity, tenant, budget).expect("permit");
-    TenantSchemaState::new(&permit, tenant, budget)
+    SchemaSessionStore::new(capacity, tenant, budget)
         .expect("catalog")
-        .stage_group(&permit, &mut records)
+        .stage_group(&mut records)
         .expect("delta")
 }
 

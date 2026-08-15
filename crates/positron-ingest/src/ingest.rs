@@ -1,4 +1,4 @@
-use crate::schema_session::DurableSchemaOutcome;
+use crate::schema_session::{DurableSchemaOutcome, DurableSchemaResolution};
 use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation, TenantSchemaSession};
 use positron_domain::identity::{Scope, TenantId};
 use positron_domain::routing::VirtualShardId;
@@ -10,6 +10,7 @@ use positron_kernel::{
 use positron_signals::LogStore;
 
 mod capacity;
+mod entry;
 mod failure;
 mod outcome;
 mod schema_resolution;
@@ -22,8 +23,8 @@ pub use outcome::{
 };
 use outcome::{increment_rejection, partial_admission};
 use schema_resolution::{
-    SchemaCapacityRetention, map_schema_session_failure, resolve_after_retention_failure,
-    retain_schema_capacity, rollback_schema,
+    RetentionResolution, SchemaCapacityRetention, map_schema_session_failure,
+    resolve_after_retention_failure, retain_schema_capacity, rollback_schema,
 };
 
 /// Concrete receiver-independent Log ingestion path.
@@ -40,49 +41,6 @@ pub struct LogIngest<'service, 'kernel, 'catalog, S> {
 impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
     LogIngest<'service, 'kernel, 'catalog, S>
 {
-    #[must_use]
-    pub fn new(
-        authority: &'kernel StorageKernelResourceAuthority,
-        ledger: &'service ActiveSegmentLedger<'kernel, 'catalog>,
-        clock: &'service LifecycleClock<S>,
-        policy: &'service IngestPolicy,
-        tenant: TenantId,
-        shard: VirtualShardId,
-        schema: TenantSchemaSession,
-    ) -> Self {
-        Self {
-            authority,
-            ledger,
-            clock,
-            policy,
-            tenant,
-            shard,
-            schema,
-        }
-    }
-
-    /// Validates, reserves, prepares, and durably commits one Admission Group.
-    #[must_use]
-    pub fn accept(
-        &self,
-        batch: NativeLogBatch<'kernel>,
-        identity: StoreBlockIdentity,
-    ) -> IngestOutcome {
-        self.accept_inner(batch, identity, None)
-    }
-
-    /// Observes cancellation before durability admission without fabricating a
-    /// failed outcome after a commit boundary.
-    #[must_use]
-    pub fn accept_cancellable(
-        &self,
-        batch: NativeLogBatch<'kernel>,
-        identity: StoreBlockIdentity,
-        cancellation: &AppendCancellation,
-    ) -> IngestOutcome {
-        self.accept_inner(batch, identity, Some(cancellation))
-    }
-
     fn accept_inner(
         &self,
         batch: NativeLogBatch<'kernel>,
@@ -255,6 +213,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     self.shard,
                     staged_schema,
                     IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+                    self.authority.governor(),
                 );
             },
         };
@@ -267,6 +226,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     self.shard,
                     staged_schema,
                     IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+                    self.authority.governor(),
                 );
             },
         };
@@ -287,6 +247,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     self.shard,
                     staged_schema,
                     classify_log_store_failure_code(failure.code()),
+                    self.authority.governor(),
                 );
             },
         };
@@ -300,6 +261,7 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                     self.shard,
                     staged_schema,
                     IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
+                    self.authority.governor(),
                 );
             },
         };
@@ -315,27 +277,33 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                         SchemaCapacityRetention::Failed(failure) => {
                             return resolve_after_retention_failure(
                                 &self.schema,
-                                identity,
-                                self.shard,
-                                staged_schema,
-                                retained_bytes,
-                                block_digest,
+                                RetentionResolution {
+                                    identity,
+                                    shard: self.shard,
+                                    staged: staged_schema,
+                                    capacity_bytes: retained_bytes,
+                                    digest: block_digest,
+                                },
                                 failure,
+                                self.authority.governor(),
                             );
                         },
                     };
                 if self
                     .schema
                     .resolve_durable_outcome(
-                        identity,
-                        self.shard,
-                        staged_schema,
-                        retained_capacity,
-                        retained_bytes,
-                        DurableSchemaOutcome::Committed {
-                            position: receipt.position(),
-                            digest: block_digest,
+                        DurableSchemaResolution {
+                            identity,
+                            shard: self.shard,
+                            staged: staged_schema,
+                            capacity: retained_capacity,
+                            capacity_bytes: retained_bytes,
+                            outcome: DurableSchemaOutcome::Committed {
+                                position: receipt.position(),
+                                digest: block_digest,
+                            },
                         },
+                        self.authority.governor(),
                     )
                     .is_err()
                 {
@@ -366,12 +334,15 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                             SchemaCapacityRetention::Failed(failure) => {
                                 return resolve_after_retention_failure(
                                     &self.schema,
-                                    identity,
-                                    self.shard,
-                                    staged_schema,
-                                    staged_bytes,
-                                    block_digest,
+                                    RetentionResolution {
+                                        identity,
+                                        shard: self.shard,
+                                        staged: staged_schema,
+                                        capacity_bytes: staged_bytes,
+                                        digest: block_digest,
+                                    },
                                     failure,
+                                    self.authority.governor(),
                                 );
                             },
                         }
@@ -382,12 +353,15 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
                 if self
                     .schema
                     .resolve_durable_outcome(
-                        identity,
-                        self.shard,
-                        staged_schema,
-                        pending_capacity,
-                        staged_bytes,
-                        schema_outcome,
+                        DurableSchemaResolution {
+                            identity,
+                            shard: self.shard,
+                            staged: staged_schema,
+                            capacity: pending_capacity,
+                            capacity_bytes: staged_bytes,
+                            outcome: schema_outcome,
+                        },
+                        self.authority.governor(),
                     )
                     .is_err()
                 {

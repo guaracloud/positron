@@ -2,7 +2,7 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, VirtualShardId};
 use positron_kernel::{
     LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation,
-    StoreBlockIdentity, TransferredResourceReservation,
+    StoreBlockIdentity,
 };
 use positron_signals::{SchemaBudget, SchemaCheckpointFrontier};
 
@@ -22,6 +22,9 @@ impl TenantSchemaSession {
         if tenant != state.tenant || snapshot.scope().tenant_id() != tenant {
             return Err(SchemaSessionFailure::TenantConflict);
         }
+        if !state.catalog.governed_by(governor) {
+            return Err(SchemaSessionFailure::StateUnavailable);
+        }
         let frontier = state
             .frontiers
             .iter()
@@ -36,32 +39,41 @@ impl TenantSchemaSession {
             let digest = block
                 .content_digest()
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-            let permit = state.permit;
-            state
-                .catalog
-                .reconcile_block_identity(&permit, block.identity(), digest)
-                .map_err(SchemaSessionFailure::Schema)?;
             let decode_capacity =
                 reserve_replay_decode_capacity(tenant, block.payload().len(), governor)?;
             let delta = state
                 .catalog
-                .replay(&state.permit, tenant, snapshot, block)
+                .replay(tenant, snapshot, block)
                 .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
             let retained_bytes = u64::try_from(delta.retained_memory_bytes())
                 .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-            let capacity = resize_replay_capacity(decode_capacity, retained_bytes)?;
-            state
-                .catalog
-                .commit(&permit, delta, block.identity(), digest)
-                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
-            retain_capacity(&mut state, capacity, retained_bytes)?;
-            set_frontier(
-                &mut state,
+            let next_retained = state
+                .retained_charge_bytes
+                .checked_add(retained_bytes)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+            let capacity = reserve_schema_memory(tenant, retained_bytes, governor)?;
+            ensure_retained_slot(&state, capacity.is_some())?;
+            ensure_frontier_slot(&state, snapshot.scope().shard_id())?;
+            let frontier = validated_frontier(
                 snapshot.scope().shard_id(),
                 block.position(),
                 block.identity(),
                 digest,
             )?;
+            state
+                .catalog
+                .reconcile_block_identity(block.identity(), digest)
+                .map_err(SchemaSessionFailure::Schema)?;
+            state
+                .catalog
+                .commit(delta, block.identity(), digest)
+                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+            drop(decode_capacity);
+            if let Some(capacity) = capacity {
+                state.retained_capacity.push(capacity.transfer());
+            }
+            state.retained_charge_bytes = next_retained;
+            publish_frontier(&mut state, frontier);
         }
         Ok(())
     }
@@ -93,27 +105,27 @@ impl TenantSchemaSession {
             let digest = block
                 .content_digest()
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-            let permit = state.permit;
-            state
-                .catalog
-                .reconcile_block_identity(&permit, block.identity(), digest)
-                .map_err(SchemaSessionFailure::Schema)?;
             ensure_replay_capacity(recovery, block.payload().len())?;
             let delta = state
                 .catalog
-                .replay(&state.permit, tenant, snapshot, block)
+                .replay(tenant, snapshot, block)
                 .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
-            state
-                .catalog
-                .commit(&permit, delta, block.identity(), digest)
-                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
-            set_frontier(
-                &mut state,
+            ensure_frontier_slot(&state, snapshot.scope().shard_id())?;
+            let frontier = validated_frontier(
                 snapshot.scope().shard_id(),
                 block.position(),
                 block.identity(),
                 digest,
             )?;
+            state
+                .catalog
+                .reconcile_block_identity(block.identity(), digest)
+                .map_err(SchemaSessionFailure::Schema)?;
+            state
+                .catalog
+                .commit(delta, block.identity(), digest)
+                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+            publish_frontier(&mut state, frontier);
         }
         Ok(())
     }
@@ -181,7 +193,7 @@ pub(super) fn reconcile_pending(
         reserve_replay_decode_capacity(state.tenant, block.payload().len(), governor)?;
     let replayed = state
         .catalog
-        .replay(&state.permit, state.tenant, snapshot, block)
+        .replay(state.tenant, snapshot, block)
         .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
     let retained_bytes = u64::try_from(replayed.retained_memory_bytes())
         .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
@@ -190,69 +202,25 @@ pub(super) fn reconcile_pending(
         .checked_add(retained_bytes)
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     ensure_frontier_slot(state, shard)?;
-    drop(decode_capacity);
-    let permit = state.permit;
+    let frontier = validated_frontier(shard, block.position(), identity, digest)?;
+    let retained_capacity = reserve_schema_memory(state.tenant, retained_bytes, governor)?;
+    ensure_retained_slot(state, retained_capacity.is_some())?;
     state
         .catalog
-        .commit(&permit, replayed, block.identity(), digest)
+        .commit(replayed, block.identity(), digest)
         .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
-    set_frontier(state, shard, block.position(), identity, digest)?;
-    let mut pending = state
+    drop(decode_capacity);
+    publish_frontier(state, frontier);
+    let pending = state
         .pending
         .take()
         .ok_or(SchemaSessionFailure::StateUnavailable)?;
-    if let Err(failure) = resize_pending_capacity(
-        state,
-        &mut pending.capacity,
-        retained_bytes,
-        next_retained,
-        governor,
-    ) {
-        state.pending = Some(pending);
-        return Err(failure);
-    }
     drop(pending);
-    Ok(())
-}
-
-fn resize_pending_capacity(
-    state: &mut SessionState,
-    pending_capacity: &mut Option<TransferredResourceReservation>,
-    retained_bytes: u64,
-    next_retained: u64,
-    governor: ResourceGovernor<'_>,
-) -> Result<(), SchemaSessionFailure> {
-    let Some(capacity) = pending_capacity.take() else {
-        return if retained_bytes == 0 {
-            Ok(())
-        } else {
-            Err(SchemaSessionFailure::StateUnavailable)
-        };
-    };
-    if !capacity.can_reclaim_with(governor) {
-        *pending_capacity = Some(capacity);
-        return Err(SchemaSessionFailure::StateUnavailable);
+    if let Some(capacity) = retained_capacity {
+        state.retained_capacity.push(capacity.transfer());
     }
-    if retained_bytes == 0 {
-        capacity.release(governor);
-        return Ok(());
-    }
-    let mut capacity = capacity
-        .reclaim(governor)
-        .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-    let amounts = match ResourceAmounts::only(ResourceDimension::MemoryBytes, retained_bytes) {
-        Ok(amounts) => amounts,
-        Err(_) => {
-            *pending_capacity = Some(capacity.transfer());
-            return Err(SchemaSessionFailure::ReplayLimitExceeded);
-        },
-    };
-    if capacity.try_resize(amounts).is_err() {
-        *pending_capacity = capacity.is_active().then(|| capacity.transfer());
-        return Err(SchemaSessionFailure::StateUnavailable);
-    }
-    state.retained_capacity.push(capacity.transfer());
     state.retained_charge_bytes = next_retained;
+    state.in_flight = None;
     Ok(())
 }
 
@@ -284,21 +252,6 @@ pub(super) fn reserve_query_index_capacity(
     reserve_replay_decode_capacity(tenant, payload_bytes, governor)
 }
 
-fn resize_replay_capacity(
-    mut capacity: ResourceReservation<'_>,
-    retained_bytes: u64,
-) -> Result<Option<TransferredResourceReservation>, SchemaSessionFailure> {
-    if retained_bytes == 0 {
-        return Ok(None);
-    }
-    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, retained_bytes)
-        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    capacity
-        .try_resize(amounts)
-        .map_err(|_| SchemaSessionFailure::StateUnavailable)
-        .map(|_| Some(capacity.transfer()))
-}
-
 fn ensure_replay_capacity(
     capacity: &ResourceReservation<'_>,
     payload_bytes: usize,
@@ -314,19 +267,12 @@ fn ensure_replay_capacity(
     Ok(())
 }
 
-fn retain_capacity(
-    state: &mut SessionState,
-    capacity: Option<TransferredResourceReservation>,
-    retained_bytes: u64,
-) -> Result<(), SchemaSessionFailure> {
-    if let Some(capacity) = capacity {
-        state.retained_capacity.push(capacity);
+fn ensure_retained_slot(state: &SessionState, adding: bool) -> Result<(), SchemaSessionFailure> {
+    if adding && state.retained_capacity.len() == state.retained_capacity.capacity() {
+        Err(SchemaSessionFailure::ReplayLimitExceeded)
+    } else {
+        Ok(())
     }
-    state.retained_charge_bytes = state
-        .retained_charge_bytes
-        .checked_add(retained_bytes)
-        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-    Ok(())
 }
 
 pub(super) fn ensure_frontier_slot(
@@ -346,27 +292,44 @@ pub(super) fn ensure_frontier_slot(
     Ok(())
 }
 
-pub(super) fn set_frontier(
-    state: &mut SessionState,
+pub(super) fn validated_frontier(
     shard: VirtualShardId,
     position: CommitPosition,
     identity: StoreBlockIdentity,
     digest: [u8; 32],
-) -> Result<(), SchemaSessionFailure> {
-    let frontier = SchemaCheckpointFrontier::new(shard, position, identity, digest)
-        .map_err(SchemaSessionFailure::Schema)?;
+) -> Result<SchemaCheckpointFrontier, SchemaSessionFailure> {
+    SchemaCheckpointFrontier::new(shard, position, identity, digest)
+        .map_err(SchemaSessionFailure::Schema)
+}
+
+pub(super) fn publish_frontier(state: &mut SessionState, frontier: SchemaCheckpointFrontier) {
     if let Some(known) = state
         .frontiers
         .iter_mut()
-        .find(|known| known.shard() == shard)
+        .find(|known| known.shard() == frontier.shard())
     {
         *known = frontier;
-        return Ok(());
-    }
-    if state.frontiers.len() >= MAX_REPLAY_SHARDS {
-        return Err(SchemaSessionFailure::ReplayLimitExceeded);
+        return;
     }
     state.frontiers.push(frontier);
     state.frontiers.sort_by_key(|known| known.shard());
-    Ok(())
+}
+
+pub(super) fn reserve_schema_memory<'authority>(
+    tenant: TenantId,
+    bytes: u64,
+    governor: ResourceGovernor<'authority>,
+) -> Result<Option<ResourceReservation<'authority>>, SchemaSessionFailure> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
+        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+    let claim =
+        positron_kernel::WorkClaim::tenant(tenant, positron_kernel::WorkKind::Ingest, amounts)
+            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+    governor
+        .reserve(claim)
+        .map(Some)
+        .map_err(|_| SchemaSessionFailure::StateUnavailable)
 }

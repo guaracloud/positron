@@ -13,7 +13,8 @@ use crate::{IngestOutcome, LogIngest, OtlpLogsReceiver};
 
 #[test]
 fn rebuild_from_committed_custom_shards_is_canonical_and_idempotent() {
-    let fixture = crate::tests::support::fixture().expect("fixture");
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
     let catalog = Catalog::open(
         &fixture.authority,
         InstanceId::new([0xd1; 16]).expect("instance"),

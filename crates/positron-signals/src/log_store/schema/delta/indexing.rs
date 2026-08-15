@@ -17,7 +17,10 @@ pub(crate) fn additional_physical_cost(
     let mut wire = 0_usize;
     let mut memory = 0_usize;
     let mut added = false;
-    for entry in root.iter().filter(|entry| entry.query_uses > 0) {
+    for entry in root
+        .iter()
+        .filter(|entry| entry.query_uses > 0 && entry.promoted)
+    {
         if delta
             .index_paths
             .binary_search_by(|known| known.wire_cmp_path(&entry.path))
@@ -62,7 +65,10 @@ pub(super) fn stage_index_root(
         return Ok(());
     }
     let was_empty = delta.index_paths.is_empty();
-    for entry in root.iter().filter(|entry| entry.query_uses > 0) {
+    for entry in root
+        .iter()
+        .filter(|entry| entry.query_uses > 0 && entry.promoted)
+    {
         match delta
             .index_paths
             .binary_search_by(|known| known.wire_cmp_path(&entry.path))
@@ -125,8 +131,6 @@ fn merge_kinds(
         .index_paths
         .get_mut(position)
         .ok_or(SchemaFailure::InvalidValue)?;
-    for variant in &entry.variants {
-        known.kind_mask |= crate::log_store::schema::index::kind_bit(*variant);
-    }
+    known.kind_mask |= crate::log_store::schema::index::scalar_kind_mask(&entry.variants);
     Ok(())
 }

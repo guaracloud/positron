@@ -1,4 +1,5 @@
 use super::*;
+use positron_kernel::StoreBlockIdentity;
 
 #[test]
 fn discovery_keeps_namespaces_and_counts_typed_conflicts() -> Result<(), Box<dyn Error>> {
@@ -224,5 +225,86 @@ fn discovery_snapshot_reports_container_decisions_and_digest_samples() -> Result
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn discovery_digest_changes_with_physical_index_pressure() -> Result<(), Box<dyn Error>> {
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    let indexed_path = path(AttributeNamespace::Record, "indexed");
+    catalog.record_query_use(&indexed_path)?;
+    let request = super::super::SchemaDiscoveryRequest::new(1, 0)?;
+    let before = catalog.discover(request)?;
+
+    let variants = catalog.entry(&indexed_path).ok_or("entry")?.variants();
+    let indexed = super::super::index::SchemaIndexPath::from_variants(&indexed_path, variants)?;
+    catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+        StoreBlockIdentity::new(1_u128.to_be_bytes())?,
+        [0x91; 32],
+        indexed,
+    )?)?;
+
+    let after = catalog.discover(request)?;
+    assert_ne!(before.index().used(), after.index().used());
+    assert_ne!(before.snapshot_digest(), after.snapshot_digest());
+
+    catalog.reconcile_block_identity(StoreBlockIdentity::new(1_u128.to_be_bytes())?, [0x92; 32])?;
+    let variants = catalog.entry(&indexed_path).ok_or("entry")?.variants();
+    let indexed = super::super::index::SchemaIndexPath::from_variants(&indexed_path, variants)?;
+    catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+        StoreBlockIdentity::new(2_u128.to_be_bytes())?,
+        [0x91; 32],
+        indexed,
+    )?)?;
+    let replacement = catalog.discover(request)?;
+    assert_eq!(after.index().used(), replacement.index().used());
+    assert_ne!(after.snapshot_digest(), replacement.snapshot_digest());
+    Ok(())
+}
+
+#[test]
+fn discovery_pagination_is_bounded_and_reports_its_exact_window() -> Result<(), Box<dyn Error>> {
+    let maximum = super::super::SchemaBudget::system_max_discovery_nodes();
+    let exact = super::super::SchemaDiscoveryRequest::page(maximum, 0, maximum)?;
+    assert_eq!(exact.path_offset(), maximum);
+    assert_eq!(exact.top_paths(), 0);
+    assert_eq!(exact.sampled_paths(), maximum);
+    assert_eq!(
+        super::super::SchemaDiscoveryRequest::page(maximum, 1, 0),
+        Err(super::super::SchemaFailure::LimitExceeded)
+    );
+    assert_eq!(
+        super::super::SchemaDiscoveryRequest::page(0, maximum + 1, 0),
+        Err(super::super::SchemaFailure::LimitExceeded)
+    );
+    assert_eq!(
+        super::super::SchemaDiscoveryRequest::page(0, 0, maximum + 1),
+        Err(super::super::SchemaFailure::LimitExceeded)
+    );
+
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::release_1()?)?;
+    for key in ["alpha", "beta", "gamma"] {
+        catalog.observe(&[occurrence(
+            AttributeNamespace::Record,
+            key,
+            CandidateAttributeValue::boolean(true),
+        )?])?;
+    }
+    let page = catalog.discover(super::super::SchemaDiscoveryRequest::page(1, 1, 1)?)?;
+    assert_eq!(page.path_offset(), 1);
+    assert_eq!(page.total_paths(), 3);
+    assert_eq!(page.top_paths().len(), 1);
+    assert!(matches!(
+        page.top_paths()[0].promotion(),
+        super::super::SchemaPromotionDecision::NotPromoted {
+            reason: super::super::SchemaPromotionReason::InsufficientEvidence
+        }
+    ));
     Ok(())
 }

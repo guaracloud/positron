@@ -6,7 +6,7 @@ use positron_kernel::StoreBlockIdentity;
 use super::*;
 
 #[test]
-fn live_catalog_refuses_more_than_the_canonical_block_index_ceiling() -> Result<(), Box<dyn Error>>
+fn root_overflows_before_append_when_block_index_ceiling_is_reached() -> Result<(), Box<dyn Error>>
 {
     let tenant = tenant();
     let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
@@ -22,11 +22,23 @@ fn live_catalog_refuses_more_than_the_canonical_block_index_ceiling() -> Result<
         let (delta, index) = staged_index(&catalog, tenant, &attribute, sequence)?;
         catalog.apply_delta(delta, index)?;
     }
-    let (excess, index) = staged_index(&catalog, tenant, &attribute, 4_097)?;
+    let mut excess = super::super::SchemaDelta::empty(tenant, true);
+    let observation = catalog.stage_record(
+        std::slice::from_ref(&attribute),
+        &mut excess,
+        &mut super::super::delta::DiscoveryMeter::new(),
+    )?;
     assert_eq!(
-        catalog.apply_delta(excess, index),
-        Err(super::super::SchemaFailure::LimitExceeded)
+        observation.representation(&path(AttributeNamespace::Record, "indexed")),
+        Some(super::super::SchemaRepresentation::Overflow)
     );
+    let (excess, index) = excess.into_block_index(
+        StoreBlockIdentity::new(4_097_u128.to_be_bytes())?,
+        [0x61; 32],
+    );
+    assert!(index.is_none(), "overflow must not create a sidecar");
+    catalog.apply_delta(excess, index)?;
+    assert_eq!(catalog.overflow_record_count(), 1);
     Ok(())
 }
 
@@ -152,6 +164,61 @@ fn demotion_removes_only_its_paths_and_sidecar_budget_is_exact() -> Result<(), B
         tight.install_query_index(index_for(&tight, identity, digest, "tight")?),
         Err(super::super::SchemaFailure::LimitExceeded)
     );
+    Ok(())
+}
+
+#[test]
+fn composite_kinds_always_fall_back_while_scalar_kinds_remain_prunable()
+-> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let scalar = occurrence(
+        AttributeNamespace::Record,
+        "mixed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    let composite = occurrence(
+        AttributeNamespace::Record,
+        "mixed",
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::boolean(true)]),
+    )?;
+    catalog.observe(std::slice::from_ref(&scalar))?;
+    catalog.observe(std::slice::from_ref(&composite))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "mixed"))?;
+
+    let identity = StoreBlockIdentity::new(5_u128.to_be_bytes())?;
+    let digest = [0x61; 32];
+    let (delta, index) = staged_index(&catalog, tenant, &scalar, 5)?;
+    catalog.apply_delta(delta, index)?;
+
+    let indexed_path = path(AttributeNamespace::Record, "mixed");
+    assert_eq!(
+        catalog.verified_block_kind(
+            identity,
+            digest,
+            &indexed_path,
+            positron_domain::value::AttributeValueKind::String,
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        catalog.verified_block_kind(
+            identity,
+            digest,
+            &indexed_path,
+            positron_domain::value::AttributeValueKind::Boolean,
+        ),
+        Some(false)
+    );
+    for kind in [
+        positron_domain::value::AttributeValueKind::Array,
+        positron_domain::value::AttributeValueKind::KeyValueList,
+    ] {
+        assert_eq!(
+            catalog.verified_block_kind(identity, digest, &indexed_path, kind),
+            None
+        );
+    }
     Ok(())
 }
 

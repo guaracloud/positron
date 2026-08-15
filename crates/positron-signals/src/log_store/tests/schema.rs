@@ -18,9 +18,7 @@ use super::{AttributeRepresentation, LogRecord, LogScan, LogStore, ScanLimit};
 use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
-use crate::{
-    LogStoreFailureCode, SchemaBudget, SchemaCatalog, SchemaMutationPermit, TenantSchemaState,
-};
+use crate::{LogStoreFailureCode, SchemaBudget, SchemaCatalog, SchemaSessionStore};
 
 #[test]
 fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(), Box<dyn Error>> {
@@ -81,15 +79,9 @@ fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(
     let block = snapshot.blocks().first().ok_or("committed block")?;
     let replay_budget = SchemaBudget::new(1, 8_192, 512, 256)?;
     let permit_capacity = preparation_capacity(&authority, tenant)?;
-    let permit = SchemaMutationPermit::for_new_catalog(&permit_capacity, tenant, replay_budget)?;
-    let mut replayed = TenantSchemaState::new(&permit, tenant, replay_budget)?;
-    let replay_delta = replayed.replay(&permit, tenant, &snapshot, block)?;
-    replayed.commit(
-        &permit,
-        replay_delta,
-        block.identity(),
-        block.content_digest()?,
-    )?;
+    let mut replayed = SchemaSessionStore::new(permit_capacity, tenant, replay_budget)?;
+    let replay_delta = replayed.replay(tenant, &snapshot, block)?;
+    replayed.commit(replay_delta, block.identity(), block.content_digest()?)?;
     assert_eq!(replayed.catalog(), &schema);
 
     let constrained = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 512, 2)?)?;

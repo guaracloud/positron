@@ -1,10 +1,12 @@
 use positron_domain::identity::TenantId;
-use sha2::{Digest, Sha256};
 
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
 use super::model::{MAX_DISCOVERY_NODES, SchemaEntry, SchemaPath};
 use positron_domain::value::AttributeValueKind;
+
+mod digest;
+use digest::{catalog_digest, path_digest};
 
 /// Bounded limits for one immutable schema-discovery read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,36 +350,4 @@ impl SchemaCatalog {
             overflow_bytes: self.overflow_bytes,
         })
     }
-}
-
-fn path_digest(path: &SchemaPath) -> Result<SchemaPathDigest, SchemaFailure> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"positron-schema-path-v1");
-    hasher.update(path.namespace().as_str().as_bytes());
-    hasher.update([0]);
-    for segment in path.segments() {
-        let length = u64::try_from(segment.len()).map_err(|_| SchemaFailure::LimitExceeded)?;
-        hasher.update(length.to_be_bytes());
-        hasher.update(segment.as_bytes());
-    }
-    Ok(SchemaPathDigest(hasher.finalize().into()))
-}
-
-fn catalog_digest(catalog: &SchemaCatalog) -> Result<[u8; 32], SchemaFailure> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"positron-schema-discovery-v1");
-    hasher.update(catalog.tenant.to_bytes());
-    for entry in &catalog.entries {
-        hasher.update(path_digest(entry.path())?.as_bytes());
-        for variant in entry.variants() {
-            hasher.update([*variant as u8]);
-        }
-        hasher.update(entry.observations().to_be_bytes());
-        hasher.update(entry.conflicts().to_be_bytes());
-        hasher.update(entry.query_uses().to_be_bytes());
-        hasher.update([u8::from(entry.promoted())]);
-    }
-    hasher.update(catalog.overflow_records.to_be_bytes());
-    hasher.update(catalog.overflow_bytes.to_be_bytes());
-    Ok(hasher.finalize().into())
 }

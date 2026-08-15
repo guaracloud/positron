@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use positron_domain::identity::TenantId;
-use positron_kernel::TransferredResourceReservation;
-use positron_signals::{SchemaCatalog, SchemaFailure, SchemaMutationPermit, TenantSchemaState};
+use positron_kernel::{ResourceReservation, TransferredResourceReservation};
+use positron_signals::{SchemaFailure, SchemaSessionStore};
 
 use super::{MAX_REPLAY_SHARDS, SchemaSessionFailure, SessionState, TenantSchemaSession};
 
@@ -21,14 +21,14 @@ impl TenantSchemaSession {
     pub(crate) fn from_checkpoint(
         tenant: TenantId,
         bytes: &[u8],
-        permit: SchemaMutationPermit,
+        capacity: ResourceReservation<'_>,
     ) -> Result<Self, SchemaSessionFailure> {
         let (catalog, decoded_frontiers) =
-            SchemaCatalog::decode_checkpoint_object(bytes).map_err(SchemaSessionFailure::Schema)?;
-        if catalog.tenant() != tenant {
-            return Err(SchemaSessionFailure::TenantConflict);
-        }
-        let budget = catalog.budget();
+            SchemaSessionStore::from_checkpoint(capacity, tenant, bytes)
+                .map_err(SchemaSessionFailure::Schema)?
+                .ok_or(SchemaSessionFailure::TenantConflict)?;
+        let budget = catalog.catalog().budget();
+        let base_charge_bytes = catalog.capacity_bytes();
         let mut frontiers = Vec::new();
         frontiers
             .try_reserve_exact(MAX_REPLAY_SHARDS)
@@ -41,13 +41,10 @@ impl TenantSchemaSession {
         Ok(Self {
             state: Arc::new(Mutex::new(SessionState {
                 tenant,
-                catalog: TenantSchemaState::from_catalog(&permit, catalog)
-                    .map_err(SchemaSessionFailure::Schema)?,
-                permit,
+                catalog,
                 frontiers,
                 retained_capacity,
-                base_capacity: None,
-                base_charge_bytes: 0,
+                base_charge_bytes,
                 retained_charge_bytes: 0,
                 pending: None,
                 in_flight: None,

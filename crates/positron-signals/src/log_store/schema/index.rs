@@ -27,9 +27,7 @@ impl SchemaIndexPath {
         path: &SchemaPath,
         variants: &[AttributeValueKind],
     ) -> Result<Self, SchemaFailure> {
-        let kind_mask = variants
-            .iter()
-            .fold(0_u8, |mask, kind| mask | kind_bit(*kind));
+        let kind_mask = scalar_kind_mask(variants);
         Ok(Self {
             path: path.try_clone()?,
             kind_mask,
@@ -83,6 +81,12 @@ impl SchemaBlockIndex {
     }
 
     pub(crate) fn covers_kind(&self, path: &SchemaPath, kind: AttributeValueKind) -> Option<bool> {
+        if matches!(
+            kind,
+            AttributeValueKind::Array | AttributeValueKind::KeyValueList
+        ) {
+            return None;
+        }
         self.paths
             .binary_search_by(|known| known.wire_cmp_path(path))
             .ok()
@@ -178,18 +182,9 @@ impl SchemaBudget {
 
     /// Conservative peak for decoding one authenticated v2 block and staging its schema delta.
     pub fn replay_working_memory_bytes(payload_bytes: usize) -> Option<usize> {
-        let decoded_and_staged = payload_bytes
+        payload_bytes
             .checked_mul(4)?
-            .checked_add(1)?
-            .checked_add(payload_bytes.checked_mul(SchemaPath::system_max_segments())?)?
-            .checked_add(
-                Self::system_max_entries().checked_mul(
-                    std::mem::size_of::<SchemaEntry>()
-                        .checked_add(std::mem::size_of::<SchemaIndexPath>())?
-                        .checked_add(64)?,
-                )?,
-            )?
-            .checked_add(std::mem::size_of::<Vec<SchemaEntry>>())?;
-        Some(decoded_and_staged.min(Self::system_max_memory_bytes()))
+            .checked_add(Self::system_max_memory_bytes())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaEntry>>()))
     }
 }

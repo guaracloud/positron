@@ -29,9 +29,9 @@ pub use scan::{LogScan, LogScanResult, ScanLimit, ScannedLogRecord};
 pub use schema::{
     OccurrenceSelector, SchemaBudget, SchemaBudgetPressure, SchemaCatalog,
     SchemaCheckpointFrontier, SchemaDelta, SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry,
-    SchemaFailure, SchemaMutationPermit, SchemaObservation, SchemaPath, SchemaPathDigest,
-    SchemaPathSummary, SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery,
-    SchemaQueryResult, SchemaRepresentation, SchemaValue, TenantSchemaState,
+    SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
+    SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
+    SchemaRepresentation, SchemaSessionStore, SchemaValue,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,

@@ -170,7 +170,6 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         SchemaValue::boolean(true),
         SchemaValue::floating_point_bits(1.0_f64.to_bits()),
         SchemaValue::bytes(vec![1]),
-        SchemaValue::kind(AttributeValueKind::Array),
     ] {
         let other_type = store.scan_schema(
             authority.governor(),
@@ -187,6 +186,26 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         assert!(other_type.records().is_empty());
         assert_eq!(other_type.scanned_bytes(), 0);
         assert!(!other_type.reduced_pruning());
+    }
+    for value in [
+        SchemaValue::kind(AttributeValueKind::Array),
+        SchemaValue::kind(AttributeValueKind::KeyValueList),
+    ] {
+        let composite = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(2)?),
+            &schema,
+            &SchemaQuery::value(
+                SchemaPath::new(AttributeNamespace::Record, "indexed".to_owned())?,
+                OccurrenceSelector::Any,
+                value,
+            ),
+        )?;
+        assert!(composite.records().is_empty());
+        assert!(composite.scanned_bytes() > 0);
+        assert!(composite.reduced_pruning());
     }
 
     let overflow = store.scan_schema(

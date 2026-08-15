@@ -99,3 +99,8 @@ Dictionary budget exhaustion overflows the complete attribute root atomically.
 Verified coverage can reject an impossible type before value traversal; exact
 value comparison, ordered nested duplicates, and explicit `index`, `any`, and
 `all` selection still use the source-of-truth record values with no coercion.
+This format defines the bounded immutable discovery snapshot, not a public
+administration operation or pagination authority. Tenant-administrator
+exposure is owned by tickets #69 through #71 and uses the recoverable Durable
+Operation authority from ticket #73; no schema-local cursor or operation record
+is stored in `PSCHEMA1`.
