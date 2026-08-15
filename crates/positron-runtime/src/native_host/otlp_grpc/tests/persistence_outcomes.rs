@@ -46,7 +46,12 @@ async fn live_receiver_distinguishes_precommit_retry_from_postcommit_ambiguity()
     let failure = tokio::time::timeout(std::time::Duration::from_secs(2), client.export(retryable))
         .await?
         .expect_err("pre-commit failure must remain retryable");
-    assert_eq!(failure.code(), Code::Unavailable);
+    assert_eq!(
+        failure.code(),
+        Code::Unavailable,
+        "{failure}; backend calls={}",
+        backend.calls()
+    );
     assert_eq!(
         failure.message(),
         "OTLP Logs ingest is temporarily unavailable"
@@ -94,6 +99,7 @@ enum Completion {
 struct ScriptedBackend {
     completions: Mutex<VecDeque<Completion>>,
     committed: AtomicUsize,
+    calls: AtomicUsize,
 }
 
 impl ScriptedBackend {
@@ -101,16 +107,22 @@ impl ScriptedBackend {
         Self {
             completions: Mutex::new(completions.into_iter().collect()),
             committed: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
         }
     }
 
     fn committed_records(&self) -> usize {
         self.committed.load(Ordering::Acquire)
     }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
 }
 
 impl ReceiverTestBackend for ScriptedBackend {
     fn ingest(&self, groups: NativeLogAdmissionGroups<'_>) -> IngestRequestOutcome {
+        self.calls.fetch_add(1, Ordering::AcqRel);
         let groups = groups
             .map(|group| (group.shard(), group.records()))
             .collect::<Vec<_>>();
@@ -172,7 +184,7 @@ impl ReceiverHarness {
             .ingest_secret()
             .ok_or("ingest secret missing")?
             .to_owned();
-        let services = ServiceHandle::new(Arc::new(InstanceBootstrap::reopen(&paths)?));
+        let services = ServiceHandle::new(Arc::new(InstanceBootstrap::reopen(&paths)?))?;
         services.install_receiver_test_backend(backend)?;
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
@@ -212,14 +224,22 @@ impl ReceiverHarness {
     }
 
     fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.cancellation.cancel();
         self.force.cancel();
-        self.server
-            .take()
-            .ok_or("server missing")?
-            .join()
-            .map_err(|_| "server panicked")?;
+        if let Some(server) = self.server.take() {
+            server.join().map_err(|_| "server panicked")?;
+        }
         Ok(())
+    }
+}
+
+impl Drop for ReceiverHarness {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 

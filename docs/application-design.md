@@ -551,7 +551,43 @@ preserve this knowledge split:
 - Ingest owns receiver-independent admission ordering
 
 The Log Store hides full-text structures, scalar attribute indexes, generic
-typed overflow, and workload-driven Attribute Promotion.
+typed overflow, and workload-driven Attribute Promotion. It owns bounded
+Tenant Schema Catalog discovery: namespace-qualified paths, typed variants,
+conflicts, query-use evidence, budget accounting, and the lossless Schema
+Overflow placement decision. Mutable state requires an opaque capability held
+only by the governor-bound tenant schema session; Signal Store callers receive
+immutable views or opaque staged deltas. Catalog state is published only
+through the Storage Kernel Catalog Writer; no receiver or private schema
+publisher may bypass that authority. Generic and overflow
+representations use the same logical scan and explicit typed occurrence query
+semantics. Scalar paths consume an exact bounded typed-variant dictionary
+budget. `PSCHEMA1` binds each physical dictionary to the exact Store Block
+identity and authenticated payload digest; only matching coverage may prune an
+impossible type. Missing, stale, replaced, demoted, generic, or Schema Overflow
+coverage selects the generic scan and exposes reduced pruning without changing
+`index`, `any`, or `all` results. Discovery returns tenant-bound bounded top
+paths, typed conflicts and variants, promotion decisions, budget pressure,
+overflow counts, and sampled path digests without exposing mutation authority.
+The Log Store exposes only the bounded immutable discovery result. The public
+tenant-administrator request, snapshot-bound pagination, and Durable Operation
+are owned by the canonical Tenant Attribution, tenant-lifecycle, and
+administration work in tickets #69 through #71 and the recoverable Durable
+Operation authority in ticket #73. Runtime defines no schema-local operation
+or cursor authority and does not substitute system-administrator inspection.
+
+Committed version 2 blocks, including their generic versus Schema Overflow
+root tags, are authoritative. The tenant-bound `PSCHEMA1` object is rebuildable
+optimization state. Allocation-free preflight accounts its catalog entries,
+physical block-index sidecars, and per-shard replay frontiers before decode or
+session construction. Runtime loads it and replays authenticated blocks before
+Serving, then publishes a changed checkpoint through the existing Catalog
+Writer before opening data admission. During Serving, ingest changes only the
+governed live session. The next publication occurs during graceful shutdown
+after listeners and admitted ingest drain; a crash instead rebuilds on the next
+bootstrap. No per-ingest publisher, queue, or competing Catalog authority
+exists. Replay and retention reconciliation remove physical coverage for
+unreachable or replacement block identities; queries then fall back to the
+authoritative generic representation.
 
 The canonical Log Store Block layout and bounded logical scan are defined by
 [`log-store-block-format-v2.md`](log-store-block-format-v2.md), which preserves

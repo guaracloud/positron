@@ -54,6 +54,7 @@ fn lowered_request_record_limit_is_checked_after_policy_before_commit() {
         &policy,
         fixture.tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     )
     .accept(
         batch,
@@ -108,6 +109,7 @@ fn lowered_request_attribute_limit_counts_namespaced_source_occurrences() {
         &policy,
         fixture.tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     )
     .accept(
         batch,

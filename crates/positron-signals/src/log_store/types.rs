@@ -59,6 +59,10 @@ impl StoredLogAttribute {
     pub const fn occurrences(&self) -> &AttributeOccurrenceSet {
         &self.occurrences
     }
+
+    pub(super) const fn set_representation(&mut self, representation: AttributeRepresentation) {
+        self.representation = representation;
+    }
 }
 
 /// The checked minimal native log record needed by the M1 vertical slice.
@@ -286,6 +290,10 @@ impl LogRecord {
     #[must_use]
     pub fn attributes(&self) -> &[StoredLogAttribute] {
         &self.attributes
+    }
+
+    pub(super) fn attributes_mut(&mut self) -> &mut [StoredLogAttribute] {
+        &mut self.attributes
     }
 
     #[must_use]

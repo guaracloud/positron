@@ -29,7 +29,10 @@ mod codec;
 mod malformed;
 mod public_contract;
 mod scan;
-mod support;
+mod schema;
+mod schema_overflow_replay;
+mod schema_query;
+pub(crate) mod support;
 mod time;
 mod value_limits;
 

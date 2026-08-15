@@ -8,7 +8,7 @@ use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 
 use crate::catalog::CatalogFailure;
-use crate::data_protection::{SecretKeyBytes, SegmentEnvelopeRoute};
+use crate::data_protection::{DataProtection, SecretKeyBytes, SegmentEnvelopeRoute};
 
 use crate::IngestTime;
 use crate::ResourceReservation;
@@ -230,6 +230,12 @@ impl CommittedBlock {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// Recomputes the stable digest of this already-authenticated payload.
+    pub fn content_digest(&self) -> Result<[u8; 32], LedgerFailure> {
+        DataProtection::hash(&self.payload)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))
     }
 }
 

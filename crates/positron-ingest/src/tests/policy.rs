@@ -54,6 +54,7 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
         &policy,
         fixture.tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     )
     .accept(
         batch,
@@ -150,6 +151,7 @@ fn partial_admission_preserves_each_permanent_rejection_class() {
         &policy,
         fixture.tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     )
     .accept(
         batch,
@@ -204,6 +206,7 @@ fn value_limit_rejection_never_claims_durability() {
             &policy,
             fixture.tenant,
             shard,
+            super::support::schema_session(&fixture).expect("schema"),
         )
         .accept(
             batch,
@@ -244,6 +247,7 @@ fn complete_policy_rejection_is_permanent_and_has_no_receipt() {
             &policy,
             fixture.tenant,
             shard,
+            super::support::schema_session(&fixture).expect("schema"),
         )
         .accept(
             batch,

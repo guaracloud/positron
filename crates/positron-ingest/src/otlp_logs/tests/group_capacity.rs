@@ -97,6 +97,7 @@ fn second_group_capacity_is_reserved_before_its_configured_policy_result() {
         &policy,
         fixture.tenant,
         second_shard,
+        crate::tests::support::schema_session(&fixture).expect("schema"),
     )
     .accept(
         second.into_batch(),

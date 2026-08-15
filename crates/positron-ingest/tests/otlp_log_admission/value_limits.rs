@@ -78,6 +78,7 @@ fn effective_nesting_boundary_survives_authenticated_admission_and_reopen()
             &policy,
             fixture.tenant,
             shard,
+            super::schema_support::session(&fixture)?,
         );
         assert!(matches!(
             ingest.accept(batch, StoreBlockIdentity::new([0xf6; 16])?),
@@ -164,6 +165,7 @@ fn decoded_record_boundary_survives_authenticated_admission_and_reopen()
             &policy,
             fixture.tenant,
             shard,
+            super::schema_support::session(&fixture)?,
         );
         assert!(matches!(
             ingest.accept(batch, StoreBlockIdentity::new([0xd6; 16])?),

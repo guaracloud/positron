@@ -6,6 +6,7 @@ const MAX_CLEANUP_ROLES: usize = 4;
 pub enum CleanupRole {
     Task(TaskRole),
     Listener(ListenerRole),
+    SchemaCheckpoint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +30,7 @@ pub struct CleanupFailure {
     listener_mask: u8,
     task_failures: u8,
     listener_failures: u8,
+    schema_checkpoint_failed: bool,
     overflowed: bool,
 }
 
@@ -49,6 +51,7 @@ impl CleanupFailure {
             listener_mask: 0,
             task_failures: 0,
             listener_failures: 0,
+            schema_checkpoint_failed: false,
             overflowed: false,
         }
     }
@@ -62,7 +65,7 @@ impl CleanupFailure {
     pub fn first_task(self) -> Option<TaskRole> {
         self.failed_roles().find_map(|role| match role {
             CleanupRole::Task(role) => Some(role),
-            CleanupRole::Listener(_) => None,
+            CleanupRole::Listener(_) | CleanupRole::SchemaCheckpoint => None,
         })
     }
 
@@ -74,6 +77,11 @@ impl CleanupFailure {
     #[must_use]
     pub const fn listener_failures(self) -> u8 {
         self.listener_failures
+    }
+
+    #[must_use]
+    pub const fn schema_checkpoint_failed(self) -> bool {
+        self.schema_checkpoint_failed
     }
 
     pub fn failed_roles(self) -> impl Iterator<Item = CleanupRole> {
@@ -158,8 +166,11 @@ impl CleanupAccumulator {
         self.failure.listener_mask |= other.listener_mask;
         self.failure.task_failures = self.failure.task_mask.count_ones() as u8;
         self.failure.listener_failures = self.failure.listener_mask.count_ones() as u8;
+        self.failure.schema_checkpoint_failed |= other.schema_checkpoint_failed;
         self.failure.overflowed |= other.overflowed
-            || self.failure.task_failures + self.failure.listener_failures
+            || self.failure.task_failures
+                + self.failure.listener_failures
+                + u8::from(self.failure.schema_checkpoint_failed)
                 > self.failure.role_count;
     }
 
@@ -174,7 +185,13 @@ impl CleanupAccumulator {
     }
 
     pub(crate) fn has_failures(&self) -> bool {
-        self.failure.task_failures > 0 || self.failure.listener_failures > 0
+        self.failure.task_failures > 0
+            || self.failure.listener_failures > 0
+            || self.failure.schema_checkpoint_failed
+    }
+
+    pub(crate) fn record_schema_checkpoint(&mut self) {
+        self.record(CleanupRole::SchemaCheckpoint);
     }
 
     pub(crate) fn outcome(&self) -> ExitOutcome {
@@ -202,6 +219,12 @@ impl CleanupAccumulator {
                 }
                 self.failure.listener_mask |= bit;
                 self.failure.listener_failures = self.failure.listener_mask.count_ones() as u8;
+            },
+            CleanupRole::SchemaCheckpoint => {
+                if self.failure.schema_checkpoint_failed {
+                    return;
+                }
+                self.failure.schema_checkpoint_failed = true;
             },
         }
         let index = usize::from(self.failure.role_count);

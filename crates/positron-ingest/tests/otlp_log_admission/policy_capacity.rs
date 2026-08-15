@@ -62,6 +62,7 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
     let second = groups.next().ok_or("missing second group")?;
     let first_ledger = ledger(&fixture, &catalog, first.shard(), 0x95)?;
     let second_ledger = ledger(&fixture, &catalog, second.shard(), 0x97)?;
+    let schema = super::schema_support::session(&fixture)?;
     assert!(matches!(
         LogIngest::new(
             &fixture.authority,
@@ -70,10 +71,12 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
             &policy,
             fixture.tenant,
             first.shard(),
+            schema.clone(),
         )
         .accept(first.into_batch(), StoreBlockIdentity::new([0x96; 16])?),
         IngestOutcome::Full(_)
     ));
+    let before_refusal = schema.checkpoint()?;
 
     let claim = WorkClaim::tenant(
         fixture.tenant,
@@ -92,12 +95,23 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
             &policy,
             fixture.tenant,
             second.shard(),
+            schema.clone(),
         )
         .accept(second.into_batch(), StoreBlockIdentity::new([0x98; 16])?),
         IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
     );
     assert_eq!(first_ledger.snapshot()?.blocks().len(), 1);
     assert!(second_ledger.snapshot()?.blocks().is_empty());
+    let after_refusal = schema.checkpoint()?;
+    assert_eq!(after_refusal.entry_count(), before_refusal.entry_count());
+    assert_eq!(
+        after_refusal.overflow_record_count(),
+        before_refusal.overflow_record_count()
+    );
+    assert_eq!(
+        after_refusal.catalog_bytes(),
+        before_refusal.catalog_bytes()
+    );
     drop(held);
     Ok(())
 }

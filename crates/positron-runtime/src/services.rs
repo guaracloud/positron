@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use positron_domain::routing::SignalKind;
@@ -6,34 +7,38 @@ use positron_governance::{
     RequestedIntent,
 };
 use positron_ingest::{
-    AdmissionGroupOutcome, AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest,
-    IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, LokiPushReceiver,
-    LokiPushRequestEncoding, NativeLogBatch, OtlpLogsReceiver, reserve_log_receiver_transport,
+    AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest, IngestRequestOutcome,
+    LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry,
+    reserve_log_receiver_transport,
 };
-use positron_kernel::{
-    ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
-    StoreBlockIdentity, SystemLifecycleClockSource, TransferredResourceReservation,
-};
+use positron_kernel::{ActiveSegmentLedger, Catalog, SegmentScope, TransferredResourceReservation};
 use positron_query::{QueryBudget, QueryEvent, QueryService};
 
 use crate::InitializedInstance;
 
 mod failure;
+mod ingest;
 mod otlp;
 mod policy;
+mod schema_bootstrap;
+mod schema_maintenance;
 
 pub use failure::ServiceFailure;
 use failure::{map_admission_group_plan_failure, map_receive_failure};
-
 #[cfg(test)]
 mod tests;
 
 #[derive(Clone)]
 pub struct ServiceHandle {
-    instance: Arc<InitializedInstance>,
     ingest_policy: IngestPolicyServingSnapshot,
+    schema_sessions: TenantSchemaRegistry,
+    schema_dirty: Arc<AtomicBool>,
+    shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
+    // Keep the authority alive until every governed session and admission
+    // capability above has released its transferred reservations.
+    instance: Arc<InitializedInstance>,
 }
 
 #[cfg(test)]
@@ -49,14 +54,58 @@ impl std::fmt::Debug for ServiceHandle {
 }
 
 impl ServiceHandle {
-    pub(crate) fn new(instance: Arc<InitializedInstance>) -> Self {
+    pub(crate) fn new(instance: Arc<InitializedInstance>) -> Result<Self, ServiceFailure> {
         let ingest_policy = instance.ingest_policy.serving();
-        Self {
-            instance,
+        let recovered = schema_bootstrap::recover(&instance)?;
+        if let Some(checkpoint) = recovered.dirty_checkpoint {
+            schema_maintenance::publish_quiescent_checkpoint(&instance, checkpoint)?;
+        }
+        Ok(Self {
             ingest_policy,
+            schema_sessions: recovered.registry,
+            schema_dirty: Arc::new(AtomicBool::new(false)),
+            shutdown_schema_capacity: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
+            instance,
+        })
+    }
+
+    pub(crate) fn prepare_shutdown_schema_checkpoint(&self) -> Result<(), ServiceFailure> {
+        if !self.schema_dirty.load(Ordering::Acquire) {
+            return Ok(());
         }
+        let capacity = schema_maintenance::reserve_shutdown_capacity(&self.instance)?;
+        *self
+            .shutdown_schema_capacity
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)? = Some(capacity);
+        Ok(())
+    }
+
+    pub(crate) fn publish_prepared_shutdown_schema_checkpoint(&self) -> Result<(), ServiceFailure> {
+        if !self.schema_dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let capacity = self
+            .shutdown_schema_capacity
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)?
+            .take()
+            .ok_or(ServiceFailure::CapacityUnavailable)?;
+        let checkpoint = self
+            .schema_sessions
+            .session(self.instance.tenant, self.instance.resource_governor())
+            .map_err(|_| ServiceFailure::CapacityUnavailable)?
+            .checkpoint()
+            .map_err(|_| ServiceFailure::Internal)?;
+        schema_maintenance::publish_with_capacity(&self.instance, checkpoint, capacity)?;
+        self.schema_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub(super) fn mark_schema_dirty(&self) {
+        self.schema_dirty.store(true, Ordering::Release);
     }
 
     pub fn ingest_otlp_logs(
@@ -72,7 +121,7 @@ impl ServiceHandle {
             protobuf,
         )
         .map_err(map_receive_failure)?;
-        ingest_authenticated(self, request)
+        ingest::ingest_authenticated(self, request)
     }
 
     pub(crate) fn authorize_logs(&self, bearer: &str) -> Result<AuthorizedContext, ServiceFailure> {
@@ -108,7 +157,7 @@ impl ServiceHandle {
             context, decoded, capacity,
         )
         .map_err(map_receive_failure)?;
-        ingest_authenticated(self, request)
+        ingest::ingest_authenticated(self, request)
     }
 
     pub(crate) fn ingest_encoded_loki_push(
@@ -128,7 +177,7 @@ impl ServiceHandle {
         let batch = LokiPushReceiver::with_value_limit_profile(self.instance.value_limit_profile)
             .decode(request)
             .map_err(map_receive_failure)?;
-        ingest_native_batch(self, batch)
+        ingest::ingest_native_batch(self, batch)
     }
 
     pub(crate) fn logs_transport_limits(&self) -> Result<(usize, usize), ServiceFailure> {
@@ -255,94 +304,6 @@ impl ServiceHandle {
             .flatten()
             .collect())
     }
-}
-
-fn ingest_authenticated<'authority>(
-    services: &'authority ServiceHandle,
-    request: AuthenticatedOtlpLogsRequest<'authority>,
-) -> Result<IngestRequestOutcome, ServiceFailure> {
-    let instance = &services.instance;
-    let batch = OtlpLogsReceiver::with_value_limit_profile(instance.value_limit_profile)
-        .decode(request)
-        .map_err(map_receive_failure)?;
-    ingest_native_batch(services, batch)
-}
-
-fn ingest_native_batch(
-    services: &ServiceHandle,
-    batch: NativeLogBatch<'_>,
-) -> Result<IngestRequestOutcome, ServiceFailure> {
-    let instance = &services.instance;
-    let policy = services
-        .ingest_policy
-        .pin()
-        .map_err(|_| ServiceFailure::Internal)?;
-    let groups = batch
-        .into_admission_groups(instance.admission_group_planner.as_ref())
-        .map_err(map_admission_group_plan_failure)?;
-    if groups.is_empty() {
-        return Ok(IngestRequestOutcome::new(Vec::new()));
-    }
-    #[cfg(test)]
-    if let Some(backend) = services
-        .receiver_test_backend
-        .lock()
-        .map_err(|_| ServiceFailure::Internal)?
-        .clone()
-    {
-        return Ok(backend.ingest(groups));
-    }
-    let catalog = Catalog::open(
-        &instance._authority,
-        instance.instance,
-        instance
-            .key
-            .catalog_secret(instance.instance)
-            .map_err(|_| ServiceFailure::KeyUnavailable)?,
-    )
-    .map_err(|_| ServiceFailure::StorageUnavailable)?;
-    let clock = LifecycleClock::new(SystemLifecycleClockSource);
-    let mut outcomes = Vec::new();
-    outcomes
-        .try_reserve_exact(groups.len())
-        .map_err(|_| ServiceFailure::CapacityUnavailable)?;
-    for group in groups {
-        let shard = group.shard();
-        let records = group.records();
-        let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
-        let outcome = match instance.key.segment_key(instance.instance, scope) {
-            Ok(protection) => {
-                let ledger =
-                    ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection);
-                match ledger {
-                    Ok(ledger) => match instance.key.random_identifier() {
-                        Ok(identifier) => match StoreBlockIdentity::new(identifier) {
-                            Ok(identity) => LogIngest::new(
-                                &instance._authority,
-                                &ledger,
-                                &clock,
-                                &policy,
-                                instance.tenant,
-                                shard,
-                            )
-                            .accept(group.into_batch(), identity),
-                            Err(_) => IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
-                        },
-                        Err(_) => IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
-                    },
-                    Err(failure)
-                        if failure.code() == LedgerFailureCode::ResourceAdmissionRefused =>
-                    {
-                        IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
-                    },
-                    Err(_) => IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
-                }
-            },
-            Err(_) => IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
-        };
-        outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
-    }
-    Ok(IngestRequestOutcome::new(outcomes))
 }
 
 #[derive(Clone)]

@@ -11,6 +11,7 @@ mod protection;
 mod publication;
 mod receipt;
 mod recovery;
+mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_codec;
 mod snapshot_lease_recovery;

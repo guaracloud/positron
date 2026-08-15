@@ -116,6 +116,29 @@ impl<'authority> ResourceReservation<'authority> {
             && self.amounts.get(ResourceDimension::MemoryBytes) >= memory_bytes
     }
 
+    /// Confirms that this live grant governs one tenant schema-session construction.
+    #[must_use]
+    pub fn authorizes_tenant_schema_session(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        memory_bytes: u64,
+    ) -> bool {
+        let tenant_bound = match self.identity {
+            ReservationIdentity::Ordinary {
+                tenant: reserved_tenant,
+                kind: WorkKind::Ingest,
+            } => reserved_tenant == tenant,
+            ReservationIdentity::Recovery {
+                scope: RecoveryScope::Tenant(reserved_tenant),
+                kind: RecoveryWorkKind::Repair,
+            } => reserved_tenant == tenant,
+            _ => false,
+        };
+        self.active
+            && tenant_bound
+            && self.amounts.get(ResourceDimension::MemoryBytes) >= memory_bytes
+    }
+
     pub(crate) fn belongs_to(&self, governor: ResourceGovernor<'_>) -> bool {
         std::ptr::eq(self.governor, governor.inner)
     }
@@ -129,12 +152,19 @@ impl<'authority> ResourceReservation<'authority> {
 }
 
 impl TransferredResourceReservation {
+    /// Reports whether this move-only grant can be reclaimed by `governor`
+    /// without consuming or releasing the grant.
+    #[must_use]
+    pub fn can_reclaim_with(&self, governor: ResourceGovernor<'_>) -> bool {
+        Arc::ptr_eq(&self.drop_ledger, &governor.inner.drop_ledger)
+    }
+
     /// Rebinds this move-only token to the same governor that granted it.
     pub fn reclaim(
         mut self,
         governor: ResourceGovernor<'_>,
     ) -> Result<ResourceReservation<'_>, GovernorFailure> {
-        if !Arc::ptr_eq(&self.drop_ledger, &governor.inner.drop_ledger) {
+        if !self.can_reclaim_with(governor) {
             governor.inner.mark_foreign_release();
             return Err(GovernorFailure::InternalFenced);
         }

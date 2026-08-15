@@ -57,6 +57,7 @@ fn attributed_batch_cannot_cross_the_admission_group_tenant() {
         &policy,
         other_tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     )
     .accept(
         batch,
@@ -75,6 +76,7 @@ fn attributed_batch_cannot_cross_the_admission_group_tenant() {
         &policy,
         fixture.tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     );
     let empty = correct_ingest.accept(
         OtlpLogsReceiver::new()
@@ -108,6 +110,7 @@ fn cancellation_and_capacity_refusal_are_retryable_and_release_reservations() {
     .expect("ledger");
     let policy = IngestPolicy::preserving(1).expect("policy");
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
+    let schema = super::support::schema_session(&fixture).expect("schema");
     let ingest = LogIngest::new(
         &fixture.authority,
         &ledger,
@@ -115,6 +118,7 @@ fn cancellation_and_capacity_refusal_are_retryable_and_release_reservations() {
         &policy,
         fixture.tenant,
         shard,
+        schema.clone(),
     );
     let baseline = fixture
         .authority
@@ -143,6 +147,11 @@ fn cancellation_and_capacity_refusal_are_retryable_and_release_reservations() {
             .outstanding_total(),
         baseline
     );
+    let checkpoint = schema.checkpoint().expect("checkpoint after cancellation");
+    assert_eq!(checkpoint.entry_count(), 0);
+    assert_eq!(checkpoint.overflow_record_count(), 0);
+    assert_eq!(checkpoint.retained_charge_bytes(), 0);
+    assert_eq!(checkpoint.pending_bytes(), 0);
 
     let amounts = ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 1, 0, 1, 1, 1, 4, 1_048_576]);
     let claim = WorkClaim::tenant(fixture.tenant, WorkKind::Ingest, amounts).expect("claim");
@@ -199,6 +208,7 @@ fn post_commit_disconnect_is_ambiguous_while_retry_replays_one_durable_block() {
         &policy,
         fixture.tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     );
     let identity = StoreBlockIdentity::new([0x96; 16]).expect("identity");
     let first = ingest.accept(
@@ -279,6 +289,7 @@ fn committed_logs_survive_reopen_and_remain_publicly_readable() {
                 &policy,
                 fixture.tenant,
                 shard,
+                super::support::schema_session(&fixture).expect("schema"),
             )
             .accept(
                 OtlpLogsReceiver::new()
@@ -353,6 +364,7 @@ fn receiver_profile_snapshot_governs_post_policy_log_validation() {
         &policy,
         fixture.tenant,
         shard,
+        super::support::schema_session(&fixture).expect("schema"),
     )
     .accept(
         batch,

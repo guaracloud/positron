@@ -72,6 +72,7 @@ fn admitted_request_keeps_one_immutable_snapshot_across_groups() -> Result<(), B
                 &old,
                 first_fixture.tenant,
                 group.shard(),
+                super::schema_support::session(&first_fixture)?,
             )
             .accept(
                 group.into_batch(),

@@ -65,6 +65,7 @@ pub(crate) fn ingest_and_scan<'fixture>(
         policy,
         fixture.tenant,
         shard,
+        super::super::schema_support::session(fixture)?,
     )
     .accept(batch, StoreBlockIdentity::new([marker + 4; 16])?);
     if !matches!(outcome, IngestOutcome::Full(_) | IngestOutcome::Partial(_)) {

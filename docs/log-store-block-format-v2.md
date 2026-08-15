@@ -56,3 +56,51 @@ Version 2 extends the attribute namespace tag table with:
 Tags `1` through `3` keep their exact version 1 meanings. Tag `4` is invalid in
 a version 1 block and cannot be silently reinterpreted by a new reader. The
 version 2 format uses tag `4` only for the native Stream Attribute namespace.
+
+## Schema Catalog and overflow
+
+The Log Store owns a bounded Tenant Schema Catalog separately from Store Block
+payloads. Its immutable Catalog Object uses the ASCII magic `PSCHEMA1` and
+version `1`, followed by the tenant identity, entry/memory/persistent-byte/
+index-byte budgets, overflow record and byte counters, and deterministic
+namespace-qualified path entries. Each entry preserves observed typed
+variants, observation and conflict counts, query-use count, promotion state,
+index bytes, and canonical bounded per-block typed dictionaries. A bounded
+`REPLAY1` trailer records one canonical authenticated replay frontier per
+shard. The allocation-free reader preflight accounts catalog entries, physical
+index paths, and frontier vector storage before construction. Each physical
+dictionary is keyed by the exact Store Block identity and authenticated payload
+digest, and its paths and type masks must match promoted catalog members. A
+query may prune only when all of those facts match; missing, stale,
+unreachable, replacement, or demoted coverage falls back to the authoritative
+v2 value and reports reduced pruning. These sidecars do not add a Store Block
+tag or version. The object is
+content-addressed and published only through
+the Storage Kernel Catalog Writer with the generation precondition and typed
+governance evidence required by ADR-0069. It is rebuildable optimization state,
+published only after bootstrap replay before Serving or during graceful
+shutdown after ingest drains. A process crash leaves version 2 blocks as the
+authoritative replay source and does not require a new block version or tag.
+
+Discovery spends bounded work and admits an entry only when every applicable
+catalog and index budget remains available. A valid attribute that cannot be
+admitted is encoded with the existing physical representation tag `2` as
+Schema Overflow. Its namespace, key, ordered occurrences, and complete native
+values remain unchanged; overflow updates only bounded evidence and never
+allocates catalog, statistics, dictionary, or automatic-index state. Generic
+and overflow records therefore have identical logical scan and typed-query
+semantics, while overflow scans report reduced pruning. Promoted scalar paths
+carry a canonical typed-variant dictionary whose entry, per-block
+identity/digest framing, path, and type-mask bytes all consume the same checked
+index and persistent budgets. Observation or governed query-use evidence may
+promote a path; removing query evidence or reconciling unreachable blocks
+removes the corresponding physical coverage without altering logical state.
+Dictionary budget exhaustion overflows the complete attribute root atomically.
+Verified coverage can reject an impossible type before value traversal; exact
+value comparison, ordered nested duplicates, and explicit `index`, `any`, and
+`all` selection still use the source-of-truth record values with no coercion.
+This format defines the bounded immutable discovery snapshot, not a public
+administration operation or pagination authority. Tenant-administrator
+exposure is owned by tickets #69 through #71 and uses the recoverable Durable
+Operation authority from ticket #73; no schema-local cursor or operation record
+is stored in `PSCHEMA1`.

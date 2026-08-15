@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
@@ -23,7 +24,8 @@ use super::super::super::{InitializationPlan, InstanceBootstrap};
 use super::super::support::Roots;
 
 struct BlockingTwoGroups {
-    barrier: Arc<Barrier>,
+    entered: mpsc::SyncSender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
     shards: [VirtualShardId; 2],
     blocked: AtomicBool,
 }
@@ -37,8 +39,14 @@ impl AdmissionGroupPlanner for BlockingTwoGroups {
         _record: &NativeLogCandidate,
     ) -> Result<VirtualShardId, AdmissionGroupPlanFailure> {
         if ordinal == 0 && !self.blocked.swap(true, Ordering::AcqRel) {
-            self.barrier.wait();
-            self.barrier.wait();
+            self.entered
+                .send(())
+                .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?;
+            self.resume
+                .lock()
+                .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?;
         }
         self.shards
             .get(
@@ -65,14 +73,16 @@ fn running_service_switches_after_activation_but_inflight_groups_keep_one_snapsh
         CompatibilityHints::none(),
     )?;
     let ingest_secret = claim.ingest_secret().ok_or("ingest secret")?.to_owned();
-    let barrier = Arc::new(Barrier::new(2));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (resume_sender, resume_receiver) = mpsc::sync_channel(1);
     initialized.admission_group_planner = Arc::new(BlockingTwoGroups {
-        barrier: Arc::clone(&barrier),
+        entered: entered_sender,
+        resume: Mutex::new(resume_receiver),
         shards: [initialized.logs_shard, VirtualShardId::new(2)?],
         blocked: AtomicBool::new(false),
     });
     let initialized = Arc::new(initialized);
-    let services = ServiceHandle::new(Arc::clone(&initialized));
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
 
     let inflight = thread::scope(|scope| -> Result<_, Box<dyn std::error::Error>> {
         let inflight_services = services.clone();
@@ -83,30 +93,35 @@ fn running_service_switches_after_activation_but_inflight_groups_keep_one_snapsh
                 request(&["old-first", "old-second"]).encode_to_vec(),
             )
         });
-        barrier.wait();
-        services.activate_ingest_policy(
-            administrator,
-            ResourceGeneration::new(1)?,
-            AdministrativeIdempotencyKey::new([0xa1; 16])?,
-            IngestPolicy::compile(
-                2,
-                vec![PolicyRule::new(
-                    "reject-after-activation",
-                    Vec::new(),
-                    PolicyAction::Reject,
-                )?],
-            )?,
-        )?;
-        barrier.wait();
-        Ok(handle
+        entered_receiver.recv_timeout(Duration::from_secs(2))?;
+        services
+            .activate_ingest_policy(
+                administrator,
+                ResourceGeneration::new(1)?,
+                AdministrativeIdempotencyKey::new([0xa1; 16])?,
+                IngestPolicy::compile(
+                    2,
+                    vec![PolicyRule::new(
+                        "reject-after-activation",
+                        Vec::new(),
+                        PolicyAction::Reject,
+                    )?],
+                )?,
+            )
+            .map_err(|failure| std::io::Error::other(format!("activation: {failure:?}")))?;
+        resume_sender.send(())?;
+        let joined = handle
             .join()
-            .map_err(|_| std::io::Error::other("service thread panicked"))??)
+            .map_err(|_| std::io::Error::other("service thread panicked"))?;
+        Ok(joined
+            .map_err(|failure| std::io::Error::other(format!("in-flight ingest: {failure:?}")))?)
     })?;
     assert_eq!(inflight.groups().len(), 2);
     assert_eq!(inflight.accepted_records(), 2);
 
-    let after =
-        services.ingest_otlp_logs(&ingest_secret, request(&["new-request"]).encode_to_vec())?;
+    let after = services
+        .ingest_otlp_logs(&ingest_secret, request(&["new-request"]).encode_to_vec())
+        .map_err(|failure| std::io::Error::other(format!("new ingest: {failure:?}")))?;
     assert_eq!(after.permanently_rejected_records(), 1);
     assert_eq!(
         after.terminal_failure(),

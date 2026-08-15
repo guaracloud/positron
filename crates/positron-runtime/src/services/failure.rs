@@ -10,7 +10,10 @@ pub enum ServiceFailure {
     RequestTooLarge,
     InvalidRequest,
     KeyUnavailable,
+    CatalogUnavailable,
+    LedgerUnavailable,
     StorageUnavailable,
+    CorruptState,
     Internal,
 }
 
@@ -40,3 +43,20 @@ impl Display for ServiceFailure {
 }
 
 impl Error for ServiceFailure {}
+
+impl ServiceFailure {
+    pub(crate) const fn bootstrap_code(self) -> crate::BootstrapFailureCode {
+        match self {
+            Self::CorruptState => crate::BootstrapFailureCode::CorruptState,
+            Self::KeyUnavailable => crate::BootstrapFailureCode::KeyCustodyUnavailable,
+            Self::CatalogUnavailable | Self::StorageUnavailable => {
+                crate::BootstrapFailureCode::CatalogUnavailable
+            },
+            Self::LedgerUnavailable => crate::BootstrapFailureCode::LedgerUnavailable,
+            Self::CapacityUnavailable => crate::BootstrapFailureCode::ResourceUnavailable,
+            Self::Unauthorized | Self::RequestTooLarge | Self::InvalidRequest | Self::Internal => {
+                crate::BootstrapFailureCode::ResourceUnavailable
+            },
+        }
+    }
+}

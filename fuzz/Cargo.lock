@@ -880,6 +880,7 @@ dependencies = [
  "positron-governance",
  "positron-ingest",
  "positron-kernel",
+ "positron-policy",
  "positron-query",
  "positron-runtime",
  "positron-signals",
@@ -977,6 +978,7 @@ dependencies = [
  "positron-domain",
  "positron-kernel",
  "positron-policy",
+ "sha2",
 ]
 
 [[package]]

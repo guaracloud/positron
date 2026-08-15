@@ -17,6 +17,7 @@ positron-ingest = { path = "../crates/positron-ingest" }
 positron-runtime = { path = "../crates/positron-runtime" }
 positron-signals = { path = "../crates/positron-signals" }
 positron-query = { path = "../crates/positron-query" }
+positron-policy = { path = "../crates/positron-policy" }
 prost = "=0.14.3"
 
 [[bin]]
@@ -99,6 +100,20 @@ bench = false
 [[bin]]
 name = "ingest_policy"
 path = "fuzz_targets/ingest_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema_catalog_decode"
+path = "fuzz_targets/schema_catalog_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema_discovery_query"
+path = "fuzz_targets/schema_discovery_query.rs"
 test = false
 doc = false
 bench = false

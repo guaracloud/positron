@@ -5,9 +5,9 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId};
 use positron_kernel::{
     DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
     StorageKernelResourceAuthority, TenantQuota,
 };
 use prost::Message;
@@ -15,6 +15,7 @@ use prost::Message;
 use crate::AuthenticatedOtlpLogsRequest;
 
 const DIMENSIONS: usize = 11;
+const DEFAULT_ORDINARY_MEMORY_BYTES: u64 = 8_000_000;
 
 pub struct Fixture {
     pub authority: StorageKernelResourceAuthority,
@@ -23,9 +24,30 @@ pub struct Fixture {
 }
 
 pub fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
+    fixture_with_ordinary_memory(DEFAULT_ORDINARY_MEMORY_BYTES)
+}
+
+pub fn fixture_with_ordinary_memory(
+    ordinary_memory_bytes: u64,
+) -> Result<Fixture, Box<dyn std::error::Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let tenant = TenantId::from_bytes([2; 16])?;
+    fixture_for_volume(root, volume, tenant, ordinary_memory_bytes)
+}
+
+pub fn fixture_for_tenant(tenant: TenantId) -> Result<Fixture, Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    fixture_for_volume(root, volume, tenant, DEFAULT_ORDINARY_MEMORY_BYTES)
+}
+
+fn fixture_for_volume(
+    root: TemporaryRoot,
+    volume: OwnedPrimaryDataVolume,
+    tenant: TenantId,
+    ordinary_memory_bytes: u64,
+) -> Result<Fixture, Box<dyn std::error::Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
     let observed = ObservedResourceEnvironment::observe(
         &volume,
@@ -38,7 +60,17 @@ pub fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
     let ordinary_capacity = ResourceAmounts::new([
-        5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 800, 32, 2_000_000,
+        ordinary_memory_bytes,
+        32,
+        32,
+        5_000_000,
+        2_048,
+        32,
+        32,
+        32,
+        800,
+        32,
+        2_000_000,
     ]);
     let governed = add(recovery_capacity, ordinary_capacity)?;
     let raw = add(governed, cardinality.governor_bootstrap_overhead(1)?)?;
@@ -69,6 +101,12 @@ pub fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         tenant,
         _root: root,
     })
+}
+
+pub fn schema_session(
+    fixture: &Fixture,
+) -> Result<crate::TenantSchemaSession, crate::SchemaSessionFailure> {
+    crate::TenantSchemaRegistry::new(1)?.session(fixture.tenant, fixture.authority.governor())
 }
 
 fn uniform(value: u64) -> ResourceAmounts {

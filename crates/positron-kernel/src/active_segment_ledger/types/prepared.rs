@@ -1,4 +1,5 @@
 use crate::ResourceReservation;
+use crate::data_protection::DataProtection;
 
 use super::{LedgerFailure, LedgerFailureCode, SegmentScope, StoreBlockIdentity};
 use crate::active_segment_ledger::MAX_STORE_BLOCK_BYTES;
@@ -23,6 +24,12 @@ impl PreparedStoreBlock<'static> {
 }
 
 impl<'capacity> PreparedStoreBlock<'capacity> {
+    /// Computes the stable digest used to reconcile this canonical payload.
+    pub fn content_digest(&self) -> Result<[u8; 32], LedgerFailure> {
+        DataProtection::hash(&self.payload)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))
+    }
+
     pub fn new_with_preparation_capacity(
         scope: SegmentScope,
         identity: StoreBlockIdentity,

@@ -134,7 +134,17 @@ impl ApplicationRuntime {
             instance.admission_group_planner = planner;
         }
         let instance = Arc::new(instance);
-        let services = ServiceHandle::new(Arc::clone(&instance));
+        let services = match ServiceHandle::new(Arc::clone(&instance)) {
+            Ok(services) => services,
+            Err(failure) => {
+                return Err(cleanup_startup(
+                    ExitOutcome::StartupUnavailable(failure.bootstrap_code()),
+                    &cancellation,
+                    &mut listeners,
+                    &mut tasks,
+                ));
+            },
+        };
         for role in [
             ListenerRole::Api,
             ListenerRole::OtlpGrpc,

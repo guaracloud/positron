@@ -4,7 +4,8 @@ use positron_ingest::{
 };
 use positron_kernel::TransferredResourceReservation;
 
-use super::{ServiceFailure, ServiceHandle, ingest_authenticated, map_receive_failure};
+use super::ingest::ingest_authenticated;
+use super::{ServiceFailure, ServiceHandle, map_receive_failure};
 
 impl ServiceHandle {
     pub(crate) fn ingest_encoded_otlp_http_logs(

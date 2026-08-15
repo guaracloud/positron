@@ -2,6 +2,10 @@ use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
 
 use super::{ServiceFailure, map_admission_group_plan_failure, map_receive_failure};
 
+mod schema_maintenance;
+mod schema_replay_integrity;
+mod schema_routes;
+
 #[test]
 fn service_diagnostics_are_stable_and_secret_free() {
     assert_eq!(

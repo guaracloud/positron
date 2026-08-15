@@ -17,3 +17,4 @@ workspace = true
 positron-domain = { path = "../positron-domain" }
 positron-kernel = { path = "../positron-kernel" }
 positron-policy = { path = "../positron-policy" }
+sha2 = { version = "=0.11.0", default-features = false }

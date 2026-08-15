@@ -73,6 +73,26 @@ pub struct AttributeOccurrenceSet {
 }
 
 impl AttributeOccurrenceSet {
+    /// Fallibly clones this bounded occurrence set for retained store state.
+    pub fn try_clone(&self) -> Result<Self, DomainFailure> {
+        let mut key = String::new();
+        key.try_reserve_exact(self.key.len())
+            .map_err(|_| DomainFailure::allocation_unavailable())?;
+        key.push_str(&self.key);
+        let mut occurrences = Vec::new();
+        occurrences
+            .try_reserve_exact(self.occurrences.len())
+            .map_err(|_| DomainFailure::allocation_unavailable())?;
+        for occurrence in &self.occurrences {
+            occurrences.push(occurrence.try_clone()?);
+        }
+        Ok(Self {
+            namespace: self.namespace,
+            key,
+            occurrences,
+        })
+    }
+
     /// Returns the namespace that owns this occurrence set.
     #[must_use]
     pub const fn namespace(&self) -> AttributeNamespace {

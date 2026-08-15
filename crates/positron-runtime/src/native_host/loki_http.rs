@@ -129,10 +129,15 @@ fn service_response(service_failure: ServiceFailure) -> Response {
             failure(413, "Loki Push request exceeds the receiver limit")
         },
         ServiceFailure::InvalidRequest => failure(400, "Loki Push request was rejected"),
-        ServiceFailure::KeyUnavailable | ServiceFailure::StorageUnavailable => {
+        ServiceFailure::KeyUnavailable
+        | ServiceFailure::CatalogUnavailable
+        | ServiceFailure::LedgerUnavailable
+        | ServiceFailure::StorageUnavailable => {
             failure(503, "Loki Push ingest is temporarily unavailable")
         },
-        ServiceFailure::Internal => failure(500, "Loki Push ingest failed"),
+        ServiceFailure::CorruptState | ServiceFailure::Internal => {
+            failure(500, "Loki Push ingest failed")
+        },
     }
 }
 

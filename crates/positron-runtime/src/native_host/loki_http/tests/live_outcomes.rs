@@ -131,7 +131,7 @@ impl ReceiverHarness {
             .ingest_secret()
             .ok_or("ingest secret missing")?
             .to_owned();
-        let services = ServiceHandle::new(Arc::new(InstanceBootstrap::reopen(&paths)?));
+        let services = ServiceHandle::new(Arc::new(InstanceBootstrap::reopen(&paths)?))?;
         services.install_receiver_test_backend(backend)?;
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
@@ -174,13 +174,21 @@ impl ReceiverHarness {
     }
 
     fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.cancellation.cancel();
-        self.server
-            .take()
-            .ok_or("server missing")?
-            .join()
-            .map_err(|_| "server panicked")?;
+        if let Some(server) = self.server.take() {
+            server.join().map_err(|_| "server panicked")?;
+        }
         Ok(())
+    }
+}
+
+impl Drop for ReceiverHarness {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 

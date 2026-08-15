@@ -68,6 +68,7 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
             &policy,
             fixture.tenant,
             shard,
+            super::schema_support::session(&fixture)?,
         )
         .accept(batch, StoreBlockIdentity::new([0xe6; 16])?)
         {
