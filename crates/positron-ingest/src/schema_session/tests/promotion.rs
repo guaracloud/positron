@@ -100,6 +100,44 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
     assert!(!initial.entry(&path).expect("entry").promoted());
     assert!(scan(&fixture, &snapshot, &initial, &query).reduced_pruning());
 
+    let before_promotion_charge = session
+        .checkpoint()
+        .expect("pre-promotion checkpoint")
+        .retained_charge_bytes();
+    let before_promotion = session
+        .checkpoint()
+        .expect("pre-promotion bytes")
+        .into_catalog_bytes();
+    let blocker = fixture
+        .authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                fixture.tenant,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 10_000_000)
+                    .expect("blocking amount"),
+            )
+            .expect("blocking claim"),
+        )
+        .expect("blocking reservation");
+    assert_eq!(
+        session.record_query_use(
+            fixture.tenant,
+            &path,
+            &snapshot,
+            fixture.authority.governor(),
+        ),
+        Err(super::super::SchemaSessionFailure::StateUnavailable)
+    );
+    assert_eq!(
+        session
+            .checkpoint()
+            .expect("failed promotion checkpoint")
+            .catalog_bytes(),
+        before_promotion
+    );
+    drop(blocker);
     session
         .record_query_use(
             fixture.tenant,
@@ -108,7 +146,16 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
             fixture.authority.governor(),
         )
         .expect("promote");
+    let promoted_charge = session
+        .checkpoint()
+        .expect("promoted checkpoint")
+        .retained_charge_bytes();
+    assert!(promoted_charge > before_promotion_charge);
     let promoted = decoded(&session);
+    let promoted_checkpoint = session
+        .checkpoint()
+        .expect("promoted checkpoint")
+        .into_catalog_bytes();
     let promoted_result = scan(&fixture, &snapshot, &promoted, &query);
     assert!(promoted.entry(&path).expect("entry").promoted());
     assert!(!promoted_result.reduced_pruning());
@@ -142,20 +189,26 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
         Err(super::super::SchemaSessionFailure::TenantConflict)
     );
     assert_eq!(
-        session.remove_query_evidence(foreign, &path),
+        session.remove_query_evidence(foreign, &path, fixture.authority.governor()),
         Err(super::super::SchemaSessionFailure::TenantConflict)
     );
+    let foreign_governor =
+        crate::tests::support::fixture_with_ordinary_memory(40_000_000).expect("foreign governor");
+    assert_eq!(
+        session
+            .remove_query_evidence(fixture.tenant, &path, foreign_governor.authority.governor(),),
+        Err(super::super::SchemaSessionFailure::StateUnavailable)
+    );
     session
-        .retain_reachable_indexes(&[])
-        .expect("reconcile unreachable sidecar");
-    let reconciled = decoded(&session);
-    let reconciled_result = scan(&fixture, &snapshot, &reconciled, &query);
-    assert!(reconciled_result.reduced_pruning());
-    assert_eq!(reconciled_result.records(), promoted_result.records());
-
-    session
-        .remove_query_evidence(fixture.tenant, &path)
+        .remove_query_evidence(fixture.tenant, &path, fixture.authority.governor())
         .expect("demote");
+    assert_eq!(
+        session
+            .checkpoint()
+            .expect("demoted checkpoint")
+            .retained_charge_bytes(),
+        before_promotion_charge
+    );
     let demoted = decoded(&session);
     let demoted_result = scan(&fixture, &snapshot, &demoted, &query);
     assert!(!demoted.entry(&path).expect("entry").promoted());
@@ -168,6 +221,29 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
     assert_eq!(
         scan(&fixture, &snapshot, &reopened, &query).records(),
         promoted_result.records()
+    );
+    session
+        .retain_reachable_indexes(&[])
+        .expect("reconcile unreachable sidecar");
+    drop(session);
+    drop(registry);
+    let reopened_registry = TenantSchemaRegistry::new(1).expect("reopen registry");
+    let reopened_session = reopened_registry
+        .session_from_checkpoint(
+            fixture.tenant,
+            &promoted_checkpoint,
+            fixture.authority.governor(),
+        )
+        .expect("reopen promoted session");
+    reopened_session
+        .remove_query_evidence(fixture.tenant, &path, fixture.authority.governor())
+        .expect("demote base-reserved reopened sidecar");
+    assert_eq!(
+        reopened_session
+            .checkpoint()
+            .expect("reopened demotion")
+            .retained_charge_bytes(),
+        0
     );
 }
 

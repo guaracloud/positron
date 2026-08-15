@@ -31,7 +31,7 @@ pub use schema::{
     SchemaCheckpointFrontier, SchemaDelta, SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry,
     SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
     SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
-    SchemaRepresentation, SchemaSessionStore, SchemaValue,
+    SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaValue,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,

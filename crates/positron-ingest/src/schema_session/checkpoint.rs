@@ -44,6 +44,8 @@ impl TenantSchemaSession {
                 catalog,
                 frontiers,
                 retained_capacity,
+                query_capacity: None,
+                query_charge_bytes: 0,
                 base_charge_bytes,
                 retained_charge_bytes: 0,
                 pending: None,
@@ -66,7 +68,10 @@ impl TenantSchemaSession {
                 .map_err(SchemaSessionFailure::Schema)?,
             entry_count: state.catalog.catalog().entry_count(),
             overflow_record_count: state.catalog.catalog().overflow_record_count(),
-            retained_charge_bytes: state.retained_charge_bytes,
+            retained_charge_bytes: state
+                .retained_charge_bytes
+                .checked_add(state.query_charge_bytes)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
             pending_bytes: state
                 .pending
                 .as_ref()

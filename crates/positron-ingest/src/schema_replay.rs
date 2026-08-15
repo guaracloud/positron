@@ -48,12 +48,16 @@ impl<'authority> SchemaReplayBuilder<'authority> {
             Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, base_capacity)?,
             None => TenantSchemaSession::release_1(tenant, base_capacity)?,
         };
+        let mut reachable_indexes = Vec::new();
+        reachable_indexes
+            .try_reserve_exact(SchemaBudget::system_max_entries())
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         Ok(Self {
             tenant,
             session,
             source_bytes,
             recovery,
-            reachable_indexes: Vec::new(),
+            reachable_indexes,
         })
     }
 
@@ -68,18 +72,13 @@ impl<'authority> SchemaReplayBuilder<'authority> {
             .replay_snapshot_for_bootstrap(self.tenant, snapshot, &mut self.recovery)?;
         self.session
             .append_reachable_indexes(snapshot, &mut self.reachable_indexes)?;
-        let retained = self
-            .session
-            .base_memory_bytes()?
-            .checked_add(self.source_bytes)
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-        self.recovery
-            .try_resize(active_resources(retained)?)
-            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         Ok(())
     }
 
-    pub fn finish(self) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {
+    pub fn finish(mut self) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {
+        self.recovery
+            .try_resize(peak_resources(self.source_bytes)?)
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         self.session
             .retain_reachable_indexes(&self.reachable_indexes)?;
         self.session.checkpoint()
@@ -87,8 +86,18 @@ impl<'authority> SchemaReplayBuilder<'authority> {
 }
 
 fn peak_resources(source_bytes: u64) -> Result<ResourceAmounts, SchemaSessionFailure> {
+    let working = SchemaBudget::replay_working_memory_bytes(1_048_576)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let reachable = SchemaBudget::system_max_entries()
+        .checked_mul(std::mem::size_of::<(StoreBlockIdentity, [u8; 32])>())
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let serialized = SchemaBudget::release_1()
+        .map_err(SchemaSessionFailure::Schema)?
+        .max_persistent_bytes();
     let memory = u64::try_from(
-        SchemaBudget::replay_working_memory_bytes(1_048_576)
+        working
+            .checked_add(reachable)
+            .and_then(|bytes| bytes.checked_add(serialized))
             .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
     )
     .ok()
@@ -112,3 +121,7 @@ fn active_resources(memory: u64) -> Result<ResourceAmounts, SchemaSessionFailure
         0,
     ]))
 }
+
+#[cfg(test)]
+#[path = "schema_replay/tests/mod.rs"]
+mod tests;

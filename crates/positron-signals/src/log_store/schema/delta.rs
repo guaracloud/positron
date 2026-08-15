@@ -12,6 +12,7 @@ use crate::log_store::{AttributeRepresentation, StoredLogAttribute};
 mod accounting;
 mod apply;
 mod indexing;
+mod unverified;
 use accounting::{attribute_bytes, projected_cost, root_fits, staged_memory_bytes};
 pub(super) use indexing::additional_physical_cost;
 use indexing::stage_index_root;
@@ -27,6 +28,7 @@ pub struct SchemaDelta {
     persistent_bytes: usize,
     index_bytes: usize,
     index_paths: Vec<SchemaIndexPath>,
+    unverified_paths: Vec<SchemaPath>,
     physical_index_bytes: usize,
     physical_memory_bytes: usize,
     build_physical_index: bool,
@@ -44,6 +46,7 @@ impl SchemaDelta {
             persistent_bytes: 0,
             index_bytes: 0,
             index_paths: Vec::new(),
+            unverified_paths: Vec::new(),
             physical_index_bytes: 0,
             physical_memory_bytes: 0,
             build_physical_index,
@@ -87,6 +90,13 @@ impl SchemaDelta {
         for path in &self.index_paths {
             index_paths.push(path.try_clone()?);
         }
+        let mut unverified_paths = Vec::new();
+        unverified_paths
+            .try_reserve_exact(self.unverified_paths.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for path in &self.unverified_paths {
+            unverified_paths.push(path.try_clone()?);
+        }
         Ok(Self {
             tenant: self.tenant,
             entries,
@@ -97,6 +107,7 @@ impl SchemaDelta {
             persistent_bytes: self.persistent_bytes,
             index_bytes: self.index_bytes,
             index_paths,
+            unverified_paths,
             physical_index_bytes: self.physical_index_bytes,
             physical_memory_bytes: self.physical_memory_bytes,
             build_physical_index: self.build_physical_index,
@@ -230,16 +241,17 @@ impl SchemaCatalog {
             if cataloged {
                 stage_index_root(self, delta, &root)?;
                 merge_root(delta, root)?;
-                let (memory, persistent, index, _) = projected_cost(self, delta, None)?;
-                delta.retained_memory_bytes = memory;
-                delta.persistent_bytes = persistent;
-                delta.index_bytes = index;
-                delta.staged_memory_bytes = staged_memory_bytes(delta)?;
             } else {
+                delta.mark_paths_unverified(self, &root)?;
                 record_overflow_bytes = record_overflow_bytes
                     .checked_add(attribute_bytes(set)?)
                     .ok_or(SchemaFailure::LimitExceeded)?;
             }
+            let (memory, persistent, index, _) = projected_cost(self, delta, None)?;
+            delta.retained_memory_bytes = memory;
+            delta.persistent_bytes = persistent;
+            delta.index_bytes = index;
+            delta.staged_memory_bytes = staged_memory_bytes(delta)?;
             observed.push(ObservedAttribute::new(
                 set.try_clone()
                     .map_err(|_| SchemaFailure::AllocationUnavailable)?,

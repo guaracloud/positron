@@ -6,6 +6,7 @@ use crate::log_store::schema::failure::SchemaFailure;
 use crate::log_store::schema::index::MAX_BLOCK_INDEXES;
 use crate::log_store::schema::model::{
     CATALOG_HEADER_BYTES, MAX_VARIANTS, SchemaEntry, entry_memory_bytes, entry_persistent_bytes,
+    path_memory_bytes,
 };
 
 pub(super) fn root_fits(
@@ -143,25 +144,28 @@ fn add_entry_cost(
 }
 
 pub(super) fn staged_memory_bytes(delta: &SchemaDelta) -> Result<usize, SchemaFailure> {
-    delta
-        .entries
-        .iter()
-        .try_fold(
-            delta
-                .entries
-                .capacity()
-                .checked_mul(std::mem::size_of::<SchemaEntry>())
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaEntry>>()))
-                .ok_or(SchemaFailure::LimitExceeded)?,
-            |total, entry| {
-                total
-                    .checked_add(
-                        entry_memory_bytes(&entry.path, entry.variants.capacity())
-                            .ok_or(SchemaFailure::LimitExceeded)?,
-                    )
-                    .ok_or(SchemaFailure::LimitExceeded)
-            },
-        )?
+    let mut memory = delta.entries.iter().try_fold(
+        delta
+            .entries
+            .capacity()
+            .checked_mul(std::mem::size_of::<SchemaEntry>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaEntry>>()))
+            .ok_or(SchemaFailure::LimitExceeded)?,
+        |total, entry| {
+            total
+                .checked_add(
+                    entry_memory_bytes(&entry.path, entry.variants.capacity())
+                        .ok_or(SchemaFailure::LimitExceeded)?,
+                )
+                .ok_or(SchemaFailure::LimitExceeded)
+        },
+    )?;
+    for path in &delta.unverified_paths {
+        memory = memory
+            .checked_add(path_memory_bytes(path).ok_or(SchemaFailure::LimitExceeded)?)
+            .ok_or(SchemaFailure::LimitExceeded)?;
+    }
+    memory
         .checked_add(delta.physical_memory_bytes())
         .ok_or(SchemaFailure::LimitExceeded)
 }

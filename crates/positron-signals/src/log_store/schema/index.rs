@@ -63,6 +63,21 @@ pub(crate) struct SchemaBlockIndex {
 }
 
 impl SchemaBlockIndex {
+    pub(crate) fn try_clone(&self) -> Result<Self, SchemaFailure> {
+        let mut paths = Vec::new();
+        paths
+            .try_reserve_exact(self.paths.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for path in &self.paths {
+            paths.push(path.try_clone()?);
+        }
+        Ok(Self {
+            identity: self.identity,
+            digest: self.digest,
+            paths,
+        })
+    }
+
     pub(crate) fn one(
         identity: StoreBlockIdentity,
         digest: [u8; 32],

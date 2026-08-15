@@ -17,10 +17,10 @@ pub(crate) fn additional_physical_cost(
     let mut wire = 0_usize;
     let mut memory = 0_usize;
     let mut added = false;
-    for entry in root
-        .iter()
-        .filter(|entry| entry.query_uses > 0 && entry.promoted)
-    {
+    for entry in root {
+        if entry.query_uses == 0 || !entry.promoted || delta.path_is_unverified(&entry.path) {
+            continue;
+        }
         if delta
             .index_paths
             .binary_search_by(|known| known.wire_cmp_path(&entry.path))
@@ -65,10 +65,10 @@ pub(super) fn stage_index_root(
         return Ok(());
     }
     let was_empty = delta.index_paths.is_empty();
-    for entry in root
-        .iter()
-        .filter(|entry| entry.query_uses > 0 && entry.promoted)
-    {
+    for entry in root {
+        if entry.query_uses == 0 || !entry.promoted || delta.path_is_unverified(&entry.path) {
+            continue;
+        }
         match delta
             .index_paths
             .binary_search_by(|known| known.wire_cmp_path(&entry.path))

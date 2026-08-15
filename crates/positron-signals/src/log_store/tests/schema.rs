@@ -3,7 +3,9 @@ use std::error::Error;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
-use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
+use positron_domain::value::{
+    AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue,
+};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
     LifecycleClock, MountQualification, PrimaryDataVolume, SegmentProtectionKey, SegmentScope,
@@ -18,7 +20,10 @@ use super::{AttributeRepresentation, LogRecord, LogScan, LogStore, ScanLimit};
 use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
-use crate::{LogStoreFailureCode, SchemaBudget, SchemaCatalog, SchemaSessionStore};
+use crate::{
+    LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery,
+    SchemaSessionStore, SchemaValue,
+};
 
 #[test]
 fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(), Box<dyn Error>> {
@@ -150,6 +155,92 @@ fn staged_schema_delta_cannot_be_applied_to_another_tenant() -> Result<(), Box<d
     Ok(())
 }
 
+#[test]
+fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1a; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2a; 32]), Box::new([0x3a; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(18)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
+    )?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 96)?)?;
+    let seed = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "collision".to_owned(),
+        vec![CandidateAttributeValue::string("seed".to_owned())],
+    )
+    .validate(LogStore::value_limit_profile())?;
+    schema.observe(std::slice::from_ref(&seed))?;
+    schema.observe(std::slice::from_ref(&seed))?;
+    let path = SchemaPath::new(AttributeNamespace::Record, "collision".to_owned())?;
+    schema.record_query_use(&path)?;
+    assert!(
+        schema
+            .entry(&path)
+            .ok_or("promoted path missing")?
+            .promoted()
+    );
+
+    let identity = StoreBlockIdentity::new([0x6a; 16])?;
+    let mut records = vec![
+        make_record("collision", "cataloged")?,
+        make_integer_record("collision", 42)?,
+        make_record("collision", "still-cataloged")?,
+    ];
+    let store = LogStore::new();
+    let delta = store.stage_schema_group(&mut records, &schema)?;
+    assert_eq!(
+        records[0].attributes()[0].representation(),
+        AttributeRepresentation::Generic
+    );
+    assert_eq!(
+        records[1].attributes()[0].representation(),
+        AttributeRepresentation::SchemaOverflow
+    );
+    assert_eq!(
+        records[2].attributes()[0].representation(),
+        AttributeRepresentation::Generic
+    );
+    let prepared = store.prepare(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        identity,
+        records,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+
+    let result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(3)?),
+        &schema,
+        &SchemaQuery::value(
+            path,
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(42),
+        ),
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert!(result.reduced_pruning());
+    Ok(())
+}
+
 fn make_record(key: &str, value: &str) -> Result<LogRecord, Box<dyn Error>> {
     make_record_with_occurrences(key, &[value])
 }
@@ -167,6 +258,30 @@ fn make_record_with_occurrences(key: &str, values: &[&str]) -> Result<LogRecord,
                 .iter()
                 .map(|value| CandidateAttributeValue::string((*value).to_owned()))
                 .collect(),
+        )],
+        LogMetadata::empty(),
+    );
+    let PolicyEvaluation::Accepted(evaluated) =
+        policy.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+    else {
+        return Err("preserving policy rejected fixture".into());
+    };
+    Ok(LogRecord::checked_evaluated(
+        LogStore::value_limit_profile(),
+        *evaluated,
+    )?)
+}
+
+fn make_integer_record(key: &str, value: i64) -> Result<LogRecord, Box<dyn Error>> {
+    let policy = IngestPolicy::preserving(1)?;
+    let candidate = NativeLogCandidate::new(
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![NativeLogAttribute::new(
+            AttributeNamespace::Record,
+            key.to_owned(),
+            vec![CandidateAttributeValue::signed_integer(value)],
         )],
         LogMetadata::empty(),
     );

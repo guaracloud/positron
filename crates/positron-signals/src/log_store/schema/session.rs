@@ -18,6 +18,12 @@ pub struct SchemaSessionStore {
     capacity_bytes: u64,
 }
 
+/// Fallibly constructed, unpublished query-evidence replacement.
+#[doc(hidden)]
+pub struct SchemaQueryUpdate {
+    catalog: SchemaCatalog,
+}
+
 impl SchemaSessionStore {
     pub fn new(
         reservation: ResourceReservation<'_>,
@@ -109,6 +115,29 @@ impl SchemaSessionStore {
         LogStore::new().replay_schema_block(tenant, snapshot, block, &self.catalog)
     }
 
+    pub fn stage_query_update(&self) -> Result<SchemaQueryUpdate, SchemaFailure> {
+        Ok(SchemaQueryUpdate {
+            catalog: self.catalog.try_clone()?,
+        })
+    }
+
+    pub fn commit_query_update(&mut self, update: SchemaQueryUpdate) -> Result<(), SchemaFailure> {
+        if self.catalog.tenant() != update.catalog.tenant() {
+            return Err(SchemaFailure::InvalidValue);
+        }
+        self.catalog = update.catalog;
+        Ok(())
+    }
+
+    pub fn retain_reachable_indexes(
+        &mut self,
+        reachable: &[(StoreBlockIdentity, [u8; 32])],
+    ) -> Result<(), SchemaFailure> {
+        self.catalog.retain_reachable_indexes(reachable)
+    }
+}
+
+impl SchemaQueryUpdate {
     pub fn record_query_use(&mut self, path: &super::SchemaPath) -> Result<(), SchemaFailure> {
         self.catalog.record_query_use(path)
     }
@@ -137,6 +166,43 @@ impl SchemaSessionStore {
         self.catalog.remove_query_evidence(path)
     }
 
+    #[must_use]
+    pub const fn memory_bytes(&self) -> usize {
+        self.catalog.memory_bytes()
+    }
+}
+
+impl SchemaCatalog {
+    fn try_clone(&self) -> Result<Self, SchemaFailure> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.capacity())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for entry in &self.entries {
+            entries.push(entry.try_clone()?);
+        }
+        let mut block_indexes = Vec::new();
+        block_indexes
+            .try_reserve_exact(self.block_indexes.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for block in &self.block_indexes {
+            block_indexes.push(block.try_clone()?);
+        }
+        Ok(Self {
+            tenant: self.tenant,
+            budget: self.budget,
+            entries,
+            memory_bytes: self.memory_bytes,
+            persistent_bytes: self.persistent_bytes,
+            index_bytes: self.index_bytes,
+            overflow_records: self.overflow_records,
+            overflow_bytes: self.overflow_bytes,
+            block_indexes,
+        })
+    }
+}
+
+impl SchemaSessionStore {
     pub fn has_verified_block(&self, identity: StoreBlockIdentity, digest: [u8; 32]) -> bool {
         self.catalog.has_verified_block(identity, digest)
     }
@@ -147,12 +213,5 @@ impl SchemaSessionStore {
         digest: [u8; 32],
     ) -> Result<(), SchemaFailure> {
         self.catalog.reconcile_block_identity(identity, digest)
-    }
-
-    pub fn retain_reachable_indexes(
-        &mut self,
-        reachable: &[(StoreBlockIdentity, [u8; 32])],
-    ) -> Result<(), SchemaFailure> {
-        self.catalog.retain_reachable_indexes(reachable)
     }
 }

@@ -33,6 +33,8 @@ pub(super) struct SessionState {
     pub(super) catalog: SchemaSessionStore,
     pub(super) frontiers: Vec<SchemaCheckpointFrontier>,
     pub(super) retained_capacity: Vec<TransferredResourceReservation>,
+    pub(super) query_capacity: Option<TransferredResourceReservation>,
+    pub(super) query_charge_bytes: u64,
     pub(super) base_charge_bytes: u64,
     pub(super) retained_charge_bytes: u64,
     pub(super) pending: Option<PendingStage>,
@@ -170,44 +172,14 @@ impl TenantSchemaSession {
                 catalog,
                 frontiers,
                 retained_capacity,
+                query_capacity: None,
+                query_charge_bytes: 0,
                 base_charge_bytes,
                 retained_charge_bytes: 0,
                 pending: None,
                 in_flight: None,
             })),
         })
-    }
-
-    pub(super) fn base_memory_bytes(&self) -> Result<u64, SchemaSessionFailure> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-        let bytes = state
-            .catalog
-            .catalog()
-            .memory_bytes()
-            .checked_add(
-                state
-                    .frontiers
-                    .capacity()
-                    .checked_mul(std::mem::size_of::<SchemaCheckpointFrontier>())
-                    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
-            )
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    state
-                        .retained_capacity
-                        .capacity()
-                        .checked_mul(std::mem::size_of::<TransferredResourceReservation>())?,
-                )
-            })
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SessionState>()))
-            .and_then(|bytes| {
-                bytes.checked_add(std::mem::size_of::<(TenantId, TenantSchemaSession)>())
-            })
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-        u64::try_from(bytes).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
     }
 
     pub(crate) fn stage_group(
