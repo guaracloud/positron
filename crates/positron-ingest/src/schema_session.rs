@@ -124,11 +124,13 @@ impl TenantSchemaSession {
         u64::try_from(bytes).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
     }
 
-    pub(crate) fn checkpoint_construction_memory_bytes(
+    pub(crate) fn checkpoint_construction_capacity_bytes(
         bytes: &[u8],
-    ) -> Result<u64, SchemaSessionFailure> {
+    ) -> Result<(u64, u64), SchemaSessionFailure> {
         let catalog =
             SchemaCatalog::catalog_memory_bound(bytes).map_err(SchemaSessionFailure::Schema)?;
+        let sidecar = SchemaCatalog::catalog_sidecar_memory_bound(bytes)
+            .map_err(SchemaSessionFailure::Schema)?;
         let structural = MAX_REPLAY_SHARDS
             .checked_mul(std::mem::size_of::<SchemaCheckpointFrontier>())
             .and_then(|value| {
@@ -142,12 +144,14 @@ impl TenantSchemaSession {
                 value.checked_add(std::mem::size_of::<(TenantId, TenantSchemaSession)>())
             })
             .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-        u64::try_from(
-            catalog
-                .checked_add(structural)
-                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
-        )
-        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
+        let base = catalog
+            .checked_sub(sidecar)
+            .and_then(|catalog| catalog.checked_add(structural))
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        Ok((
+            u64::try_from(base).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?,
+            u64::try_from(sidecar).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?,
+        ))
     }
 
     fn with_budget(

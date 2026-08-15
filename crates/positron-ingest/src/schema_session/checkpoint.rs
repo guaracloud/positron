@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use positron_domain::identity::TenantId;
 use positron_kernel::{ResourceReservation, TransferredResourceReservation};
-use positron_signals::{SchemaFailure, SchemaSessionStore};
+use positron_signals::{SchemaCatalog, SchemaFailure, SchemaSessionStore};
 
 use super::{MAX_REPLAY_SHARDS, SchemaSessionFailure, SessionState, TenantSchemaSession};
 
@@ -22,7 +22,22 @@ impl TenantSchemaSession {
         tenant: TenantId,
         bytes: &[u8],
         capacity: ResourceReservation<'_>,
+        sidecar_capacity: Option<ResourceReservation<'_>>,
     ) -> Result<Self, SchemaSessionFailure> {
+        let sidecar_bytes = u64::try_from(
+            SchemaCatalog::catalog_sidecar_memory_bound(bytes)
+                .map_err(SchemaSessionFailure::Schema)?,
+        )
+        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+        if sidecar_bytes == 0 {
+            if sidecar_capacity.is_some() {
+                return Err(SchemaSessionFailure::StateUnavailable);
+            }
+        } else if !sidecar_capacity.as_ref().is_some_and(|reservation| {
+            reservation.authorizes_tenant_schema_session(tenant, sidecar_bytes)
+        }) {
+            return Err(SchemaSessionFailure::StateUnavailable);
+        }
         let (catalog, decoded_frontiers) =
             SchemaSessionStore::from_checkpoint(capacity, tenant, bytes)
                 .map_err(SchemaSessionFailure::Schema)?
@@ -44,8 +59,8 @@ impl TenantSchemaSession {
                 catalog,
                 frontiers,
                 retained_capacity,
-                query_capacity: None,
-                query_charge_bytes: 0,
+                query_capacity: sidecar_capacity.map(ResourceReservation::transfer),
+                query_charge_bytes: sidecar_bytes,
                 base_charge_bytes,
                 retained_charge_bytes: 0,
                 pending: None,

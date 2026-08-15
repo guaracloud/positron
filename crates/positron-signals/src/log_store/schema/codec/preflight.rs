@@ -7,6 +7,7 @@ use crate::log_store::schema::model::{
 pub(super) struct CatalogPrefix {
     pub(super) offset: usize,
     pub(super) memory_bound: usize,
+    pub(super) sidecar_memory_bound: usize,
     pub(super) budget: SchemaBudget,
 }
 
@@ -138,6 +139,7 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailur
     Ok(CatalogPrefix {
         offset: bytes.len().saturating_sub(input.remaining_len()),
         memory_bound: memory,
+        sidecar_memory_bound: physical.memory_bound,
         budget,
     })
 }

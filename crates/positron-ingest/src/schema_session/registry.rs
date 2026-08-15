@@ -71,11 +71,11 @@ impl TenantSchemaRegistry {
                 if state.sessions.len() >= state.maximum {
                     return Err(SchemaSessionFailure::RegistryLimitExceeded);
                 }
-                let base_bytes = match checkpoint {
+                let (base_bytes, sidecar_bytes) = match checkpoint {
                     Some(bytes) => {
-                        TenantSchemaSession::checkpoint_construction_memory_bytes(bytes)?
+                        TenantSchemaSession::checkpoint_construction_capacity_bytes(bytes)?
                     },
-                    None => TenantSchemaSession::release_1_base_memory_bytes()?,
+                    None => (TenantSchemaSession::release_1_base_memory_bytes()?, 0),
                 };
                 let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, base_bytes)
                     .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
@@ -84,12 +84,18 @@ impl TenantSchemaRegistry {
                 let capacity = governor
                     .reserve(claim)
                     .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+                let sidecar_capacity = reserve_sidecar(tenant, sidecar_bytes, governor)?;
                 state
                     .sessions
                     .try_reserve_exact(1)
                     .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
                 let session = match checkpoint {
-                    Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, capacity)?,
+                    Some(bytes) => TenantSchemaSession::from_checkpoint(
+                        tenant,
+                        bytes,
+                        capacity,
+                        sidecar_capacity,
+                    )?,
                     None => TenantSchemaSession::release_1(tenant, capacity)?,
                 };
                 state.sessions.insert(index, (tenant, session.clone()));
@@ -97,4 +103,22 @@ impl TenantSchemaRegistry {
             },
         }
     }
+}
+
+fn reserve_sidecar<'authority>(
+    tenant: TenantId,
+    bytes: u64,
+    governor: ResourceGovernor<'authority>,
+) -> Result<Option<positron_kernel::ResourceReservation<'authority>>, SchemaSessionFailure> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
+        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+    let claim = WorkClaim::tenant(tenant, WorkKind::Ingest, amounts)
+        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+    governor
+        .reserve(claim)
+        .map(Some)
+        .map_err(|_| SchemaSessionFailure::StateUnavailable)
 }

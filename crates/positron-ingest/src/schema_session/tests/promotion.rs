@@ -227,6 +227,13 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
         .expect("reconcile unreachable sidecar");
     drop(session);
     drop(registry);
+    let bootstrap = crate::SchemaReplayBuilder::new(
+        fixture.tenant,
+        Some(&promoted_checkpoint),
+        fixture.authority.recovery(),
+    )
+    .expect("bootstrap reserves checkpoint sidecar separately");
+    drop(bootstrap);
     let reopened_registry = TenantSchemaRegistry::new(1).expect("reopen registry");
     let reopened_session = reopened_registry
         .session_from_checkpoint(
@@ -235,16 +242,21 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
             fixture.authority.governor(),
         )
         .expect("reopen promoted session");
+    let reopened_promoted = reopened_session
+        .checkpoint()
+        .expect("reopened promoted checkpoint");
+    assert_eq!(
+        reopened_promoted.retained_charge_bytes(),
+        promoted_charge,
+        "checkpoint-loaded sidecar capacity remains separately attributable"
+    );
+    let reopened_base_charge = reopened_promoted.base_charge_bytes();
     reopened_session
         .remove_query_evidence(fixture.tenant, &path, fixture.authority.governor())
         .expect("demote base-reserved reopened sidecar");
-    assert_eq!(
-        reopened_session
-            .checkpoint()
-            .expect("reopened demotion")
-            .retained_charge_bytes(),
-        0
-    );
+    let reopened_demoted = reopened_session.checkpoint().expect("reopened demotion");
+    assert_eq!(reopened_demoted.retained_charge_bytes(), 0);
+    assert_eq!(reopened_demoted.base_charge_bytes(), reopened_base_charge);
 }
 
 fn decoded(session: &super::super::TenantSchemaSession) -> SchemaCatalog {

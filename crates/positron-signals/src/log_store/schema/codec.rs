@@ -52,6 +52,12 @@ impl SchemaCatalog {
             .ok_or(SchemaFailure::MalformedCatalog)
     }
 
+    /// Returns the heap bytes attributable to rebuildable physical sidecars.
+    #[doc(hidden)]
+    pub fn catalog_sidecar_memory_bound(bytes: &[u8]) -> Result<usize, SchemaFailure> {
+        Ok(preflight::catalog_prefix(bytes)?.sidecar_memory_bound)
+    }
+
     /// Encodes this immutable tenant schema representation for Catalog publication.
     pub fn encode_catalog_object(&self) -> Result<Vec<u8>, SchemaFailure> {
         encode::catalog(self)

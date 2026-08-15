@@ -1,4 +1,6 @@
-use super::SchemaDelta;
+use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
+
+use super::{DiscoveryMeter, SchemaDelta};
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
 use crate::log_store::schema::index::{BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES};
@@ -18,25 +20,82 @@ impl SchemaDelta {
             .iter()
             .filter(|entry| entry.query_uses > 0 && entry.promoted)
         {
-            if !self.path_is_unverified(&entry.path) {
-                self.unverified_paths
-                    .try_reserve_exact(1)
-                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-                self.unverified_paths.push(entry.path.try_clone()?);
-            }
+            self.mark_path_unverified(catalog, &entry.path)?;
         }
 
-        let had_index_paths = !self.index_paths.is_empty();
+        Ok(())
+    }
+
+    pub(super) fn mark_overflow_paths(
+        &mut self,
+        catalog: &SchemaCatalog,
+        set: &AttributeOccurrenceSet,
+        meter: &mut DiscoveryMeter,
+    ) -> Result<(), SchemaFailure> {
+        let root = SchemaPath::root_borrowed(set.namespace(), set.key())?;
+        for index in 0..set.len() {
+            let value = set.occurrence(index).ok_or(SchemaFailure::InvalidValue)?;
+            self.mark_overflow_value(catalog, &root, value, meter)?;
+        }
+        Ok(())
+    }
+
+    fn mark_overflow_value(
+        &mut self,
+        catalog: &SchemaCatalog,
+        path: &SchemaPath,
+        value: &ValidatedAttributeValue,
+        meter: &mut DiscoveryMeter,
+    ) -> Result<(), SchemaFailure> {
+        self.mark_path_unverified(catalog, path)?;
+        let Some(count) = value.key_value_list_len() else {
+            return Ok(());
+        };
+        for index in 0..count {
+            if !meter.consume()? {
+                break;
+            }
+            let entry = value
+                .key_value_entry(index)
+                .ok_or(SchemaFailure::InvalidValue)?;
+            let Some(child) = path.child(entry.key())? else {
+                continue;
+            };
+            self.mark_overflow_value(catalog, &child, entry.value(), meter)?;
+        }
+        Ok(())
+    }
+
+    fn mark_path_unverified(
+        &mut self,
+        catalog: &SchemaCatalog,
+        path: &SchemaPath,
+    ) -> Result<(), SchemaFailure> {
+        if !catalog
+            .entry(path)
+            .is_some_and(|entry| entry.query_uses() > 0 && entry.promoted())
+        {
+            return Ok(());
+        }
+        if !self.path_is_unverified(path) {
+            self.unverified_paths
+                .try_reserve_exact(1)
+                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+            self.unverified_paths.push(path.try_clone()?);
+        }
+
+        let mut removed = false;
         let mut position = self.index_paths.len();
         while position > 0 {
             position -= 1;
             let remove = self
                 .index_paths
                 .get(position)
-                .is_some_and(|indexed| root.iter().any(|entry| entry.path == indexed.path));
+                .is_some_and(|indexed| indexed.path == *path);
             if !remove {
                 continue;
             }
+            removed = true;
             let indexed = self
                 .index_paths
                 .get(position)
@@ -51,7 +110,7 @@ impl SchemaDelta {
                 .ok_or(SchemaFailure::InvalidValue)?;
             self.index_paths.remove(position);
         }
-        if had_index_paths && self.index_paths.is_empty() {
+        if removed && self.index_paths.is_empty() {
             let index_header = if catalog.block_indexes.is_empty() {
                 INDEX_HEADER_BYTES
             } else {

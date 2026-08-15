@@ -194,6 +194,7 @@ impl SchemaCatalog {
                         .map_err(|_| SchemaFailure::AllocationUnavailable)?,
                 ),
                 AttributeRepresentation::SchemaOverflow => {
+                    delta.mark_overflow_paths(self, attribute.occurrences(), meter)?;
                     overflow_bytes = overflow_bytes
                         .checked_add(attribute_bytes(attribute.occurrences())?)
                         .ok_or(SchemaFailure::LimitExceeded)?;

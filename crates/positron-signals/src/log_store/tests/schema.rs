@@ -191,13 +191,33 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
             .promoted()
     );
 
+    schema.remove_query_evidence(&path)?;
+    let store = LogStore::new();
+    let seed_identity = StoreBlockIdentity::new([0x5a; 16])?;
+    let (prepared, seed_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(90))),
+        tenant,
+        shard,
+        seed_identity,
+        vec![
+            make_record("collision", "seed-one")?,
+            make_record("collision", "seed-two")?,
+        ],
+        &schema,
+    )?;
+    let seed_block = prepared.into_store_block();
+    let seed_digest = seed_block.content_digest()?;
+    ledger.append(seed_block)?;
+    store.apply_schema_delta(&mut schema, seed_delta, seed_identity, seed_digest)?;
+    schema.record_query_use(&path)?;
+
     let identity = StoreBlockIdentity::new([0x6a; 16])?;
     let mut records = vec![
         make_record("collision", "cataloged")?,
         make_integer_record("collision", 42)?,
         make_record("collision", "still-cataloged")?,
     ];
-    let store = LogStore::new();
     let delta = store.stage_schema_group(&mut records, &schema)?;
     assert_eq!(
         records[0].attributes()[0].representation(),
@@ -231,13 +251,52 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         LogScan::all(ScanLimit::new(3)?),
         &schema,
         &SchemaQuery::value(
-            path,
+            path.clone(),
             OccurrenceSelector::Any,
             SchemaValue::signed_integer(42),
         ),
     )?;
     assert_eq!(result.records().len(), 1);
     assert!(result.reduced_pruning());
+
+    let snapshot = ledger.snapshot()?;
+    let replay_capacity = preparation_capacity(&authority, tenant)?;
+    let mut replayed = SchemaSessionStore::new(
+        replay_capacity,
+        tenant,
+        SchemaBudget::new(1, 8_192, 8_192, 96)?,
+    )?;
+    let seed = snapshot
+        .blocks()
+        .iter()
+        .find(|block| block.identity() == seed_identity)
+        .ok_or("replay seed block")?;
+    let seed_delta = replayed.replay(tenant, &snapshot, seed)?;
+    replayed.commit(seed_delta, seed.identity(), seed.content_digest()?)?;
+    let mut query_update = replayed.stage_query_update()?;
+    query_update.record_query_use(&path)?;
+    replayed.commit_query_update(query_update)?;
+    let target = snapshot
+        .blocks()
+        .iter()
+        .find(|block| block.identity() == identity)
+        .ok_or("replay target block")?;
+    let target_delta = replayed.replay(tenant, &snapshot, target)?;
+    replayed.commit(target_delta, target.identity(), target.content_digest()?)?;
+    let replayed_result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(5)?),
+        replayed.catalog(),
+        &SchemaQuery::value(
+            path,
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(42),
+        ),
+    )?;
+    assert_eq!(replayed_result.records().len(), 1);
+    assert!(replayed_result.reduced_pruning());
     Ok(())
 }
 

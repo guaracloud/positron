@@ -28,9 +28,9 @@ impl<'authority> SchemaReplayBuilder<'authority> {
         let peak = peak_resources(source_bytes)?;
         let claim = RecoveryWorkClaim::tenant(tenant, RecoveryWorkKind::Repair, peak)
             .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-        let base_bytes = match checkpoint {
-            Some(bytes) => TenantSchemaSession::checkpoint_construction_memory_bytes(bytes)?,
-            None => TenantSchemaSession::release_1_base_memory_bytes()?,
+        let (base_bytes, sidecar_bytes) = match checkpoint {
+            Some(bytes) => TenantSchemaSession::checkpoint_construction_capacity_bytes(bytes)?,
+            None => (TenantSchemaSession::release_1_base_memory_bytes()?, 0),
         };
         let base_claim = RecoveryWorkClaim::tenant(
             tenant,
@@ -41,11 +41,31 @@ impl<'authority> SchemaReplayBuilder<'authority> {
         let base_capacity = recovery
             .reserve(base_claim)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        let sidecar_capacity = if sidecar_bytes == 0 {
+            None
+        } else {
+            let sidecar_claim = RecoveryWorkClaim::tenant(
+                tenant,
+                RecoveryWorkKind::Repair,
+                active_resources(sidecar_bytes)?,
+            )
+            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+            Some(
+                recovery
+                    .reserve(sidecar_claim)
+                    .map_err(|_| SchemaSessionFailure::StateUnavailable)?,
+            )
+        };
         let recovery = recovery
             .reserve(claim)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         let session = match checkpoint {
-            Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, base_capacity)?,
+            Some(bytes) => TenantSchemaSession::from_checkpoint(
+                tenant,
+                bytes,
+                base_capacity,
+                sidecar_capacity,
+            )?,
             None => TenantSchemaSession::release_1(tenant, base_capacity)?,
         };
         let mut reachable_indexes = Vec::new();

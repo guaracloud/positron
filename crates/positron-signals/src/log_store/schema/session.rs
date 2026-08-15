@@ -51,9 +51,13 @@ impl SchemaSessionStore {
         tenant: TenantId,
         checkpoint: &[u8],
     ) -> Result<Option<(Self, Vec<super::SchemaCheckpointFrontier>)>, SchemaFailure> {
-        let memory_bytes = u64::try_from(SchemaCatalog::catalog_memory_bound(checkpoint)?)
-            .map_err(|_| SchemaFailure::LimitExceeded)?;
-        if !reservation.authorizes_tenant_schema_session(tenant, memory_bytes) {
+        let total_memory = SchemaCatalog::catalog_memory_bound(checkpoint)?;
+        let sidecar_memory = SchemaCatalog::catalog_sidecar_memory_bound(checkpoint)?;
+        let base_memory = total_memory
+            .checked_sub(sidecar_memory)
+            .ok_or(SchemaFailure::MalformedCatalog)?;
+        let base_memory = u64::try_from(base_memory).map_err(|_| SchemaFailure::LimitExceeded)?;
+        if !reservation.authorizes_tenant_schema_session(tenant, base_memory) {
             return Err(SchemaFailure::AllocationUnavailable);
         }
         let capacity_bytes = reservation
