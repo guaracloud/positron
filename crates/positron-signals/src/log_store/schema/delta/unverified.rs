@@ -8,7 +8,7 @@ use crate::log_store::schema::model::{SchemaBudget, SchemaEntry, SchemaPath};
 
 impl SchemaDelta {
     pub(super) fn path_is_unverified(&self, path: &SchemaPath) -> bool {
-        self.unverified_paths.iter().any(|known| known == path)
+        self.all_paths_unverified || self.unverified_paths.iter().any(|known| known == path)
     }
 
     pub(super) fn mark_paths_unverified(
@@ -35,7 +35,9 @@ impl SchemaDelta {
         let root = SchemaPath::root_borrowed(set.namespace(), set.key())?;
         for index in 0..set.len() {
             let value = set.occurrence(index).ok_or(SchemaFailure::InvalidValue)?;
-            self.mark_overflow_value(catalog, &root, value, meter)?;
+            if !self.mark_overflow_value(catalog, &root, value, meter)? {
+                break;
+            }
         }
         Ok(())
     }
@@ -46,14 +48,15 @@ impl SchemaDelta {
         path: &SchemaPath,
         value: &ValidatedAttributeValue,
         meter: &mut DiscoveryMeter,
-    ) -> Result<(), SchemaFailure> {
+    ) -> Result<bool, SchemaFailure> {
         self.mark_path_unverified(catalog, path)?;
         let Some(count) = value.key_value_list_len() else {
-            return Ok(());
+            return Ok(true);
         };
         for index in 0..count {
             if !meter.consume()? {
-                break;
+                self.mark_all_paths_unverified();
+                return Ok(false);
             }
             let entry = value
                 .key_value_entry(index)
@@ -61,9 +64,18 @@ impl SchemaDelta {
             let Some(child) = path.child(entry.key())? else {
                 continue;
             };
-            self.mark_overflow_value(catalog, &child, entry.value(), meter)?;
+            if !self.mark_overflow_value(catalog, &child, entry.value(), meter)? {
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn mark_all_paths_unverified(&mut self) {
+        self.all_paths_unverified = true;
+        self.index_paths = Vec::new();
+        self.physical_index_bytes = 0;
+        self.physical_memory_bytes = 0;
     }
 
     fn mark_path_unverified(
