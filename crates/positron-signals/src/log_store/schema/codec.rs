@@ -33,7 +33,23 @@ impl SchemaCatalog {
 
     /// Returns the allocation bound validated before a catalog object decode.
     pub fn catalog_memory_bound(bytes: &[u8]) -> Result<usize, SchemaFailure> {
-        Ok(preflight::catalog_prefix(bytes)?.memory_bound)
+        let prefix = preflight::catalog_prefix(bytes)?;
+        let frontier_count = super::checkpoint::preflight(
+            bytes
+                .get(prefix.offset..)
+                .ok_or(SchemaFailure::MalformedCatalog)?,
+        )?;
+        prefix
+            .memory_bound
+            .checked_add(
+                frontier_count
+                    .checked_mul(std::mem::size_of::<
+                        super::checkpoint::SchemaCheckpointFrontier,
+                    >())
+                    .ok_or(SchemaFailure::MalformedCatalog)?,
+            )
+            .filter(|memory| *memory <= prefix.budget.max_memory_bytes())
+            .ok_or(SchemaFailure::MalformedCatalog)
     }
 
     /// Encodes this immutable tenant schema representation for Catalog publication.
@@ -146,6 +162,12 @@ fn decode_checkpoint(
         catalog.entries.push(entry);
     }
     let (block_indexes, physical_bytes, physical_memory) = index::decode(&mut input, budget)?;
+    if block_indexes
+        .iter()
+        .any(|index| !index.semantically_valid(&catalog.entries))
+    {
+        return Err(SchemaFailure::MalformedCatalog);
+    }
     catalog.block_indexes = block_indexes;
     catalog.persistent_bytes = catalog
         .persistent_bytes

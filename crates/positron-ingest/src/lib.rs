@@ -28,7 +28,7 @@ pub use positron_policy::{
     PolicyAttributePath, PolicyCompileFailure, PolicyEvaluation, PolicyEvaluationFailure,
     PolicyPredicate, PolicyReceiver, PolicyRule, PolicyTarget,
 };
-pub use positron_signals::SchemaBudget;
+pub use positron_signals::{SchemaBudget, SchemaDiscovery, SchemaDiscoveryRequest};
 pub use request_outcome::{AdmissionGroupOutcome, IngestRequestOutcome};
 pub use schema_catalog::{SchemaCatalogLoadFailure, load_schema_checkpoint};
 pub use schema_replay::SchemaReplayBuilder;

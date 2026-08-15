@@ -1,4 +1,4 @@
-use positron_domain::identity::TenantId;
+use crate::TenantSchemaRegistry;
 use positron_domain::routing::VirtualShardId;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::StoreBlockIdentity;
@@ -8,11 +8,14 @@ use positron_policy::{
     PolicyReceiver,
 };
 use positron_signals::SchemaFailure;
-use positron_signals::{LogRecord, LogStore, SchemaBudget, SchemaDelta, TenantSchemaState};
+use positron_signals::{
+    LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaDelta, SchemaMutationPermit,
+    TenantSchemaState,
+};
 
 use super::{
-    IngestFailureCode, IngestOutcome, SchemaSessionFailure, TenantSchemaSession,
-    map_schema_session_failure, rollback_schema,
+    IngestFailureCode, IngestOutcome, SchemaSessionFailure, map_schema_session_failure,
+    rollback_schema,
 };
 
 #[test]
@@ -83,9 +86,13 @@ fn schema_failures_keep_their_closed_ingest_outcomes() {
 
 #[test]
 fn rollback_refuses_a_delta_without_the_matching_inflight_identity() {
-    let tenant = TenantId::from_bytes([0x41; 16]).expect("tenant");
-    let delta = staged_delta(tenant);
-    let session = TenantSchemaSession::release_1(tenant).expect("session");
+    let fixture = crate::tests::support::fixture().expect("fixture");
+    let tenant = fixture.tenant;
+    let delta = staged_delta(&fixture);
+    let session = TenantSchemaRegistry::new(1)
+        .expect("registry")
+        .session(tenant, fixture.authority.governor())
+        .expect("session");
 
     assert_eq!(
         rollback_schema(
@@ -142,12 +149,15 @@ fn failed_retention_still_resolves_the_durable_schema_lifecycle() {
     else {
         panic!("growth must fail");
     };
-    let session = TenantSchemaSession::release_1(fixture.tenant).expect("session");
+    let session = TenantSchemaRegistry::new(1)
+        .expect("registry")
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("session");
     let outcome = super::super::resolve_after_retention_failure(
         &session,
         StoreBlockIdentity::new([0x62; 16]).expect("identity"),
         VirtualShardId::new(1).expect("shard"),
-        staged_delta(fixture.tenant),
+        staged_delta(&fixture),
         9_000_000,
         [0x63; 32],
         failure,
@@ -158,7 +168,8 @@ fn failed_retention_still_resolves_the_durable_schema_lifecycle() {
     );
 }
 
-fn staged_delta(tenant: TenantId) -> SchemaDelta {
+fn staged_delta(fixture: &crate::tests::support::Fixture) -> SchemaDelta {
+    let tenant = fixture.tenant;
     let policy = IngestPolicy::preserving(1).expect("policy");
     let candidate = NativeLogCandidate::new(
         None,
@@ -180,9 +191,25 @@ fn staged_delta(tenant: TenantId) -> SchemaDelta {
     let mut records = vec![
         LogRecord::checked_evaluated(LogStore::value_limit_profile(), *evaluated).expect("record"),
     ];
-    TenantSchemaState::new(tenant, SchemaBudget::release_1().expect("budget"))
+    let budget = SchemaBudget::release_1().expect("budget");
+    let bytes = u64::try_from(SchemaCatalog::base_memory_bound(budget).expect("bound"))
+        .expect("bounded memory");
+    let capacity = fixture
+        .authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                tenant,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes).expect("amounts"),
+            )
+            .expect("claim"),
+        )
+        .expect("capacity");
+    let permit = SchemaMutationPermit::for_new_catalog(&capacity, tenant, budget).expect("permit");
+    TenantSchemaState::new(&permit, tenant, budget)
         .expect("catalog")
-        .stage_group(&mut records)
+        .stage_group(&permit, &mut records)
         .expect("delta")
 }
 

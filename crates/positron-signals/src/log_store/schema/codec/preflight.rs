@@ -7,6 +7,7 @@ use crate::log_store::schema::model::{
 pub(super) struct CatalogPrefix {
     pub(super) offset: usize,
     pub(super) memory_bound: usize,
+    pub(super) budget: SchemaBudget,
 }
 
 pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailure> {
@@ -108,14 +109,15 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailur
             1 => true,
             _ => return Err(SchemaFailure::MalformedCatalog),
         };
-        let expected_index = if has_scalar {
+        let promoted_index = if has_scalar {
             // The preflight bound above limits variants to the closed kind set.
             2 + variants
         } else {
             0
         };
         let entry_index = input.usize()?;
-        if promoted != (expected_index > 0) || entry_index != expected_index {
+        let expected_index = if promoted { promoted_index } else { 0 };
+        if entry_index != expected_index || (promoted && !has_scalar) {
             return Err(SchemaFailure::MalformedCatalog);
         }
         index_bytes = index_bytes
@@ -123,14 +125,19 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailur
             .filter(|value| *value <= budget.max_index_bytes())
             .ok_or(SchemaFailure::MalformedCatalog)?;
     }
-    let physical_bytes = super::index::preflight(&mut input, budget)?;
+    let physical = super::index::preflight(&mut input, budget)?;
+    memory = memory
+        .checked_add(physical.memory_bound)
+        .filter(|value| *value <= budget.max_memory_bytes())
+        .ok_or(SchemaFailure::MalformedCatalog)?;
     index_bytes = index_bytes
-        .checked_add(physical_bytes)
+        .checked_add(physical.encoded_bytes)
         .filter(|value| *value <= budget.max_index_bytes())
         .ok_or(SchemaFailure::MalformedCatalog)?;
     let _ = index_bytes;
     Ok(CatalogPrefix {
         offset: bytes.len().saturating_sub(input.remaining_len()),
         memory_bound: memory,
+        budget,
     })
 }

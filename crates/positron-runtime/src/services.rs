@@ -20,11 +20,13 @@ mod failure;
 mod ingest;
 mod otlp;
 mod policy;
+mod schema_admin;
 mod schema_bootstrap;
 mod schema_maintenance;
 
 pub use failure::ServiceFailure;
 use failure::{map_admission_group_plan_failure, map_receive_failure};
+pub use schema_admin::{SchemaDiscoveryCursor, SchemaDiscoveryOperation};
 
 #[cfg(test)]
 mod tests;

@@ -1,9 +1,11 @@
 use positron_domain::identity::TenantId;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
-use positron_kernel::ResourceDimension;
+use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 use positron_policy::IngestPolicy;
 use positron_policy::{NativeLogAttribute, NativeLogCandidate, PolicyEvaluation, PolicyReceiver};
-use positron_signals::{LogRecord, LogStore, SchemaBudget};
+use positron_signals::{
+    LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaMutationPermit, TenantSchemaState,
+};
 
 use super::{
     SchemaAdmissionEstimate, group_work_amounts, schema_admission_estimate,
@@ -126,12 +128,28 @@ fn valid_loki_stream_attribute_fits_the_conservative_schema_estimate() {
         LogRecord::checked_evaluated(LogStore::value_limit_profile(), *evaluated)
             .expect("valid record"),
     ];
-    let catalog = positron_signals::TenantSchemaState::new(
-        TenantId::from_bytes([0xb1; 16]).expect("tenant"),
-        SchemaBudget::release_1().expect("budget"),
-    )
-    .expect("catalog");
-    let delta = catalog.stage_group(&mut records).expect("schema stage");
+    let tenant = TenantId::from_bytes([0xb1; 16]).expect("tenant");
+    let fixture = crate::tests::support::fixture_for_tenant(tenant).expect("fixture");
+    let budget = SchemaBudget::release_1().expect("budget");
+    let base =
+        u64::try_from(SchemaCatalog::base_memory_bound(budget).expect("base")).expect("bounded");
+    let capacity = fixture
+        .authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                tenant,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, base).expect("amounts"),
+            )
+            .expect("claim"),
+        )
+        .expect("capacity");
+    let permit = SchemaMutationPermit::for_new_catalog(&capacity, tenant, budget).expect("permit");
+    let catalog = TenantSchemaState::new(&permit, tenant, budget).expect("catalog");
+    let delta = catalog
+        .stage_group(&permit, &mut records)
+        .expect("schema stage");
     assert!(
         u64::try_from(delta.staged_memory_bytes()).expect("staged bytes")
             <= estimate.staging_memory_bytes(),

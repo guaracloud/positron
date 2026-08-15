@@ -244,6 +244,11 @@ fn physical_index_decoder_rejects_noncanonical_or_unverifiable_entries()
         "indexed",
         CandidateAttributeValue::string("value".to_owned()),
     )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&SchemaPath::root(
+        AttributeNamespace::Record,
+        "indexed".to_owned(),
+    )?)?;
     let mut delta = super::super::SchemaDelta::empty(tenant, true);
     catalog.stage_record(
         &[attribute],

@@ -162,6 +162,27 @@ fn committed_ambiguity_reconciles_from_v2_and_shrinks_to_exact_retained_charge()
         staged_bytes
     );
 
+    let foreign = crate::tests::support::fixture_for_tenant(fixture.tenant).expect("foreign");
+    let mut refused_records = records();
+    assert!(matches!(
+        session.stage_group(
+            fixture.tenant,
+            shard,
+            StoreBlockIdentity::new([0xda; 16]).expect("identity"),
+            &ledger.snapshot().expect("committed snapshot"),
+            &mut refused_records,
+            foreign.authority.governor(),
+        ),
+        Err(SchemaSessionFailure::StateUnavailable)
+    ));
+    assert_eq!(
+        session
+            .checkpoint()
+            .expect("pending retained")
+            .pending_bytes(),
+        staged_bytes
+    );
+
     let next_identity = StoreBlockIdentity::new([0xd6; 16]).expect("identity");
     let mut next_records = records();
     let next = session

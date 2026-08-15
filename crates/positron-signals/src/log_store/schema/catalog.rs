@@ -115,10 +115,23 @@ impl SchemaCatalog {
             .ok()
             .and_then(|position| self.block_indexes.get(position))
             .filter(|index| index.digest == digest)
+            .filter(|index| index.semantically_valid(&self.entries))
             .and_then(|index| index.covers_kind(path, kind))
     }
 
-    fn entry_index(&self, path: &SchemaPath) -> Result<usize, usize> {
+    pub(crate) fn has_verified_block(
+        &self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> bool {
+        self.block_indexes
+            .binary_search_by_key(&identity, |index| index.identity)
+            .ok()
+            .and_then(|position| self.block_indexes.get(position))
+            .is_some_and(|index| index.digest == digest && index.semantically_valid(&self.entries))
+    }
+
+    pub(crate) fn entry_index(&self, path: &SchemaPath) -> Result<usize, usize> {
         self.entries.binary_search_by(|entry| entry.path.cmp(path))
     }
 

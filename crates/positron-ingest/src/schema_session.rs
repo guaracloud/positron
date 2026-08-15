@@ -7,10 +7,11 @@ use positron_kernel::{
 };
 use positron_signals::{
     LogRecord, SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta, SchemaFailure,
-    TenantSchemaState,
+    SchemaMutationPermit, TenantSchemaState,
 };
 
 mod checkpoint;
+mod inspection;
 mod recovery;
 mod registry;
 pub use checkpoint::TenantSchemaCheckpoint;
@@ -27,6 +28,7 @@ pub struct TenantSchemaSession {
 pub(super) struct SessionState {
     pub(super) tenant: TenantId,
     pub(super) catalog: TenantSchemaState,
+    pub(super) permit: SchemaMutationPermit,
     pub(super) frontiers: Vec<SchemaCheckpointFrontier>,
     pub(super) retained_capacity: Vec<TransferredResourceReservation>,
     pub(super) base_capacity: Option<TransferredResourceReservation>,
@@ -78,9 +80,12 @@ pub(crate) enum DurableSchemaOutcome {
 }
 
 impl TenantSchemaSession {
-    pub(crate) fn release_1(tenant: TenantId) -> Result<Self, SchemaSessionFailure> {
+    pub(crate) fn release_1(
+        tenant: TenantId,
+        permit: SchemaMutationPermit,
+    ) -> Result<Self, SchemaSessionFailure> {
         let budget = SchemaBudget::release_1().map_err(SchemaSessionFailure::Schema)?;
-        Self::with_budget(tenant, budget)
+        Self::with_budget(tenant, budget, permit)
     }
 
     pub(crate) fn release_1_base_memory_bytes() -> Result<u64, SchemaSessionFailure> {
@@ -107,9 +112,37 @@ impl TenantSchemaSession {
         u64::try_from(bytes).map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
     }
 
-    fn with_budget(tenant: TenantId, budget: SchemaBudget) -> Result<Self, SchemaSessionFailure> {
+    fn checkpoint_construction_memory_bytes(bytes: &[u8]) -> Result<u64, SchemaSessionFailure> {
         let catalog =
-            TenantSchemaState::new(tenant, budget).map_err(SchemaSessionFailure::Schema)?;
+            SchemaCatalog::catalog_memory_bound(bytes).map_err(SchemaSessionFailure::Schema)?;
+        let structural = MAX_REPLAY_SHARDS
+            .checked_mul(std::mem::size_of::<SchemaCheckpointFrontier>())
+            .and_then(|value| {
+                value.checked_add(
+                    SchemaBudget::system_max_entries()
+                        .checked_mul(std::mem::size_of::<TransferredResourceReservation>())?,
+                )
+            })
+            .and_then(|value| value.checked_add(std::mem::size_of::<SessionState>()))
+            .and_then(|value| {
+                value.checked_add(std::mem::size_of::<(TenantId, TenantSchemaSession)>())
+            })
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        u64::try_from(
+            catalog
+                .checked_add(structural)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+        )
+        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)
+    }
+
+    fn with_budget(
+        tenant: TenantId,
+        budget: SchemaBudget,
+        permit: SchemaMutationPermit,
+    ) -> Result<Self, SchemaSessionFailure> {
+        let catalog = TenantSchemaState::new(&permit, tenant, budget)
+            .map_err(SchemaSessionFailure::Schema)?;
         let mut frontiers = Vec::new();
         frontiers
             .try_reserve_exact(MAX_REPLAY_SHARDS)
@@ -122,6 +155,7 @@ impl TenantSchemaSession {
             state: Arc::new(Mutex::new(SessionState {
                 tenant,
                 catalog,
+                permit,
                 frontiers,
                 retained_capacity,
                 base_capacity: None,
@@ -205,7 +239,7 @@ impl TenantSchemaSession {
         ensure_frontier_slot(&state, shard)?;
         let delta = state
             .catalog
-            .stage_group(records)
+            .stage_group(&state.permit, records)
             .map_err(|failure| match failure.code() {
                 positron_signals::LogStoreFailureCode::InvalidInput
                 | positron_signals::LogStoreFailureCode::MalformedBlock
@@ -242,25 +276,50 @@ impl TenantSchemaSession {
         if state.in_flight != Some(identity) {
             return Err(SchemaSessionFailure::InFlight);
         }
-        state.in_flight = None;
         match outcome {
             DurableSchemaOutcome::Committed { position, digest } => {
-                state
-                    .catalog
-                    .commit(staged, identity, digest)
-                    .map_err(|_| SchemaSessionFailure::Schema(SchemaFailure::InvalidValue))?;
-                set_frontier(&mut state, shard, position, identity, digest)?;
-                if let Some(capacity) = capacity {
-                    state.retained_capacity.push(capacity);
-                }
-                state.retained_charge_bytes = state
+                state.pending = Some(PendingStage {
+                    identity,
+                    shard,
+                    delta: staged,
+                    capacity,
+                    capacity_bytes,
+                    digest,
+                });
+                state.in_flight = None;
+                ensure_frontier_slot(&state, shard)?;
+                let next_retained = state
                     .retained_charge_bytes
                     .checked_add(capacity_bytes)
                     .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-                state.pending = None;
+                let commit_delta = state
+                    .pending
+                    .as_ref()
+                    .ok_or(SchemaSessionFailure::StateUnavailable)?
+                    .delta
+                    .try_clone()
+                    .map_err(SchemaSessionFailure::Schema)?;
+                let permit = state.permit;
+                state
+                    .catalog
+                    .commit(&permit, commit_delta, identity, digest)
+                    .map_err(|_| SchemaSessionFailure::Schema(SchemaFailure::InvalidValue))?;
+                set_frontier(&mut state, shard, position, identity, digest)?;
+                let completed = state
+                    .pending
+                    .take()
+                    .ok_or(SchemaSessionFailure::StateUnavailable)?;
+                if let Some(capacity) = completed.capacity {
+                    state.retained_capacity.push(capacity);
+                }
+                state.retained_charge_bytes = next_retained;
             },
-            DurableSchemaOutcome::DefiniteFailure => drop(capacity),
+            DurableSchemaOutcome::DefiniteFailure => {
+                state.in_flight = None;
+                drop(capacity);
+            },
             DurableSchemaOutcome::Ambiguous { digest } => {
+                state.in_flight = None;
                 state.pending = Some(PendingStage {
                     identity,
                     shard,

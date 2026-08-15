@@ -7,6 +7,7 @@ mod failure;
 mod index;
 mod model;
 mod observation;
+mod promotion;
 mod query;
 mod representation;
 mod session;
@@ -23,7 +24,7 @@ pub use model::{SchemaBudget, SchemaEntry, SchemaPath};
 pub use observation::SchemaObservation;
 pub use query::{OccurrenceSelector, SchemaQuery, SchemaQueryResult, SchemaValue};
 pub use representation::SchemaRepresentation;
-pub use session::TenantSchemaState;
+pub use session::{SchemaMutationPermit, TenantSchemaState};
 
 #[cfg(test)]
 mod tests;

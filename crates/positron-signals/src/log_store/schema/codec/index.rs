@@ -29,12 +29,20 @@ pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(),
     Ok(())
 }
 
+pub(super) struct IndexPreflight {
+    pub(super) encoded_bytes: usize,
+    pub(super) memory_bound: usize,
+}
+
 pub(super) fn preflight(
     input: &mut Input<'_>,
     budget: SchemaBudget,
-) -> Result<usize, SchemaFailure> {
+) -> Result<IndexPreflight, SchemaFailure> {
     if !input.starts_with(INDEX_MAGIC) {
-        return Ok(0);
+        return Ok(IndexPreflight {
+            encoded_bytes: 0,
+            memory_bound: 0,
+        });
     }
     let before = input.remaining_len();
     input.take(INDEX_MAGIC.len())?;
@@ -43,6 +51,9 @@ pub(super) fn preflight(
         return Err(SchemaFailure::MalformedCatalog);
     }
     let mut previous_identity = None;
+    let mut memory = count
+        .checked_mul(SchemaBudget::block_index_memory_bytes())
+        .ok_or(SchemaFailure::MalformedCatalog)?;
     for _ in 0..count {
         let identity: [u8; 16] = input.array()?;
         let digest: [u8; 32] = input.array()?;
@@ -66,12 +77,16 @@ pub(super) fn preflight(
             if segments == 0 || segments > SchemaPath::system_max_segments() {
                 return Err(SchemaFailure::MalformedCatalog);
             }
+            let mut path_bytes = 0_usize;
             for _ in 0..segments {
                 let length = input.usize()?;
                 let segment = input.take(length)?;
                 if segment.is_empty() || std::str::from_utf8(segment).is_err() {
                     return Err(SchemaFailure::MalformedCatalog);
                 }
+                path_bytes = path_bytes
+                    .checked_add(length)
+                    .ok_or(SchemaFailure::MalformedCatalog)?;
             }
             if input.u8()? == 0 {
                 return Err(SchemaFailure::MalformedCatalog);
@@ -87,13 +102,24 @@ pub(super) fn preflight(
                 return Err(SchemaFailure::MalformedCatalog);
             }
             previous_path = Some(current);
+            memory = memory
+                .checked_add(
+                    SchemaBudget::index_path_memory_bytes(path_bytes, segments)
+                        .ok_or(SchemaFailure::MalformedCatalog)?,
+                )
+                .filter(|bytes| *bytes <= budget.max_memory_bytes())
+                .ok_or(SchemaFailure::MalformedCatalog)?;
         }
     }
-    before
+    let encoded_bytes = before
         .checked_sub(input.remaining_len())
         .filter(|bytes| *bytes >= INDEX_HEADER_BYTES + BLOCK_INDEX_HEADER_BYTES)
         .filter(|bytes| *bytes <= budget.max_index_bytes())
-        .ok_or(SchemaFailure::MalformedCatalog)
+        .ok_or(SchemaFailure::MalformedCatalog)?;
+    Ok(IndexPreflight {
+        encoded_bytes,
+        memory_bound: memory,
+    })
 }
 
 pub(super) fn decode(

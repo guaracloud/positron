@@ -167,7 +167,7 @@ fn every_native_query_value_is_typed_and_nested_paths_are_explicit() -> Result<(
     assert_eq!(nested_query.selector(), OccurrenceSelector::All);
     let nested_result = catalog.query(&observation, &nested_query);
     assert!(nested_result.is_match());
-    assert!(!nested_result.reduced_pruning());
+    assert!(nested_result.reduced_pruning());
 
     assert!(
         !catalog

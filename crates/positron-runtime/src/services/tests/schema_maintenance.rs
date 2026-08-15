@@ -18,6 +18,8 @@ use prost::Message;
 use super::super::{ServiceFailure, ServiceHandle, schema_maintenance};
 use crate::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
+type InitializedCredentials = (Arc<crate::InitializedInstance>, String, String, String);
+
 #[test]
 fn startup_rebuild_publishes_before_service_and_preserves_unrelated_objects()
 -> Result<(), Box<dyn Error>> {
@@ -346,6 +348,11 @@ impl Fixture {
     pub(super) fn initialized(
         &self,
     ) -> Result<(Arc<crate::InitializedInstance>, String, String), Box<dyn Error>> {
+        let (initialized, ingest, query, _) = self.initialized_with_admin()?;
+        Ok((initialized, ingest, query))
+    }
+
+    pub(super) fn initialized_with_admin(&self) -> Result<InitializedCredentials, Box<dyn Error>> {
         let paths = BootstrapPaths::new(
             &self.root.join("data"),
             &self.root.join("secrets"),
@@ -358,7 +365,13 @@ impl Fixture {
         let claim = InstanceBootstrap::claim(&paths)?;
         let ingest = claim.ingest_secret().ok_or("ingest secret")?.to_owned();
         let query = claim.query_secret().ok_or("query secret")?.to_owned();
-        Ok((Arc::new(InstanceBootstrap::reopen(&paths)?), ingest, query))
+        let administrator = claim.secret().to_owned();
+        Ok((
+            Arc::new(InstanceBootstrap::reopen(&paths)?),
+            ingest,
+            query,
+            administrator,
+        ))
     }
 }
 

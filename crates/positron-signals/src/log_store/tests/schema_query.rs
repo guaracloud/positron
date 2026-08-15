@@ -43,7 +43,21 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     )?;
     let store = LogStore::new();
     let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 256)?)?;
-    let records = vec![record("indexed", "one")?, record("overflow", "two")?];
+    let seed = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "indexed".to_owned(),
+        vec![CandidateAttributeValue::string("one".to_owned())],
+    )
+    .validate(LogStore::value_limit_profile())?;
+    schema.observe(&[seed])?;
+    schema.record_query_use(&SchemaPath::root(
+        AttributeNamespace::Record,
+        "indexed".to_owned(),
+    )?)?;
+    let records = vec![
+        record_with_occurrences("indexed", &["one", "one"])?,
+        record("overflow", "two")?,
+    ];
     let identity = StoreBlockIdentity::new([0x69; 16])?;
     let (prepared, delta) = store.prepare_with_schema_delta(
         preparation_capacity(&authority, tenant)?,
@@ -110,6 +124,19 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     )?;
     assert_eq!(replacement.records(), indexed.records());
     assert!(replacement.reduced_pruning());
+
+    let mut forged_kinds = SchemaCatalog::decode_catalog_object(&checkpoint)?;
+    forged_kinds.block_indexes[0].paths[0].kind_mask = 1 << 1;
+    let forged = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &forged_kinds,
+        &query("indexed", "one")?,
+    )?;
+    assert_eq!(forged.records(), indexed.records());
+    assert!(forged.reduced_pruning());
 
     let generic = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
     let demoted = store.scan_schema(
@@ -294,6 +321,10 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
 }
 
 fn record(key: &str, value: &str) -> Result<LogRecord, Box<dyn Error>> {
+    record_with_occurrences(key, &[value])
+}
+
+fn record_with_occurrences(key: &str, values: &[&str]) -> Result<LogRecord, Box<dyn Error>> {
     Ok(LogRecord::checked_receiver_candidate(
         LogStore::value_limit_profile(),
         None,
@@ -302,7 +333,10 @@ fn record(key: &str, value: &str) -> Result<LogRecord, Box<dyn Error>> {
         vec![AttributeOccurrenceSetCandidate::new(
             AttributeNamespace::Record,
             key.to_owned(),
-            vec![CandidateAttributeValue::string(value.to_owned())],
+            values
+                .iter()
+                .map(|value| CandidateAttributeValue::string((*value).to_owned()))
+                .collect(),
         )],
         PolicyProvenance::new(1, [0x71; 32], vec![])?,
     )?)

@@ -16,6 +16,13 @@ pub(crate) struct SchemaIndexPath {
 }
 
 impl SchemaIndexPath {
+    pub(crate) fn try_clone(&self) -> Result<Self, SchemaFailure> {
+        Ok(Self {
+            path: self.path.try_clone()?,
+            kind_mask: self.kind_mask,
+        })
+    }
+
     pub(crate) fn from_variants(
         path: &SchemaPath,
         variants: &[AttributeValueKind],
@@ -58,6 +65,23 @@ pub(crate) struct SchemaBlockIndex {
 }
 
 impl SchemaBlockIndex {
+    pub(crate) fn one(
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        path: SchemaIndexPath,
+    ) -> Result<Self, SchemaFailure> {
+        let mut paths = Vec::new();
+        paths
+            .try_reserve_exact(1)
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        paths.push(path);
+        Ok(Self {
+            identity,
+            digest,
+            paths,
+        })
+    }
+
     pub(crate) fn covers_kind(&self, path: &SchemaPath, kind: AttributeValueKind) -> Option<bool> {
         self.paths
             .binary_search_by(|known| known.wire_cmp_path(path))
@@ -65,6 +89,30 @@ impl SchemaBlockIndex {
             .and_then(|index| self.paths.get(index))
             .map(|known| known.kind_mask & kind_bit(kind) != 0)
     }
+
+    pub(crate) fn semantically_valid(&self, entries: &[SchemaEntry]) -> bool {
+        self.semantically_valid_with_delta(entries, &[])
+    }
+
+    pub(crate) fn semantically_valid_with_delta(
+        &self,
+        entries: &[SchemaEntry],
+        delta: &[SchemaEntry],
+    ) -> bool {
+        self.paths.iter().all(|indexed| {
+            entry_for_path(delta, &indexed.path)
+                .or_else(|| entry_for_path(entries, &indexed.path))
+                .filter(|entry| entry.promoted)
+                .is_some_and(|entry| indexed.kind_mask == scalar_kind_mask(&entry.variants))
+        })
+    }
+}
+
+fn entry_for_path<'a>(entries: &'a [SchemaEntry], path: &SchemaPath) -> Option<&'a SchemaEntry> {
+    entries
+        .binary_search_by(|entry| entry.path.cmp(path))
+        .ok()
+        .and_then(|position| entries.get(position))
 }
 
 fn path_wire_cmp(left: &SchemaPath, right: &SchemaPath) -> Ordering {
@@ -97,6 +145,18 @@ const fn namespace_tag(path: &SchemaPath) -> u8 {
 
 pub(crate) const fn kind_bit(kind: AttributeValueKind) -> u8 {
     1_u8 << (kind as u8)
+}
+
+pub(crate) fn scalar_kind_mask(kinds: &[AttributeValueKind]) -> u8 {
+    kinds
+        .iter()
+        .filter(|kind| {
+            !matches!(
+                kind,
+                AttributeValueKind::Array | AttributeValueKind::KeyValueList
+            )
+        })
+        .fold(0_u8, |mask, kind| mask | kind_bit(*kind))
 }
 
 impl SchemaBudget {

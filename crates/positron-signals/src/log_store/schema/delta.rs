@@ -10,6 +10,7 @@ use super::representation::SchemaRepresentation;
 use crate::log_store::{AttributeRepresentation, StoredLogAttribute};
 
 mod accounting;
+mod apply;
 mod indexing;
 use accounting::{attribute_bytes, projected_cost, root_fits, staged_memory_bytes};
 pub(super) use indexing::additional_physical_cost;
@@ -71,6 +72,37 @@ impl SchemaDelta {
         self.physical_memory_bytes
     }
 
+    pub fn try_clone(&self) -> Result<Self, SchemaFailure> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for entry in &self.entries {
+            entries.push(entry.try_clone()?);
+        }
+        let mut index_paths = Vec::new();
+        index_paths
+            .try_reserve_exact(self.index_paths.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for path in &self.index_paths {
+            index_paths.push(path.try_clone()?);
+        }
+        Ok(Self {
+            tenant: self.tenant,
+            entries,
+            overflow_records: self.overflow_records,
+            overflow_bytes: self.overflow_bytes,
+            retained_memory_bytes: self.retained_memory_bytes,
+            staged_memory_bytes: self.staged_memory_bytes,
+            persistent_bytes: self.persistent_bytes,
+            index_bytes: self.index_bytes,
+            index_paths,
+            physical_index_bytes: self.physical_index_bytes,
+            physical_memory_bytes: self.physical_memory_bytes,
+            build_physical_index: self.build_physical_index,
+        })
+    }
+
     pub(crate) fn into_block_index(
         self,
         identity: positron_kernel::StoreBlockIdentity,
@@ -89,6 +121,26 @@ impl SchemaDelta {
                 paths,
             }),
         )
+    }
+
+    pub(super) fn into_query_index(
+        self,
+        path: &super::SchemaPath,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> Result<Option<SchemaBlockIndex>, SchemaFailure> {
+        let Ok(position) = self
+            .index_paths
+            .binary_search_by(|known| known.wire_cmp_path(path))
+        else {
+            return Ok(None);
+        };
+        let indexed = self
+            .index_paths
+            .into_iter()
+            .nth(position)
+            .ok_or(SchemaFailure::InvalidValue)?;
+        SchemaBlockIndex::one(identity, digest, indexed).map(Some)
     }
 }
 
@@ -205,77 +257,6 @@ impl SchemaCatalog {
         }
         Ok(SchemaObservation::new(observed, record_overflow_bytes))
     }
-
-    pub(crate) fn apply_delta(
-        &mut self,
-        delta: SchemaDelta,
-        block_index: Option<SchemaBlockIndex>,
-    ) -> Result<(), SchemaFailure> {
-        if delta.tenant != self.tenant {
-            return Err(SchemaFailure::InvalidValue);
-        }
-        let insertion = if let Some(index) = block_index.as_ref() {
-            match self
-                .block_indexes
-                .binary_search_by_key(&index.identity, |known| known.identity)
-            {
-                Ok(position) => {
-                    return if self.block_indexes.get(position) == Some(index) {
-                        Ok(())
-                    } else {
-                        Err(SchemaFailure::InvalidValue)
-                    };
-                },
-                Err(position) => {
-                    self.block_indexes
-                        .try_reserve_exact(1)
-                        .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-                    Some(position)
-                },
-            }
-        } else {
-            None
-        };
-        for staged in delta.entries {
-            match self
-                .entries
-                .binary_search_by(|entry| entry.path.cmp(&staged.path))
-            {
-                Ok(index) => {
-                    let entry = self
-                        .entries
-                        .get_mut(index)
-                        .ok_or(SchemaFailure::InvalidValue)?;
-                    *entry = staged;
-                },
-                Err(index) => {
-                    if self.entries.len() == self.entries.capacity() {
-                        return Err(SchemaFailure::AllocationUnavailable);
-                    }
-                    self.entries.insert(index, staged);
-                },
-            }
-        }
-        self.memory_bytes = self
-            .memory_bytes
-            .checked_add(delta.retained_memory_bytes)
-            .ok_or(SchemaFailure::LimitExceeded)?;
-        self.persistent_bytes = self
-            .persistent_bytes
-            .checked_add(delta.persistent_bytes)
-            .ok_or(SchemaFailure::LimitExceeded)?;
-        self.index_bytes = self
-            .index_bytes
-            .checked_add(delta.index_bytes)
-            .ok_or(SchemaFailure::LimitExceeded)?;
-        self.overflow_records = self.overflow_records.saturating_add(delta.overflow_records);
-        self.overflow_bytes = self.overflow_bytes.saturating_add(delta.overflow_bytes);
-        if let Some(index) = block_index {
-            self.block_indexes
-                .insert(insertion.ok_or(SchemaFailure::InvalidValue)?, index);
-        }
-        Ok(())
-    }
 }
 
 fn stage_value(
@@ -315,17 +296,18 @@ fn stage_value(
         return Ok(true);
     }
     entry.observations = entry.observations.saturating_add(1);
-    if entry.variants.contains(&kind) {
-        return Ok(true);
+    if !entry.variants.contains(&kind) {
+        entry.conflicts = entry.conflicts.saturating_add(1);
+        let position = entry
+            .variants
+            .binary_search(&kind)
+            .unwrap_or_else(|index| index);
+        entry.variants.insert(position, kind);
     }
-    entry.conflicts = entry.conflicts.saturating_add(1);
-    let position = entry
-        .variants
-        .binary_search(&kind)
-        .unwrap_or_else(|index| index);
-    entry.variants.insert(position, kind);
-    entry.index_bytes = promoted_index_bytes(&entry.variants);
-    entry.promoted = entry.index_bytes > 0;
+    if entry.observations >= 2 || entry.query_uses > 0 {
+        entry.index_bytes = promoted_index_bytes(&entry.variants);
+        entry.promoted = entry.index_bytes > 0;
+    }
     Ok(true)
 }
 

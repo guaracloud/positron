@@ -9,6 +9,13 @@ fn scalar_discovery_consumes_exact_dictionary_index_bytes() -> Result<(), Box<dy
         CandidateAttributeValue::signed_integer(7),
     )?;
     let observation = catalog.observe(std::slice::from_ref(&observed))?;
+    assert!(
+        !catalog
+            .entry(&path(AttributeNamespace::Record, "scalar"))
+            .ok_or("entry")?
+            .promoted()
+    );
+    catalog.observe(std::slice::from_ref(&observed))?;
     let entry = catalog
         .entry(&path(AttributeNamespace::Record, "scalar"))
         .ok_or("entry missing")?;
@@ -62,9 +69,15 @@ fn root_overflows_atomically_when_its_dictionary_index_does_not_fit() -> Result<
         "scalar",
         CandidateAttributeValue::string("still preserved".to_owned()),
     )?;
+    let first = catalog.observe(std::slice::from_ref(&observed))?;
+    assert!(
+        first
+            .attributes()
+            .all(|(_, representation)| representation.is_cataloged())
+    );
     let observation = catalog.observe(std::slice::from_ref(&observed))?;
 
-    assert_eq!(catalog.entry_count(), 0);
+    assert_eq!(catalog.entry_count(), 1);
     assert_eq!(catalog.index_bytes(), 0);
     assert_eq!(observation.overflow_records(), 1);
     assert_eq!(

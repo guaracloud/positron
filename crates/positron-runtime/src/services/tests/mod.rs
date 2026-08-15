@@ -2,6 +2,7 @@ use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
 
 use super::{ServiceFailure, map_admission_group_plan_failure, map_receive_failure};
 
+mod schema_admin;
 mod schema_maintenance;
 mod schema_replay_integrity;
 mod schema_routes;

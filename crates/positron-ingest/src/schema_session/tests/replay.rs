@@ -8,7 +8,7 @@ use positron_kernel::{
 use positron_policy::IngestPolicy;
 use positron_signals::{SchemaCatalog, SchemaCheckpointFrontier};
 
-use super::super::{SchemaSessionFailure, TenantSchemaRegistry, TenantSchemaSession};
+use super::super::{SchemaSessionFailure, TenantSchemaRegistry};
 use crate::{IngestOutcome, LogIngest, OtlpLogsReceiver};
 
 #[test]
@@ -82,11 +82,17 @@ fn checkpoint_frontier_rejects_identity_or_digest_mismatch() {
     let canonical = schema
         .encode_checkpoint_object(&frontiers)
         .expect("checkpoint");
+    let foreign_tenant = TenantId::from_bytes([0xef; 16]).expect("foreign tenant");
+    let foreign_fixture =
+        crate::tests::support::fixture_for_tenant(foreign_tenant).expect("foreign fixture");
     assert!(matches!(
-        TenantSchemaSession::from_checkpoint(
-            TenantId::from_bytes([0xef; 16]).expect("foreign tenant"),
-            &canonical,
-        ),
+        TenantSchemaRegistry::new(1)
+            .expect("registry")
+            .session_from_checkpoint(
+                foreign_tenant,
+                &canonical,
+                foreign_fixture.authority.governor(),
+            ),
         Err(SchemaSessionFailure::TenantConflict)
     ));
     drop(live);

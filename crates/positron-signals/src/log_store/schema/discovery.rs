@@ -9,6 +9,7 @@ use positron_domain::value::AttributeValueKind;
 /// Bounded limits for one immutable schema-discovery read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchemaDiscoveryRequest {
+    path_offset: usize,
     top_paths: usize,
     sampled_paths: usize,
 }
@@ -20,9 +21,36 @@ impl SchemaDiscoveryRequest {
             return Err(SchemaFailure::LimitExceeded);
         }
         Ok(Self {
+            path_offset: 0,
             top_paths,
             sampled_paths,
         })
+    }
+
+    pub fn page(
+        path_offset: usize,
+        page_size: usize,
+        sampled_paths: usize,
+    ) -> Result<Self, SchemaFailure> {
+        if path_offset > MAX_DISCOVERY_NODES
+            || page_size > MAX_DISCOVERY_NODES
+            || sampled_paths > MAX_DISCOVERY_NODES
+            || path_offset
+                .checked_add(page_size)
+                .is_none_or(|end| end > MAX_DISCOVERY_NODES)
+        {
+            return Err(SchemaFailure::LimitExceeded);
+        }
+        Ok(Self {
+            path_offset,
+            top_paths: page_size,
+            sampled_paths,
+        })
+    }
+
+    #[must_use]
+    pub const fn path_offset(self) -> usize {
+        self.path_offset
     }
 
     #[must_use]
@@ -67,6 +95,12 @@ impl SchemaBudgetPressure {
 /// The reason a path is or is not represented by a scalar physical index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchemaPromotionReason {
+    /// Repeated committed observations justify dictionary allocation.
+    FrequentObservation,
+    /// Governed query-use evidence justifies physical pruning state.
+    QueryUse,
+    /// A scalar path has not accumulated enough bounded evidence.
+    InsufficientEvidence,
     /// The path has no scalar value variant to index.
     NoScalarVariant,
 }
@@ -75,7 +109,10 @@ pub enum SchemaPromotionReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchemaPromotionDecision {
     /// The path has an allocated scalar index of the reported size.
-    Promoted { index_bytes: usize },
+    Promoted {
+        index_bytes: usize,
+        reason: SchemaPromotionReason,
+    },
     /// The path remains generic because it has no scalar value variant.
     NotPromoted { reason: SchemaPromotionReason },
 }
@@ -137,10 +174,24 @@ impl SchemaPathSummary {
         let promotion = if entry.promoted() {
             SchemaPromotionDecision::Promoted {
                 index_bytes: entry.index_bytes(),
+                reason: if entry.query_uses() > 0 {
+                    SchemaPromotionReason::QueryUse
+                } else {
+                    SchemaPromotionReason::FrequentObservation
+                },
             }
         } else {
             SchemaPromotionDecision::NotPromoted {
-                reason: SchemaPromotionReason::NoScalarVariant,
+                reason: if entry.variants().iter().any(|kind| {
+                    !matches!(
+                        kind,
+                        AttributeValueKind::Array | AttributeValueKind::KeyValueList
+                    )
+                }) {
+                    SchemaPromotionReason::InsufficientEvidence
+                } else {
+                    SchemaPromotionReason::NoScalarVariant
+                },
             }
         };
         Ok(Self {
@@ -175,6 +226,9 @@ pub struct SchemaDiscovery {
     index: SchemaBudgetPressure,
     top_paths: Vec<SchemaPathSummary>,
     sampled_path_digests: Vec<SchemaPathDigest>,
+    snapshot_digest: [u8; 32],
+    path_offset: usize,
+    total_paths: usize,
     overflow_records: u64,
     overflow_bytes: u64,
 }
@@ -211,6 +265,21 @@ impl SchemaDiscovery {
     }
 
     #[must_use]
+    pub const fn snapshot_digest(&self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+
+    #[must_use]
+    pub const fn path_offset(&self) -> usize {
+        self.path_offset
+    }
+
+    #[must_use]
+    pub const fn total_paths(&self) -> usize {
+        self.total_paths
+    }
+
+    #[must_use]
     pub const fn overflow_records(&self) -> u64 {
         self.overflow_records
     }
@@ -239,12 +308,14 @@ impl SchemaCatalog {
                 .then_with(|| left.path().cmp(right.path()))
         });
 
-        let top_count = request.top_paths.min(ranked.len());
+        let top_count = request
+            .top_paths
+            .min(ranked.len().saturating_sub(request.path_offset));
         let mut top_paths = Vec::new();
         top_paths
             .try_reserve_exact(top_count)
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-        for entry in ranked.iter().take(top_count) {
+        for entry in ranked.iter().skip(request.path_offset).take(top_count) {
             top_paths.push(SchemaPathSummary::from_entry(entry)?);
         }
 
@@ -254,7 +325,7 @@ impl SchemaCatalog {
             .try_reserve_exact(sample_count)
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
         for entry in self.entries.iter().take(sample_count) {
-            sampled_path_digests.push(path_digest(entry.path()));
+            sampled_path_digests.push(path_digest(entry.path())?);
         }
 
         Ok(SchemaDiscovery {
@@ -270,21 +341,43 @@ impl SchemaCatalog {
             index: SchemaBudgetPressure::new(self.index_bytes, self.budget.max_index_bytes()),
             top_paths,
             sampled_path_digests,
+            snapshot_digest: catalog_digest(self)?,
+            path_offset: request.path_offset,
+            total_paths: self.entries.len(),
             overflow_records: self.overflow_records,
             overflow_bytes: self.overflow_bytes,
         })
     }
 }
 
-fn path_digest(path: &SchemaPath) -> SchemaPathDigest {
+fn path_digest(path: &SchemaPath) -> Result<SchemaPathDigest, SchemaFailure> {
     let mut hasher = Sha256::new();
     hasher.update(b"positron-schema-path-v1");
     hasher.update(path.namespace().as_str().as_bytes());
     hasher.update([0]);
     for segment in path.segments() {
-        let length = u64::try_from(segment.len()).unwrap_or(u64::MAX);
+        let length = u64::try_from(segment.len()).map_err(|_| SchemaFailure::LimitExceeded)?;
         hasher.update(length.to_be_bytes());
         hasher.update(segment.as_bytes());
     }
-    SchemaPathDigest(hasher.finalize().into())
+    Ok(SchemaPathDigest(hasher.finalize().into()))
+}
+
+fn catalog_digest(catalog: &SchemaCatalog) -> Result<[u8; 32], SchemaFailure> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"positron-schema-discovery-v1");
+    hasher.update(catalog.tenant.to_bytes());
+    for entry in &catalog.entries {
+        hasher.update(path_digest(entry.path())?.as_bytes());
+        for variant in entry.variants() {
+            hasher.update([*variant as u8]);
+        }
+        hasher.update(entry.observations().to_be_bytes());
+        hasher.update(entry.conflicts().to_be_bytes());
+        hasher.update(entry.query_uses().to_be_bytes());
+        hasher.update([u8::from(entry.promoted())]);
+    }
+    hasher.update(catalog.overflow_records.to_be_bytes());
+    hasher.update(catalog.overflow_bytes.to_be_bytes());
+    Ok(hasher.finalize().into())
 }

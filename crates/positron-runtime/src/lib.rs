@@ -26,7 +26,9 @@ pub use process::{
     HostInputs, InitializationMode, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,
     RunningProcess, ServeConfiguration, ShutdownTrigger,
 };
-pub use services::{ServiceFailure, ServiceHandle};
+pub use services::{
+    SchemaDiscoveryCursor, SchemaDiscoveryOperation, ServiceFailure, ServiceHandle,
+};
 pub use task::{
     RegisteredTask, RunningTask, TaskCancellation, TaskFailure, TaskJoinOutcome, TaskRegistrar,
     TaskRole,

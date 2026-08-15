@@ -13,6 +13,8 @@ mod bounds;
 mod checkpoint;
 mod codec;
 mod discovery;
+mod index_bounds;
+mod index_codec;
 mod overflow;
 mod promotion;
 mod query;

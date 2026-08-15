@@ -1,9 +1,11 @@
 use positron_domain::identity::TenantId;
+use positron_kernel::StoreBlockIdentity;
 use positron_kernel::{
     LedgerSnapshot, RecoveryAuthority, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
     ResourceReservation,
 };
 use positron_signals::SchemaBudget;
+use positron_signals::SchemaMutationPermit;
 
 use crate::{SchemaSessionFailure, TenantSchemaCheckpoint, TenantSchemaSession};
 
@@ -13,6 +15,7 @@ pub struct SchemaReplayBuilder<'authority> {
     session: TenantSchemaSession,
     source_bytes: u64,
     recovery: ResourceReservation<'authority>,
+    reachable_indexes: Vec<(StoreBlockIdentity, [u8; 32])>,
 }
 
 impl<'authority> SchemaReplayBuilder<'authority> {
@@ -29,15 +32,25 @@ impl<'authority> SchemaReplayBuilder<'authority> {
         let recovery = recovery
             .reserve(claim)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        let permit = match checkpoint {
+            Some(bytes) => SchemaMutationPermit::for_checkpoint(&recovery, tenant, bytes),
+            None => SchemaMutationPermit::for_new_catalog(
+                &recovery,
+                tenant,
+                SchemaBudget::release_1().map_err(SchemaSessionFailure::Schema)?,
+            ),
+        }
+        .map_err(SchemaSessionFailure::Schema)?;
         let session = match checkpoint {
-            Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes)?,
-            None => TenantSchemaSession::release_1(tenant)?,
+            Some(bytes) => TenantSchemaSession::from_checkpoint(tenant, bytes, permit)?,
+            None => TenantSchemaSession::release_1(tenant, permit)?,
         };
         Ok(Self {
             tenant,
             session,
             source_bytes,
             recovery,
+            reachable_indexes: Vec::new(),
         })
     }
 
@@ -50,6 +63,8 @@ impl<'authority> SchemaReplayBuilder<'authority> {
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
         self.session
             .replay_snapshot_for_bootstrap(self.tenant, snapshot, &mut self.recovery)?;
+        self.session
+            .append_reachable_indexes(snapshot, &mut self.reachable_indexes)?;
         let retained = self
             .session
             .base_memory_bytes()?
@@ -62,6 +77,8 @@ impl<'authority> SchemaReplayBuilder<'authority> {
     }
 
     pub fn finish(self) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {
+        self.session
+            .retain_reachable_indexes(&self.reachable_indexes)?;
         self.session.checkpoint()
     }
 }

@@ -293,15 +293,14 @@ impl SchemaEntry {
             .try_reserve_exact(MAX_VARIANTS)
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
         variants.push(kind);
-        let promoted = scalar_kind(kind);
         Ok(Self {
             path,
             variants,
             observations: 1,
             conflicts: 0,
             query_uses: 0,
-            promoted,
-            index_bytes: if promoted { 3 } else { 0 },
+            promoted: false,
+            index_bytes: 0,
         })
     }
 
@@ -367,7 +366,7 @@ pub(crate) fn promoted_index_bytes(variants: &[AttributeValueKind]) -> usize {
     }
 }
 
-const fn scalar_kind(kind: AttributeValueKind) -> bool {
+pub(crate) const fn scalar_kind(kind: AttributeValueKind) -> bool {
     !matches!(
         kind,
         AttributeValueKind::Array | AttributeValueKind::KeyValueList

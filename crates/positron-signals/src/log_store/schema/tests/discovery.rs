@@ -51,23 +51,18 @@ fn discovery_keeps_namespaces_and_counts_typed_conflicts() -> Result<(), Box<dyn
 }
 
 #[test]
-fn tenant_state_is_the_single_bound_observation_authority() -> Result<(), Box<dyn Error>> {
-    let catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
-    let mut state = super::super::TenantSchemaState::from_catalog(catalog);
-    assert_eq!(state.tenant(), tenant());
-    assert_eq!(state.catalog().entry_count(), 0);
-
-    let observed = state.observe(&[occurrence(
+fn catalog_discovery_observes_one_tenant_bound_record() -> Result<(), Box<dyn Error>> {
+    let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 8_192, 8_192, 4_096)?)?;
+    let observed = catalog.observe(&[occurrence(
         AttributeNamespace::Record,
         "governed",
         CandidateAttributeValue::boolean(true),
     )?])?;
 
     assert_eq!(observed.overflow_records(), 0);
-    assert_eq!(state.catalog().entry_count(), 1);
+    assert_eq!(catalog.entry_count(), 1);
     assert!(
-        state
-            .catalog()
+        catalog
             .entry(&path(AttributeNamespace::Record, "governed"))
             .is_some()
     );
