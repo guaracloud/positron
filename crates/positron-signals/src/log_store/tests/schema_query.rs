@@ -179,6 +179,89 @@ fn scalar_fallback_is_scoped_to_the_non_fitting_root() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn merged_scalar_dictionary_falls_back_atomically_and_reopens() -> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let budget = SchemaBudget::new(8, 4_000_000, 1_048_576, 1_048_576)?;
+    let mut schema = SchemaCatalog::new(tenant, budget)?;
+    let store = LogStore::new();
+    let nested_path = SchemaPath::new(AttributeNamespace::Record, "payload.token".to_owned())?;
+    let kept_path = SchemaPath::root(AttributeNamespace::Record, "kept".to_owned())?;
+    let seed = [
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            vec![CandidateAttributeValue::key_value_list(vec![
+                CandidateKeyValue::new(
+                    "token".to_owned(),
+                    CandidateAttributeValue::string("seed".to_owned()),
+                ),
+            ])],
+        )
+        .validate(LogStore::value_limit_profile())?,
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "kept".to_owned(),
+            vec![CandidateAttributeValue::string("kept".to_owned())],
+        )
+        .validate(LogStore::value_limit_profile())?,
+    ];
+    schema.observe(&seed)?;
+    schema.record_query_use(&nested_path)?;
+    schema.record_query_use(&kept_path)?;
+
+    let make_nested = |offset: usize, groups: &[usize]| -> Result<LogRecord, Box<dyn Error>> {
+        let values = groups
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(group, count)| {
+                CandidateAttributeValue::key_value_list(
+                    (0..count)
+                        .map(|index| {
+                            CandidateKeyValue::new(
+                                "token".to_owned(),
+                                CandidateAttributeValue::signed_integer(
+                                    (offset * 100_000 + group * 10_000 + index) as i64,
+                                ),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        Ok(LogRecord::checked_receiver_candidate(
+            LogStore::value_limit_profile(),
+            None,
+            None,
+            Some(CandidateAttributeValue::string("body".to_owned())),
+            vec![
+                AttributeOccurrenceSetCandidate::new(
+                    AttributeNamespace::Record,
+                    "payload".to_owned(),
+                    values,
+                ),
+                AttributeOccurrenceSetCandidate::new(
+                    AttributeNamespace::Record,
+                    "kept".to_owned(),
+                    vec![CandidateAttributeValue::string("kept".to_owned())],
+                ),
+            ],
+            PolicyProvenance::new(1, [0x56; 32], vec![])?,
+        )?)
+    };
+    let mut records = vec![
+        make_nested(0, &[1_024, 1_024, 1_024, 1_023])?,
+        make_nested(1, &[2])?,
+    ];
+    let identity = StoreBlockIdentity::new([0x57; 16])?;
+    let delta = store.stage_schema_group(&mut records, &schema)?;
+    store.apply_schema_delta(&mut schema, delta, identity, [0x58; 32])?;
+    let checkpoint = schema.encode_checkpoint_object(&[])?;
+    let _reopened = SchemaCatalog::decode_checkpoint_object(&checkpoint)?.0;
+    Ok(())
+}
+
+#[test]
 fn scalar_index_prunes_an_absent_same_type_value() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

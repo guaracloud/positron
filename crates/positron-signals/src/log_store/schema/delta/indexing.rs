@@ -34,7 +34,11 @@ fn scalar_values_fit(
     root: &[SchemaEntry],
     attributes: &[AttributeOccurrenceSet],
 ) -> Result<bool, SchemaFailure> {
-    let (memory, wire) = projected_physical_cost(catalog, delta, root, attributes, true)?;
+    let (memory, wire) = match projected_physical_cost(catalog, delta, root, attributes, true) {
+        Ok(cost) => cost,
+        Err(SchemaFailure::LimitExceeded) => return Ok(false),
+        Err(failure) => return Err(failure),
+    };
     Ok(catalog
         .memory_bytes
         .checked_add(memory)
@@ -129,6 +133,9 @@ fn merge_paths(
     for value in incoming.values {
         if known.values.contains(&value) {
             continue;
+        }
+        if known.values.len() == super::super::index::MAX_INDEX_VALUES {
+            return Err(SchemaFailure::LimitExceeded);
         }
         known
             .values

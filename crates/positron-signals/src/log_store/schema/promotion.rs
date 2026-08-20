@@ -1,6 +1,8 @@
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
-use super::index::{BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, SchemaBlockIndex};
+use super::index::{
+    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, MAX_INDEX_VALUES, SchemaBlockIndex,
+};
 use super::model::{SchemaPath, promoted_index_bytes};
 
 impl SchemaCatalog {
@@ -120,15 +122,23 @@ impl SchemaCatalog {
                     .ok_or(SchemaFailure::InvalidValue)?;
                 let mut merged = current.try_clone()?;
                 merged.kind_mask |= path.kind_mask;
+                let mut values_overflowed = false;
                 for value in path.values {
                     if merged.values.contains(&value) {
                         continue;
+                    }
+                    if merged.values.len() == MAX_INDEX_VALUES {
+                        values_overflowed = true;
+                        break;
                     }
                     merged
                         .values
                         .try_reserve_exact(1)
                         .map_err(|_| SchemaFailure::AllocationUnavailable)?;
                     merged.values.push(value);
+                }
+                if values_overflowed {
+                    merged.values.clear();
                 }
                 merged.values.sort_unstable();
                 if &merged == current {
