@@ -34,6 +34,8 @@ use super::authority;
 
 const MAX_ATTRIBUTES: usize = 32;
 const MAX_PERSISTED_BLOCKS: u64 = 32;
+const FALLBACK_KEY: &str = "fuzz-fallback";
+const FALLBACK_VALUE: &str = "fallback";
 
 pub struct FuzzFixture {
     tenant: TenantId,
@@ -130,25 +132,81 @@ impl FuzzFixture {
         let Ok(catalog) = SchemaCatalog::decode_catalog_object(checkpoint.catalog_bytes()) else {
             return;
         };
+        let Some((exact_value, exact_kind)) = exact_value(data) else {
+            return;
+        };
+        let Ok(limit) = ScanLimit::new(32) else {
+            return;
+        };
         for selector in [
             OccurrenceSelector::Index(0),
             OccurrenceSelector::Index(1),
             OccurrenceSelector::Any,
             OccurrenceSelector::All,
         ] {
-            let query = SchemaQuery::value(
+            let exact_query = SchemaQuery::value(
                 path.clone(),
                 selector,
-                SchemaValue::kind(AttributeValueKind::String),
+                exact_value.clone(),
             );
-            let _ = LogStore::new().scan_schema(
+            let kind_query = SchemaQuery::value(
+                path.clone(),
+                selector,
+                SchemaValue::kind(exact_kind),
+            );
+            let Ok(exact_result) = LogStore::new().scan_schema(
                 self.authority.governor(),
                 self.tenant,
                 &snapshot,
-                LogScan::all(ScanLimit::new(32).expect("fixed valid scan limit")),
+                LogScan::all(limit),
                 &catalog,
-                &query,
+                &exact_query,
+            ) else {
+                continue;
+            };
+            let Ok(kind_result) = LogStore::new().scan_schema(
+                self.authority.governor(),
+                self.tenant,
+                &snapshot,
+                LogScan::all(limit),
+                &catalog,
+                &kind_query,
+            ) else {
+                continue;
+            };
+            assert!(
+                exact_result
+                    .records()
+                    .iter()
+                    .all(|record| kind_result.records().contains(record)),
+                "exact scalar query lost a same-kind logical result"
             );
+        }
+        let fallback_path = SchemaPath::root(AttributeNamespace::Record, FALLBACK_KEY.to_owned())
+            .ok();
+        if let Some(fallback_path) = fallback_path {
+            let fallback_query = SchemaQuery::value(
+                fallback_path,
+                OccurrenceSelector::Any,
+                SchemaValue::string(FALLBACK_VALUE),
+            );
+            let Ok(fallback_result) = LogStore::new().scan_schema(
+                self.authority.governor(),
+                self.tenant,
+                &snapshot,
+                LogScan::all(limit),
+                &catalog,
+                &fallback_query,
+            ) else {
+                return;
+            };
+            if self.blocks.get() > 0 {
+                assert_eq!(fallback_result.records().len(), self.blocks.get() as usize);
+                assert!(
+                    fallback_result.reduced_pruning(),
+                    "unpromoted fallback path must report reduced pruning"
+                );
+            }
         }
         let requested = usize::from(data.get(1).copied().unwrap_or_default() % 32);
         if let Ok(request) = SchemaDiscoveryRequest::page(0, requested, requested / 2) {
@@ -207,24 +265,33 @@ impl Drop for FuzzRoot {
 }
 
 fn request(data: &[u8]) -> ExportLogsServiceRequest {
-    let attributes = data
+    let mut attributes = data
         .chunks(3)
         .take(MAX_ATTRIBUTES)
         .map(|chunk| {
             let byte = chunk.first().copied().unwrap_or_default();
-            let value = match byte % 4 {
-                0 => any_value::Value::StringValue(format!("v{byte:02x}")),
-                1 => any_value::Value::IntValue(i64::from(byte)),
-                2 => any_value::Value::BoolValue(byte & 1 == 1),
-                _ => any_value::Value::BytesValue(chunk.to_vec()),
+            let value = match byte % 6 {
+                0 => None,
+                1 => Some(any_value::Value::StringValue(format!("v{byte:02x}"))),
+                2 => Some(any_value::Value::IntValue(i64::from(byte))),
+                3 => Some(any_value::Value::BoolValue(byte & 1 == 1)),
+                4 => Some(any_value::Value::DoubleValue(f64::from(byte) + 0.5)),
+                _ => Some(any_value::Value::BytesValue(chunk.to_vec())),
             };
             KeyValue {
                 key: key(byte),
-                value: Some(AnyValue { value: Some(value) }),
+                value: Some(AnyValue { value }),
                 ..Default::default()
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    attributes.push(KeyValue {
+        key: FALLBACK_KEY.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(FALLBACK_VALUE.to_owned())),
+        }),
+        ..Default::default()
+    });
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             scope_logs: vec![ScopeLogs {
@@ -238,6 +305,34 @@ fn request(data: &[u8]) -> ExportLogsServiceRequest {
             ..Default::default()
         }],
     }
+}
+
+fn exact_value(data: &[u8]) -> Option<(SchemaValue, AttributeValueKind)> {
+    let chunk = data.chunks(3).next()?;
+    let byte = *chunk.first()?;
+    Some(match byte % 6 {
+        0 => (SchemaValue::null(), AttributeValueKind::Null),
+        1 => (
+            SchemaValue::string(format!("v{byte:02x}")),
+            AttributeValueKind::String,
+        ),
+        2 => (
+            SchemaValue::signed_integer(i64::from(byte)),
+            AttributeValueKind::SignedInteger,
+        ),
+        3 => (
+            SchemaValue::boolean(byte & 1 == 1),
+            AttributeValueKind::Boolean,
+        ),
+        4 => (
+            SchemaValue::floating_point_bits((f64::from(byte) + 0.5).to_bits()),
+            AttributeValueKind::FloatingPoint,
+        ),
+        _ => (
+            SchemaValue::bytes(chunk.to_vec()),
+            AttributeValueKind::Bytes,
+        ),
+    })
 }
 
 fn key(byte: u8) -> String {
