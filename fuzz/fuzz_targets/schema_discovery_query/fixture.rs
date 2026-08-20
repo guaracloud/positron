@@ -25,8 +25,8 @@ use positron_kernel::{
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{
-    LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaCatalog, SchemaPath, SchemaQuery,
-    SchemaValue, ScannedLogRecord,
+    AttributeRepresentation, LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaCatalog,
+    SchemaPath, SchemaQuery, SchemaValue, ScannedLogRecord,
 };
 use prost::Message;
 
@@ -179,10 +179,12 @@ impl FuzzFixture {
                 .map(ScannedLogRecord::commit_position)
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "exact scalar query changed logical results");
-            let expected_reduced = all_result
-                .records()
-                .iter()
-                .any(|record| reference_reduced_pruning(record, &key));
+            let expected_reduced = reference_reduced_pruning(
+                &catalog,
+                all_result.records(),
+                &path,
+                &exact_value,
+            );
             assert_eq!(
                 exact_result.reduced_pruning(),
                 expected_reduced,
@@ -373,16 +375,67 @@ fn reference_value_matches(value: &ValidatedAttributeValue, expected: &SchemaVal
     }
 }
 
-fn reference_reduced_pruning(record: &ScannedLogRecord, key: &str) -> bool {
-    record.attributes().iter().any(|attribute| {
+fn reference_reduced_pruning(
+    catalog: &SchemaCatalog,
+    records: &[ScannedLogRecord],
+    path: &SchemaPath,
+    expected: &SchemaValue,
+) -> bool {
+    records
+        .iter()
+        .any(|record| reference_block_coverage(catalog, record, path, expected).is_none())
+}
+
+/// Independently models the public sidecar contract for one persisted block.
+///
+/// `None` is deliberate for every non-authoritative state: absent or
+/// unpromoted catalog paths, missing/stale sidecars, type-only coverage, and
+/// Schema Overflow records. Only a promoted path with scalar occurrences that
+/// can supply an exact bounded dictionary returns `Some`.
+fn reference_block_coverage(
+    catalog: &SchemaCatalog,
+    record: &ScannedLogRecord,
+    path: &SchemaPath,
+    expected: &SchemaValue,
+) -> Option<bool> {
+    if !catalog.entry(path).is_some_and(|entry| entry.promoted()) {
+        return None;
+    }
+    let root = path.segments().first()?;
+    let attributes = record.attributes().iter().filter(|attribute| {
         let occurrences = attribute.occurrences();
-        occurrences.namespace() == AttributeNamespace::Record
-            && occurrences.key() == key
-            && matches!(
-                attribute.representation(),
-                positron_signals::AttributeRepresentation::SchemaOverflow
-            )
-    })
+        occurrences.namespace() == path.namespace() && occurrences.key() == root
+    });
+    let mut saw_attribute = false;
+    let mut saw_scalar = false;
+    let mut matches = false;
+    for attribute in attributes {
+        saw_attribute = true;
+        if attribute.representation() == AttributeRepresentation::SchemaOverflow {
+            return None;
+        }
+        let occurrences = attribute.occurrences();
+        for index in 0..occurrences.len() {
+            let value = occurrences.occurrence(index)?;
+            if is_scalar(value) {
+                saw_scalar = true;
+                matches |= reference_value_matches(value, expected);
+            }
+        }
+    }
+    (saw_attribute && saw_scalar).then_some(matches)
+}
+
+fn is_scalar(value: &ValidatedAttributeValue) -> bool {
+    matches!(
+        value.kind(),
+        positron_domain::value::AttributeValueKind::Null
+            | positron_domain::value::AttributeValueKind::Boolean
+            | positron_domain::value::AttributeValueKind::SignedInteger
+            | positron_domain::value::AttributeValueKind::FloatingPoint
+            | positron_domain::value::AttributeValueKind::String
+            | positron_domain::value::AttributeValueKind::Bytes
+    )
 }
 
 fn key(byte: u8) -> String {
