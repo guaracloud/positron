@@ -23,7 +23,7 @@ impl SchemaIndexPath {
     pub(crate) fn try_clone(&self) -> Result<Self, SchemaFailure> {
         let mut values = Vec::new();
         values
-            .try_reserve_exact(self.values.len())
+            .try_reserve_exact(self.values.capacity())
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
         for value in &self.values {
             values.push(value.try_clone()?);
@@ -181,14 +181,22 @@ impl SchemaIndexPath {
     }
 
     pub(crate) fn memory_bytes(&self) -> Result<usize, SchemaFailure> {
-        let values = self.values.iter().try_fold(
-            std::mem::size_of::<Vec<SchemaValue>>(),
-            |total, value| {
-                total
-                    .checked_add(value.memory_bytes()?)
-                    .ok_or(SchemaFailure::LimitExceeded)
-            },
-        )?;
+        let values = self
+            .values
+            .capacity()
+            .checked_mul(std::mem::size_of::<SchemaValue>())
+            .and_then(|capacity| capacity.checked_add(std::mem::size_of::<Vec<SchemaValue>>()))
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        let inline = std::mem::size_of::<SchemaValue>();
+        let values = self.values.iter().try_fold(values, |total, value| {
+            let owned_payload = value
+                .memory_bytes()?
+                .checked_sub(inline)
+                .ok_or(SchemaFailure::LimitExceeded)?;
+            total
+                .checked_add(owned_payload)
+                .ok_or(SchemaFailure::LimitExceeded)
+        })?;
         super::model::path_memory_bytes(&self.path)
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
             .and_then(|bytes| bytes.checked_add(values))

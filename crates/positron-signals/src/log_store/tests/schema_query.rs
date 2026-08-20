@@ -9,8 +9,8 @@ use positron_domain::value::{
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, PrimaryDataVolume, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity,
+    LifecycleClock, MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 
 use super::{LogRecord, LogScan, LogStore, PolicyProvenance, ScanLimit};
@@ -19,8 +19,57 @@ use crate::log_store::tests::support::{
 };
 use crate::{
     LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery,
-    SchemaValue,
+    SchemaSessionStore, SchemaValue,
 };
+
+#[test]
+fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let budget = SchemaBudget::new(8, 200_000, 1_000_000, 40_000)?;
+    let base = u64::try_from(SchemaCatalog::base_memory_bound(budget)?)?;
+    let reservation = authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, base)?,
+    )?)?;
+    let mut session = SchemaSessionStore::new(reservation, tenant, budget)?;
+    let mut seed = vec![record_with_occurrences("indexed", &["seed", "seed-2"])?];
+    let seed_delta = session.stage_group(&mut seed)?;
+    session.commit(seed_delta, StoreBlockIdentity::new([0x46; 16])?, [0x47; 32])?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?;
+    let mut query_update = session.stage_query_update()?;
+    query_update.record_query_use(&path)?;
+    session.commit_query_update(query_update)?;
+    let first = (0..1_024)
+        .map(|index| format!("first-{index:04}"))
+        .collect::<Vec<_>>();
+    let second = (0..1_024)
+        .map(|index| format!("second-{index:04}"))
+        .collect::<Vec<_>>();
+    let mut records = vec![
+        record_with_occurrences(
+            "indexed",
+            &first.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?,
+        record_with_occurrences(
+            "indexed",
+            &second.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?,
+    ];
+
+    let delta = session.stage_group(&mut records)?;
+
+    assert!(
+        delta.staged_memory_bytes() >= 24_576,
+        "fallback must retain the 1,024-element SchemaValue allocation: {}",
+        delta.staged_memory_bytes()
+    );
+    Ok(())
+}
 
 #[test]
 fn scalar_index_prunes_an_absent_same_type_value() -> Result<(), Box<dyn Error>> {
