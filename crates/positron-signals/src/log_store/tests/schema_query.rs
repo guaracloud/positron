@@ -44,6 +44,14 @@ fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
     let mut query_update = session.stage_query_update()?;
     query_update.record_query_use(&path)?;
     session.commit_query_update(query_update)?;
+    let mut promoted = vec![record_with_occurrences("indexed", &["promoted"])?];
+    let promoted_delta = session.stage_group(&mut promoted)?;
+    session.commit(
+        promoted_delta,
+        StoreBlockIdentity::new([0x48; 16])?,
+        [0x49; 32],
+    )?;
+    let _cloned_update = session.stage_query_update()?;
     let first = (0..1_024)
         .map(|index| format!("first-{index:04}"))
         .collect::<Vec<_>>();
@@ -62,6 +70,11 @@ fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
     ];
 
     let delta = session.stage_group(&mut records)?;
+    let cloned_delta = delta.try_clone()?;
+    assert_eq!(
+        cloned_delta.staged_memory_bytes(),
+        delta.staged_memory_bytes()
+    );
 
     assert!(
         delta.staged_memory_bytes() >= 24_576,
@@ -126,6 +139,8 @@ fn scalar_fallback_is_scoped_to_the_non_fitting_root() -> Result<(), Box<dyn Err
         ],
         PolicyProvenance::new(1, [0x75; 32], vec![])?,
     )?;
+    let second_record = record_with_occurrences("kept", &["kept-two"])?;
+    let duplicate_record = record_with_occurrences("kept", &["kept"])?;
     let identity = StoreBlockIdentity::new([0x4f; 16])?;
     let (prepared, delta) = store.prepare_with_schema_delta(
         preparation_capacity(&authority, tenant)?,
@@ -133,7 +148,7 @@ fn scalar_fallback_is_scoped_to_the_non_fitting_root() -> Result<(), Box<dyn Err
         tenant,
         shard,
         identity,
-        vec![record],
+        vec![record, second_record, duplicate_record],
         &schema,
     )?;
     let block = prepared.into_store_block();

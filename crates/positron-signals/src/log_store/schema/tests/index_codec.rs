@@ -75,6 +75,7 @@ fn physical_scalar_dictionary_rejects_malformed_native_payloads() -> Result<(), 
         .get_mut(presence)
         .ok_or("presence field missing")? = 2;
     assert!(SchemaCatalog::decode_catalog_object(&invalid_presence).is_err());
+    let value_count = marker.checked_add(8).ok_or("count offset overflow")?;
     let value_start = marker.checked_add(16).ok_or("value offset overflow")?;
 
     let mut invalid_tag = valid.clone();
@@ -102,6 +103,14 @@ fn physical_scalar_dictionary_rejects_malformed_native_payloads() -> Result<(), 
         .get(..valid.len().checked_sub(1).ok_or("empty catalog")?)
         .ok_or("truncation boundary missing")?;
     assert!(SchemaCatalog::decode_catalog_object(truncated).is_err());
+
+    let mut too_many_values = valid.clone();
+    too_many_values[value_count..value_start].copy_from_slice(&u64::MAX.to_be_bytes());
+    assert!(SchemaCatalog::decode_catalog_object(&too_many_values).is_err());
+
+    let mut empty_values = valid;
+    empty_values[value_count..value_start].copy_from_slice(&0_u64.to_be_bytes());
+    assert!(SchemaCatalog::decode_catalog_object(&empty_values).is_err());
     Ok(())
 }
 

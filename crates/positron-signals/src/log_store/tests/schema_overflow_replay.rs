@@ -141,8 +141,33 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
     let snapshot = ledger.snapshot()?;
     let committed = snapshot.blocks().first().ok_or("committed block")?;
     let mut replay_delta = store.replay_schema_block(tenant, &snapshot, committed, &replayed)?;
+    let cloned_replay_delta = replay_delta.try_clone()?;
+    assert_eq!(
+        cloned_replay_delta.staged_memory_bytes(),
+        replay_delta.staged_memory_bytes()
+    );
     let isolated = snapshot.blocks().get(1).ok_or("isolated committed block")?;
-    let _isolated_delta = store.replay_schema_block(tenant, &snapshot, isolated, &replayed)?;
+    let isolated_delta = store.replay_schema_block(tenant, &snapshot, isolated, &replayed)?;
+    let cloned_isolated_delta = isolated_delta.try_clone()?;
+    assert_eq!(
+        cloned_isolated_delta.staged_memory_bytes(),
+        isolated_delta.staged_memory_bytes()
+    );
+    let no_query_evidence = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let generic_result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(6)?),
+        &no_query_evidence,
+        &SchemaQuery::value(
+            path.clone(),
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(42),
+        ),
+    )?;
+    assert_eq!(generic_result.records().len(), 1);
+    assert!(generic_result.reduced_pruning());
 
     replayed.stage_record(
         std::slice::from_ref(&seed),
