@@ -11,6 +11,7 @@ pub(crate) const BLOCK_INDEX_HEADER_BYTES: usize = 16 + 32 + 8;
 pub(crate) const MAX_BLOCK_INDEXES: usize = 4_096;
 pub(crate) const SCALAR_VALUES_MAGIC: &[u8; 8] = b"PVALUES\0";
 pub(crate) const MAX_INDEX_VALUES: usize = 4_096;
+const BLOCK_SCALAR_FRAMING_BYTES: usize = 1;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SchemaIndexPath {
@@ -279,6 +280,7 @@ impl SchemaBlockIndex {
                     0
                 })
             })
+            .and_then(|bytes| bytes.checked_add(BLOCK_SCALAR_FRAMING_BYTES))
             .ok_or(SchemaFailure::LimitExceeded)
     }
 

@@ -8,7 +8,11 @@ use crate::log_store::schema::index::{
 use crate::log_store::schema::query::SchemaValue;
 use crate::log_store::{SchemaBudget, SchemaCatalog, SchemaFailure, SchemaPath};
 
-pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(), SchemaFailure> {
+pub(super) fn append(
+    catalog: &SchemaCatalog,
+    bytes: &mut Vec<u8>,
+    legacy: bool,
+) -> Result<(), SchemaFailure> {
     if catalog.block_indexes.is_empty() {
         return Ok(());
     }
@@ -26,7 +30,11 @@ pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(),
             }
             bytes.push(indexed.kind_mask);
         }
-        if block.paths.iter().any(|indexed| !indexed.values.is_empty()) {
+        let has_values = block.paths.iter().any(|indexed| !indexed.values.is_empty());
+        if !legacy {
+            bytes.push(u8::from(has_values));
+        }
+        if has_values {
             bytes.extend_from_slice(SCALAR_VALUES_MAGIC);
             for indexed in &block.paths {
                 put_len(bytes, indexed.values.len())?;
@@ -47,6 +55,7 @@ pub(super) struct IndexPreflight {
 pub(super) fn preflight(
     input: &mut Input<'_>,
     budget: SchemaBudget,
+    legacy: bool,
 ) -> Result<IndexPreflight, SchemaFailure> {
     if !input.starts_with(INDEX_MAGIC) {
         return Ok(IndexPreflight {
@@ -121,19 +130,33 @@ pub(super) fn preflight(
                 .filter(|bytes| *bytes <= budget.max_memory_bytes())
                 .ok_or(SchemaFailure::MalformedCatalog)?;
         }
-        if input.starts_with(SCALAR_VALUES_MAGIC) {
+        let has_values = if legacy {
+            input.starts_with(SCALAR_VALUES_MAGIC)
+        } else {
+            match input.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(SchemaFailure::MalformedCatalog),
+            }
+        };
+        if has_values {
             input.take(SCALAR_VALUES_MAGIC.len())?;
+            let mut any_values = false;
             for _ in 0..paths {
                 let values = input.usize()?;
                 if values > MAX_INDEX_VALUES {
                     return Err(SchemaFailure::MalformedCatalog);
                 }
+                any_values |= values > 0;
                 for _ in 0..values {
                     memory = memory
                         .checked_add(preflight_value(&mut *input)?)
                         .filter(|bytes| *bytes <= budget.max_memory_bytes())
                         .ok_or(SchemaFailure::MalformedCatalog)?;
                 }
+            }
+            if !legacy && !any_values {
+                return Err(SchemaFailure::MalformedCatalog);
             }
         }
     }
@@ -151,6 +174,7 @@ pub(super) fn preflight(
 pub(super) fn decode(
     input: &mut Input<'_>,
     budget: SchemaBudget,
+    legacy: bool,
 ) -> Result<(Vec<SchemaBlockIndex>, usize, usize), SchemaFailure> {
     if !input.starts_with(INDEX_MAGIC) {
         return Ok((Vec::new(), 0, 0));
@@ -200,13 +224,24 @@ pub(super) fn decode(
                 .ok_or(SchemaFailure::MalformedCatalog)?;
             paths.push(indexed);
         }
-        if input.starts_with(SCALAR_VALUES_MAGIC) {
+        let has_values = if legacy {
+            input.starts_with(SCALAR_VALUES_MAGIC)
+        } else {
+            match input.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(SchemaFailure::MalformedCatalog),
+            }
+        };
+        if has_values {
             input.take(SCALAR_VALUES_MAGIC.len())?;
+            let mut any_values = false;
             for path in &mut paths {
                 let count = input.usize()?;
                 if count > MAX_INDEX_VALUES {
                     return Err(SchemaFailure::MalformedCatalog);
                 }
+                any_values |= count > 0;
                 path.values
                     .try_reserve_exact(count)
                     .map_err(|_| SchemaFailure::AllocationUnavailable)?;
@@ -220,6 +255,9 @@ pub(super) fn decode(
                 {
                     return Err(SchemaFailure::MalformedCatalog);
                 }
+            }
+            if !legacy && !any_values {
+                return Err(SchemaFailure::MalformedCatalog);
             }
         }
         for path in &paths {

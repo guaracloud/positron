@@ -173,7 +173,7 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         SegmentScope::new(tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
     )?;
-    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 96)?)?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 97)?)?;
     let seed = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "collision".to_owned(),
@@ -264,7 +264,7 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
     let mut replayed = SchemaSessionStore::new(
         replay_capacity,
         tenant,
-        SchemaBudget::new(1, 8_192, 8_192, 96)?,
+        SchemaBudget::new(1, 8_192, 8_192, 97)?,
     )?;
     let seed = snapshot
         .blocks()

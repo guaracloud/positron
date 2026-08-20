@@ -69,6 +69,12 @@ fn physical_scalar_dictionary_rejects_malformed_native_payloads() -> Result<(), 
         .windows(8)
         .position(|window| window == b"PVALUES\0")
         .ok_or("scalar dictionary missing")?;
+    let presence = marker.checked_sub(1).ok_or("presence field missing")?;
+    let mut invalid_presence = valid.clone();
+    *invalid_presence
+        .get_mut(presence)
+        .ok_or("presence field missing")? = 2;
+    assert!(SchemaCatalog::decode_catalog_object(&invalid_presence).is_err());
     let value_start = marker.checked_add(16).ok_or("value offset overflow")?;
 
     let mut invalid_tag = valid.clone();
@@ -96,6 +102,66 @@ fn physical_scalar_dictionary_rejects_malformed_native_payloads() -> Result<(), 
         .get(..valid.len().checked_sub(1).ok_or("empty catalog")?)
         .ok_or("truncation boundary missing")?;
     assert!(SchemaCatalog::decode_catalog_object(truncated).is_err());
+    Ok(())
+}
+
+#[test]
+fn legacy_scalar_dictionary_without_explicit_presence_remains_readable()
+-> Result<(), Box<dyn Error>> {
+    let (_, valid) = indexed_checkpoint(false)?;
+    let marker = valid
+        .windows(8)
+        .position(|window| window == b"PVALUES\0")
+        .ok_or("scalar dictionary missing")?;
+    let mut legacy = valid;
+    legacy[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    legacy.remove(marker.checked_sub(1).ok_or("presence field missing")?);
+    assert!(SchemaCatalog::decode_catalog_object(&legacy).is_ok());
+    Ok(())
+}
+
+#[test]
+fn checkpoint_round_trips_a_following_identity_starting_with_scalar_marker()
+-> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let budget = SchemaBudget::new(8, 16_384, 16_384, 8_192)?;
+    let mut catalog = SchemaCatalog::new(tenant, budget)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    let path = path(AttributeNamespace::Record, "indexed");
+    catalog.record_query_use(&path)?;
+    let variants = catalog
+        .entry(&path)
+        .ok_or("indexed entry")?
+        .variants()
+        .to_vec();
+    let first = StoreBlockIdentity::new([0x01; 16])?;
+    let mut marker_identity = [0_u8; 16];
+    marker_identity[..8].copy_from_slice(super::super::index::SCALAR_VALUES_MAGIC);
+    marker_identity[8..].copy_from_slice(&[0x02; 8]);
+    let following = StoreBlockIdentity::new(marker_identity)?;
+    for (identity, digest) in [(first, [0x61; 32]), (following, [0x62; 32])] {
+        let indexed = super::super::index::SchemaIndexPath::from_variants(&path, &variants)?;
+        catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+            identity, digest, indexed,
+        )?)?;
+    }
+    let frontier = super::super::SchemaCheckpointFrontier::new(
+        VirtualShardId::new(17)?,
+        CommitPosition::origin().next()?,
+        following,
+        [0x62; 32],
+    )?;
+    let bytes = catalog.encode_checkpoint_object(&[frontier])?;
+
+    let (decoded, frontiers) = SchemaCatalog::decode_checkpoint_object(&bytes)?;
+
+    assert_eq!(decoded, catalog);
+    assert_eq!(frontiers, vec![frontier]);
     Ok(())
 }
 

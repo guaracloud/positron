@@ -61,7 +61,7 @@ version 2 format uses tag `4` only for the native Stream Attribute namespace.
 
 The Log Store owns a bounded Tenant Schema Catalog separately from Store Block
 payloads. Its immutable Catalog Object uses the ASCII magic `PSCHEMA1` and
-version `1`, followed by the tenant identity, entry/memory/persistent-byte/
+version `2`, followed by the tenant identity, entry/memory/persistent-byte/
 index-byte budgets, overflow record and byte counters, and deterministic
 namespace-qualified path entries. Each entry preserves observed typed
 variants, observation and conflict counts, query-use count, promotion state,
@@ -76,8 +76,14 @@ dictionary is keyed by the exact Store Block identity and authenticated payload
 digest, and its paths and type masks must match promoted catalog members. A
 query may prune only when all of those facts match; missing, stale,
 unreachable, replacement, or demoted coverage falls back to the authoritative
-v2 value and reports reduced pruning. These sidecars do not add a Store Block
-tag or version. The object is
+v2 value and reports reduced pruning. Version 2 frames every physical index
+block with an explicit one-byte scalar-sidecar-presence field (`0` absent,
+`1` present), followed by `PVALUES\0` and the bounded per-path dictionaries
+only when present. Readers accept version 1 objects using the original
+optional-marker grammar for current Release 1 development data and accept
+version 2 objects using the explicit framing; a version 1 object is never
+parsed as version 2. These sidecars do not add a Store Block tag or version.
+The object is
 content-addressed and published only through
 the Storage Kernel Catalog Writer with the generation precondition and typed
 governance evidence required by ADR-0069. It is rebuildable optimization state,

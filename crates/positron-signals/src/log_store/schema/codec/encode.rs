@@ -45,7 +45,7 @@ pub(super) fn catalog(catalog: &SchemaCatalog) -> Result<Vec<u8>, SchemaFailure>
             u64::try_from(entry.index_bytes).map_err(|_| SchemaFailure::LimitExceeded)?,
         );
     }
-    super::index::append(catalog, &mut bytes)?;
+    super::index::append(catalog, &mut bytes, false)?;
     if bytes.len() != catalog.persistent_bytes
         || bytes.len() > catalog.budget.max_persistent_bytes()
     {
