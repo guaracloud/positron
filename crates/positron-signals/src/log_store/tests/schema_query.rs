@@ -81,6 +81,7 @@ fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
         "fallback must retain the 1,024-element SchemaValue allocation: {}",
         delta.staged_memory_bytes()
     );
+    assert!(delta.retained_memory_bytes() > 0);
     Ok(())
 }
 
@@ -155,6 +156,20 @@ fn scalar_fallback_is_scoped_to_the_non_fitting_root() -> Result<(), Box<dyn Err
     let digest = block.content_digest()?;
     ledger.append(block)?;
     store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+    let second_identity = StoreBlockIdentity::new([0x50; 16])?;
+    let (second_prepared, second_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+        tenant,
+        shard,
+        second_identity,
+        vec![record_with_occurrences("kept", &["kept-three"])?],
+        &schema,
+    )?;
+    let second_block = second_prepared.into_store_block();
+    let second_digest = second_block.content_digest()?;
+    ledger.append(second_block)?;
+    store.apply_schema_delta(&mut schema, second_delta, second_identity, second_digest)?;
 
     let result = store.scan_schema(
         authority.governor(),
@@ -538,17 +553,45 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     let checkpoint = schema.encode_catalog_object()?;
     let reopened = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     let snapshot = successor.snapshot()?;
+    let marker = checkpoint
+        .windows(8)
+        .position(|window| window == b"PVALUES\0")
+        .ok_or("scalar dictionary")?;
+    let presence = marker.checked_sub(1).ok_or("presence byte")?;
+    let mut stale_checkpoint = checkpoint.clone();
+    stale_checkpoint[presence] = 0;
+    stale_checkpoint.truncate(presence + 1);
+    let (mut replayed, _) = SchemaSessionStore::from_checkpoint(
+        preparation_capacity(&authority, tenant)?,
+        tenant,
+        &stale_checkpoint,
+    )?
+    .ok_or("checkpoint tenant")?;
+    let target = snapshot.blocks().first().ok_or("target block")?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?;
+    let mut query_update = replayed.stage_query_update()?;
+    query_update.index_replayed_query_path(tenant, &snapshot, target, &path)?;
+    replayed.commit_query_update(query_update)?;
+    let mut repeated_update = replayed.stage_query_update()?;
+    repeated_update.index_replayed_query_path(tenant, &snapshot, target, &path)?;
+    replayed.commit_query_update(repeated_update)?;
 
     let indexed = store.scan_schema(
         authority.governor(),
         tenant,
         &snapshot,
         LogScan::all(ScanLimit::new(2)?),
-        &schema,
+        replayed.catalog(),
         &query("indexed", "one")?,
     )?;
     assert_eq!(indexed.records().len(), 1);
     assert!(!indexed.reduced_pruning());
+    replayed.retain_reachable_indexes(&[(target.identity(), target.content_digest()?)])?;
+    replayed.reconcile_block_identity(target.identity(), [0x72; 32])?;
+    let mut demotion = replayed.stage_query_update()?;
+    demotion.remove_query_evidence(&path)?;
+    replayed.commit_query_update(demotion)?;
+    replayed.reconcile_block_identity(StoreBlockIdentity::new([0x70; 16])?, [0x71; 32])?;
     for (selector, expected_match) in [
         (OccurrenceSelector::Index(0), true),
         (OccurrenceSelector::Index(1), true),

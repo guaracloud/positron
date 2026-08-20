@@ -46,6 +46,32 @@ fn physical_index_must_match_catalog_path_and_complete_kind_set() -> Result<(), 
 }
 
 #[test]
+fn physical_index_rejects_duplicate_wire_paths() -> Result<(), Box<dyn Error>> {
+    let (_, valid) = indexed_checkpoint(false)?;
+    let marker = valid
+        .windows(8)
+        .position(|window| window == b"PINDEX1\0")
+        .ok_or("physical index missing")?;
+    let path_count = marker.checked_add(64).ok_or("path count offset overflow")?;
+    let path_start = marker.checked_add(73).ok_or("path offset overflow")?;
+    let path_end = valid
+        .windows(8)
+        .position(|window| window == b"PVALUES\0")
+        .ok_or("scalar dictionary missing")?
+        .checked_sub(1)
+        .ok_or("presence offset underflow")?;
+    let path = valid
+        .get(path_start..path_end)
+        .ok_or("path bytes missing")?
+        .to_vec();
+    let mut duplicate = valid;
+    duplicate[path_count..path_count + 8].copy_from_slice(&2_u64.to_be_bytes());
+    duplicate.splice(path_end..path_end, path);
+    assert!(SchemaCatalog::decode_catalog_object(&duplicate).is_err());
+    Ok(())
+}
+
+#[test]
 fn physical_scalar_dictionary_must_be_canonical_and_unique() -> Result<(), Box<dyn Error>> {
     let (_, valid) = indexed_checkpoint(false)?;
     let marker = valid

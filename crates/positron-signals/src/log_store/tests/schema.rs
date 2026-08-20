@@ -281,16 +281,11 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         .iter()
         .find(|block| block.identity() == identity)
         .ok_or("replay target block")?;
-    let mut query_update = replayed.stage_query_update()?;
-    query_update.index_replayed_query_path(
-        tenant,
-        &snapshot,
-        target,
-        &SchemaPath::root(AttributeNamespace::Record, "missing".to_owned())?,
-    )?;
-    replayed.commit_query_update(query_update)?;
     let target_delta = replayed.replay(tenant, &snapshot, target)?;
     replayed.commit(target_delta, target.identity(), target.content_digest()?)?;
+    let mut query_update = replayed.stage_query_update()?;
+    query_update.index_replayed_query_path(tenant, &snapshot, target, &path)?;
+    replayed.commit_query_update(query_update)?;
     let replayed_result = store.scan_schema(
         authority.governor(),
         tenant,
