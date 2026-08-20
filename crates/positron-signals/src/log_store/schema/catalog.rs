@@ -111,12 +111,7 @@ impl SchemaCatalog {
         path: &SchemaPath,
         kind: positron_domain::value::AttributeValueKind,
     ) -> Option<bool> {
-        self.block_indexes
-            .binary_search_by_key(&identity, |index| index.identity)
-            .ok()
-            .and_then(|position| self.block_indexes.get(position))
-            .filter(|index| index.digest == digest)
-            .filter(|index| index.semantically_valid(&self.entries))
+        self.verified_block(identity, digest)
             .and_then(|index| index.covers_kind(path, kind))
     }
 
@@ -127,13 +122,21 @@ impl SchemaCatalog {
         path: &SchemaPath,
         expected: &SchemaValue,
     ) -> Option<bool> {
+        self.verified_block(identity, digest)
+            .and_then(|index| index.covers_value(path, expected))
+    }
+
+    fn verified_block(
+        &self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> Option<&SchemaBlockIndex> {
         self.block_indexes
             .binary_search_by_key(&identity, |index| index.identity)
             .ok()
             .and_then(|position| self.block_indexes.get(position))
             .filter(|index| index.digest == digest)
             .filter(|index| index.semantically_valid(&self.entries))
-            .and_then(|index| index.covers_value(path, expected))
     }
 
     pub(crate) fn has_verified_block(
@@ -141,11 +144,7 @@ impl SchemaCatalog {
         identity: positron_kernel::StoreBlockIdentity,
         digest: [u8; 32],
     ) -> bool {
-        self.block_indexes
-            .binary_search_by_key(&identity, |index| index.identity)
-            .ok()
-            .and_then(|position| self.block_indexes.get(position))
-            .is_some_and(|index| index.digest == digest && index.semantically_valid(&self.entries))
+        self.verified_block(identity, digest).is_some()
     }
 
     pub(crate) fn entry_index(&self, path: &SchemaPath) -> Result<usize, usize> {

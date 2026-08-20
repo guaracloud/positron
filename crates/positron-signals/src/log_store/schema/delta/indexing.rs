@@ -17,8 +17,7 @@ pub(crate) fn additional_physical_cost(
     if !delta.build_physical_index {
         return Ok((0, 0));
     }
-    let include_values =
-        delta.scalar_values && scalar_values_fit(catalog, delta, root, attributes)?;
+    let include_values = scalar_values_fit(catalog, delta, root, attributes)?;
     let (memory, wire) = projected_physical_cost(catalog, delta, root, attributes, include_values)?;
     let added_memory = memory
         .checked_sub(delta.physical_memory_bytes())
@@ -150,8 +149,7 @@ pub(super) fn stage_index_root(
     if !delta.build_physical_index {
         return Ok(());
     }
-    let include_values =
-        delta.scalar_values && scalar_values_fit(catalog, delta, root, attributes)?;
+    let include_values = scalar_values_fit(catalog, delta, root, attributes)?;
     delta.index_paths = projected_paths(delta, root, attributes, include_values)?;
     let (memory, wire) = projected_physical_cost(catalog, delta, &[], &[], include_values)?;
     delta.physical_memory_bytes = memory;
