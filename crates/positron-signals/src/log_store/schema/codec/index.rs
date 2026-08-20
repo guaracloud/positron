@@ -125,7 +125,7 @@ pub(super) fn preflight(
                 .ok_or(SchemaFailure::MalformedCatalog)?;
         }
         let has_values = if legacy {
-            input.starts_with(SCALAR_VALUES_MAGIC)
+            false
         } else {
             match input.u8()? {
                 0 => false,
@@ -221,11 +221,7 @@ pub(super) fn decode(
                 .ok_or(SchemaFailure::MalformedCatalog)?;
             paths.push(indexed);
         }
-        let has_values = if legacy {
-            input.starts_with(SCALAR_VALUES_MAGIC)
-        } else {
-            input.u8()? == 1
-        };
+        let has_values = if legacy { false } else { input.u8()? == 1 };
         if has_values {
             input.take(SCALAR_VALUES_MAGIC.len())?;
             for path in &mut paths {

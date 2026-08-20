@@ -79,10 +79,12 @@ unreachable, replacement, or demoted coverage falls back to the authoritative
 v2 value and reports reduced pruning. Version 2 frames every physical index
 block with an explicit one-byte scalar-sidecar-presence field (`0` absent,
 `1` present), followed by `PVALUES\0` and the bounded per-path dictionaries
-only when present. Readers accept version 1 objects using the original
-optional-marker grammar for current Release 1 development data and accept
+only when present. Readers accept version 1 objects without scalar sidecars
+(their values are rebuilt from the authoritative Store Blocks) and accept
 version 2 objects using the explicit framing; a version 1 object is never
-parsed as version 2. These sidecars do not add a Store Block tag or version.
+parsed as version 2. Version 1 bytes beginning with `PVALUES\0` therefore
+remain the next identity, not an optional trailer. These sidecars do not add
+a Store Block tag or version.
 The object is
 content-addressed and published only through
 the Storage Kernel Catalog Writer with the generation precondition and typed

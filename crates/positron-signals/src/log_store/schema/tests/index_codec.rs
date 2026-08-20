@@ -144,14 +144,67 @@ fn physical_scalar_dictionary_rejects_malformed_native_payloads() -> Result<(), 
 fn legacy_scalar_dictionary_without_explicit_presence_remains_readable()
 -> Result<(), Box<dyn Error>> {
     let (_, valid) = indexed_checkpoint(false)?;
-    let marker = valid
-        .windows(8)
-        .position(|window| window == b"PVALUES\0")
-        .ok_or("scalar dictionary missing")?;
     let mut legacy = valid;
     legacy[8..10].copy_from_slice(&1_u16.to_be_bytes());
-    legacy.remove(marker.checked_sub(1).ok_or("presence field missing")?);
+    let presence = legacy
+        .windows(8)
+        .position(|window| window == b"PVALUES\0")
+        .and_then(|marker| marker.checked_sub(1))
+        .ok_or("presence field missing")?;
+    legacy.truncate(presence);
     assert!(SchemaCatalog::decode_catalog_object(&legacy).is_ok());
+    Ok(())
+}
+
+#[test]
+fn legacy_identity_starting_with_scalar_marker_is_not_consumed_as_sidecar()
+-> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let budget = SchemaBudget::new(8, 16_384, 16_384, 8_192)?;
+    let mut catalog = SchemaCatalog::new(tenant, budget)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    let path = path(AttributeNamespace::Record, "indexed");
+    catalog.record_query_use(&path)?;
+    let variants = catalog
+        .entry(&path)
+        .ok_or("indexed entry")?
+        .variants()
+        .to_vec();
+    let first = StoreBlockIdentity::new([0x11; 16])?;
+    let mut marker_identity = [0_u8; 16];
+    marker_identity[..8].copy_from_slice(super::super::index::SCALAR_VALUES_MAGIC);
+    marker_identity[8..].copy_from_slice(&[0x12; 8]);
+    let following = StoreBlockIdentity::new(marker_identity)?;
+    for (identity, digest) in [(first, [0x63; 32]), (following, [0x64; 32])] {
+        let indexed = super::super::index::SchemaIndexPath::from_variants(&path, &variants)?;
+        catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+            identity, digest, indexed,
+        )?)?;
+    }
+    let mut legacy = catalog.encode_catalog_object()?;
+    legacy[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    let first_marker = legacy
+        .windows(16)
+        .position(|window| window == first.to_bytes())
+        .ok_or("first identity")?;
+    let first_presence = first_marker
+        .checked_add(16 + 32 + 8 + 1 + 2 + 8 + 7 + 1)
+        .ok_or("first presence offset")?;
+    legacy.remove(first_presence);
+    let second_presence = legacy.len().checked_sub(1).ok_or("second presence")?;
+    legacy.remove(second_presence);
+    let (decoded, _) = SchemaCatalog::decode_checkpoint_object(&legacy)?;
+    let reencoded = decoded.encode_catalog_object()?;
+    assert!(
+        reencoded
+            .windows(16)
+            .any(|window| window == following.to_bytes())
+    );
     Ok(())
 }
 
