@@ -176,13 +176,6 @@ fn decode_checkpoint(
     }
     let (block_indexes, physical_bytes, physical_memory) =
         index::decode(&mut input, budget, legacy_version(prefix.version))?;
-    let physical_bytes = physical_bytes
-        .checked_add(if legacy_version(prefix.version) {
-            block_indexes.len()
-        } else {
-            0
-        })
-        .ok_or(SchemaFailure::MalformedCatalog)?;
     if block_indexes
         .iter()
         .any(|index| !index.semantically_valid(&catalog.entries))

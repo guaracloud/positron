@@ -4,6 +4,8 @@ use positron_domain::routing::{CommitPosition, VirtualShardId};
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::StoreBlockIdentity;
 
+use crate::log_store::SchemaFailure;
+
 use super::*;
 
 #[test]
@@ -157,6 +159,51 @@ fn legacy_scalar_dictionary_without_explicit_presence_remains_readable()
 }
 
 #[test]
+fn legacy_single_block_at_exact_v1_budgets_reopens_without_synthetic_framing()
+-> Result<(), Box<dyn Error>> {
+    let (legacy, index_bytes) = exact_legacy_budget_checkpoint(1)?;
+    let (decoded, _) = SchemaCatalog::decode_checkpoint_object(&legacy)?;
+    assert_eq!(decoded.persistent_bytes(), legacy.len());
+    assert_eq!(decoded.index_bytes(), index_bytes);
+    assert_eq!(decoded.block_indexes.len(), 1);
+    assert!(decoded.block_indexes[0].paths[0].values.is_empty());
+
+    // The exact v1 budget deliberately excludes v2 presence framing; an
+    // explicit v2 write must therefore fail closed rather than mutating the
+    // accepted v1 accounting during decode.
+    assert_eq!(
+        decoded.encode_catalog_object(),
+        Err(SchemaFailure::LimitExceeded)
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_multiple_blocks_at_exact_v1_budgets_reopen_without_sidecars() -> Result<(), Box<dyn Error>>
+{
+    let (legacy, index_bytes) = exact_legacy_budget_checkpoint(2)?;
+    let (decoded, _) = SchemaCatalog::decode_checkpoint_object(&legacy)?;
+    assert_eq!(decoded.persistent_bytes(), legacy.len());
+    assert_eq!(decoded.index_bytes(), index_bytes);
+    assert_eq!(decoded.block_indexes.len(), 2);
+    assert_eq!(
+        decoded.block_indexes[0].identity,
+        StoreBlockIdentity::new([0x11; 16])?
+    );
+    assert_eq!(
+        decoded.block_indexes[1].identity,
+        StoreBlockIdentity::new([0x12; 16])?
+    );
+    assert!(
+        decoded
+            .block_indexes
+            .iter()
+            .all(|block| block.paths.iter().all(|path| path.values.is_empty()))
+    );
+    Ok(())
+}
+
+#[test]
 fn legacy_identity_starting_with_scalar_marker_is_not_consumed_as_sidecar()
 -> Result<(), Box<dyn Error>> {
     let tenant = tenant();
@@ -285,4 +332,61 @@ fn indexed_checkpoint(frontier: bool) -> Result<(SchemaCatalog, Vec<u8>), Box<dy
         catalog.encode_catalog_object()?
     };
     Ok((catalog, bytes))
+}
+
+fn exact_legacy_budget_checkpoint(blocks: usize) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
+    let tenant = tenant();
+    let budget = SchemaBudget::new(8, 16_384, 16_384, 8_192)?;
+    let mut catalog = SchemaCatalog::new(tenant, budget)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    let path = path(AttributeNamespace::Record, "indexed");
+    catalog.record_query_use(&path)?;
+    let variants = catalog
+        .entry(&path)
+        .ok_or("indexed entry")?
+        .variants()
+        .to_vec();
+    for offset in 0..blocks {
+        let marker = u8::try_from(0x11_usize.checked_add(offset).ok_or("identity overflow")?)?;
+        let identity = StoreBlockIdentity::new([marker; 16])?;
+        let indexed = super::super::index::SchemaIndexPath::from_variants(&path, &variants)?;
+        catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+            identity,
+            [marker.wrapping_add(0x40); 32],
+            indexed,
+        )?)?;
+    }
+    let mut legacy = catalog.encode_catalog_object()?;
+    legacy[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    let mut presence_offsets = Vec::new();
+    for offset in 0..blocks {
+        let marker_byte = u8::try_from(0x11_usize.checked_add(offset).ok_or("identity overflow")?)?;
+        let identity = [marker_byte; 16];
+        let identity_offset = legacy
+            .windows(identity.len())
+            .position(|window| window == identity)
+            .ok_or("block identity")?;
+        let presence = identity_offset
+            .checked_add(16 + 32 + 8 + 1 + 2 + 8 + 7 + 1)
+            .ok_or("presence offset")?;
+        presence_offsets.push(presence);
+    }
+    presence_offsets.sort_unstable_by(|left, right| right.cmp(left));
+    for presence in presence_offsets {
+        legacy.remove(presence);
+    }
+    let index_bytes = catalog
+        .index_bytes()
+        .checked_sub(blocks)
+        .ok_or("v1 index accounting underflow")?;
+    let persistent_bytes = u64::try_from(legacy.len())?;
+    let index_bytes = u64::try_from(index_bytes)?;
+    legacy[42..50].copy_from_slice(&persistent_bytes.to_be_bytes());
+    legacy[50..58].copy_from_slice(&index_bytes.to_be_bytes());
+    Ok((legacy, usize::try_from(index_bytes)?))
 }
