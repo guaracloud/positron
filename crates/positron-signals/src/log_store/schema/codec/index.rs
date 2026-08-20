@@ -3,7 +3,7 @@ use positron_kernel::StoreBlockIdentity;
 use super::{Input, decode_namespace, namespace_tag, put_bytes, put_len, put_u16};
 use crate::log_store::schema::index::{
     BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, INDEX_MAGIC, MAX_BLOCK_INDEXES, MAX_INDEX_VALUES,
-    SCALAR_VALUES_MAGIC, SchemaBlockIndex, SchemaIndexPath,
+    SCALAR_VALUES_MAGIC, ScalarIndexFraming, SchemaBlockIndex, SchemaIndexPath,
 };
 use crate::log_store::schema::query::SchemaValue;
 use crate::log_store::{SchemaBudget, SchemaCatalog, SchemaFailure, SchemaPath};
@@ -254,6 +254,11 @@ pub(super) fn decode(
             identity,
             digest,
             paths,
+            scalar_framing: if legacy {
+                ScalarIndexFraming::LegacyV1
+            } else {
+                ScalarIndexFraming::V2
+            },
         });
     }
     let physical = before

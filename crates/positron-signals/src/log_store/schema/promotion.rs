@@ -1,8 +1,6 @@
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
-use super::index::{
-    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, MAX_INDEX_VALUES, SchemaBlockIndex,
-};
+use super::index::{BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, MAX_INDEX_VALUES};
 use super::model::{SchemaPath, promoted_index_bytes};
 
 impl SchemaCatalog {
@@ -144,7 +142,7 @@ impl SchemaCatalog {
                 if &merged == current {
                     return Ok(());
                 }
-                let old_wire = SchemaBlockIndex::paths_encoded_bytes(&known.paths)?;
+                let old_wire = known.paths_encoded_bytes_for(&known.paths)?;
                 let mut projected = Vec::new();
                 projected
                     .try_reserve_exact(known.paths.len())
@@ -156,7 +154,7 @@ impl SchemaCatalog {
                         projected.push(known_path.try_clone()?);
                     }
                 }
-                let new_wire = SchemaBlockIndex::paths_encoded_bytes(&projected)?;
+                let new_wire = known.paths_encoded_bytes_for(&projected)?;
                 let old_memory = current.memory_bytes()?;
                 let new_memory = merged.memory_bytes()?;
                 let next_index_bytes = self
@@ -204,8 +202,8 @@ impl SchemaCatalog {
             projected.push(known_path.try_clone()?);
         }
         projected.insert(insertion, path.try_clone()?);
-        let old_wire = SchemaBlockIndex::paths_encoded_bytes(&known.paths)?;
-        let new_wire = SchemaBlockIndex::paths_encoded_bytes(&projected)?;
+        let old_wire = known.paths_encoded_bytes_for(&known.paths)?;
+        let new_wire = known.paths_encoded_bytes_for(&projected)?;
         let added_wire = new_wire
             .checked_sub(old_wire)
             .ok_or(SchemaFailure::InvalidValue)?;
@@ -356,12 +354,12 @@ impl SchemaCatalog {
                     .paths
                     .get(position)
                     .ok_or(SchemaFailure::InvalidValue)?;
-                let old_wire = SchemaBlockIndex::paths_encoded_bytes(&block.paths)?;
+                let old_wire = block.paths_encoded_bytes_for(&block.paths)?;
                 removed_memory = removed_memory
                     .checked_add(indexed.memory_bytes()?)
                     .ok_or(SchemaFailure::LimitExceeded)?;
                 block.paths.remove(position);
-                let new_wire = SchemaBlockIndex::paths_encoded_bytes(&block.paths)?;
+                let new_wire = block.paths_encoded_bytes_for(&block.paths)?;
                 removed_wire = removed_wire
                     .checked_add(
                         old_wire

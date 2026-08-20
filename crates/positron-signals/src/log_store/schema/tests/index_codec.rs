@@ -2,9 +2,14 @@ use std::error::Error;
 
 use positron_domain::routing::{CommitPosition, VirtualShardId};
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
-use positron_kernel::StoreBlockIdentity;
+use positron_kernel::{
+    MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension, StoreBlockIdentity,
+    WorkClaim, WorkKind,
+};
 
 use crate::log_store::SchemaFailure;
+use crate::log_store::schema::SchemaSessionStore;
+use crate::log_store::tests::support::{TemporaryRoot, establish_kernel_authority};
 
 use super::*;
 
@@ -204,9 +209,76 @@ fn legacy_multiple_blocks_at_exact_v1_budgets_reopen_without_sidecars() -> Resul
 }
 
 #[test]
+fn governed_v1_exact_budget_demotion_releases_legacy_block_bytes() -> Result<(), Box<dyn Error>> {
+    let (legacy, _) = exact_legacy_budget_checkpoint(1)?;
+    with_governed_legacy_session(&legacy, |session| {
+        let mut update = session.stage_query_update()?;
+        update.remove_query_evidence(&path(AttributeNamespace::Record, "indexed"))?;
+        session.commit_query_update(update)?;
+        let encoded = session.catalog().encode_catalog_object()?;
+        assert_eq!(session.catalog().persistent_bytes(), encoded.len());
+        let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
+        assert_eq!(reopened.persistent_bytes(), encoded.len());
+        assert_eq!(reopened.index_bytes(), 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn governed_v1_exact_budget_reachability_removal_reopens_remaining_block()
+-> Result<(), Box<dyn Error>> {
+    let (legacy, _) = exact_legacy_budget_checkpoint(2)?;
+    with_governed_legacy_session(&legacy, |session| {
+        session.retain_reachable_indexes(&[(StoreBlockIdentity::new([0x11; 16])?, [0x51; 32])])?;
+        let encoded = session.catalog().encode_catalog_object()?;
+        assert_eq!(
+            session.catalog().persistent_bytes().checked_add(1),
+            Some(encoded.len())
+        );
+        let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
+        assert_eq!(
+            session.catalog().index_bytes().checked_add(1),
+            Some(reopened.index_bytes())
+        );
+        assert_eq!(reopened.persistent_bytes(), encoded.len());
+        assert_eq!(reopened.block_indexes.len(), 1);
+        assert_eq!(
+            reopened.block_indexes[0].identity,
+            StoreBlockIdentity::new([0x11; 16])?
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn governed_v1_exact_budget_reconciliation_removes_stale_block() -> Result<(), Box<dyn Error>> {
+    let (legacy, _) = exact_legacy_budget_checkpoint(2)?;
+    with_governed_legacy_session(&legacy, |session| {
+        session.reconcile_block_identity(StoreBlockIdentity::new([0x12; 16])?, [0x61; 32])?;
+        let encoded = session.catalog().encode_catalog_object()?;
+        assert_eq!(
+            session.catalog().persistent_bytes().checked_add(1),
+            Some(encoded.len())
+        );
+        let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
+        assert_eq!(
+            session.catalog().index_bytes().checked_add(1),
+            Some(reopened.index_bytes())
+        );
+        assert_eq!(reopened.persistent_bytes(), encoded.len());
+        assert_eq!(reopened.block_indexes.len(), 1);
+        assert_eq!(
+            reopened.block_indexes[0].identity,
+            StoreBlockIdentity::new([0x11; 16])?
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn legacy_identity_starting_with_scalar_marker_is_not_consumed_as_sidecar()
 -> Result<(), Box<dyn Error>> {
-    let tenant = tenant();
+    let tenant = positron_domain::identity::TenantId::from_bytes([0x41; 16])?;
     let budget = SchemaBudget::new(8, 16_384, 16_384, 8_192)?;
     let mut catalog = SchemaCatalog::new(tenant, budget)?;
     let attribute = occurrence(
@@ -258,7 +330,7 @@ fn legacy_identity_starting_with_scalar_marker_is_not_consumed_as_sidecar()
 #[test]
 fn checkpoint_round_trips_a_following_identity_starting_with_scalar_marker()
 -> Result<(), Box<dyn Error>> {
-    let tenant = tenant();
+    let tenant = positron_domain::identity::TenantId::from_bytes([0x41; 16])?;
     let budget = SchemaBudget::new(8, 16_384, 16_384, 8_192)?;
     let mut catalog = SchemaCatalog::new(tenant, budget)?;
     let attribute = occurrence(
@@ -335,7 +407,7 @@ fn indexed_checkpoint(frontier: bool) -> Result<(SchemaCatalog, Vec<u8>), Box<dy
 }
 
 fn exact_legacy_budget_checkpoint(blocks: usize) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
-    let tenant = tenant();
+    let tenant = positron_domain::identity::TenantId::from_bytes([0x41; 16])?;
     let budget = SchemaBudget::new(8, 16_384, 16_384, 8_192)?;
     let mut catalog = SchemaCatalog::new(tenant, budget)?;
     let attribute = occurrence(
@@ -389,4 +461,25 @@ fn exact_legacy_budget_checkpoint(blocks: usize) -> Result<(Vec<u8>, usize), Box
     legacy[42..50].copy_from_slice(&persistent_bytes.to_be_bytes());
     legacy[50..58].copy_from_slice(&index_bytes.to_be_bytes());
     Ok((legacy, usize::try_from(index_bytes)?))
+}
+
+fn with_governed_legacy_session(
+    checkpoint: &[u8],
+    operation: impl FnOnce(&mut SchemaSessionStore) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let tenant = positron_domain::identity::TenantId::from_bytes([0x41; 16])?;
+    let reservation = authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 200_000)?,
+    )?)?;
+    let Some((mut session, _)) =
+        SchemaSessionStore::from_checkpoint(reservation, tenant, checkpoint)?
+    else {
+        return Err("legacy checkpoint tenant".into());
+    };
+    operation(&mut session)
 }

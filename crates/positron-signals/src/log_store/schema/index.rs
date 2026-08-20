@@ -13,6 +13,21 @@ pub(crate) const SCALAR_VALUES_MAGIC: &[u8; 8] = b"PVALUES\0";
 pub(crate) const MAX_INDEX_VALUES: usize = 4_096;
 const BLOCK_SCALAR_FRAMING_BYTES: usize = 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScalarIndexFraming {
+    LegacyV1,
+    V2,
+}
+
+impl ScalarIndexFraming {
+    const fn encoded_bytes(self) -> usize {
+        match self {
+            Self::LegacyV1 => 0,
+            Self::V2 => BLOCK_SCALAR_FRAMING_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SchemaIndexPath {
     pub(crate) path: SchemaPath,
@@ -214,6 +229,7 @@ pub(crate) struct SchemaBlockIndex {
     pub(crate) identity: StoreBlockIdentity,
     pub(crate) digest: [u8; 32],
     pub(crate) paths: Vec<SchemaIndexPath>,
+    pub(crate) scalar_framing: ScalarIndexFraming,
 }
 
 impl SchemaBlockIndex {
@@ -229,6 +245,7 @@ impl SchemaBlockIndex {
             identity: self.identity,
             digest: self.digest,
             paths,
+            scalar_framing: self.scalar_framing,
         })
     }
 
@@ -246,16 +263,24 @@ impl SchemaBlockIndex {
             identity,
             digest,
             paths,
+            scalar_framing: ScalarIndexFraming::V2,
         })
     }
 
     pub(crate) fn encoded_bytes(&self) -> Result<usize, SchemaFailure> {
-        Self::paths_encoded_bytes(&self.paths)?
+        self.paths_encoded_bytes_for(&self.paths)?
             .checked_add(BLOCK_INDEX_HEADER_BYTES)
             .ok_or(SchemaFailure::LimitExceeded)
     }
 
     pub(crate) fn paths_encoded_bytes(paths: &[SchemaIndexPath]) -> Result<usize, SchemaFailure> {
+        Self::paths_encoded_bytes_with_framing(paths, ScalarIndexFraming::V2)
+    }
+
+    pub(crate) fn paths_encoded_bytes_with_framing(
+        paths: &[SchemaIndexPath],
+        framing: ScalarIndexFraming,
+    ) -> Result<usize, SchemaFailure> {
         if paths.is_empty() {
             return Ok(0);
         }
@@ -283,8 +308,15 @@ impl SchemaBlockIndex {
                     0
                 })
             })
-            .and_then(|bytes| bytes.checked_add(BLOCK_SCALAR_FRAMING_BYTES))
+            .and_then(|bytes| bytes.checked_add(framing.encoded_bytes()))
             .ok_or(SchemaFailure::LimitExceeded)
+    }
+
+    pub(crate) fn paths_encoded_bytes_for(
+        &self,
+        paths: &[SchemaIndexPath],
+    ) -> Result<usize, SchemaFailure> {
+        Self::paths_encoded_bytes_with_framing(paths, self.scalar_framing)
     }
 
     pub(crate) fn covers_kind(&self, path: &SchemaPath, kind: AttributeValueKind) -> Option<bool> {

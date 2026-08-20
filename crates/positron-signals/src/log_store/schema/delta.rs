@@ -3,7 +3,7 @@ use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
 
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
-use super::index::{SchemaBlockIndex, SchemaIndexPath};
+use super::index::{ScalarIndexFraming, SchemaBlockIndex, SchemaIndexPath};
 use super::model::{MAX_DISCOVERY_NODES, SchemaEntry, SchemaPath, promoted_index_bytes};
 use super::observation::{ObservedAttribute, SchemaObservation};
 use super::representation::SchemaRepresentation;
@@ -133,6 +133,7 @@ impl SchemaDelta {
                 identity,
                 digest,
                 paths,
+                scalar_framing: ScalarIndexFraming::V2,
             }),
         )
     }
