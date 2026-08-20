@@ -300,7 +300,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         "indexed".to_owned(),
     )?)?;
     let records = vec![
-        record_with_occurrences("indexed", &["one", "one"])?,
+        record_with_occurrences("indexed", &["one", "two", "one"])?,
         record("overflow", "two")?,
     ];
     let identity = StoreBlockIdentity::new([0x69; 16])?;
@@ -331,6 +331,31 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     )?;
     assert_eq!(indexed.records().len(), 1);
     assert!(!indexed.reduced_pruning());
+    for (selector, expected_match) in [
+        (OccurrenceSelector::Index(0), true),
+        (OccurrenceSelector::Index(1), true),
+        (OccurrenceSelector::Index(2), true),
+        (OccurrenceSelector::All, false),
+    ] {
+        let expected = if matches!(selector, OccurrenceSelector::Index(1)) {
+            "two"
+        } else {
+            "one"
+        };
+        let ordered = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(2)?),
+            &schema,
+            &SchemaQuery::value(
+                SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?,
+                selector,
+                SchemaValue::string(expected),
+            ),
+        )?;
+        assert_eq!(ordered.records().len() == 1, expected_match);
+    }
     let indexed_reopened = store.scan_schema(
         authority.governor(),
         tenant,
@@ -480,6 +505,86 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
 }
 
 #[test]
+fn scalar_index_falls_back_for_a_composite_block() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1e; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2e; 32]), Box::new([0x3e; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(14)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x5e; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?;
+    let seed = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "indexed".to_owned(),
+        vec![CandidateAttributeValue::string("one".to_owned())],
+    )
+    .validate(LogStore::value_limit_profile())?;
+    schema.observe(std::slice::from_ref(&seed))?;
+    schema.record_query_use(&path)?;
+
+    for (identity, record) in [
+        (
+            StoreBlockIdentity::new([0x6e; 16])?,
+            record("indexed", "one")?,
+        ),
+        (
+            StoreBlockIdentity::new([0x6f; 16])?,
+            array_record("indexed")?,
+        ),
+    ] {
+        let (prepared, delta) = store.prepare_with_schema_delta(
+            preparation_capacity(&authority, tenant)?,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+            tenant,
+            shard,
+            identity,
+            vec![record],
+            &schema,
+        )?;
+        let block = prepared.into_store_block();
+        let digest = block.content_digest()?;
+        ledger.append(block)?;
+        store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+    }
+
+    let snapshot = ledger.snapshot()?;
+    let present = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &schema,
+        &query("indexed", "one")?,
+    )?;
+    assert_eq!(present.records().len(), 1);
+    assert!(present.reduced_pruning());
+    let absent = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &schema,
+        &query("indexed", "two")?,
+    )?;
+    assert!(absent.records().is_empty());
+    assert!(absent.scanned_bytes() > 0);
+    assert!(absent.reduced_pruning());
+    Ok(())
+}
+
+#[test]
 fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -623,6 +728,23 @@ fn nested_record(value: &str) -> Result<LogRecord, Box<dyn Error>> {
             ])],
         )],
         PolicyProvenance::new(1, [0x72; 32], vec![])?,
+    )?)
+}
+
+fn array_record(key: &str) -> Result<LogRecord, Box<dyn Error>> {
+    Ok(LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            key.to_owned(),
+            vec![CandidateAttributeValue::array(vec![
+                CandidateAttributeValue::boolean(true),
+            ])],
+        )],
+        PolicyProvenance::new(1, [0x73; 32], vec![])?,
     )?)
 }
 

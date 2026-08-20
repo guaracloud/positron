@@ -62,6 +62,43 @@ fn physical_scalar_dictionary_must_be_canonical_and_unique() -> Result<(), Box<d
     Ok(())
 }
 
+#[test]
+fn physical_scalar_dictionary_rejects_malformed_native_payloads() -> Result<(), Box<dyn Error>> {
+    let (_, valid) = indexed_checkpoint(false)?;
+    let marker = valid
+        .windows(8)
+        .position(|window| window == b"PVALUES\0")
+        .ok_or("scalar dictionary missing")?;
+    let value_start = marker.checked_add(16).ok_or("value offset overflow")?;
+
+    let mut invalid_tag = valid.clone();
+    *invalid_tag
+        .get_mut(value_start)
+        .ok_or("value tag missing")? = 9;
+    assert!(SchemaCatalog::decode_catalog_object(&invalid_tag).is_err());
+
+    let mut invalid_boolean = valid.clone();
+    *invalid_boolean
+        .get_mut(value_start)
+        .ok_or("value tag missing")? = 1;
+    *invalid_boolean
+        .get_mut(value_start + 1)
+        .ok_or("boolean payload missing")? = 2;
+    assert!(SchemaCatalog::decode_catalog_object(&invalid_boolean).is_err());
+
+    let mut invalid_utf8 = valid.clone();
+    *invalid_utf8
+        .get_mut(value_start + 9)
+        .ok_or("string payload missing")? = 0xff;
+    assert!(SchemaCatalog::decode_catalog_object(&invalid_utf8).is_err());
+
+    let truncated = valid
+        .get(..valid.len().checked_sub(1).ok_or("empty catalog")?)
+        .ok_or("truncation boundary missing")?;
+    assert!(SchemaCatalog::decode_catalog_object(truncated).is_err());
+    Ok(())
+}
+
 fn indexed_checkpoint(frontier: bool) -> Result<(SchemaCatalog, Vec<u8>), Box<dyn Error>> {
     let tenant = tenant();
     let budget = SchemaBudget::new(8, 8_192, 8_192, 4_096)?;
