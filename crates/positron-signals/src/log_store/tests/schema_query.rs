@@ -308,7 +308,7 @@ fn governed_promotion_overflow_releases_sidecar_cost_and_reopens() -> Result<(),
     .validate(LogStore::value_limit_profile())?])?;
     fixture.record_query_use(&path)?;
     let values = (0..4_096)
-        .map(|value| SchemaValue::signed_integer(value))
+        .map(SchemaValue::signed_integer)
         .collect::<Vec<_>>();
     let full = crate::log_store::schema::SchemaIndexPath::from_variants_and_values(
         &path,
