@@ -5,6 +5,7 @@ use crate::log_store::schema::index::{
     BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, INDEX_MAGIC, MAX_BLOCK_INDEXES, MAX_INDEX_VALUES,
     SCALAR_VALUES_MAGIC, ScalarIndexFraming, SchemaBlockIndex, SchemaIndexPath,
 };
+use crate::log_store::schema::model::MAX_SCALAR_VALUE_BYTES;
 use crate::log_store::schema::query::SchemaValue;
 use crate::log_store::{SchemaBudget, SchemaCatalog, SchemaFailure, SchemaPath};
 
@@ -330,9 +331,15 @@ fn put_value(bytes: &mut Vec<u8>, value: &SchemaValue) -> Result<(), SchemaFailu
             bytes.extend_from_slice(&value.to_be_bytes());
         },
         SchemaValue::String(value) => {
+            if value.len() > MAX_SCALAR_VALUE_BYTES {
+                return Err(SchemaFailure::LimitExceeded);
+            }
             put_bytes(bytes, value.as_bytes())?;
         },
         SchemaValue::Bytes(value) => {
+            if value.len() > MAX_SCALAR_VALUE_BYTES {
+                return Err(SchemaFailure::LimitExceeded);
+            }
             put_bytes(bytes, value)?;
         },
         SchemaValue::Kind(_) => return Err(SchemaFailure::InvalidValue),
@@ -356,6 +363,9 @@ fn preflight_value(input: &mut Input<'_>) -> Result<usize, SchemaFailure> {
         },
         ScalarTag::String | ScalarTag::Bytes => {
             let length = input.usize()?;
+            if length > MAX_SCALAR_VALUE_BYTES {
+                return Err(SchemaFailure::MalformedCatalog);
+            }
             let bytes = input.take(length)?;
             if matches!(tag, ScalarTag::String) && std::str::from_utf8(bytes).is_err() {
                 return Err(SchemaFailure::MalformedCatalog);
@@ -378,9 +388,25 @@ fn decode_value(input: &mut Input<'_>) -> Result<SchemaValue, SchemaFailure> {
         ScalarTag::FloatingPointBits => Ok(SchemaValue::FloatingPointBits(u64::from_be_bytes(
             input.array()?,
         ))),
-        ScalarTag::String => Ok(SchemaValue::String(input.string()?)),
+        ScalarTag::String => {
+            let length = input.usize()?;
+            if length > MAX_SCALAR_VALUE_BYTES {
+                return Err(SchemaFailure::MalformedCatalog);
+            }
+            let bytes = input.take(length)?;
+            let value = std::str::from_utf8(bytes).map_err(|_| SchemaFailure::MalformedCatalog)?;
+            let mut decoded = String::new();
+            decoded
+                .try_reserve_exact(length)
+                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+            decoded.push_str(value);
+            Ok(SchemaValue::String(decoded))
+        },
         ScalarTag::Bytes => {
             let length = input.usize()?;
+            if length > MAX_SCALAR_VALUE_BYTES {
+                return Err(SchemaFailure::MalformedCatalog);
+            }
             let source = input.take(length)?;
             let mut bytes = Vec::new();
             bytes

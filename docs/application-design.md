@@ -573,6 +573,10 @@ per-block sidecar-presence framing. Version 1 bytes beginning `PVALUES\0` remain
 StoreBlockIdentity bytes, preserving the legacy identity-collision contract. This
 versioning remains rebuildable optimization state and does not change the
 authoritative Store Block format.
+Scalar String and Bytes sidecar payloads use the canonical 65,536-byte native
+value limit. Any mutation of a version 1 physical index upgrades its framing to
+version 2 and reserves the one-byte presence field atomically before publication;
+the governed mutation fails closed when that additional budget is unavailable.
 Discovery returns tenant-bound bounded top
 paths, typed conflicts and variants, promotion decisions, budget pressure,
 overflow counts, and sampled path digests without exposing mutation authority.

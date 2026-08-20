@@ -148,6 +148,49 @@ fn physical_scalar_dictionary_rejects_malformed_native_payloads() -> Result<(), 
 }
 
 #[test]
+fn scalar_sidecar_string_and_bytes_payloads_obey_the_value_limit() -> Result<(), Box<dyn Error>> {
+    let maximum = super::super::model::MAX_SCALAR_VALUE_BYTES;
+    for (is_string, value, candidate) in [
+        (
+            true,
+            SchemaValue::string("a".repeat(maximum)),
+            CandidateAttributeValue::string("a".repeat(maximum)),
+        ),
+        (
+            false,
+            SchemaValue::bytes(vec![0; maximum]),
+            CandidateAttributeValue::bytes(vec![0; maximum]),
+        ),
+    ] {
+        let valid = scalar_payload_checkpoint(value, candidate)?;
+        let decoded = SchemaCatalog::decode_catalog_object(&valid)?;
+        assert_eq!(decoded.encode_catalog_object()?, valid);
+        let marker = valid
+            .windows(8)
+            .position(|window| window == b"PVALUES\0")
+            .ok_or("scalar dictionary")?;
+        let value_start = marker.checked_add(16).ok_or("value start")?;
+        let length_start = value_start.checked_add(1).ok_or("length start")?;
+
+        let mut oversized = valid.clone();
+        oversized[length_start..length_start + 8]
+            .copy_from_slice(&u64::try_from(maximum + 1)?.to_be_bytes());
+        oversized.push(if is_string { b'a' } else { 0 });
+        assert!(SchemaCatalog::decode_catalog_object(&oversized).is_err());
+
+        let truncated = valid
+            .get(..valid.len().checked_sub(1).ok_or("truncation")?)
+            .ok_or("truncation")?;
+        assert!(SchemaCatalog::decode_catalog_object(truncated).is_err());
+
+        let mut overflowing = valid;
+        overflowing[length_start..length_start + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(SchemaCatalog::decode_catalog_object(&overflowing).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn legacy_scalar_dictionary_without_explicit_presence_remains_readable()
 -> Result<(), Box<dyn Error>> {
     let (_, valid) = indexed_checkpoint(false)?;
@@ -204,6 +247,76 @@ fn legacy_multiple_blocks_at_exact_v1_budgets_reopen_without_sidecars() -> Resul
             .block_indexes
             .iter()
             .all(|block| block.paths.iter().all(|path| path.values.is_empty()))
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_mutation_upgrades_to_v2_framing_before_accounting_publication()
+-> Result<(), Box<dyn Error>> {
+    let (legacy, index_bytes) = exact_legacy_budget_checkpoint(1)?;
+    let legacy_len = legacy.len();
+    let added_wire = 29_u64;
+    let mut with_headroom = legacy.clone();
+    with_headroom[42..50].copy_from_slice(
+        &u64::try_from(legacy_len)?
+            .checked_add(added_wire)
+            .ok_or("persistent budget")?
+            .to_be_bytes(),
+    );
+    with_headroom[50..58].copy_from_slice(
+        &u64::try_from(index_bytes)?
+            .checked_add(added_wire)
+            .ok_or("index budget")?
+            .to_be_bytes(),
+    );
+    let (mut decoded, _) = SchemaCatalog::decode_checkpoint_object(&with_headroom)?;
+    let path = path(AttributeNamespace::Record, "indexed");
+    let incoming = super::super::index::SchemaIndexPath::from_variants_and_values(
+        &path,
+        &[positron_domain::value::AttributeValueKind::String],
+        &[SchemaValue::string("new")],
+    )?;
+    decoded.install_query_index(super::super::index::SchemaBlockIndex::one(
+        StoreBlockIdentity::new([0x11; 16])?,
+        [0x51; 32],
+        incoming,
+    )?)?;
+    let encoded = decoded.encode_catalog_object()?;
+    assert_eq!(decoded.persistent_bytes(), encoded.len());
+    assert_eq!(
+        decoded.persistent_bytes(),
+        legacy_len + usize::try_from(added_wire)?
+    );
+    let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
+    assert_eq!(reopened.persistent_bytes(), encoded.len());
+
+    let mut without_headroom = legacy;
+    without_headroom[42..50].copy_from_slice(
+        &u64::try_from(legacy_len)?
+            .checked_add(added_wire - 1)
+            .ok_or("persistent budget")?
+            .to_be_bytes(),
+    );
+    without_headroom[50..58].copy_from_slice(
+        &u64::try_from(index_bytes)?
+            .checked_add(added_wire - 1)
+            .ok_or("index budget")?
+            .to_be_bytes(),
+    );
+    let (mut tight, _) = SchemaCatalog::decode_checkpoint_object(&without_headroom)?;
+    let incoming = super::super::index::SchemaIndexPath::from_variants_and_values(
+        &path,
+        &[positron_domain::value::AttributeValueKind::String],
+        &[SchemaValue::string("new")],
+    )?;
+    assert_eq!(
+        tight.install_query_index(super::super::index::SchemaBlockIndex::one(
+            StoreBlockIdentity::new([0x11; 16])?,
+            [0x51; 32],
+            incoming,
+        )?),
+        Err(SchemaFailure::LimitExceeded)
     );
     Ok(())
 }
@@ -404,6 +517,28 @@ fn indexed_checkpoint(frontier: bool) -> Result<(SchemaCatalog, Vec<u8>), Box<dy
         catalog.encode_catalog_object()?
     };
     Ok((catalog, bytes))
+}
+
+fn scalar_payload_checkpoint(
+    value: SchemaValue,
+    candidate: CandidateAttributeValue,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let tenant = tenant();
+    let budget = SchemaBudget::new(8, 16_000_000, 1_048_576, 16_000_000)?;
+    let mut catalog = SchemaCatalog::new(tenant, budget)?;
+    let attribute = occurrence(AttributeNamespace::Record, "indexed", candidate)?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    let path = path(AttributeNamespace::Record, "indexed");
+    catalog.record_query_use(&path)?;
+    let kind = value.kind_value().ok_or("scalar value kind")?;
+    let indexed =
+        super::super::index::SchemaIndexPath::from_variants_and_values(&path, &[kind], &[value])?;
+    catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+        StoreBlockIdentity::new([0x59; 16])?,
+        [0x5a; 32],
+        indexed,
+    )?)?;
+    Ok(catalog.encode_catalog_object()?)
 }
 
 fn exact_legacy_budget_checkpoint(blocks: usize) -> Result<(Vec<u8>, usize), Box<dyn Error>> {

@@ -84,7 +84,11 @@ only when present. Readers accept version 1 objects without scalar sidecars
 version 2 objects using the explicit framing; a version 1 object is never
 parsed as version 2. Version 1 bytes beginning with `PVALUES\0` therefore
 remain the next identity, not an optional trailer. These sidecars do not add
-a Store Block tag or version.
+a Store Block tag or version. Each scalar String or Bytes payload is bounded to
+the canonical native value limit of 65,536 bytes. When a legacy version 1
+block is mutated by replay, promotion, or path removal, the in-memory index
+atomically upgrades that block to version 2 framing and charges its one-byte
+presence field before publication; insufficient budget rejects the mutation.
 The object is
 content-addressed and published only through
 the Storage Kernel Catalog Writer with the generation precondition and typed

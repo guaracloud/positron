@@ -154,7 +154,7 @@ impl SchemaCatalog {
                         projected.push(known_path.try_clone()?);
                     }
                 }
-                let new_wire = known.paths_encoded_bytes_for(&projected)?;
+                let new_wire = known.paths_encoded_bytes_after_mutation(&projected)?;
                 let old_memory = current.memory_bytes()?;
                 let new_memory = merged.memory_bytes()?;
                 let next_index_bytes = self
@@ -187,6 +187,7 @@ impl SchemaCatalog {
                     .get_mut(existing)
                     .ok_or(SchemaFailure::InvalidValue)?;
                 *existing = merged;
+                known.scalar_framing = known.scalar_framing.for_mutation();
                 self.index_bytes = next_index_bytes;
                 self.persistent_bytes = next_persistent_bytes;
                 self.memory_bytes = next_memory_bytes;
@@ -203,7 +204,7 @@ impl SchemaCatalog {
         }
         projected.insert(insertion, path.try_clone()?);
         let old_wire = known.paths_encoded_bytes_for(&known.paths)?;
-        let new_wire = known.paths_encoded_bytes_for(&projected)?;
+        let new_wire = known.paths_encoded_bytes_after_mutation(&projected)?;
         let added_wire = new_wire
             .checked_sub(old_wire)
             .ok_or(SchemaFailure::InvalidValue)?;
@@ -217,6 +218,7 @@ impl SchemaCatalog {
             .try_reserve_exact(1)
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
         known.paths.insert(insertion, path);
+        known.scalar_framing = known.scalar_framing.for_mutation();
         self.add_index_cost(added_wire, memory)
     }
 
@@ -359,7 +361,14 @@ impl SchemaCatalog {
                     .checked_add(indexed.memory_bytes()?)
                     .ok_or(SchemaFailure::LimitExceeded)?;
                 block.paths.remove(position);
-                let new_wire = block.paths_encoded_bytes_for(&block.paths)?;
+                let new_wire = if block.paths.is_empty() {
+                    0
+                } else {
+                    block.paths_encoded_bytes_after_mutation(&block.paths)?
+                };
+                if !block.paths.is_empty() {
+                    block.scalar_framing = block.scalar_framing.for_mutation();
+                }
                 removed_wire = removed_wire
                     .checked_add(
                         old_wire
