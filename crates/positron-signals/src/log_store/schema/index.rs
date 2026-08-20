@@ -256,6 +256,9 @@ impl SchemaBlockIndex {
     }
 
     pub(crate) fn paths_encoded_bytes(paths: &[SchemaIndexPath]) -> Result<usize, SchemaFailure> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
         let has_values = paths.iter().any(|path| !path.values.is_empty());
         let value_count_slots = if has_values {
             paths.iter().filter(|path| path.values.is_empty()).count()
