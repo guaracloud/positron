@@ -18,10 +18,14 @@ impl SchemaDelta {
         catalog: &SchemaCatalog,
         root: &[SchemaEntry],
     ) -> Result<(), SchemaFailure> {
-        for entry in root
-            .iter()
-            .filter(|entry| entry.query_uses > 0 && entry.promoted)
-        {
+        for entry in catalog.entries().filter(|entry| {
+            entry.query_uses > 0
+                && entry.promoted
+                && root.iter().any(|observed| {
+                    observed.path.namespace() == entry.path.namespace()
+                        && observed.path.segments().first() == entry.path.segments().first()
+                })
+        }) {
             self.mark_path_unverified(catalog, &entry.path)?;
         }
 

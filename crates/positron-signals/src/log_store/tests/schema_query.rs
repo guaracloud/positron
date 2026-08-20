@@ -262,6 +262,196 @@ fn merged_scalar_dictionary_falls_back_atomically_and_reopens() -> Result<(), Bo
 }
 
 #[test]
+fn scalar_budget_fallback_clears_prior_dictionary_values() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let kernel_catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x6b; 16])?,
+        CatalogSecret::from_owned(Box::new([0x6c; 32]), Box::new([0x6d; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(27)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &kernel_catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x6e; 32])),
+    )?;
+    let store = LogStore::new();
+    let path = SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(8, 4_000_000, 1_048_576, 130)?)?;
+    schema.observe(&[AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "indexed".to_owned(),
+        vec![CandidateAttributeValue::string("a".to_owned())],
+    )
+    .validate(LogStore::value_limit_profile())?])?;
+    schema.record_query_use(&path)?;
+    let identity = StoreBlockIdentity::new([0x6f; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(106))),
+        tenant,
+        shard,
+        identity,
+        vec![record("indexed", "a")?, record("indexed", "b")?],
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+
+    let snapshot = ledger.snapshot()?;
+    let query = SchemaQuery::value(
+        path.clone(),
+        OccurrenceSelector::Any,
+        SchemaValue::string("b"),
+    );
+    let result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &schema,
+        &query,
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert!(result.reduced_pruning());
+    drop(result);
+    let reopened =
+        SchemaCatalog::decode_checkpoint_object(&schema.encode_checkpoint_object(&[])?)?.0;
+    let reopened_result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &reopened,
+        &query,
+    )?;
+    assert_eq!(reopened_result.records().len(), 1);
+    assert!(reopened_result.reduced_pruning());
+    Ok(())
+}
+
+#[test]
+fn live_discovery_exhaustion_invalidates_unseen_promoted_descendants() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let kernel_catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x66; 16])?,
+        CatalogSecret::from_owned(Box::new([0x67; 32]), Box::new([0x68; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(26)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &kernel_catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x69; 32])),
+    )?;
+    let store = LogStore::new();
+    let path = SchemaPath::new(AttributeNamespace::Record, "payload.token".to_owned())?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    schema.observe(&[AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "payload".to_owned(),
+        vec![CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new(
+                "token".to_owned(),
+                CandidateAttributeValue::signed_integer(0),
+            ),
+        ])],
+    )
+    .validate(LogStore::value_limit_profile())?])?;
+    schema.record_query_use(&path)?;
+
+    let first = nested_integer_record(vec![vec![CandidateKeyValue::new(
+        "token".to_owned(),
+        CandidateAttributeValue::signed_integer(0),
+    )]])?;
+    let mut noisy_values = Vec::new();
+    for _ in 0..4 {
+        let mut noisy_entries = Vec::new();
+        for _ in 0..1_024 {
+            noisy_entries.push(CandidateKeyValue::new(
+                "noise".to_owned(),
+                CandidateAttributeValue::signed_integer(1),
+            ));
+        }
+        noisy_values.push(CandidateAttributeValue::key_value_list(noisy_entries));
+    }
+    noisy_values.push(CandidateAttributeValue::key_value_list(vec![
+        CandidateKeyValue::new(
+            "token".to_owned(),
+            CandidateAttributeValue::signed_integer(4_096),
+        ),
+    ]));
+    let second = LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            noisy_values,
+        )],
+        PolicyProvenance::new(1, [0x72; 32], vec![])?,
+    )?;
+    let identity = StoreBlockIdentity::new([0x6a; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(105))),
+        tenant,
+        shard,
+        identity,
+        vec![first, second],
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+
+    let snapshot = ledger.snapshot()?;
+    let query = SchemaQuery::value(
+        path.clone(),
+        OccurrenceSelector::Any,
+        SchemaValue::signed_integer(4_096),
+    );
+    let result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &schema,
+        &query,
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert!(result.reduced_pruning());
+    drop(result);
+    let reopened =
+        SchemaCatalog::decode_checkpoint_object(&schema.encode_checkpoint_object(&[])?)?.0;
+    let reopened_result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(2)?),
+        &reopened,
+        &query,
+    )?;
+    assert_eq!(reopened_result.records().len(), 1);
+    assert!(reopened_result.reduced_pruning());
+    Ok(())
+}
+
+#[test]
 fn governed_promotion_overflow_releases_sidecar_cost_and_reopens() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -1285,6 +1475,24 @@ fn nested_record(value: &str) -> Result<LogRecord, Box<dyn Error>> {
                     CandidateAttributeValue::string(value.to_owned()),
                 ),
             ])],
+        )],
+        PolicyProvenance::new(1, [0x72; 32], vec![])?,
+    )?)
+}
+
+fn nested_integer_record(values: Vec<Vec<CandidateKeyValue>>) -> Result<LogRecord, Box<dyn Error>> {
+    Ok(LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            values
+                .into_iter()
+                .map(CandidateAttributeValue::key_value_list)
+                .collect(),
         )],
         PolicyProvenance::new(1, [0x72; 32], vec![])?,
     )?)

@@ -128,6 +128,7 @@ fn merge_paths(
 ) -> Result<(), SchemaFailure> {
     known.kind_mask |= incoming.kind_mask;
     if !include_values {
+        known.values.clear();
         return Ok(());
     }
     for value in incoming.values {
