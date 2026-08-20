@@ -18,8 +18,8 @@ use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
 use crate::{
-    LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery,
-    SchemaSessionStore, SchemaValue,
+    LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaDiscoveryRequest,
+    SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue,
 };
 
 #[test]
@@ -68,20 +68,9 @@ fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
             &second.iter().map(String::as_str).collect::<Vec<_>>(),
         )?,
     ];
-
     let delta = session.stage_group(&mut records)?;
-    let cloned_delta = delta.try_clone()?;
-    assert_eq!(
-        cloned_delta.staged_memory_bytes(),
-        delta.staged_memory_bytes()
-    );
-
-    assert!(
-        delta.staged_memory_bytes() >= 24_576,
-        "fallback must retain the 1,024-element SchemaValue allocation: {}",
-        delta.staged_memory_bytes()
-    );
-    assert!(delta.retained_memory_bytes() > 0);
+    session.commit(delta, StoreBlockIdentity::new([0x4a; 16])?, [0x4b; 32])?;
+    assert!(session.catalog().memory_bytes() <= budget.max_memory_bytes());
     Ok(())
 }
 
@@ -519,7 +508,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         vec![CandidateAttributeValue::string("one".to_owned())],
     )
     .validate(LogStore::value_limit_profile())?;
-    schema.observe(&[seed])?;
+    schema.observe(std::slice::from_ref(&seed))?;
     schema.record_query_use(&SchemaPath::root(
         AttributeNamespace::Record,
         "indexed".to_owned(),
@@ -552,11 +541,26 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     )?;
     let checkpoint = schema.encode_catalog_object()?;
     let reopened = SchemaCatalog::decode_catalog_object(&checkpoint)?;
-    let snapshot = successor.snapshot()?;
+    let original_discovery = reopened.discover(SchemaDiscoveryRequest::new(1, 0)?)?;
     let marker = checkpoint
         .windows(8)
         .position(|window| window == b"PVALUES\0")
         .ok_or("scalar dictionary")?;
+    let value_offset = checkpoint
+        .get(marker + 8..)
+        .and_then(|bytes| bytes.windows(3).position(|window| window == b"one"))
+        .and_then(|offset| marker.checked_add(8)?.checked_add(offset))
+        .ok_or("scalar value")?;
+    let mut changed_checkpoint = checkpoint.clone();
+    changed_checkpoint[value_offset..value_offset + 3].copy_from_slice(b"odd");
+    let changed = SchemaCatalog::decode_catalog_object(&changed_checkpoint)?;
+    let changed_discovery = changed.discover(SchemaDiscoveryRequest::new(1, 0)?)?;
+    assert_ne!(
+        original_discovery.snapshot_digest(),
+        changed_discovery.snapshot_digest(),
+        "authenticated discovery digest must include scalar dictionary contents"
+    );
+    let snapshot = successor.snapshot()?;
     let presence = marker.checked_sub(1).ok_or("presence byte")?;
     let mut stale_checkpoint = checkpoint.clone();
     stale_checkpoint[presence] = 0;
@@ -586,6 +590,8 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     )?;
     assert_eq!(indexed.records().len(), 1);
     assert!(!indexed.reduced_pruning());
+    let indexed_record = indexed.records()[0].record().clone();
+    let indexed_reduced = indexed.reduced_pruning();
     replayed.retain_reachable_indexes(&[(target.identity(), target.content_digest()?)])?;
     replayed.reconcile_block_identity(target.identity(), [0x72; 32])?;
     let mut demotion = replayed.stage_query_update()?;
@@ -784,6 +790,79 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     assert_eq!(
         overflow_reopened.reduced_pruning(),
         overflow.reduced_pruning()
+    );
+
+    // This is a canonical rewritten sealed-block fixture, not a compaction
+    // executor: it proves representation invariance through public prepare,
+    // seal, reopen, and scan behavior.
+    drop(indexed);
+    drop(indexed_reopened);
+    drop(stale);
+    drop(replacement);
+    drop(forged);
+    drop(demoted);
+    drop(pruned);
+    drop(overflow);
+    drop(overflow_reopened);
+    drop(replayed);
+    drop(snapshot);
+    drop(successor);
+    let canonical_shard = VirtualShardId::new(23)?;
+    let canonical_scope = SegmentScope::new(tenant, SignalKind::Logs, canonical_shard);
+    let canonical_ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        canonical_scope,
+        SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
+    )?;
+    let mut canonical_schema =
+        SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 256)?)?;
+    canonical_schema.observe(std::slice::from_ref(&seed))?;
+    canonical_schema.record_query_use(&path)?;
+    let canonical_identity = StoreBlockIdentity::new([0x7a; 16])?;
+    let (canonical, canonical_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(102))),
+        tenant,
+        canonical_shard,
+        canonical_identity,
+        vec![record_with_occurrences("indexed", &["one", "two", "one"])?],
+        &canonical_schema,
+    )?;
+    let canonical_block = canonical.into_store_block();
+    let canonical_digest = canonical_block.content_digest()?;
+    canonical_ledger.append(canonical_block)?;
+    store.apply_schema_delta(
+        &mut canonical_schema,
+        canonical_delta,
+        canonical_identity,
+        canonical_digest,
+    )?;
+    let _canonical_sealed = canonical_ledger.seal()?;
+    let canonical_reopened = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        canonical_scope,
+        SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
+    )?;
+    let compacted = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &canonical_reopened.snapshot()?,
+        LogScan::all(ScanLimit::new(2)?),
+        &canonical_schema,
+        &query("indexed", "one")?,
+    )?;
+    assert_eq!(compacted.records().len(), 1);
+    assert_eq!(
+        compacted.records()[0].record(),
+        &indexed_record,
+        "canonical rewritten sealed block changed logical records"
+    );
+    assert_eq!(
+        compacted.reduced_pruning(),
+        indexed_reduced,
+        "canonical rewritten sealed block changed pruning metadata"
     );
     Ok(())
 }

@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 
 use super::SchemaPathDigest;
-use crate::log_store::schema::{SchemaCatalog, SchemaFailure, SchemaPath};
+use crate::log_store::schema::{SchemaCatalog, SchemaFailure, SchemaPath, SchemaValue};
 
 pub(super) fn path_digest(path: &SchemaPath) -> Result<SchemaPathDigest, SchemaFailure> {
     let mut hasher = Sha256::new();
@@ -17,7 +17,7 @@ pub(super) fn path_digest(path: &SchemaPath) -> Result<SchemaPathDigest, SchemaF
 
 pub(super) fn catalog_digest(catalog: &SchemaCatalog) -> Result<[u8; 32], SchemaFailure> {
     let mut hasher = Sha256::new();
-    hasher.update(b"positron-schema-discovery-v2");
+    hasher.update(b"positron-schema-discovery-v3");
     hasher.update(catalog.tenant.to_bytes());
     update_usize(&mut hasher, catalog.budget.max_entries())?;
     update_usize(&mut hasher, catalog.budget.max_memory_bytes())?;
@@ -47,11 +47,42 @@ pub(super) fn catalog_digest(catalog: &SchemaCatalog) -> Result<[u8; 32], Schema
         for indexed in &block.paths {
             hasher.update(path_digest(&indexed.path)?.as_bytes());
             hasher.update([indexed.kind_mask]);
+            update_usize(&mut hasher, indexed.values.len())?;
+            for value in &indexed.values {
+                update_scalar_value(&mut hasher, value)?;
+            }
         }
     }
     hasher.update(catalog.overflow_records.to_be_bytes());
     hasher.update(catalog.overflow_bytes.to_be_bytes());
     Ok(hasher.finalize().into())
+}
+
+fn update_scalar_value(hasher: &mut Sha256, value: &SchemaValue) -> Result<(), SchemaFailure> {
+    match value {
+        SchemaValue::Null => hasher.update([0]),
+        SchemaValue::Boolean(value) => hasher.update([1, u8::from(*value)]),
+        SchemaValue::SignedInteger(value) => {
+            hasher.update([2]);
+            hasher.update(value.to_be_bytes());
+        },
+        SchemaValue::FloatingPointBits(value) => {
+            hasher.update([3]);
+            hasher.update(value.to_be_bytes());
+        },
+        SchemaValue::String(value) => {
+            hasher.update([4]);
+            update_usize(hasher, value.len())?;
+            hasher.update(value.as_bytes());
+        },
+        SchemaValue::Bytes(value) => {
+            hasher.update([5]);
+            update_usize(hasher, value.len())?;
+            hasher.update(value);
+        },
+        SchemaValue::Kind(_) => return Err(SchemaFailure::InvalidValue),
+    }
+    Ok(())
 }
 
 fn update_usize(hasher: &mut Sha256, value: usize) -> Result<(), SchemaFailure> {
