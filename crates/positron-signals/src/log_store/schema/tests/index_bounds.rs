@@ -98,6 +98,7 @@ fn query_indexes_merge_idempotently_and_reconcile_reachability() -> Result<(), B
         super::super::index::SchemaIndexPath {
             path: path(AttributeNamespace::Record, "missing"),
             kind_mask: 1,
+            values: Vec::new(),
         },
     )?;
     assert_eq!(

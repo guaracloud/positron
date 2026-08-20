@@ -11,6 +11,7 @@ use super::model::{
 };
 #[cfg(test)]
 use super::observation::SchemaObservation;
+use super::query::SchemaValue;
 
 /// Observable typed schema and overflow state for one tenant.
 #[derive(Debug, Eq, PartialEq)]
@@ -117,6 +118,22 @@ impl SchemaCatalog {
             .filter(|index| index.digest == digest)
             .filter(|index| index.semantically_valid(&self.entries))
             .and_then(|index| index.covers_kind(path, kind))
+    }
+
+    pub(crate) fn verified_block_value(
+        &self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+        path: &SchemaPath,
+        expected: &SchemaValue,
+    ) -> Option<bool> {
+        self.block_indexes
+            .binary_search_by_key(&identity, |index| index.identity)
+            .ok()
+            .and_then(|position| self.block_indexes.get(position))
+            .filter(|index| index.digest == digest)
+            .filter(|index| index.semantically_valid(&self.entries))
+            .and_then(|index| index.covers_value(path, expected))
     }
 
     pub(crate) fn has_verified_block(

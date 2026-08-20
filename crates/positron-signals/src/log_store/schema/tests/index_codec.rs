@@ -45,6 +45,23 @@ fn physical_index_must_match_catalog_path_and_complete_kind_set() -> Result<(), 
     Ok(())
 }
 
+#[test]
+fn physical_scalar_dictionary_must_be_canonical_and_unique() -> Result<(), Box<dyn Error>> {
+    let (_, valid) = indexed_checkpoint(false)?;
+    let marker = valid
+        .windows(8)
+        .position(|window| window == b"PVALUES\0")
+        .ok_or("scalar dictionary missing")?;
+    let value_count = marker.checked_add(8).ok_or("count offset overflow")?;
+    let value_start = marker.checked_add(16).ok_or("value offset overflow")?;
+    let value = valid.get(value_start..).ok_or("scalar value missing")?;
+    let mut duplicate = valid.clone();
+    duplicate[value_count..value_start].copy_from_slice(&2_u64.to_be_bytes());
+    duplicate.extend_from_slice(value);
+    assert!(SchemaCatalog::decode_catalog_object(&duplicate).is_err());
+    Ok(())
+}
+
 fn indexed_checkpoint(frontier: bool) -> Result<(SchemaCatalog, Vec<u8>), Box<dyn Error>> {
     let tenant = tenant();
     let budget = SchemaBudget::new(8, 8_192, 8_192, 4_096)?;

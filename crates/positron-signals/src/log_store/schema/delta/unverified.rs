@@ -3,7 +3,9 @@ use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
 use super::{DiscoveryMeter, SchemaDelta, projected_cost, staged_memory_bytes};
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
-use crate::log_store::schema::index::{BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES};
+use crate::log_store::schema::index::{
+    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, SCALAR_VALUES_MAGIC,
+};
 use crate::log_store::schema::model::{SchemaBudget, SchemaEntry, SchemaPath};
 
 impl SchemaDelta {
@@ -104,6 +106,7 @@ impl SchemaDelta {
         }
 
         let mut removed = false;
+        let mut removed_scalar_values = false;
         let mut position = self.index_paths.len();
         while position > 0 {
             position -= 1;
@@ -127,6 +130,7 @@ impl SchemaDelta {
                 .physical_memory_bytes
                 .checked_sub(indexed.memory_bytes()?)
                 .ok_or(SchemaFailure::InvalidValue)?;
+            removed_scalar_values |= !indexed.values.is_empty();
             self.index_paths.remove(position);
         }
         if removed && self.index_paths.is_empty() {
@@ -137,7 +141,15 @@ impl SchemaDelta {
             };
             self.physical_index_bytes = self
                 .physical_index_bytes
-                .checked_sub(BLOCK_INDEX_HEADER_BYTES + index_header)
+                .checked_sub(
+                    BLOCK_INDEX_HEADER_BYTES
+                        + index_header
+                        + if removed_scalar_values {
+                            SCALAR_VALUES_MAGIC.len()
+                        } else {
+                            0
+                        },
+                )
                 .ok_or(SchemaFailure::InvalidValue)?;
             self.physical_memory_bytes = self
                 .physical_memory_bytes

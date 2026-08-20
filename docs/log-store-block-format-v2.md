@@ -65,7 +65,10 @@ version `1`, followed by the tenant identity, entry/memory/persistent-byte/
 index-byte budgets, overflow record and byte counters, and deterministic
 namespace-qualified path entries. Each entry preserves observed typed
 variants, observation and conflict counts, query-use count, promotion state,
-index bytes, and canonical bounded per-block typed dictionaries. A bounded
+index bytes, and canonical bounded per-block typed dictionaries. Scalar
+dictionaries retain a sorted, duplicate-free set of exact native scalar values
+in addition to the type mask; a legacy or type-only sidecar remains valid
+coverage only for type pruning. A bounded
 `REPLAY1` trailer records one canonical authenticated replay frontier per
 shard. The allocation-free reader preflight accounts catalog entries, physical
 index paths, and frontier vector storage before construction. Each physical
@@ -90,9 +93,12 @@ values remain unchanged; overflow updates only bounded evidence and never
 allocates catalog, statistics, dictionary, or automatic-index state. Generic
 and overflow records therefore have identical logical scan and typed-query
 semantics, while overflow scans report reduced pruning. Promoted scalar paths
-carry a canonical typed-variant dictionary whose entry, per-block
-identity/digest framing, path, and type-mask bytes all consume the same checked
-index and persistent budgets. Observation or governed query-use evidence may
+carry a canonical typed-variant and scalar-value dictionary whose entry,
+per-block identity/digest framing, path, type-mask, value-count, and value
+bytes all consume the same checked index, persistent, and retained-memory
+budgets. Scalar sidecar bytes are rebuildable and bounded; when the scalar
+dictionary cannot fit, the path falls back to type-only coverage or Schema
+Overflow atomically. Observation or governed query-use evidence may
 promote a path; removing query evidence or reconciling unreachable blocks
 removes the corresponding physical coverage without altering logical state.
 Dictionary budget exhaustion overflows the complete attribute root atomically.

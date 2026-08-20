@@ -560,8 +560,9 @@ immutable views or opaque staged deltas. Catalog state is published only
 through the Storage Kernel Catalog Writer; no receiver or private schema
 publisher may bypass that authority. Generic and overflow
 representations use the same logical scan and explicit typed occurrence query
-semantics. Scalar paths consume an exact bounded typed-variant dictionary
-budget. `PSCHEMA1` binds each physical dictionary to the exact Store Block
+ semantics. Scalar paths consume an exact bounded typed-variant and native
+ scalar-value dictionary budget. `PSCHEMA1` binds each physical dictionary to
+ the exact Store Block
 identity and authenticated payload digest; only matching coverage may prune an
 impossible type. Missing, stale, replaced, demoted, generic, or Schema Overflow
 coverage selects the generic scan and exposes reduced pruning without changing

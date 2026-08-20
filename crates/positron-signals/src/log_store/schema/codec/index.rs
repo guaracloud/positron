@@ -2,9 +2,10 @@ use positron_kernel::StoreBlockIdentity;
 
 use super::{Input, decode_namespace, namespace_tag, put_bytes, put_len, put_u16};
 use crate::log_store::schema::index::{
-    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, INDEX_MAGIC, MAX_BLOCK_INDEXES, SchemaBlockIndex,
-    SchemaIndexPath,
+    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, INDEX_MAGIC, MAX_BLOCK_INDEXES, MAX_INDEX_VALUES,
+    SCALAR_VALUES_MAGIC, SchemaBlockIndex, SchemaIndexPath,
 };
+use crate::log_store::schema::query::SchemaValue;
 use crate::log_store::{SchemaBudget, SchemaCatalog, SchemaFailure, SchemaPath};
 
 pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(), SchemaFailure> {
@@ -24,6 +25,15 @@ pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(),
                 put_bytes(bytes, segment.as_bytes())?;
             }
             bytes.push(indexed.kind_mask);
+        }
+        if block.paths.iter().any(|indexed| !indexed.values.is_empty()) {
+            bytes.extend_from_slice(SCALAR_VALUES_MAGIC);
+            for indexed in &block.paths {
+                put_len(bytes, indexed.values.len())?;
+                for value in &indexed.values {
+                    put_value(bytes, value)?;
+                }
+            }
         }
     }
     Ok(())
@@ -107,8 +117,24 @@ pub(super) fn preflight(
                     SchemaBudget::index_path_memory_bytes(path_bytes, segments)
                         .ok_or(SchemaFailure::MalformedCatalog)?,
                 )
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaValue>>()))
                 .filter(|bytes| *bytes <= budget.max_memory_bytes())
                 .ok_or(SchemaFailure::MalformedCatalog)?;
+        }
+        if input.starts_with(SCALAR_VALUES_MAGIC) {
+            input.take(SCALAR_VALUES_MAGIC.len())?;
+            for _ in 0..paths {
+                let values = input.usize()?;
+                if values > MAX_INDEX_VALUES {
+                    return Err(SchemaFailure::MalformedCatalog);
+                }
+                for _ in 0..values {
+                    memory = memory
+                        .checked_add(preflight_value(&mut *input)?)
+                        .filter(|bytes| *bytes <= budget.max_memory_bytes())
+                        .ok_or(SchemaFailure::MalformedCatalog)?;
+                }
+            }
         }
     }
     let encoded_bytes = before
@@ -167,11 +193,43 @@ pub(super) fn decode(
             let indexed = SchemaIndexPath {
                 path,
                 kind_mask: input.u8()?,
+                values: Vec::new(),
             };
             memory = memory
                 .checked_add(indexed.memory_bytes()?)
                 .ok_or(SchemaFailure::MalformedCatalog)?;
             paths.push(indexed);
+        }
+        if input.starts_with(SCALAR_VALUES_MAGIC) {
+            input.take(SCALAR_VALUES_MAGIC.len())?;
+            for path in &mut paths {
+                let count = input.usize()?;
+                if count > MAX_INDEX_VALUES {
+                    return Err(SchemaFailure::MalformedCatalog);
+                }
+                path.values
+                    .try_reserve_exact(count)
+                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+                for _ in 0..count {
+                    path.values.push(decode_value(&mut *input)?);
+                }
+                if path
+                    .values
+                    .windows(2)
+                    .any(|values| values.first() >= values.get(1))
+                {
+                    return Err(SchemaFailure::MalformedCatalog);
+                }
+            }
+        }
+        for path in &paths {
+            memory = memory
+                .checked_add(path.values.iter().try_fold(0_usize, |total, value| {
+                    total
+                        .checked_add(value.memory_bytes()?)
+                        .ok_or(SchemaFailure::MalformedCatalog)
+                })?)
+                .ok_or(SchemaFailure::MalformedCatalog)?;
         }
         blocks.push(SchemaBlockIndex {
             identity,
@@ -186,4 +244,90 @@ pub(super) fn decode(
         return Err(SchemaFailure::MalformedCatalog);
     }
     Ok((blocks, physical, memory))
+}
+
+fn put_value(bytes: &mut Vec<u8>, value: &SchemaValue) -> Result<(), SchemaFailure> {
+    match value {
+        SchemaValue::Null => bytes.push(0),
+        SchemaValue::Boolean(value) => {
+            bytes.push(1);
+            bytes.push(u8::from(*value));
+        },
+        SchemaValue::SignedInteger(value) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&value.to_be_bytes());
+        },
+        SchemaValue::FloatingPointBits(value) => {
+            bytes.push(3);
+            bytes.extend_from_slice(&value.to_be_bytes());
+        },
+        SchemaValue::String(value) => {
+            bytes.push(4);
+            put_bytes(bytes, value.as_bytes())?;
+        },
+        SchemaValue::Bytes(value) => {
+            bytes.push(5);
+            put_bytes(bytes, value)?;
+        },
+        SchemaValue::Kind(_) => return Err(SchemaFailure::InvalidValue),
+    }
+    Ok(())
+}
+
+fn preflight_value(input: &mut Input<'_>) -> Result<usize, SchemaFailure> {
+    let tag = input.u8()?;
+    let payload = match tag {
+        0 => 0,
+        1 => {
+            if input.u8()? > 1 {
+                return Err(SchemaFailure::MalformedCatalog);
+            }
+            1
+        },
+        2 | 3 => {
+            input.take(8)?;
+            8
+        },
+        4 | 5 => {
+            let length = input.usize()?;
+            let bytes = input.take(length)?;
+            if tag == 4 && std::str::from_utf8(bytes).is_err() {
+                return Err(SchemaFailure::MalformedCatalog);
+            }
+            length
+        },
+        _ => return Err(SchemaFailure::MalformedCatalog),
+    };
+    std::mem::size_of::<SchemaValue>()
+        .checked_add(payload)
+        .ok_or(SchemaFailure::MalformedCatalog)
+}
+
+fn decode_value(input: &mut Input<'_>) -> Result<SchemaValue, SchemaFailure> {
+    match input.u8()? {
+        0 => Ok(SchemaValue::Null),
+        1 => match input.u8()? {
+            0 => Ok(SchemaValue::Boolean(false)),
+            1 => Ok(SchemaValue::Boolean(true)),
+            _ => Err(SchemaFailure::MalformedCatalog),
+        },
+        2 => Ok(SchemaValue::SignedInteger(i64::from_be_bytes(
+            input.array()?,
+        ))),
+        3 => Ok(SchemaValue::FloatingPointBits(u64::from_be_bytes(
+            input.array()?,
+        ))),
+        4 => Ok(SchemaValue::String(input.string()?)),
+        5 => {
+            let length = input.usize()?;
+            let source = input.take(length)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+            bytes.extend_from_slice(source);
+            Ok(SchemaValue::Bytes(bytes))
+        },
+        _ => Err(SchemaFailure::MalformedCatalog),
+    }
 }

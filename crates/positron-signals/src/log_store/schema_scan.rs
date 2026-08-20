@@ -73,12 +73,20 @@ impl LogStore {
                 continue;
             }
             let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
-            match schema.verified_block_kind(
-                block.identity(),
-                digest,
-                query.path(),
-                query.expected_kind(),
-            ) {
+            let coverage = query.expected_scalar().map_or_else(
+                || {
+                    schema.verified_block_kind(
+                        block.identity(),
+                        digest,
+                        query.path(),
+                        query.expected_kind(),
+                    )
+                },
+                |expected| {
+                    schema.verified_block_value(block.identity(), digest, query.path(), expected)
+                },
+            );
+            match coverage {
                 Some(false) => continue,
                 Some(true) => {},
                 None => reduced_pruning = true,

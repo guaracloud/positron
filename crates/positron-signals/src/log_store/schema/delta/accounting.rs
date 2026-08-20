@@ -13,6 +13,7 @@ pub(super) fn root_fits(
     catalog: &SchemaCatalog,
     delta: &SchemaDelta,
     root: &[SchemaEntry],
+    attributes: &[AttributeOccurrenceSet],
 ) -> Result<bool, SchemaFailure> {
     if delta.build_physical_index
         && delta.index_paths.is_empty()
@@ -24,7 +25,8 @@ pub(super) fn root_fits(
         return Ok(false);
     }
     let (memory, persistent, index, new_entries) = projected_cost(catalog, delta, Some(root))?;
-    let (physical_memory, physical_bytes) = additional_physical_cost(catalog, delta, root)?;
+    let (physical_memory, physical_bytes) =
+        additional_physical_cost(catalog, delta, root, attributes)?;
     let entries = catalog
         .entries
         .len()

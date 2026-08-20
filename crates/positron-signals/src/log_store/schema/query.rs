@@ -1,6 +1,6 @@
 use positron_domain::value::{AttributeOccurrenceSet, AttributeValueKind, ValidatedAttributeValue};
 
-use super::{SchemaCatalog, SchemaObservation, SchemaPath, SchemaRepresentation};
+use super::{SchemaCatalog, SchemaFailure, SchemaObservation, SchemaPath, SchemaRepresentation};
 use crate::log_store::{AttributeRepresentation, StoredLogRecord};
 
 /// Explicit selection semantics for repeated attribute occurrences.
@@ -12,7 +12,7 @@ pub enum OccurrenceSelector {
 }
 
 /// A typed scalar or structural value used by a Log Store path query.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SchemaValue {
     Null,
     Boolean(bool),
@@ -52,6 +52,119 @@ impl SchemaValue {
     pub const fn kind(value: AttributeValueKind) -> Self {
         Self::Kind(value)
     }
+
+    pub(crate) fn try_from_validated(
+        value: &ValidatedAttributeValue,
+    ) -> Result<Option<Self>, SchemaFailure> {
+        let scalar = match value.kind() {
+            AttributeValueKind::Null => Self::Null,
+            AttributeValueKind::Boolean => {
+                Self::Boolean(value.as_boolean().ok_or(SchemaFailure::InvalidValue)?)
+            },
+            AttributeValueKind::SignedInteger => Self::SignedInteger(
+                value
+                    .as_signed_integer()
+                    .ok_or(SchemaFailure::InvalidValue)?,
+            ),
+            AttributeValueKind::FloatingPoint => Self::FloatingPointBits(
+                value
+                    .as_floating_point_bits()
+                    .ok_or(SchemaFailure::InvalidValue)?,
+            ),
+            AttributeValueKind::String => {
+                let source = value.as_str().ok_or(SchemaFailure::InvalidValue)?;
+                let mut owned = String::new();
+                owned
+                    .try_reserve_exact(source.len())
+                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+                owned.push_str(source);
+                Self::String(owned)
+            },
+            AttributeValueKind::Bytes => {
+                let source = value.as_bytes().ok_or(SchemaFailure::InvalidValue)?;
+                let mut owned = Vec::new();
+                owned
+                    .try_reserve_exact(source.len())
+                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+                owned.extend_from_slice(source);
+                Self::Bytes(owned)
+            },
+            AttributeValueKind::Array | AttributeValueKind::KeyValueList => return Ok(None),
+        };
+        Ok(Some(scalar))
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, SchemaFailure> {
+        match self {
+            Self::Null => Ok(Self::Null),
+            Self::Boolean(value) => Ok(Self::Boolean(*value)),
+            Self::SignedInteger(value) => Ok(Self::SignedInteger(*value)),
+            Self::FloatingPointBits(value) => Ok(Self::FloatingPointBits(*value)),
+            Self::String(value) => {
+                let mut cloned = String::new();
+                cloned
+                    .try_reserve_exact(value.len())
+                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+                cloned.push_str(value);
+                Ok(Self::String(cloned))
+            },
+            Self::Bytes(value) => {
+                let mut cloned = Vec::new();
+                cloned
+                    .try_reserve_exact(value.len())
+                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+                cloned.extend_from_slice(value);
+                Ok(Self::Bytes(cloned))
+            },
+            Self::Kind(_) => Err(SchemaFailure::InvalidValue),
+        }
+    }
+
+    pub(crate) const fn kind_value(&self) -> Option<AttributeValueKind> {
+        match self {
+            Self::Null => Some(AttributeValueKind::Null),
+            Self::Boolean(_) => Some(AttributeValueKind::Boolean),
+            Self::SignedInteger(_) => Some(AttributeValueKind::SignedInteger),
+            Self::FloatingPointBits(_) => Some(AttributeValueKind::FloatingPoint),
+            Self::String(_) => Some(AttributeValueKind::String),
+            Self::Bytes(_) => Some(AttributeValueKind::Bytes),
+            Self::Kind(_) => None,
+        }
+    }
+
+    pub(crate) fn encoded_bytes(&self) -> Result<usize, SchemaFailure> {
+        let payload = match self {
+            Self::Null => 0,
+            Self::Boolean(_) => 1,
+            Self::SignedInteger(_) | Self::FloatingPointBits(_) => 8,
+            Self::String(value) => value.len(),
+            Self::Bytes(value) => value.len(),
+            Self::Kind(_) => return Err(SchemaFailure::InvalidValue),
+        };
+        let length: usize = match self {
+            Self::Null => 1,
+            Self::Boolean(_) | Self::SignedInteger(_) | Self::FloatingPointBits(_) => 1,
+            Self::String(_) | Self::Bytes(_) => 1 + 8,
+            Self::Kind(_) => return Err(SchemaFailure::InvalidValue),
+        };
+        length
+            .checked_add(payload)
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
+    pub(crate) fn memory_bytes(&self) -> Result<usize, SchemaFailure> {
+        std::mem::size_of::<Self>()
+            .checked_add(match self {
+                Self::String(value) => value.capacity(),
+                Self::Bytes(value) => value.capacity(),
+                Self::Null
+                | Self::Boolean(_)
+                | Self::SignedInteger(_)
+                | Self::FloatingPointBits(_) => 0,
+                Self::Kind(_) => return Err(SchemaFailure::InvalidValue),
+            })
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
 }
 
 /// A path and typed predicate evaluated against one immutable observation.
@@ -88,6 +201,13 @@ impl SchemaQuery {
             SchemaValue::String(_) => AttributeValueKind::String,
             SchemaValue::Bytes(_) => AttributeValueKind::Bytes,
             SchemaValue::Kind(kind) => *kind,
+        }
+    }
+
+    pub(crate) const fn expected_scalar(&self) -> Option<&SchemaValue> {
+        match self.value {
+            SchemaValue::Kind(_) => None,
+            _ => Some(&self.value),
         }
     }
 }

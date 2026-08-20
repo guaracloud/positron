@@ -33,6 +33,7 @@ pub struct SchemaDelta {
     physical_index_bytes: usize,
     physical_memory_bytes: usize,
     build_physical_index: bool,
+    scalar_values: bool,
 }
 
 impl SchemaDelta {
@@ -52,6 +53,7 @@ impl SchemaDelta {
             physical_index_bytes: 0,
             physical_memory_bytes: 0,
             build_physical_index,
+            scalar_values: true,
         }
     }
 
@@ -114,6 +116,7 @@ impl SchemaDelta {
             physical_index_bytes: self.physical_index_bytes,
             physical_memory_bytes: self.physical_memory_bytes,
             build_physical_index: self.build_physical_index,
+            scalar_values: self.scalar_values,
         })
     }
 
@@ -241,9 +244,9 @@ impl SchemaCatalog {
                     complete = false;
                 }
             }
-            let cataloged = complete && root_fits(self, delta, &root)?;
+            let cataloged = complete && root_fits(self, delta, &root, attributes)?;
             if cataloged {
-                stage_index_root(self, delta, &root)?;
+                stage_index_root(self, delta, &root, attributes)?;
                 merge_root(delta, root)?;
             } else {
                 delta.mark_paths_unverified(self, &root)?;

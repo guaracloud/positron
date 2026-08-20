@@ -5,7 +5,7 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind,
-    CandidateAttributeValue,
+    CandidateAttributeValue, CandidateKeyValue,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
@@ -21,6 +21,251 @@ use crate::{
     LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery,
     SchemaValue,
 };
+
+#[test]
+fn scalar_index_prunes_an_absent_same_type_value() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1b; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2b; 32]), Box::new([0x3b; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(11)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x5b; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let indexed_path = SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?;
+    let seed = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "indexed".to_owned(),
+        vec![CandidateAttributeValue::string("one".to_owned())],
+    )
+    .validate(LogStore::value_limit_profile())?;
+    schema.observe(&[seed])?;
+    schema.record_query_use(&indexed_path)?;
+    let identity = StoreBlockIdentity::new([0x6b; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        identity,
+        vec![record("indexed", "one")?],
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+
+    let result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &query("indexed", "two")?,
+    )?;
+    assert!(result.records().is_empty());
+    assert_eq!(result.scanned_bytes(), 0);
+    assert!(!result.reduced_pruning());
+    Ok(())
+}
+
+#[test]
+fn scalar_index_prunes_an_absent_nested_value() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1c; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2c; 32]), Box::new([0x3c; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(12)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x5c; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let seed = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "payload".to_owned(),
+        vec![CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new(
+                "token".to_owned(),
+                CandidateAttributeValue::string("one".to_owned()),
+            ),
+        ])],
+    )
+    .validate(LogStore::value_limit_profile())?;
+    schema.observe(std::slice::from_ref(&seed))?;
+    let nested_path = SchemaPath::new(AttributeNamespace::Record, "payload.token".to_owned())?;
+    schema.record_query_use(&nested_path)?;
+    let identity = StoreBlockIdentity::new([0x6c; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        identity,
+        vec![nested_record("one")?],
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+
+    let result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &SchemaQuery::value(
+            nested_path,
+            OccurrenceSelector::Any,
+            SchemaValue::string("two"),
+        ),
+    )?;
+    assert!(result.records().is_empty());
+    assert_eq!(result.scanned_bytes(), 0);
+    assert!(!result.reduced_pruning());
+    Ok(())
+}
+
+#[test]
+fn scalar_index_round_trips_each_native_scalar_dictionary() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1d; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2d; 32]), Box::new([0x3d; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(13)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x5d; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let values = vec![
+        (
+            "null",
+            CandidateAttributeValue::null(),
+            SchemaValue::null(),
+            SchemaValue::kind(AttributeValueKind::Boolean),
+        ),
+        (
+            "boolean",
+            CandidateAttributeValue::boolean(true),
+            SchemaValue::boolean(true),
+            SchemaValue::boolean(false),
+        ),
+        (
+            "integer",
+            CandidateAttributeValue::signed_integer(7),
+            SchemaValue::signed_integer(7),
+            SchemaValue::signed_integer(8),
+        ),
+        (
+            "floating",
+            CandidateAttributeValue::floating_point_bits(1.5_f64.to_bits()),
+            SchemaValue::floating_point_bits(1.5_f64.to_bits()),
+            SchemaValue::floating_point_bits(2.5_f64.to_bits()),
+        ),
+        (
+            "string",
+            CandidateAttributeValue::string("one".to_owned()),
+            SchemaValue::string("one"),
+            SchemaValue::string("two"),
+        ),
+        (
+            "bytes",
+            CandidateAttributeValue::bytes(vec![1, 2]),
+            SchemaValue::bytes(vec![1, 2]),
+            SchemaValue::bytes(vec![2, 1]),
+        ),
+    ];
+    let mut records = Vec::new();
+    for (key, candidate, _, _) in &values {
+        let seed = AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            (*key).to_owned(),
+            vec![candidate.clone()],
+        )
+        .validate(LogStore::value_limit_profile())?;
+        schema.observe(std::slice::from_ref(&seed))?;
+        schema.record_query_use(&SchemaPath::root(
+            AttributeNamespace::Record,
+            (*key).to_owned(),
+        )?)?;
+        records.push(scalar_record(key, candidate.clone())?);
+    }
+    let identity = StoreBlockIdentity::new([0x6d; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        identity,
+        records,
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+    let encoded = schema
+        .encode_catalog_object()
+        .map_err(|failure| format!("encode: {failure:?}"))?;
+    let reopened = SchemaCatalog::decode_catalog_object(&encoded)
+        .map_err(|failure| format!("decode: {failure:?}"))?;
+    let snapshot = ledger.snapshot()?;
+    for (key, _, expected, absent) in values {
+        let path = SchemaPath::root(AttributeNamespace::Record, key.to_owned())?;
+        let present = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &reopened,
+            &SchemaQuery::value(path.clone(), OccurrenceSelector::Any, expected),
+        )?;
+        assert_eq!(present.records().len(), 1, "present value for {key}");
+        assert!(!present.reduced_pruning());
+        let missing = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &reopened,
+            &SchemaQuery::value(path, OccurrenceSelector::Any, absent),
+        )?;
+        assert!(missing.records().is_empty(), "absent value for {key}");
+        assert_eq!(missing.scanned_bytes(), 0, "pruned value for {key}");
+        assert!(!missing.reduced_pruning());
+    }
+    Ok(())
+}
 
 #[test]
 fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(), Box<dyn Error>> {
@@ -358,6 +603,41 @@ fn record_with_occurrences(key: &str, values: &[&str]) -> Result<LogRecord, Box<
                 .collect(),
         )],
         PolicyProvenance::new(1, [0x71; 32], vec![])?,
+    )?)
+}
+
+fn nested_record(value: &str) -> Result<LogRecord, Box<dyn Error>> {
+    Ok(LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            vec![CandidateAttributeValue::key_value_list(vec![
+                CandidateKeyValue::new(
+                    "token".to_owned(),
+                    CandidateAttributeValue::string(value.to_owned()),
+                ),
+            ])],
+        )],
+        PolicyProvenance::new(1, [0x72; 32], vec![])?,
+    )?)
+}
+
+fn scalar_record(key: &str, value: CandidateAttributeValue) -> Result<LogRecord, Box<dyn Error>> {
+    Ok(LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            key.to_owned(),
+            vec![value],
+        )],
+        PolicyProvenance::new(1, [0x74; 32], vec![])?,
     )?)
 }
 
