@@ -159,11 +159,27 @@ impl SchemaCatalog {
                 let new_wire = SchemaBlockIndex::paths_encoded_bytes(&projected)?;
                 let old_memory = current.memory_bytes()?;
                 let new_memory = merged.memory_bytes()?;
-                let added_wire = new_wire
+                let next_index_bytes = self
+                    .index_bytes
                     .checked_sub(old_wire)
+                    .and_then(|bytes| bytes.checked_add(new_wire))
                     .ok_or(SchemaFailure::InvalidValue)?;
-                let added_memory = new_memory.checked_sub(old_memory).map_or(0, |value| value);
-                self.ensure_index_cost(added_wire, added_memory)?;
+                let next_persistent_bytes = self
+                    .persistent_bytes
+                    .checked_sub(old_wire)
+                    .and_then(|bytes| bytes.checked_add(new_wire))
+                    .ok_or(SchemaFailure::InvalidValue)?;
+                let next_memory_bytes = self
+                    .memory_bytes
+                    .checked_sub(old_memory)
+                    .and_then(|bytes| bytes.checked_add(new_memory))
+                    .ok_or(SchemaFailure::InvalidValue)?;
+                if next_index_bytes > self.budget.max_index_bytes()
+                    || next_persistent_bytes > self.budget.max_persistent_bytes()
+                    || next_memory_bytes > self.budget.max_memory_bytes()
+                {
+                    return Err(SchemaFailure::LimitExceeded);
+                }
                 let known = self
                     .block_indexes
                     .get_mut(position)
@@ -173,7 +189,10 @@ impl SchemaCatalog {
                     .get_mut(existing)
                     .ok_or(SchemaFailure::InvalidValue)?;
                 *existing = merged;
-                return self.add_index_cost(added_wire, added_memory);
+                self.index_bytes = next_index_bytes;
+                self.persistent_bytes = next_persistent_bytes;
+                self.memory_bytes = next_memory_bytes;
+                return Ok(());
             },
             Err(insertion) => insertion,
         };
