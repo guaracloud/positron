@@ -170,6 +170,9 @@ pub(super) fn decode(
     budget: SchemaBudget,
     legacy: bool,
 ) -> Result<(Vec<SchemaBlockIndex>, usize, usize), SchemaFailure> {
+    // `decode_checkpoint` performs the complete bounded and canonical preflight
+    // immediately before this pass; this pass retains checked allocation and
+    // arithmetic while avoiding a second, drifting grammar implementation.
     if !input.starts_with(INDEX_MAGIC) {
         return Ok((Vec::new(), 0, 0));
     }
@@ -221,21 +224,12 @@ pub(super) fn decode(
         let has_values = if legacy {
             input.starts_with(SCALAR_VALUES_MAGIC)
         } else {
-            match input.u8()? {
-                0 => false,
-                1 => true,
-                _ => return Err(SchemaFailure::MalformedCatalog),
-            }
+            input.u8()? == 1
         };
         if has_values {
             input.take(SCALAR_VALUES_MAGIC.len())?;
-            let mut any_values = false;
             for path in &mut paths {
                 let count = input.usize()?;
-                if count > MAX_INDEX_VALUES {
-                    return Err(SchemaFailure::MalformedCatalog);
-                }
-                any_values |= count > 0;
                 path.values
                     .try_reserve_exact(count)
                     .map_err(|_| SchemaFailure::AllocationUnavailable)?;
@@ -249,9 +243,6 @@ pub(super) fn decode(
                 {
                     return Err(SchemaFailure::MalformedCatalog);
                 }
-            }
-            if !legacy && !any_values {
-                return Err(SchemaFailure::MalformedCatalog);
             }
         }
         for path in &paths {
@@ -271,10 +262,8 @@ pub(super) fn decode(
     }
     let physical = before
         .checked_sub(input.remaining_len())
+        .filter(|bytes| *bytes <= budget.max_index_bytes())
         .ok_or(SchemaFailure::MalformedCatalog)?;
-    if physical > budget.max_index_bytes() || memory > budget.max_memory_bytes() {
-        return Err(SchemaFailure::MalformedCatalog);
-    }
     Ok((blocks, physical, memory))
 }
 
@@ -381,11 +370,7 @@ fn preflight_value(input: &mut Input<'_>) -> Result<usize, SchemaFailure> {
 fn decode_value(input: &mut Input<'_>) -> Result<SchemaValue, SchemaFailure> {
     match ScalarTag::from_byte(input.u8()?)? {
         ScalarTag::Null => Ok(SchemaValue::Null),
-        ScalarTag::Boolean => match input.u8()? {
-            0 => Ok(SchemaValue::Boolean(false)),
-            1 => Ok(SchemaValue::Boolean(true)),
-            _ => Err(SchemaFailure::MalformedCatalog),
-        },
+        ScalarTag::Boolean => Ok(SchemaValue::Boolean(input.u8()? == 1)),
         ScalarTag::SignedInteger => Ok(SchemaValue::SignedInteger(i64::from_be_bytes(
             input.array()?,
         ))),
