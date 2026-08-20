@@ -1,12 +1,24 @@
 use super::{
     MAGIC, VERSION, namespace_tag, put_bytes, put_len, put_u8, put_u16, put_u64, value_tag,
 };
+use crate::log_store::schema::index::{BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES};
+use crate::log_store::schema::model::{
+    CATALOG_HEADER_BYTES, MAX_SCALAR_VALUE_BYTES, entry_persistent_bytes,
+};
+use crate::log_store::schema::query::SchemaValue;
 use crate::log_store::{SchemaCatalog, SchemaFailure};
 
 pub(super) fn catalog(catalog: &SchemaCatalog) -> Result<Vec<u8>, SchemaFailure> {
+    let expected_len = preflight_length(catalog)?;
+    if expected_len > catalog.budget.max_persistent_bytes() {
+        return Err(SchemaFailure::LimitExceeded);
+    }
+    if expected_len != catalog.persistent_bytes {
+        return Err(SchemaFailure::InvalidValue);
+    }
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(catalog.persistent_bytes)
+        .try_reserve_exact(expected_len)
         .map_err(|_| SchemaFailure::AllocationUnavailable)?;
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&VERSION.to_be_bytes());
@@ -46,9 +58,59 @@ pub(super) fn catalog(catalog: &SchemaCatalog) -> Result<Vec<u8>, SchemaFailure>
         );
     }
     super::index::append(catalog, &mut bytes)?;
-    if bytes.len() < catalog.persistent_bytes || bytes.len() > catalog.budget.max_persistent_bytes()
-    {
-        return Err(SchemaFailure::LimitExceeded);
+    if bytes.len() != expected_len {
+        return Err(SchemaFailure::InvalidValue);
     }
     Ok(bytes)
+}
+
+fn preflight_length(catalog: &SchemaCatalog) -> Result<usize, SchemaFailure> {
+    let entries = catalog.entries.iter().try_fold(0_usize, |total, entry| {
+        total
+            .checked_add(
+                entry_persistent_bytes(&entry.path, entry.variants.len())
+                    .ok_or(SchemaFailure::LimitExceeded)?,
+            )
+            .ok_or(SchemaFailure::LimitExceeded)
+    })?;
+    let indexes = if catalog.block_indexes.is_empty() {
+        0
+    } else {
+        catalog
+            .block_indexes
+            .iter()
+            .try_fold(INDEX_HEADER_BYTES, |total, block| {
+                for path in &block.paths {
+                    for value in &path.values {
+                        validate_value(value)?;
+                    }
+                }
+                let path_bytes =
+                    super::super::index::SchemaBlockIndex::paths_encoded_bytes_with_framing(
+                        &block.paths,
+                        super::super::index::ScalarIndexFraming::V2,
+                    )?;
+                total
+                    .checked_add(BLOCK_INDEX_HEADER_BYTES)
+                    .and_then(|bytes| bytes.checked_add(path_bytes))
+                    .ok_or(SchemaFailure::LimitExceeded)
+            })?
+    };
+    CATALOG_HEADER_BYTES
+        .checked_add(entries)
+        .and_then(|bytes| bytes.checked_add(indexes))
+        .ok_or(SchemaFailure::LimitExceeded)
+}
+
+fn validate_value(value: &SchemaValue) -> Result<(), SchemaFailure> {
+    let length = match value {
+        SchemaValue::String(value) => value.len(),
+        SchemaValue::Bytes(value) => value.len(),
+        _ => return Ok(()),
+    };
+    if length > MAX_SCALAR_VALUE_BYTES {
+        Err(SchemaFailure::LimitExceeded)
+    } else {
+        Ok(())
+    }
 }

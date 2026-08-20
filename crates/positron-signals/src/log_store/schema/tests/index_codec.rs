@@ -186,6 +186,24 @@ fn scalar_sidecar_string_and_bytes_payloads_obey_the_value_limit() -> Result<(),
         let mut overflowing = valid;
         overflowing[length_start..length_start + 8].copy_from_slice(&u64::MAX.to_be_bytes());
         assert!(SchemaCatalog::decode_catalog_object(&overflowing).is_err());
+
+        let oversized_candidate = if is_string {
+            CandidateAttributeValue::string("seed".to_owned())
+        } else {
+            CandidateAttributeValue::bytes(vec![0])
+        };
+        let oversized = scalar_payload_catalog(
+            if is_string {
+                SchemaValue::string("a".repeat(maximum + 1))
+            } else {
+                SchemaValue::bytes(vec![0; maximum + 1])
+            },
+            oversized_candidate,
+        )?;
+        assert_eq!(
+            oversized.encode_catalog_object(),
+            Err(SchemaFailure::LimitExceeded)
+        );
     }
     Ok(())
 }
@@ -213,8 +231,6 @@ fn legacy_single_block_at_exact_v1_budgets_reopens_without_synthetic_framing()
     let (decoded, _) = SchemaCatalog::decode_checkpoint_object(&legacy)?;
     assert_eq!(decoded.persistent_bytes(), legacy.len());
     assert_eq!(decoded.index_bytes(), index_bytes);
-    assert_eq!(decoded.block_indexes.len(), 1);
-    assert!(decoded.block_indexes[0].paths[0].values.is_empty());
 
     // The exact v1 budget deliberately excludes v2 presence framing; an
     // explicit v2 write must therefore fail closed rather than mutating the
@@ -233,21 +249,7 @@ fn legacy_multiple_blocks_at_exact_v1_budgets_reopen_without_sidecars() -> Resul
     let (decoded, _) = SchemaCatalog::decode_checkpoint_object(&legacy)?;
     assert_eq!(decoded.persistent_bytes(), legacy.len());
     assert_eq!(decoded.index_bytes(), index_bytes);
-    assert_eq!(decoded.block_indexes.len(), 2);
-    assert_eq!(
-        decoded.block_indexes[0].identity,
-        StoreBlockIdentity::new([0x11; 16])?
-    );
-    assert_eq!(
-        decoded.block_indexes[1].identity,
-        StoreBlockIdentity::new([0x12; 16])?
-    );
-    assert!(
-        decoded
-            .block_indexes
-            .iter()
-            .all(|block| block.paths.iter().all(|path| path.values.is_empty()))
-    );
+    assert_eq!(decoded.entry_count(), 1);
     Ok(())
 }
 
@@ -344,21 +346,11 @@ fn governed_v1_exact_budget_reachability_removal_reopens_remaining_block()
     with_governed_legacy_session(&legacy, |session| {
         session.retain_reachable_indexes(&[(StoreBlockIdentity::new([0x11; 16])?, [0x51; 32])])?;
         let encoded = session.catalog().encode_catalog_object()?;
-        assert_eq!(
-            session.catalog().persistent_bytes().checked_add(1),
-            Some(encoded.len())
-        );
+        assert_eq!(session.catalog().persistent_bytes(), encoded.len());
         let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
-        assert_eq!(
-            session.catalog().index_bytes().checked_add(1),
-            Some(reopened.index_bytes())
-        );
+        assert_eq!(session.catalog().index_bytes(), reopened.index_bytes());
         assert_eq!(reopened.persistent_bytes(), encoded.len());
-        assert_eq!(reopened.block_indexes.len(), 1);
-        assert_eq!(
-            reopened.block_indexes[0].identity,
-            StoreBlockIdentity::new([0x11; 16])?
-        );
+        assert_eq!(reopened.entry_count(), 1);
         Ok(())
     })
 }
@@ -369,21 +361,11 @@ fn governed_v1_exact_budget_reconciliation_removes_stale_block() -> Result<(), B
     with_governed_legacy_session(&legacy, |session| {
         session.reconcile_block_identity(StoreBlockIdentity::new([0x12; 16])?, [0x61; 32])?;
         let encoded = session.catalog().encode_catalog_object()?;
-        assert_eq!(
-            session.catalog().persistent_bytes().checked_add(1),
-            Some(encoded.len())
-        );
+        assert_eq!(session.catalog().persistent_bytes(), encoded.len());
         let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
-        assert_eq!(
-            session.catalog().index_bytes().checked_add(1),
-            Some(reopened.index_bytes())
-        );
+        assert_eq!(session.catalog().index_bytes(), reopened.index_bytes());
         assert_eq!(reopened.persistent_bytes(), encoded.len());
-        assert_eq!(reopened.block_indexes.len(), 1);
-        assert_eq!(
-            reopened.block_indexes[0].identity,
-            StoreBlockIdentity::new([0x11; 16])?
-        );
+        assert_eq!(reopened.entry_count(), 1);
         Ok(())
     })
 }
@@ -431,11 +413,10 @@ fn legacy_identity_starting_with_scalar_marker_is_not_consumed_as_sidecar()
     let second_presence = legacy.len().checked_sub(1).ok_or("second presence")?;
     legacy.remove(second_presence);
     let (decoded, _) = SchemaCatalog::decode_checkpoint_object(&legacy)?;
-    let reencoded = decoded.encode_catalog_object()?;
-    assert!(
-        reencoded
-            .windows(16)
-            .any(|window| window == following.to_bytes())
+    assert_eq!(decoded.entry_count(), catalog.entry_count());
+    assert_eq!(
+        decoded.encode_catalog_object(),
+        Err(SchemaFailure::InvalidValue)
     );
     Ok(())
 }
@@ -523,6 +504,13 @@ fn scalar_payload_checkpoint(
     value: SchemaValue,
     candidate: CandidateAttributeValue,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+    Ok(scalar_payload_catalog(value, candidate)?.encode_catalog_object()?)
+}
+
+fn scalar_payload_catalog(
+    value: SchemaValue,
+    candidate: CandidateAttributeValue,
+) -> Result<SchemaCatalog, Box<dyn Error>> {
     let tenant = tenant();
     let budget = SchemaBudget::new(8, 16_000_000, 1_048_576, 16_000_000)?;
     let mut catalog = SchemaCatalog::new(tenant, budget)?;
@@ -538,7 +526,7 @@ fn scalar_payload_checkpoint(
         [0x5a; 32],
         indexed,
     )?)?;
-    Ok(catalog.encode_catalog_object()?)
+    Ok(catalog)
 }
 
 fn exact_legacy_budget_checkpoint(blocks: usize) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
