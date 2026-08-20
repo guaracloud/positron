@@ -262,6 +262,104 @@ fn merged_scalar_dictionary_falls_back_atomically_and_reopens() -> Result<(), Bo
 }
 
 #[test]
+fn governed_promotion_overflow_releases_sidecar_cost_and_reopens() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let kernel_catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x59; 16])?,
+        CatalogSecret::from_owned(Box::new([0x5a; 32]), Box::new([0x5b; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(24)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &kernel_catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x5c; 32])),
+    )?;
+    let store = LogStore::new();
+    let path = SchemaPath::root(AttributeNamespace::Record, "scalar".to_owned())?;
+    let identity = StoreBlockIdentity::new([0x5d; 16])?;
+    let prepared = store
+        .prepare(
+            preparation_capacity(&authority, tenant)?,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(103))),
+            tenant,
+            shard,
+            identity,
+            vec![signed_record("scalar", 4_096)?],
+        )?
+        .into_store_block();
+    let digest = prepared.content_digest()?;
+    ledger.append(prepared)?;
+    let snapshot = ledger.snapshot()?;
+
+    let mut fixture = SchemaCatalog::new(
+        tenant,
+        SchemaBudget::new(8, 16_000_000, 1_048_576, 16_000_000)?,
+    )?;
+    fixture.observe(&[AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "scalar".to_owned(),
+        vec![CandidateAttributeValue::signed_integer(0)],
+    )
+    .validate(LogStore::value_limit_profile())?])?;
+    fixture.record_query_use(&path)?;
+    let values = (0..4_096)
+        .map(|value| SchemaValue::signed_integer(value))
+        .collect::<Vec<_>>();
+    let full = crate::log_store::schema::SchemaIndexPath::from_variants_and_values(
+        &path,
+        &[AttributeValueKind::SignedInteger],
+        &values,
+    )?;
+    fixture.install_query_index(crate::log_store::schema::SchemaBlockIndex::one(
+        identity, digest, full,
+    )?)?;
+    let full_index_bytes = fixture.index_bytes();
+    let checkpoint = fixture.encode_checkpoint_object(&[])?;
+    let (mut session, _) = SchemaSessionStore::from_checkpoint(
+        preparation_capacity(&authority, tenant)?,
+        tenant,
+        &checkpoint,
+    )?
+    .ok_or("checkpoint tenant")?;
+
+    let mut update = session.stage_query_update()?;
+    update.index_replayed_query_path(
+        tenant,
+        &snapshot,
+        snapshot.blocks().first().ok_or("replayed block")?,
+        &path,
+    )?;
+    session.commit_query_update(update)?;
+    assert!(session.catalog().index_bytes() < full_index_bytes);
+
+    let result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        session.catalog(),
+        &SchemaQuery::value(
+            path.clone(),
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(4_096),
+        ),
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert!(result.reduced_pruning());
+
+    let reopened =
+        SchemaCatalog::decode_checkpoint_object(&session.catalog().encode_checkpoint_object(&[])?)?
+            .0;
+    assert_eq!(reopened.index_bytes(), session.catalog().index_bytes());
+    Ok(())
+}
+
+#[test]
 fn scalar_index_prunes_an_absent_same_type_value() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -1154,6 +1252,21 @@ fn record_with_occurrences(key: &str, values: &[&str]) -> Result<LogRecord, Box<
                 .collect(),
         )],
         PolicyProvenance::new(1, [0x71; 32], vec![])?,
+    )?)
+}
+
+fn signed_record(key: &str, value: i64) -> Result<LogRecord, Box<dyn Error>> {
+    Ok(LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            key.to_owned(),
+            vec![CandidateAttributeValue::signed_integer(value)],
+        )],
+        PolicyProvenance::new(1, [0x72; 32], vec![])?,
     )?)
 }
 

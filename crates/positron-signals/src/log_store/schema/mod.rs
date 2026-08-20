@@ -5,6 +5,8 @@ pub(crate) mod delta;
 mod discovery;
 mod failure;
 mod index;
+#[cfg(test)]
+pub(crate) use index::{SchemaBlockIndex, SchemaIndexPath};
 mod model;
 mod observation;
 mod promotion;

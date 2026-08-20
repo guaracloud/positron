@@ -127,51 +127,6 @@ fn query_indexes_merge_idempotently_and_reconcile_reachability() -> Result<(), B
 }
 
 #[test]
-fn promotion_overflow_replaces_full_dictionary_with_type_only_coverage()
--> Result<(), Box<dyn Error>> {
-    let tenant = tenant();
-    let path = path(AttributeNamespace::Record, "scalar");
-    let mut catalog = SchemaCatalog::new(
-        tenant,
-        SchemaBudget::new(8, 16_000_000, 1_048_576, 16_000_000)?,
-    )?;
-    catalog.observe(&[occurrence(
-        AttributeNamespace::Record,
-        "scalar",
-        CandidateAttributeValue::signed_integer(0),
-    )?])?;
-    catalog.record_query_use(&path)?;
-    let identity = StoreBlockIdentity::new(17_u128.to_be_bytes())?;
-    let digest = [0x66; 32];
-    let values = (0..super::super::index::MAX_INDEX_VALUES)
-        .map(|value| SchemaValue::signed_integer(value as i64))
-        .collect::<Vec<_>>();
-    let full = super::super::index::SchemaIndexPath::from_variants_and_values(
-        &path,
-        &[positron_domain::value::AttributeValueKind::SignedInteger],
-        &values,
-    )?;
-    catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
-        identity, digest, full,
-    )?)?;
-    let full_index_bytes = catalog.index_bytes();
-    let incoming = super::super::index::SchemaIndexPath::from_variants_and_values(
-        &path,
-        &[positron_domain::value::AttributeValueKind::SignedInteger],
-        &[SchemaValue::signed_integer(4_096)],
-    )?;
-
-    catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
-        identity, digest, incoming,
-    )?)?;
-    let checkpoint = catalog.encode_catalog_object()?;
-    let reopened = SchemaCatalog::decode_catalog_object(&checkpoint)?;
-    assert!(catalog.index_bytes() < full_index_bytes);
-    assert_eq!(reopened.index_bytes(), catalog.index_bytes());
-    Ok(())
-}
-
-#[test]
 fn demotion_removes_only_its_paths_and_sidecar_budget_is_exact() -> Result<(), Box<dyn Error>> {
     let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 32_768, 32_768, 8_192)?)?;
     for key in ["alpha", "beta"] {
