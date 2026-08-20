@@ -146,6 +146,14 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
             fixture.authority.governor(),
         )
         .expect("promote");
+    session
+        .record_query_use(
+            fixture.tenant,
+            &path,
+            &snapshot,
+            fixture.authority.governor(),
+        )
+        .expect("idempotent replayed index");
     let promoted_charge = session
         .checkpoint()
         .expect("promoted checkpoint")

@@ -127,6 +127,58 @@ fn query_indexes_merge_idempotently_and_reconcile_reachability() -> Result<(), B
 }
 
 #[test]
+fn scalar_dictionary_merge_preserves_each_bounded_value() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("one".to_owned()),
+    )?;
+    let path = path(AttributeNamespace::Record, "indexed");
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path)?;
+    let variants = catalog
+        .entry(&path)
+        .ok_or("indexed entry")?
+        .variants()
+        .to_vec();
+    let identity = StoreBlockIdentity::new(11_u128.to_be_bytes())?;
+    let digest = [0x66; 32];
+    let first = super::super::index::SchemaIndexPath::from_variants_and_values(
+        &path,
+        &variants,
+        &[SchemaValue::string("one")],
+    )?;
+    catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+        identity, digest, first,
+    )?)?;
+    let before = catalog.index_bytes();
+    let second = super::super::index::SchemaIndexPath::from_variants_and_values(
+        &path,
+        &variants,
+        &[SchemaValue::string("two")],
+    )?;
+    catalog.install_query_index(super::super::index::SchemaBlockIndex::one(
+        identity, digest, second,
+    )?)?;
+    assert!(catalog.index_bytes() > before);
+    assert_eq!(
+        catalog.verified_block_value(identity, digest, &path, &SchemaValue::string("one")),
+        Some(true)
+    );
+    assert_eq!(
+        catalog.verified_block_value(identity, digest, &path, &SchemaValue::string("two")),
+        Some(true)
+    );
+    assert_eq!(
+        catalog.verified_block_value(identity, digest, &path, &SchemaValue::string("three")),
+        Some(false)
+    );
+    Ok(())
+}
+
+#[test]
 fn demotion_removes_only_its_paths_and_sidecar_budget_is_exact() -> Result<(), Box<dyn Error>> {
     let mut catalog = SchemaCatalog::new(tenant(), SchemaBudget::new(8, 32_768, 32_768, 8_192)?)?;
     for key in ["alpha", "beta"] {

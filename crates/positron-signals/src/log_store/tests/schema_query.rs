@@ -181,6 +181,12 @@ fn scalar_index_round_trips_each_native_scalar_dictionary() -> Result<(), Box<dy
             SchemaValue::boolean(false),
         ),
         (
+            "boolean_false",
+            CandidateAttributeValue::boolean(false),
+            SchemaValue::boolean(false),
+            SchemaValue::boolean(true),
+        ),
+        (
             "integer",
             CandidateAttributeValue::signed_integer(7),
             SchemaValue::signed_integer(7),
@@ -219,6 +225,22 @@ fn scalar_index_round_trips_each_native_scalar_dictionary() -> Result<(), Box<dy
             (*key).to_owned(),
         )?)?;
         records.push(scalar_record(key, candidate.clone())?);
+    }
+    for (namespace, key) in [
+        (AttributeNamespace::Stream, "stream_id"),
+        (AttributeNamespace::Resource, "resource_id"),
+        (AttributeNamespace::InstrumentationScope, "scope_id"),
+    ] {
+        let candidate = CandidateAttributeValue::signed_integer(7);
+        let seed = AttributeOccurrenceSetCandidate::new(
+            namespace,
+            key.to_owned(),
+            vec![candidate.clone()],
+        )
+        .validate(LogStore::value_limit_profile())?;
+        schema.observe(std::slice::from_ref(&seed))?;
+        schema.record_query_use(&SchemaPath::root(namespace, key.to_owned())?)?;
+        records.push(scalar_record_in_namespace(namespace, key, candidate)?);
     }
     let identity = StoreBlockIdentity::new([0x6d; 16])?;
     let (prepared, delta) = store.prepare_with_schema_delta(
@@ -264,6 +286,42 @@ fn scalar_index_round_trips_each_native_scalar_dictionary() -> Result<(), Box<dy
         assert_eq!(missing.scanned_bytes(), 0, "pruned value for {key}");
         assert!(!missing.reduced_pruning());
     }
+    for (namespace, key) in [
+        (AttributeNamespace::Stream, "stream_id"),
+        (AttributeNamespace::Resource, "resource_id"),
+        (AttributeNamespace::InstrumentationScope, "scope_id"),
+    ] {
+        let path = SchemaPath::root(namespace, key.to_owned())?;
+        let present = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &reopened,
+            &SchemaQuery::value(
+                path.clone(),
+                OccurrenceSelector::Any,
+                SchemaValue::signed_integer(7),
+            ),
+        )?;
+        assert_eq!(present.records().len(), 1);
+        assert!(!present.reduced_pruning());
+        let absent = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &reopened,
+            &SchemaQuery::value(
+                path,
+                OccurrenceSelector::Any,
+                SchemaValue::signed_integer(8),
+            ),
+        )?;
+        assert!(absent.records().is_empty());
+        assert_eq!(absent.scanned_bytes(), 0);
+        assert!(!absent.reduced_pruning());
+    }
     Ok(())
 }
 
@@ -301,6 +359,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     )?)?;
     let records = vec![
         record_with_occurrences("indexed", &["one", "two", "one"])?,
+        record("indexed", "three")?,
         record("overflow", "two")?,
     ];
     let identity = StoreBlockIdentity::new([0x69; 16])?;
@@ -476,6 +535,29 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         assert!(composite.records().is_empty());
         assert!(composite.scanned_bytes() > 0);
         assert!(composite.reduced_pruning());
+    }
+    for (kind, expected_records, expected_scanned) in [
+        (AttributeValueKind::Null, 0, 0),
+        (AttributeValueKind::Boolean, 0, 0),
+        (AttributeValueKind::SignedInteger, 0, 0),
+        (AttributeValueKind::FloatingPoint, 0, 0),
+        (AttributeValueKind::String, 2, 1),
+        (AttributeValueKind::Bytes, 0, 0),
+    ] {
+        let typed = store.scan_schema(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(2)?),
+            &schema,
+            &SchemaQuery::value(
+                SchemaPath::new(AttributeNamespace::Record, "indexed".to_owned())?,
+                OccurrenceSelector::Any,
+                SchemaValue::kind(kind),
+            ),
+        )?;
+        assert_eq!(typed.records().len(), expected_records);
+        assert_eq!(typed.scanned_bytes() > 0, expected_scanned == 1);
     }
 
     let overflow = store.scan_schema(
@@ -749,13 +831,21 @@ fn array_record(key: &str) -> Result<LogRecord, Box<dyn Error>> {
 }
 
 fn scalar_record(key: &str, value: CandidateAttributeValue) -> Result<LogRecord, Box<dyn Error>> {
+    scalar_record_in_namespace(AttributeNamespace::Record, key, value)
+}
+
+fn scalar_record_in_namespace(
+    namespace: AttributeNamespace,
+    key: &str,
+    value: CandidateAttributeValue,
+) -> Result<LogRecord, Box<dyn Error>> {
     Ok(LogRecord::checked_receiver_candidate(
         LogStore::value_limit_profile(),
         None,
         None,
         Some(CandidateAttributeValue::string("body".to_owned())),
         vec![AttributeOccurrenceSetCandidate::new(
-            AttributeNamespace::Record,
+            namespace,
             key.to_owned(),
             vec![value],
         )],
