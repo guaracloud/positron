@@ -566,12 +566,13 @@ representations use the same logical scan and explicit typed occurrence query
 identity and authenticated payload digest; only matching coverage may prune an
 impossible type. Missing, stale, replaced, demoted, generic, or Schema Overflow
 coverage selects the generic scan and exposes reduced pruning without changing
-`index`, `any`, or `all` results. The current `PSCHEMA1` writer uses version 2
-explicit per-block sidecar
-presence framing; readers accept the version 1 optional-marker grammar only for
-existing Release 1 development objects and never parse version 1 bytes as
-version 2. This versioning remains rebuildable optimization state and does not
-change the authoritative Store Block format.
+`index`, `any`, or `all` results. `PSCHEMA1` version 1 entries have no scalar
+dictionary sidecar; scalar value optimization is rebuilt from authoritative Store
+Blocks or falls back to type-only coverage. Version 2 alone uses explicit
+per-block sidecar-presence framing. Version 1 bytes beginning `PVALUES\0` remain
+StoreBlockIdentity bytes, preserving the legacy identity-collision contract. This
+versioning remains rebuildable optimization state and does not change the
+authoritative Store Block format.
 Discovery returns tenant-bound bounded top
 paths, typed conflicts and variants, promotion decisions, budget pressure,
 overflow counts, and sampled path digests without exposing mutation authority.
