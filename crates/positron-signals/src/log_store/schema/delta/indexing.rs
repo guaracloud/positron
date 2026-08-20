@@ -95,11 +95,7 @@ fn projected_paths(
         .try_reserve_exact(delta.index_paths.len().saturating_add(root.len()))
         .map_err(|_| SchemaFailure::AllocationUnavailable)?;
     for known in &delta.index_paths {
-        let mut cloned = known.try_clone()?;
-        if !include_values {
-            cloned.values.clear();
-        }
-        paths.push(cloned);
+        paths.push(known.try_clone()?);
     }
     for entry in root {
         if entry.query_uses == 0 || !entry.promoted || delta.path_is_unverified(&entry.path) {
@@ -129,7 +125,6 @@ fn merge_paths(
 ) -> Result<(), SchemaFailure> {
     known.kind_mask |= incoming.kind_mask;
     if !include_values {
-        known.values.clear();
         return Ok(());
     }
     for value in incoming.values {
@@ -157,9 +152,6 @@ pub(super) fn stage_index_root(
     }
     let include_values =
         delta.scalar_values && scalar_values_fit(catalog, delta, root, attributes)?;
-    if !include_values {
-        delta.scalar_values = false;
-    }
     delta.index_paths = projected_paths(delta, root, attributes, include_values)?;
     let (memory, wire) = projected_physical_cost(catalog, delta, &[], &[], include_values)?;
     delta.physical_memory_bytes = memory;

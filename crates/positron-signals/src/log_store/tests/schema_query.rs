@@ -72,6 +72,94 @@ fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
 }
 
 #[test]
+fn scalar_fallback_is_scoped_to_the_non_fitting_root() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x4a; 16])?,
+        CatalogSecret::from_owned(Box::new([0x4b; 32]), Box::new([0x4c; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(21)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x4e; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(8, 200_000, 8_000, 8_000)?)?;
+    for key in ["oversized", "kept"] {
+        let seed = AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            key.to_owned(),
+            vec![CandidateAttributeValue::string("seed".to_owned())],
+        )
+        .validate(LogStore::value_limit_profile())?;
+        schema.observe(std::slice::from_ref(&seed))?;
+        schema.record_query_use(&SchemaPath::root(
+            AttributeNamespace::Record,
+            key.to_owned(),
+        )?)?;
+    }
+    let oversized = (0..512)
+        .map(|index| CandidateAttributeValue::string(format!("oversized-{index:03}")))
+        .collect::<Vec<_>>();
+    let record = LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                "oversized".to_owned(),
+                oversized,
+            ),
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                "kept".to_owned(),
+                vec![CandidateAttributeValue::string("kept".to_owned())],
+            ),
+        ],
+        PolicyProvenance::new(1, [0x75; 32], vec![])?,
+    )?;
+    let identity = StoreBlockIdentity::new([0x4f; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        identity,
+        vec![record],
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+
+    let result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &SchemaQuery::value(
+            SchemaPath::root(AttributeNamespace::Record, "kept".to_owned())?,
+            OccurrenceSelector::Any,
+            SchemaValue::string("absent"),
+        ),
+    )?;
+    assert!(result.records().is_empty());
+    assert_eq!(result.scanned_bytes(), 0);
+    assert!(!result.reduced_pruning());
+    Ok(())
+}
+
+#[test]
 fn scalar_index_prunes_an_absent_same_type_value() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -425,9 +513,16 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     let digest = block.content_digest()?;
     ledger.append(block)?;
     store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+    let _sealed = ledger.seal()?;
+    let successor = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
+    )?;
     let checkpoint = schema.encode_catalog_object()?;
     let reopened = SchemaCatalog::decode_catalog_object(&checkpoint)?;
-    let snapshot = ledger.snapshot()?;
+    let snapshot = successor.snapshot()?;
 
     let indexed = store.scan_schema(
         authority.governor(),

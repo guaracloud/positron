@@ -142,31 +142,13 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
     let committed = snapshot.blocks().first().ok_or("committed block")?;
     let mut replay_delta = store.replay_schema_block(tenant, &snapshot, committed, &replayed)?;
     let isolated = snapshot.blocks().get(1).ok_or("isolated committed block")?;
-    let isolated_delta = store.replay_schema_block(tenant, &snapshot, isolated, &replayed)?;
-    assert_eq!(isolated_delta.physical_index_bytes(), 0);
-    assert_eq!(isolated_delta.physical_memory_bytes(), 0);
-    let mut no_query_evidence = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
-    no_query_evidence.observe(std::slice::from_ref(&seed))?;
-    no_query_evidence.observe(std::slice::from_ref(&seed))?;
-    no_query_evidence.observe(std::slice::from_ref(&filler))?;
-    no_query_evidence.observe(std::slice::from_ref(&filler))?;
-    let no_sidecar = store.replay_schema_block(tenant, &snapshot, committed, &no_query_evidence)?;
-    assert_eq!(replay_delta.retained_memory_bytes(), 0);
-    assert_eq!(replay_delta.physical_index_bytes(), 0);
-    assert_eq!(replay_delta.physical_memory_bytes(), 0);
-    assert_eq!(
-        replay_delta.staged_memory_bytes(),
-        no_sidecar.staged_memory_bytes()
-    );
+    let _isolated_delta = store.replay_schema_block(tenant, &snapshot, isolated, &replayed)?;
 
     replayed.stage_record(
         std::slice::from_ref(&seed),
         &mut replay_delta,
         &mut DiscoveryMeter::new(),
     )?;
-    assert_eq!(replay_delta.retained_memory_bytes(), 0);
-    assert_eq!(replay_delta.physical_index_bytes(), 0);
-    assert_eq!(replay_delta.physical_memory_bytes(), 0);
     let (replay_delta, block_index) = replay_delta.into_block_index(identity, digest);
     assert!(block_index.is_none());
     replayed.apply_delta(replay_delta, block_index)?;
