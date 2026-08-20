@@ -296,7 +296,9 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         ),
     )?;
     assert_eq!(replayed_result.records().len(), 1);
+    assert_eq!(replayed_result.records(), result.records());
     assert!(replayed_result.reduced_pruning());
+    assert_eq!(replayed_result.reduced_pruning(), result.reduced_pruning());
     Ok(())
 }
 

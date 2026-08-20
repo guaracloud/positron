@@ -8,11 +8,7 @@ use crate::log_store::schema::index::{
 use crate::log_store::schema::query::SchemaValue;
 use crate::log_store::{SchemaBudget, SchemaCatalog, SchemaFailure, SchemaPath};
 
-pub(super) fn append(
-    catalog: &SchemaCatalog,
-    bytes: &mut Vec<u8>,
-    legacy: bool,
-) -> Result<(), SchemaFailure> {
+pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(), SchemaFailure> {
     if catalog.block_indexes.is_empty() {
         return Ok(());
     }
@@ -31,9 +27,7 @@ pub(super) fn append(
             bytes.push(indexed.kind_mask);
         }
         let has_values = block.paths.iter().any(|indexed| !indexed.values.is_empty());
-        if !legacy {
-            bytes.push(u8::from(has_values));
-        }
+        bytes.push(u8::from(has_values));
         if has_values {
             bytes.extend_from_slice(SCALAR_VALUES_MAGIC);
             for indexed in &block.paths {
@@ -284,27 +278,71 @@ pub(super) fn decode(
     Ok((blocks, physical, memory))
 }
 
-fn put_value(bytes: &mut Vec<u8>, value: &SchemaValue) -> Result<(), SchemaFailure> {
+#[derive(Clone, Copy)]
+enum ScalarTag {
+    Null,
+    Boolean,
+    SignedInteger,
+    FloatingPointBits,
+    String,
+    Bytes,
+}
+
+impl ScalarTag {
+    fn from_byte(byte: u8) -> Result<Self, SchemaFailure> {
+        match byte {
+            0 => Ok(Self::Null),
+            1 => Ok(Self::Boolean),
+            2 => Ok(Self::SignedInteger),
+            3 => Ok(Self::FloatingPointBits),
+            4 => Ok(Self::String),
+            5 => Ok(Self::Bytes),
+            _ => Err(SchemaFailure::MalformedCatalog),
+        }
+    }
+
+    const fn byte(self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Boolean => 1,
+            Self::SignedInteger => 2,
+            Self::FloatingPointBits => 3,
+            Self::String => 4,
+            Self::Bytes => 5,
+        }
+    }
+}
+
+fn value_tag(value: &SchemaValue) -> Result<ScalarTag, SchemaFailure> {
     match value {
-        SchemaValue::Null => bytes.push(0),
+        SchemaValue::Null => Ok(ScalarTag::Null),
+        SchemaValue::Boolean(_) => Ok(ScalarTag::Boolean),
+        SchemaValue::SignedInteger(_) => Ok(ScalarTag::SignedInteger),
+        SchemaValue::FloatingPointBits(_) => Ok(ScalarTag::FloatingPointBits),
+        SchemaValue::String(_) => Ok(ScalarTag::String),
+        SchemaValue::Bytes(_) => Ok(ScalarTag::Bytes),
+        SchemaValue::Kind(_) => Err(SchemaFailure::InvalidValue),
+    }
+}
+
+fn put_value(bytes: &mut Vec<u8>, value: &SchemaValue) -> Result<(), SchemaFailure> {
+    let tag = value_tag(value)?;
+    bytes.push(tag.byte());
+    match value {
+        SchemaValue::Null => {},
         SchemaValue::Boolean(value) => {
-            bytes.push(1);
             bytes.push(u8::from(*value));
         },
         SchemaValue::SignedInteger(value) => {
-            bytes.push(2);
             bytes.extend_from_slice(&value.to_be_bytes());
         },
         SchemaValue::FloatingPointBits(value) => {
-            bytes.push(3);
             bytes.extend_from_slice(&value.to_be_bytes());
         },
         SchemaValue::String(value) => {
-            bytes.push(4);
             put_bytes(bytes, value.as_bytes())?;
         },
         SchemaValue::Bytes(value) => {
-            bytes.push(5);
             put_bytes(bytes, value)?;
         },
         SchemaValue::Kind(_) => return Err(SchemaFailure::InvalidValue),
@@ -313,28 +351,27 @@ fn put_value(bytes: &mut Vec<u8>, value: &SchemaValue) -> Result<(), SchemaFailu
 }
 
 fn preflight_value(input: &mut Input<'_>) -> Result<usize, SchemaFailure> {
-    let tag = input.u8()?;
+    let tag = ScalarTag::from_byte(input.u8()?)?;
     let payload = match tag {
-        0 => 0,
-        1 => {
+        ScalarTag::Null => 0,
+        ScalarTag::Boolean => {
             if input.u8()? > 1 {
                 return Err(SchemaFailure::MalformedCatalog);
             }
             1
         },
-        2 | 3 => {
+        ScalarTag::SignedInteger | ScalarTag::FloatingPointBits => {
             input.take(8)?;
             8
         },
-        4 | 5 => {
+        ScalarTag::String | ScalarTag::Bytes => {
             let length = input.usize()?;
             let bytes = input.take(length)?;
-            if tag == 4 && std::str::from_utf8(bytes).is_err() {
+            if matches!(tag, ScalarTag::String) && std::str::from_utf8(bytes).is_err() {
                 return Err(SchemaFailure::MalformedCatalog);
             }
             length
         },
-        _ => return Err(SchemaFailure::MalformedCatalog),
     };
     std::mem::size_of::<SchemaValue>()
         .checked_add(payload)
@@ -342,21 +379,21 @@ fn preflight_value(input: &mut Input<'_>) -> Result<usize, SchemaFailure> {
 }
 
 fn decode_value(input: &mut Input<'_>) -> Result<SchemaValue, SchemaFailure> {
-    match input.u8()? {
-        0 => Ok(SchemaValue::Null),
-        1 => match input.u8()? {
+    match ScalarTag::from_byte(input.u8()?)? {
+        ScalarTag::Null => Ok(SchemaValue::Null),
+        ScalarTag::Boolean => match input.u8()? {
             0 => Ok(SchemaValue::Boolean(false)),
             1 => Ok(SchemaValue::Boolean(true)),
             _ => Err(SchemaFailure::MalformedCatalog),
         },
-        2 => Ok(SchemaValue::SignedInteger(i64::from_be_bytes(
+        ScalarTag::SignedInteger => Ok(SchemaValue::SignedInteger(i64::from_be_bytes(
             input.array()?,
         ))),
-        3 => Ok(SchemaValue::FloatingPointBits(u64::from_be_bytes(
+        ScalarTag::FloatingPointBits => Ok(SchemaValue::FloatingPointBits(u64::from_be_bytes(
             input.array()?,
         ))),
-        4 => Ok(SchemaValue::String(input.string()?)),
-        5 => {
+        ScalarTag::String => Ok(SchemaValue::String(input.string()?)),
+        ScalarTag::Bytes => {
             let length = input.usize()?;
             let source = input.take(length)?;
             let mut bytes = Vec::new();
@@ -366,6 +403,5 @@ fn decode_value(input: &mut Input<'_>) -> Result<SchemaValue, SchemaFailure> {
             bytes.extend_from_slice(source);
             Ok(SchemaValue::Bytes(bytes))
         },
-        _ => Err(SchemaFailure::MalformedCatalog),
     }
 }

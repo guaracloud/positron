@@ -10,7 +10,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord as OtlpLogRecord, ResourceL
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
-use positron_domain::value::{AttributeNamespace, AttributeValueKind};
+use positron_domain::value::{AttributeNamespace, ValidatedAttributeValue};
 use positron_governance::{
     AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
 };
@@ -26,7 +26,7 @@ use positron_kernel::{
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{
     LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaCatalog, SchemaPath, SchemaQuery,
-    SchemaValue,
+    SchemaValue, ScannedLogRecord,
 };
 use prost::Message;
 
@@ -117,7 +117,7 @@ impl FuzzFixture {
             return;
         };
         let key = key(data.first().copied().unwrap_or_default());
-        let Ok(path) = SchemaPath::root(AttributeNamespace::Record, key) else {
+        let Ok(path) = SchemaPath::root(AttributeNamespace::Record, key.clone()) else {
             return;
         };
         let _ = self.session.record_query_use(
@@ -132,10 +132,18 @@ impl FuzzFixture {
         let Ok(catalog) = SchemaCatalog::decode_catalog_object(checkpoint.catalog_bytes()) else {
             return;
         };
-        let Some((exact_value, exact_kind)) = exact_value(data) else {
+        let Some(exact_value) = exact_value(data) else {
             return;
         };
         let Ok(limit) = ScanLimit::new(32) else {
+            return;
+        };
+        let Ok(all_result) = LogStore::new().scan(
+            self.authority.governor(),
+            self.tenant,
+            &snapshot,
+            LogScan::all(limit),
+        ) else {
             return;
         };
         for selector in [
@@ -149,11 +157,6 @@ impl FuzzFixture {
                 selector,
                 exact_value.clone(),
             );
-            let kind_query = SchemaQuery::value(
-                path.clone(),
-                selector,
-                SchemaValue::kind(exact_kind),
-            );
             let Ok(exact_result) = LogStore::new().scan_schema(
                 self.authority.governor(),
                 self.tenant,
@@ -164,23 +167,18 @@ impl FuzzFixture {
             ) else {
                 continue;
             };
-            let Ok(kind_result) = LogStore::new().scan_schema(
-                self.authority.governor(),
-                self.tenant,
-                &snapshot,
-                LogScan::all(limit),
-                &catalog,
-                &kind_query,
-            ) else {
-                continue;
-            };
-            assert!(
-                exact_result
-                    .records()
-                    .iter()
-                    .all(|record| kind_result.records().contains(record)),
-                "exact scalar query lost a same-kind logical result"
-            );
+            let expected = all_result
+                .records()
+                .iter()
+                .filter(|record| reference_matches(record, &key, selector, &exact_value))
+                .map(ScannedLogRecord::commit_position)
+                .collect::<Vec<_>>();
+            let actual = exact_result
+                .records()
+                .iter()
+                .map(ScannedLogRecord::commit_position)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "exact scalar query changed logical results");
         }
         let fallback_path = SchemaPath::root(AttributeNamespace::Record, FALLBACK_KEY.to_owned())
             .ok();
@@ -307,32 +305,63 @@ fn request(data: &[u8]) -> ExportLogsServiceRequest {
     }
 }
 
-fn exact_value(data: &[u8]) -> Option<(SchemaValue, AttributeValueKind)> {
+fn exact_value(data: &[u8]) -> Option<SchemaValue> {
     let chunk = data.chunks(3).next()?;
     let byte = *chunk.first()?;
     Some(match byte % 6 {
-        0 => (SchemaValue::null(), AttributeValueKind::Null),
-        1 => (
-            SchemaValue::string(format!("v{byte:02x}")),
-            AttributeValueKind::String,
-        ),
-        2 => (
-            SchemaValue::signed_integer(i64::from(byte)),
-            AttributeValueKind::SignedInteger,
-        ),
-        3 => (
-            SchemaValue::boolean(byte & 1 == 1),
-            AttributeValueKind::Boolean,
-        ),
-        4 => (
-            SchemaValue::floating_point_bits((f64::from(byte) + 0.5).to_bits()),
-            AttributeValueKind::FloatingPoint,
-        ),
-        _ => (
-            SchemaValue::bytes(chunk.to_vec()),
-            AttributeValueKind::Bytes,
-        ),
+        0 => SchemaValue::null(),
+        1 => SchemaValue::string(format!("v{byte:02x}")),
+        2 => SchemaValue::signed_integer(i64::from(byte)),
+        3 => SchemaValue::boolean(byte & 1 == 1),
+        4 => SchemaValue::floating_point_bits((f64::from(byte) + 0.5).to_bits()),
+        _ => SchemaValue::bytes(chunk.to_vec()),
     })
+}
+
+fn reference_matches(
+    record: &ScannedLogRecord,
+    key: &str,
+    selector: OccurrenceSelector,
+    expected: &SchemaValue,
+) -> bool {
+    let mut values = record
+        .attributes()
+        .iter()
+        .filter(|attribute| {
+            let occurrences = attribute.occurrences();
+            occurrences.namespace() == AttributeNamespace::Record && occurrences.key() == key
+        })
+        .flat_map(|attribute| {
+            let occurrences = attribute.occurrences();
+            (0..occurrences.len()).filter_map(move |index| occurrences.occurrence(index))
+        });
+    match selector {
+        OccurrenceSelector::Index(index) => values
+            .nth(index)
+            .is_some_and(|value| reference_value_matches(value, expected)),
+        OccurrenceSelector::Any => values.any(|value| reference_value_matches(value, expected)),
+        OccurrenceSelector::All => {
+            let mut found = false;
+            let matches = values.inspect(|_| found = true).all(|value| {
+                reference_value_matches(value, expected)
+            });
+            found && matches
+        },
+    }
+}
+
+fn reference_value_matches(value: &ValidatedAttributeValue, expected: &SchemaValue) -> bool {
+    match expected {
+        SchemaValue::Null => value.is_null(),
+        SchemaValue::Boolean(expected) => value.as_boolean() == Some(*expected),
+        SchemaValue::SignedInteger(expected) => value.as_signed_integer() == Some(*expected),
+        SchemaValue::FloatingPointBits(expected) => {
+            value.as_floating_point_bits() == Some(*expected)
+        },
+        SchemaValue::String(expected) => value.as_str() == Some(expected),
+        SchemaValue::Bytes(expected) => value.as_bytes() == Some(expected),
+        SchemaValue::Kind(expected) => value.kind() == *expected,
+    }
 }
 
 fn key(byte: u8) -> String {
