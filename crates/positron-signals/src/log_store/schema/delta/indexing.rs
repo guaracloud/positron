@@ -4,8 +4,7 @@ use super::SchemaDelta;
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
 use crate::log_store::schema::index::{
-    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, SCALAR_VALUES_MAGIC, SchemaBlockIndex,
-    SchemaIndexPath,
+    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, SchemaBlockIndex, SchemaIndexPath,
 };
 use crate::log_store::schema::model::SchemaEntry;
 
@@ -62,25 +61,9 @@ fn projected_physical_cost(
     if paths.is_empty() {
         return Ok((0, 0));
     }
-    let mut wire = 0_usize;
     let mut memory = 0_usize;
-    for path in &paths {
-        wire = wire
-            .checked_add(path.encoded_bytes()?)
-            .ok_or(SchemaFailure::LimitExceeded)?;
-        memory = memory
-            .checked_add(path.memory_bytes()?)
-            .ok_or(SchemaFailure::LimitExceeded)?;
-    }
-    wire = wire
+    let wire = SchemaBlockIndex::paths_encoded_bytes(&paths)?
         .checked_add(BLOCK_INDEX_HEADER_BYTES)
-        .and_then(|bytes| {
-            bytes.checked_add(if paths.iter().any(|path| !path.values.is_empty()) {
-                SCALAR_VALUES_MAGIC.len()
-            } else {
-                0
-            })
-        })
         .and_then(|bytes| {
             bytes.checked_add(if catalog.block_indexes.is_empty() {
                 INDEX_HEADER_BYTES
@@ -89,6 +72,11 @@ fn projected_physical_cost(
             })
         })
         .ok_or(SchemaFailure::LimitExceeded)?;
+    for path in &paths {
+        memory = memory
+            .checked_add(path.memory_bytes()?)
+            .ok_or(SchemaFailure::LimitExceeded)?;
+    }
     memory = memory
         .checked_add(std::mem::size_of::<SchemaBlockIndex>())
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaIndexPath>>()))

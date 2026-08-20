@@ -240,6 +240,40 @@ impl SchemaBlockIndex {
         })
     }
 
+    pub(crate) fn encoded_bytes(&self) -> Result<usize, SchemaFailure> {
+        Self::paths_encoded_bytes(&self.paths)?
+            .checked_add(BLOCK_INDEX_HEADER_BYTES)
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
+    pub(crate) fn paths_encoded_bytes(paths: &[SchemaIndexPath]) -> Result<usize, SchemaFailure> {
+        let has_values = paths.iter().any(|path| !path.values.is_empty());
+        let value_count_slots = if has_values {
+            paths.iter().filter(|path| path.values.is_empty()).count()
+        } else {
+            0
+        };
+        let paths_bytes = paths.iter().try_fold(0_usize, |total, path| {
+            total
+                .checked_add(path.encoded_bytes()?)
+                .ok_or(SchemaFailure::LimitExceeded)
+        })?;
+        paths_bytes
+            .checked_add(
+                value_count_slots
+                    .checked_mul(8)
+                    .ok_or(SchemaFailure::LimitExceeded)?,
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(if has_values {
+                    SCALAR_VALUES_MAGIC.len()
+                } else {
+                    0
+                })
+            })
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
     pub(crate) fn covers_kind(&self, path: &SchemaPath, kind: AttributeValueKind) -> Option<bool> {
         if matches!(
             kind,

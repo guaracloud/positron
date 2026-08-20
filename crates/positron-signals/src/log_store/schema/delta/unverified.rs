@@ -4,7 +4,7 @@ use super::{DiscoveryMeter, SchemaDelta, projected_cost, staged_memory_bytes};
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
 use crate::log_store::schema::index::{
-    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, SCALAR_VALUES_MAGIC,
+    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, SchemaBlockIndex,
 };
 use crate::log_store::schema::model::{SchemaBudget, SchemaEntry, SchemaPath};
 
@@ -106,7 +106,7 @@ impl SchemaDelta {
         }
 
         let mut removed = false;
-        let mut removed_scalar_values = false;
+        let old_wire = SchemaBlockIndex::paths_encoded_bytes(&self.index_paths)?;
         let mut position = self.index_paths.len();
         while position > 0 {
             position -= 1;
@@ -122,35 +122,38 @@ impl SchemaDelta {
                 .index_paths
                 .get(position)
                 .ok_or(SchemaFailure::InvalidValue)?;
-            self.physical_index_bytes = self
-                .physical_index_bytes
-                .checked_sub(indexed.encoded_bytes()?)
-                .ok_or(SchemaFailure::InvalidValue)?;
             self.physical_memory_bytes = self
                 .physical_memory_bytes
                 .checked_sub(indexed.memory_bytes()?)
                 .ok_or(SchemaFailure::InvalidValue)?;
-            removed_scalar_values |= !indexed.values.is_empty();
             self.index_paths.remove(position);
         }
-        if removed && self.index_paths.is_empty() {
-            let index_header = if catalog.block_indexes.is_empty() {
-                INDEX_HEADER_BYTES
+        if removed {
+            if self.index_paths.is_empty() {
+                let index_header = if catalog.block_indexes.is_empty() {
+                    INDEX_HEADER_BYTES
+                } else {
+                    0
+                };
+                self.physical_index_bytes = self
+                    .physical_index_bytes
+                    .checked_sub(old_wire)
+                    .and_then(|bytes| bytes.checked_sub(BLOCK_INDEX_HEADER_BYTES))
+                    .and_then(|bytes| bytes.checked_sub(index_header))
+                    .ok_or(SchemaFailure::InvalidValue)?;
             } else {
-                0
-            };
-            self.physical_index_bytes = self
-                .physical_index_bytes
-                .checked_sub(
-                    BLOCK_INDEX_HEADER_BYTES
-                        + index_header
-                        + if removed_scalar_values {
-                            SCALAR_VALUES_MAGIC.len()
-                        } else {
-                            0
-                        },
-                )
-                .ok_or(SchemaFailure::InvalidValue)?;
+                let new_wire = SchemaBlockIndex::paths_encoded_bytes(&self.index_paths)?;
+                self.physical_index_bytes = self
+                    .physical_index_bytes
+                    .checked_sub(
+                        old_wire
+                            .checked_sub(new_wire)
+                            .ok_or(SchemaFailure::InvalidValue)?,
+                    )
+                    .ok_or(SchemaFailure::InvalidValue)?;
+            }
+        }
+        if removed && self.index_paths.is_empty() {
             self.physical_memory_bytes = self
                 .physical_memory_bytes
                 .checked_sub(SchemaBudget::block_index_memory_bytes())
