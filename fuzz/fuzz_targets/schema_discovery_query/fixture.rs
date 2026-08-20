@@ -179,6 +179,15 @@ impl FuzzFixture {
                 .map(ScannedLogRecord::commit_position)
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "exact scalar query changed logical results");
+            let expected_reduced = all_result
+                .records()
+                .iter()
+                .any(|record| reference_reduced_pruning(record, &key));
+            assert_eq!(
+                exact_result.reduced_pruning(),
+                expected_reduced,
+                "scalar query changed independent pruning classification"
+            );
         }
         let fallback_path = SchemaPath::root(AttributeNamespace::Record, FALLBACK_KEY.to_owned())
             .ok();
@@ -362,6 +371,18 @@ fn reference_value_matches(value: &ValidatedAttributeValue, expected: &SchemaVal
         SchemaValue::Bytes(expected) => value.as_bytes() == Some(expected),
         SchemaValue::Kind(expected) => value.kind() == *expected,
     }
+}
+
+fn reference_reduced_pruning(record: &ScannedLogRecord, key: &str) -> bool {
+    record.attributes().iter().any(|attribute| {
+        let occurrences = attribute.occurrences();
+        occurrences.namespace() == AttributeNamespace::Record
+            && occurrences.key() == key
+            && matches!(
+                attribute.representation(),
+                positron_signals::AttributeRepresentation::SchemaOverflow
+            )
+    })
 }
 
 fn key(byte: u8) -> String {
