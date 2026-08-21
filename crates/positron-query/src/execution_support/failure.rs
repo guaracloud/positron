@@ -11,17 +11,17 @@ pub(crate) fn map_domain_value_failure(
 }
 
 pub(crate) fn map_ledger_failure(failure: positron_kernel::LedgerFailure) -> QueryFailure {
-    match failure.code() {
-        positron_kernel::LedgerFailureCode::SnapshotExpired => {
-            QueryFailure::new(QueryFailureCode::SnapshotExpired)
-        },
-        positron_kernel::LedgerFailureCode::LimitExceeded => {
-            QueryFailure::new(QueryFailureCode::InvalidBudget)
-        },
+    QueryFailure::new(map_ledger_failure_code(failure.code()))
+}
+
+const fn map_ledger_failure_code(code: positron_kernel::LedgerFailureCode) -> QueryFailureCode {
+    match code {
+        positron_kernel::LedgerFailureCode::SnapshotExpired => QueryFailureCode::SnapshotExpired,
+        positron_kernel::LedgerFailureCode::LimitExceeded => QueryFailureCode::InvalidBudget,
         positron_kernel::LedgerFailureCode::ResourceAdmissionRefused => {
-            QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused)
+            QueryFailureCode::ResourceAdmissionRefused
         },
-        _ => QueryFailure::new(QueryFailureCode::StoreUnavailable),
+        _ => QueryFailureCode::StoreUnavailable,
     }
 }
 
@@ -58,11 +58,27 @@ const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::map_store_failure_code;
+    use super::{map_ledger_failure_code, map_store_failure_code};
     use crate::QueryFailureCode;
 
     #[test]
     fn storage_failures_preserve_resource_and_cancellation_truth() {
+        assert_eq!(
+            map_ledger_failure_code(positron_kernel::LedgerFailureCode::SnapshotExpired),
+            QueryFailureCode::SnapshotExpired
+        );
+        assert_eq!(
+            map_ledger_failure_code(positron_kernel::LedgerFailureCode::LimitExceeded),
+            QueryFailureCode::InvalidBudget
+        );
+        assert_eq!(
+            map_ledger_failure_code(positron_kernel::LedgerFailureCode::ResourceAdmissionRefused),
+            QueryFailureCode::ResourceAdmissionRefused
+        );
+        assert_eq!(
+            map_ledger_failure_code(positron_kernel::LedgerFailureCode::IntegrityCorruption),
+            QueryFailureCode::StoreUnavailable
+        );
         assert_eq!(
             map_store_failure_code(positron_signals::LogStoreFailureCode::ResourceExhausted),
             QueryFailureCode::ResourceExhausted
@@ -78,6 +94,22 @@ mod tests {
         assert_eq!(
             map_store_failure_code(positron_signals::LogStoreFailureCode::PhysicalScopeMismatch),
             QueryFailureCode::StoreUnavailable
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::MalformedBlock),
+            QueryFailureCode::MalformedPersistentData
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::ResourceAdmissionRefused),
+            QueryFailureCode::ResourceAdmissionRefused
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::BudgetExhausted),
+            QueryFailureCode::BudgetExhausted
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::Internal),
+            QueryFailureCode::Internal
         );
     }
 }

@@ -13,6 +13,30 @@ use super::super::support::{
 use super::super::terminal_and_bounds::QueryFixture;
 
 #[test]
+fn clock_only_runtime_override_preserves_normal_query_execution() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("clock-only-runtime")?;
+    fixture.kernel.append_log("clocked", 20, 1)?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let planned = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
+    )?;
+    let events = service.execute(planned)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats))) if stats.records() == 1
+    ));
+    Ok(())
+}
+
+#[test]
 fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         positron_query::QueryClockFailure.to_string(),
@@ -53,6 +77,21 @@ fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<d
         1,
         TestClock::shared(100),
         std::sync::Arc::new(FailingWorkMeter),
+    );
+    assert_eq!(
+        failure_code(service.plan_pipeline(
+            context,
+            "logs | range query_time -100 100 | limit 1",
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+        ))?,
+        QueryFailureCode::Internal
+    );
+    let service = QueryService::with_runtime(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        1,
+        SequenceClock::shared([100, 99]),
+        std::sync::Arc::new(TestWorkMeter),
     );
     assert_eq!(
         failure_code(service.plan_pipeline(
@@ -141,6 +180,25 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
             .code(),
         QueryFailureCode::BudgetExhausted
     );
+
+    let service = super::super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        SequenceClock::shared([100, 100, 100, 100, 99]),
+    );
+    let planned = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service.execute(planned)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Internal
+    ));
     Ok(())
 }
 

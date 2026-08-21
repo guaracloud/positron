@@ -2,7 +2,7 @@ use positron_kernel::{
     ActiveSegmentLedger, ResourceReservation, SnapshotLeaseId, TransferredResourceReservation,
 };
 
-use crate::{QueryFailure, QueryFailureCode};
+use crate::QueryFailure;
 
 use crate::execution_support::map_ledger_failure;
 
@@ -36,9 +36,5 @@ impl ExecutionResources {
 
     pub(super) fn into_stream(self) -> (TransferredResourceReservation, SnapshotLeaseId) {
         (self.admission, self.lease)
-    }
-
-    pub(super) fn invalid() -> QueryFailure {
-        QueryFailure::new(QueryFailureCode::Internal)
     }
 }

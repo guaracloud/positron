@@ -106,9 +106,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
         framed!(memory.acquire(result.retained_size_bytes()));
         if state.cancellation.is_cancelled() {
-            return self.stopped_page(
+            return self.failed_page(
                 Some(header),
-                QueryFailureCode::Cancelled,
+                QueryFailure::new(QueryFailureCode::Cancelled),
                 &state,
                 delivered_before,
                 resources,

@@ -1,31 +1,13 @@
 use crate::execution_state::stats_before_current;
 use crate::execution_support::map_ledger_failure;
 use crate::{
-    QueryEvent, QueryFailure, QueryFailureCode, QueryIncomplete, QueryService, QueryStats,
-    QueryStream, QueryTerminal,
+    QueryEvent, QueryFailure, QueryIncomplete, QueryService, QueryStats, QueryStream, QueryTerminal,
 };
 
 use super::resources::ExecutionResources;
 use crate::cursor::CursorState;
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
-    pub(super) fn stopped_page(
-        &self,
-        header: Option<QueryEvent>,
-        code: QueryFailureCode,
-        state: &CursorState,
-        delivered_before: QueryStats,
-        resources: ExecutionResources,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.failed_page(
-            header,
-            QueryFailure::new(code),
-            state,
-            delivered_before,
-            resources,
-        )
-    }
-
     pub(super) fn failed_page(
         &self,
         header: Option<QueryEvent>,
@@ -118,7 +100,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let ledger = self.ledger;
         let (admission, identity) = resources.into_stream();
         if identity.to_bytes() != state.lease_identity {
-            return Err(ExecutionResources::invalid());
+            return Err(QueryFailure::new(crate::QueryFailureCode::Internal));
         }
         let cancellation = state.cancellation.clone();
         let release = Box::new(move || {
