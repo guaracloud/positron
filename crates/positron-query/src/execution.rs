@@ -144,57 +144,40 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ResultLease::new(state.lease_identity, state.expiry),
             initial_cursor,
         ));
-        let scan_limit = match usize::try_from(state.budget.decoded_records())
-            .ok()
-            .map(|limit| limit.min(MAX_SCAN_RECORDS))
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))
-        {
-            Ok(limit) => limit,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
-        let scan_limit = match ScanLimit::new(scan_limit) {
-            Ok(limit) => limit,
-            Err(_) => {
-                return self.failed_page(
-                    Some(header),
-                    QueryFailure::new(QueryFailureCode::Internal),
-                    &state,
-                    delivered_before,
-                );
-            },
-        };
-        let result = match LogStore::new().scan_cancellable(
-            self.governor,
-            state.tenant,
-            snapshot,
-            LogScan::through(scan_limit, frontier),
-            &state.cancellation,
-        ) {
-            Ok(result) => result,
-            Err(failure) => {
-                return self.failed_page(
-                    Some(header),
-                    map_store_failure(failure),
-                    &state,
-                    delivered_before,
-                );
-            },
-        };
-        let scan_work = match self.work_units(crate::QueryWorkStage::ScanDecode) {
-            Ok(work) => work,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
-        if let Err(failure) = charge_scan(&mut state, &result, scan_work) {
-            return self.failed_page(Some(header), failure, &state, delivered_before);
+        macro_rules! framed {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(failure) => {
+                        return self.failed_page(Some(header), failure, &state, delivered_before);
+                    },
+                }
+            };
         }
+        let scan_limit = framed!(
+            usize::try_from(state.budget.decoded_records())
+                .ok()
+                .map(|limit| limit.min(MAX_SCAN_RECORDS))
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))
+        );
+        let scan_limit = framed!(
+            ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+        );
+        let result = framed!(
+            LogStore::new()
+                .scan_cancellable(
+                    self.governor,
+                    state.tenant,
+                    snapshot,
+                    LogScan::through(scan_limit, frontier),
+                    &state.cancellation,
+                )
+                .map_err(map_store_failure)
+        );
+        let scan_work = framed!(self.work_units(crate::QueryWorkStage::ScanDecode));
+        framed!(charge_scan(&mut state, &result, scan_work));
         let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
-        if let Err(failure) = memory.acquire(result.retained_size_bytes()) {
-            return self.failed_page(Some(header), failure, &state, delivered_before);
-        }
+        framed!(memory.acquire(result.retained_size_bytes()));
         if state.cancellation.is_cancelled() {
             return self.stopped_page(
                 Some(header),
@@ -203,12 +186,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 delivered_before,
             );
         }
-        let wall_exhausted = match self.observe_state(&mut state) {
-            Ok(exhausted) => exhausted,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
+        let wall_exhausted = framed!(self.observe_state(&mut state));
         if wall_exhausted || exhausted(&state) || !result.complete() {
             return self.stopped_page(
                 Some(header),
@@ -219,27 +197,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
 
         let operator_count = state.plan.operator_count();
-        let records = match crate::operators::execute(self, &mut state, result, &mut memory) {
-            Ok(records) => records,
-            Err(failure)
-                if matches!(
-                    failure.code(),
-                    QueryFailureCode::BudgetExhausted | QueryFailureCode::Cancelled
-                ) =>
-            {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
+        let records = framed!(crate::operators::execute(
+            self,
+            &mut state,
+            result,
+            &mut memory,
+        ));
         let operator_wall_exhausted = if operator_count > 0 {
-            match self.observe_state(&mut state) {
-                Ok(exhausted) => exhausted,
-                Err(failure) => {
-                    return self.failed_page(Some(header), failure, &state, delivered_before);
-                },
-            }
+            framed!(self.observe_state(&mut state))
         } else {
             false
         };
@@ -254,32 +219,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
 
         let wanted = usize::from(state.plan.limit()).min(records.len());
         let start = usize::from(state.offset);
-        let end = match start
-            .checked_add(usize::from(batch_limit))
-            .map(|end| end.min(wanted))
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
-        {
-            Ok(end) => end,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
-        let page = match materialize_page(records, start, end, &mut memory) {
-            Ok(page) => page,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
+        let end = framed!(
+            start
+                .checked_add(usize::from(batch_limit))
+                .map(|end| end.min(wanted))
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
+        );
+        let page = framed!(materialize_page(records, start, end, &mut memory));
         let before_batch = stats_before_current(&state);
-        let output_work = match self.work_units(crate::QueryWorkStage::Output) {
-            Ok(work) => work,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
-        if let Err(failure) = charge_work(&mut state, output_work) {
-            return self.failed_page(Some(header), failure, &state, delivered_before);
-        }
+        let output_work = framed!(self.work_units(crate::QueryWorkStage::Output));
+        framed!(charge_work(&mut state, output_work));
         if state.cancellation.is_cancelled() {
             return self.stopped_page_with_stats(
                 Some(header),
@@ -289,12 +238,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 before_batch,
             );
         }
-        let output_wall_exhausted = match self.observe_state(&mut state) {
-            Ok(exhausted) => exhausted,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
+        let output_wall_exhausted = framed!(self.observe_state(&mut state));
         if output_wall_exhausted || exhausted(&state) {
             return self.stopped_page(
                 Some(header),
@@ -304,15 +248,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
         let mut output_state = state.clone();
-        match charge_output(&mut output_state, &page, &state.cancellation) {
-            Ok(()) => {},
-            Err(failure) if failure.code() == QueryFailureCode::Cancelled => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        }
+        framed!(charge_output(&mut output_state, &page, &state.cancellation,));
         if exhausted(&output_state) {
             return self.stopped_page_with_stats(
                 Some(header),
@@ -342,7 +278,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 stats,
             );
         }
-        let digest = match batch_digest(
+        let digest = framed!(batch_digest(
             &self.ledger.control_tokens(),
             state.prior_digest,
             state.sequence,
@@ -350,21 +286,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             &page,
             &state.cancellation,
             &mut memory,
-        ) {
-            Ok(digest) => digest,
-            Err(failure) if failure.code() == QueryFailureCode::Cancelled => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
-        let post_digest_expired = match self.observe_state(&mut state) {
-            Ok(exhausted) => exhausted,
-            Err(failure) => {
-                return self.failed_page(Some(header), failure, &state, delivered_before);
-            },
-        };
+        ));
+        let post_digest_expired = framed!(self.observe_state(&mut state));
         if post_digest_expired {
             return self.stopped_page(
                 Some(header),
