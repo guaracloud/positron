@@ -226,11 +226,11 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
                 &columns.split_ascii_whitespace().collect::<Vec<_>>(),
             )?);
             stage_order = 3;
-        } else if stage == "aggregate count" {
+        } else if stage == "aggregate count" || stage.starts_with("aggregate count by ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            aggregate = Some(AggregateSpec::Count);
+            aggregate = Some(parse_aggregate(stage)?);
             stage_order = 3;
         } else if let Some(specification) = stage.strip_prefix("order by ") {
             if ordering.is_some() || aggregate.is_some() || stage_order > 3 {
@@ -373,6 +373,17 @@ fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailur
         projection.push(column);
     }
     Ok(projection)
+}
+
+fn parse_aggregate(stage: &str) -> Result<AggregateSpec, QueryFailure> {
+    if stage == "aggregate count" {
+        return Ok(AggregateSpec::count());
+    }
+    let columns = stage
+        .strip_prefix("aggregate count by ")
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+    parse_projection(&columns.split_ascii_whitespace().collect::<Vec<_>>())
+        .map(AggregateSpec::count_by)
 }
 
 fn parse_ordering(axis: TemporalAxis, specification: &str) -> Result<OrderSpec, QueryFailure> {

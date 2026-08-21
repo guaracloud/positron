@@ -1,8 +1,13 @@
 use positron_domain::time::{IngestTimeCandidate, QueryTime};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use crate::cursor::CursorState;
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
+
+const MAX_GROUPS: usize = 1_024;
+const GROUP_ENTRY_BASE_BYTES: u64 = 32;
+const GROUP_VALUE_SLOT_BYTES: u64 = 16;
 
 pub(crate) fn query_record(
     record: &positron_signals::ScannedLogRecord,
@@ -28,8 +33,11 @@ pub(crate) fn query_record(
     if !plan.temporal_range().contains(ordering_time) {
         return None;
     }
-    let body = plan
-        .projection()
+    let selected_columns = plan
+        .aggregate()
+        .map(crate::plan::AggregateSpec::group_by)
+        .unwrap_or_else(|| plan.projection());
+    let body = selected_columns
         .contains(&crate::plan::ProjectionColumn::Body)
         .then(|| {
             record
@@ -42,11 +50,115 @@ pub(crate) fn query_record(
         body,
         ordering_time,
         record.commit_position(),
-        plan.projection()
-            .contains(&crate::plan::ProjectionColumn::QueryTime),
-        plan.projection()
-            .contains(&crate::plan::ProjectionColumn::CommitPosition),
+        selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
+        selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition),
     ))
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum GroupValue {
+    Body(Option<String>),
+    QueryTime(positron_domain::time::UnixNanoseconds),
+    CommitPosition(positron_domain::routing::CommitPosition),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GroupKey(Vec<GroupValue>);
+
+impl GroupKey {
+    fn for_record(record: &QueryRecord, columns: &[crate::plan::ProjectionColumn]) -> Self {
+        Self(
+            columns
+                .iter()
+                .map(|column| match column {
+                    crate::plan::ProjectionColumn::Body => {
+                        GroupValue::Body(record.body_text().map(str::to_owned))
+                    },
+                    crate::plan::ProjectionColumn::QueryTime => {
+                        GroupValue::QueryTime(record.query_time())
+                    },
+                    crate::plan::ProjectionColumn::CommitPosition => {
+                        GroupValue::CommitPosition(record.commit_position())
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    fn retained_bytes(&self) -> Result<u64, QueryFailure> {
+        self.0
+            .iter()
+            .try_fold(GROUP_ENTRY_BASE_BYTES, |total, value| {
+                let value_bytes = match value {
+                    GroupValue::Body(body) => u64::try_from(body.as_deref().map_or(0, str::len))
+                        .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
+                    GroupValue::QueryTime(_) | GroupValue::CommitPosition(_) => 8,
+                };
+                total
+                    .checked_add(GROUP_VALUE_SLOT_BYTES)
+                    .and_then(|bytes| bytes.checked_add(value_bytes))
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))
+            })
+    }
+
+    fn into_record(self, count: u64) -> QueryRecord {
+        let mut body = None;
+        let mut query_time = None;
+        let mut commit_position = None;
+        for value in self.0 {
+            match value {
+                GroupValue::Body(value) => body = value,
+                GroupValue::QueryTime(value) => query_time = Some(value),
+                GroupValue::CommitPosition(value) => commit_position = Some(value),
+            }
+        }
+        QueryRecord::grouped_count_record(body, query_time, commit_position, count)
+    }
+}
+
+pub(crate) fn aggregate_records(
+    records: Vec<QueryRecord>,
+    aggregate: &crate::plan::AggregateSpec,
+    memory_budget: u64,
+) -> Result<Vec<QueryRecord>, QueryFailure> {
+    if aggregate.group_by().is_empty() {
+        return Ok(vec![QueryRecord::count_record(
+            u64::try_from(records.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
+        )]);
+    }
+    let mut groups = BTreeMap::<GroupKey, u64>::new();
+    let mut retained_bytes = 0_u64;
+    for record in &records {
+        let key = GroupKey::for_record(record, aggregate.group_by());
+        let key_bytes = key.retained_bytes()?;
+        let at_capacity = groups.len() >= MAX_GROUPS;
+        match groups.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let count = entry
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+                *entry.get_mut() = count;
+            },
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if at_capacity {
+                    return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+                }
+                retained_bytes = retained_bytes
+                    .checked_add(key_bytes)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+                if retained_bytes > memory_budget {
+                    return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+                }
+                entry.insert(1);
+            },
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(key, count)| key.into_record(count))
+        .collect())
 }
 
 pub(crate) fn compare_records(

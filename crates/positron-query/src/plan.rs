@@ -54,9 +54,25 @@ pub(crate) enum ProjectionColumn {
     CommitPosition,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AggregateSpec {
-    Count,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AggregateSpec {
+    group_by: Vec<ProjectionColumn>,
+}
+
+impl AggregateSpec {
+    pub(crate) const fn count() -> Self {
+        Self {
+            group_by: Vec::new(),
+        }
+    }
+
+    pub(crate) const fn count_by(group_by: Vec<ProjectionColumn>) -> Self {
+        Self { group_by }
+    }
+
+    pub(crate) fn group_by(&self) -> &[ProjectionColumn] {
+        &self.group_by
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,8 +175,8 @@ impl LogicalPlan {
         self
     }
 
-    pub(crate) const fn aggregate(&self) -> Option<AggregateSpec> {
-        self.aggregate
+    pub(crate) const fn aggregate(&self) -> Option<&AggregateSpec> {
+        self.aggregate.as_ref()
     }
 
     pub(crate) fn with_ordering(mut self, ordering: OrderSpec) -> Self {

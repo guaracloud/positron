@@ -10,20 +10,16 @@ pub struct ResultSchema {
 
 impl ResultSchema {
     pub(crate) fn for_plan(plan: &LogicalPlan) -> Self {
-        if plan.aggregate().is_some() {
-            return Self {
-                columns: vec!["count"],
-            };
+        if let Some(aggregate) = plan.aggregate() {
+            let mut columns = aggregate
+                .group_by()
+                .iter()
+                .map(column_name)
+                .collect::<Vec<_>>();
+            columns.push("count");
+            return Self { columns };
         }
-        let columns = plan
-            .projection()
-            .iter()
-            .map(|column| match column {
-                crate::plan::ProjectionColumn::Body => "body",
-                crate::plan::ProjectionColumn::QueryTime => "query_time",
-                crate::plan::ProjectionColumn::CommitPosition => "commit_position",
-            })
-            .collect();
+        let columns = plan.projection().iter().map(column_name).collect();
         Self { columns }
     }
 
@@ -62,36 +58,51 @@ impl ResultSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+fn column_name(column: &crate::plan::ProjectionColumn) -> &'static str {
+    match column {
+        crate::plan::ProjectionColumn::Body => "body",
+        crate::plan::ProjectionColumn::QueryTime => "query_time",
+        crate::plan::ProjectionColumn::CommitPosition => "commit_position",
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultOrdering {
-    axis: TemporalAxis,
-    primary_direction: crate::OrderDirection,
-    commit_direction: crate::OrderDirection,
+    columns: Vec<&'static str>,
+    directions: Vec<crate::OrderDirection>,
 }
 
 impl ResultOrdering {
-    pub(crate) const fn for_plan(plan: &LogicalPlan) -> Self {
+    pub(crate) fn for_plan(plan: &LogicalPlan) -> Self {
+        if let Some(aggregate) = plan.aggregate() {
+            return Self {
+                columns: aggregate.group_by().iter().map(column_name).collect(),
+                directions: vec![crate::OrderDirection::Ascending; aggregate.group_by().len()],
+            };
+        }
         Self {
-            axis: plan.temporal_axis(),
-            primary_direction: plan.ordering().primary_direction(),
-            commit_direction: plan.ordering().commit_direction(),
+            columns: vec![
+                match plan.temporal_axis() {
+                    TemporalAxis::QueryTime => "query_time",
+                    TemporalAxis::EventTime => "event_time",
+                },
+                "commit_position",
+            ],
+            directions: vec![
+                plan.ordering().primary_direction(),
+                plan.ordering().commit_direction(),
+            ],
         }
     }
 
     #[must_use]
-    pub const fn columns(self) -> [&'static str; 2] {
-        [
-            match self.axis {
-                TemporalAxis::QueryTime => "query_time",
-                TemporalAxis::EventTime => "event_time",
-            },
-            "commit_position",
-        ]
+    pub fn columns(&self) -> &[&'static str] {
+        &self.columns
     }
 
     #[must_use]
-    pub const fn directions(self) -> [crate::OrderDirection; 2] {
-        [self.primary_direction, self.commit_direction]
+    pub fn directions(&self) -> &[crate::OrderDirection] {
+        &self.directions
     }
 }
 
@@ -117,8 +128,8 @@ impl ResultLease {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryHeader {
-    plan: LogicalPlan,
     schema: ResultSchema,
+    ordering: ResultOrdering,
     budget: QueryBudget,
     snapshot: ResultSnapshot,
     lease: ResultLease,
@@ -135,7 +146,7 @@ impl QueryHeader {
     ) -> Self {
         Self {
             schema: ResultSchema::for_plan(&plan),
-            plan,
+            ordering: ResultOrdering::for_plan(&plan),
             budget,
             snapshot,
             lease,
@@ -151,8 +162,8 @@ impl QueryHeader {
         self.snapshot
     }
     #[must_use]
-    pub const fn ordering(&self) -> ResultOrdering {
-        ResultOrdering::for_plan(&self.plan)
+    pub fn ordering(&self) -> ResultOrdering {
+        self.ordering.clone()
     }
     #[must_use]
     pub const fn budget(&self) -> QueryBudget {
@@ -203,6 +214,22 @@ impl QueryRecord {
             commit_position: CommitPosition::origin(),
             query_time_selected: false,
             commit_position_selected: false,
+            count: Some(count),
+        }
+    }
+
+    pub(crate) fn grouped_count_record(
+        body: Option<String>,
+        query_time: Option<UnixNanoseconds>,
+        commit_position: Option<CommitPosition>,
+        count: u64,
+    ) -> Self {
+        Self {
+            body,
+            query_time: query_time.unwrap_or_else(|| UnixNanoseconds::new(0)),
+            commit_position: commit_position.unwrap_or_else(CommitPosition::origin),
+            query_time_selected: query_time.is_some(),
+            commit_position_selected: commit_position.is_some(),
             count: Some(count),
         }
     }

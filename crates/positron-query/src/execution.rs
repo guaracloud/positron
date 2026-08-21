@@ -8,13 +8,13 @@ use crate::execution_state::{
     stats_with_current, validate_authorization,
 };
 use crate::execution_support::{
-    batch_digest, charge_output, charge_scan, charge_work, compare_records, exhausted,
-    map_ledger_failure, map_store_failure, query_record,
+    aggregate_records, batch_digest, charge_output, charge_scan, charge_work, compare_records,
+    exhausted, map_ledger_failure, map_store_failure, query_record,
 };
 use crate::{
     PlannedQuery, QueryBatch, QueryCursor, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader,
-    QueryIncomplete, QueryRecord, QueryService, QueryStats, QueryStream, QueryTerminal,
-    ResultLease, ResultSnapshot,
+    QueryIncomplete, QueryService, QueryStats, QueryStream, QueryTerminal, ResultLease,
+    ResultSnapshot,
 };
 
 const MAX_SCAN_RECORDS: usize = 1_024;
@@ -173,36 +173,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 );
             },
         };
-        let mut records = result
-            .records()
-            .iter()
-            .filter_map(|record| query_record(record, &state.plan))
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| compare_records(left, right, state.plan.ordering()));
-        if state.plan.aggregate().is_some() {
-            records = vec![QueryRecord::count_record(
-                u64::try_from(records.len())
-                    .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
-            )];
-        }
-        let operator_count = state.plan.operator_count();
-        if operator_count > 0 {
-            let operator_units = self
-                .work_units(crate::QueryWorkStage::Operators)?
-                .checked_mul(operator_count)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-            charge_work(&mut state, operator_units)?;
-        }
-        let wanted = usize::from(state.plan.limit()).min(records.len());
-        let start = usize::from(state.offset);
-        let end = start
-            .checked_add(usize::from(batch_limit))
-            .map(|end| end.min(wanted))
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        let page = records
-            .get(start..end)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
-            .to_vec();
         charge_scan(
             &mut state,
             &result,
@@ -224,6 +194,68 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 stats,
             );
         }
+        let mut records = result
+            .records()
+            .iter()
+            .filter_map(|record| query_record(record, &state.plan))
+            .collect::<Vec<_>>();
+        if let Some(aggregate) = state.plan.aggregate() {
+            records = match aggregate_records(records, aggregate, state.budget.memory_bytes()) {
+                Ok(records) => records,
+                Err(failure) if failure.code() == QueryFailureCode::BudgetExhausted => {
+                    let stats = stats_before_current(&state);
+                    return self.stream(
+                        vec![
+                            header,
+                            QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
+                                failure, &state,
+                            ))),
+                        ],
+                        state.lease_identity,
+                        false,
+                        delivered_before,
+                        stats,
+                    );
+                },
+                Err(failure) => return Err(failure),
+            };
+        } else {
+            records.sort_by(|left, right| compare_records(left, right, state.plan.ordering()));
+        }
+        let operator_count = state.plan.operator_count();
+        if operator_count > 0 {
+            let operator_units = self
+                .work_units(crate::QueryWorkStage::Operators)?
+                .checked_mul(operator_count)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+            charge_work(&mut state, operator_units)?;
+            if self.observe_state(&mut state)? || exhausted(&state) {
+                let stats = stats_before_current(&state);
+                return self.stream(
+                    vec![
+                        header,
+                        QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
+                            QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                            &state,
+                        ))),
+                    ],
+                    state.lease_identity,
+                    false,
+                    delivered_before,
+                    stats,
+                );
+            }
+        }
+        let wanted = usize::from(state.plan.limit()).min(records.len());
+        let start = usize::from(state.offset);
+        let end = start
+            .checked_add(usize::from(batch_limit))
+            .map(|end| end.min(wanted))
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        let page = records
+            .get(start..end)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
+            .to_vec();
         let before_batch = stats_before_current(&state);
         charge_work(&mut state, self.work_units(crate::QueryWorkStage::Output)?)?;
         if self.observe_state(&mut state)? || exhausted(&state) {
