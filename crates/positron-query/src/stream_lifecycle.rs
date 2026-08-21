@@ -55,13 +55,21 @@ impl<'lease> QueryStream<'lease> {
         if self.terminal_observed {
             self.events = Vec::new().into_iter();
         } else {
-            self.events = vec![QueryEvent::Terminal(QueryTerminal::Incomplete(
+            let pending_header =
+                if matches!(self.events.as_slice().first(), Some(QueryEvent::Header(_))) {
+                    self.events.next()
+                } else {
+                    None
+                };
+            let mut events = Vec::with_capacity(usize::from(pending_header.is_some()) + 1);
+            events.extend(pending_header);
+            events.push(QueryEvent::Terminal(QueryTerminal::Incomplete(
                 QueryIncomplete::new(
                     QueryFailure::new(QueryFailureCode::Cancelled),
                     self.observed_stats,
                 ),
-            ))]
-            .into_iter();
+            )));
+            self.events = events.into_iter();
         }
     }
 
