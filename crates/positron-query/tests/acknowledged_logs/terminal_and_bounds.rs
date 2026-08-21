@@ -8,7 +8,9 @@ use positron_query::{
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
-use super::support::{KernelFixture, TemporaryRoots, TestClock};
+use super::support::{
+    KernelFixture, SequenceClock, TemporaryRoots, TestClock, zero_work_clock_service,
+};
 
 #[test]
 fn cancellation_replaces_unsent_events_with_one_non_complete_terminal() -> Result<(), Box<dyn Error>>
@@ -153,6 +155,73 @@ fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Resul
             .code(),
         QueryFailureCode::InvalidBudget
     );
+    Ok(())
+}
+
+#[test]
+fn paged_execution_classifies_elapsed_deadlines_before_snapshot_mutation()
+-> Result<(), Box<dyn Error>> {
+    for (label, execute_at) in [("page-exact-deadline", 101), ("page-past-deadline", 102)] {
+        let fixture = QueryFixture::new(label)?;
+        let service = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            1,
+            SequenceClock::shared([100, 100, execute_at]),
+        );
+        let before_resources = fixture.kernel.authority.governor().inspect()?;
+        let before_snapshot = fixture.kernel.ledger()?.snapshot()?;
+        let before_catalog = (
+            before_snapshot.catalog_identity(),
+            before_snapshot.catalog_generation(),
+        );
+        drop(before_snapshot);
+        let query = service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 1",
+            deadline_budget(),
+        )?;
+
+        let failure = service
+            .execute_page(query)
+            .expect_err("elapsed page deadline must fail before snapshot lease creation");
+        assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+        assert_eq!(
+            failure.limiting_budget(),
+            Some(QueryBudgetDimension::WallSeconds)
+        );
+        assert_eq!(
+            fixture.kernel.authority.governor().inspect()?,
+            before_resources
+        );
+        let after_snapshot = fixture.kernel.ledger()?.snapshot()?;
+        assert_eq!(
+            (
+                after_snapshot.catalog_identity(),
+                after_snapshot.catalog_generation(),
+            ),
+            before_catalog
+        );
+    }
+
+    let fixture = QueryFixture::new("page-within-deadline")?;
+    let service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        deadline_budget(),
+    )?;
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
     Ok(())
 }
 
@@ -397,6 +466,11 @@ impl QueryFixture {
 
 fn budget() -> QueryBudget {
     QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 1_048_576, 60).expect("fixture budget")
+}
+
+fn deadline_budget() -> QueryBudget {
+    QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 1_048_576, 1)
+        .expect("deadline fixture budget")
 }
 
 fn terminal_count(events: &[QueryEvent]) -> usize {

@@ -75,6 +75,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .started_at
             .checked_add(query.budget.wall_seconds())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
+        if now_seconds >= expiry {
+            return Err(QueryFailure::budget_exhausted(
+                crate::QueryBudgetDimension::WallSeconds,
+            ));
+        }
         // PlannedQuery still owns its admitted CPU reservation while the
         // immutable lease snapshot is constructed.
         let lease = self
