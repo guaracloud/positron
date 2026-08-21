@@ -211,9 +211,11 @@ impl QueryRecord {
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
         let query_time_bytes = u64::from(self.query_time_selected) * 8;
         let commit_position_bytes = u64::from(self.commit_position_selected) * 8;
+        let count_bytes = u64::from(self.count.is_some()) * 8;
         body_bytes
             .checked_add(query_time_bytes)
             .and_then(|bytes| bytes.checked_add(commit_position_bytes))
+            .and_then(|bytes| bytes.checked_add(count_bytes))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
     }
 
