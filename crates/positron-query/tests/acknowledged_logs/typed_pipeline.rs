@@ -8,8 +8,8 @@ use positron_query::{
 };
 
 use super::support::{
-    BlockingOperatorWorkMeter, CancellingStageWorkMeter, ConstantWorkMeter, SequenceClock,
-    TestClock, TestWorkMeter,
+    BlockingOperatorWorkMeter, CancellingOperatorCallMeter, CancellingStageWorkMeter,
+    ConstantWorkMeter, SequenceClock, TestClock, TestWorkMeter,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -1010,7 +1010,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_432, true), (1_431, false)] {
+    for (memory_bytes, expected_complete) in [(1_496, true), (1_495, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -1037,7 +1037,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(2_862, true), (2_861, false)] {
+    for (memory_bytes, expected_complete) in [(2_990, true), (2_989, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
@@ -1366,19 +1366,19 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(10)?,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(18)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.cpu_work_units() == 10
+            if stats.cpu_work_units() == 18
     ));
 
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(9)?,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(17)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -1390,8 +1390,94 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 10
+                && incomplete.stats().cpu_work_units() == 18
     ));
+    Ok(())
+}
+
+#[test]
+fn group_key_construction_charges_large_native_values_before_lookup() -> Result<(), Box<dyn Error>>
+{
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("group-key-construction-work")?;
+    fixture.kernel.append_log_bodies(
+        vec![Some(CandidateAttributeValue::string("x".repeat(4_096)))],
+        20,
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 8_192, 1_048_576, 60)?.with_cpu_work_units(10)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 11
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_is_polled_during_native_group_key_construction() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("group-key-construction-cancel")?;
+    fixture.kernel.append_log_bodies(
+        vec![Some(CandidateAttributeValue::string("x".repeat(4_096)))],
+        20,
+        1,
+    )?;
+    let meter = CancellingOperatorCallMeter::shared(10);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 8_192, 1_048_576, 60)?.with_cpu_work_units(18)?,
+    )?;
+    meter.bind(query.cancellation())?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
     Ok(())
 }
 

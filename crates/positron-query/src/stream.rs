@@ -258,6 +258,7 @@ impl QueryHeader {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRecord {
     body: Option<positron_domain::value::ValidatedAttributeValue>,
+    body_retained_bytes: u64,
     body_selected: bool,
     query_time: Option<QueryTime>,
     event_time: Option<EventTime>,
@@ -287,9 +288,29 @@ pub(crate) struct QueryRecordSelection {
     pub(crate) commit_position: bool,
 }
 
+pub(crate) struct QueryGroupFields {
+    pub(crate) body: Option<positron_domain::value::ValidatedAttributeValue>,
+    pub(crate) body_retained_bytes: u64,
+    pub(crate) query_time: QueryTime,
+    pub(crate) event_time: EventTime,
+    pub(crate) ingest_time: IngestTime,
+    pub(crate) commit_position: CommitPosition,
+}
+
+pub(crate) struct GroupedCountFields {
+    pub(crate) body: Option<positron_domain::value::ValidatedAttributeValue>,
+    pub(crate) body_retained_bytes: u64,
+    pub(crate) body_selected: bool,
+    pub(crate) query_time: Option<QueryTime>,
+    pub(crate) event_time: Option<EventTime>,
+    pub(crate) ingest_time: Option<IngestTime>,
+    pub(crate) commit_position: Option<CommitPosition>,
+}
+
 impl QueryRecord {
     pub(crate) const fn new(
         body: Option<positron_domain::value::ValidatedAttributeValue>,
+        body_retained_bytes: u64,
         times: QueryRecordTimes,
         commit_position: CommitPosition,
         record_ordinal: RecordOrdinal,
@@ -297,6 +318,7 @@ impl QueryRecord {
     ) -> Self {
         Self {
             body,
+            body_retained_bytes,
             body_selected: selection.body,
             query_time: Some(times.query),
             event_time: Some(times.event),
@@ -315,6 +337,7 @@ impl QueryRecord {
     pub(crate) const fn count_record(count: u64) -> Self {
         Self {
             body: None,
+            body_retained_bytes: 0,
             body_selected: false,
             query_time: None,
             event_time: None,
@@ -330,28 +353,23 @@ impl QueryRecord {
         }
     }
 
-    pub(crate) fn grouped_count_record(
-        body: Option<positron_domain::value::ValidatedAttributeValue>,
-        body_selected: bool,
-        query_time: Option<QueryTime>,
-        event_time: Option<EventTime>,
-        ingest_time: Option<IngestTime>,
-        commit_position: Option<CommitPosition>,
-        count: u64,
-    ) -> Self {
+    pub(crate) fn grouped_count_record(fields: GroupedCountFields, count: u64) -> Self {
         Self {
-            body,
-            body_selected,
-            query_time,
-            event_time,
-            ingest_time,
+            body: fields.body,
+            body_retained_bytes: fields.body_retained_bytes,
+            body_selected: fields.body_selected,
+            query_time: fields.query_time,
+            event_time: fields.event_time,
+            ingest_time: fields.ingest_time,
             ordering_time: UnixNanoseconds::new(0),
-            commit_position: commit_position.unwrap_or_else(CommitPosition::origin),
+            commit_position: fields
+                .commit_position
+                .unwrap_or_else(CommitPosition::origin),
             record_ordinal: RecordOrdinal::first(),
-            query_time_selected: query_time.is_some(),
-            event_time_selected: event_time.is_some(),
-            ingest_time_selected: ingest_time.is_some(),
-            commit_position_selected: commit_position.is_some(),
+            query_time_selected: fields.query_time.is_some(),
+            event_time_selected: fields.event_time.is_some(),
+            ingest_time_selected: fields.ingest_time.is_some(),
+            commit_position_selected: fields.commit_position.is_some(),
             count: Some(count),
         }
     }
@@ -468,36 +486,24 @@ impl QueryRecord {
     }
 
     pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {
-        let bytes = self
-            .body
-            .as_ref()
-            .map_or(Ok(0), |body| body.retained_heap_bytes())
-            .map_err(map_value_failure)?;
-        u64::try_from(bytes).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+        Ok(self.body_retained_bytes)
     }
 
-    pub(crate) fn into_group_fields(
-        self,
-    ) -> Result<
-        (
-            Option<positron_domain::value::ValidatedAttributeValue>,
-            QueryTime,
-            EventTime,
-            IngestTime,
-            CommitPosition,
-        ),
-        QueryFailure,
-    > {
-        Ok((
-            self.body,
-            self.query_time
+    pub(crate) fn into_group_fields(self) -> Result<QueryGroupFields, QueryFailure> {
+        Ok(QueryGroupFields {
+            body: self.body,
+            body_retained_bytes: self.body_retained_bytes,
+            query_time: self
+                .query_time
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
-            self.event_time
+            event_time: self
+                .event_time
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
-            self.ingest_time
+            ingest_time: self
+                .ingest_time
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
-            self.commit_position,
-        ))
+            commit_position: self.commit_position,
+        })
     }
 
     pub(crate) const fn query_time_selected(&self) -> bool {

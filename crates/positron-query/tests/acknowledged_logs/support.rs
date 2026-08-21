@@ -123,6 +123,53 @@ pub struct CancellingStageWorkMeter {
     cancellation: Mutex<Option<positron_query::QueryCancellation>>,
 }
 
+pub struct CancellingOperatorCallMeter {
+    cancel_at: u64,
+    calls: AtomicU64,
+    cancellation: Mutex<Option<positron_query::QueryCancellation>>,
+}
+
+impl CancellingOperatorCallMeter {
+    pub fn shared(cancel_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            cancel_at,
+            calls: AtomicU64::new(0),
+            cancellation: Mutex::new(None),
+        })
+    }
+
+    pub fn bind(
+        &self,
+        cancellation: positron_query::QueryCancellation,
+    ) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut slot = self
+            .cancellation
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        *slot = Some(cancellation);
+        Ok(())
+    }
+}
+
+impl positron_query::QueryWorkMeter for CancellingOperatorCallMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage == positron_query::QueryWorkStage::Operators
+            && self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_at
+            && let Some(cancellation) = self
+                .cancellation
+                .lock()
+                .map_err(|_| positron_query::QueryWorkFailure)?
+                .as_ref()
+        {
+            cancellation.cancel();
+        }
+        Ok(1)
+    }
+}
+
 impl CancellingStageWorkMeter {
     pub fn shared(stage: positron_query::QueryWorkStage) -> Arc<Self> {
         Arc::new(Self {

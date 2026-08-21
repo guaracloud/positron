@@ -9,6 +9,7 @@ const MAX_GROUPS: usize = 1_024;
 const DIGEST_STATE_BYTES: u64 = 256;
 const DIGEST_CONTRACT_BYTES: usize = 128;
 const DIGEST_CHUNK_BYTES: usize = 1_024;
+const GROUP_ENCODING_CHUNK_BYTES: u64 = 256;
 
 pub(crate) fn query_record(
     record: &positron_signals::ScannedLogRecord,
@@ -43,16 +44,18 @@ pub(crate) fn query_record(
         .map(crate::plan::AggregateSpec::group_by)
         .unwrap_or_else(|| plan.projection());
     let body_selected = selected_columns.contains(&crate::plan::ProjectionColumn::Body);
-    let body = if body_selected {
+    let (body, body_retained_bytes) = if body_selected {
         record
             .body()
             .map(|body| try_retained_value(body, memory))
             .transpose()?
+            .map_or((None, 0), |(body, bytes)| (Some(body), bytes))
     } else {
-        None
+        (None, 0)
     };
     Ok(Some(QueryRecord::new(
         body,
+        body_retained_bytes,
         crate::stream::QueryRecordTimes {
             query: query_time,
             event: event_time,
@@ -75,7 +78,7 @@ pub(crate) fn query_record(
 fn try_retained_value(
     value: &positron_domain::value::ValidatedAttributeValue,
     memory: &mut crate::memory::QueryMemory,
-) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
+) -> Result<(positron_domain::value::ValidatedAttributeValue, u64), QueryFailure> {
     let bytes = u64::try_from(
         value
             .retained_heap_bytes()
@@ -84,7 +87,7 @@ fn try_retained_value(
     .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     memory.acquire(bytes)?;
     match value.try_clone() {
-        Ok(retained) => Ok(retained),
+        Ok(retained) => Ok((retained, bytes)),
         Err(failure) => {
             memory.release(bytes)?;
             Err(map_domain_value_failure(failure))
@@ -107,21 +110,19 @@ const _: () = assert!(
 );
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct GroupKey(Vec<GroupValue>);
+struct GroupKey {
+    values: Vec<GroupValue>,
+    body_retained_bytes: u64,
+}
 
 impl GroupKey {
     fn for_record(
         record: QueryRecord,
         columns: &[crate::plan::ProjectionColumn],
     ) -> Result<(Self, u64), QueryFailure> {
-        let (mut body, query_time, event_time, ingest_time, commit_position) =
-            record.into_group_fields()?;
-        let body_bytes = u64::try_from(
-            body.as_ref()
-                .map_or(Ok(0), |body| body.retained_heap_bytes())
-                .map_err(map_domain_value_failure)?,
-        )
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let fields = record.into_group_fields()?;
+        let mut body = fields.body;
+        let body_retained_bytes = fields.body_retained_bytes;
         let mut values = Vec::new();
         values
             .try_reserve_exact(columns.len())
@@ -129,15 +130,27 @@ impl GroupKey {
         for column in columns {
             values.push(match column {
                 crate::plan::ProjectionColumn::Body => GroupValue::Body(body.take()),
-                crate::plan::ProjectionColumn::QueryTime => GroupValue::QueryTime(query_time),
-                crate::plan::ProjectionColumn::EventTime => GroupValue::EventTime(event_time),
-                crate::plan::ProjectionColumn::IngestTime => GroupValue::IngestTime(ingest_time),
+                crate::plan::ProjectionColumn::QueryTime => {
+                    GroupValue::QueryTime(fields.query_time)
+                },
+                crate::plan::ProjectionColumn::EventTime => {
+                    GroupValue::EventTime(fields.event_time)
+                },
+                crate::plan::ProjectionColumn::IngestTime => {
+                    GroupValue::IngestTime(fields.ingest_time)
+                },
                 crate::plan::ProjectionColumn::CommitPosition => {
-                    GroupValue::CommitPosition(commit_position)
+                    GroupValue::CommitPosition(fields.commit_position)
                 },
             });
         }
-        Ok((Self(values), body_bytes))
+        Ok((
+            Self {
+                values,
+                body_retained_bytes,
+            },
+            body_retained_bytes,
+        ))
     }
 
     fn into_record(self, count: u64) -> QueryRecord {
@@ -147,7 +160,7 @@ impl GroupKey {
         let mut event_time = None;
         let mut ingest_time = None;
         let mut commit_position = None;
-        for value in self.0 {
+        for value in self.values {
             match value {
                 GroupValue::Body(value) => {
                     body = value;
@@ -160,37 +173,40 @@ impl GroupKey {
             }
         }
         QueryRecord::grouped_count_record(
-            body,
-            body_selected,
-            query_time,
-            event_time,
-            ingest_time,
-            commit_position,
+            crate::stream::GroupedCountFields {
+                body,
+                body_retained_bytes: self.body_retained_bytes,
+                body_selected,
+                query_time,
+                event_time,
+                ingest_time,
+                commit_position,
+            },
             count,
         )
     }
 
     fn comparison_encoding(
         &self,
+        service: &crate::QueryService<'_, '_, '_>,
+        state: &mut CursorState,
         memory: &mut crate::memory::QueryMemory,
     ) -> Result<(Vec<u8>, u64), QueryFailure> {
-        let encoded_bytes = self.0.iter().try_fold(0_usize, |total, value| {
-            total
-                .checked_add(group_value_comparison_size(value)?)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))
-        })?;
-        let memory_bytes = u64::try_from(encoded_bytes)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-        memory.acquire(memory_bytes)?;
         let mut encoding = Vec::new();
-        encoding
-            .try_reserve_exact(encoded_bytes)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        for value in &self.0 {
-            append_group_value_comparison(value, &mut encoding)?;
-        }
-        if encoding.len() != encoded_bytes {
-            return Err(QueryFailure::new(QueryFailureCode::Internal));
+        let mut memory_bytes = 0_u64;
+        for value in &self.values {
+            if let Err(failure) = append_group_value_comparison(
+                value,
+                service,
+                state,
+                memory,
+                &mut encoding,
+                &mut memory_bytes,
+            ) {
+                drop(encoding);
+                memory.release(memory_bytes)?;
+                return Err(failure);
+            }
         }
         Ok((encoding, memory_bytes))
     }
@@ -244,7 +260,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
         }
         memory.acquire(key_slots)?;
         let (key, body_bytes) = GroupKey::for_record(record, aggregate.group_by())?;
-        let (comparison, comparison_bytes) = key.comparison_encoding(memory)?;
+        let (comparison, comparison_bytes) = key.comparison_encoding(service, state, memory)?;
         match find_group(service, state, &groups, &comparison)? {
             Ok(index) => {
                 let entry = groups
@@ -367,57 +383,80 @@ fn charge_group_unit<'kernel, 'catalog, 'ledger>(
     Ok(())
 }
 
-fn group_value_comparison_size(value: &GroupValue) -> Result<usize, QueryFailure> {
-    match value {
-        GroupValue::Body(None) => Ok(2),
-        GroupValue::Body(Some(value)) => value
-            .comparison_encoded_size_bytes()
-            .map_err(map_domain_value_failure)?
-            .checked_add(2)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted)),
-        GroupValue::QueryTime(_) => Ok(10),
-        GroupValue::EventTime(value) => Ok(3 + usize::from(value.instant().is_some()) * 8),
-        GroupValue::IngestTime(_) | GroupValue::CommitPosition(_) => Ok(9),
-    }
-}
-
 fn append_group_value_comparison(
     value: &GroupValue,
+    service: &crate::QueryService<'_, '_, '_>,
+    state: &mut CursorState,
+    memory: &mut crate::memory::QueryMemory,
     output: &mut Vec<u8>,
+    memory_bytes: &mut u64,
 ) -> Result<(), QueryFailure> {
+    let mut append = |bytes: &[u8]| {
+        append_metered_group_bytes(service, state, memory, output, memory_bytes, bytes)
+    };
     match value {
         GroupValue::Body(body) => {
-            output.push(0);
-            output.push(u8::from(body.is_some()));
+            append(&[0, u8::from(body.is_some())])?;
             if let Some(body) = body {
-                body.append_comparison_encoding(output)
-                    .map_err(map_domain_value_failure)?;
+                body.visit_comparison_encoding(&mut append)?;
             }
         },
         GroupValue::QueryTime(value) => {
-            output.push(1);
+            append(&[1])?;
             let ordered = (value.instant().value() as u64) ^ (1_u64 << 63);
-            output.extend_from_slice(&ordered.to_be_bytes());
-            output.push(query_time_provenance_tag(value.provenance()));
+            append(&ordered.to_be_bytes())?;
+            append(&[query_time_provenance_tag(value.provenance())])?;
         },
         GroupValue::EventTime(value) => {
-            output.push(2);
-            output.push(u8::from(value.instant().is_some()));
+            append(&[2, u8::from(value.instant().is_some())])?;
             if let Some(value) = value.instant() {
                 let ordered = (value.value() as u64) ^ (1_u64 << 63);
-                output.extend_from_slice(&ordered.to_be_bytes());
+                append(&ordered.to_be_bytes())?;
             }
-            output.push(source_time_quality_tag(value.quality()));
+            append(&[source_time_quality_tag(value.quality())])?;
         },
         GroupValue::IngestTime(value) => {
-            output.push(4);
+            append(&[4])?;
             let ordered = (value.instant().value() as u64) ^ (1_u64 << 63);
-            output.extend_from_slice(&ordered.to_be_bytes());
+            append(&ordered.to_be_bytes())?;
         },
         GroupValue::CommitPosition(value) => {
-            output.push(3);
-            output.extend_from_slice(&value.value().to_be_bytes());
+            append(&[3])?;
+            append(&value.value().to_be_bytes())?;
         },
+    }
+    Ok(())
+}
+
+fn append_metered_group_bytes(
+    service: &crate::QueryService<'_, '_, '_>,
+    state: &mut CursorState,
+    memory: &mut crate::memory::QueryMemory,
+    output: &mut Vec<u8>,
+    memory_bytes: &mut u64,
+    bytes: &[u8],
+) -> Result<(), QueryFailure> {
+    charge_group_unit(service, state)?;
+    for byte in bytes {
+        if state.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        let length = u64::try_from(output.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+        if length == *memory_bytes {
+            let next_memory_bytes = memory_bytes
+                .checked_add(GROUP_ENCODING_CHUNK_BYTES)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+            memory.acquire(GROUP_ENCODING_CHUNK_BYTES)?;
+            let reserve = usize::try_from(GROUP_ENCODING_CHUNK_BYTES)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+            if output.try_reserve_exact(reserve).is_err() {
+                memory.release(GROUP_ENCODING_CHUNK_BYTES)?;
+                return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+            }
+            *memory_bytes = next_memory_bytes;
+        }
+        output.push(*byte);
     }
     Ok(())
 }

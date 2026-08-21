@@ -393,8 +393,63 @@ impl ValidatedAttributeValue {
         output
             .try_reserve_exact(encoded)
             .map_err(|_| DomainFailure::allocation_unavailable())?;
-        self.append_comparison_encoding_reserved(output);
-        Ok(())
+        self.visit_comparison_encoding(&mut |bytes| {
+            output.extend_from_slice(bytes);
+            Ok::<(), DomainFailure>(())
+        })
+    }
+
+    /// Visits the domain-owned order-preserving comparison encoding without allocating.
+    ///
+    /// Callers can meter, cancel, or stream each bounded encoding fragment while this
+    /// domain type remains the single authority for native-value comparison bytes.
+    pub fn visit_comparison_encoding<E>(
+        &self,
+        visit: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match &self.inner {
+            ValidatedAttributeValueInner::Null => visit(&[0]),
+            ValidatedAttributeValueInner::Boolean(value) => visit(&[1, u8::from(*value)]),
+            ValidatedAttributeValueInner::SignedInteger(value) => {
+                visit(&[2])?;
+                let ordered = (*value as u64) ^ (1_u64 << 63);
+                visit(&ordered.to_be_bytes())
+            },
+            ValidatedAttributeValueInner::FloatingPointBits(bits) => {
+                visit(&[3])?;
+                let ordered = if bits & (1_u64 << 63) == 0 {
+                    bits ^ (1_u64 << 63)
+                } else {
+                    !bits
+                };
+                visit(&ordered.to_be_bytes())
+            },
+            ValidatedAttributeValueInner::String(value) => {
+                visit(&[4])?;
+                visit_comparison_sequence(value.as_bytes(), visit)
+            },
+            ValidatedAttributeValueInner::Bytes(value) => {
+                visit(&[5])?;
+                visit_comparison_sequence(value, visit)
+            },
+            ValidatedAttributeValueInner::Array(values) => {
+                visit(&[6])?;
+                for value in values {
+                    visit(&[1])?;
+                    value.visit_comparison_encoding(visit)?;
+                }
+                visit(&[0])
+            },
+            ValidatedAttributeValueInner::KeyValueList(values) => {
+                visit(&[7])?;
+                for entry in values {
+                    visit(&[1])?;
+                    visit_comparison_sequence(entry.key.as_bytes(), visit)?;
+                    entry.value.visit_comparison_encoding(visit)?;
+                }
+                visit(&[0])
+            },
+        }
     }
 
     /// Returns only heap storage retained beyond the value's owning inline slot.
@@ -473,55 +528,6 @@ impl ValidatedAttributeValue {
             },
         }
         Ok(())
-    }
-
-    fn append_comparison_encoding_reserved(&self, output: &mut Vec<u8>) {
-        match &self.inner {
-            ValidatedAttributeValueInner::Null => output.push(0),
-            ValidatedAttributeValueInner::Boolean(value) => {
-                output.push(1);
-                output.push(u8::from(*value));
-            },
-            ValidatedAttributeValueInner::SignedInteger(value) => {
-                output.push(2);
-                let ordered = (*value as u64) ^ (1_u64 << 63);
-                output.extend_from_slice(&ordered.to_be_bytes());
-            },
-            ValidatedAttributeValueInner::FloatingPointBits(bits) => {
-                output.push(3);
-                let ordered = if bits & (1_u64 << 63) == 0 {
-                    bits ^ (1_u64 << 63)
-                } else {
-                    !bits
-                };
-                output.extend_from_slice(&ordered.to_be_bytes());
-            },
-            ValidatedAttributeValueInner::String(value) => {
-                output.push(4);
-                append_comparison_sequence(output, value.as_bytes());
-            },
-            ValidatedAttributeValueInner::Bytes(value) => {
-                output.push(5);
-                append_comparison_sequence(output, value);
-            },
-            ValidatedAttributeValueInner::Array(values) => {
-                output.push(6);
-                for value in values {
-                    output.push(1);
-                    value.append_comparison_encoding_reserved(output);
-                }
-                output.push(0);
-            },
-            ValidatedAttributeValueInner::KeyValueList(values) => {
-                output.push(7);
-                for entry in values {
-                    output.push(1);
-                    append_comparison_sequence(output, entry.key.as_bytes());
-                    entry.value.append_comparison_encoding_reserved(output);
-                }
-                output.push(0);
-            },
-        }
     }
 
     pub(crate) fn value_size_bytes(&self) -> Result<usize, DomainFailure> {
@@ -616,12 +622,14 @@ fn comparison_bare_sequence_size(length: usize) -> Result<usize, DomainFailure> 
         .ok_or_else(DomainFailure::value_limit_exceeded)
 }
 
-fn append_comparison_sequence(output: &mut Vec<u8>, bytes: &[u8]) {
+fn visit_comparison_sequence<E>(
+    bytes: &[u8],
+    visit: &mut impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
     for byte in bytes {
-        output.push(1);
-        output.push(*byte);
+        visit(&[1, *byte])?;
     }
-    output.push(0);
+    visit(&[0])
 }
 
 fn canonical_sequence_size(payload: usize) -> Result<usize, DomainFailure> {
