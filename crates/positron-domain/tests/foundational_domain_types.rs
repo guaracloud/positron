@@ -7,7 +7,7 @@ use positron_domain::{
     identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug},
     lifecycle::{TenantLifecycle, TenantLifecycleState},
     outcome::{CompletionState, DomainFailure, DomainFailureCode, FailureSource, RetryClass},
-    routing::{AssignmentEpoch, CommitPosition, SignalKind, VirtualShardId},
+    routing::{AssignmentEpoch, CommitPosition, RecordOrdinal, SignalKind, VirtualShardId},
     time::{
         EventTime, IngestTimeCandidate, ObservedTime, QueryTime, QueryTimeProvenance,
         SourceTimeQuality, UnixNanoseconds,
@@ -554,6 +554,19 @@ fn commit_position_advances_without_wrapping_into_timestamp_like_order() -> Resu
                 && failure.source() == FailureSource::CommitPosition
     ));
 
+    Ok(())
+}
+
+#[test]
+fn record_ordinal_is_a_checked_store_block_identity_component() -> Result<(), DomainFailure> {
+    assert_eq!(RecordOrdinal::new(0)?.value(), 0);
+    assert_eq!(RecordOrdinal::new(RecordOrdinal::MAXIMUM)?.value(), 1_023);
+    assert!(matches!(
+        RecordOrdinal::new(1_024),
+        Err(failure)
+            if failure.code() == DomainFailureCode::InvalidIdentifier
+                && failure.source() == FailureSource::RecordOrdinal
+    ));
     Ok(())
 }
 

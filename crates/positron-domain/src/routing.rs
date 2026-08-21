@@ -104,6 +104,41 @@ impl CommitPosition {
     }
 }
 
+/// A record's stable zero-based position in its original committed Store Block.
+///
+/// Together, `(CommitPosition, RecordOrdinal)` is the logical record identity.
+/// Physical compaction must preserve both components rather than recomputing
+/// the ordinal from a replacement block's layout.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordOrdinal(u16);
+
+impl RecordOrdinal {
+    /// Release 1 Store Blocks contain at most 1,024 records.
+    pub const MAXIMUM: u16 = 1_023;
+
+    /// Checks one canonical zero-based committed-record position.
+    pub fn new(value: u16) -> Result<Self, DomainFailure> {
+        if value > Self::MAXIMUM {
+            return Err(DomainFailure::invalid_identifier(
+                FailureSource::RecordOrdinal,
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the first record position for synthetic non-record result rows.
+    #[must_use]
+    pub const fn first() -> Self {
+        Self(0)
+    }
+
+    /// Returns the exact bounded position inside the original Store Block.
+    #[must_use]
+    pub const fn value(self) -> u16 {
+        self.0
+    }
+}
+
 /// The supported Release 1 telemetry signal stores.
 ///
 /// This closed native taxonomy deliberately excludes Metrics and Profiles. It

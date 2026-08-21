@@ -51,6 +51,7 @@ pub(crate) fn query_record(
         body,
         ordering_time,
         record.commit_position(),
+        record.record_ordinal(),
         selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
         selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition),
     )))
@@ -207,9 +208,17 @@ pub(crate) fn compare_records(
         return primary;
     }
     let commit = left.commit_position().cmp(&right.commit_position());
-    match ordering.commit_direction() {
+    let commit = match ordering.commit_direction() {
         crate::plan::OrderDirection::Ascending => commit,
         crate::plan::OrderDirection::Descending => commit.reverse(),
+    };
+    if commit != Ordering::Equal {
+        return commit;
+    }
+    let ordinal = left.record_ordinal().cmp(&right.record_ordinal());
+    match ordering.commit_direction() {
+        crate::plan::OrderDirection::Ascending => ordinal,
+        crate::plan::OrderDirection::Descending => ordinal.reverse(),
     }
 }
 
@@ -305,9 +314,10 @@ pub(crate) fn batch_digest(
         if cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
-        let (query_time, position) = record.order_key();
+        let (query_time, position, ordinal) = record.order_key();
         encoding.extend_from_slice(&query_time.value().to_be_bytes());
         encoding.extend_from_slice(&position.value().to_be_bytes());
+        encoding.extend_from_slice(&ordinal.value().to_be_bytes());
         let body = record.body_text().unwrap_or_default().as_bytes();
         encoding.push(u8::from(record.body_text().is_some()));
         encoding.extend_from_slice(
@@ -351,13 +361,15 @@ fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<
             encoding.push(order_direction_tag(crate::plan::OrderDirection::Ascending));
         }
     } else {
-        encoding.extend_from_slice(&2_u64.to_be_bytes());
+        encoding.extend_from_slice(&3_u64.to_be_bytes());
         encoding.push(match plan.temporal_axis() {
             crate::TemporalAxis::QueryTime => 4,
             crate::TemporalAxis::EventTime => 5,
         });
         encoding.push(order_direction_tag(plan.ordering().primary_direction()));
         encoding.push(2);
+        encoding.push(order_direction_tag(plan.ordering().commit_direction()));
+        encoding.push(6);
         encoding.push(order_direction_tag(plan.ordering().commit_direction()));
     }
     Ok(())

@@ -281,12 +281,16 @@ impl LogStore {
             if decoded.truncated {
                 complete = false;
             }
-            for record in decoded.records {
+            for (ordinal, record) in decoded.records.into_iter().enumerate() {
                 if records.len() == limit {
                     complete = false;
                     break;
                 }
-                records.push(ScannedLogRecord::new(record, block.position()));
+                let ordinal = u16::try_from(ordinal)
+                    .ok()
+                    .and_then(|ordinal| positron_domain::routing::RecordOrdinal::new(ordinal).ok())
+                    .ok_or_else(LogStoreFailure::malformed_block)?;
+                records.push(ScannedLogRecord::new(record, block.position(), ordinal));
             }
             if !complete {
                 break;

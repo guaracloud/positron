@@ -87,7 +87,7 @@ fn result_envelope_identifies_snapshot_schema_budget_order_lease_and_digest_chai
     assert!(header.snapshot().generation() > 0);
     assert_eq!(
         header.ordering().columns(),
-        ["query_time", "commit_position"]
+        ["query_time", "commit_position", "record_ordinal"]
     );
     assert_eq!(header.budget().output_rows(), 16);
     assert_ne!(header.lease().identity(), [0; 16]);

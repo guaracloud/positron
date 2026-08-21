@@ -76,6 +76,8 @@ pub enum FailureSource {
     AssignmentEpoch,
     /// A commit-position progression check failed.
     CommitPosition,
+    /// A committed Store Block record ordinal exceeded its bounded identity space.
+    RecordOrdinal,
     /// A system-versus-tenant profile relationship check failed.
     ValueLimitProfile,
     /// A unit value-limit check failed.

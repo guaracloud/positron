@@ -102,7 +102,7 @@ impl LogStore {
             // predicate, so an additional result-sized decode limit would be
             // both redundant and incorrect.
             let decoded = codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?;
-            for record in decoded.records {
+            for (ordinal, record) in decoded.records.into_iter().enumerate() {
                 let result = schema.query_stored_record(&record, query);
                 reduced_pruning |= result.reduced_pruning();
                 if result.is_match() {
@@ -110,7 +110,13 @@ impl LogStore {
                         complete = false;
                         break 'blocks;
                     }
-                    records.push(ScannedLogRecord::new(record, block.position()));
+                    let ordinal = u16::try_from(ordinal)
+                        .ok()
+                        .and_then(|ordinal| {
+                            positron_domain::routing::RecordOrdinal::new(ordinal).ok()
+                        })
+                        .ok_or_else(LogStoreFailure::malformed_block)?;
+                    records.push(ScannedLogRecord::new(record, block.position(), ordinal));
                 }
             }
         }

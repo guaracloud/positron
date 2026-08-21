@@ -1,4 +1,4 @@
-use positron_domain::routing::CommitPosition;
+use positron_domain::routing::{CommitPosition, RecordOrdinal};
 use positron_domain::time::UnixNanoseconds;
 
 use crate::{LogicalPlan, QueryBudget, QueryCursor, QueryFailure, QueryFailureCode, TemporalAxis};
@@ -87,9 +87,11 @@ impl ResultOrdering {
                     TemporalAxis::EventTime => "event_time",
                 },
                 "commit_position",
+                "record_ordinal",
             ],
             directions: vec![
                 plan.ordering().primary_direction(),
+                plan.ordering().commit_direction(),
                 plan.ordering().commit_direction(),
             ],
         }
@@ -184,6 +186,7 @@ pub struct QueryRecord {
     body: Option<String>,
     query_time: UnixNanoseconds,
     commit_position: CommitPosition,
+    record_ordinal: RecordOrdinal,
     query_time_selected: bool,
     commit_position_selected: bool,
     count: Option<u64>,
@@ -194,6 +197,7 @@ impl QueryRecord {
         body: Option<String>,
         query_time: UnixNanoseconds,
         commit_position: CommitPosition,
+        record_ordinal: RecordOrdinal,
         query_time_selected: bool,
         commit_position_selected: bool,
     ) -> Self {
@@ -201,6 +205,7 @@ impl QueryRecord {
             body,
             query_time,
             commit_position,
+            record_ordinal,
             query_time_selected,
             commit_position_selected,
             count: None,
@@ -212,6 +217,7 @@ impl QueryRecord {
             body: None,
             query_time: UnixNanoseconds::new(0),
             commit_position: CommitPosition::origin(),
+            record_ordinal: RecordOrdinal::first(),
             query_time_selected: false,
             commit_position_selected: false,
             count: Some(count),
@@ -228,6 +234,7 @@ impl QueryRecord {
             body,
             query_time: query_time.unwrap_or_else(|| UnixNanoseconds::new(0)),
             commit_position: commit_position.unwrap_or_else(CommitPosition::origin),
+            record_ordinal: RecordOrdinal::first(),
             query_time_selected: query_time.is_some(),
             commit_position_selected: commit_position.is_some(),
             count: Some(count),
@@ -244,6 +251,11 @@ impl QueryRecord {
     #[must_use]
     pub const fn commit_position(&self) -> CommitPosition {
         self.commit_position
+    }
+    /// Returns the final intrinsic component of this record's total order.
+    #[must_use]
+    pub const fn record_ordinal(&self) -> RecordOrdinal {
+        self.record_ordinal
     }
     #[must_use]
     pub const fn count(&self) -> Option<u64> {
@@ -263,8 +275,8 @@ impl QueryRecord {
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
     }
 
-    pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition) {
-        (self.query_time, self.commit_position)
+    pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition, RecordOrdinal) {
+        (self.query_time, self.commit_position, self.record_ordinal)
     }
 
     pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {

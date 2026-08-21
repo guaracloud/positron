@@ -120,11 +120,15 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
     };
     assert_eq!(
         header.ordering().columns(),
-        ["query_time", "commit_position"]
+        ["query_time", "commit_position", "record_ordinal"]
     );
     assert_eq!(
         header.ordering().directions(),
-        [OrderDirection::Descending, OrderDirection::Ascending]
+        [
+            OrderDirection::Descending,
+            OrderDirection::Ascending,
+            OrderDirection::Ascending,
+        ]
     );
     Ok(())
 }
@@ -160,6 +164,82 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
     assert_eq!(first, digest_for(query_time)?);
     assert_ne!(first, digest_for(commit_position)?);
     assert_ne!(first, digest_for(descending_query_time)?);
+    Ok(())
+}
+
+#[test]
+fn same_time_records_in_one_block_have_a_stable_total_identity_across_reopen()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = QueryFixture::new("same-block-total-order")?;
+    fixture.kernel.append_log_bodies(
+        ["first", "second", "duplicate", "duplicate"]
+            .into_iter()
+            .map(|body| {
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    body.to_owned(),
+                ))
+            })
+            .collect(),
+        20,
+        1,
+    )?;
+
+    let execute =
+        |fixture: &QueryFixture| -> Result<(Vec<(String, u16)>, [u8; 32]), Box<dyn Error>> {
+            let service = QueryService::new(
+                fixture.kernel.authority.governor(),
+                fixture.kernel.ledger()?,
+                16,
+            );
+            let query = service.plan_pipeline(
+                fixture.context,
+                "logs | range query_time -100 100 | limit 4",
+                QueryBudget::new(1_048_576, 4, 4, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
+            )?;
+            let events = service.execute(query)?.collect::<Vec<_>>();
+            let header = events
+                .iter()
+                .find_map(|event| match event {
+                    QueryEvent::Header(header) => Some(header),
+                    QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+                })
+                .ok_or("result header missing")?;
+            assert_eq!(
+                header.ordering().columns(),
+                ["query_time", "commit_position", "record_ordinal"]
+            );
+            let batch = events
+                .iter()
+                .find_map(|event| match event {
+                    QueryEvent::Batch(batch) => Some(batch),
+                    QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+                })
+                .ok_or("result batch missing")?;
+            let records = batch
+                .records()
+                .iter()
+                .map(|record| {
+                    Ok((
+                        record.body_text().ok_or("body missing")?.to_owned(),
+                        record.record_ordinal().value(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            Ok((records, batch.digest()))
+        };
+
+    let active = execute(&fixture)?;
+    assert_eq!(
+        active.0,
+        [
+            ("first".to_owned(), 0),
+            ("second".to_owned(), 1),
+            ("duplicate".to_owned(), 2),
+            ("duplicate".to_owned(), 3),
+        ]
+    );
+    fixture.kernel.seal_and_reopen()?;
+    assert_eq!(execute(&fixture)?, active);
     Ok(())
 }
 

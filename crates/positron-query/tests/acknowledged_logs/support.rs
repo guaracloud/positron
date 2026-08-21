@@ -348,22 +348,34 @@ impl KernelFixture {
         event_time: i64,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
-        let candidate = NativeLogCandidate::new(
-            Some(event_time),
-            None,
-            Some(CandidateAttributeValue::string(body.to_owned())),
-            vec![],
-            LogMetadata::empty(),
-        );
-        let PolicyEvaluation::Accepted(evaluated) =
-            IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
-        else {
-            return Err("preserving policy rejected the query fixture".into());
-        };
-        let record = LogRecord::checked_evaluated(
-            ValueLimitProfile::release_1_system_maximum(),
-            *evaluated,
-        )?;
+        self.append_log_bodies(
+            vec![Some(CandidateAttributeValue::string(body.to_owned()))],
+            event_time,
+            identity,
+        )
+    }
+
+    pub fn append_log_bodies(
+        &self,
+        bodies: Vec<Option<CandidateAttributeValue>>,
+        event_time: i64,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut records = Vec::new();
+        records.try_reserve_exact(bodies.len())?;
+        for body in bodies {
+            let candidate =
+                NativeLogCandidate::new(Some(event_time), None, body, vec![], LogMetadata::empty());
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
         let capacity = self.authority.governor().reserve(WorkClaim::tenant(
             self.tenant,
             WorkKind::Ingest,
@@ -375,7 +387,7 @@ impl KernelFixture {
             self.tenant,
             self.shard,
             StoreBlockIdentity::new([identity; 16])?,
-            vec![record],
+            records,
         )?;
         self.ledger()?.append(block.into_store_block())?;
         Ok(())

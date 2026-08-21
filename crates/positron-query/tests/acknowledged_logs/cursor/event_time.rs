@@ -23,7 +23,7 @@ fn event_time_cursor_preserves_its_temporal_axis_across_resume() -> Result<(), B
     };
     assert_eq!(
         header.ordering().columns(),
-        ["event_time", "commit_position"]
+        ["event_time", "commit_position", "record_ordinal"]
     );
     assert_eq!(super::bodies(&resumed), ["second"]);
     Ok(())

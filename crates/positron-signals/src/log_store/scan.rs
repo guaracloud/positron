@@ -1,4 +1,4 @@
-use positron_domain::routing::CommitPosition;
+use positron_domain::routing::{CommitPosition, RecordOrdinal};
 use positron_kernel::ResourceReservation;
 
 use super::{LogStoreFailure, StoredLogRecord};
@@ -130,18 +130,27 @@ impl<'kernel> LogScanResult<'kernel> {
     }
 }
 
-/// One verified log plus the kernel-assigned position that totally orders it.
+/// One verified log plus its stable logical identity.
+///
+/// `(commit_position, record_ordinal)` is assigned from the authenticated
+/// original Store Block and must survive physical compaction unchanged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannedLogRecord {
     record: StoredLogRecord,
     commit_position: CommitPosition,
+    record_ordinal: RecordOrdinal,
 }
 
 impl ScannedLogRecord {
-    pub(super) const fn new(record: StoredLogRecord, commit_position: CommitPosition) -> Self {
+    pub(super) const fn new(
+        record: StoredLogRecord,
+        commit_position: CommitPosition,
+        record_ordinal: RecordOrdinal,
+    ) -> Self {
         Self {
             record,
             commit_position,
+            record_ordinal,
         }
     }
 
@@ -153,6 +162,12 @@ impl ScannedLogRecord {
     #[must_use]
     pub const fn commit_position(&self) -> CommitPosition {
         self.commit_position
+    }
+
+    /// Returns the record's position in its original authenticated Store Block.
+    #[must_use]
+    pub const fn record_ordinal(&self) -> RecordOrdinal {
+        self.record_ordinal
     }
 }
 
