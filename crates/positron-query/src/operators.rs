@@ -14,10 +14,7 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
     predicate_applied: bool,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<crate::memory::RecordBuffer, QueryFailure> {
-    let operator_count = state
-        .plan
-        .operator_count()
-        .saturating_sub(u64::from(predicate_applied));
+    let operator_count = state.plan.operator_count();
     let mut records = crate::memory::RecordBuffer::allocate(scanned.records().len(), memory)?;
     let scanned_retained_bytes = scanned.retained_size_bytes();
     let mut transferred_body_bytes = 0_u64;

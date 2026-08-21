@@ -152,7 +152,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
 
-        let operator_count = state.plan.operator_count();
+        let has_operator_work = state.plan.has_advanced_operators();
         state.reduced_pruning |=
             state.plan.requires_post_decode_predicate_fallback() && !schema_filter_used;
         let records = framed!(crate::operators::execute(
@@ -162,7 +162,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             schema_filter_used,
             &mut memory,
         ));
-        let operator_wall_exhausted = if operator_count > 0 {
+        let operator_wall_exhausted = if has_operator_work {
             framed!(self.observe_state(&mut state))
         } else {
             false

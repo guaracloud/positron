@@ -205,8 +205,7 @@ impl LogicalPlan {
     }
 
     pub(crate) fn operator_count(&self) -> u64 {
-        u64::from(self.filter.is_some())
-            + u64::from(self.projection != [ProjectionColumn::Body])
+        u64::from(self.projection != [ProjectionColumn::Body])
             + u64::from(self.aggregate.is_some())
             + u64::from(self.ordering != OrderSpec::ascending(self.axis))
     }

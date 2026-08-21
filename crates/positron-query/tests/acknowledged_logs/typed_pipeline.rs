@@ -1677,6 +1677,66 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
 }
 
 #[test]
+fn structurally_observed_filter_does_not_retain_a_proxy_work_charge() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("observed-filter-work-ledger")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(10),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "match".to_owned(),
+                )),
+            ),
+            (
+                Some(20),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "match".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        2,
+    );
+    let source = r#"pipeline:v1 logs | range query_time -100 100 | filter body == string("match") | limit 2"#;
+
+    let exact = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(13)?,
+    )?;
+    let exact_events = service.execute(exact)?.collect::<Vec<_>>();
+    assert!(
+        matches!(
+            exact_events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if stats.cpu_work_units() == 13 && stats.records() == 2
+        ),
+        "exact events: {exact_events:?}"
+    );
+
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(12)?,
+    )?;
+    let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 13
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    Ok(())
+}
+
+#[test]
 fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-peak-memory")?;
