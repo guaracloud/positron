@@ -1,11 +1,12 @@
-use positron_domain::value::{
-    AttributeValueKind, CandidateAttributeValue, CandidateKeyValue, ValidatedAttributeValue,
-};
+use positron_domain::value::{AttributeValueKind, ValidatedAttributeValue};
 
-use super::limits::CodecLimits;
 use super::size::bounded_add;
-use super::{Input, bounded_vec, put_bytes, put_count};
+use super::{put_bytes, put_count};
 use crate::log_store::LogStoreFailure;
+
+mod decode;
+
+pub(in crate::log_store::codec) use decode::{decode, validate};
 
 pub(super) fn encoded_length(
     value: &ValidatedAttributeValue,
@@ -171,120 +172,4 @@ fn encode_key_value_list(
         encode(output, entry.value(), next)?;
     }
     Ok(())
-}
-
-pub(super) fn decode(
-    input: &mut Input<'_>,
-    depth: u8,
-    value_bytes: usize,
-    limits: CodecLimits,
-    version: u16,
-) -> Result<CandidateAttributeValue, LogStoreFailure> {
-    Ok(match input.u8()? {
-        0 => CandidateAttributeValue::null(),
-        1 => CandidateAttributeValue::boolean(match input.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(LogStoreFailure::malformed_block()),
-        }),
-        2 => CandidateAttributeValue::signed_integer(input.i64()?),
-        3 => CandidateAttributeValue::floating_point_bits(input.u64()?),
-        4 => CandidateAttributeValue::string(input.string(value_bytes)?),
-        5 => CandidateAttributeValue::bytes(input.bytes(value_bytes)?),
-        6 => CandidateAttributeValue::array(decode_array(
-            input,
-            depth,
-            value_bytes,
-            limits,
-            version,
-        )?),
-        7 => CandidateAttributeValue::key_value_list(decode_key_value_list(
-            input,
-            depth,
-            value_bytes,
-            limits,
-            version,
-        )?),
-        _ => return Err(LogStoreFailure::malformed_block()),
-    })
-}
-
-pub(super) fn skip(
-    input: &mut Input<'_>,
-    depth: u8,
-    value_bytes: usize,
-    limits: CodecLimits,
-) -> Result<(), LogStoreFailure> {
-    match input.u8()? {
-        0 => {},
-        1 => match input.u8()? {
-            0 | 1 => {},
-            _ => return Err(LogStoreFailure::malformed_block()),
-        },
-        2 | 3 => {
-            input.take(8)?;
-        },
-        4 => input.skip_string(value_bytes)?,
-        5 => input.skip_bytes(value_bytes)?,
-        6 => {
-            let next = depth
-                .checked_sub(1)
-                .ok_or_else(LogStoreFailure::malformed_block)?;
-            let count = input.count(limits.array_entries)?;
-            for _ in 0..count {
-                skip(input, next, value_bytes, limits)?;
-            }
-        },
-        7 => {
-            let next = depth
-                .checked_sub(1)
-                .ok_or_else(LogStoreFailure::malformed_block)?;
-            let count = input.count(limits.key_value_list_entries)?;
-            for _ in 0..count {
-                input.skip_string(limits.key_bytes)?;
-                skip(input, next, value_bytes, limits)?;
-            }
-        },
-        _ => return Err(LogStoreFailure::malformed_block()),
-    }
-    Ok(())
-}
-
-fn decode_array(
-    input: &mut Input<'_>,
-    depth: u8,
-    value_bytes: usize,
-    limits: CodecLimits,
-    version: u16,
-) -> Result<Vec<CandidateAttributeValue>, LogStoreFailure> {
-    let next = depth
-        .checked_sub(1)
-        .ok_or_else(LogStoreFailure::malformed_block)?;
-    let count = input.count(limits.array_entries)?;
-    let mut values = bounded_vec(count)?;
-    for _ in 0..count {
-        values.push(decode(input, next, value_bytes, limits, version)?);
-    }
-    Ok(values)
-}
-
-fn decode_key_value_list(
-    input: &mut Input<'_>,
-    depth: u8,
-    value_bytes: usize,
-    limits: CodecLimits,
-    version: u16,
-) -> Result<Vec<CandidateKeyValue>, LogStoreFailure> {
-    let next = depth
-        .checked_sub(1)
-        .ok_or_else(LogStoreFailure::malformed_block)?;
-    let count = input.count(limits.key_value_list_entries)?;
-    let mut values = bounded_vec(count)?;
-    for _ in 0..count {
-        values.push(CandidateKeyValue::new(
-            input.string(limits.key_bytes)?,
-            decode(input, next, value_bytes, limits, version)?,
-        ));
-    }
-    Ok(values)
 }

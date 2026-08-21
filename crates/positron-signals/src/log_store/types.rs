@@ -1,7 +1,9 @@
 use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
+#[cfg(test)]
+use positron_domain::value::AttributeNamespace;
 use positron_domain::value::{
-    AttributeNamespace, AttributeOccurrenceSet, AttributeOccurrenceSetCandidate,
-    CandidateAttributeValue, ValidatedAttributeValue, ValueLimitProfile,
+    AttributeOccurrenceSet, AttributeOccurrenceSetCandidate, CandidateAttributeValue,
+    ValidatedAttributeValue, ValueLimitProfile,
 };
 use positron_kernel::{IngestTime, PreparedStoreBlock};
 
@@ -9,6 +11,9 @@ use super::{LogMetadata, PolicyProvenance, failure::LogStoreFailure};
 
 mod evaluated;
 mod retained;
+mod validation;
+
+pub(super) use validation::NativeRecordValidator;
 
 /// The M1 physical dynamic-attribute representation carried by a Log Block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,66 +208,39 @@ impl LogRecord {
         metadata: LogMetadata,
         policy: PolicyProvenance,
     ) -> Result<Self, LogStoreFailure> {
-        let maximum = usize::try_from(
-            profile
-                .effective_limits()
-                .dynamic_value()
-                .attributes_per_namespace()
-                .value(),
-        )
-        .map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let mut occurrences_by_namespace = [0_usize; 4];
+        let mut validation = NativeRecordValidator::new(profile)?;
+        validation.observe_body(
+            body.as_ref()
+                .map_or(Ok(0), ValidatedAttributeValue::decoded_size_bytes)
+                .map_err(LogStoreFailure::domain)?,
+        )?;
         for attribute in &attributes {
-            let index = match attribute.occurrences().namespace() {
-                AttributeNamespace::Stream => 0,
-                AttributeNamespace::Resource => 1,
-                AttributeNamespace::InstrumentationScope => 2,
-                AttributeNamespace::Record => 3,
-            };
-            let count = occurrences_by_namespace
-                .get_mut(index)
-                .ok_or_else(LogStoreFailure::invalid_input)?;
-            *count = count
-                .checked_add(attribute.occurrences().len())
-                .filter(|count| *count <= maximum)
-                .ok_or_else(LogStoreFailure::limit_exceeded)?;
-        }
-        let decoded_limit =
-            usize::try_from(profile.effective_limits().record().decoded_bytes().value())
-                .map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let mut decoded_bytes = body
-            .as_ref()
-            .map_or(Ok(0), ValidatedAttributeValue::decoded_size_bytes)
-            .map_err(LogStoreFailure::domain)?;
-        for attribute in &attributes {
-            decoded_bytes = decoded_bytes
-                .checked_add(attribute.occurrences().key().len())
-                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+            let mut occurrence_bytes = 0_usize;
             for index in 0..attribute.occurrences().len() {
                 let value = attribute
                     .occurrences()
                     .occurrence(index)
                     .ok_or_else(LogStoreFailure::invalid_input)?;
-                decoded_bytes = decoded_bytes
+                occurrence_bytes = occurrence_bytes
                     .checked_add(
                         value
                             .decoded_size_bytes()
                             .map_err(LogStoreFailure::domain)?,
                     )
-                    .filter(|bytes| *bytes <= decoded_limit)
                     .ok_or_else(LogStoreFailure::limit_exceeded)?;
             }
+            validation.observe_attribute(
+                attribute.occurrences().namespace(),
+                attribute.occurrences().key().len(),
+                attribute.occurrences().len(),
+                occurrence_bytes,
+            )?;
         }
-        decoded_bytes = decoded_bytes
-            .checked_add(
-                metadata
-                    .decoded_size_bytes()
-                    .ok_or_else(LogStoreFailure::limit_exceeded)?,
-            )
-            .ok_or_else(LogStoreFailure::limit_exceeded)?;
-        if decoded_bytes > decoded_limit {
-            return Err(LogStoreFailure::limit_exceeded());
-        }
+        validation.observe_metadata(
+            metadata
+                .decoded_size_bytes()
+                .ok_or_else(LogStoreFailure::limit_exceeded)?,
+        )?;
         Ok(Self {
             event_time,
             observed_time,

@@ -89,39 +89,16 @@ impl<'a> Input<'a> {
         Ok(count)
     }
 
-    pub(super) fn bytes(&mut self, maximum: usize) -> Result<Vec<u8>, LogStoreFailure> {
+    pub(super) fn bytes_slice(&mut self, maximum: usize) -> Result<&'a [u8], LogStoreFailure> {
         let count = usize::try_from(self.u32()?).map_err(|_| LogStoreFailure::malformed_block())?;
         if count > maximum {
             return Err(LogStoreFailure::malformed_block());
         }
-        let source = self.take(count)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(count)
-            .map_err(|_| LogStoreFailure::resource_exhausted())?;
-        bytes.extend_from_slice(source);
-        Ok(bytes)
+        self.take(count)
     }
 
-    pub(super) fn string(&mut self, maximum: usize) -> Result<String, LogStoreFailure> {
-        String::from_utf8(self.bytes(maximum)?).map_err(|_| LogStoreFailure::malformed_block())
-    }
-
-    pub(super) fn skip_bytes(&mut self, maximum: usize) -> Result<(), LogStoreFailure> {
-        let count = usize::try_from(self.u32()?).map_err(|_| LogStoreFailure::malformed_block())?;
-        if count > maximum {
-            return Err(LogStoreFailure::malformed_block());
-        }
-        self.take(count).map(|_| ())
-    }
-
-    pub(super) fn skip_string(&mut self, maximum: usize) -> Result<(), LogStoreFailure> {
-        let count = usize::try_from(self.u32()?).map_err(|_| LogStoreFailure::malformed_block())?;
-        if count > maximum {
-            return Err(LogStoreFailure::malformed_block());
-        }
-        std::str::from_utf8(self.take(count)?)
-            .map(|_| ())
+    pub(super) fn string_slice(&mut self, maximum: usize) -> Result<&'a str, LogStoreFailure> {
+        std::str::from_utf8(self.bytes_slice(maximum)?)
             .map_err(|_| LogStoreFailure::malformed_block())
     }
 

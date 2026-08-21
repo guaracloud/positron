@@ -241,6 +241,64 @@ fn atomic_budget_preflight_rejects_malformed_version_two_framing() -> Result<(),
 }
 
 #[test]
+fn atomic_budget_preflight_rejects_semantically_invalid_policy_provenance()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x19; 16])?,
+        CatalogSecret::from_owned(Box::new([0x29; 32]), Box::new([0x39; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let first = minimal_record("first", 1)?;
+    let second = minimal_record("second", 2)?;
+    let encoded_bytes =
+        crate::log_store::codec::encoded_block_length(&[first.clone(), second.clone()])?;
+    let records = [
+        StoredLogRecord::new(first, clock(1).assign_ingest_time()?),
+        StoredLogRecord::new(second, clock(2).assign_ingest_time()?),
+    ];
+    let mut bytes = crate::log_store::codec::encode_block(tenant, &records, encoded_bytes)?;
+    let digest_end = bytes
+        .len()
+        .checked_sub(2)
+        .ok_or("encoded fixture omitted its final rule count")?;
+    let digest_start = digest_end
+        .checked_sub(32)
+        .ok_or("encoded fixture omitted its final policy digest")?;
+    bytes
+        .get_mut(digest_start..digest_end)
+        .ok_or("encoded fixture policy digest range was invalid")?
+        .fill(0);
+
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(103)?);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
+    )?;
+    ledger.append(PreparedStoreBlock::new(
+        scope,
+        StoreBlockIdentity::new([0x69; 16])?,
+        bytes,
+    )?)?;
+
+    let failure = LogStore::new()
+        .scan(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            LogScan::all(ScanLimit::new(1)?),
+        )
+        .expect_err("semantic corruption behind an atomic budget boundary must fail closed");
+    assert_eq!(failure.code(), LogStoreFailureCode::MalformedBlock);
+    Ok(())
+}
+
+#[test]
 fn version_two_metadata_tags_and_truncation_fail_closed() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
