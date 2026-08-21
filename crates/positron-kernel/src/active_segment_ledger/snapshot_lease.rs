@@ -125,6 +125,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             expiry,
             blocks: state.blocks.iter().map(LeaseBlock::from).collect(),
         };
+        // Admit every capacity needed by the returned grant before publishing its
+        // durable identity. Later failures then drop both reservations without
+        // leaving a catalog lease that no caller can release.
+        let snapshot = snapshot_from_record(self, &state, &record)?;
         let encoded = encode(&record)?;
         let claim = WorkClaim::tenant(
             self.scope.tenant,
@@ -141,7 +145,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         remove_reservations(&mut state, &expired);
         state.lease_reservations.insert(identity, retained);
         state.last_snapshot_lease_time = now;
-        let snapshot = snapshot_from_record(self, &state, &record)?;
         Ok(SnapshotLeaseGrant {
             identity,
             expiry,

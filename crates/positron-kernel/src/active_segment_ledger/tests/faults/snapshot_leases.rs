@@ -122,6 +122,52 @@ fn snapshot_lease_creation_prunes_expired_capacity_without_releasing_active_leas
 }
 
 #[test]
+fn refused_snapshot_capacity_never_publishes_or_retains_a_lease() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        ledger.append(prepared(scope, b"snapshot-capacity")?)?;
+        let held = authority.governor().reserve(crate::WorkClaim::tenant(
+            scope.tenant,
+            crate::WorkKind::InteractiveQueryTail,
+            crate::ResourceAmounts::only(crate::ResourceDimension::QueueSlots, 16)?,
+        )?)?;
+        let baseline = authority.governor().inspect()?.outstanding_total();
+
+        for now in 100..=164 {
+            assert_eq!(
+                ledger
+                    .create_snapshot_lease(now, now + 100)
+                    .expect_err("snapshot capacity is unavailable")
+                    .code(),
+                LedgerFailureCode::ResourceAdmissionRefused
+            );
+            assert_eq!(
+                authority.governor().inspect()?.outstanding_total(),
+                baseline
+            );
+            assert_eq!(
+                catalog
+                    .pin()?
+                    .plaintext_objects()
+                    .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                    .count(),
+                0
+            );
+        }
+
+        drop(held);
+        let lease = ledger.create_snapshot_lease(165, 265)?;
+        ledger.release_snapshot_lease(lease.identity())?;
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_pruning_is_restart_safe_atomic_and_rejects_time_regression()
 -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
