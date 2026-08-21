@@ -14,6 +14,7 @@ mod recovery;
 mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_codec;
+mod snapshot_lease_pending;
 mod snapshot_lease_recovery;
 mod state;
 mod storage;
@@ -243,6 +244,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 next_sequence: 0,
                 poisoned: false,
                 lease_reservations: recovered_leases.reservations,
+                pending_lease_releases: snapshot_lease_pending::PendingLeaseReleases::new(),
                 last_snapshot_lease_time: recovered_leases.last_observed,
             }),
         })

@@ -234,8 +234,11 @@ fn snapshot_lease_release_fault_retains_retryable_idempotent_truth() -> Result<(
         .expect_err("failed release cannot erase durable resume truth");
         assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
         assert_eq!(
-            ledger.resume_snapshot_lease(identity, 101)?.identity(),
-            identity
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("resume retries the registered cleanup intent")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
         );
         ledger.release_snapshot_lease(identity)?;
         ledger.release_snapshot_lease(identity)?;
@@ -243,6 +246,39 @@ fn snapshot_lease_release_fault_retains_retryable_idempotent_truth() -> Result<(
             ledger
                 .resume_snapshot_lease(identity, 102)
                 .expect_err("idempotent release remains terminal")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn later_lease_activity_retries_a_failed_release_without_losing_its_identity()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            ledger.release_snapshot_lease(identity)
+        })
+        .expect_err("failed release stays pending in the ledger authority");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+
+        let replacement = ledger.create_snapshot_lease(101, 201)?.identity();
+        assert_eq!(
+            ledger.resume_snapshot_lease(replacement, 101)?.identity(),
+            replacement
+        );
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("later lease activity drains the pending release")
                 .code(),
             LedgerFailureCode::SnapshotExpired
         );

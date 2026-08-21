@@ -102,6 +102,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        self.retry_pending_releases(&mut state)?;
         reject_time_regression(&state, now)?;
         let basis = self.catalog.pin()?;
         let all_records = records(&basis)?;
@@ -157,6 +158,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        self.retry_pending_releases(&mut state)?;
         reject_time_regression(&state, now)?;
         let basis = self.catalog.pin()?;
         let all_records = records(&basis)?;
@@ -190,21 +192,34 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
-        let basis = self.catalog.pin()?;
-        let Some(record) = records(&basis)?
-            .into_iter()
-            .find(|record| record.identity == identity && record.scope == self.scope)
-        else {
-            state.lease_reservations.remove(&identity);
+        state.pending_lease_releases.register(identity)?;
+        self.retry_pending_releases(&mut state)
+    }
+
+    fn retry_pending_releases(
+        &self,
+        state: &mut super::state::LedgerState<'kernel>,
+    ) -> Result<(), LedgerFailure> {
+        let pending = state
+            .pending_lease_releases
+            .identities()
+            .collect::<BTreeSet<_>>();
+        if pending.is_empty() {
             return Ok(());
-        };
-        publish(
-            self.catalog,
-            &basis,
-            &BTreeSet::from([record.identity]),
-            None,
-        )?;
-        state.lease_reservations.remove(&identity);
+        }
+        let basis = self.catalog.pin()?;
+        let remove = records(&basis)?
+            .into_iter()
+            .filter(|record| record.scope == self.scope && pending.contains(&record.identity))
+            .map(|record| record.identity)
+            .collect::<BTreeSet<_>>();
+        if !remove.is_empty() {
+            publish(self.catalog, &basis, &remove, None)?;
+        }
+        for identity in pending {
+            state.lease_reservations.remove(&identity);
+        }
+        state.pending_lease_releases.clear();
         Ok(())
     }
 }
