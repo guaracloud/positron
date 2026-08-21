@@ -45,11 +45,18 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-        let frontier = commit_position(state.frontier)?;
-        let initial_cursor = pagination
+        let frontier = match commit_position(state.frontier) {
+            Ok(frontier) => frontier,
+            Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
+        };
+        let initial_cursor = match pagination
             .then(|| cursor::encode(&self.ledger.control_tokens(), state.clone()))
-            .transpose()?;
-        let header = QueryEvent::Header(QueryHeader::new(
+            .transpose()
+        {
+            Ok(cursor) => cursor,
+            Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
+        };
+        let header = match QueryHeader::new(
             state.plan.clone(),
             state.budget,
             ResultSnapshot::new(
@@ -59,7 +66,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ),
             ResultLease::new(state.lease_identity, state.expiry),
             initial_cursor,
-        )?);
+        ) {
+            Ok(header) => QueryEvent::Header(header),
+            Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
+        };
         macro_rules! framed {
             ($result:expr) => {
                 match $result {
