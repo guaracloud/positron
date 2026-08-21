@@ -88,6 +88,35 @@ fn empty_snapshot_completes_once_without_a_batch_and_terminal_cancel_is_idempote
 }
 
 #[test]
+fn response_header_exposes_every_effective_query_budget_limit() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("header-budget")?;
+    let service = fixture.service(1)?;
+    let expected = QueryBudget::new(101, 7, 5, 103, 107, 109)?
+        .with_cpu_work_units(11)?
+        .with_maximum_time_range_nanoseconds(113)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time 0 100 | limit 1",
+        expected,
+    )?;
+    let mut stream = service.execute(query)?;
+    let actual = match stream.next() {
+        Some(QueryEvent::Header(header)) => header.budget(),
+        _ => return Err("query header missing".into()),
+    };
+
+    assert_eq!(actual.scanned_bytes(), 101);
+    assert_eq!(actual.decoded_records(), 7);
+    assert_eq!(actual.output_rows(), 5);
+    assert_eq!(actual.output_bytes(), 103);
+    assert_eq!(actual.memory_bytes(), 107);
+    assert_eq!(actual.cpu_work_units(), 11);
+    assert_eq!(actual.wall_seconds(), 109);
+    assert_eq!(actual.maximum_time_range_nanoseconds(), 113);
+    Ok(())
+}
+
+#[test]
 fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("page-bounds")?;
