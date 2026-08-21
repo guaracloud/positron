@@ -454,10 +454,6 @@ impl ValidatedAttributeValue {
 
 impl Ord for ValidatedAttributeValue {
     fn cmp(&self, other: &Self) -> Ordering {
-        let kind = self.kind().cmp(&other.kind());
-        if kind != Ordering::Equal {
-            return kind;
-        }
         match (&self.inner, &other.inner) {
             (ValidatedAttributeValueInner::Null, ValidatedAttributeValueInner::Null) => {
                 Ordering::Equal
@@ -490,7 +486,7 @@ impl Ord for ValidatedAttributeValue {
                 ValidatedAttributeValueInner::KeyValueList(left),
                 ValidatedAttributeValueInner::KeyValueList(right),
             ) => left.cmp(right),
-            _ => Ordering::Equal,
+            _ => self.kind().cmp(&other.kind()),
         }
     }
 }

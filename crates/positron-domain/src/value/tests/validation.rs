@@ -114,6 +114,56 @@ fn native_values_have_exact_total_order_and_self_delimiting_encoding() {
     assert!(first_nan < second_nan);
     assert_ne!(negative_zero, positive_zero);
 
+    let validated = |candidate: CandidateAttributeValue| {
+        candidate
+            .validate_log_body(profile)
+            .expect("comparison fixture is within the release-one body limit")
+    };
+    assert_eq!(
+        validated(CandidateAttributeValue::null()).cmp(&validated(CandidateAttributeValue::null())),
+        std::cmp::Ordering::Equal
+    );
+    assert!(
+        validated(CandidateAttributeValue::boolean(false))
+            < validated(CandidateAttributeValue::boolean(true))
+    );
+    assert!(
+        validated(CandidateAttributeValue::signed_integer(1))
+            < validated(CandidateAttributeValue::signed_integer(2))
+    );
+    assert!(
+        validated(CandidateAttributeValue::bytes(vec![1]))
+            < validated(CandidateAttributeValue::bytes(vec![2]))
+    );
+    assert!(
+        validated(CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::boolean(false),
+        ])) < validated(CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::boolean(true),
+        ]))
+    );
+    let first_key = validated(CandidateAttributeValue::key_value_list(vec![
+        CandidateKeyValue::new("a".to_owned(), CandidateAttributeValue::null()),
+    ]));
+    let second_key = validated(CandidateAttributeValue::key_value_list(vec![
+        CandidateKeyValue::new("b".to_owned(), CandidateAttributeValue::null()),
+    ]));
+    assert!(first_key < second_key);
+    assert_eq!(
+        first_key
+            .key_value_entry(0)
+            .expect("first key exists")
+            .partial_cmp(second_key.key_value_entry(0).expect("second key exists")),
+        Some(std::cmp::Ordering::Less)
+    );
+    assert!(
+        validated(CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new("same".to_owned(), CandidateAttributeValue::boolean(false),),
+        ])) < validated(CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new("same".to_owned(), CandidateAttributeValue::boolean(true),),
+        ]))
+    );
+
     let value = CandidateAttributeValue::array(vec![
         CandidateAttributeValue::string(String::new()),
         CandidateAttributeValue::bytes(vec![0, 255]),
