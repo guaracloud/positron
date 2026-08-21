@@ -64,6 +64,25 @@ impl positron_query::QueryClock for FailingClock {
     }
 }
 
+pub struct PeriodicFailingClock(AtomicU64);
+
+impl PeriodicFailingClock {
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(0)))
+    }
+}
+
+impl positron_query::QueryClock for PeriodicFailingClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        let call = self.0.fetch_add(1, Ordering::SeqCst);
+        if call % 4 == 3 {
+            Err(positron_query::QueryClockFailure)
+        } else {
+            Ok(100)
+        }
+    }
+}
+
 pub struct FailingWorkMeter;
 
 impl positron_query::QueryWorkMeter for FailingWorkMeter {

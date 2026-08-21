@@ -1,9 +1,9 @@
 use std::error::Error;
 
-use positron_kernel::{LedgerFailureCode, SnapshotLeaseId};
+use positron_kernel::{LedgerFailureCode, SnapshotLeaseId, WorkClass};
 use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
 
-use super::support::TestClock;
+use super::support::{PeriodicFailingClock, TestClock};
 use super::terminal_and_bounds::QueryFixture;
 
 #[test]
@@ -38,6 +38,87 @@ fn sequential_non_resumable_completion_reclaims_every_snapshot_lease() -> Result
                 .expect_err("non-resumable terminal releases promptly")
                 .code(),
             LedgerFailureCode::SnapshotExpired
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn admission_and_snapshot_lease_remain_owned_until_stream_terminal_or_drop()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("stream-resource-ownership")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let planned = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let mut stream = service.execute(planned)?;
+    let outstanding = || {
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()
+            .map(|snapshot| snapshot.outstanding_for(WorkClass::InteractiveQueryTail))
+    };
+    assert_eq!(outstanding()?, 1);
+    assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+    assert_eq!(outstanding()?, 1);
+    assert!(matches!(stream.next(), Some(QueryEvent::Batch(_))));
+    assert_eq!(outstanding()?, 1);
+    assert!(matches!(stream.next(), Some(QueryEvent::Terminal(_))));
+    assert_eq!(outstanding()?, 0);
+
+    let planned = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+    let stream = service.execute(planned)?;
+    assert_eq!(outstanding()?, 1);
+    drop(stream);
+    assert_eq!(outstanding()?, 0);
+    Ok(())
+}
+
+#[test]
+fn repeated_pre_stream_failures_release_admission_and_snapshot_leases() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("pre-stream-resource-ownership")?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        PeriodicFailingClock::shared(),
+    );
+    for _ in 0..65 {
+        let planned = service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 1",
+            budget(),
+        )?;
+        assert_eq!(
+            service
+                .execute(planned)
+                .expect_err("the fourth clock observation fails before stream construction")
+                .code(),
+            QueryFailureCode::Internal
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .authority
+                .governor()
+                .inspect()?
+                .outstanding_for(WorkClass::InteractiveQueryTail),
+            0
         );
     }
     Ok(())

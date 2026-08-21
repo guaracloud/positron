@@ -6,6 +6,8 @@ use crate::execution_state::{initial_state, query_tenant, validate_authorization
 use crate::execution_support::map_ledger_failure;
 use crate::{PlannedQuery, QueryCursor, QueryFailure, QueryFailureCode, QueryService, QueryStream};
 
+use super::resources::ExecutionResources;
+
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub fn execute(
         &self,
@@ -28,7 +30,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .map_err(map_ledger_failure)?;
         let tenant = query_tenant(query.context)?;
         let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
-        self.run_page(state, lease.snapshot(), query.plan.limit(), false)
+        let limit = query.plan.limit();
+        let resources = ExecutionResources::new(query._reservation, lease.identity());
+        self.run_page(state, lease.snapshot(), limit, false, resources)
     }
 
     pub fn execute_page(
@@ -55,7 +59,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .map_err(map_ledger_failure)?;
         let tenant = query_tenant(query.context)?;
         let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
-        self.run_page(state, lease.snapshot(), self.batch_limit, true)
+        let resources = ExecutionResources::new(query._reservation, lease.identity());
+        self.run_page(state, lease.snapshot(), self.batch_limit, true, resources)
     }
 
     pub fn resume(
@@ -80,24 +85,28 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now_seconds >= state.expiry {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
-        let _reservation = self.reserve_query(tenant, state.budget)?;
+        let reservation = self.reserve_query(tenant, state.budget)?;
         let lease_id = SnapshotLeaseId::new(state.lease_identity)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
         let lease = self
             .ledger
             .resume_snapshot_lease(lease_id, now_seconds)
             .map_err(map_ledger_failure)?;
+        let resources = ExecutionResources::new(reservation, lease.identity());
         if lease.snapshot().catalog_identity().to_bytes() != state.catalog_identity
             || lease.snapshot().catalog_generation() != state.catalog_generation
             || lease.snapshot().frontier().value() != state.frontier
             || lease.expiry() != state.expiry
         {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+            return Err(resources.fail_before_stream(
+                self.ledger,
+                QueryFailure::new(QueryFailureCode::InvalidCursor),
+            ));
         }
         let mut state = state;
         state.last_observed_at = now_seconds;
         state.elapsed_wall_seconds = now_seconds.saturating_sub(state.started_at);
-        self.run_page(state, lease.snapshot(), self.batch_limit, true)
+        self.run_page(state, lease.snapshot(), self.batch_limit, true, resources)
     }
 
     fn observe_planned(&self, query: &PlannedQuery<'_>) -> Result<u64, QueryFailure> {

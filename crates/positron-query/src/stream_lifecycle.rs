@@ -1,6 +1,7 @@
 use crate::{
     QueryEvent, QueryFailure, QueryFailureCode, QueryIncomplete, QueryStats, QueryTerminal,
 };
+use positron_kernel::TransferredResourceReservation;
 
 type LeaseRelease<'lease> = Box<dyn FnMut() -> Result<(), QueryFailure> + 'lease>;
 
@@ -15,6 +16,7 @@ pub struct QueryStream<'lease> {
     batch_stats: QueryStats,
     cancellation: crate::QueryCancellation,
     cancellation_transitioned: bool,
+    admission: Option<TransferredResourceReservation>,
 }
 
 impl std::fmt::Debug for QueryStream<'_> {
@@ -31,6 +33,7 @@ impl<'lease> QueryStream<'lease> {
         observed_stats: QueryStats,
         batch_stats: QueryStats,
         cancellation: crate::QueryCancellation,
+        admission: Option<TransferredResourceReservation>,
     ) -> Self {
         Self {
             events: events.into_iter(),
@@ -43,6 +46,7 @@ impl<'lease> QueryStream<'lease> {
             batch_stats,
             cancellation,
             cancellation_transitioned: false,
+            admission,
         }
     }
 
@@ -53,6 +57,7 @@ impl<'lease> QueryStream<'lease> {
         observed_stats: QueryStats,
         batch_stats: QueryStats,
         cancellation: crate::QueryCancellation,
+        admission: Option<TransferredResourceReservation>,
     ) -> Self {
         let release = if retain_for_resume {
             Some(release)
@@ -75,6 +80,7 @@ impl<'lease> QueryStream<'lease> {
             observed_stats,
             batch_stats,
             cancellation,
+            admission,
         )
     }
 
@@ -163,6 +169,7 @@ impl Iterator for QueryStream<'_> {
         }
         if matches!(event, Some(QueryEvent::Terminal(_))) {
             self.terminal_observed = true;
+            self.admission = None;
         }
         event
     }
@@ -219,6 +226,7 @@ mod tests {
             stats,
             stats,
             crate::QueryCancellation::new(),
+            None,
         );
 
         assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
@@ -252,6 +260,7 @@ mod tests {
             stats,
             stats,
             crate::QueryCancellation::new(),
+            None,
         );
 
         assert_eq!(
@@ -298,6 +307,7 @@ mod tests {
             stats,
             stats,
             cancellation,
+            None,
         );
 
         retained.cancel();

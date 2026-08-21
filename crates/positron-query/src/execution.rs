@@ -1,20 +1,24 @@
-use positron_kernel::{LedgerSnapshot, SnapshotLeaseId};
+use positron_kernel::LedgerSnapshot;
 use positron_signals::{LogScan, LogStore, ScanLimit};
 
 use crate::cursor::{self, CursorState};
 use crate::execution_state::{commit_position, stats_before_current, stats_with_current};
 use crate::execution_support::{
     QueryScanObserver, batch_digest, charge_output, charge_scan, charge_work, exhausted,
-    map_ledger_failure, map_store_failure,
+    map_store_failure,
 };
 use crate::{
-    QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader, QueryIncomplete,
-    QueryService, QueryStats, QueryStream, QueryTerminal, ResultLease, ResultSnapshot,
+    QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader, QueryService, QueryStream,
+    QueryTerminal, ResultLease, ResultSnapshot,
 };
 
 const MAX_SCAN_RECORDS: usize = 1_024;
 
 mod entry;
+mod lifecycle;
+mod resources;
+
+use resources::ExecutionResources;
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub(super) fn run_page(
@@ -23,14 +27,22 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         snapshot: &LedgerSnapshot<'kernel>,
         batch_limit: u16,
         pagination: bool,
+        resources: ExecutionResources,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let delivered_before = stats_before_current(&state);
-        if self.observe_state(&mut state)? {
+        let initially_exhausted = match self.observe_state(&mut state) {
+            Ok(exhausted) => exhausted,
+            Err(failure) => {
+                return Err(resources.fail_before_stream(self.ledger, failure));
+            },
+        };
+        if initially_exhausted {
             return self.stopped_page(
                 None,
                 QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
+                resources,
             );
         }
         let frontier = commit_position(state.frontier)?;
@@ -53,7 +65,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 match $result {
                     Ok(value) => value,
                     Err(failure) => {
-                        return self.failed_page(Some(header), failure, &state, delivered_before);
+                        return self.failed_page(
+                            Some(header),
+                            failure,
+                            &state,
+                            delivered_before,
+                            resources,
+                        );
                     },
                 }
             };
@@ -93,6 +111,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryFailureCode::Cancelled,
                 &state,
                 delivered_before,
+                resources,
             );
         }
         let wall_exhausted = framed!(self.observe_state(&mut state));
@@ -102,6 +121,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
+                resources,
             );
         }
 
@@ -123,6 +143,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
+                resources,
             );
         }
 
@@ -145,6 +166,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 &state,
                 delivered_before,
                 before_batch,
+                resources,
             );
         }
         let output_wall_exhausted = framed!(self.observe_state(&mut state));
@@ -154,6 +176,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
+                resources,
             );
         }
         let mut output_state = state.clone();
@@ -165,6 +188,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 &state,
                 delivered_before,
                 before_batch,
+                resources,
             );
         }
         if page.is_empty() {
@@ -176,6 +200,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 pagination,
                 delivered_before,
                 stats,
+                resources,
             );
         }
         let digest = framed!(batch_digest(
@@ -194,6 +219,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
+                resources,
             );
         }
         output_state.last_observed_at = state.last_observed_at;
@@ -219,6 +245,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                             &state,
                             delivered_before,
                             batch_stats,
+                            resources,
                         );
                     },
                 }
@@ -248,105 +275,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             pagination,
             delivered_before,
             batch_stats,
+            resources,
         )
-    }
-
-    fn stopped_page(
-        &self,
-        header: Option<QueryEvent>,
-        code: QueryFailureCode,
-        state: &CursorState,
-        delivered_before: QueryStats,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.failed_page(header, QueryFailure::new(code), state, delivered_before)
-    }
-
-    fn failed_page(
-        &self,
-        header: Option<QueryEvent>,
-        failure: QueryFailure,
-        state: &CursorState,
-        delivered_before: QueryStats,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.incomplete_page(
-            header,
-            failure,
-            state,
-            delivered_before,
-            stats_before_current(state),
-        )
-    }
-
-    fn stopped_page_with_stats(
-        &self,
-        header: Option<QueryEvent>,
-        code: QueryFailureCode,
-        state: &CursorState,
-        delivered_before: QueryStats,
-        terminal_stats: QueryStats,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.incomplete_page(
-            header,
-            QueryFailure::new(code),
-            state,
-            delivered_before,
-            terminal_stats,
-        )
-    }
-
-    fn incomplete_page(
-        &self,
-        header: Option<QueryEvent>,
-        failure: QueryFailure,
-        state: &CursorState,
-        delivered_before: QueryStats,
-        terminal_stats: QueryStats,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let mut events = Vec::with_capacity(1);
-        events.extend(header);
-        self.incomplete_events(events, failure, state, delivered_before, terminal_stats)
-    }
-
-    fn incomplete_events(
-        &self,
-        mut events: Vec<QueryEvent>,
-        failure: QueryFailure,
-        state: &CursorState,
-        delivered_before: QueryStats,
-        terminal_stats: QueryStats,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        events.push(QueryEvent::Terminal(QueryTerminal::Incomplete(
-            QueryIncomplete::new(failure, terminal_stats),
-        )));
-        self.stream(events, state, false, delivered_before, terminal_stats)
-    }
-
-    fn stream(
-        &self,
-        events: Vec<QueryEvent>,
-        state: &CursorState,
-        retain_for_resume: bool,
-        observed_stats: QueryStats,
-        batch_stats: QueryStats,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let ledger = self.ledger;
-        let identity = state.lease_identity;
-        let cancellation = state.cancellation.clone();
-        let release = Box::new(move || {
-            let identity = SnapshotLeaseId::new(identity)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-            ledger
-                .release_snapshot_lease(identity)
-                .map_err(map_ledger_failure)
-        });
-        Ok(QueryStream::new_releasing(
-            events,
-            release,
-            retain_for_resume,
-            observed_stats,
-            batch_stats,
-            cancellation,
-        ))
     }
 
     fn observe_state(&self, state: &mut CursorState) -> Result<bool, QueryFailure> {

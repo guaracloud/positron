@@ -41,7 +41,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
     let plan = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?.with_cpu_work_units(16)?,
     )?;
     let first = service.execute_page(plan)?.collect::<Vec<_>>();
     let cursor = continuation(&first)?.clone();
@@ -49,23 +49,24 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
 
     fixture.append_log("future", 22, 3)?;
     clock.set(101);
-    let resumed = QueryService::with_clock(
+    let mut resumed = QueryService::with_clock(
         fixture.authority.governor(),
         fixture.ledger()?,
         1,
         clock.clone(),
     )
     .resume(context, &cursor)?;
+    let resumed_events = resumed.by_ref().take(2).collect::<Vec<_>>();
+    drop(resumed);
     let repeated = service.resume(context, &cursor)?;
-    let resumed = resumed.collect::<Vec<_>>();
-    assert_eq!(bodies(&resumed), ["second"]);
+    assert_eq!(bodies(&resumed_events), ["second"]);
+    let repeated = repeated.collect::<Vec<_>>();
     assert!(matches!(
-        resumed.last(),
+        repeated.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
     ));
-    let repeated = repeated.collect::<Vec<_>>();
-    assert_eq!(batch_identity(&resumed)?, batch_identity(&repeated)?);
-    assert_ne!(first_batch, batch_identity(&resumed)?);
+    assert_eq!(batch_identity(&resumed_events)?, batch_identity(&repeated)?);
+    assert_ne!(first_batch, batch_identity(&resumed_events)?);
     Ok(())
 }
 

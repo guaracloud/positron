@@ -1678,7 +1678,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_672, true), (1_671, false)] {
+    for (memory_bytes, expected_complete) in [(1_688, true), (1_687, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -1705,7 +1705,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(3_342, true), (3_341, false)] {
+    for (memory_bytes, expected_complete) in [(3_374, true), (3_373, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
