@@ -61,11 +61,14 @@ version 2 format uses tag `4` only for the native Stream Attribute namespace.
 
 The Log Store owns a bounded Tenant Schema Catalog separately from Store Block
 payloads. Its immutable Catalog Object uses the ASCII magic `PSCHEMA1` and
-version `1`, followed by the tenant identity, entry/memory/persistent-byte/
+version `2`, followed by the tenant identity, entry/memory/persistent-byte/
 index-byte budgets, overflow record and byte counters, and deterministic
 namespace-qualified path entries. Each entry preserves observed typed
 variants, observation and conflict counts, query-use count, promotion state,
-index bytes, and canonical bounded per-block typed dictionaries. A bounded
+index bytes, and canonical bounded per-block typed dictionaries. Scalar
+dictionaries retain a sorted, duplicate-free set of exact native scalar values
+in addition to the type mask; a legacy or type-only sidecar remains valid
+coverage only for type pruning. A bounded
 `REPLAY1` trailer records one canonical authenticated replay frontier per
 shard. The allocation-free reader preflight accounts catalog entries, physical
 index paths, and frontier vector storage before construction. Each physical
@@ -73,8 +76,20 @@ dictionary is keyed by the exact Store Block identity and authenticated payload
 digest, and its paths and type masks must match promoted catalog members. A
 query may prune only when all of those facts match; missing, stale,
 unreachable, replacement, or demoted coverage falls back to the authoritative
-v2 value and reports reduced pruning. These sidecars do not add a Store Block
-tag or version. The object is
+v2 value and reports reduced pruning. Version 2 frames every physical index
+block with an explicit one-byte scalar-sidecar-presence field (`0` absent,
+`1` present), followed by `PVALUES\0` and the bounded per-path dictionaries
+only when present. Readers accept version 1 objects without scalar sidecars
+(their values are rebuilt from the authoritative Store Blocks) and accept
+version 2 objects using the explicit framing; a version 1 object is never
+parsed as version 2. Version 1 bytes beginning with `PVALUES\0` therefore
+remain the next identity, not an optional trailer. These sidecars do not add
+a Store Block tag or version. Each scalar String or Bytes payload is bounded to
+the canonical native value limit of 65,536 bytes. When a legacy version 1
+block is mutated by replay, promotion, or path removal, the in-memory index
+atomically upgrades that block to version 2 framing and charges its one-byte
+presence field before publication; insufficient budget rejects the mutation.
+The object is
 content-addressed and published only through
 the Storage Kernel Catalog Writer with the generation precondition and typed
 governance evidence required by ADR-0069. It is rebuildable optimization state,
@@ -90,9 +105,12 @@ values remain unchanged; overflow updates only bounded evidence and never
 allocates catalog, statistics, dictionary, or automatic-index state. Generic
 and overflow records therefore have identical logical scan and typed-query
 semantics, while overflow scans report reduced pruning. Promoted scalar paths
-carry a canonical typed-variant dictionary whose entry, per-block
-identity/digest framing, path, and type-mask bytes all consume the same checked
-index and persistent budgets. Observation or governed query-use evidence may
+carry a canonical typed-variant and scalar-value dictionary whose entry,
+per-block identity/digest framing, path, type-mask, value-count, and value
+bytes all consume the same checked index, persistent, and retained-memory
+budgets. Scalar sidecar bytes are rebuildable and bounded; when the scalar
+dictionary cannot fit, the path falls back to type-only coverage or Schema
+Overflow atomically. Observation or governed query-use evidence may
 promote a path; removing query evidence or reconciling unreachable blocks
 removes the corresponding physical coverage without altering logical state.
 Dictionary budget exhaustion overflows the complete attribute root atomically.

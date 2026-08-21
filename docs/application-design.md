@@ -560,12 +560,24 @@ immutable views or opaque staged deltas. Catalog state is published only
 through the Storage Kernel Catalog Writer; no receiver or private schema
 publisher may bypass that authority. Generic and overflow
 representations use the same logical scan and explicit typed occurrence query
-semantics. Scalar paths consume an exact bounded typed-variant dictionary
-budget. `PSCHEMA1` binds each physical dictionary to the exact Store Block
+ semantics. Scalar paths consume an exact bounded typed-variant and native
+ scalar-value dictionary budget. `PSCHEMA1` binds each physical dictionary to
+ the exact Store Block
 identity and authenticated payload digest; only matching coverage may prune an
 impossible type. Missing, stale, replaced, demoted, generic, or Schema Overflow
 coverage selects the generic scan and exposes reduced pruning without changing
-`index`, `any`, or `all` results. Discovery returns tenant-bound bounded top
+`index`, `any`, or `all` results. `PSCHEMA1` version 1 entries have no scalar
+dictionary sidecar; scalar value optimization is rebuilt from authoritative Store
+Blocks or falls back to type-only coverage. Version 2 alone uses explicit
+per-block sidecar-presence framing. Version 1 bytes beginning `PVALUES\0` remain
+StoreBlockIdentity bytes, preserving the legacy identity-collision contract. This
+versioning remains rebuildable optimization state and does not change the
+authoritative Store Block format.
+Scalar String and Bytes sidecar payloads use the canonical 65,536-byte native
+value limit. Any mutation of a version 1 physical index upgrades its framing to
+version 2 and reserves the one-byte presence field atomically before publication;
+the governed mutation fails closed when that additional budget is unavailable.
+Discovery returns tenant-bound bounded top
 paths, typed conflicts and variants, promotion decisions, budget pressure,
 overflow counts, and sampled path digests without exposing mutation authority.
 The Log Store exposes only the bounded immutable discovery result. The public

@@ -1,4 +1,4 @@
-use positron_domain::value::{AttributeNamespace, AttributeValueKind};
+use positron_domain::value::{AttributeNamespace, AttributeValueKind, ValueLimitProfile};
 
 use super::failure::SchemaFailure;
 
@@ -6,6 +6,11 @@ pub(crate) const MAX_VARIANTS: usize = 8;
 pub(crate) const MAX_DISCOVERY_NODES: usize = 4_096;
 pub(crate) const CATALOG_HEADER_BYTES: usize = 82;
 const MAX_PATH_BYTES: usize = 65_536;
+pub(crate) const MAX_SCALAR_VALUE_BYTES: usize = ValueLimitProfile::release_1_system_maximum()
+    .system_limits()
+    .dynamic_value()
+    .individual_value_bytes()
+    .value() as usize;
 const MAX_PATH_SEGMENTS: usize = 128;
 const MAX_SCHEMA_ENTRIES: usize = 4_096;
 const MAX_SCHEMA_MEMORY_BYTES: usize = 16_777_216;

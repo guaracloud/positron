@@ -173,7 +173,7 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         SegmentScope::new(tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
     )?;
-    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 96)?)?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(1, 8_192, 8_192, 97)?)?;
     let seed = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "collision".to_owned(),
@@ -264,7 +264,7 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
     let mut replayed = SchemaSessionStore::new(
         replay_capacity,
         tenant,
-        SchemaBudget::new(1, 8_192, 8_192, 96)?,
+        SchemaBudget::new(1, 8_192, 8_192, 97)?,
     )?;
     let seed = snapshot
         .blocks()
@@ -283,6 +283,9 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         .ok_or("replay target block")?;
     let target_delta = replayed.replay(tenant, &snapshot, target)?;
     replayed.commit(target_delta, target.identity(), target.content_digest()?)?;
+    let mut query_update = replayed.stage_query_update()?;
+    query_update.index_replayed_query_path(tenant, &snapshot, target, &path)?;
+    replayed.commit_query_update(query_update)?;
     let replayed_result = store.scan_schema(
         authority.governor(),
         tenant,
@@ -296,7 +299,9 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         ),
     )?;
     assert_eq!(replayed_result.records().len(), 1);
+    assert_eq!(replayed_result.records(), result.records());
     assert!(replayed_result.reduced_pruning());
+    assert_eq!(replayed_result.reduced_pruning(), result.reduced_pruning());
     Ok(())
 }
 

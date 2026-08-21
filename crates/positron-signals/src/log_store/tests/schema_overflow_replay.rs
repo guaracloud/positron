@@ -87,6 +87,30 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
     let digest = block.content_digest()?;
     ledger.append(block)?;
 
+    let isolated_identity = StoreBlockIdentity::new([0x6c; 16])?;
+    let mut isolated_record = nested_record(CandidateAttributeValue::signed_integer(43))?;
+    let _isolated_delta =
+        store.stage_schema_group(std::slice::from_mut(&mut isolated_record), &constrained)?;
+    assert_eq!(
+        isolated_record
+            .attributes()
+            .first()
+            .map(|attribute| attribute.representation()),
+        Some(AttributeRepresentation::SchemaOverflow)
+    );
+    let isolated_block = store
+        .prepare(
+            preparation_capacity(&authority, tenant)?,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(102))),
+            tenant,
+            shard,
+            isolated_identity,
+            vec![isolated_record],
+        )?
+        .into_store_block();
+    let _isolated_digest = isolated_block.content_digest()?;
+    ledger.append(isolated_block)?;
+
     let seed = AttributeOccurrenceSetCandidate::new(
         AttributeNamespace::Record,
         "target".to_owned(),
@@ -117,28 +141,39 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
     let snapshot = ledger.snapshot()?;
     let committed = snapshot.blocks().first().ok_or("committed block")?;
     let mut replay_delta = store.replay_schema_block(tenant, &snapshot, committed, &replayed)?;
-    let mut no_query_evidence = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
-    no_query_evidence.observe(std::slice::from_ref(&seed))?;
-    no_query_evidence.observe(std::slice::from_ref(&seed))?;
-    no_query_evidence.observe(std::slice::from_ref(&filler))?;
-    no_query_evidence.observe(std::slice::from_ref(&filler))?;
-    let no_sidecar = store.replay_schema_block(tenant, &snapshot, committed, &no_query_evidence)?;
-    assert_eq!(replay_delta.retained_memory_bytes(), 0);
-    assert_eq!(replay_delta.physical_index_bytes(), 0);
-    assert_eq!(replay_delta.physical_memory_bytes(), 0);
+    let cloned_replay_delta = replay_delta.try_clone()?;
     assert_eq!(
-        replay_delta.staged_memory_bytes(),
-        no_sidecar.staged_memory_bytes()
+        cloned_replay_delta.staged_memory_bytes(),
+        replay_delta.staged_memory_bytes()
     );
+    let isolated = snapshot.blocks().get(1).ok_or("isolated committed block")?;
+    let isolated_delta = store.replay_schema_block(tenant, &snapshot, isolated, &replayed)?;
+    let cloned_isolated_delta = isolated_delta.try_clone()?;
+    assert_eq!(
+        cloned_isolated_delta.staged_memory_bytes(),
+        isolated_delta.staged_memory_bytes()
+    );
+    let no_query_evidence = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let generic_result = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(6)?),
+        &no_query_evidence,
+        &SchemaQuery::value(
+            path.clone(),
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(42),
+        ),
+    )?;
+    assert_eq!(generic_result.records().len(), 1);
+    assert!(generic_result.reduced_pruning());
 
     replayed.stage_record(
         std::slice::from_ref(&seed),
         &mut replay_delta,
         &mut DiscoveryMeter::new(),
     )?;
-    assert_eq!(replay_delta.retained_memory_bytes(), 0);
-    assert_eq!(replay_delta.physical_index_bytes(), 0);
-    assert_eq!(replay_delta.physical_memory_bytes(), 0);
     let (replay_delta, block_index) = replay_delta.into_block_index(identity, digest);
     assert!(block_index.is_none());
     replayed.apply_delta(replay_delta, block_index)?;

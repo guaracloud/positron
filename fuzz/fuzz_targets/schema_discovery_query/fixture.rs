@@ -10,7 +10,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord as OtlpLogRecord, ResourceL
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
-use positron_domain::value::{AttributeNamespace, AttributeValueKind};
+use positron_domain::value::{AttributeNamespace, ValidatedAttributeValue};
 use positron_governance::{
     AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
 };
@@ -25,8 +25,8 @@ use positron_kernel::{
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{
-    LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaCatalog, SchemaPath, SchemaQuery,
-    SchemaValue,
+    AttributeRepresentation, LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaCatalog,
+    SchemaPath, SchemaQuery, SchemaValue, ScannedLogRecord,
 };
 use prost::Message;
 
@@ -34,6 +34,8 @@ use super::authority;
 
 const MAX_ATTRIBUTES: usize = 32;
 const MAX_PERSISTED_BLOCKS: u64 = 32;
+const FALLBACK_KEY: &str = "fuzz-fallback";
+const FALLBACK_VALUE: &str = "fallback";
 
 pub struct FuzzFixture {
     tenant: TenantId,
@@ -115,7 +117,7 @@ impl FuzzFixture {
             return;
         };
         let key = key(data.first().copied().unwrap_or_default());
-        let Ok(path) = SchemaPath::root(AttributeNamespace::Record, key) else {
+        let Ok(path) = SchemaPath::root(AttributeNamespace::Record, key.clone()) else {
             return;
         };
         let _ = self.session.record_query_use(
@@ -130,25 +132,90 @@ impl FuzzFixture {
         let Ok(catalog) = SchemaCatalog::decode_catalog_object(checkpoint.catalog_bytes()) else {
             return;
         };
+        let Some(exact_value) = exact_value(data) else {
+            return;
+        };
+        let Ok(limit) = ScanLimit::new(32) else {
+            return;
+        };
+        let Ok(all_result) = LogStore::new().scan(
+            self.authority.governor(),
+            self.tenant,
+            &snapshot,
+            LogScan::all(limit),
+        ) else {
+            return;
+        };
         for selector in [
             OccurrenceSelector::Index(0),
             OccurrenceSelector::Index(1),
             OccurrenceSelector::Any,
             OccurrenceSelector::All,
         ] {
-            let query = SchemaQuery::value(
+            let exact_query = SchemaQuery::value(
                 path.clone(),
                 selector,
-                SchemaValue::kind(AttributeValueKind::String),
+                exact_value.clone(),
             );
-            let _ = LogStore::new().scan_schema(
+            let Ok(exact_result) = LogStore::new().scan_schema(
                 self.authority.governor(),
                 self.tenant,
                 &snapshot,
-                LogScan::all(ScanLimit::new(32).expect("fixed valid scan limit")),
+                LogScan::all(limit),
                 &catalog,
-                &query,
+                &exact_query,
+            ) else {
+                continue;
+            };
+            let expected = all_result
+                .records()
+                .iter()
+                .filter(|record| reference_matches(record, &key, selector, &exact_value))
+                .map(ScannedLogRecord::commit_position)
+                .collect::<Vec<_>>();
+            let actual = exact_result
+                .records()
+                .iter()
+                .map(ScannedLogRecord::commit_position)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "exact scalar query changed logical results");
+            let expected_reduced = reference_reduced_pruning(
+                &catalog,
+                all_result.records(),
+                &path,
+                &exact_value,
             );
+            assert_eq!(
+                exact_result.reduced_pruning(),
+                expected_reduced,
+                "scalar query changed independent pruning classification"
+            );
+        }
+        let fallback_path = SchemaPath::root(AttributeNamespace::Record, FALLBACK_KEY.to_owned())
+            .ok();
+        if let Some(fallback_path) = fallback_path {
+            let fallback_query = SchemaQuery::value(
+                fallback_path,
+                OccurrenceSelector::Any,
+                SchemaValue::string(FALLBACK_VALUE),
+            );
+            let Ok(fallback_result) = LogStore::new().scan_schema(
+                self.authority.governor(),
+                self.tenant,
+                &snapshot,
+                LogScan::all(limit),
+                &catalog,
+                &fallback_query,
+            ) else {
+                return;
+            };
+            if self.blocks.get() > 0 {
+                assert_eq!(fallback_result.records().len(), self.blocks.get() as usize);
+                assert!(
+                    fallback_result.reduced_pruning(),
+                    "unpromoted fallback path must report reduced pruning"
+                );
+            }
         }
         let requested = usize::from(data.get(1).copied().unwrap_or_default() % 32);
         if let Ok(request) = SchemaDiscoveryRequest::page(0, requested, requested / 2) {
@@ -207,24 +274,33 @@ impl Drop for FuzzRoot {
 }
 
 fn request(data: &[u8]) -> ExportLogsServiceRequest {
-    let attributes = data
+    let mut attributes = data
         .chunks(3)
         .take(MAX_ATTRIBUTES)
         .map(|chunk| {
             let byte = chunk.first().copied().unwrap_or_default();
-            let value = match byte % 4 {
-                0 => any_value::Value::StringValue(format!("v{byte:02x}")),
-                1 => any_value::Value::IntValue(i64::from(byte)),
-                2 => any_value::Value::BoolValue(byte & 1 == 1),
-                _ => any_value::Value::BytesValue(chunk.to_vec()),
+            let value = match byte % 6 {
+                0 => None,
+                1 => Some(any_value::Value::StringValue(format!("v{byte:02x}"))),
+                2 => Some(any_value::Value::IntValue(i64::from(byte))),
+                3 => Some(any_value::Value::BoolValue(byte & 1 == 1)),
+                4 => Some(any_value::Value::DoubleValue(f64::from(byte) + 0.5)),
+                _ => Some(any_value::Value::BytesValue(chunk.to_vec())),
             };
             KeyValue {
                 key: key(byte),
-                value: Some(AnyValue { value: Some(value) }),
+                value: Some(AnyValue { value }),
                 ..Default::default()
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    attributes.push(KeyValue {
+        key: FALLBACK_KEY.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(FALLBACK_VALUE.to_owned())),
+        }),
+        ..Default::default()
+    });
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             scope_logs: vec![ScopeLogs {
@@ -238,6 +314,128 @@ fn request(data: &[u8]) -> ExportLogsServiceRequest {
             ..Default::default()
         }],
     }
+}
+
+fn exact_value(data: &[u8]) -> Option<SchemaValue> {
+    let chunk = data.chunks(3).next()?;
+    let byte = *chunk.first()?;
+    Some(match byte % 6 {
+        0 => SchemaValue::null(),
+        1 => SchemaValue::string(format!("v{byte:02x}")),
+        2 => SchemaValue::signed_integer(i64::from(byte)),
+        3 => SchemaValue::boolean(byte & 1 == 1),
+        4 => SchemaValue::floating_point_bits((f64::from(byte) + 0.5).to_bits()),
+        _ => SchemaValue::bytes(chunk.to_vec()),
+    })
+}
+
+fn reference_matches(
+    record: &ScannedLogRecord,
+    key: &str,
+    selector: OccurrenceSelector,
+    expected: &SchemaValue,
+) -> bool {
+    let mut values = record
+        .attributes()
+        .iter()
+        .filter(|attribute| {
+            let occurrences = attribute.occurrences();
+            occurrences.namespace() == AttributeNamespace::Record && occurrences.key() == key
+        })
+        .flat_map(|attribute| {
+            let occurrences = attribute.occurrences();
+            (0..occurrences.len()).filter_map(move |index| occurrences.occurrence(index))
+        });
+    match selector {
+        OccurrenceSelector::Index(index) => values
+            .nth(index)
+            .is_some_and(|value| reference_value_matches(value, expected)),
+        OccurrenceSelector::Any => values.any(|value| reference_value_matches(value, expected)),
+        OccurrenceSelector::All => {
+            let mut found = false;
+            let matches = values.inspect(|_| found = true).all(|value| {
+                reference_value_matches(value, expected)
+            });
+            found && matches
+        },
+    }
+}
+
+fn reference_value_matches(value: &ValidatedAttributeValue, expected: &SchemaValue) -> bool {
+    match expected {
+        SchemaValue::Null => value.is_null(),
+        SchemaValue::Boolean(expected) => value.as_boolean() == Some(*expected),
+        SchemaValue::SignedInteger(expected) => value.as_signed_integer() == Some(*expected),
+        SchemaValue::FloatingPointBits(expected) => {
+            value.as_floating_point_bits() == Some(*expected)
+        },
+        SchemaValue::String(expected) => value.as_str() == Some(expected),
+        SchemaValue::Bytes(expected) => value.as_bytes() == Some(expected),
+        SchemaValue::Kind(expected) => value.kind() == *expected,
+    }
+}
+
+fn reference_reduced_pruning(
+    catalog: &SchemaCatalog,
+    records: &[ScannedLogRecord],
+    path: &SchemaPath,
+    expected: &SchemaValue,
+) -> bool {
+    records
+        .iter()
+        .any(|record| reference_block_coverage(catalog, record, path, expected).is_none())
+}
+
+/// Independently models the public sidecar contract for one persisted block.
+///
+/// `None` is deliberate for every non-authoritative state: absent or
+/// unpromoted catalog paths, missing/stale sidecars, type-only coverage, and
+/// Schema Overflow records. Only a promoted path with scalar occurrences that
+/// can supply an exact bounded dictionary returns `Some`.
+fn reference_block_coverage(
+    catalog: &SchemaCatalog,
+    record: &ScannedLogRecord,
+    path: &SchemaPath,
+    expected: &SchemaValue,
+) -> Option<bool> {
+    if !catalog.entry(path).is_some_and(|entry| entry.promoted()) {
+        return None;
+    }
+    let root = path.segments().first()?;
+    let attributes = record.attributes().iter().filter(|attribute| {
+        let occurrences = attribute.occurrences();
+        occurrences.namespace() == path.namespace() && occurrences.key() == root
+    });
+    let mut saw_attribute = false;
+    let mut saw_scalar = false;
+    let mut matches = false;
+    for attribute in attributes {
+        saw_attribute = true;
+        if attribute.representation() == AttributeRepresentation::SchemaOverflow {
+            return None;
+        }
+        let occurrences = attribute.occurrences();
+        for index in 0..occurrences.len() {
+            let value = occurrences.occurrence(index)?;
+            if is_scalar(value) {
+                saw_scalar = true;
+                matches |= reference_value_matches(value, expected);
+            }
+        }
+    }
+    (saw_attribute && saw_scalar).then_some(matches)
+}
+
+fn is_scalar(value: &ValidatedAttributeValue) -> bool {
+    matches!(
+        value.kind(),
+        positron_domain::value::AttributeValueKind::Null
+            | positron_domain::value::AttributeValueKind::Boolean
+            | positron_domain::value::AttributeValueKind::SignedInteger
+            | positron_domain::value::AttributeValueKind::FloatingPoint
+            | positron_domain::value::AttributeValueKind::String
+            | positron_domain::value::AttributeValueKind::Bytes
+    )
 }
 
 fn key(byte: u8) -> String {

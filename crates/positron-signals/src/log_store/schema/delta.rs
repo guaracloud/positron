@@ -3,7 +3,7 @@ use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
 
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
-use super::index::{SchemaBlockIndex, SchemaIndexPath};
+use super::index::{ScalarIndexFraming, SchemaBlockIndex, SchemaIndexPath};
 use super::model::{MAX_DISCOVERY_NODES, SchemaEntry, SchemaPath, promoted_index_bytes};
 use super::observation::{ObservedAttribute, SchemaObservation};
 use super::representation::SchemaRepresentation;
@@ -133,6 +133,7 @@ impl SchemaDelta {
                 identity,
                 digest,
                 paths,
+                scalar_framing: ScalarIndexFraming::V2,
             }),
         )
     }
@@ -241,12 +242,12 @@ impl SchemaCatalog {
                     complete = false;
                 }
             }
-            let cataloged = complete && root_fits(self, delta, &root)?;
+            let cataloged = complete && root_fits(self, delta, &root, attributes)?;
             if cataloged {
-                stage_index_root(self, delta, &root)?;
+                stage_index_root(self, delta, &root, attributes)?;
                 merge_root(delta, root)?;
             } else {
-                delta.mark_paths_unverified(self, &root)?;
+                delta.mark_paths_unverified(self, &root, &path)?;
                 record_overflow_bytes = record_overflow_bytes
                     .checked_add(attribute_bytes(set)?)
                     .ok_or(SchemaFailure::LimitExceeded)?;

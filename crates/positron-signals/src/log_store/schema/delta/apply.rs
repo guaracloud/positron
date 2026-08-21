@@ -26,56 +26,52 @@ impl SchemaCatalog {
         }) {
             return Ok(());
         }
-        let insertion = self.prepare_block_index(block_index.as_ref())?;
-        let memory_bytes = self
-            .memory_bytes
-            .checked_add(delta.retained_memory_bytes)
-            .ok_or(SchemaFailure::LimitExceeded)?;
-        let persistent_bytes = self
+        let mut next = self.clone_block_indexes()?;
+        if let Some(index) = block_index.as_ref() {
+            if next.len() >= MAX_BLOCK_INDEXES {
+                return Err(SchemaFailure::LimitExceeded);
+            }
+            let insertion = match next.binary_search_by_key(&index.identity, |known| known.identity)
+            {
+                Ok(_) => return Err(SchemaFailure::InvalidValue),
+                Err(position) => position,
+            };
+            next.try_reserve_exact(1)
+                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+            next.insert(insertion, index.try_clone()?);
+        }
+        let added_memory = delta
+            .retained_memory_bytes
+            .checked_sub(delta.physical_memory_bytes())
+            .ok_or(SchemaFailure::InvalidValue)?;
+        let added_persistent = delta
             .persistent_bytes
-            .checked_add(delta.persistent_bytes)
-            .ok_or(SchemaFailure::LimitExceeded)?;
-        let index_bytes = self
+            .checked_sub(delta.physical_index_bytes())
+            .ok_or(SchemaFailure::InvalidValue)?;
+        let added_index = delta
             .index_bytes
-            .checked_add(delta.index_bytes)
-            .ok_or(SchemaFailure::LimitExceeded)?;
+            .checked_sub(delta.physical_index_bytes())
+            .ok_or(SchemaFailure::InvalidValue)?;
+        let new_entries = delta
+            .entries
+            .iter()
+            .filter(|staged| self.entry(&staged.path).is_none())
+            .count();
+        if self
+            .entries
+            .len()
+            .checked_add(new_entries)
+            .is_none_or(|count| count > self.entries.capacity())
+        {
+            return Err(SchemaFailure::AllocationUnavailable);
+        }
+        self.replace_block_indexes(next, 0, added_memory, added_persistent, added_index)?;
         for staged in delta.entries {
             self.apply_entry(staged)?;
         }
-        self.memory_bytes = memory_bytes;
-        self.persistent_bytes = persistent_bytes;
-        self.index_bytes = index_bytes;
         self.overflow_records = self.overflow_records.saturating_add(delta.overflow_records);
         self.overflow_bytes = self.overflow_bytes.saturating_add(delta.overflow_bytes);
-        if let Some(index) = block_index {
-            self.block_indexes
-                .insert(insertion.ok_or(SchemaFailure::InvalidValue)?, index);
-        }
         Ok(())
-    }
-
-    fn prepare_block_index(
-        &mut self,
-        index: Option<&SchemaBlockIndex>,
-    ) -> Result<Option<usize>, SchemaFailure> {
-        let Some(index) = index else {
-            return Ok(None);
-        };
-        match self
-            .block_indexes
-            .binary_search_by_key(&index.identity, |known| known.identity)
-        {
-            Ok(_) => Err(SchemaFailure::InvalidValue),
-            Err(position) => {
-                if self.block_indexes.len() >= MAX_BLOCK_INDEXES {
-                    return Err(SchemaFailure::LimitExceeded);
-                }
-                self.block_indexes
-                    .try_reserve_exact(1)
-                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-                Ok(Some(position))
-            },
-        }
     }
 
     fn apply_entry(

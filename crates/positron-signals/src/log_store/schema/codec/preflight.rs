@@ -1,4 +1,7 @@
-use super::{Input, MAGIC, MAX_SEGMENTS_ON_WIRE, VERSION, decode_namespace, decode_value_kind};
+use super::{
+    Input, MAGIC, MAX_SEGMENTS_ON_WIRE, VERSION, decode_namespace, decode_value_kind,
+    legacy_version,
+};
 use crate::log_store::SchemaFailure;
 use crate::log_store::schema::model::{
     CATALOG_HEADER_BYTES, MAX_VARIANTS, SchemaBudget, catalog_base_memory_bytes,
@@ -9,6 +12,7 @@ pub(super) struct CatalogPrefix {
     pub(super) memory_bound: usize,
     pub(super) sidecar_memory_bound: usize,
     pub(super) budget: SchemaBudget,
+    pub(super) version: u16,
 }
 
 pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailure> {
@@ -16,7 +20,11 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailur
         return Err(SchemaFailure::MalformedCatalog);
     }
     let mut input = Input::new(bytes);
-    if input.take(MAGIC.len())? != MAGIC || input.u16()? != VERSION {
+    if input.take(MAGIC.len())? != MAGIC {
+        return Err(SchemaFailure::MalformedCatalog);
+    }
+    let version = input.u16()?;
+    if version != VERSION && !legacy_version(version) {
         return Err(SchemaFailure::MalformedCatalog);
     }
     let _: [u8; 16] = input.array()?;
@@ -126,7 +134,7 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailur
             .filter(|value| *value <= budget.max_index_bytes())
             .ok_or(SchemaFailure::MalformedCatalog)?;
     }
-    let physical = super::index::preflight(&mut input, budget)?;
+    let physical = super::index::preflight(&mut input, budget, legacy_version(version))?;
     memory = memory
         .checked_add(physical.memory_bound)
         .filter(|value| *value <= budget.max_memory_bytes())
@@ -141,5 +149,6 @@ pub(super) fn catalog_prefix(bytes: &[u8]) -> Result<CatalogPrefix, SchemaFailur
         memory_bound: memory,
         sidecar_memory_bound: physical.memory_bound,
         budget,
+        version,
     })
 }

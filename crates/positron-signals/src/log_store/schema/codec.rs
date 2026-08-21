@@ -8,11 +8,16 @@ use super::model::{
 };
 
 const MAGIC: &[u8; 8] = b"PSCHEMA1";
-const VERSION: u16 = 1;
+const LEGACY_VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const MAX_SEGMENTS_ON_WIRE: usize = 128;
 mod encode;
 mod index;
 mod preflight;
+
+pub(super) const fn legacy_version(version: u16) -> bool {
+    version == LEGACY_VERSION
+}
 
 impl SchemaCatalog {
     /// Decodes one bounded schema Catalog Object through the production reader.
@@ -100,7 +105,9 @@ fn decode_checkpoint(
             .ok_or(SchemaFailure::MalformedCatalog)?,
     );
     input.take(MAGIC.len())?;
-    input.u16()?;
+    if input.u16()? != prefix.version {
+        return Err(SchemaFailure::MalformedCatalog);
+    }
     let tenant =
         TenantId::from_bytes(input.array()?).map_err(|_| SchemaFailure::MalformedCatalog)?;
     let max_entries = input.usize()?;
@@ -167,7 +174,8 @@ fn decode_checkpoint(
             .ok_or(SchemaFailure::MalformedCatalog)?;
         catalog.entries.push(entry);
     }
-    let (block_indexes, physical_bytes, physical_memory) = index::decode(&mut input, budget)?;
+    let (block_indexes, physical_bytes, physical_memory) =
+        index::decode(&mut input, budget, legacy_version(prefix.version))?;
     if block_indexes
         .iter()
         .any(|index| !index.semantically_valid(&catalog.entries))
