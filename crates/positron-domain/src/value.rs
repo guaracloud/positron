@@ -9,6 +9,7 @@ include!("value/occurrences.rs");
 mod observed;
 mod observed_encoding;
 mod validated_encoding;
+mod validated_profile;
 
 pub use observed::{NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, NativeValueObserver, ObservedValueFailure};
 use validated_encoding::visit_comparison_sequence;

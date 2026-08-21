@@ -97,6 +97,13 @@ impl AttributeOccurrenceSet {
         {
             return Err(DomainFailure::value_limit_exceeded());
         }
+        for occurrence in &occurrences {
+            occurrence.validate_against(
+                limits,
+                limits.dynamic_value().individual_value_bytes(),
+                limits.dynamic_value().nesting_depth().value(),
+            )?;
+        }
         Ok(Self {
             namespace,
             key,

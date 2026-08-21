@@ -13,9 +13,10 @@ use positron_domain::{
         SourceTimeQuality, UnixNanoseconds,
     },
     value::{
-        AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind, ByteLimit,
-        CandidateAttributeValue, CandidateKeyValue, CollectionLimit, DynamicValueLimits,
-        NestingLimit, RecordLimits, RequestLimits, ValueLimitProfileCandidate, ValueLimitSet,
+        AttributeNamespace, AttributeOccurrenceSet, AttributeOccurrenceSetCandidate,
+        AttributeValueKind, ByteLimit, CandidateAttributeValue, CandidateKeyValue, CollectionLimit,
+        DynamicValueLimits, NestingLimit, RecordLimits, RequestLimits, ValueLimitProfile,
+        ValueLimitProfileCandidate, ValueLimitSet,
     },
 };
 
@@ -45,6 +46,39 @@ fn dynamic_value_limits(
             CollectionLimit::new(collection_entries)?,
             CollectionLimit::new(collection_entries)?,
         ),
+    ))
+}
+
+fn profile_with_tenant_dynamic_limits(
+    tenant: DynamicValueLimits,
+) -> Result<(ValueLimitProfile, ValueLimitProfile), DomainFailure> {
+    let request = RequestLimits::new(
+        ByteLimit::new(4_096)?,
+        ByteLimit::new(16_384)?,
+        CollectionLimit::new(128)?,
+        CollectionLimit::new(1_024)?,
+    );
+    let record = RecordLimits::new(
+        ByteLimit::new(16_384)?,
+        ByteLimit::new(65_536)?,
+        ByteLimit::new(65_536)?,
+    );
+    let system = ValueLimitSet::new(
+        request,
+        record,
+        DynamicValueLimits::new(
+            ByteLimit::new(64)?,
+            CollectionLimit::new(8)?,
+            ByteLimit::new(16)?,
+            NestingLimit::new(4)?,
+            CollectionLimit::new(4)?,
+            CollectionLimit::new(4)?,
+        ),
+    );
+    let tenant = ValueLimitSet::new(request, record, tenant);
+    Ok((
+        ValueLimitProfileCandidate::new(system, None).validate()?,
+        ValueLimitProfileCandidate::new(system, Some(tenant)).validate()?,
     ))
 }
 
@@ -1022,6 +1056,123 @@ fn attribute_occurrence_count_cannot_exceed_the_profile_limit() -> Result<(), Do
                 && failure.source() == FailureSource::AttributeValue
     ));
 
+    Ok(())
+}
+
+#[test]
+fn projected_validated_occurrences_recheck_every_tenant_lowered_value_dimension()
+-> Result<(), DomainFailure> {
+    let tenant_dynamic = |individual, key, depth, array, key_value| {
+        Ok::<_, DomainFailure>(DynamicValueLimits::new(
+            ByteLimit::new(individual)?,
+            CollectionLimit::new(8)?,
+            ByteLimit::new(key)?,
+            NestingLimit::new(depth)?,
+            CollectionLimit::new(array)?,
+            CollectionLimit::new(key_value)?,
+        ))
+    };
+    let (system, size_profile) =
+        profile_with_tenant_dynamic_limits(tenant_dynamic(4, 16, 4, 4, 4)?)?;
+    let exact = CandidateAttributeValue::string("four".to_owned()).validate_attribute(system)?;
+    let oversized =
+        CandidateAttributeValue::string("fives".to_owned()).validate_attribute(system)?;
+    let accepted = AttributeOccurrenceSet::from_validated(
+        AttributeNamespace::Record,
+        "key".to_owned(),
+        vec![exact.try_clone()?],
+        size_profile,
+    )?;
+    assert_eq!(
+        accepted.occurrence(0).and_then(|value| value.as_str()),
+        Some("four")
+    );
+    assert!(matches!(
+        AttributeOccurrenceSet::from_validated(
+            AttributeNamespace::Record,
+            "key".to_owned(),
+            vec![exact, oversized],
+            size_profile,
+        ),
+        Err(failure)
+            if failure.code() == DomainFailureCode::ValueLimitExceeded
+                && failure.source() == FailureSource::AttributeValue
+    ));
+
+    let (_, exact_structural_profile) =
+        profile_with_tenant_dynamic_limits(tenant_dynamic(64, 4, 2, 2, 2)?)?;
+    let exact_key_values = || {
+        CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new("four".to_owned(), CandidateAttributeValue::null()),
+            CandidateKeyValue::new("four".to_owned(), CandidateAttributeValue::null()),
+        ])
+    };
+    let exact_structural =
+        CandidateAttributeValue::array(vec![exact_key_values(), exact_key_values()])
+            .validate_attribute(system)?;
+    let accepted = AttributeOccurrenceSet::from_validated(
+        AttributeNamespace::Record,
+        "four".to_owned(),
+        vec![exact_structural],
+        exact_structural_profile,
+    )?;
+    assert_eq!(
+        accepted.occurrence(0).map(|value| value.kind()),
+        Some(AttributeValueKind::Array)
+    );
+
+    let nested = CandidateAttributeValue::array(vec![CandidateAttributeValue::array(vec![
+        CandidateAttributeValue::null(),
+    ])])
+    .validate_attribute(system)?;
+    let array = CandidateAttributeValue::array(vec![
+        CandidateAttributeValue::null(),
+        CandidateAttributeValue::null(),
+        CandidateAttributeValue::null(),
+    ])
+    .validate_attribute(system)?;
+    let key_value = CandidateAttributeValue::key_value_list(vec![
+        CandidateKeyValue::new("a".to_owned(), CandidateAttributeValue::null()),
+        CandidateKeyValue::new("b".to_owned(), CandidateAttributeValue::null()),
+        CandidateKeyValue::new("c".to_owned(), CandidateAttributeValue::null()),
+    ])
+    .validate_attribute(system)?;
+    let nested_key = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+        "abcde".to_owned(),
+        CandidateAttributeValue::null(),
+    )])
+    .validate_attribute(system)?;
+
+    for (value, profile) in [
+        (
+            nested,
+            profile_with_tenant_dynamic_limits(tenant_dynamic(64, 16, 1, 4, 4)?)?.1,
+        ),
+        (
+            array,
+            profile_with_tenant_dynamic_limits(tenant_dynamic(64, 16, 4, 2, 4)?)?.1,
+        ),
+        (
+            key_value,
+            profile_with_tenant_dynamic_limits(tenant_dynamic(64, 16, 4, 4, 2)?)?.1,
+        ),
+        (
+            nested_key,
+            profile_with_tenant_dynamic_limits(tenant_dynamic(64, 4, 4, 4, 4)?)?.1,
+        ),
+    ] {
+        assert!(matches!(
+            AttributeOccurrenceSet::from_validated(
+                AttributeNamespace::Record,
+                "key".to_owned(),
+                vec![value],
+                profile,
+            ),
+            Err(failure)
+                if failure.code() == DomainFailureCode::ValueLimitExceeded
+                    && failure.source() == FailureSource::AttributeValue
+        ));
+    }
     Ok(())
 }
 
