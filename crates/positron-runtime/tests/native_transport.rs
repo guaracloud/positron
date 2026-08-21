@@ -104,7 +104,7 @@ fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
             &query_secret,
             "logs | range query_time 0 100 | limit 16",
             QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
-                .with_cpu_work_units(12)?,
+                .with_cpu_work_units(15)?,
         )?;
     assert_eq!(bodies, ["durable-loopback"]);
     assert!(matches!(

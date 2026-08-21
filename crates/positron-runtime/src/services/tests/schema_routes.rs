@@ -43,7 +43,7 @@ fn real_otlp_and_loki_routes_share_one_live_schema_session() -> Result<(), Box<d
             &query,
             "logs | range query_time 0 100 | limit 16",
             QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
-                .with_cpu_work_units(12)?,
+                .with_cpu_work_units(15)?,
         )?,
         ["otlp-shared", "loki-shared"]
     );

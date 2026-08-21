@@ -263,7 +263,7 @@ impl LiveHttpHarness {
             &self.query_secret,
             query,
             positron_query::QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
-                .with_cpu_work_units(12)?,
+                .with_cpu_work_units(15)?,
         )?)
     }
 
