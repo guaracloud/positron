@@ -4,18 +4,40 @@ use crate::{
     LogicalPlan, QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis,
 };
 
-use super::failure::map_domain_value_failure;
-
 pub(crate) fn query_record(
-    record: &positron_signals::ScannedLogRecord,
-    plan: &LogicalPlan,
+    service: &crate::QueryService<'_, '_, '_>,
+    state: &mut crate::cursor::CursorState,
+    record: &mut positron_signals::ScannedLogRecord,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<Option<QueryRecord>, QueryFailure> {
-    if let Some(filter) = plan.filter() {
+    if let Some(filter) = state.plan.filter() {
         let matched = match filter {
-            crate::plan::FilterPredicate::BodyEquals(expected) => record.body() == Some(expected),
+            crate::plan::FilterPredicate::BodyEquals(expected) => match record.body() {
+                Some(value) => {
+                    let mut observer = super::QueryValueObserver::new(
+                        service,
+                        &mut state.cpu_work_units,
+                        state.budget.cpu_work_units(),
+                        state.cancellation.clone(),
+                        crate::QueryWorkStage::Operators,
+                    );
+                    value
+                        .equals_observed(expected, &mut observer)
+                        .map_err(super::map_observed_failure)?
+                },
+                None => false,
+            },
             crate::plan::FilterPredicate::AttributeEquals(query) => {
-                query.matches_stored_record(record.stored())
+                let mut observer = super::QueryValueObserver::new(
+                    service,
+                    &mut state.cpu_work_units,
+                    state.budget.cpu_work_units(),
+                    state.cancellation.clone(),
+                    crate::QueryWorkStage::Operators,
+                );
+                query
+                    .matches_stored_record_observed(record.stored(), &mut observer)
+                    .map_err(super::map_observed_failure)?
             },
         };
         if !matched {
@@ -30,6 +52,7 @@ pub(crate) fn query_record(
         IngestTimeCandidate::new(ingest_time.instant()),
     );
     let event_time = record.event_time();
+    let plan: &LogicalPlan = &state.plan;
     let Some(ordering_time) = (match plan.temporal_axis() {
         TemporalAxis::QueryTime => Some(query_time.instant()),
         TemporalAxis::EventTime => event_time.instant(),
@@ -45,20 +68,26 @@ pub(crate) fn query_record(
         .map(crate::plan::AggregateSpec::group_by)
         .unwrap_or_else(|| plan.projection());
     let body_selected = selected_columns.contains(&crate::plan::ProjectionColumn::Body);
-    let (attributes, attribute_retained_bytes) =
-        project_attributes(record.stored(), selected_columns, memory)?;
+    let query_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime);
+    let event_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::EventTime);
+    let ingest_time_selected =
+        selected_columns.contains(&crate::plan::ProjectionColumn::IngestTime);
+    let commit_position_selected =
+        selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition);
+    let cancellation = state.cancellation.clone();
+    let cpu_limit = state.budget.cpu_work_units();
+    let (attributes, attribute_retained_bytes) = project_attributes(
+        record.stored(),
+        selected_columns,
+        service,
+        &mut state.cpu_work_units,
+        cpu_limit,
+        cancellation.clone(),
+        memory,
+    )?;
     let (body, body_retained_bytes) = if body_selected {
-        match record
-            .body()
-            .map(|body| try_retained_value(body, memory))
-            .transpose()
-        {
-            Ok(value) => value.map_or((None, 0), |(body, bytes)| (Some(body), bytes)),
-            Err(failure) => {
-                memory.release(attribute_retained_bytes)?;
-                return Err(failure);
-            },
-        }
+        let retained = record.body_retained_bytes();
+        (record.take_body(), retained)
     } else {
         (None, 0)
     };
@@ -75,11 +104,10 @@ pub(crate) fn query_record(
         record.record_ordinal(),
         crate::stream::QueryRecordSelection {
             body: body_selected,
-            query_time: selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
-            event_time: selected_columns.contains(&crate::plan::ProjectionColumn::EventTime),
-            ingest_time: selected_columns.contains(&crate::plan::ProjectionColumn::IngestTime),
-            commit_position: selected_columns
-                .contains(&crate::plan::ProjectionColumn::CommitPosition),
+            query_time: query_time_selected,
+            event_time: event_time_selected,
+            ingest_time: ingest_time_selected,
+            commit_position: commit_position_selected,
             attributes,
             attribute_retained_bytes,
         },
@@ -89,6 +117,10 @@ pub(crate) fn query_record(
 fn project_attributes(
     record: &positron_signals::StoredLogRecord,
     columns: &[crate::plan::ProjectionColumn],
+    service: &crate::QueryService<'_, '_, '_>,
+    cpu_work_units: &mut u64,
+    cpu_limit: u64,
+    cancellation: crate::QueryCancellation,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<(Vec<crate::stream::AttributeProjection>, u64), QueryFailure> {
     const ATTRIBUTE_PROJECTION_SLOT_BYTES: u64 = 64;
@@ -112,13 +144,21 @@ fn project_attributes(
             values.push(crate::stream::AttributeProjection::Intrinsic);
             continue;
         };
-        let estimated = match record.projected_attribute_retained_bytes(path) {
-            Ok(value) => value,
-            Err(failure) => {
-                memory.release(retained)?;
-                return Err(map_schema_failure(failure));
-            },
-        };
+        let mut observer = super::QueryValueObserver::new(
+            service,
+            cpu_work_units,
+            cpu_limit,
+            cancellation.clone(),
+            crate::QueryWorkStage::Operators,
+        );
+        let estimated =
+            match record.projected_attribute_retained_bytes_observed(path, &mut observer) {
+                Ok(value) => value,
+                Err(failure) => {
+                    memory.release(retained)?;
+                    return Err(map_schema_traversal_failure(failure));
+                },
+            };
         let bytes = match estimated.map(u64::try_from).transpose() {
             Ok(value) => value.unwrap_or(0),
             Err(_) => {
@@ -142,11 +182,18 @@ fn project_attributes(
                 ));
             },
         };
-        match record.project_attribute(path) {
+        let mut observer = super::QueryValueObserver::new(
+            service,
+            cpu_work_units,
+            cpu_limit,
+            cancellation.clone(),
+            crate::QueryWorkStage::Operators,
+        );
+        match record.project_attribute_observed(path, &mut observer) {
             Ok(value) => values.push(crate::stream::AttributeProjection::Attribute(value)),
             Err(failure) => {
                 memory.release(retained)?;
-                return Err(map_schema_failure(failure));
+                return Err(map_schema_traversal_failure(failure));
             },
         }
     }
@@ -165,22 +212,13 @@ fn map_schema_failure(failure: positron_signals::SchemaFailure) -> QueryFailure 
     }
 }
 
-fn try_retained_value(
-    value: &positron_domain::value::ValidatedAttributeValue,
-    memory: &mut crate::memory::QueryMemory,
-) -> Result<(positron_domain::value::ValidatedAttributeValue, u64), QueryFailure> {
-    let bytes = u64::try_from(
-        value
-            .retained_heap_bytes()
-            .map_err(map_domain_value_failure)?,
-    )
-    .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
-    memory.acquire(bytes)?;
-    match value.try_clone() {
-        Ok(retained) => Ok((retained, bytes)),
-        Err(failure) => {
-            memory.release(bytes)?;
-            Err(map_domain_value_failure(failure))
+fn map_schema_traversal_failure(
+    failure: positron_signals::SchemaTraversalFailure<QueryFailure>,
+) -> QueryFailure {
+    match failure {
+        positron_signals::SchemaTraversalFailure::Schema(failure) => map_schema_failure(failure),
+        positron_signals::SchemaTraversalFailure::Value(failure) => {
+            super::map_observed_failure(failure)
         },
     }
 }

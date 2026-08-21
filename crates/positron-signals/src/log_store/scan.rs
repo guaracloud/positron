@@ -131,6 +131,12 @@ impl<'kernel> LogScanResult<'kernel> {
         &self.records
     }
 
+    /// Consumes the scan container and transfers ownership of its verified records.
+    #[must_use]
+    pub fn into_records(self) -> Vec<ScannedLogRecord> {
+        self.records
+    }
+
     #[must_use]
     pub const fn complete(&self) -> bool {
         self.complete
@@ -163,6 +169,7 @@ pub struct ScannedLogRecord {
     record: StoredLogRecord,
     commit_position: CommitPosition,
     record_ordinal: RecordOrdinal,
+    body_retained_bytes: u64,
 }
 
 impl ScannedLogRecord {
@@ -175,12 +182,28 @@ impl ScannedLogRecord {
             record,
             commit_position,
             record_ordinal,
+            body_retained_bytes: 0,
         }
     }
 
     #[must_use]
     pub const fn stored(&self) -> &StoredLogRecord {
         &self.record
+    }
+
+    /// Transfers the optional native body out of this query-owned scan record.
+    pub fn take_body(&mut self) -> Option<positron_domain::value::ValidatedAttributeValue> {
+        self.record.take_body()
+    }
+
+    /// Returns the scan-accounted heap bytes transferred with the native body.
+    #[must_use]
+    pub const fn body_retained_bytes(&self) -> u64 {
+        self.body_retained_bytes
+    }
+
+    pub(super) fn set_body_retained_bytes(&mut self, bytes: u64) {
+        self.body_retained_bytes = bytes;
     }
 
     #[must_use]

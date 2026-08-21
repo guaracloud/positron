@@ -1,29 +1,37 @@
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord};
 
+#[cfg(test)]
 use super::failure::map_domain_value_failure;
 use super::vocabulary::{query_time_provenance_tag, source_time_quality_tag};
 
 const DIGEST_STATE_BYTES: u64 = 256;
-const DIGEST_CHUNK_BYTES: usize = 1_024;
+
+pub(crate) struct BatchDigestInput<'a, O> {
+    pub(crate) prior: [u8; 32],
+    pub(crate) sequence: u64,
+    pub(crate) plan: &'a LogicalPlan,
+    pub(crate) records: &'a [QueryRecord],
+    pub(crate) cancellation: &'a crate::QueryCancellation,
+    pub(crate) observer: &'a mut O,
+}
 
 pub(crate) fn batch_digest(
     protector: &positron_kernel::ControlTokenProtector<'_>,
-    prior: [u8; 32],
-    sequence: u64,
-    plan: &LogicalPlan,
-    records: &[QueryRecord],
-    cancellation: &crate::QueryCancellation,
+    input: BatchDigestInput<
+        '_,
+        impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
+    >,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<[u8; 32], QueryFailure> {
     memory.acquire(DIGEST_STATE_BYTES)?;
     let result = batch_digest_with_acquired_state(
         protector,
-        prior,
-        sequence,
-        plan,
-        records,
-        cancellation,
-        memory,
+        input.prior,
+        input.sequence,
+        input.plan,
+        input.records,
+        input.cancellation,
+        input.observer,
     );
     memory.release(DIGEST_STATE_BYTES)?;
     result
@@ -36,7 +44,7 @@ fn batch_digest_with_acquired_state(
     plan: &LogicalPlan,
     records: &[QueryRecord],
     cancellation: &crate::QueryCancellation,
-    memory: &mut crate::memory::QueryMemory,
+    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
 ) -> Result<[u8; 32], QueryFailure> {
     check_digest_cancellation(cancellation)?;
     let mut digest = protector
@@ -44,7 +52,7 @@ fn batch_digest_with_acquired_state(
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
     digest.update(&prior);
     digest.update(&sequence.to_be_bytes());
-    update_result_contract_digest(&mut digest, plan, cancellation, memory)?;
+    update_result_contract_digest(&mut digest, plan, cancellation)?;
     digest.update(
         &u64::try_from(records.len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
@@ -58,7 +66,7 @@ fn batch_digest_with_acquired_state(
         digest.update(&ordinal.value().to_be_bytes());
         digest.update(&[u8::from(record.body_value().is_some())]);
         if let Some(body) = record.body_value() {
-            update_native_value_digest(&mut digest, body, cancellation, memory)?;
+            update_native_value_digest(&mut digest, body, observer)?;
         }
         digest.update(&[u8::from(record.query_time_selected())]);
         if record.query_time_selected() {
@@ -96,7 +104,7 @@ fn batch_digest_with_acquired_state(
             };
             digest.update(&[u8::from(value.is_some())]);
             if let Some(value) = value {
-                update_occurrence_set_digest(&mut digest, value, cancellation, memory)?;
+                update_occurrence_set_digest(&mut digest, value, observer)?;
             }
         }
     }
@@ -110,76 +118,29 @@ fn update_result_contract_digest(
     digest: &mut positron_kernel::QueryResultDigest,
     plan: &LogicalPlan,
     cancellation: &crate::QueryCancellation,
-    memory: &mut crate::memory::QueryMemory,
 ) -> Result<(), QueryFailure> {
     check_digest_cancellation(cancellation)?;
-    let _ = memory;
     encode_result_contract(digest, plan, cancellation)
 }
 
 fn update_native_value_digest(
     digest: &mut positron_kernel::QueryResultDigest,
     value: &positron_domain::value::ValidatedAttributeValue,
-    cancellation: &crate::QueryCancellation,
-    memory: &mut crate::memory::QueryMemory,
+    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
 ) -> Result<(), QueryFailure> {
-    check_digest_cancellation(cancellation)?;
-    let encoded_bytes = value
-        .canonical_encoded_size_bytes()
-        .map_err(map_domain_value_failure)?;
-    let memory_bytes =
-        u64::try_from(encoded_bytes).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    memory.acquire(memory_bytes)?;
-    let mut encoding = Vec::new();
-    if encoding.try_reserve_exact(encoded_bytes).is_err() {
-        memory.release(memory_bytes)?;
-        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-    }
-    if let Err(failure) = value.append_canonical_encoding(&mut encoding) {
-        drop(encoding);
-        memory.release(memory_bytes)?;
-        return Err(map_domain_value_failure(failure));
-    }
-    for chunk in encoding.chunks(DIGEST_CHUNK_BYTES) {
-        check_digest_cancellation(cancellation)?;
-        digest.update(chunk);
-    }
-    drop(encoding);
-    memory.release(memory_bytes)?;
-    Ok(())
+    value
+        .visit_canonical_encoding_observed(observer, &mut |chunk| digest.update(chunk))
+        .map_err(super::map_observed_failure)
 }
 
 fn update_occurrence_set_digest(
     digest: &mut positron_kernel::QueryResultDigest,
     value: &positron_domain::value::AttributeOccurrenceSet,
-    cancellation: &crate::QueryCancellation,
-    memory: &mut crate::memory::QueryMemory,
+    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
 ) -> Result<(), QueryFailure> {
-    digest.update(&[match value.namespace() {
-        positron_domain::value::AttributeNamespace::Stream => 0,
-        positron_domain::value::AttributeNamespace::Resource => 1,
-        positron_domain::value::AttributeNamespace::InstrumentationScope => 2,
-        positron_domain::value::AttributeNamespace::Record => 3,
-    }]);
-    digest.update(
-        &u64::try_from(value.key().len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
-            .to_be_bytes(),
-    );
-    digest.update(value.key().as_bytes());
-    digest.update(
-        &u64::try_from(value.len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
-            .to_be_bytes(),
-    );
-    for index in 0..value.len() {
-        check_digest_cancellation(cancellation)?;
-        let occurrence = value
-            .occurrence(index)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        update_native_value_digest(digest, occurrence, cancellation, memory)?;
-    }
-    Ok(())
+    value
+        .visit_canonical_encoding_observed(observer, &mut |chunk| digest.update(chunk))
+        .map_err(super::map_observed_failure)
 }
 
 fn check_digest_cancellation(cancellation: &crate::QueryCancellation) -> Result<(), QueryFailure> {

@@ -2,6 +2,9 @@ use positron_domain::value::{AttributeOccurrenceSet, AttributeValueKind, Validat
 
 use super::{SchemaCatalog, SchemaFailure, SchemaObservation, SchemaPath, SchemaRepresentation};
 
+mod traversal;
+pub(crate) use traversal::{matches_observed, visit_terminals, visit_terminals_observed};
+
 /// Explicit selection semantics for repeated attribute occurrences.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OccurrenceSelector {
@@ -175,7 +178,7 @@ pub struct SchemaQuery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum QueryValue {
+pub(super) enum QueryValue {
     Scalar(SchemaValue),
     Native(ValidatedAttributeValue),
 }
@@ -324,7 +327,7 @@ impl<'a> SelectionState<'a> {
             return true;
         }
         self.selected = self.selected.saturating_add(1);
-        let matches = value_matches(value, self.expected);
+        let matches = traversal::value_matches(value, self.expected);
         match self.selector {
             OccurrenceSelector::Index(_) => {
                 self.matched = matches;
@@ -347,48 +350,5 @@ impl<'a> SelectionState<'a> {
     }
     const fn matched(&self) -> bool {
         self.selected > 0 && self.matched
-    }
-}
-
-pub(super) fn visit_terminals(
-    value: &ValidatedAttributeValue,
-    segments: &[String],
-    visit: &mut impl FnMut(&ValidatedAttributeValue) -> bool,
-) -> bool {
-    let Some((segment, remaining)) = segments.split_first() else {
-        return visit(value);
-    };
-    let Some(count) = value.key_value_list_len() else {
-        return true;
-    };
-    for index in 0..count {
-        if let Some(entry) = value.key_value_entry(index)
-            && entry.key() == segment
-            && !visit_terminals(entry.value(), remaining, visit)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn value_matches(value: &ValidatedAttributeValue, expected: &QueryValue) -> bool {
-    match expected {
-        QueryValue::Scalar(SchemaValue::Null) => value.is_null(),
-        QueryValue::Scalar(SchemaValue::Boolean(expected)) => value.as_boolean() == Some(*expected),
-        QueryValue::Scalar(SchemaValue::SignedInteger(expected)) => {
-            value.as_signed_integer() == Some(*expected)
-        },
-        QueryValue::Scalar(SchemaValue::FloatingPointBits(expected)) => {
-            value.as_floating_point_bits() == Some(*expected)
-        },
-        QueryValue::Scalar(SchemaValue::String(expected)) => {
-            value.as_str() == Some(expected.as_str())
-        },
-        QueryValue::Scalar(SchemaValue::Bytes(expected)) => {
-            value.as_bytes() == Some(expected.as_slice())
-        },
-        QueryValue::Scalar(SchemaValue::Kind(expected)) => value.kind() == *expected,
-        QueryValue::Native(expected) => value == expected,
     }
 }

@@ -83,6 +83,10 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    pub(in crate::log_store) fn take_body(&mut self) -> Option<ValidatedAttributeValue> {
+        self.body.take()
+    }
+
     /// Applies the Log Store's authoritative semantic Value Limits to a
     /// receiver-native candidate after Ingest Policy evaluation.
     #[cfg(test)]
@@ -338,6 +342,10 @@ impl StoredLogRecord {
     #[must_use]
     pub const fn body(&self) -> Option<&ValidatedAttributeValue> {
         self.record.body()
+    }
+
+    pub(in crate::log_store) fn take_body(&mut self) -> Option<ValidatedAttributeValue> {
+        self.record.take_body()
     }
 
     #[must_use]

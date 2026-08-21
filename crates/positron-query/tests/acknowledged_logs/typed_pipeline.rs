@@ -1647,26 +1647,26 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(3)?,
+        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(6)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.cpu_work_units() == 3
+            if stats.cpu_work_units() == 6
     ));
 
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(2)?,
+        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(5)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(matches!(
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 3
+                && incomplete.stats().cpu_work_units() == 6
     ));
     assert!(
         !exhausted_events
@@ -1690,7 +1690,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_688, true), (1_687, false)] {
+    for (memory_bytes, expected_complete) in [(1_676, true), (1_675, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -1717,7 +1717,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(3_374, true), (3_373, false)] {
+    for (memory_bytes, expected_complete) in [(3_351, true), (3_350, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
@@ -2055,19 +2055,19 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(17)?,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(20)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.cpu_work_units() == 17
+            if stats.cpu_work_units() == 20
     ));
 
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(19)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -2079,7 +2079,7 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 17
+                && incomplete.stats().cpu_work_units() == 20
                 && incomplete.stats().limiting_budget()
                     == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
     ));
@@ -2170,6 +2170,410 @@ fn cancellation_is_polled_during_native_group_key_construction() -> Result<(), B
         !events
             .iter()
             .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn deep_native_predicate_work_exhausts_before_any_result_prefix() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("deep-native-predicate-work")?;
+    let mut body = CandidateAttributeValue::null();
+    let mut literal = "null".to_owned();
+    for _ in 0..8 {
+        body = CandidateAttributeValue::array(vec![body]);
+        literal = format!("array({literal})");
+    }
+    fixture.kernel.append_log_bodies(vec![Some(body)], 20, 1)?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let source = format!(
+        "pipeline:v1 logs | range query_time -100 100 | filter body == {literal} | limit 1"
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        &source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn deep_native_body_projection_defers_recursive_work_to_output() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("deep-native-projection-work")?;
+    let mut body = CandidateAttributeValue::null();
+    for _ in 0..8 {
+        body = CandidateAttributeValue::array(vec![body]);
+    }
+    fixture.kernel.append_log_bodies(vec![Some(body)], 20, 1)?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn deep_native_output_and_digest_share_the_cumulative_cpu_budget() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("deep-native-output-work")?;
+    let mut body = CandidateAttributeValue::null();
+    for _ in 0..8 {
+        body = CandidateAttributeValue::array(vec![body]);
+    }
+    fixture.kernel.append_log_bodies(vec![Some(body)], 20, 1)?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(9)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn deep_native_digest_traversal_is_cumulatively_metered() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("deep-native-digest-work")?;
+    let mut body = CandidateAttributeValue::null();
+    for _ in 0..8 {
+        body = CandidateAttributeValue::array(vec![body]);
+    }
+    fixture.kernel.append_log_bodies(vec![Some(body)], 20, 1)?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let source = "pipeline:v1 logs | range query_time -100 100 | project body | limit 1";
+    let query = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(18)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+
+    let exact = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(19)?,
+    )?;
+    let exact_events = service.execute(exact)?.collect::<Vec<_>>();
+    assert!(
+        exact_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        exact_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.cpu_work_units() == 19 && stats.records() == 1
+    ));
+    Ok(())
+}
+
+#[test]
+fn cancellation_interrupts_deep_native_digest_before_batch_delivery() -> Result<(), Box<dyn Error>>
+{
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("deep-native-digest-cancel")?;
+    let mut body = CandidateAttributeValue::null();
+    for _ in 0..8 {
+        body = CandidateAttributeValue::array(vec![body]);
+    }
+    fixture.kernel.append_log_bodies(vec![Some(body)], 20, 1)?;
+    let meter =
+        CancellingOperatorCallMeter::shared_for_stage(positron_query::QueryWorkStage::Output, 14);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let before = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?,
+    )?;
+    meter.bind(query.cancellation())?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn deep_attribute_path_projection_is_cumulatively_metered() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
+    use positron_policy::NativeLogAttribute;
+
+    let fixture = QueryFixture::new("deep-attribute-projection-work")?;
+    let mut value = CandidateAttributeValue::null();
+    let mut path = r#"record["payload"]"#.to_owned();
+    for index in (0..8).rev() {
+        let key = format!("k{index}");
+        value = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            key.clone(),
+            value,
+        )]);
+    }
+    for index in 0..8 {
+        path.push_str(&format!(r#"["k{index}"]"#));
+    }
+    fixture.kernel.append_attribute_logs(
+        vec![(
+            Some(20),
+            vec![NativeLogAttribute::new(
+                AttributeNamespace::Record,
+                "payload".to_owned(),
+                vec![value],
+            )],
+        )],
+        1,
+    )?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let source = format!("pipeline:v1 logs | range query_time -100 100 | project {path} | limit 1");
+    let query = service.plan_pipeline(
+        fixture.context,
+        &source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(93)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 0
+                && incomplete.stats().cpu_work_units() == 94
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+
+    let exact = service.plan_pipeline(
+        fixture.context,
+        &source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(94)?,
+    )?;
+    let exact_events = service.execute(exact)?.collect::<Vec<_>>();
+    let Some(QueryEvent::Terminal(QueryTerminal::Complete(stats))) = exact_events.last() else {
+        return Err("deep attribute projection did not complete".into());
+    };
+    assert_eq!(stats.cpu_work_units(), 94);
+    assert_eq!(stats.records(), 1);
+    Ok(())
+}
+
+#[test]
+fn cancellation_interrupts_deep_attribute_projection_before_allocation_delivery()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
+    use positron_policy::NativeLogAttribute;
+
+    let fixture = QueryFixture::new("deep-attribute-projection-cancel")?;
+    let mut value = CandidateAttributeValue::null();
+    let mut path = r#"record["payload"]"#.to_owned();
+    for index in (0..8).rev() {
+        let key = format!("k{index}");
+        value = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            key.clone(),
+            value,
+        )]);
+    }
+    for index in 0..8 {
+        path.push_str(&format!(r#"["k{index}"]"#));
+    }
+    fixture.kernel.append_attribute_logs(
+        vec![(
+            Some(20),
+            vec![NativeLogAttribute::new(
+                AttributeNamespace::Record,
+                "payload".to_owned(),
+                vec![value],
+            )],
+        )],
+        1,
+    )?;
+    let meter = CancellingOperatorCallMeter::shared(20);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let before = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let source = format!("pipeline:v1 logs | range query_time -100 100 | project {path} | limit 1");
+    let query = service.plan_pipeline(
+        fixture.context,
+        &source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?,
+    )?;
+    meter.bind(query.cancellation())?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        before
     );
     Ok(())
 }
@@ -2306,7 +2710,7 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
         );
         let query = service.plan_pipeline(
             fixture.context,
-            "pipeline:v1 logs | range query_time -100 100 | project query_time | limit 1",
+            "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
             QueryBudget::new(1_048_576, 1, 1, 8, 1_048_576, 60)?,
         )?;
         meter.bind(query.cancellation())?;

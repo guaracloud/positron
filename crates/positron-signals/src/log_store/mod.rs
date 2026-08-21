@@ -34,7 +34,8 @@ pub use schema::{
     SchemaCheckpointFrontier, SchemaDelta, SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry,
     SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
     SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
-    SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaValue,
+    SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaTraversalFailure,
+    SchemaValue,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
@@ -326,7 +327,7 @@ impl LogStore {
             }
         }
         check_scan_cancellation(cancellation)?;
-        let retained_size_bytes = retained_scan_bytes(scan.limit(), &records)?;
+        let retained_size_bytes = retained_scan_bytes(scan.limit(), &mut records)?;
         Ok(LogScanResult::new(
             records,
             complete,
@@ -342,15 +343,17 @@ const SCANNED_RECORD_SLOT_BYTES: u64 = 512;
 
 pub(super) fn retained_scan_bytes(
     limit: ScanLimit,
-    records: &[ScannedLogRecord],
+    records: &mut [ScannedLogRecord],
 ) -> Result<u64, LogStoreFailure> {
     let slots = u64::try_from(limit.value())
         .map_err(|_| LogStoreFailure::limit_exceeded())?
         .checked_mul(SCANNED_RECORD_SLOT_BYTES)
         .ok_or_else(LogStoreFailure::limit_exceeded)?;
-    records.iter().try_fold(slots, |total, record| {
+    records.iter_mut().try_fold(slots, |total, record| {
+        let retained = record.stored().retained_dynamic_bytes()?;
+        record.set_body_retained_bytes(retained.body_heap);
         total
-            .checked_add(record.stored().retained_dynamic_bytes()?)
+            .checked_add(retained.total)
             .ok_or_else(LogStoreFailure::limit_exceeded)
     })
 }

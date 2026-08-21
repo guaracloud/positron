@@ -15,7 +15,9 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
 ) -> Result<crate::memory::RecordBuffer, QueryFailure> {
     let operator_count = state.plan.operator_count();
     let mut records = crate::memory::RecordBuffer::allocate(scanned.records().len(), memory)?;
-    for record in scanned.records() {
+    let scanned_retained_bytes = scanned.retained_size_bytes();
+    let mut transferred_body_bytes = 0_u64;
+    for mut record in scanned.into_records() {
         check_cancellation(state)?;
         if operator_count > 0 {
             let operator_units = service
@@ -32,13 +34,18 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
                 ));
             }
         }
-        if let Some(record) = query_record(record, &state.plan, memory)? {
+        if let Some(record) = query_record(service, state, &mut record, memory)? {
             let dynamic_bytes = record.retained_dynamic_bytes()?;
+            transferred_body_bytes = transferred_body_bytes
+                .checked_add(record.body_retained_bytes())
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
             records.push_acquired(record, dynamic_bytes)?;
         }
     }
-    memory.release(scanned.retained_size_bytes())?;
-    drop(scanned);
+    let released_scan_bytes = scanned_retained_bytes
+        .checked_sub(transferred_body_bytes)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+    memory.release(released_scan_bytes)?;
 
     if let Some(aggregate) = state.plan.aggregate().cloned() {
         return aggregate_records(service, state, records, &aggregate, memory);

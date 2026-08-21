@@ -15,7 +15,7 @@ pub use log_store::{
     SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry, SchemaFailure, SchemaObservation,
     SchemaPath, SchemaPathDigest, SchemaPathSummary, SchemaPromotionDecision,
     SchemaPromotionReason, SchemaQuery, SchemaQueryResult, SchemaQueryUpdate, SchemaRepresentation,
-    SchemaSessionStore, SchemaValue, StoredLogAttribute, StoredLogRecord,
+    SchemaSessionStore, SchemaTraversalFailure, SchemaValue, StoredLogAttribute, StoredLogRecord,
 };
 
 #[cfg(fuzzing)]

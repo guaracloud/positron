@@ -22,28 +22,10 @@ impl PartialOrd for ValidatedKeyValue {
 impl ValidatedAttributeValue {
     /// Returns the bounded canonical logical encoding length used for output and digests.
     pub fn canonical_encoded_size_bytes(&self) -> Result<usize, DomainFailure> {
-        match &self.inner {
-            ValidatedAttributeValueInner::Null => Ok(1),
-            ValidatedAttributeValueInner::Boolean(_) => Ok(2),
-            ValidatedAttributeValueInner::SignedInteger(_)
-            | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(9),
-            ValidatedAttributeValueInner::String(value) => canonical_sequence_size(value.len()),
-            ValidatedAttributeValueInner::Bytes(value) => canonical_sequence_size(value.len()),
-            ValidatedAttributeValueInner::Array(values) => values
-                .iter()
-                .try_fold(canonical_prefix_size(values.len())?, |total, value| {
-                    checked_decoded_add(total, value.canonical_encoded_size_bytes()?)
-                }),
-            ValidatedAttributeValueInner::KeyValueList(values) => {
-                values
-                    .iter()
-                    .try_fold(canonical_prefix_size(values.len())?, |total, entry| {
-                        let total = checked_decoded_add(total, 8)?;
-                        let total = checked_decoded_add(total, entry.key.len())?;
-                        checked_decoded_add(total, entry.value.canonical_encoded_size_bytes()?)
-                    })
-            },
-        }
+        let mut observer = super::observed::UnobservedNativeValue;
+        super::observed::remove_observation(
+            self.canonical_encoded_size_bytes_observed(&mut observer),
+        )
     }
 
     /// Appends one self-delimiting canonical logical value without changing its native type.
@@ -52,8 +34,12 @@ impl ValidatedAttributeValue {
         output
             .try_reserve_exact(encoded)
             .map_err(|_| DomainFailure::allocation_unavailable())?;
-        self.append_canonical_encoding_reserved(output)?;
-        Ok(())
+        let mut observer = super::observed::UnobservedNativeValue;
+        super::observed::remove_observation(
+            self.visit_canonical_encoding_observed(&mut observer, &mut |bytes| {
+                output.extend_from_slice(bytes)
+            }),
+        )
     }
 
     /// Returns the bounded length of the order-preserving comparison encoding.
@@ -180,54 +166,6 @@ impl ValidatedAttributeValue {
             },
         }
     }
-
-    fn append_canonical_encoding_reserved(
-        &self,
-        output: &mut Vec<u8>,
-    ) -> Result<(), DomainFailure> {
-        match &self.inner {
-            ValidatedAttributeValueInner::Null => output.push(0),
-            ValidatedAttributeValueInner::Boolean(value) => {
-                output.push(1);
-                output.push(u8::from(*value));
-            },
-            ValidatedAttributeValueInner::SignedInteger(value) => {
-                output.push(2);
-                output.extend_from_slice(&value.to_be_bytes());
-            },
-            ValidatedAttributeValueInner::FloatingPointBits(value) => {
-                output.push(3);
-                output.extend_from_slice(&value.to_be_bytes());
-            },
-            ValidatedAttributeValueInner::String(value) => {
-                output.push(4);
-                append_length(output, value.len())?;
-                output.extend_from_slice(value.as_bytes());
-            },
-            ValidatedAttributeValueInner::Bytes(value) => {
-                output.push(5);
-                append_length(output, value.len())?;
-                output.extend_from_slice(value);
-            },
-            ValidatedAttributeValueInner::Array(values) => {
-                output.push(6);
-                append_length(output, values.len())?;
-                for value in values {
-                    value.append_canonical_encoding_reserved(output)?;
-                }
-            },
-            ValidatedAttributeValueInner::KeyValueList(values) => {
-                output.push(7);
-                append_length(output, values.len())?;
-                for entry in values {
-                    append_length(output, entry.key.len())?;
-                    output.extend_from_slice(entry.key.as_bytes());
-                    entry.value.append_canonical_encoding_reserved(output)?;
-                }
-            },
-        }
-        Ok(())
-    }
 }
 
 impl Ord for ValidatedAttributeValue {
@@ -294,19 +232,4 @@ pub(super) fn visit_comparison_sequence<E>(
         visit(&[1, *byte])?;
     }
     visit(&[0])
-}
-
-fn canonical_sequence_size(payload: usize) -> Result<usize, DomainFailure> {
-    checked_decoded_add(canonical_prefix_size(payload)?, payload)
-}
-
-fn canonical_prefix_size(length: usize) -> Result<usize, DomainFailure> {
-    u64::try_from(length).map_err(|_| DomainFailure::value_limit_exceeded())?;
-    Ok(9)
-}
-
-fn append_length(output: &mut Vec<u8>, length: usize) -> Result<(), DomainFailure> {
-    let length = u64::try_from(length).map_err(|_| DomainFailure::value_limit_exceeded())?;
-    output.extend_from_slice(&length.to_be_bytes());
-    Ok(())
 }

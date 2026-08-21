@@ -369,15 +369,16 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
     };
     after_batch.cancel()?;
     assert!(after_batch_cancellation.is_cancelled());
+    let cancelled_terminal = after_batch.next();
     assert!(matches!(
-        after_batch.next(),
+        cancelled_terminal,
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::Cancelled
                 && incomplete.stats().records() == 1
                 && incomplete.stats().scanned_bytes() > 0
                 && incomplete.stats().decoded_records() == 2
                 && incomplete.stats().output_bytes() == u64::try_from(output_bytes)?
-                && incomplete.stats().cpu_work_units() == 3
+                && incomplete.stats().cpu_work_units() == 4
                 && incomplete.stats().wall_seconds() == 0
                 && incomplete.stats().last_sequence() == Some(0)
                 && incomplete.stats().result_digest() == digest

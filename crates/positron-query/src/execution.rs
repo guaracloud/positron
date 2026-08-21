@@ -4,7 +4,7 @@ use positron_signals::{LogScan, LogStore, ScanLimit};
 use crate::cursor::{self, CursorState};
 use crate::execution_state::{commit_position, stats_before_current, stats_with_current};
 use crate::execution_support::{
-    QueryScanObserver, batch_digest, charge_output, charge_scan, charge_work, limiting_budget,
+    BatchDigestInput, QueryScanObserver, batch_digest, charge_output, charge_scan, limiting_budget,
     map_store_failure,
 };
 use crate::{
@@ -170,8 +170,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         );
         let page = framed!(materialize_page(records, start, end, &mut memory));
         let before_batch = stats_before_current(&state);
-        let output_work = framed!(self.work_units(crate::QueryWorkStage::Output));
-        framed!(charge_work(&mut state, output_work));
         if state.cancellation.is_cancelled() {
             return self.failed_page_with_stats(
                 Some(header),
@@ -195,7 +193,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
         let mut output_state = state.clone();
-        framed!(charge_output(&mut output_state, &page, &state.cancellation,));
+        if let Err(failure) = charge_output(self, &mut output_state, &page, &state.cancellation) {
+            state.cpu_work_units = output_state.cpu_work_units;
+            return self.failed_page(Some(header), failure, &state, delivered_before, resources);
+        }
         if let Some(dimension) = limiting_budget(&output_state) {
             return self.failed_page_with_stats(
                 Some(header),
@@ -206,6 +207,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
+        state.cpu_work_units = output_state.cpu_work_units;
         if page.is_empty() {
             state = output_state;
             let stats = stats_before_current(&state);
@@ -218,13 +220,25 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
+        let digest_cancellation = state.cancellation.clone();
+        let digest_limit = state.budget.cpu_work_units();
+        let mut digest_observer = crate::execution_support::QueryValueObserver::new(
+            self,
+            &mut state.cpu_work_units,
+            digest_limit,
+            digest_cancellation.clone(),
+            crate::QueryWorkStage::Output,
+        );
         let digest = framed!(batch_digest(
             &self.ledger.control_tokens(),
-            state.prior_digest,
-            state.sequence,
-            &state.plan,
-            &page,
-            &state.cancellation,
+            BatchDigestInput {
+                prior: state.prior_digest,
+                sequence: state.sequence,
+                plan: &state.plan,
+                records: &page,
+                cancellation: &digest_cancellation,
+                observer: &mut digest_observer,
+            },
             &mut memory,
         ));
         let post_digest_expired = framed!(self.observe_state(&mut state));
@@ -239,6 +253,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         output_state.last_observed_at = state.last_observed_at;
         output_state.elapsed_wall_seconds = state.elapsed_wall_seconds;
+        output_state.cpu_work_units = state.cpu_work_units;
         state = output_state;
         let batch = QueryEvent::Batch(QueryBatch::new(
             state.sequence,

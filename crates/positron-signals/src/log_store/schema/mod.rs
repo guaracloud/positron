@@ -28,6 +28,7 @@ pub use observation::SchemaObservation;
 pub use query::{OccurrenceSelector, SchemaQuery, SchemaQueryResult, SchemaValue};
 pub use representation::SchemaRepresentation;
 pub use session::{SchemaQueryUpdate, SchemaSessionStore};
+pub use stored_query::SchemaTraversalFailure;
 
 #[cfg(test)]
 mod tests;

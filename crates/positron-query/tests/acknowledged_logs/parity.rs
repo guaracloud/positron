@@ -178,7 +178,7 @@ fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
     )?;
     assert_eq!(query.logical_plan().version(), 1);
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -214,7 +214,7 @@ fn versioned_pipeline_filters_on_an_intrinsic_body_literal() -> Result<(), Box<d
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let bodies = events

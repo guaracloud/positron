@@ -133,6 +133,41 @@ impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
 
 pub struct ConstantWorkMeter(pub u64);
 
+pub struct StageCountingWorkMeter {
+    calls: [AtomicU64; 4],
+}
+
+impl StageCountingWorkMeter {
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self {
+            calls: std::array::from_fn(|_| AtomicU64::new(0)),
+        })
+    }
+
+    pub fn calls(&self, stage: positron_query::QueryWorkStage) -> u64 {
+        self.calls[stage_index(stage)].load(Ordering::SeqCst)
+    }
+}
+
+impl positron_query::QueryWorkMeter for StageCountingWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        self.calls[stage_index(stage)].fetch_add(1, Ordering::SeqCst);
+        Ok(1)
+    }
+}
+
+const fn stage_index(stage: positron_query::QueryWorkStage) -> usize {
+    match stage {
+        positron_query::QueryWorkStage::Parse => 0,
+        positron_query::QueryWorkStage::ScanDecode => 1,
+        positron_query::QueryWorkStage::Operators => 2,
+        positron_query::QueryWorkStage::Output => 3,
+    }
+}
+
 pub struct ZeroScanWorkMeter;
 
 impl positron_query::QueryWorkMeter for ZeroScanWorkMeter {
@@ -219,6 +254,7 @@ pub struct CancellingStageWorkMeter {
 }
 
 pub struct CancellingOperatorCallMeter {
+    stage: positron_query::QueryWorkStage,
     cancel_at: u64,
     calls: AtomicU64,
     cancellation: Mutex<Option<positron_query::QueryCancellation>>,
@@ -227,6 +263,16 @@ pub struct CancellingOperatorCallMeter {
 impl CancellingOperatorCallMeter {
     pub fn shared(cancel_at: u64) -> Arc<Self> {
         Arc::new(Self {
+            stage: positron_query::QueryWorkStage::Operators,
+            cancel_at,
+            calls: AtomicU64::new(0),
+            cancellation: Mutex::new(None),
+        })
+    }
+
+    pub fn shared_for_stage(stage: positron_query::QueryWorkStage, cancel_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            stage,
             cancel_at,
             calls: AtomicU64::new(0),
             cancellation: Mutex::new(None),
@@ -251,7 +297,7 @@ impl positron_query::QueryWorkMeter for CancellingOperatorCallMeter {
         &self,
         stage: positron_query::QueryWorkStage,
     ) -> Result<u64, positron_query::QueryWorkFailure> {
-        if stage == positron_query::QueryWorkStage::Operators {
+        if stage == self.stage {
             if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_at
                 && let Some(cancellation) = self
                     .cancellation

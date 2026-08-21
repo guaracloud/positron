@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::sync::Arc;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_query::{
@@ -9,7 +10,8 @@ use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_kernel::{ResourceDimension, WorkClass};
 
 use super::support::{
-    CancellingStageWorkMeter, KernelFixture, StepClock, TemporaryRoots, TestClock, TestWorkMeter,
+    CancellingStageWorkMeter, KernelFixture, StageCountingWorkMeter, StepClock, TemporaryRoots,
+    TestClock, TestWorkMeter,
 };
 
 #[path = "budget_and_sealed/runtime_boundaries.rs"]
@@ -28,7 +30,14 @@ fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dy
     )?;
     let fixture = KernelFixture::new(instance.default_tenant_id(), "default-fitting-cpu-kernel")?;
     fixture.append_log("normal", 20, 1)?;
-    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 1);
+    let meter = StageCountingWorkMeter::shared();
+    let service = QueryService::with_runtime(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
     let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         context,
@@ -36,6 +45,10 @@ fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dy
         budget,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
+    assert_eq!(meter.calls(positron_query::QueryWorkStage::Parse), 1);
+    assert_eq!(meter.calls(positron_query::QueryWorkStage::ScanDecode), 3);
+    assert_eq!(meter.calls(positron_query::QueryWorkStage::Operators), 0);
+    assert_eq!(meter.calls(positron_query::QueryWorkStage::Output), 2);
     assert!(matches!(
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
@@ -307,7 +320,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 10)?.with_cpu_work_units(3)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 10)?.with_cpu_work_units(4)?,
     )?;
     let first = service.execute_page(planned)?.collect::<Vec<_>>();
     let cursor = match first.last() {
@@ -321,7 +334,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().records() == 1
-                && incomplete.stats().cpu_work_units() == 4
+                && incomplete.stats().cpu_work_units() == 5
                 && incomplete.stats().wall_seconds() == 2
                 && incomplete.stats().last_sequence() == Some(0)
                 && incomplete.stats().result_digest() != [0; 32]

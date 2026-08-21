@@ -9,14 +9,28 @@ const ATTRIBUTE_SLOT_BYTES: u64 = 64;
 const DYNAMIC_ENTRY_SLOT_BYTES: u64 = 32;
 
 impl StoredLogRecord {
-    pub(in crate::log_store) fn retained_dynamic_bytes(&self) -> Result<u64, LogStoreFailure> {
+    pub(in crate::log_store) fn retained_dynamic_bytes(
+        &self,
+    ) -> Result<RetainedRecordBytes, LogStoreFailure> {
         self.record.retained_dynamic_bytes()
     }
 }
 
+pub(in crate::log_store) struct RetainedRecordBytes {
+    pub(in crate::log_store) total: u64,
+    pub(in crate::log_store) body_heap: u64,
+}
+
 impl LogRecord {
-    fn retained_dynamic_bytes(&self) -> Result<u64, LogStoreFailure> {
-        let mut total = self.body.as_ref().map_or(Ok(0), retained_value_bytes)?;
+    fn retained_dynamic_bytes(&self) -> Result<RetainedRecordBytes, LogStoreFailure> {
+        let body_heap = self
+            .body
+            .as_ref()
+            .map_or(Ok(0), retained_value_heap_bytes)?;
+        let mut total = body_heap;
+        if self.body.is_some() {
+            total = checked_add(total, VALUE_SLOT_BYTES)?;
+        }
         for attribute in &self.attributes {
             let occurrences = attribute.occurrences();
             total = checked_add(total, ATTRIBUTE_SLOT_BYTES)?;
@@ -40,15 +54,19 @@ impl LogRecord {
             total = checked_add(total, DYNAMIC_ENTRY_SLOT_BYTES)?;
             total = checked_add(total, to_u64(rule.len())?)?;
         }
-        Ok(total)
+        Ok(RetainedRecordBytes { total, body_heap })
     }
 }
 
 fn retained_value_bytes(value: &ValidatedAttributeValue) -> Result<u64, LogStoreFailure> {
+    checked_add(VALUE_SLOT_BYTES, retained_value_heap_bytes(value)?)
+}
+
+fn retained_value_heap_bytes(value: &ValidatedAttributeValue) -> Result<u64, LogStoreFailure> {
     let heap = value
         .retained_heap_bytes()
         .map_err(LogStoreFailure::domain)?;
-    checked_add(VALUE_SLOT_BYTES, to_u64(heap)?)
+    to_u64(heap)
 }
 
 fn to_u64(value: usize) -> Result<u64, LogStoreFailure> {

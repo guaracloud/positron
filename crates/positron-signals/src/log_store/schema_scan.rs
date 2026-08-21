@@ -120,7 +120,7 @@ impl LogStore {
                 }
             }
         }
-        let retained_size_bytes = super::retained_scan_bytes(scan.limit(), &records)?;
+        let retained_size_bytes = super::retained_scan_bytes(scan.limit(), &mut records)?;
         Ok(LogScanResult::new(
             records,
             complete,
