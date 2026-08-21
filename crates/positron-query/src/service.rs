@@ -9,7 +9,7 @@ use crate::{
     LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis,
     TemporalRange,
 };
-use crate::plan::FilterPredicate;
+use crate::plan::{FilterPredicate, ProjectionColumn};
 
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
@@ -190,6 +190,60 @@ pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> 
             parse_body_literal(literal)
                 .map(|literal| plan.with_filter(FilterPredicate::BodyEquals(literal)))
         }),
+        [
+            "pipeline:v1",
+            "logs",
+            "|",
+            "range",
+            axis,
+            start,
+            end,
+            "|",
+            "project",
+            first,
+            "|",
+            "limit",
+            limit,
+        ] => plan(axis, start, end, limit).and_then(|plan| {
+            parse_projection(&[first]).map(|projection| plan.with_projection(projection))
+        }),
+        [
+            "pipeline:v1",
+            "logs",
+            "|",
+            "range",
+            axis,
+            start,
+            end,
+            "|",
+            "project",
+            first,
+            second,
+            "|",
+            "limit",
+            limit,
+        ] => plan(axis, start, end, limit).and_then(|plan| {
+            parse_projection(&[first, second]).map(|projection| plan.with_projection(projection))
+        }),
+        [
+            "pipeline:v1",
+            "logs",
+            "|",
+            "range",
+            axis,
+            start,
+            end,
+            "|",
+            "project",
+            first,
+            second,
+            third,
+            "|",
+            "limit",
+            limit,
+        ] => plan(axis, start, end, limit).and_then(|plan| {
+            parse_projection(&[first, second, third]).map(|projection| plan.with_projection(projection))
+        }),
         ["pipeline:v1", "logs", "|", "range", axis, start, end, "|", "limit", limit] => {
             plan(axis, start, end, limit)
         },
@@ -275,4 +329,32 @@ fn parse_body_literal(source: &str) -> Result<String, QueryFailure> {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     Ok(inner.to_owned())
+}
+
+fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailure> {
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    let mut projection = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index + 1 == parts.len();
+        let column = if is_last {
+            *part
+        } else {
+            part.strip_suffix(',').ok_or_else(|| {
+                QueryFailure::new(QueryFailureCode::UnsupportedQuery)
+            })?
+        };
+        let column = match column {
+            "body" => ProjectionColumn::Body,
+            "query_time" => ProjectionColumn::QueryTime,
+            "commit_position" => ProjectionColumn::CommitPosition,
+            _ => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+        };
+        if projection.contains(&column) {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
+        projection.push(column);
+    }
+    Ok(projection)
 }

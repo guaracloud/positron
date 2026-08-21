@@ -3,13 +3,28 @@ use positron_domain::time::UnixNanoseconds;
 
 use crate::{LogicalPlan, QueryBudget, QueryCursor, QueryFailure, QueryFailureCode, TemporalAxis};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResultSchema;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResultSchema {
+    columns: Vec<&'static str>,
+}
 
 impl ResultSchema {
+    pub(crate) fn for_plan(plan: &LogicalPlan) -> Self {
+        let columns = plan
+            .projection()
+            .iter()
+            .map(|column| match column {
+                crate::plan::ProjectionColumn::Body => "body",
+                crate::plan::ProjectionColumn::QueryTime => "query_time",
+                crate::plan::ProjectionColumn::CommitPosition => "commit_position",
+            })
+            .collect();
+        Self { columns }
+    }
+
     #[must_use]
-    pub const fn columns(self) -> [&'static str; 1] {
-        ["body"]
+    pub fn columns(&self) -> Vec<&'static str> {
+        self.columns.clone()
     }
 }
 
@@ -81,6 +96,7 @@ impl ResultLease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryHeader {
     plan: LogicalPlan,
+    schema: ResultSchema,
     budget: QueryBudget,
     snapshot: ResultSnapshot,
     lease: ResultLease,
@@ -88,7 +104,7 @@ pub struct QueryHeader {
 }
 
 impl QueryHeader {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         plan: LogicalPlan,
         budget: QueryBudget,
         snapshot: ResultSnapshot,
@@ -96,6 +112,7 @@ impl QueryHeader {
         initial_cursor: Option<QueryCursor>,
     ) -> Self {
         Self {
+            schema: ResultSchema::for_plan(&plan),
             plan,
             budget,
             snapshot,
@@ -104,8 +121,8 @@ impl QueryHeader {
         }
     }
     #[must_use]
-    pub const fn schema(&self) -> ResultSchema {
-        ResultSchema
+    pub fn schema(&self) -> &ResultSchema {
+        &self.schema
     }
     #[must_use]
     pub const fn snapshot(&self) -> ResultSnapshot {
@@ -151,6 +168,14 @@ impl QueryRecord {
     #[must_use]
     pub fn body_text(&self) -> Option<&str> {
         self.body.as_deref()
+    }
+    #[must_use]
+    pub const fn query_time(&self) -> UnixNanoseconds {
+        self.query_time
+    }
+    #[must_use]
+    pub const fn commit_position(&self) -> CommitPosition {
+        self.commit_position
     }
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition) {
         (self.query_time, self.commit_position)

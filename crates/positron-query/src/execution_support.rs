@@ -27,11 +27,18 @@ pub(crate) fn query_record(
     if !plan.temporal_range().contains(ordering_time) {
         return None;
     }
+    let body = plan
+        .projection()
+        .contains(&crate::plan::ProjectionColumn::Body)
+        .then(|| {
+            record
+                .body()
+                .and_then(|body| body.as_str())
+                .map(str::to_owned)
+        })
+        .flatten();
     Some(QueryRecord::new(
-        record
-            .body()
-            .and_then(|body| body.as_str())
-            .map(str::to_owned),
+        body,
         ordering_time,
         record.commit_position(),
     ))

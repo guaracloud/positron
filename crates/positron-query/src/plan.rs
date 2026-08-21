@@ -47,6 +47,13 @@ pub(crate) enum FilterPredicate {
     BodyEquals(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionColumn {
+    Body,
+    QueryTime,
+    CommitPosition,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalPlan {
     version: u8,
@@ -54,16 +61,18 @@ pub struct LogicalPlan {
     range: TemporalRange,
     limit: u16,
     filter: Option<FilterPredicate>,
+    projection: Vec<ProjectionColumn>,
 }
 
 impl LogicalPlan {
-    pub(crate) const fn logs(axis: TemporalAxis, range: TemporalRange, limit: u16) -> Self {
+    pub(crate) fn logs(axis: TemporalAxis, range: TemporalRange, limit: u16) -> Self {
         Self {
             version: 1,
             axis,
             range,
             limit,
             filter: None,
+            projection: vec![ProjectionColumn::Body],
         }
     }
 
@@ -73,11 +82,20 @@ impl LogicalPlan {
     }
 
     pub(crate) fn has_advanced_operators(&self) -> bool {
-        self.filter.is_some()
+        self.filter.is_some() || self.projection != [ProjectionColumn::Body]
     }
 
     pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
         self.filter.as_ref()
+    }
+
+    pub(crate) fn with_projection(mut self, projection: Vec<ProjectionColumn>) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    pub(crate) fn projection(&self) -> &[ProjectionColumn] {
+        &self.projection
     }
 
     pub(crate) const fn limit(&self) -> u16 {
