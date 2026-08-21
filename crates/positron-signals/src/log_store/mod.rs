@@ -217,17 +217,22 @@ impl LogStore {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
         check_scan_cancellation(cancellation)?;
-        let encoded_bytes = snapshot
-            .blocks()
-            .iter()
-            .filter(|block| {
-                scan.frontier()
-                    .is_none_or(|frontier| block.position() <= frontier)
-            })
-            .try_fold(0_u64, |total, block| {
-                total.checked_add(u64::try_from(block.payload().len()).ok()?)
-            })
-            .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        let mut encoded_bytes = 0_u64;
+        for block in snapshot.blocks() {
+            check_scan_cancellation(cancellation)?;
+            if scan
+                .frontier()
+                .is_some_and(|frontier| block.position() > frontier)
+            {
+                continue;
+            }
+            encoded_bytes = encoded_bytes
+                .checked_add(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        }
         let memory = encoded_bytes
             .checked_add(
                 u64::try_from(scan.limit().value())

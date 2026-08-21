@@ -10,6 +10,14 @@ impl super::super::ScanCancellation for CancelDuringDecode {
     }
 }
 
+struct CancelDuringPreflight(AtomicU64);
+
+impl super::super::ScanCancellation for CancelDuringPreflight {
+    fn is_cancelled(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst) >= 1
+    }
+}
+
 #[test]
 fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
@@ -280,6 +288,67 @@ fn insufficient_query_budget_refuses_before_decode_and_releases_on_error()
         )
         .expect_err("malformed authenticated bytes fail closed");
     assert_eq!(malformed.code(), LogStoreFailureCode::MalformedBlock);
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        baseline
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellable_scan_stops_during_snapshot_preflight_before_admission() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x61; 16])?,
+        CatalogSecret::from_owned(Box::new([0x62; 32]), Box::new([0x63; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(82)?);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x64; 32])),
+    )?;
+    ledger.append(PreparedStoreBlock::new(
+        scope,
+        StoreBlockIdentity::new([0x65; 16])?,
+        b"authenticated-preflight-block".to_vec(),
+    )?)?;
+    let snapshot = ledger.snapshot()?;
+    let baseline = authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let claim = WorkClaim::tenant(
+        tenant,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?;
+    let mut saturation = Vec::new();
+    while let Ok(grant) = authority.governor().reserve(claim) {
+        saturation.push(grant);
+    }
+
+    let failure = LogStore::new()
+        .scan_cancellable(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &CancelDuringPreflight(AtomicU64::new(0)),
+        )
+        .expect_err("preflight cancellation must precede query admission");
+    assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
+
+    drop(saturation);
     assert_eq!(
         authority
             .governor()
