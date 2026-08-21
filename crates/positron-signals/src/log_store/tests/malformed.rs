@@ -172,6 +172,75 @@ fn result_limit_does_not_hide_a_malformed_declared_record() -> Result<(), Box<dy
 }
 
 #[test]
+fn atomic_budget_preflight_rejects_malformed_version_two_framing() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x18; 16])?,
+        CatalogSecret::from_owned(Box::new([0x28; 32]), Box::new([0x38; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let first = minimal_record("x", 1)?;
+    let second = minimal_record("y", 2)?;
+    let encoded_bytes =
+        crate::log_store::codec::encoded_block_length(&[first.clone(), second.clone()])?;
+    let records = [
+        StoredLogRecord::new(first, clock(1).assign_ingest_time()?),
+        StoredLogRecord::new(second, clock(2).assign_ingest_time()?),
+    ];
+    let valid = crate::log_store::codec::encode_block(tenant, &records, encoded_bytes)?;
+    let cases = [
+        (
+            "invalid trace identifier tag",
+            replaced_byte(&valid, 42, 9)?,
+        ),
+        ("invalid span identifier tag", replaced_byte(&valid, 43, 9)?),
+        ("invalid body presence tag", replaced_byte(&valid, 84, 9)?),
+        ("invalid native value tag", replaced_byte(&valid, 85, 9)?),
+        (
+            "invalid native boolean payload",
+            replaced_bytes(&replaced_byte(&valid, 85, 1)?, 86, [9])?,
+        ),
+        (
+            "oversized native string framing",
+            replaced_bytes(&valid, 86, [0, 1, 0, 1])?,
+        ),
+        (
+            "oversized native bytes framing",
+            replaced_bytes(&replaced_byte(&valid, 85, 5)?, 86, [0, 1, 0, 1])?,
+        ),
+    ];
+
+    for (index, (description, bytes)) in cases.into_iter().enumerate() {
+        let case_shard = VirtualShardId::new(u32::try_from(index + 91)?)?;
+        let scope = SegmentScope::new(tenant, SignalKind::Logs, case_shard);
+        let ledger = ActiveSegmentLedger::open(
+            &authority,
+            &catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([u8::try_from(index + 0x69)?; 32])),
+        )?;
+        ledger.append(PreparedStoreBlock::new(
+            scope,
+            StoreBlockIdentity::new([u8::try_from(index + 0x79)?; 16])?,
+            bytes,
+        )?)?;
+        let failure = LogStore::new()
+            .scan(
+                authority.governor(),
+                tenant,
+                &ledger.snapshot()?,
+                LogScan::all(ScanLimit::new(1)?),
+            )
+            .expect_err(description);
+        assert_eq!(failure.code(), LogStoreFailureCode::MalformedBlock);
+    }
+    Ok(())
+}
+
+#[test]
 fn version_two_metadata_tags_and_truncation_fail_closed() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
