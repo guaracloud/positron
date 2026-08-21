@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod attribute_syntax;
 mod budget;
 mod cancellation;
 mod cursor;
@@ -13,6 +14,7 @@ mod memory;
 mod native_literal;
 mod operators;
 mod plan;
+mod query_service;
 mod runtime;
 mod service;
 mod stream;
@@ -23,10 +25,10 @@ pub use cancellation::QueryCancellation;
 pub use cursor::QueryCursor;
 pub use failure::{QueryFailure, QueryFailureCode};
 pub use plan::{LogicalPlan, OrderDirection, PlannedQuery, TemporalAxis, TemporalRange};
+pub use query_service::QueryService;
 pub use runtime::{
     QueryClock, QueryClockFailure, QueryWorkFailure, QueryWorkMeter, QueryWorkStage,
 };
-pub use service::QueryService;
 pub use stream::{
     QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryTerminal,
     ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,

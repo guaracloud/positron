@@ -777,6 +777,270 @@ fn typed_body_equality_accepts_every_native_literal_without_coercion() -> Result
 }
 
 #[test]
+fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, CandidateKeyValue};
+    use positron_policy::NativeLogAttribute;
+
+    let fixture = QueryFixture::new("typed-attribute-query")?;
+    fixture.kernel.append_attribute_logs(
+        vec![
+            (
+                Some(10),
+                vec![
+                    NativeLogAttribute::new(
+                        AttributeNamespace::Resource,
+                        "service.name".to_owned(),
+                        vec![
+                            CandidateAttributeValue::string("api".to_owned()),
+                            CandidateAttributeValue::signed_integer(7),
+                            CandidateAttributeValue::null(),
+                        ],
+                    ),
+                    NativeLogAttribute::new(
+                        AttributeNamespace::Record,
+                        "payload".to_owned(),
+                        vec![CandidateAttributeValue::key_value_list(vec![
+                            CandidateKeyValue::new(
+                                "token".to_owned(),
+                                CandidateAttributeValue::string("first".to_owned()),
+                            ),
+                            CandidateKeyValue::new(
+                                "token".to_owned(),
+                                CandidateAttributeValue::string("second".to_owned()),
+                            ),
+                        ])],
+                    ),
+                    NativeLogAttribute::new(
+                        AttributeNamespace::InstrumentationScope,
+                        "enabled".to_owned(),
+                        vec![
+                            CandidateAttributeValue::boolean(true),
+                            CandidateAttributeValue::boolean(true),
+                        ],
+                    ),
+                    NativeLogAttribute::new(
+                        AttributeNamespace::Resource,
+                        "strange |\"\\ key".to_owned(),
+                        vec![CandidateAttributeValue::boolean(true)],
+                    ),
+                ],
+            ),
+            (Some(20), vec![]),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source = concat!(
+        "pipeline:v1 logs | range query_time 0 100 | ",
+        "filter resource[\"service.name\"] any == int(7) | ",
+        "project resource[\"service.name\"], record[\"payload\"][\"token\"] | limit 2"
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 2, 2, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let header = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("attribute result header missing")?;
+    assert_eq!(
+        header.schema().columns(),
+        [
+            r#"resource["service.name"]"#,
+            r#"record["payload"]["token"]"#,
+        ]
+    );
+    assert_eq!(
+        header.schema().types(),
+        [
+            ResultValueType::AttributeOccurrenceSet,
+            ResultValueType::AttributeOccurrenceSet,
+        ]
+    );
+    assert_eq!(header.schema().nullable(), [true, true]);
+    let record = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch.records().first(),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("attribute result row missing")?;
+    let service_name = record
+        .attribute_occurrence_set(0)
+        .ok_or("resource occurrence set missing")?;
+    assert_eq!(service_name.namespace(), AttributeNamespace::Resource);
+    assert_eq!(service_name.len(), 3);
+    assert_eq!(
+        service_name.occurrence(0).and_then(|value| value.as_str()),
+        Some("api")
+    );
+    assert_eq!(
+        service_name
+            .occurrence(1)
+            .and_then(|value| value.as_signed_integer()),
+        Some(7)
+    );
+    assert!(
+        service_name
+            .occurrence(2)
+            .is_some_and(|value| value.is_null())
+    );
+    let tokens = record
+        .attribute_occurrence_set(1)
+        .ok_or("nested occurrence set missing")?;
+    assert_eq!(tokens.len(), 2);
+    assert_eq!(
+        tokens.occurrence(0).and_then(|value| value.as_str()),
+        Some("first")
+    );
+    assert_eq!(
+        tokens.occurrence(1).and_then(|value| value.as_str()),
+        Some("second")
+    );
+
+    for predicate in [
+        r#"scope["enabled"] all == bool(true)"#,
+        r#"resource["service.name"] index(0) == string("api")"#,
+    ] {
+        let source =
+            format!("pipeline:v1 logs | range query_time 0 100 | filter {predicate} | limit 2");
+        let query = service.plan_pipeline(
+            fixture.context,
+            &source,
+            QueryBudget::new(1_048_576, 2, 2, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert!(
+            events.iter().any(
+                |event| matches!(event, QueryEvent::Batch(batch) if batch.records().len() == 1)
+            )
+        );
+    }
+
+    let missing_all = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time 0 100 | filter record["absent"] all == null | limit 2"#,
+        QueryBudget::new(1_048_576, 2, 2, 1_048_576, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+    let missing_events = service.execute(missing_all)?.collect::<Vec<_>>();
+    assert!(
+        !missing_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+
+    let escaped_path = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time 0 100 | project resource["strange \|\"\\ key"] | limit 2"#,
+        QueryBudget::new(1_048_576, 2, 2, 1_048_576, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+    let escaped_events = service.execute(escaped_path)?.collect::<Vec<_>>();
+    let escaped_header = escaped_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("escaped attribute header missing")?;
+    assert_eq!(
+        escaped_header.schema().columns(),
+        [r#"resource["strange \|\"\\ key"]"#]
+    );
+    Ok(())
+}
+
+#[test]
+fn attribute_grouping_keeps_missing_distinct_from_the_full_occurrence_set()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
+    use positron_policy::NativeLogAttribute;
+
+    let fixture = QueryFixture::new("typed-attribute-grouping")?;
+    fixture.kernel.append_attribute_logs(
+        vec![
+            (
+                Some(10),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Resource,
+                    "service.name".to_owned(),
+                    vec![
+                        CandidateAttributeValue::string("api".to_owned()),
+                        CandidateAttributeValue::signed_integer(7),
+                    ],
+                )],
+            ),
+            (Some(20), vec![]),
+            (
+                Some(30),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Resource,
+                    "service.name".to_owned(),
+                    vec![
+                        CandidateAttributeValue::string("api".to_owned()),
+                        CandidateAttributeValue::signed_integer(7),
+                    ],
+                )],
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(2_000_000_000),
+        Arc::new(ConstantWorkMeter(0)),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time 0 100 | aggregate count by resource["service.name"] | limit 3"#,
+        QueryBudget::new(1_048_576, 3, 3, 1_048_576, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let header = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("attribute group header missing")?;
+    assert_eq!(
+        header.schema().columns(),
+        [r#"resource["service.name"]"#, "count"]
+    );
+    assert_eq!(header.schema().nullable(), [true, false]);
+    let records = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or_else(|| format!("attribute group batch missing: {events:?}"))?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].attribute_occurrence_set(0), None);
+    assert_eq!(records[0].count(), Some(1));
+    let present = records[1]
+        .attribute_occurrence_set(0)
+        .ok_or("present group missing")?;
+    assert_eq!(present.len(), 2);
+    assert_eq!(records[1].count(), Some(2));
+    Ok(())
+}
+
+#[test]
 fn version_one_equality_rejects_untyped_literal_syntax() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("native-filter-boundary")?;
     let service = QueryService::new(
@@ -1147,7 +1411,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_496, true), (1_495, false)] {
+    for (memory_bytes, expected_complete) in [(1_672, true), (1_671, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -1174,7 +1438,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(2_990, true), (2_989, false)] {
+    for (memory_bytes, expected_complete) in [(3_342, true), (3_341, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,

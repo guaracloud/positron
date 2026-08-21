@@ -46,15 +46,17 @@ impl TemporalRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FilterPredicate {
     BodyEquals(positron_domain::value::ValidatedAttributeValue),
+    AttributeEquals(positron_signals::SchemaQuery),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectionColumn {
     Body,
     QueryTime,
     EventTime,
     IngestTime,
     CommitPosition,
+    Attribute(positron_signals::SchemaPath),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

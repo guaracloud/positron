@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 use positron_domain::time::{EventTime, QueryTime};
 use positron_kernel::IngestTime;
 
@@ -12,6 +10,8 @@ use super::vocabulary::{query_time_provenance_tag, source_time_quality_tag};
 const MAX_GROUPS: usize = 1_024;
 const GROUP_ENCODING_CHUNK_BYTES: u64 = 256;
 
+mod search;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum GroupValue {
     Body(Option<positron_domain::value::ValidatedAttributeValue>),
@@ -19,6 +19,7 @@ enum GroupValue {
     EventTime(EventTime),
     IngestTime(IngestTime),
     CommitPosition(positron_domain::routing::CommitPosition),
+    Attribute(Option<positron_domain::value::AttributeOccurrenceSet>),
 }
 
 const _: () = assert!(
@@ -29,7 +30,9 @@ const _: () = assert!(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GroupKey {
     values: Vec<GroupValue>,
+    dynamic_retained_bytes: u64,
     body_retained_bytes: u64,
+    attribute_retained_bytes: u64,
 }
 
 impl GroupKey {
@@ -39,12 +42,16 @@ impl GroupKey {
     ) -> Result<(Self, u64), QueryFailure> {
         let fields = record.into_group_fields()?;
         let mut body = fields.body;
-        let body_retained_bytes = fields.body_retained_bytes;
+        let mut attributes = fields.attributes;
+        let dynamic_retained_bytes = fields
+            .body_retained_bytes
+            .checked_add(fields.attribute_retained_bytes)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
         let mut values = Vec::new();
         values
             .try_reserve_exact(columns.len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        for column in columns {
+        for (index, column) in columns.iter().enumerate() {
             values.push(match column {
                 crate::plan::ProjectionColumn::Body => GroupValue::Body(body.take()),
                 crate::plan::ProjectionColumn::QueryTime => {
@@ -59,14 +66,25 @@ impl GroupKey {
                 crate::plan::ProjectionColumn::CommitPosition => {
                     GroupValue::CommitPosition(fields.commit_position)
                 },
+                crate::plan::ProjectionColumn::Attribute(_) => {
+                    let projected = attributes
+                        .get_mut(index)
+                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+                    let crate::stream::AttributeProjection::Attribute(value) = projected else {
+                        return Err(QueryFailure::new(QueryFailureCode::Internal));
+                    };
+                    GroupValue::Attribute(value.take())
+                },
             });
         }
         Ok((
             Self {
                 values,
-                body_retained_bytes,
+                dynamic_retained_bytes,
+                body_retained_bytes: fields.body_retained_bytes,
+                attribute_retained_bytes: fields.attribute_retained_bytes,
             },
-            body_retained_bytes,
+            dynamic_retained_bytes,
         ))
     }
 
@@ -77,16 +95,33 @@ impl GroupKey {
         let mut event_time = None;
         let mut ingest_time = None;
         let mut commit_position = None;
+        let mut attributes = Vec::with_capacity(self.values.len());
         for value in self.values {
             match value {
                 GroupValue::Body(value) => {
                     body = value;
                     body_selected = true;
+                    attributes.push(crate::stream::AttributeProjection::Intrinsic);
                 },
-                GroupValue::QueryTime(value) => query_time = Some(value),
-                GroupValue::EventTime(value) => event_time = Some(value),
-                GroupValue::IngestTime(value) => ingest_time = Some(value),
-                GroupValue::CommitPosition(value) => commit_position = Some(value),
+                GroupValue::QueryTime(value) => {
+                    query_time = Some(value);
+                    attributes.push(crate::stream::AttributeProjection::Intrinsic);
+                },
+                GroupValue::EventTime(value) => {
+                    event_time = Some(value);
+                    attributes.push(crate::stream::AttributeProjection::Intrinsic);
+                },
+                GroupValue::IngestTime(value) => {
+                    ingest_time = Some(value);
+                    attributes.push(crate::stream::AttributeProjection::Intrinsic);
+                },
+                GroupValue::CommitPosition(value) => {
+                    commit_position = Some(value);
+                    attributes.push(crate::stream::AttributeProjection::Intrinsic);
+                },
+                GroupValue::Attribute(value) => {
+                    attributes.push(crate::stream::AttributeProjection::Attribute(value));
+                },
             }
         }
         QueryRecord::grouped_count_record(
@@ -98,6 +133,8 @@ impl GroupKey {
                 event_time,
                 ingest_time,
                 commit_position,
+                attributes,
+                attribute_retained_bytes: self.attribute_retained_bytes,
             },
             count,
         )
@@ -178,7 +215,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
         memory.acquire(key_slots)?;
         let (key, body_bytes) = GroupKey::for_record(record, aggregate.group_by())?;
         let (comparison, comparison_bytes) = key.comparison_encoding(service, state, memory)?;
-        match find_group(service, state, &groups, &comparison)? {
+        match search::find_group(service, state, &groups, &comparison)? {
             Ok(index) => {
                 let entry = groups
                     .get_mut(index)
@@ -226,47 +263,6 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
     Ok(grouped)
 }
 
-fn find_group<'kernel, 'catalog, 'ledger>(
-    service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
-    state: &mut CursorState,
-    groups: &[GroupEntry],
-    wanted: &[u8],
-) -> Result<Result<usize, usize>, QueryFailure> {
-    let mut start = 0_usize;
-    let mut end = groups.len();
-    while start < end {
-        let middle = start
-            .checked_add((end - start) / 2)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        let existing = groups
-            .get(middle)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        match compare_group_bytes(service, state, &existing.comparison, wanted)? {
-            Ordering::Less => start = middle + 1,
-            Ordering::Greater => end = middle,
-            Ordering::Equal => return Ok(Ok(middle)),
-        }
-    }
-    Ok(Err(start))
-}
-
-fn compare_group_bytes<'kernel, 'catalog, 'ledger>(
-    service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
-    state: &mut CursorState,
-    left: &[u8],
-    right: &[u8],
-) -> Result<Ordering, QueryFailure> {
-    for (left, right) in left.iter().zip(right) {
-        charge_group_unit(service, state)?;
-        match left.cmp(right) {
-            Ordering::Equal => {},
-            ordering => return Ok(ordering),
-        }
-    }
-    charge_group_unit(service, state)?;
-    Ok(left.len().cmp(&right.len()))
-}
-
 fn charge_group_moves<'kernel, 'catalog, 'ledger>(
     service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
     state: &mut CursorState,
@@ -278,7 +274,7 @@ fn charge_group_moves<'kernel, 'catalog, 'ledger>(
     Ok(())
 }
 
-fn charge_group_unit<'kernel, 'catalog, 'ledger>(
+pub(super) fn charge_group_unit<'kernel, 'catalog, 'ledger>(
     service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
     state: &mut CursorState,
 ) -> Result<(), QueryFailure> {
@@ -339,6 +335,12 @@ fn append_group_value_comparison(
         GroupValue::CommitPosition(value) => {
             append(&[3])?;
             append(&value.value().to_be_bytes())?;
+        },
+        GroupValue::Attribute(value) => {
+            append(&[5, u8::from(value.is_some())])?;
+            if let Some(value) = value {
+                value.visit_comparison_encoding(&mut append)?;
+            }
         },
     }
     Ok(())

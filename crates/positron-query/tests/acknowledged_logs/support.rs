@@ -20,7 +20,8 @@ use positron_kernel::{
     TenantQuota, WorkClaim, WorkKind,
 };
 use positron_policy::{
-    IngestPolicy, LogMetadata, NativeLogCandidate, PolicyEvaluation, PolicyReceiver,
+    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
+    PolicyReceiver,
 };
 use positron_signals::{LogRecord, LogStore};
 
@@ -431,6 +432,43 @@ impl KernelFixture {
                 IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
             else {
                 return Err("preserving policy rejected the query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let block = LogStore::new().prepare(
+            capacity,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
+            self.tenant,
+            self.shard,
+            StoreBlockIdentity::new([identity; 16])?,
+            records,
+        )?;
+        self.ledger()?.append(block.into_store_block())?;
+        Ok(())
+    }
+
+    pub fn append_attribute_logs(
+        &self,
+        candidates: Vec<(Option<i64>, Vec<NativeLogAttribute>)>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut records = Vec::new();
+        records.try_reserve_exact(candidates.len())?;
+        for (event_time, attributes) in candidates {
+            let candidate =
+                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty());
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the attribute query fixture".into());
             };
             records.push(LogRecord::checked_evaluated(
                 ValueLimitProfile::release_1_system_maximum(),

@@ -17,6 +17,15 @@ pub(crate) fn parse_body(
         .map_err(map_domain_failure)
 }
 
+pub(crate) fn parse_attribute(
+    source: &str,
+) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
+    Cursor::new(source)?
+        .parse_complete()?
+        .validate_attribute(ValueLimitProfile::release_1_system_maximum())
+        .map_err(map_domain_failure)
+}
+
 pub(crate) fn parse_search_string(
     source: &str,
 ) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {

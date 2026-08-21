@@ -340,5 +340,6 @@ mod tests {
             ResultLease::new([2; 16], 1),
             None,
         )
+        .expect("test header allocation succeeds")
     }
 }

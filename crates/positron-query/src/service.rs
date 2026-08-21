@@ -1,177 +1,5 @@
-use positron_domain::identity::Scope;
-use positron_governance::AuthorizedContext;
-use positron_kernel::{
-    ActiveSegmentLedger, ResourceAmounts, ResourceGovernor, WorkClaim, WorkKind,
-};
-use std::sync::Arc;
-
 use crate::plan::{AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn};
-use crate::{
-    LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis,
-    TemporalRange,
-};
-
-const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
-
-pub struct QueryService<'kernel, 'catalog, 'ledger> {
-    pub(crate) governor: ResourceGovernor<'kernel>,
-    pub(crate) ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-    pub(crate) batch_limit: u16,
-    pub(crate) clock: Arc<dyn crate::QueryClock>,
-    pub(crate) work_meter: Arc<dyn crate::QueryWorkMeter>,
-}
-
-impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
-    pub fn new(
-        governor: ResourceGovernor<'kernel>,
-        ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-        batch_limit: u16,
-    ) -> Self {
-        Self::with_runtime(
-            governor,
-            ledger,
-            batch_limit,
-            Arc::new(crate::runtime::SystemQueryClock),
-            Arc::new(crate::runtime::FixedQueryWorkMeter),
-        )
-    }
-
-    pub fn with_clock(
-        governor: ResourceGovernor<'kernel>,
-        ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-        batch_limit: u16,
-        clock: Arc<dyn crate::QueryClock>,
-    ) -> Self {
-        Self::with_runtime(
-            governor,
-            ledger,
-            batch_limit,
-            clock,
-            Arc::new(crate::runtime::FixedQueryWorkMeter),
-        )
-    }
-
-    pub fn with_runtime(
-        governor: ResourceGovernor<'kernel>,
-        ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-        batch_limit: u16,
-        clock: Arc<dyn crate::QueryClock>,
-        work_meter: Arc<dyn crate::QueryWorkMeter>,
-    ) -> Self {
-        Self {
-            governor,
-            ledger,
-            batch_limit,
-            clock,
-            work_meter,
-        }
-    }
-
-    pub fn plan_pipeline(
-        &self,
-        context: AuthorizedContext,
-        source: &str,
-        budget: QueryBudget,
-    ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
-        self.plan(context, source, budget, parse_pipeline)
-    }
-
-    pub fn plan_sql(
-        &self,
-        context: AuthorizedContext,
-        source: &str,
-        budget: QueryBudget,
-    ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
-        self.plan(context, source, budget, parse_sql)
-    }
-
-    fn plan(
-        &self,
-        context: AuthorizedContext,
-        source: &str,
-        budget: QueryBudget,
-        parser: fn(&str) -> Result<LogicalPlan, QueryFailure>,
-    ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
-        let tenant = context
-            .tenant_attribution()
-            .filter(|attribution| attribution.scope() == Scope::Query)
-            .map(|attribution| attribution.tenant_id())
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
-        if source.len() > MAX_QUERY_SOURCE_BYTES {
-            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-        }
-        let started_at = self.now()?;
-        let reservation = self.reserve_query(tenant, budget)?;
-        let cpu_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
-        let plan = parser(source)?;
-        let last_observed_at = self.now()?;
-        if last_observed_at < started_at {
-            return Err(QueryFailure::new(QueryFailureCode::Internal));
-        }
-        if last_observed_at.saturating_sub(started_at) >= budget.wall_seconds()
-            || cpu_work_units > budget.cpu_work_units()
-        {
-            return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
-        }
-        if plan.limit() == 0
-            || plan.limit() > 1_024
-            || u64::from(plan.limit()) > budget.output_rows()
-            || plan
-                .temporal_range()
-                .duration()
-                .is_none_or(|duration| duration > budget.maximum_time_range_nanoseconds())
-        {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
-        }
-        Ok(PlannedQuery {
-            context,
-            plan,
-            budget,
-            _reservation: reservation,
-            started_at,
-            last_observed_at,
-            cpu_work_units,
-            cancellation: crate::QueryCancellation::new(),
-        })
-    }
-
-    pub(crate) fn reserve_query(
-        &self,
-        tenant: positron_domain::identity::TenantId,
-        budget: QueryBudget,
-    ) -> Result<positron_kernel::ResourceReservation<'kernel>, QueryFailure> {
-        let amounts = ResourceAmounts::new([
-            budget.memory_bytes(),
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            budget.cpu_work_units(),
-            0,
-            0,
-        ]);
-        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
-        self.governor
-            .reserve(claim)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
-    }
-
-    pub(crate) fn now(&self) -> Result<u64, QueryFailure> {
-        self.clock
-            .now_seconds()
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
-    }
-
-    pub(crate) fn work_units(&self, stage: crate::QueryWorkStage) -> Result<u64, QueryFailure> {
-        self.work_meter
-            .units(stage)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
-    }
-}
+use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange};
 
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let stages = pipeline_stages(source)?;
@@ -271,21 +99,31 @@ fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure
             if filter.is_some() || stage_order > 1 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            filter = Some(crate::native_literal::parse_body(literal)?);
+            filter = Some(FilterPredicate::BodyEquals(
+                crate::native_literal::parse_body(literal)?,
+            ));
+            stage_order = 2;
+        } else if let Some(predicate) = stage.strip_prefix("filter ") {
+            if filter.is_some() || stage_order > 1 {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            filter = Some(FilterPredicate::AttributeEquals(
+                crate::attribute_syntax::parse_predicate(predicate)?,
+            ));
             stage_order = 2;
         } else if let Some(literal) = stage.strip_prefix("search body == ") {
             if filter.is_some() || stage_order > 1 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            filter = Some(crate::native_literal::parse_search_string(literal)?);
+            filter = Some(FilterPredicate::BodyEquals(
+                crate::native_literal::parse_search_string(literal)?,
+            ));
             stage_order = 2;
         } else if let Some(columns) = stage.strip_prefix("project ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            projection = Some(parse_projection(
-                &columns.split_ascii_whitespace().collect::<Vec<_>>(),
-            )?);
+            projection = Some(parse_projection(columns)?);
             stage_order = 3;
         } else if stage == "aggregate count" || stage.starts_with("aggregate count by ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {
@@ -317,7 +155,7 @@ fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure
         limit.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
     )?;
     if let Some(filter) = filter {
-        plan = plan.with_filter(FilterPredicate::BodyEquals(filter));
+        plan = plan.with_filter(filter);
     }
     if let Some(projection) = projection {
         plan = plan.with_projection(projection);
@@ -397,33 +235,68 @@ fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
         .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
 }
 
-fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailure> {
-    if parts.is_empty() || parts.len() > 5 {
+fn parse_projection(source: &str) -> Result<Vec<ProjectionColumn>, QueryFailure> {
+    let mut projection = Vec::new();
+    projection
+        .try_reserve_exact(5)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in source.char_indices() {
+        if escaped {
+            if !matches!(character, '"' | '\\' | '|') {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            escaped = false;
+        } else {
+            match character {
+                '\\' if quoted => escaped = true,
+                '\\' => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+                '"' => quoted = !quoted,
+                ',' if !quoted => {
+                    let column = source
+                        .get(start..index)
+                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+                    push_projection_column(&mut projection, column.trim())?;
+                    start = index
+                        .checked_add(character.len_utf8())
+                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+                },
+                _ => {},
+            }
+        }
+    }
+    if quoted || escaped {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
-    let mut projection = Vec::with_capacity(parts.len());
-    for (index, part) in parts.iter().enumerate() {
-        let is_last = index + 1 == parts.len();
-        let column = if is_last {
-            *part
-        } else {
-            part.strip_suffix(',')
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?
-        };
-        let column = match column {
-            "body" => ProjectionColumn::Body,
-            "query_time" => ProjectionColumn::QueryTime,
-            "event_time" => ProjectionColumn::EventTime,
-            "ingest_time" => ProjectionColumn::IngestTime,
-            "commit_position" => ProjectionColumn::CommitPosition,
-            _ => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
-        };
-        if projection.contains(&column) {
-            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-        }
-        projection.push(column);
-    }
+    let column = source
+        .get(start..)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+    push_projection_column(&mut projection, column.trim())?;
     Ok(projection)
+}
+
+fn push_projection_column(
+    projection: &mut Vec<ProjectionColumn>,
+    column: &str,
+) -> Result<(), QueryFailure> {
+    if column.is_empty() || projection.len() == 5 {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    let column = match column {
+        "body" => ProjectionColumn::Body,
+        "query_time" => ProjectionColumn::QueryTime,
+        "event_time" => ProjectionColumn::EventTime,
+        "ingest_time" => ProjectionColumn::IngestTime,
+        "commit_position" => ProjectionColumn::CommitPosition,
+        _ => ProjectionColumn::Attribute(crate::attribute_syntax::parse_path(column)?),
+    };
+    if projection.contains(&column) {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    projection.push(column);
+    Ok(())
 }
 
 fn parse_aggregate(stage: &str) -> Result<AggregateSpec, QueryFailure> {
@@ -433,8 +306,7 @@ fn parse_aggregate(stage: &str) -> Result<AggregateSpec, QueryFailure> {
     let columns = stage
         .strip_prefix("aggregate count by ")
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-    parse_projection(&columns.split_ascii_whitespace().collect::<Vec<_>>())
-        .map(AggregateSpec::count_by)
+    parse_projection(columns).map(AggregateSpec::count_by)
 }
 
 fn parse_ordering(axis: TemporalAxis, specification: &str) -> Result<OrderSpec, QueryFailure> {

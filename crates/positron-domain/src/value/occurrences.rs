@@ -73,6 +73,31 @@ pub struct AttributeOccurrenceSet {
 }
 
 impl AttributeOccurrenceSet {
+    /// Builds a projected occurrence set from values that already passed this profile.
+    pub fn from_validated(
+        namespace: AttributeNamespace,
+        key: String,
+        occurrences: Vec<ValidatedAttributeValue>,
+        profile: ValueLimitProfile,
+    ) -> Result<Self, DomainFailure> {
+        let limits = profile.effective_limits();
+        if key.is_empty()
+            || exceeds_byte_limit(key.len(), limits.dynamic_value().key_path_bytes())
+            || occurrences.is_empty()
+            || exceeds_collection_limit(
+                occurrences.len(),
+                limits.dynamic_value().attributes_per_namespace(),
+            )
+        {
+            return Err(DomainFailure::value_limit_exceeded());
+        }
+        Ok(Self {
+            namespace,
+            key,
+            occurrences,
+        })
+    }
+
     /// Fallibly clones this bounded occurrence set for retained store state.
     pub fn try_clone(&self) -> Result<Self, DomainFailure> {
         let mut key = String::new();
@@ -121,6 +146,49 @@ impl AttributeOccurrenceSet {
     #[must_use]
     pub fn occurrence(&self, index: usize) -> Option<&ValidatedAttributeValue> {
         self.occurrences.get(index)
+    }
+
+    /// Returns the canonical retained bytes for one occurrence slot and value.
+    pub fn retained_occurrence_bytes(
+        value: &ValidatedAttributeValue,
+    ) -> Result<usize, DomainFailure> {
+        checked_decoded_add(
+            std::mem::size_of::<ValidatedAttributeValue>(),
+            value.retained_heap_bytes()?,
+        )
+    }
+
+    /// Returns the self-delimiting canonical logical encoding length.
+    pub fn canonical_encoded_size_bytes(&self) -> Result<usize, DomainFailure> {
+        self.occurrences.iter().try_fold(
+            checked_decoded_add(17, self.key.len())?,
+            |total, value| {
+                checked_decoded_add(total, value.canonical_encoded_size_bytes()?)
+            },
+        )
+    }
+
+    /// Visits the domain-owned order-preserving occurrence-set encoding.
+    pub fn visit_comparison_encoding<E>(
+        &self,
+        visit: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        visit(&[namespace_tag(self.namespace)])?;
+        visit_comparison_sequence(self.key.as_bytes(), visit)?;
+        for value in &self.occurrences {
+            visit(&[1])?;
+            value.visit_comparison_encoding(visit)?;
+        }
+        visit(&[0])
+    }
+}
+
+const fn namespace_tag(namespace: AttributeNamespace) -> u8 {
+    match namespace {
+        AttributeNamespace::Stream => 0,
+        AttributeNamespace::Resource => 1,
+        AttributeNamespace::InstrumentationScope => 2,
+        AttributeNamespace::Record => 3,
     }
 }
 

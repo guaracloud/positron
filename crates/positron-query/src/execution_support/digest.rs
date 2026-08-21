@@ -4,7 +4,6 @@ use super::failure::map_domain_value_failure;
 use super::vocabulary::{query_time_provenance_tag, source_time_quality_tag};
 
 const DIGEST_STATE_BYTES: u64 = 256;
-const DIGEST_CONTRACT_BYTES: usize = 128;
 const DIGEST_CHUNK_BYTES: usize = 1_024;
 
 pub(crate) fn batch_digest(
@@ -91,6 +90,15 @@ fn batch_digest_with_acquired_state(
         if let Some(count) = record.count() {
             digest.update(&count.to_be_bytes());
         }
+        for projected in record.attribute_projections() {
+            let crate::stream::AttributeProjection::Attribute(value) = projected else {
+                continue;
+            };
+            digest.update(&[u8::from(value.is_some())]);
+            if let Some(value) = value {
+                update_occurrence_set_digest(&mut digest, value, cancellation, memory)?;
+            }
+        }
     }
     check_digest_cancellation(cancellation)?;
     digest
@@ -105,29 +113,8 @@ fn update_result_contract_digest(
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<(), QueryFailure> {
     check_digest_cancellation(cancellation)?;
-    let scratch_bytes = u64::try_from(DIGEST_CONTRACT_BYTES)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    memory.acquire(scratch_bytes)?;
-    let mut encoding = Vec::new();
-    if encoding.try_reserve_exact(DIGEST_CONTRACT_BYTES).is_err() {
-        memory.release(scratch_bytes)?;
-        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-    }
-    let encoded = encode_result_contract(&mut encoding, plan);
-    if encoding.len() > DIGEST_CONTRACT_BYTES {
-        drop(encoding);
-        memory.release(scratch_bytes)?;
-        return Err(QueryFailure::new(QueryFailureCode::Internal));
-    }
-    if let Err(failure) = encoded {
-        drop(encoding);
-        memory.release(scratch_bytes)?;
-        return Err(failure);
-    }
-    digest.update(&encoding);
-    drop(encoding);
-    memory.release(scratch_bytes)?;
-    Ok(())
+    let _ = memory;
+    encode_result_contract(digest, plan, cancellation)
 }
 
 fn update_native_value_digest(
@@ -153,17 +140,45 @@ fn update_native_value_digest(
         memory.release(memory_bytes)?;
         return Err(map_domain_value_failure(failure));
     }
-    if encoding.len() != encoded_bytes {
-        drop(encoding);
-        memory.release(memory_bytes)?;
-        return Err(QueryFailure::new(QueryFailureCode::Internal));
-    }
     for chunk in encoding.chunks(DIGEST_CHUNK_BYTES) {
         check_digest_cancellation(cancellation)?;
         digest.update(chunk);
     }
     drop(encoding);
     memory.release(memory_bytes)?;
+    Ok(())
+}
+
+fn update_occurrence_set_digest(
+    digest: &mut positron_kernel::QueryResultDigest,
+    value: &positron_domain::value::AttributeOccurrenceSet,
+    cancellation: &crate::QueryCancellation,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<(), QueryFailure> {
+    digest.update(&[match value.namespace() {
+        positron_domain::value::AttributeNamespace::Stream => 0,
+        positron_domain::value::AttributeNamespace::Resource => 1,
+        positron_domain::value::AttributeNamespace::InstrumentationScope => 2,
+        positron_domain::value::AttributeNamespace::Record => 3,
+    }]);
+    digest.update(
+        &u64::try_from(value.key().len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
+            .to_be_bytes(),
+    );
+    digest.update(value.key().as_bytes());
+    digest.update(
+        &u64::try_from(value.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
+            .to_be_bytes(),
+    );
+    for index in 0..value.len() {
+        check_digest_cancellation(cancellation)?;
+        let occurrence = value
+            .occurrence(index)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        update_native_value_digest(digest, occurrence, cancellation, memory)?;
+    }
     Ok(())
 }
 
@@ -175,67 +190,113 @@ fn check_digest_cancellation(cancellation: &crate::QueryCancellation) -> Result<
     }
 }
 
-fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<(), QueryFailure> {
+fn encode_result_contract(
+    digest: &mut positron_kernel::QueryResultDigest,
+    plan: &LogicalPlan,
+    cancellation: &crate::QueryCancellation,
+) -> Result<(), QueryFailure> {
     let schema = plan
         .aggregate()
         .map(crate::plan::AggregateSpec::group_by)
         .unwrap_or_else(|| plan.projection());
-    encoding.extend_from_slice(
+    digest.update(
         &u64::try_from(schema.len() + usize::from(plan.aggregate().is_some()))
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
             .to_be_bytes(),
     );
     for column in schema {
-        encoding.push(projection_column_tag(*column));
-        encoding.push(result_value_type_tag(crate::stream::column_type(*column)));
+        update_projection_contract(digest, column, cancellation)?;
     }
     if plan.aggregate().is_some() {
-        encoding.push(3);
-        encoding.push(result_value_type_tag(
-            crate::ResultValueType::UnsignedInteger,
-        ));
-        encoding.extend_from_slice(
+        digest.update(&[
+            3,
+            result_value_type_tag(crate::ResultValueType::UnsignedInteger),
+            0,
+        ]);
+        digest.update(
             &u64::try_from(schema.len())
                 .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
                 .to_be_bytes(),
         );
         for column in schema {
-            encoding.push(projection_column_tag(*column));
-            encoding.push(result_value_type_tag(crate::stream::column_type(*column)));
-            encoding.push(order_direction_tag(crate::plan::OrderDirection::Ascending));
+            update_projection_contract(digest, column, cancellation)?;
+            digest.update(&[order_direction_tag(crate::plan::OrderDirection::Ascending)]);
         }
     } else {
-        encoding.extend_from_slice(&3_u64.to_be_bytes());
-        encoding.push(match plan.temporal_axis() {
-            crate::TemporalAxis::QueryTime => 4,
-            crate::TemporalAxis::EventTime => 5,
-            crate::TemporalAxis::IngestTime => 7,
-        });
-        encoding.push(result_value_type_tag(match plan.temporal_axis() {
-            crate::TemporalAxis::QueryTime => crate::ResultValueType::QueryTime,
-            crate::TemporalAxis::EventTime => crate::ResultValueType::EventTime,
-            crate::TemporalAxis::IngestTime => crate::ResultValueType::IngestTime,
-        }));
-        encoding.push(order_direction_tag(plan.ordering().primary_direction()));
-        encoding.push(2);
-        encoding.push(result_value_type_tag(
-            crate::ResultValueType::CommitPosition,
-        ));
-        encoding.push(order_direction_tag(plan.ordering().commit_direction()));
-        encoding.push(6);
-        encoding.push(result_value_type_tag(crate::ResultValueType::RecordOrdinal));
-        encoding.push(order_direction_tag(plan.ordering().commit_direction()));
+        digest.update(&3_u64.to_be_bytes());
+        digest.update(&[
+            match plan.temporal_axis() {
+                crate::TemporalAxis::QueryTime => 4,
+                crate::TemporalAxis::EventTime => 5,
+                crate::TemporalAxis::IngestTime => 7,
+            },
+            result_value_type_tag(match plan.temporal_axis() {
+                crate::TemporalAxis::QueryTime => crate::ResultValueType::QueryTime,
+                crate::TemporalAxis::EventTime => crate::ResultValueType::EventTime,
+                crate::TemporalAxis::IngestTime => crate::ResultValueType::IngestTime,
+            }),
+            order_direction_tag(plan.ordering().primary_direction()),
+        ]);
+        digest.update(&[
+            2,
+            result_value_type_tag(crate::ResultValueType::CommitPosition),
+            order_direction_tag(plan.ordering().commit_direction()),
+        ]);
+        digest.update(&[
+            6,
+            result_value_type_tag(crate::ResultValueType::RecordOrdinal),
+            order_direction_tag(plan.ordering().commit_direction()),
+        ]);
     }
     Ok(())
 }
 
-const fn projection_column_tag(column: crate::plan::ProjectionColumn) -> u8 {
+fn update_projection_contract(
+    digest: &mut positron_kernel::QueryResultDigest,
+    column: &crate::plan::ProjectionColumn,
+    cancellation: &crate::QueryCancellation,
+) -> Result<(), QueryFailure> {
+    digest.update(&[
+        projection_column_tag(column),
+        result_value_type_tag(crate::stream::column_type(column)),
+        u8::from(matches!(
+            column,
+            crate::plan::ProjectionColumn::Body | crate::plan::ProjectionColumn::Attribute(_)
+        )),
+    ]);
+    if let crate::plan::ProjectionColumn::Attribute(path) = column {
+        digest.update(&[match path.namespace() {
+            positron_domain::value::AttributeNamespace::Stream => 0,
+            positron_domain::value::AttributeNamespace::Resource => 1,
+            positron_domain::value::AttributeNamespace::InstrumentationScope => 2,
+            positron_domain::value::AttributeNamespace::Record => 3,
+        }]);
+        digest.update(
+            &u64::try_from(path.segments().len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
+                .to_be_bytes(),
+        );
+        for segment in path.segments() {
+            check_digest_cancellation(cancellation)?;
+            digest.update(
+                &u64::try_from(segment.len())
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
+                    .to_be_bytes(),
+            );
+            digest.update(segment.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+const fn projection_column_tag(column: &crate::plan::ProjectionColumn) -> u8 {
     match column {
         crate::plan::ProjectionColumn::Body => 0,
         crate::plan::ProjectionColumn::QueryTime => 1,
         crate::plan::ProjectionColumn::EventTime => 3,
         crate::plan::ProjectionColumn::IngestTime => 4,
         crate::plan::ProjectionColumn::CommitPosition => 2,
+        crate::plan::ProjectionColumn::Attribute(_) => 8,
     }
 }
 
@@ -250,6 +311,7 @@ const fn result_value_type_tag(value_type: crate::ResultValueType) -> u8 {
         crate::ResultValueType::CommitPosition => 2,
         crate::ResultValueType::RecordOrdinal => 3,
         crate::ResultValueType::UnsignedInteger => 4,
+        crate::ResultValueType::AttributeOccurrenceSet => 9,
     }
 }
 

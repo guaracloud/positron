@@ -13,6 +13,7 @@ mod promotion;
 mod query;
 mod representation;
 mod session;
+mod stored_query;
 
 pub use catalog::SchemaCatalog;
 pub use checkpoint::SchemaCheckpointFrontier;
