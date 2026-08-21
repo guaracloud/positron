@@ -16,6 +16,36 @@ use super::support::{
 mod runtime_boundaries;
 
 #[test]
+fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dyn Error>> {
+    let (_roots, paths) = bootstrap_paths("default-fitting-cpu")?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "default-fitting-cpu-kernel")?;
+    fixture.append_log("normal", 20, 1)?;
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 1);
+    let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        context,
+        "logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.records() == 1
+                && stats.cpu_work_units() <= budget.cpu_work_units()
+    ));
+    Ok(())
+}
+
+#[test]
 fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box<dyn Error>> {
     let (roots, paths) = bootstrap_paths("budget")?;
     let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;

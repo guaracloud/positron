@@ -22,6 +22,8 @@ pub enum ScanObservationFailureCode {
 
 /// Query-agnostic capability for accounting bounded Signal Store scan work.
 pub trait ScanObserver {
+    /// Accounts deterministic bounded decode operations. Raw payload volume is
+    /// accounted separately by `scanned_bytes` and is never duplicated here.
     fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode>;
 }
 

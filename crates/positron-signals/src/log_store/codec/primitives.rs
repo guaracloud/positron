@@ -1,5 +1,7 @@
 use crate::log_store::LogStoreFailure;
 
+const CANCELLATION_POLL_BYTES: usize = 1_024;
+
 pub(super) fn put_count(output: &mut Vec<u8>, value: usize) -> Result<(), LogStoreFailure> {
     put_u16(
         output,
@@ -58,27 +60,45 @@ impl<'a> Input<'a> {
     }
 
     pub(super) fn take(&mut self, count: usize) -> Result<&'a [u8], LogStoreFailure> {
-        if self
-            .cancellation
-            .is_some_and(|cancellation| cancellation.is_cancelled())
-        {
-            return Err(LogStoreFailure::cancelled());
-        }
-        if let Some(observer) = self.observer {
-            let units = u64::try_from(count)
-                .ok()
-                .and_then(|count| count.checked_add(1))
-                .ok_or_else(LogStoreFailure::malformed_block)?;
-            observer
-                .observe_work(units)
-                .map_err(LogStoreFailure::observation)?;
-        }
+        self.poll_copy(count)?;
         let (value, remaining) = self
             .remaining
             .split_at_checked(count)
             .ok_or_else(LogStoreFailure::malformed_block)?;
         self.remaining = remaining;
         Ok(value)
+    }
+
+    /// Charges one structural decode operation without duplicating the exact
+    /// raw-byte accounting owned by the scan result.
+    pub(super) fn observe_component(&self) -> Result<(), LogStoreFailure> {
+        self.poll_cancellation()?;
+        if let Some(observer) = self.observer {
+            observer
+                .observe_work(1)
+                .map_err(LogStoreFailure::observation)?;
+        }
+        Ok(())
+    }
+
+    fn poll_copy(&self, count: usize) -> Result<(), LogStoreFailure> {
+        self.poll_cancellation()?;
+        let chunks = count / CANCELLATION_POLL_BYTES;
+        for _ in 0..chunks {
+            self.poll_cancellation()?;
+        }
+        Ok(())
+    }
+
+    fn poll_cancellation(&self) -> Result<(), LogStoreFailure> {
+        if self
+            .cancellation
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            Err(LogStoreFailure::cancelled())
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn u8(&mut self) -> Result<u8, LogStoreFailure> {

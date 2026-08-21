@@ -193,6 +193,7 @@ impl<'input> BlockDecode<'input> {
         expected_tenant: TenantId,
         input: Input<'input>,
     ) -> Result<Self, LogStoreFailure> {
+        input.observe_component()?;
         let (input, version, limits, count) = decode_block_header_with(expected_tenant, input)?;
         Ok(Self {
             input,

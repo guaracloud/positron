@@ -58,6 +58,7 @@ fn decode_mode(
     limits: CodecLimits,
     mode: DecodeMode,
 ) -> Result<DecodedValue, LogStoreFailure> {
+    input.observe_component()?;
     let decoded = match input.u8()? {
         0 => scalar(mode_value(mode, CandidateAttributeValue::null()), 0),
         1 => {

@@ -358,6 +358,20 @@ fn fitting_block_decode_has_an_exact_observed_work_boundary() -> Result<(), Box<
         CatalogSecret::from_owned(Box::new([0x4e; 32]), Box::new([0x4f; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
+    let profile = value_profile()?;
+    let body = value(
+        profile,
+        CandidateAttributeValue::array((0..12).map(|_| CandidateAttributeValue::null()).collect()),
+    )?;
+    let record = LogRecord::checked_native(
+        profile,
+        EventTime::missing(),
+        None,
+        Some(body),
+        vec![],
+        LogMetadata::empty(),
+        PolicyProvenance::new(1, [0x70; 32], vec![])?,
+    )?;
     let shard = VirtualShardId::new(81)?;
     let ledger = ActiveSegmentLedger::open(
         &authority,
@@ -373,7 +387,7 @@ fn fitting_block_decode_has_an_exact_observed_work_boundary() -> Result<(), Box<
                 tenant,
                 shard,
                 StoreBlockIdentity::new([0x4d; 16])?,
-                vec![minimal_record("observed-fitting-record", 1)?],
+                vec![record],
             )?
             .into_store_block(),
     )?;
@@ -391,7 +405,10 @@ fn fitting_block_decode_has_an_exact_observed_work_boundary() -> Result<(), Box<
     assert_eq!(result.records().len(), 1);
     assert!(result.complete());
     let exact_work = recording.0.load(Ordering::SeqCst);
-    assert!(exact_work > 0, "ordinary decode work must be observed");
+    assert!(
+        exact_work >= 15,
+        "record, container, and nested values must each be observed"
+    );
     drop(result);
 
     let exact = BudgetedScanObserver(AtomicU64::new(exact_work));

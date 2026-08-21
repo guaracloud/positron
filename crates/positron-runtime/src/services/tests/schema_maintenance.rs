@@ -67,7 +67,8 @@ fn serving_updates_live_schema_without_catalog_publication() -> Result<(), Box<d
         services.query_log_bodies(
             &query,
             "logs | range query_time 0 100 | limit 16",
-            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?,
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
+                .with_cpu_work_units(12)?,
         )?,
         ["first", "latest"]
     );
@@ -96,7 +97,8 @@ fn crash_without_publication_rebuilds_from_committed_blocks() -> Result<(), Box<
         reopened.query_log_bodies(
             &query,
             "logs | range query_time 0 100 | limit 16",
-            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?,
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
+                .with_cpu_work_units(12)?,
         )?,
         ["replayed"]
     );

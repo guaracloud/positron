@@ -55,6 +55,7 @@ fn decode_mode(
     version: u16,
     mode: DecodeMode,
 ) -> Result<Option<DecodedRecord>, LogStoreFailure> {
+    input.observe_component()?;
     let event_time = decode_event_time(input)?;
     let observed_time = match input.u8()? {
         0 => None,
@@ -187,6 +188,7 @@ fn decode_attribute(
     validation: &mut NativeRecordValidator,
     attributes: &mut Option<Vec<StoredLogAttribute>>,
 ) -> Result<(), LogStoreFailure> {
+    input.observe_component()?;
     let representation = match input.u8()? {
         1 => AttributeRepresentation::Generic,
         2 => AttributeRepresentation::SchemaOverflow,
@@ -255,6 +257,7 @@ fn decode_policy(
     let count = input.count(64)?;
     let mut rule_slices = [""; 64];
     for index in 0..count {
+        input.observe_component()?;
         *rule_slices
             .get_mut(index)
             .ok_or_else(LogStoreFailure::malformed_block)? = input.string_slice(256)?;
