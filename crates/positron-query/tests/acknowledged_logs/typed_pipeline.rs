@@ -56,6 +56,41 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("empty-body-equality")?;
+    fixture.kernel.append_log_bodies(
+        vec![
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                String::new(),
+            )),
+            None,
+        ],
+        20,
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"\" | limit 2",
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let records = service
+        .execute(query)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records().to_vec()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("result batch missing")?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].body_text(), Some(""));
+    Ok(())
+}
+
+#[test]
 fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-count-bytes")?;
     fixture.kernel.append_log("counted", 20, 1)?;

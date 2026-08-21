@@ -343,7 +343,7 @@ fn parse_body_literal(source: &str) -> Result<String, QueryFailure> {
     else {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     };
-    if inner.is_empty() || inner.len() > 65_536 || inner.contains('"') {
+    if inner.len() > 65_536 || inner.contains('"') {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     Ok(inner.to_owned())
