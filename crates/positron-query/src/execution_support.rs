@@ -405,7 +405,7 @@ pub(crate) fn compare_records(
     right: &QueryRecord,
     ordering: crate::plan::OrderSpec,
 ) -> Ordering {
-    let primary = left.query_time().cmp(&right.query_time());
+    let primary = left.ordering_time().cmp(&right.ordering_time());
     let primary = match ordering.primary_direction() {
         crate::plan::OrderDirection::Ascending => primary,
         crate::plan::OrderDirection::Descending => primary.reverse(),

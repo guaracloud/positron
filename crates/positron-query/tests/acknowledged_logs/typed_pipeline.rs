@@ -220,6 +220,72 @@ fn event_time_range_excludes_records_without_event_time() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn event_time_ordering_uses_selected_axis_and_intrinsic_ties_in_both_directions()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("event-time-ordering-axis")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(0),
+                Some(CandidateAttributeValue::string("zero-first".to_owned())),
+            ),
+            (
+                Some(20),
+                Some(CandidateAttributeValue::string("twenty".to_owned())),
+            ),
+            (
+                Some(0),
+                Some(CandidateAttributeValue::string("zero-second".to_owned())),
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range event_time -1 100 | project body, event_time | order by event_time asc, commit_position asc | limit 3",
+        QueryBudget::new(1_048_576, 3, 3, 128, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+
+    let records = service
+        .execute(query)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records().to_vec()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("event-time ordered batch missing")?;
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].body_text(), Some("zero-first"));
+    assert_eq!(records[1].body_text(), Some("zero-second"));
+    assert_eq!(records[2].body_text(), Some("twenty"));
+
+    let descending = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range event_time -1 100 | project body, event_time | order by event_time desc, commit_position desc | limit 3",
+        QueryBudget::new(1_048_576, 3, 3, 128, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+    let descending_records = service
+        .execute(descending)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records().to_vec()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("descending event-time ordered batch missing")?;
+    assert_eq!(descending_records[0].body_text(), Some("twenty"));
+    assert_eq!(descending_records[1].body_text(), Some("zero-second"));
+    assert_eq!(descending_records[2].body_text(), Some("zero-first"));
+    Ok(())
+}
+
+#[test]
 fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("empty-body-equality")?;
     fixture.kernel.append_log_bodies(

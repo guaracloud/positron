@@ -400,6 +400,10 @@ impl QueryRecord {
         )
     }
 
+    pub(crate) const fn ordering_time(&self) -> UnixNanoseconds {
+        self.ordering_time
+    }
+
     pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {
         let bytes = self
             .body
