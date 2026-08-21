@@ -249,9 +249,11 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
         "logs | range query_time -100 100 | limit 2",
         budget(),
     )?;
+    let before_batch_cancellation = query.cancellation();
     let mut before_batch = service.execute_page(query)?;
     assert!(matches!(before_batch.next(), Some(QueryEvent::Header(_))));
     before_batch.cancel()?;
+    assert!(before_batch_cancellation.is_cancelled());
     assert!(matches!(
         before_batch.next(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
@@ -267,6 +269,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
         "logs | range query_time -100 100 | limit 2",
         budget(),
     )?;
+    let after_batch_cancellation = query.cancellation();
     let mut after_batch = service.execute_page(query)?;
     assert!(matches!(after_batch.next(), Some(QueryEvent::Header(_))));
     let (digest, output_bytes) = match after_batch.next() {
@@ -282,6 +285,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
         _ => return Err("result batch missing".into()),
     };
     after_batch.cancel()?;
+    assert!(after_batch_cancellation.is_cancelled());
     assert!(matches!(
         after_batch.next(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
@@ -297,6 +301,15 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
     ));
     after_batch.cancel()?;
     assert!(after_batch.next().is_none());
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 2",
+        budget(),
+    )?;
+    let disconnect = query.cancellation();
+    drop(service.execute_page(query)?);
+    assert!(disconnect.is_cancelled());
     Ok(())
 }
 

@@ -1,9 +1,12 @@
 use std::error::Error;
+use std::sync::Arc;
 
+use positron_kernel::{SnapshotLeaseId, WorkClass};
 use positron_query::{
     OrderDirection, QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
 };
 
+use super::support::{BlockingOperatorWorkMeter, TestClock};
 use super::terminal_and_bounds::QueryFixture;
 
 #[test]
@@ -169,7 +172,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 61, 1_024, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 61, 1_024, 60)?.with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let header = match events.first() {
@@ -214,7 +217,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let output_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 60, 1_024, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 60, 1_024, 60)?.with_cpu_work_units(16)?,
     )?;
     let output_events = service.execute(output_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -233,7 +236,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let memory_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(228, 16, 16, 61, 1_024, 60)?,
+        QueryBudget::new(228, 16, 16, 61, 1_024, 60)?.with_cpu_work_units(16)?,
     )?;
     let memory_events = service.execute(memory_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -246,5 +249,117 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
     ));
+
+    let work_exhausted = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
+        QueryBudget::new(1_048_576, 16, 16, 61, 1_024, 60)?.with_cpu_work_units(5)?,
+    )?;
+    let work_events = service.execute(work_exhausted)?.collect::<Vec<_>>();
+    assert!(
+        !work_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        work_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 6
+    ));
+    Ok(())
+}
+
+#[test]
+fn cancellation_interrupts_grouping_and_releases_query_resources() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("typed-group-cancellation")?;
+    for identity in 1_u8..=8 {
+        fixture
+            .kernel
+            .append_log(&format!("group-{identity}"), i64::from(identity), identity)?;
+    }
+    let meter = BlockingOperatorWorkMeter::shared(4);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        8,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let before = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 8",
+        QueryBudget::new(1_048_576, 8, 8, 1_048_576, 1_024, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let cancellation = query.cancellation();
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        before + 1
+    );
+
+    let events = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let service = &service;
+        let worker = scope.spawn(move || service.execute(query).map(Iterator::collect::<Vec<_>>));
+        meter.wait_until_blocked()?;
+        cancellation.cancel();
+        meter.release()?;
+        worker
+            .join()
+            .map_err(|_| "query execution thread panicked")?
+            .map_err(Into::into)
+    })?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+    ));
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        before
+    );
+    let lease = events.iter().find_map(|event| match event {
+        QueryEvent::Header(header) => Some(header.lease().identity()),
+        QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+    });
+    let lease = SnapshotLeaseId::new(lease.ok_or("cancelled query header missing")?)?;
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .resume_snapshot_lease(lease, 100)
+            .expect_err("cancelled execution must release its snapshot lease")
+            .code(),
+        positron_kernel::LedgerFailureCode::SnapshotExpired
+    );
     Ok(())
 }

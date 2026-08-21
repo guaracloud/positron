@@ -13,6 +13,7 @@ pub struct QueryStream<'lease> {
     resumable_delivery_observed: bool,
     observed_stats: QueryStats,
     batch_stats: QueryStats,
+    cancellation: crate::QueryCancellation,
 }
 
 impl std::fmt::Debug for QueryStream<'_> {
@@ -28,6 +29,7 @@ impl<'lease> QueryStream<'lease> {
         retain_for_resume: bool,
         observed_stats: QueryStats,
         batch_stats: QueryStats,
+        cancellation: crate::QueryCancellation,
     ) -> Self {
         Self {
             events: events.into_iter(),
@@ -38,10 +40,12 @@ impl<'lease> QueryStream<'lease> {
             resumable_delivery_observed: false,
             observed_stats,
             batch_stats,
+            cancellation,
         }
     }
 
     pub fn cancel(&mut self) -> Result<(), QueryFailure> {
+        self.cancellation.cancel();
         if let Some(release) = self.release.take() {
             release()?;
         }
@@ -94,6 +98,9 @@ impl Iterator for QueryStream<'_> {
 
 impl Drop for QueryStream<'_> {
     fn drop(&mut self) {
+        if !self.terminal_observed {
+            self.cancellation.cancel();
+        }
         if !(self.retain_for_resume
             && self.resumable_delivery_observed
             && !self.releasing_terminal_observed)

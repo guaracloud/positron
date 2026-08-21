@@ -126,6 +126,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             started_at,
             last_observed_at,
             cpu_work_units,
+            cancellation: crate::QueryCancellation::new(),
         })
     }
 

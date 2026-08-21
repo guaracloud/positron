@@ -4,12 +4,12 @@ use positron_signals::{LogScan, LogStore, ScanLimit};
 
 use crate::cursor::{self, CursorState};
 use crate::execution_state::{
-    commit_position, incomplete, initial_state, query_tenant, stats_before_current,
-    stats_with_current, validate_authorization,
+    commit_position, initial_state, query_tenant, stats_before_current, stats_with_current,
+    validate_authorization,
 };
 use crate::execution_support::{
-    aggregate_records, batch_digest, charge_output, charge_scan, charge_work, compare_records,
-    exhausted, map_ledger_failure, map_store_failure, query_record,
+    batch_digest, charge_output, charge_scan, charge_work, exhausted, map_ledger_failure,
+    map_store_failure,
 };
 use crate::{
     PlannedQuery, QueryBatch, QueryCursor, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader,
@@ -115,17 +115,22 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         pagination: bool,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let delivered_before = stats_before_current(&state);
+        if state.cancellation.is_cancelled() {
+            let stats = stats_before_current(&state);
+            return self.incomplete_page(
+                None,
+                QueryFailure::new(QueryFailureCode::Cancelled),
+                &state,
+                delivered_before,
+                stats,
+            );
+        }
         if self.observe_state(&mut state)? {
             let stats = stats_before_current(&state);
-            return self.stream(
-                vec![QueryEvent::Terminal(QueryTerminal::Incomplete(
-                    QueryIncomplete::new(
-                        QueryFailure::new(QueryFailureCode::BudgetExhausted),
-                        stats,
-                    ),
-                ))],
-                state.lease_identity,
-                false,
+            return self.incomplete_page(
+                None,
+                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                &state,
                 delivered_before,
                 stats,
             );
@@ -145,6 +150,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ResultLease::new(state.lease_identity, state.expiry),
             initial_cursor,
         ));
+        if state.cancellation.is_cancelled() {
+            let stats = stats_before_current(&state);
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::Cancelled),
+                &state,
+                delivered_before,
+                stats,
+            );
+        }
         let result = match LogStore::new().scan(
             self.governor,
             state.tenant,
@@ -158,16 +173,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             Ok(result) => result,
             Err(failure) => {
                 let stats = stats_before_current(&state);
-                return self.stream(
-                    vec![
-                        header,
-                        QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
-                            map_store_failure(failure),
-                            &state,
-                        ))),
-                    ],
-                    state.lease_identity,
-                    false,
+                return self.incomplete_page(
+                    Some(header),
+                    map_store_failure(failure),
+                    &state,
                     delivered_before,
                     stats,
                 );
@@ -178,74 +187,58 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             &result,
             self.work_units(crate::QueryWorkStage::ScanDecode)?,
         )?;
-        if self.observe_state(&mut state)? || exhausted(&state) || !result.complete() {
+        if state.cancellation.is_cancelled() {
             let stats = stats_before_current(&state);
-            return self.stream(
-                vec![
-                    header,
-                    QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
-                        QueryFailure::new(QueryFailureCode::BudgetExhausted),
-                        &state,
-                    ))),
-                ],
-                state.lease_identity,
-                false,
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::Cancelled),
+                &state,
                 delivered_before,
                 stats,
             );
         }
-        let mut records = result
-            .records()
-            .iter()
-            .filter_map(|record| query_record(record, &state.plan))
-            .collect::<Vec<_>>();
-        if let Some(aggregate) = state.plan.aggregate() {
-            records = match aggregate_records(records, aggregate, state.budget.memory_bytes()) {
-                Ok(records) => records,
-                Err(failure) if failure.code() == QueryFailureCode::BudgetExhausted => {
-                    let stats = stats_before_current(&state);
-                    return self.stream(
-                        vec![
-                            header,
-                            QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
-                                failure, &state,
-                            ))),
-                        ],
-                        state.lease_identity,
-                        false,
-                        delivered_before,
-                        stats,
-                    );
-                },
-                Err(failure) => return Err(failure),
-            };
-        } else {
-            records.sort_by(|left, right| compare_records(left, right, state.plan.ordering()));
+        if self.observe_state(&mut state)? || exhausted(&state) || !result.complete() {
+            let stats = stats_before_current(&state);
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                &state,
+                delivered_before,
+                stats,
+            );
         }
+
         let operator_count = state.plan.operator_count();
-        if operator_count > 0 {
-            let operator_units = self
-                .work_units(crate::QueryWorkStage::Operators)?
-                .checked_mul(operator_count)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-            charge_work(&mut state, operator_units)?;
-            if self.observe_state(&mut state)? || exhausted(&state) {
+        let records = match crate::operators::execute(self, &mut state, result.records()) {
+            Ok(records) => records,
+            Err(failure)
+                if matches!(
+                    failure.code(),
+                    QueryFailureCode::BudgetExhausted | QueryFailureCode::Cancelled
+                ) =>
+            {
                 let stats = stats_before_current(&state);
-                return self.stream(
-                    vec![
-                        header,
-                        QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
-                            QueryFailure::new(QueryFailureCode::BudgetExhausted),
-                            &state,
-                        ))),
-                    ],
-                    state.lease_identity,
-                    false,
+                return self.incomplete_page(
+                    Some(header),
+                    failure,
+                    &state,
                     delivered_before,
                     stats,
                 );
-            }
+            },
+            Err(failure) => return Err(failure),
+        };
+        if operator_count > 0 && self.observe_state(&mut state)? {
+            let stats = stats_before_current(&state);
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                &state,
+                delivered_before,
+                stats,
+            );
         }
+
         let wanted = usize::from(state.plan.limit()).min(records.len());
         let start = usize::from(state.offset);
         let end = start
@@ -257,36 +250,54 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
             .to_vec();
         let before_batch = stats_before_current(&state);
+        if state.cancellation.is_cancelled() {
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::Cancelled),
+                &state,
+                delivered_before,
+                before_batch,
+            );
+        }
         charge_work(&mut state, self.work_units(crate::QueryWorkStage::Output)?)?;
+        if state.cancellation.is_cancelled() {
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::Cancelled),
+                &state,
+                delivered_before,
+                before_batch,
+            );
+        }
         if self.observe_state(&mut state)? || exhausted(&state) {
             let stats = stats_before_current(&state);
-            return self.stream(
-                vec![
-                    header,
-                    QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
-                        QueryFailure::new(QueryFailureCode::BudgetExhausted),
-                        &state,
-                    ))),
-                ],
-                state.lease_identity,
-                false,
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                &state,
                 delivered_before,
                 stats,
             );
         }
         let mut output_state = state.clone();
-        charge_output(&mut output_state, &page)?;
+        match charge_output(&mut output_state, &page, &state.cancellation) {
+            Ok(()) => {},
+            Err(failure) if failure.code() == QueryFailureCode::Cancelled => {
+                return self.incomplete_page(
+                    Some(header),
+                    failure,
+                    &state,
+                    delivered_before,
+                    before_batch,
+                );
+            },
+            Err(failure) => return Err(failure),
+        }
         if exhausted(&output_state) {
-            return self.stream(
-                vec![
-                    header,
-                    QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
-                        QueryFailure::new(QueryFailureCode::BudgetExhausted),
-                        &state,
-                    ))),
-                ],
-                state.lease_identity,
-                false,
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                &state,
                 delivered_before,
                 before_batch,
             );
@@ -294,33 +305,59 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         state = output_state;
         if page.is_empty() {
             let stats = stats_before_current(&state);
+            if state.cancellation.is_cancelled() {
+                return self.incomplete_page(
+                    Some(header),
+                    QueryFailure::new(QueryFailureCode::Cancelled),
+                    &state,
+                    delivered_before,
+                    stats,
+                );
+            }
             return self.stream(
                 vec![header, QueryEvent::Terminal(QueryTerminal::Complete(stats))],
-                state.lease_identity,
+                &state,
                 pagination,
                 delivered_before,
                 stats,
             );
         }
-        let digest = batch_digest(
+        let digest = match batch_digest(
             &self.ledger.control_tokens(),
             state.prior_digest,
             state.sequence,
             &page,
-        )?;
-        if self.observe_state(&mut state)? {
-            return self.stream(
-                vec![
-                    header,
-                    QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete(
-                        QueryFailure::new(QueryFailureCode::BudgetExhausted),
-                        &state,
-                    ))),
-                ],
-                state.lease_identity,
-                false,
+            &state.cancellation,
+        ) {
+            Ok(digest) => digest,
+            Err(failure) if failure.code() == QueryFailureCode::Cancelled => {
+                return self.incomplete_page(
+                    Some(header),
+                    failure,
+                    &state,
+                    delivered_before,
+                    before_batch,
+                );
+            },
+            Err(failure) => return Err(failure),
+        };
+        if state.cancellation.is_cancelled() {
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::Cancelled),
+                &state,
                 delivered_before,
                 before_batch,
+            );
+        }
+        if self.observe_state(&mut state)? {
+            let stats = stats_before_current(&state);
+            return self.incomplete_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                &state,
+                delivered_before,
+                stats,
             );
         }
         let batch = QueryEvent::Batch(QueryBatch::new(
@@ -350,22 +387,40 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         };
         self.stream(
             vec![header, batch, QueryEvent::Terminal(terminal)],
-            state.lease_identity,
+            &state,
             pagination,
             delivered_before,
             batch_stats,
         )
     }
 
+    fn incomplete_page(
+        &self,
+        header: Option<QueryEvent>,
+        failure: QueryFailure,
+        state: &CursorState,
+        delivered_before: QueryStats,
+        terminal_stats: QueryStats,
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        let mut events = Vec::with_capacity(2);
+        events.extend(header);
+        events.push(QueryEvent::Terminal(QueryTerminal::Incomplete(
+            QueryIncomplete::new(failure, terminal_stats),
+        )));
+        self.stream(events, state, false, delivered_before, terminal_stats)
+    }
+
     fn stream(
         &self,
         events: Vec<QueryEvent>,
-        identity: [u8; 16],
+        state: &CursorState,
         retain_for_resume: bool,
         observed_stats: QueryStats,
         batch_stats: QueryStats,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let ledger = self.ledger;
+        let identity = state.lease_identity;
+        let cancellation = state.cancellation.clone();
         let release = Box::new(move || {
             let identity = SnapshotLeaseId::new(identity)
                 .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
@@ -380,6 +435,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 true,
                 observed_stats,
                 batch_stats,
+                cancellation,
             ))
         } else {
             release()?;
@@ -389,6 +445,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 false,
                 observed_stats,
                 batch_stats,
+                cancellation,
             ))
         }
     }

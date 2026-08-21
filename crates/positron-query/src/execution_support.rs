@@ -120,7 +120,11 @@ pub(crate) fn aggregate_records(
     records: Vec<QueryRecord>,
     aggregate: &crate::plan::AggregateSpec,
     memory_budget: u64,
+    cancellation: &crate::QueryCancellation,
 ) -> Result<Vec<QueryRecord>, QueryFailure> {
+    if cancellation.is_cancelled() {
+        return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+    }
     if aggregate.group_by().is_empty() {
         return Ok(vec![QueryRecord::count_record(
             u64::try_from(records.len())
@@ -130,6 +134,9 @@ pub(crate) fn aggregate_records(
     let mut groups = BTreeMap::<GroupKey, u64>::new();
     let mut retained_bytes = 0_u64;
     for record in &records {
+        if cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
         let key = GroupKey::for_record(record, aggregate.group_by());
         let key_bytes = key.retained_bytes()?;
         let at_capacity = groups.len() >= MAX_GROUPS;
@@ -155,10 +162,14 @@ pub(crate) fn aggregate_records(
             },
         }
     }
-    Ok(groups
-        .into_iter()
-        .map(|(key, count)| key.into_record(count))
-        .collect())
+    let mut grouped = Vec::with_capacity(groups.len());
+    for (key, count) in groups {
+        if cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        grouped.push(key.into_record(count));
+    }
+    Ok(grouped)
 }
 
 pub(crate) fn compare_records(
@@ -218,6 +229,7 @@ pub(crate) fn charge_work(
 pub(crate) fn charge_output(
     state: &mut CursorState,
     page: &[QueryRecord],
+    cancellation: &crate::QueryCancellation,
 ) -> Result<(), QueryFailure> {
     state.output_rows = state
         .output_rows
@@ -226,11 +238,15 @@ pub(crate) fn charge_output(
                 .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
         )
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-    let page_bytes = page.iter().try_fold(0_u64, |total, record| {
-        total
+    let mut page_bytes = 0_u64;
+    for record in page {
+        if cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        page_bytes = page_bytes
             .checked_add(record.emitted_size_bytes()?)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
-    })?;
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+    }
     state.output_bytes = state
         .output_bytes
         .checked_add(page_bytes)
@@ -252,6 +268,7 @@ pub(crate) fn batch_digest(
     prior: [u8; 32],
     sequence: u64,
     records: &[QueryRecord],
+    cancellation: &crate::QueryCancellation,
 ) -> Result<[u8; 32], QueryFailure> {
     let mut encoding = Vec::new();
     encoding.extend_from_slice(&prior);
@@ -262,6 +279,9 @@ pub(crate) fn batch_digest(
             .to_be_bytes(),
     );
     for record in records {
+        if cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
         let (query_time, position) = record.order_key();
         encoding.extend_from_slice(&query_time.value().to_be_bytes());
         encoding.extend_from_slice(&position.value().to_be_bytes());

@@ -7,7 +7,7 @@ use positron_kernel::{LedgerSnapshot, SnapshotLeaseId};
 
 use crate::cursor::CursorState;
 use crate::stream::QueryCounters;
-use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryIncomplete, QueryStats};
+use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryStats};
 
 pub(crate) fn stats_before_current(state: &CursorState) -> QueryStats {
     QueryStats::new(
@@ -41,10 +41,6 @@ pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
     )
 }
 
-pub(crate) fn incomplete(failure: QueryFailure, state: &CursorState) -> QueryIncomplete {
-    QueryIncomplete::new(failure, stats_before_current(state))
-}
-
 pub(crate) fn initial_state(
     query: &PlannedQuery<'_>,
     snapshot: &LedgerSnapshot<'_>,
@@ -74,6 +70,7 @@ pub(crate) fn initial_state(
         last_observed_at: query.last_observed_at,
         cpu_work_units: query.cpu_work_units,
         elapsed_wall_seconds: query.last_observed_at.saturating_sub(query.started_at),
+        cancellation: query.cancellation.clone(),
     }
 }
 

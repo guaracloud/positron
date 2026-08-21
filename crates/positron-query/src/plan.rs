@@ -218,11 +218,18 @@ pub struct PlannedQuery<'kernel> {
     pub(crate) started_at: u64,
     pub(crate) last_observed_at: u64,
     pub(crate) cpu_work_units: u64,
+    pub(crate) cancellation: crate::QueryCancellation,
 }
 
 impl PlannedQuery<'_> {
     #[must_use]
     pub fn logical_plan(&self) -> LogicalPlan {
         self.plan.clone()
+    }
+
+    /// Returns the query-scoped handle used to propagate disconnects and deadlines.
+    #[must_use]
+    pub fn cancellation(&self) -> crate::QueryCancellation {
+        self.cancellation.clone()
     }
 }

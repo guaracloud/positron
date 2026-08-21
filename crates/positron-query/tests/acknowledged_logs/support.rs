@@ -3,8 +3,8 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
@@ -115,6 +115,82 @@ impl positron_query::QueryWorkMeter for ConstantWorkMeter {
         _stage: positron_query::QueryWorkStage,
     ) -> Result<u64, positron_query::QueryWorkFailure> {
         Ok(self.0)
+    }
+}
+
+pub struct BlockingOperatorWorkMeter {
+    block_at: u64,
+    operator_calls: AtomicU64,
+    state: Mutex<BlockingOperatorState>,
+    changed: Condvar,
+}
+
+struct BlockingOperatorState {
+    blocked: bool,
+    released: bool,
+}
+
+impl BlockingOperatorWorkMeter {
+    pub fn shared(block_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            block_at,
+            operator_calls: AtomicU64::new(0),
+            state: Mutex::new(BlockingOperatorState {
+                blocked: false,
+                released: false,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub fn wait_until_blocked(&self) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        while !state.blocked {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| positron_query::QueryWorkFailure)?;
+        }
+        Ok(())
+    }
+
+    pub fn release(&self) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        state.released = true;
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl positron_query::QueryWorkMeter for BlockingOperatorWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage != positron_query::QueryWorkStage::Operators
+            || self.operator_calls.fetch_add(1, Ordering::SeqCst) + 1 != self.block_at
+        {
+            return Ok(1);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        state.blocked = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| positron_query::QueryWorkFailure)?;
+        }
+        Ok(1)
     }
 }
 
@@ -288,7 +364,7 @@ fn establish_authority(
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
     let ordinary_capacity = ResourceAmounts::new([
-        8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+        8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 64, 32, 2_000_000,
     ]);
     let raw = add(
         add(recovery_capacity, ordinary_capacity)?,
@@ -309,7 +385,12 @@ fn establish_authority(
     )?;
     let policy = GovernorPolicy::new(
         [TenantQuota::new(tenant, 1, ordinary_capacity)?],
-        OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2))?,
+        OrdinaryPoolPolicy::new(
+            with_cpu(uniform(8), 18),
+            with_cpu(uniform(6), 17),
+            with_cpu(uniform(4), 16),
+            uniform(2),
+        )?,
     )?;
     let recovery =
         RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
@@ -320,6 +401,22 @@ fn establish_authority(
 
 fn uniform(value: u64) -> ResourceAmounts {
     ResourceAmounts::new([value; DIMENSIONS])
+}
+
+fn with_cpu(amounts: ResourceAmounts, cpu_work_units: u64) -> ResourceAmounts {
+    ResourceAmounts::new([
+        amounts.get(ResourceDimension::MemoryBytes),
+        amounts.get(ResourceDimension::QueueSlots),
+        amounts.get(ResourceDimension::TaskSlots),
+        amounts.get(ResourceDimension::BufferCacheBytes),
+        amounts.get(ResourceDimension::BatchItems),
+        amounts.get(ResourceDimension::LeaseSlots),
+        amounts.get(ResourceDimension::RetrySlots),
+        amounts.get(ResourceDimension::IoPermits),
+        cpu_work_units,
+        amounts.get(ResourceDimension::FileDescriptors),
+        amounts.get(ResourceDimension::DiskHeadroomBytes),
+    ])
 }
 
 fn add(left: ResourceAmounts, right: ResourceAmounts) -> Result<ResourceAmounts, Box<dyn Error>> {

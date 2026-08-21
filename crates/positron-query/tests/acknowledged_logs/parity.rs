@@ -459,7 +459,8 @@ fn versioned_pipeline_counts_filtered_records_with_a_typed_aggregate() -> Result
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | aggregate count | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?
+            .with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let header = match events.first() {

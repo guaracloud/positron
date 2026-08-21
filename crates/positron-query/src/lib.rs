@@ -3,11 +3,13 @@
 #![forbid(unsafe_code)]
 
 mod budget;
+mod cancellation;
 mod cursor;
 mod execution;
 mod execution_state;
 mod execution_support;
 mod failure;
+mod operators;
 mod plan;
 mod runtime;
 mod service;
@@ -15,6 +17,7 @@ mod stream;
 mod stream_lifecycle;
 
 pub use budget::QueryBudget;
+pub use cancellation::QueryCancellation;
 pub use cursor::QueryCursor;
 pub use failure::{QueryFailure, QueryFailureCode};
 pub use plan::{LogicalPlan, OrderDirection, PlannedQuery, TemporalAxis, TemporalRange};
