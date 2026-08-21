@@ -1,6 +1,6 @@
 use crate::{QueryFailure, QueryFailureCode, QueryRecord};
 
-pub(crate) const QUERY_RECORD_SLOT_BYTES: u64 = 64;
+pub(crate) const QUERY_RECORD_SLOT_BYTES: u64 = 96;
 pub(crate) const GROUP_ENTRY_BYTES: u64 = 640;
 pub(crate) const GROUP_VALUE_SLOT_BYTES: u64 = 32;
 

@@ -93,3 +93,44 @@ fn aggregate_collection_bytes_accept_exact_and_reject_nested_over_limit_values()
         "nested collection totals cannot exceed the individual-value byte limit"
     );
 }
+
+#[test]
+fn native_values_have_exact_total_order_and_self_delimiting_encoding() {
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let negative_zero = CandidateAttributeValue::floating_point_bits((-0.0_f64).to_bits())
+        .validate_log_body(profile)
+        .expect("negative zero is a bounded native value");
+    let positive_zero = CandidateAttributeValue::floating_point_bits(0.0_f64.to_bits())
+        .validate_log_body(profile)
+        .expect("positive zero is a bounded native value");
+    let first_nan = CandidateAttributeValue::floating_point_bits(0x7ff8_0000_0000_0001)
+        .validate_log_body(profile)
+        .expect("a NaN payload remains a native value");
+    let second_nan = CandidateAttributeValue::floating_point_bits(0x7ff8_0000_0000_0002)
+        .validate_log_body(profile)
+        .expect("a distinct NaN payload remains a native value");
+
+    assert!(negative_zero < positive_zero);
+    assert!(first_nan < second_nan);
+    assert_ne!(negative_zero, positive_zero);
+
+    let value = CandidateAttributeValue::array(vec![
+        CandidateAttributeValue::string(String::new()),
+        CandidateAttributeValue::bytes(vec![0, 255]),
+    ])
+    .validate_log_body(profile)
+    .expect("fixture is within the release-one body limit");
+    let mut encoding = Vec::new();
+    value
+        .append_canonical_encoding(&mut encoding)
+        .expect("a validated value has a bounded canonical encoding");
+    assert_eq!(
+        encoding,
+        vec![
+            6, 0, 0, 0, 0, 0, 0, 0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 2, 0,
+            255,
+        ]
+    );
+    assert_eq!(value.canonical_encoded_size_bytes(), Ok(29));
+    assert_eq!(value.retained_heap_bytes(), Ok(130));
+}

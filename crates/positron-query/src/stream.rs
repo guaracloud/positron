@@ -183,7 +183,8 @@ impl QueryHeader {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRecord {
-    body: Option<String>,
+    body: Option<positron_domain::value::ValidatedAttributeValue>,
+    body_selected: bool,
     query_time: UnixNanoseconds,
     commit_position: CommitPosition,
     record_ordinal: RecordOrdinal,
@@ -194,7 +195,8 @@ pub struct QueryRecord {
 
 impl QueryRecord {
     pub(crate) const fn new(
-        body: Option<String>,
+        body: Option<positron_domain::value::ValidatedAttributeValue>,
+        body_selected: bool,
         query_time: UnixNanoseconds,
         commit_position: CommitPosition,
         record_ordinal: RecordOrdinal,
@@ -203,6 +205,7 @@ impl QueryRecord {
     ) -> Self {
         Self {
             body,
+            body_selected,
             query_time,
             commit_position,
             record_ordinal,
@@ -215,6 +218,7 @@ impl QueryRecord {
     pub(crate) const fn count_record(count: u64) -> Self {
         Self {
             body: None,
+            body_selected: false,
             query_time: UnixNanoseconds::new(0),
             commit_position: CommitPosition::origin(),
             record_ordinal: RecordOrdinal::first(),
@@ -225,13 +229,15 @@ impl QueryRecord {
     }
 
     pub(crate) fn grouped_count_record(
-        body: Option<String>,
+        body: Option<positron_domain::value::ValidatedAttributeValue>,
+        body_selected: bool,
         query_time: Option<UnixNanoseconds>,
         commit_position: Option<CommitPosition>,
         count: u64,
     ) -> Self {
         Self {
             body,
+            body_selected,
             query_time: query_time.unwrap_or_else(|| UnixNanoseconds::new(0)),
             commit_position: commit_position.unwrap_or_else(CommitPosition::origin),
             record_ordinal: RecordOrdinal::first(),
@@ -242,7 +248,12 @@ impl QueryRecord {
     }
     #[must_use]
     pub fn body_text(&self) -> Option<&str> {
-        self.body.as_deref()
+        self.body.as_ref().and_then(|body| body.as_str())
+    }
+    /// Returns the complete native body without coercion when body is selected and present.
+    #[must_use]
+    pub const fn body_value(&self) -> Option<&positron_domain::value::ValidatedAttributeValue> {
+        self.body.as_ref()
     }
     #[must_use]
     pub const fn query_time(&self) -> UnixNanoseconds {
@@ -263,8 +274,19 @@ impl QueryRecord {
     }
 
     pub(crate) fn emitted_size_bytes(&self) -> Result<u64, QueryFailure> {
-        let body_bytes = u64::try_from(self.body_text().map_or(0, str::len))
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let body_bytes = if self.body_selected {
+            let encoded = self
+                .body
+                .as_ref()
+                .map_or(Ok(0), |body| body.canonical_encoded_size_bytes())
+                .map_err(map_value_failure)?;
+            u64::try_from(encoded)
+                .ok()
+                .and_then(|encoded| encoded.checked_add(1))
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+        } else {
+            0
+        };
         let query_time_bytes = u64::from(self.query_time_selected) * 8;
         let commit_position_bytes = u64::from(self.commit_position_selected) * 8;
         let count_bytes = u64::from(self.count.is_some()) * 8;
@@ -280,12 +302,30 @@ impl QueryRecord {
     }
 
     pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {
-        u64::try_from(self.body_text().map_or(0, str::len))
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+        let bytes = self
+            .body
+            .as_ref()
+            .map_or(Ok(0), |body| body.retained_heap_bytes())
+            .map_err(map_value_failure)?;
+        u64::try_from(bytes).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
     }
 
-    pub(crate) fn into_group_fields(self) -> (Option<String>, UnixNanoseconds, CommitPosition) {
+    pub(crate) fn into_group_fields(
+        self,
+    ) -> (
+        Option<positron_domain::value::ValidatedAttributeValue>,
+        UnixNanoseconds,
+        CommitPosition,
+    ) {
         (self.body, self.query_time, self.commit_position)
+    }
+}
+
+fn map_value_failure(failure: positron_domain::outcome::DomainFailure) -> QueryFailure {
+    if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable {
+        QueryFailure::new(QueryFailureCode::ResourceExhausted)
+    } else {
+        QueryFailure::new(QueryFailureCode::Internal)
     }
 }
 

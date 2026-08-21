@@ -11,6 +11,8 @@ use super::support::{
 };
 use super::terminal_and_bounds::QueryFixture;
 
+type OrderedBodyBatch = (Vec<(String, u16)>, [u8; 32]);
+
 #[test]
 fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-projection-bytes")?;
@@ -87,6 +89,177 @@ fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(
         .ok_or("result batch missing")?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].body_text(), Some(""));
+    Ok(())
+}
+
+#[test]
+fn grouping_and_projection_preserve_every_native_body_kind_without_coercion()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile};
+
+    let fixture = QueryFixture::new("native-body-values")?;
+    let candidates = vec![
+        CandidateAttributeValue::null(),
+        CandidateAttributeValue::boolean(true),
+        CandidateAttributeValue::signed_integer(7),
+        CandidateAttributeValue::floating_point_bits((-0.0_f64).to_bits()),
+        CandidateAttributeValue::floating_point_bits(0.0_f64.to_bits()),
+        CandidateAttributeValue::floating_point_bits(0x7ff8_0000_0000_0001),
+        CandidateAttributeValue::floating_point_bits(0xfff8_0000_0000_0001),
+        CandidateAttributeValue::string(String::new()),
+        CandidateAttributeValue::bytes(vec![0, 255]),
+        CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::boolean(false),
+            CandidateAttributeValue::signed_integer(1),
+        ]),
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "k".to_owned(),
+            CandidateAttributeValue::null(),
+        )]),
+    ];
+    let expected = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| {
+            candidate
+                .validate_log_body(ValueLimitProfile::release_1_system_maximum())
+                .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut bodies = vec![None];
+    bodies.extend(candidates.into_iter().map(Some));
+    fixture.kernel.append_log_bodies(bodies, 20, 1)?;
+
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 12",
+        QueryBudget::new(1_048_576, 12, 12, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let records = service
+        .execute(query)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records().to_vec()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("native grouped result batch missing")?;
+    assert_eq!(records.len(), 12);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.body_value().is_none() && record.count() == Some(1))
+            .count(),
+        1
+    );
+    for value in &expected {
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| {
+                    record.body_value() == Some(value) && record.count() == Some(1)
+                })
+                .count(),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn projection_preserves_missing_and_native_body_values() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
+
+    let fixture = QueryFixture::new("native-body-projection")?;
+    let expected = [
+        CandidateAttributeValue::boolean(false)
+            .validate_log_body(ValueLimitProfile::release_1_system_maximum())?,
+        CandidateAttributeValue::bytes(vec![1, 2, 3])
+            .validate_log_body(ValueLimitProfile::release_1_system_maximum())?,
+    ];
+    fixture.kernel.append_log_bodies(
+        vec![
+            None,
+            Some(CandidateAttributeValue::boolean(false)),
+            Some(CandidateAttributeValue::bytes(vec![1, 2, 3])),
+        ],
+        10,
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source = "pipeline:v1 logs | range query_time -100 100 | project body | limit 3";
+    let query = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 3, 3, 17, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let records = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("native projection batch missing")?;
+
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].body_value(), None);
+    assert_eq!(records[1].body_value(), Some(&expected[0]));
+    assert_eq!(records[2].body_value(), Some(&expected[1]));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.output_bytes() == 17
+    ));
+
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 3, 3, 16, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
+    assert!(
+        !exhausted_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().output_bytes() == 0
+    ));
+    Ok(())
+}
+
+#[test]
+fn version_one_equality_rejects_non_string_literal_syntax() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("native-filter-boundary")?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+
+    for literal in ["true", "7", "null", "[1]"] {
+        let source = format!("pipeline:v1 logs | filter body == {literal} | limit 1");
+        let failure = match service.plan_pipeline(
+            fixture.context,
+            &source,
+            QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?,
+        ) {
+            Ok(_) => return Err("version one accepted a non-string equality literal".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    }
     Ok(())
 }
 
@@ -219,49 +392,48 @@ fn same_time_records_in_one_block_have_a_stable_total_identity_across_reopen()
         1,
     )?;
 
-    let execute =
-        |fixture: &QueryFixture| -> Result<(Vec<(String, u16)>, [u8; 32]), Box<dyn Error>> {
-            let service = QueryService::new(
-                fixture.kernel.authority.governor(),
-                fixture.kernel.ledger()?,
-                16,
-            );
-            let query = service.plan_pipeline(
-                fixture.context,
-                "logs | range query_time -100 100 | limit 4",
-                QueryBudget::new(1_048_576, 4, 4, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
-            )?;
-            let events = service.execute(query)?.collect::<Vec<_>>();
-            let header = events
-                .iter()
-                .find_map(|event| match event {
-                    QueryEvent::Header(header) => Some(header),
-                    QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
-                })
-                .ok_or("result header missing")?;
-            assert_eq!(
-                header.ordering().columns(),
-                ["query_time", "commit_position", "record_ordinal"]
-            );
-            let batch = events
-                .iter()
-                .find_map(|event| match event {
-                    QueryEvent::Batch(batch) => Some(batch),
-                    QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
-                })
-                .ok_or("result batch missing")?;
-            let records = batch
-                .records()
-                .iter()
-                .map(|record| {
-                    Ok((
-                        record.body_text().ok_or("body missing")?.to_owned(),
-                        record.record_ordinal().value(),
-                    ))
-                })
-                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-            Ok((records, batch.digest()))
-        };
+    let execute = |fixture: &QueryFixture| -> Result<OrderedBodyBatch, Box<dyn Error>> {
+        let service = QueryService::new(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            16,
+        );
+        let query = service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 4",
+            QueryBudget::new(1_048_576, 4, 4, 69, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        let header = events
+            .iter()
+            .find_map(|event| match event {
+                QueryEvent::Header(header) => Some(header),
+                QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+            })
+            .ok_or("result header missing")?;
+        assert_eq!(
+            header.ordering().columns(),
+            ["query_time", "commit_position", "record_ordinal"]
+        );
+        let batch = events
+            .iter()
+            .find_map(|event| match event {
+                QueryEvent::Batch(batch) => Some(batch),
+                QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+            })
+            .ok_or("result batch missing")?;
+        let records = batch
+            .records()
+            .iter()
+            .map(|record| {
+                Ok((
+                    record.body_text().ok_or("body missing")?.to_owned(),
+                    record.record_ordinal().value(),
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        Ok((records, batch.digest()))
+    };
 
     let active = execute(&fixture)?;
     assert_eq!(
@@ -294,7 +466,7 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 12, 1_048_576, 60)?.with_cpu_work_units(4)?,
+        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(4)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
@@ -306,7 +478,7 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 12, 1_048_576, 60)?.with_cpu_work_units(3)?,
+        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(3)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(matches!(
@@ -335,11 +507,11 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         16,
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_304, true), (1_303, false)] {
+    for (memory_bytes, expected_complete) in [(1_368, true), (1_367, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
-            QueryBudget::new(1_048_576, 2, 2, 12, memory_bytes, 60)?.with_cpu_work_units(16)?,
+            QueryBudget::new(1_048_576, 2, 2, 32, memory_bytes, 60)?.with_cpu_work_units(16)?,
         )?;
         let events = service.execute(query)?.collect::<Vec<_>>();
         assert_eq!(
@@ -362,11 +534,11 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(2_967, true), (2_966, false)] {
+    for (memory_bytes, expected_complete) in [(3_095, true), (3_094, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
-            QueryBudget::new(1_048_576, 4, 4, 64, memory_bytes, 60)?.with_cpu_work_units(16)?,
+            QueryBudget::new(1_048_576, 4, 4, 95, memory_bytes, 60)?.with_cpu_work_units(16)?,
         )?;
         let events = service.execute(query)?.collect::<Vec<_>>();
         assert_eq!(
@@ -523,7 +695,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 61, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let header = match events.first() {
@@ -562,13 +734,13 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     assert!(matches!(
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.records() == 3 && stats.output_bytes() == 61
+            if stats.records() == 3 && stats.output_bytes() == 91
     ));
 
     let output_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 60, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 90, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let output_events = service.execute(output_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -587,7 +759,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let memory_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 61, 8_737, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 91, 8_737, 60)?.with_cpu_work_units(16)?,
     )?;
     let memory_events = service.execute(memory_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -604,7 +776,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let work_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 61, 1_048_576, 60)?.with_cpu_work_units(5)?,
+        QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?.with_cpu_work_units(5)?,
     )?;
     let work_events = service.execute(work_exhausted)?.collect::<Vec<_>>();
     assert!(

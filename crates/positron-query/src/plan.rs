@@ -44,7 +44,7 @@ impl TemporalRange {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FilterPredicate {
-    BodyEquals(String),
+    BodyEquals(positron_domain::value::ValidatedAttributeValue),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

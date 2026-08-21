@@ -336,7 +336,9 @@ fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
         .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
 }
 
-fn parse_body_literal(source: &str) -> Result<String, QueryFailure> {
+fn parse_body_literal(
+    source: &str,
+) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
     let Some(inner) = source
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
@@ -346,7 +348,16 @@ fn parse_body_literal(source: &str) -> Result<String, QueryFailure> {
     if inner.len() > 65_536 || inner.contains('"') {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
-    Ok(inner.to_owned())
+    positron_domain::value::CandidateAttributeValue::string(inner.to_owned())
+        .validate_log_body(positron_domain::value::ValueLimitProfile::release_1_system_maximum())
+        .map_err(|failure| {
+            if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable
+            {
+                QueryFailure::new(QueryFailureCode::ResourceExhausted)
+            } else {
+                QueryFailure::new(QueryFailureCode::UnsupportedQuery)
+            }
+        })
 }
 
 fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailure> {

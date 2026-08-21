@@ -13,7 +13,7 @@ pub(crate) fn query_record(
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<Option<QueryRecord>, QueryFailure> {
     if let Some(crate::plan::FilterPredicate::BodyEquals(expected)) = plan.filter()
-        && record.body().and_then(|body| body.as_str()) != Some(expected.as_str())
+        && record.body() != Some(expected)
     {
         return Ok(None);
     }
@@ -38,17 +38,18 @@ pub(crate) fn query_record(
         .aggregate()
         .map(crate::plan::AggregateSpec::group_by)
         .unwrap_or_else(|| plan.projection());
-    let body = if selected_columns.contains(&crate::plan::ProjectionColumn::Body) {
+    let body_selected = selected_columns.contains(&crate::plan::ProjectionColumn::Body);
+    let body = if body_selected {
         record
             .body()
-            .and_then(|body| body.as_str())
-            .map(|body| try_retained_string(body, memory))
+            .map(|body| try_retained_value(body, memory))
             .transpose()?
     } else {
         None
     };
     Ok(Some(QueryRecord::new(
         body,
+        body_selected,
         ordering_time,
         record.commit_position(),
         record.record_ordinal(),
@@ -57,25 +58,29 @@ pub(crate) fn query_record(
     )))
 }
 
-fn try_retained_string(
-    value: &str,
+fn try_retained_value(
+    value: &positron_domain::value::ValidatedAttributeValue,
     memory: &mut crate::memory::QueryMemory,
-) -> Result<String, QueryFailure> {
-    let bytes = u64::try_from(value.len())
-        .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
+    let bytes = u64::try_from(
+        value
+            .retained_heap_bytes()
+            .map_err(map_domain_value_failure)?,
+    )
+    .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     memory.acquire(bytes)?;
-    let mut retained = String::new();
-    if retained.try_reserve_exact(value.len()).is_err() {
-        memory.release(bytes)?;
-        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+    match value.try_clone() {
+        Ok(retained) => Ok(retained),
+        Err(failure) => {
+            memory.release(bytes)?;
+            Err(map_domain_value_failure(failure))
+        },
     }
-    retained.push_str(value);
-    Ok(retained)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum GroupValue {
-    Body(Option<String>),
+    Body(Option<positron_domain::value::ValidatedAttributeValue>),
     QueryTime(positron_domain::time::UnixNanoseconds),
     CommitPosition(positron_domain::routing::CommitPosition),
 }
@@ -89,8 +94,12 @@ impl GroupKey {
         columns: &[crate::plan::ProjectionColumn],
     ) -> Result<(Self, u64), QueryFailure> {
         let (mut body, query_time, commit_position) = record.into_group_fields();
-        let body_bytes = u64::try_from(body.as_deref().map_or(0, str::len))
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let body_bytes = u64::try_from(
+            body.as_ref()
+                .map_or(Ok(0), |body| body.retained_heap_bytes())
+                .map_err(map_domain_value_failure)?,
+        )
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
         let mut values = Vec::new();
         values
             .try_reserve_exact(columns.len())
@@ -109,16 +118,20 @@ impl GroupKey {
 
     fn into_record(self, count: u64) -> QueryRecord {
         let mut body = None;
+        let mut body_selected = false;
         let mut query_time = None;
         let mut commit_position = None;
         for value in self.0 {
             match value {
-                GroupValue::Body(value) => body = value,
+                GroupValue::Body(value) => {
+                    body = value;
+                    body_selected = true;
+                },
                 GroupValue::QueryTime(value) => query_time = Some(value),
                 GroupValue::CommitPosition(value) => commit_position = Some(value),
             }
         }
-        QueryRecord::grouped_count_record(body, query_time, commit_position, count)
+        QueryRecord::grouped_count_record(body, body_selected, query_time, commit_position, count)
     }
 }
 
@@ -318,14 +331,11 @@ pub(crate) fn batch_digest(
         encoding.extend_from_slice(&query_time.value().to_be_bytes());
         encoding.extend_from_slice(&position.value().to_be_bytes());
         encoding.extend_from_slice(&ordinal.value().to_be_bytes());
-        let body = record.body_text().unwrap_or_default().as_bytes();
-        encoding.push(u8::from(record.body_text().is_some()));
-        encoding.extend_from_slice(
-            &u64::try_from(body.len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
-                .to_be_bytes(),
-        );
-        encoding.extend_from_slice(body);
+        encoding.push(u8::from(record.body_value().is_some()));
+        if let Some(body) = record.body_value() {
+            body.append_canonical_encoding(&mut encoding)
+                .map_err(map_domain_value_failure)?;
+        }
         encoding.push(u8::from(record.count().is_some()));
         if let Some(count) = record.count() {
             encoding.extend_from_slice(&count.to_be_bytes());
@@ -334,6 +344,14 @@ pub(crate) fn batch_digest(
     protector
         .digest(b"query-result-batch-v1", &encoding)
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+}
+
+fn map_domain_value_failure(failure: positron_domain::outcome::DomainFailure) -> QueryFailure {
+    if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable {
+        QueryFailure::new(QueryFailureCode::ResourceExhausted)
+    } else {
+        QueryFailure::new(QueryFailureCode::Internal)
+    }
 }
 
 fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<(), QueryFailure> {

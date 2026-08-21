@@ -278,9 +278,11 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
             batch
                 .records()
                 .first()
-                .and_then(|record| record.body_text())
-                .unwrap_or_default()
-                .len(),
+                .and_then(|record| record.body_value())
+                .ok_or("body value missing")?
+                .canonical_encoded_size_bytes()?
+                .checked_add(1)
+                .ok_or("output size overflow")?,
         ),
         _ => return Err("result batch missing".into()),
     };

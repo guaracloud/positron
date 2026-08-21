@@ -1,4 +1,4 @@
-use positron_domain::value::{AttributeValueKind, ValidatedAttributeValue};
+use positron_domain::value::ValidatedAttributeValue;
 
 use super::{LogRecord, StoredLogRecord};
 use crate::log_store::LogStoreFailure;
@@ -45,59 +45,10 @@ impl LogRecord {
 }
 
 fn retained_value_bytes(value: &ValidatedAttributeValue) -> Result<u64, LogStoreFailure> {
-    let payload = match value.kind() {
-        AttributeValueKind::Null => 0,
-        AttributeValueKind::Boolean => 1,
-        AttributeValueKind::SignedInteger | AttributeValueKind::FloatingPoint => 8,
-        AttributeValueKind::String => to_u64(
-            value
-                .as_str()
-                .ok_or_else(LogStoreFailure::invalid_input)?
-                .len(),
-        )?,
-        AttributeValueKind::Bytes => to_u64(
-            value
-                .as_bytes()
-                .ok_or_else(LogStoreFailure::invalid_input)?
-                .len(),
-        )?,
-        AttributeValueKind::Array => retained_array_bytes(value)?,
-        AttributeValueKind::KeyValueList => retained_key_value_bytes(value)?,
-    };
-    checked_add(VALUE_SLOT_BYTES, payload)
-}
-
-fn retained_array_bytes(value: &ValidatedAttributeValue) -> Result<u64, LogStoreFailure> {
-    let length = value
-        .array_len()
-        .ok_or_else(LogStoreFailure::invalid_input)?;
-    (0..length).try_fold(0_u64, |total, index| {
-        checked_add(
-            total,
-            retained_value_bytes(
-                value
-                    .array_entry(index)
-                    .ok_or_else(LogStoreFailure::invalid_input)?,
-            )?,
-        )
-    })
-}
-
-fn retained_key_value_bytes(value: &ValidatedAttributeValue) -> Result<u64, LogStoreFailure> {
-    let length = value
-        .key_value_list_len()
-        .ok_or_else(LogStoreFailure::invalid_input)?;
-    (0..length).try_fold(0_u64, |total, index| {
-        let entry = value
-            .key_value_entry(index)
-            .ok_or_else(LogStoreFailure::invalid_input)?;
-        let value_bytes = retained_value_bytes(entry.value())?;
-        let entry_bytes = DYNAMIC_ENTRY_SLOT_BYTES
-            .checked_add(to_u64(entry.key().len())?)
-            .and_then(|bytes| bytes.checked_add(value_bytes))
-            .ok_or_else(LogStoreFailure::limit_exceeded)?;
-        checked_add(total, entry_bytes)
-    })
+    let heap = value
+        .retained_heap_bytes()
+        .map_err(LogStoreFailure::domain)?;
+    checked_add(VALUE_SLOT_BYTES, to_u64(heap)?)
 }
 
 fn to_u64(value: usize) -> Result<u64, LogStoreFailure> {
