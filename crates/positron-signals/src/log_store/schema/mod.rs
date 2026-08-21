@@ -15,6 +15,7 @@ mod query;
 mod representation;
 mod session;
 mod stored_query;
+mod text_index;
 
 pub use catalog::SchemaCatalog;
 pub use checkpoint::SchemaCheckpointFrontier;
@@ -30,6 +31,8 @@ pub use query::{OccurrenceSelector, SchemaQuery, SchemaQueryResult, SchemaValue}
 pub use representation::SchemaRepresentation;
 pub use session::{SchemaQueryUpdate, SchemaSessionStore};
 pub use stored_query::SchemaTraversalFailure;
+pub use text_index::TextSearchCandidate;
+pub(crate) use text_index::{MIN_TEXT_INDEX_BUDGET_BYTES, TextBlockSummary};
 
 #[cfg(test)]
 mod tests;

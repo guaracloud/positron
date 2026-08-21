@@ -11,6 +11,7 @@ use super::model::{
 };
 #[cfg(test)]
 use super::observation::SchemaObservation;
+use super::text_index::TextBlockSummary;
 
 /// Observable typed schema and overflow state for one tenant.
 #[derive(Debug, Eq, PartialEq)]
@@ -136,6 +137,15 @@ impl SchemaCatalog {
         self.verified_block(identity, digest).is_some()
     }
 
+    pub(crate) fn may_add_text_summary(&self) -> bool {
+        let count = self
+            .block_indexes
+            .iter()
+            .filter(|block| block.text_summary.is_some())
+            .count();
+        count < super::text_index::MAX_TEXT_SUMMARY_BLOCKS
+    }
+
     pub(crate) fn entry_index(&self, path: &SchemaPath) -> Result<usize, usize> {
         self.entries.binary_search_by(|entry| entry.path.cmp(path))
     }
@@ -158,42 +168,64 @@ impl SchemaCatalog {
         added_persistent: usize,
         added_index: usize,
     ) -> Result<(), SchemaFailure> {
+        let text_version = next.iter().any(|block| {
+            block.text_summary.is_some() || block.text_framing == super::index::TextIndexFraming::V1
+        });
         for block in &mut next {
             block.scalar_framing = block.scalar_framing.for_mutation();
+            if text_version {
+                block.text_framing = block.text_framing.for_mutation();
+            }
         }
         let old_wire = Self::block_indexes_wire(&self.block_indexes)?;
-        let new_wire = Self::block_indexes_wire(&next)?;
         let old_memory = Self::block_indexes_memory(&self.block_indexes)?;
-        let new_memory = Self::block_indexes_memory(&next)?;
-        let next_persistent = self
-            .persistent_bytes
-            .checked_sub(old_wire)
-            .and_then(|bytes| bytes.checked_add(new_wire))
-            .and_then(|bytes| bytes.checked_add(added_persistent))
-            .ok_or(SchemaFailure::InvalidValue)?;
-        let next_index = self
-            .index_bytes
-            .checked_sub(old_wire)
-            .and_then(|bytes| bytes.checked_add(new_wire))
-            .and_then(|bytes| bytes.checked_add(added_index))
-            .and_then(|bytes| bytes.checked_sub(entry_index_reduction))
-            .ok_or(SchemaFailure::InvalidValue)?;
-        let next_memory = self
-            .memory_bytes
-            .checked_sub(old_memory)
-            .and_then(|bytes| bytes.checked_add(new_memory))
-            .and_then(|bytes| bytes.checked_add(added_memory))
-            .ok_or(SchemaFailure::InvalidValue)?;
-        if next_persistent > self.budget.max_persistent_bytes()
-            || next_index > self.budget.max_index_bytes()
-            || next_memory > self.budget.max_memory_bytes()
+        let totals = |blocks: &[SchemaBlockIndex]| -> Result<(usize, usize, usize), SchemaFailure> {
+            let new_wire = Self::block_indexes_wire(blocks)?;
+            let new_memory = Self::block_indexes_memory(blocks)?;
+            let persistent = self
+                .persistent_bytes
+                .checked_sub(old_wire)
+                .and_then(|bytes| bytes.checked_add(new_wire))
+                .and_then(|bytes| bytes.checked_add(added_persistent))
+                .ok_or(SchemaFailure::InvalidValue)?;
+            let index = self
+                .index_bytes
+                .checked_sub(old_wire)
+                .and_then(|bytes| bytes.checked_add(new_wire))
+                .and_then(|bytes| bytes.checked_add(added_index))
+                .and_then(|bytes| bytes.checked_sub(entry_index_reduction))
+                .ok_or(SchemaFailure::InvalidValue)?;
+            let memory = self
+                .memory_bytes
+                .checked_sub(old_memory)
+                .and_then(|bytes| bytes.checked_add(new_memory))
+                .and_then(|bytes| bytes.checked_add(added_memory))
+                .ok_or(SchemaFailure::InvalidValue)?;
+            Ok((persistent, index, memory))
+        };
+        let mut projected = totals(&next)?;
+        if (projected.0 > self.budget.max_persistent_bytes()
+            || projected.1 > self.budget.max_index_bytes()
+            || projected.2 > self.budget.max_memory_bytes())
+            && next.iter().any(|block| block.text_summary.is_some())
+        {
+            next.retain_mut(|block| {
+                block.text_summary = None;
+                block.text_framing = super::index::TextIndexFraming::LegacyV2;
+                !block.paths.is_empty()
+            });
+            projected = totals(&next)?;
+        }
+        if projected.0 > self.budget.max_persistent_bytes()
+            || projected.1 > self.budget.max_index_bytes()
+            || projected.2 > self.budget.max_memory_bytes()
         {
             return Err(SchemaFailure::LimitExceeded);
         }
         self.block_indexes = next;
-        self.persistent_bytes = next_persistent;
-        self.index_bytes = next_index;
-        self.memory_bytes = next_memory;
+        self.persistent_bytes = projected.0;
+        self.index_bytes = projected.1;
+        self.memory_bytes = projected.2;
         Ok(())
     }
 
@@ -220,7 +252,16 @@ impl SchemaCatalog {
                         .ok_or(SchemaFailure::LimitExceeded)
                 },
             )?;
-            total.checked_add(paths).ok_or(SchemaFailure::LimitExceeded)
+            let text = block
+                .text_summary
+                .as_ref()
+                .map(TextBlockSummary::memory_bytes)
+                .transpose()?
+                .unwrap_or(0);
+            total
+                .checked_add(paths)
+                .and_then(|bytes| bytes.checked_add(text))
+                .ok_or(SchemaFailure::LimitExceeded)
         })
     }
 

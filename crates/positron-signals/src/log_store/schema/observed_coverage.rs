@@ -5,6 +5,37 @@ use super::{SchemaCatalog, SchemaPath, SchemaQuery, SchemaValue};
 use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 
 impl SchemaCatalog {
+    pub(crate) fn verified_text_coverage_observed(
+        &self,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        candidate: &super::TextSearchCandidate,
+        observer: &dyn ScanObserver,
+    ) -> Result<Option<bool>, ScanObservationFailureCode> {
+        for index in &self.block_indexes {
+            observer.observe_work(1)?;
+            if index.identity != identity {
+                continue;
+            }
+            if index.digest != digest || !index.semantically_valid(&self.entries) {
+                return Ok(None);
+            }
+            let Some(summary) = index.text_summary.as_ref() else {
+                return Ok(None);
+            };
+            for trigram in summary.trigrams() {
+                observer.observe_work(1)?;
+                poll_payload(trigram, observer)?;
+            }
+            for literal in candidate.literals() {
+                observer.observe_work(1)?;
+                poll_payload(literal, observer)?;
+            }
+            return Ok(summary.might_contain(candidate));
+        }
+        Ok(None)
+    }
+
     pub(crate) fn verified_query_coverage_observed(
         &self,
         identity: StoreBlockIdentity,
@@ -80,4 +111,82 @@ fn poll_payload(
         observer.observe_work(0)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use positron_domain::identity::TenantId;
+    use positron_kernel::StoreBlockIdentity;
+
+    use super::super::index::{ScalarIndexFraming, SchemaBlockIndex, TextIndexFraming};
+    use super::super::text_index::TextBlockSummary;
+    use super::super::{SchemaBudget, TextSearchCandidate};
+    use super::SchemaCatalog;
+    use crate::log_store::{ScanObservationFailureCode, ScanObserver};
+
+    struct Unobserved;
+
+    impl ScanObserver for Unobserved {
+        fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn text_coverage_falls_back_for_missing_and_skips_other_block_indexes()
+    -> Result<(), Box<dyn Error>> {
+        let tenant = TenantId::from_bytes([0x41; 16])?;
+        let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+        let first = StoreBlockIdentity::new([0x01; 16])?;
+        let second = StoreBlockIdentity::new([0x02; 16])?;
+        catalog.block_indexes = vec![
+            SchemaBlockIndex {
+                identity: first,
+                digest: [0x11; 32],
+                paths: Vec::new(),
+                scalar_framing: ScalarIndexFraming::V2,
+                text_framing: TextIndexFraming::V1,
+                text_summary: Some(TextBlockSummary::from_bodies([Some("alpha")])?),
+            },
+            SchemaBlockIndex {
+                identity: second,
+                digest: [0x22; 32],
+                paths: Vec::new(),
+                scalar_framing: ScalarIndexFraming::V2,
+                text_framing: TextIndexFraming::V1,
+                text_summary: Some(TextBlockSummary::from_bodies([Some("beta")])?),
+            },
+        ];
+        let candidate = TextSearchCandidate::literal("eta")?.ok_or("candidate was generic")?;
+        let observer = Unobserved;
+
+        assert_eq!(
+            catalog.verified_text_coverage_observed(second, [0x22; 32], &candidate, &observer),
+            Ok(Some(true))
+        );
+        let missing = StoreBlockIdentity::new([0x03; 16])?;
+        assert_eq!(
+            catalog.verified_text_coverage_observed(missing, [0x33; 32], &candidate, &observer),
+            Ok(None)
+        );
+        let partial = StoreBlockIdentity::new([0x04; 16])?;
+        catalog.block_indexes.push(SchemaBlockIndex {
+            identity: partial,
+            digest: [0x44; 32],
+            paths: Vec::new(),
+            scalar_framing: ScalarIndexFraming::V2,
+            text_framing: TextIndexFraming::V1,
+            text_summary: Some(TextBlockSummary::from_wire_parts(
+                false,
+                vec![[b'z', b'z', b'z']],
+            )),
+        });
+        assert_eq!(
+            catalog.verified_text_coverage_observed(partial, [0x44; 32], &candidate, &observer),
+            Ok(None)
+        );
+        Ok(())
+    }
 }

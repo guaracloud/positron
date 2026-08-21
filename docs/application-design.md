@@ -577,6 +577,11 @@ Scalar String and Bytes sidecar payloads use the canonical 65,536-byte native
 value limit. Any mutation of a version 1 physical index upgrades its framing to
 version 2 and reserves the one-byte presence field atomically before publication;
 the governed mutation fails closed when that additional budget is unavailable.
+The same governed checkpoint may carry a bounded UTF-8 byte-trigram summary for
+string bodies. It is an optional version 3 per-block sidecar bound to the exact
+Store Block identity and authenticated payload digest; complete summaries can
+only prove candidate absence, while partial, stale, or missing summaries force
+the authenticated generic scan and set reduced pruning.
 Discovery returns tenant-bound bounded top
 paths, typed conflicts and variants, promotion decisions, budget pressure,
 overflow counts, and sampled path digests without exposing mutation authority.

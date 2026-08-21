@@ -104,8 +104,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         );
         let schema_query = state.plan.schema_query();
         let schema_filter_used = schema.zip(schema_query).is_some();
-        let scan_result = match schema.zip(schema_query) {
-            Some((schema, query)) => LogStore::new().scan_schema_observed(
+        let text_candidate = framed!(state.plan.text_search_candidate());
+        let text_filter_used = schema.zip(text_candidate.as_ref()).is_some();
+        let scan_result = match (schema, schema_query, text_candidate.as_ref()) {
+            (Some(schema), None, Some(candidate)) => LogStore::new().scan_text_observed(
+                self.governor,
+                state.tenant,
+                snapshot,
+                LogScan::through(scan_limit, frontier),
+                schema,
+                candidate,
+                &state.cancellation,
+                &observer,
+            ),
+            (Some(schema), Some(query), _) => LogStore::new().scan_schema_observed(
                 self.governor,
                 state.tenant,
                 snapshot,
@@ -115,7 +127,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 &state.cancellation,
                 &mut observer,
             ),
-            None => LogStore::new().scan_observed(
+            _ => LogStore::new().scan_observed(
                 self.governor,
                 state.tenant,
                 snapshot,
@@ -153,8 +165,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
 
         let has_operator_work = state.plan.has_advanced_operators();
-        state.reduced_pruning |=
-            state.plan.requires_post_decode_predicate_fallback() && !schema_filter_used;
+        state.reduced_pruning |= state.plan.requires_post_decode_predicate_fallback()
+            && !schema_filter_used
+            && !text_filter_used;
         let records = framed!(crate::operators::execute(
             self,
             &mut state,

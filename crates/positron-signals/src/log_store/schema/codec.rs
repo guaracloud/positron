@@ -9,7 +9,8 @@ use super::model::{
 
 const MAGIC: &[u8; 8] = b"PSCHEMA1";
 const LEGACY_VERSION: u16 = 1;
-const VERSION: u16 = 2;
+pub(super) const PREVIOUS_VERSION: u16 = 2;
+pub(super) const VERSION: u16 = 3;
 const MAX_SEGMENTS_ON_WIRE: usize = 128;
 mod encode;
 mod index;
@@ -17,6 +18,10 @@ mod preflight;
 
 pub(super) const fn legacy_version(version: u16) -> bool {
     version == LEGACY_VERSION
+}
+
+pub(super) const fn text_version(version: u16) -> bool {
+    version == VERSION
 }
 
 impl SchemaCatalog {
@@ -174,8 +179,12 @@ fn decode_checkpoint(
             .ok_or(SchemaFailure::MalformedCatalog)?;
         catalog.entries.push(entry);
     }
-    let (block_indexes, physical_bytes, physical_memory) =
-        index::decode(&mut input, budget, legacy_version(prefix.version))?;
+    let (block_indexes, physical_bytes, physical_memory) = index::decode(
+        &mut input,
+        budget,
+        legacy_version(prefix.version),
+        text_version(prefix.version),
+    )?;
     if block_indexes
         .iter()
         .any(|index| !index.semantically_valid(&catalog.entries))

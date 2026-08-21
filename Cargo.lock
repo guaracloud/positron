@@ -1151,6 +1151,7 @@ dependencies = [
  "positron-runtime",
  "positron-signals",
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]

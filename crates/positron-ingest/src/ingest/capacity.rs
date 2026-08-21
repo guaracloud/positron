@@ -34,8 +34,14 @@ pub(super) fn schema_admission_estimate(
     let mut clone_bytes = 0_u64;
     let mut schema_bytes = u64::try_from(std::mem::size_of::<Vec<SchemaEntry>>()).ok()?;
     let mut discovery_nodes = 0_u64;
+    let mut text_body_bytes = 0_usize;
+    let mut has_text_body = false;
     let discovery_limit = u64::try_from(SchemaBudget::system_max_discovery_nodes()).ok()?;
     for record in records {
+        if let Some(positron_domain::value::CandidateAttributeValue::String(body)) = record.body() {
+            has_text_body = true;
+            text_body_bytes = text_body_bytes.checked_add(body.len())?;
+        }
         for attribute in record.attributes() {
             clone_bytes = clone_bytes
                 .checked_add(u64::try_from(attribute.key().len()).ok()?)?
@@ -46,6 +52,14 @@ pub(super) fn schema_admission_estimate(
                 accumulate_discovery_nodes(value, &mut discovery_nodes, discovery_limit)?;
             }
         }
+    }
+    if has_text_body {
+        schema_bytes = schema_bytes.checked_add(
+            u64::try_from(SchemaBudget::text_index_block_memory_bound(
+                text_body_bytes,
+            )?)
+            .ok()?,
+        )?;
     }
     if discovery_nodes > 0 {
         schema_bytes = schema_bytes

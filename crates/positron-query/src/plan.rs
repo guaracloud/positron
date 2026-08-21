@@ -188,6 +188,35 @@ impl LogicalPlan {
         }
     }
 
+    pub(crate) fn text_search_candidate(
+        &self,
+    ) -> Result<Option<positron_signals::TextSearchCandidate>, crate::QueryFailure> {
+        let candidate = match self.filter.as_ref() {
+            Some(FilterPredicate::BodyContains(value)) => {
+                positron_signals::TextSearchCandidate::literal(value)
+            },
+            Some(FilterPredicate::BodyRegex(regex)) => {
+                positron_signals::TextSearchCandidate::any_of_bytes(regex.pruning_literals())
+            },
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => return Ok(None),
+        };
+        candidate.map_err(|failure| match failure {
+            positron_signals::SchemaFailure::AllocationUnavailable
+            | positron_signals::SchemaFailure::LimitExceeded => {
+                crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted)
+            },
+            positron_signals::SchemaFailure::InvalidBudget
+            | positron_signals::SchemaFailure::PathTooLong
+            | positron_signals::SchemaFailure::InvalidPath
+            | positron_signals::SchemaFailure::InvalidValue
+            | positron_signals::SchemaFailure::MalformedCatalog => {
+                crate::QueryFailure::new(crate::QueryFailureCode::UnsupportedQuery)
+            },
+        })
+    }
+
     pub(crate) const fn requires_post_decode_predicate_fallback(&self) -> bool {
         self.filter.is_some()
     }

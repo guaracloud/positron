@@ -21,8 +21,226 @@ use crate::log_store::tests::support::{
 use crate::{
     LogScanResult, LogStoreFailure, LogStoreFailureCode, OccurrenceSelector, ScanCancellation,
     ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaCatalog, SchemaDiscoveryRequest,
-    SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue,
+    SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue, TextSearchCandidate,
 };
+
+struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct Unobserved;
+
+impl ScanObserver for Unobserved {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+}
+
+struct RejectObservedWork;
+
+impl ScanObserver for RejectObservedWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        if units > 0 {
+            Err(ScanObservationFailureCode::BudgetExhausted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn text_summary_prunes_absent_blocks_and_survives_reopen() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let kernel_catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x91; 16])?,
+        CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(91)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &kernel_catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x94; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let identity = StoreBlockIdentity::new([0x95; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        identity,
+        vec![super::minimal_record("alpha βeta", 100)?],
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+    let snapshot = ledger.snapshot()?;
+    let cancellation = NeverCancelled;
+    let observer = Unobserved;
+
+    let absent = TextSearchCandidate::literal("zzz")?
+        .ok_or("absent literal candidate was unexpectedly generic")?;
+    let other_schema = SchemaCatalog::new(
+        TenantId::from_bytes([0x42; 16])?,
+        SchemaBudget::release_1()?,
+    )?;
+    let scope_failure = store
+        .scan_text_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &other_schema,
+            &absent,
+            &cancellation,
+            &observer,
+        )
+        .expect_err("a tenant-mismatched schema must be refused before scanning");
+    assert_eq!(
+        scope_failure.code(),
+        LogStoreFailureCode::PhysicalScopeMismatch
+    );
+    let pruned = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &absent,
+        &cancellation,
+        &observer,
+    )?;
+    assert!(pruned.records().is_empty());
+    assert_eq!(pruned.decoded_records(), 0);
+    assert_eq!(pruned.scanned_bytes(), 0);
+    assert!(!pruned.reduced_pruning());
+
+    let present = TextSearchCandidate::literal("pha")?
+        .ok_or("present literal candidate was unexpectedly generic")?;
+    let decoded = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &present,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(decoded.records().len(), 1);
+    assert_eq!(decoded.decoded_records(), 1);
+    assert!(decoded.scanned_bytes() > 0);
+    assert!(!decoded.reduced_pruning());
+
+    // The ordinary catalog publication path and the checkpoint path must
+    // account for the same version-3 text framing bytes.
+    let catalog_object = schema.encode_catalog_object()?;
+    let reopened_catalog = SchemaCatalog::decode_catalog_object(&catalog_object)?;
+    assert_eq!(reopened_catalog.block_indexes, schema.block_indexes);
+
+    let checkpoint = schema.encode_checkpoint_object(&[])?;
+    let index_marker = checkpoint
+        .windows(8)
+        .position(|window| window == b"PINDEX1\0")
+        .ok_or("text index marker missing")?;
+    let text_presence = index_marker
+        .checked_add(73)
+        .ok_or("text presence offset overflow")?;
+    let mut invalid_presence = checkpoint.clone();
+    *invalid_presence
+        .get_mut(text_presence)
+        .ok_or("text presence missing")? = 2;
+    assert!(SchemaCatalog::decode_checkpoint_object(&invalid_presence).is_err());
+    let text_count = text_presence
+        .checked_add(2)
+        .ok_or("text count offset overflow")?;
+    let mut oversized_summary = checkpoint.clone();
+    oversized_summary
+        .get_mut(text_count..text_count + 8)
+        .ok_or("text count missing")?
+        .copy_from_slice(&u64::MAX.to_be_bytes());
+    assert!(SchemaCatalog::decode_checkpoint_object(&oversized_summary).is_err());
+    let reopened = SchemaCatalog::decode_checkpoint_object(&checkpoint)?.0;
+    let reopened_pruned = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &reopened,
+        &absent,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(reopened_pruned.records(), pruned.records());
+    assert_eq!(reopened_pruned.scanned_bytes(), 0);
+    assert!(!reopened_pruned.reduced_pruning());
+
+    let budget_failure = store
+        .scan_text_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &reopened,
+            &present,
+            &cancellation,
+            &RejectObservedWork,
+        )
+        .expect_err("text coverage work must be charged before digest/decode");
+    assert_eq!(budget_failure.code(), LogStoreFailureCode::BudgetExhausted);
+
+    let mut missing_summary = reopened;
+    missing_summary
+        .block_indexes
+        .first_mut()
+        .ok_or("text block index missing after reopen")?
+        .text_summary = None;
+    let fallback = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &missing_summary,
+        &present,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(fallback.records(), decoded.records());
+    assert!(fallback.scanned_bytes() > 0);
+    assert!(fallback.reduced_pruning());
+
+    let mut stale = SchemaCatalog::decode_checkpoint_object(&checkpoint)?.0;
+    stale
+        .block_indexes
+        .first_mut()
+        .ok_or("text block index missing for stale test")?
+        .digest[0] ^= 1;
+    let stale_result = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &stale,
+        &present,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(stale_result.records(), decoded.records());
+    assert!(stale_result.reduced_pruning());
+    Ok(())
+}
 
 #[test]
 fn stored_projection_compatibility_preserves_nested_occurrences_and_exact_matching()

@@ -35,7 +35,7 @@ pub use schema::{
     SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
     SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
     SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaTraversalFailure,
-    SchemaValue,
+    SchemaValue, TextSearchCandidate,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
@@ -123,6 +123,30 @@ impl LogStore {
                 });
             }
         }
+        let has_schema_overflow = records.iter().any(|record| {
+            record.attributes().iter().any(|attribute| {
+                attribute.representation() == AttributeRepresentation::SchemaOverflow
+            })
+        });
+        let has_text_body = records
+            .iter()
+            .any(|record| record.body().and_then(|body| body.as_str()).is_some());
+        if has_text_body
+            && !has_schema_overflow
+            && !delta.has_index_paths()
+            && schema.may_add_text_summary()
+            && schema.budget().max_index_bytes() >= schema::MIN_TEXT_INDEX_BUDGET_BYTES
+        {
+            let summary = schema::TextBlockSummary::from_bodies(
+                records
+                    .iter()
+                    .map(|record| record.body().and_then(|body| body.as_str())),
+            )
+            .map_err(map_schema_failure)?;
+            delta
+                .attach_text_summary(schema, summary)
+                .map_err(map_schema_failure)?;
+        }
         Ok(delta)
     }
 
@@ -155,11 +179,40 @@ impl LogStore {
         if schema.tenant() != tenant {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
+        let has_schema_overflow = decoded.records.iter().any(|record| {
+            record.attributes().iter().any(|attribute| {
+                attribute.representation() == AttributeRepresentation::SchemaOverflow
+            })
+        });
+        let has_text_body = decoded
+            .records
+            .iter()
+            .any(|record| record.body().and_then(|body| body.as_str()).is_some());
+        let summary = (has_text_body && !has_schema_overflow)
+            .then(|| {
+                schema::TextBlockSummary::from_bodies(
+                    decoded
+                        .records
+                        .iter()
+                        .map(|record| record.body().and_then(|body| body.as_str())),
+                )
+            })
+            .transpose()
+            .map_err(map_schema_failure)?;
         let mut delta = SchemaDelta::empty(tenant, true);
         let mut meter = schema::delta::DiscoveryMeter::new();
         for record in decoded.records {
             schema
                 .stage_replayed_record(record.attributes(), &mut delta, &mut meter)
+                .map_err(map_schema_failure)?;
+        }
+        if let Some(summary) = summary
+            && !delta.has_index_paths()
+            && schema.may_add_text_summary()
+            && schema.budget().max_index_bytes() >= schema::MIN_TEXT_INDEX_BUDGET_BYTES
+        {
+            delta
+                .attach_text_summary(schema, summary)
                 .map_err(map_schema_failure)?;
         }
         Ok(delta)
@@ -236,8 +289,60 @@ impl LogStore {
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        self.scan_observed_inner(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            None,
+        )
+    }
+
+    /// Scans authenticated blocks using the governed Log Store text summary
+    /// as a candidate-only pruning optimization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_text_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        schema: &SchemaCatalog,
+        candidate: &TextSearchCandidate,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        self.scan_observed_inner(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            Some((schema, candidate)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_observed_inner<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        text: Option<(&SchemaCatalog, &TextSearchCandidate)>,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
         let scope = snapshot.scope();
         if scope.tenant_id() != tenant || scope.signal_kind() != SignalKind::Logs {
+            return Err(LogStoreFailure::physical_scope_mismatch());
+        }
+        if let Some((schema, _)) = text
+            && schema.tenant() != tenant
+        {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
         check_scan_cancellation(cancellation)?;
@@ -280,6 +385,7 @@ impl LogStore {
         let mut scanned_bytes = 0_u64;
         let limit = scan.limit().value();
         let mut complete = true;
+        let mut reduced_pruning = false;
         for block in snapshot.blocks() {
             check_scan_cancellation(cancellation)?;
             if scan
@@ -287,6 +393,20 @@ impl LogStore {
                 .is_some_and(|frontier| block.position() > frontier)
             {
                 continue;
+            }
+            if let Some((schema, candidate)) = text {
+                observer
+                    .observe_work(1)
+                    .map_err(LogStoreFailure::observation)?;
+                let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
+                match schema
+                    .verified_text_coverage_observed(block.identity(), digest, candidate, observer)
+                    .map_err(LogStoreFailure::observation)?
+                {
+                    Some(false) => continue,
+                    Some(true) => {},
+                    None => reduced_pruning = true,
+                }
             }
             let remaining = limit.saturating_sub(records.len());
             if remaining == 0 {
@@ -336,7 +456,7 @@ impl LogStore {
             complete,
             scanned_bytes,
             retained_size_bytes,
-            false,
+            reduced_pruning,
             capacity,
         ))
     }

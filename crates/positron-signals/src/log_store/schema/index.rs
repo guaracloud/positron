@@ -3,6 +3,7 @@ use positron_kernel::StoreBlockIdentity;
 use std::cmp::Ordering;
 
 use super::query::SchemaValue;
+use super::text_index::TextBlockSummary;
 use super::{SchemaBudget, SchemaEntry, SchemaFailure, SchemaPath};
 
 pub(crate) const INDEX_MAGIC: &[u8; 8] = b"PINDEX1\0";
@@ -12,6 +13,7 @@ pub(crate) const MAX_BLOCK_INDEXES: usize = 4_096;
 pub(crate) const SCALAR_VALUES_MAGIC: &[u8; 8] = b"PVALUES\0";
 pub(crate) const MAX_INDEX_VALUES: usize = 4_096;
 const BLOCK_SCALAR_FRAMING_BYTES: usize = 1;
+const BLOCK_TEXT_FRAMING_BYTES: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScalarIndexFraming {
@@ -20,7 +22,7 @@ pub(crate) enum ScalarIndexFraming {
 }
 
 impl ScalarIndexFraming {
-    const fn encoded_bytes(self) -> usize {
+    pub(crate) const fn encoded_bytes(self) -> usize {
         match self {
             Self::LegacyV1 => 0,
             Self::V2 => BLOCK_SCALAR_FRAMING_BYTES,
@@ -30,6 +32,27 @@ impl ScalarIndexFraming {
     pub(crate) const fn for_mutation(self) -> Self {
         match self {
             Self::LegacyV1 | Self::V2 => Self::V2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextIndexFraming {
+    LegacyV2,
+    V1,
+}
+
+impl TextIndexFraming {
+    pub(crate) const fn encoded_bytes(self) -> usize {
+        match self {
+            Self::LegacyV2 => 0,
+            Self::V1 => BLOCK_TEXT_FRAMING_BYTES,
+        }
+    }
+
+    pub(crate) const fn for_mutation(self) -> Self {
+        match self {
+            Self::LegacyV2 | Self::V1 => Self::V1,
         }
     }
 }
@@ -236,6 +259,8 @@ pub(crate) struct SchemaBlockIndex {
     pub(crate) digest: [u8; 32],
     pub(crate) paths: Vec<SchemaIndexPath>,
     pub(crate) scalar_framing: ScalarIndexFraming,
+    pub(crate) text_framing: TextIndexFraming,
+    pub(crate) text_summary: Option<TextBlockSummary>,
 }
 
 impl SchemaBlockIndex {
@@ -252,6 +277,12 @@ impl SchemaBlockIndex {
             digest: self.digest,
             paths,
             scalar_framing: self.scalar_framing,
+            text_framing: self.text_framing,
+            text_summary: self
+                .text_summary
+                .as_ref()
+                .map(TextBlockSummary::try_clone)
+                .transpose()?,
         })
     }
 
@@ -270,11 +301,22 @@ impl SchemaBlockIndex {
             digest,
             paths,
             scalar_framing: ScalarIndexFraming::V2,
+            text_framing: TextIndexFraming::LegacyV2,
+            text_summary: None,
         })
     }
 
     pub(crate) fn encoded_bytes(&self) -> Result<usize, SchemaFailure> {
-        self.paths_encoded_bytes_for(&self.paths)?
+        let bytes = self
+            .paths_encoded_bytes_for(&self.paths)?
+            .checked_add(self.text_framing.encoded_bytes())
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        let bytes = self.text_summary.as_ref().map_or(Ok(bytes), |summary| {
+            bytes
+                .checked_add(summary.encoded_bytes()?)
+                .ok_or(SchemaFailure::LimitExceeded)
+        })?;
+        bytes
             .checked_add(BLOCK_INDEX_HEADER_BYTES)
             .ok_or(SchemaFailure::LimitExceeded)
     }
@@ -288,7 +330,7 @@ impl SchemaBlockIndex {
         framing: ScalarIndexFraming,
     ) -> Result<usize, SchemaFailure> {
         if paths.is_empty() {
-            return Ok(0);
+            return Ok(framing.encoded_bytes());
         }
         let has_values = paths.iter().any(|path| !path.values.is_empty());
         let value_count_slots = if has_values {
@@ -437,6 +479,15 @@ impl SchemaBudget {
     #[must_use]
     pub const fn block_index_memory_bytes() -> usize {
         std::mem::size_of::<SchemaBlockIndex>() + std::mem::size_of::<Vec<SchemaIndexPath>>()
+    }
+
+    /// Conservative retained-memory bound for a physical text summary and
+    /// its block-index owner.
+    #[must_use]
+    pub fn text_index_block_memory_bound(body_bytes: usize) -> Option<usize> {
+        Self::block_index_memory_bytes().checked_add(
+            super::text_index::TextBlockSummary::memory_bound(body_bytes)?,
+        )
     }
 
     /// Conservative retained-memory cost of one indexed path copy.
