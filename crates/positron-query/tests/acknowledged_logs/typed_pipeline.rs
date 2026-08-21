@@ -59,6 +59,164 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn projection_preserves_query_time_and_optional_event_time_simultaneously()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("event-time-projection")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(20),
+                Some(CandidateAttributeValue::string("event".to_owned())),
+            ),
+            (
+                None,
+                Some(CandidateAttributeValue::string("missing".to_owned())),
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time 0 100 | project query_time, event_time | limit 2",
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let header = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("result header missing")?;
+    assert_eq!(header.schema().columns(), ["query_time", "event_time"]);
+    assert_eq!(
+        header.schema().types(),
+        [
+            ResultValueType::UnixNanoseconds,
+            ResultValueType::OptionalUnixNanoseconds,
+        ]
+    );
+    let records = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("result batch missing")?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].query_time().value(), 20);
+    assert_eq!(records[0].event_time().map(|time| time.value()), Some(20));
+    assert_eq!(records[1].query_time().value(), 50);
+    assert_eq!(records[1].event_time(), None);
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.records() == 2 && stats.output_bytes() == 26
+    ));
+    Ok(())
+}
+
+#[test]
+fn event_time_grouping_orders_missing_before_present_on_a_query_time_range()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("event-time-grouping")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(20),
+                Some(CandidateAttributeValue::string("one".to_owned())),
+            ),
+            (
+                None,
+                Some(CandidateAttributeValue::string("missing".to_owned())),
+            ),
+            (
+                Some(20),
+                Some(CandidateAttributeValue::string("two".to_owned())),
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time 0 100 | aggregate count by event_time | limit 3",
+        QueryBudget::new(1_048_576, 3, 3, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let records = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("grouped result batch missing")?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].event_time(), None);
+    assert_eq!(records[0].count(), Some(1));
+    assert_eq!(records[1].event_time().map(|time| time.value()), Some(20));
+    assert_eq!(records[1].count(), Some(2));
+    Ok(())
+}
+
+#[test]
+fn event_time_range_excludes_records_without_event_time() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("event-time-range-missing")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(20),
+                Some(CandidateAttributeValue::string("event".to_owned())),
+            ),
+            (
+                None,
+                Some(CandidateAttributeValue::string("missing".to_owned())),
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range event_time 0 100 | project query_time, event_time | limit 2",
+        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?,
+    )?;
+
+    let records = service
+        .execute(query)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records().to_vec()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("event-time result batch missing")?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].query_time().value(), 20);
+    assert_eq!(records[0].event_time().map(|time| time.value()), Some(20));
+    Ok(())
+}
+
+#[test]
 fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("empty-body-equality")?;
     fixture.kernel.append_log_bodies(
@@ -466,7 +624,7 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
         fixture.kernel.ledger()?,
         16,
     );
-    let budget = QueryBudget::new(1_048_576, 16, 1, 8, 1_048_576, 60)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 16, 1_048_576, 60)?;
 
     let digest_for = |source| -> Result<[u8; 32], Box<dyn Error>> {
         let query = service.plan_pipeline(fixture.context, source, budget)?;
@@ -481,11 +639,13 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
     let query_time = "pipeline:v1 logs | range query_time -100 100 | project query_time | limit 1";
     let commit_position =
         "pipeline:v1 logs | range query_time -100 100 | project commit_position | limit 1";
+    let event_time = "pipeline:v1 logs | range query_time -100 100 | project event_time | limit 1";
     let descending_query_time = "pipeline:v1 logs | range query_time -100 100 | project query_time | order by query_time desc, commit_position desc | limit 1";
 
     let first = digest_for(query_time)?;
     assert_eq!(first, digest_for(query_time)?);
     assert_ne!(first, digest_for(commit_position)?);
+    assert_ne!(first, digest_for(event_time)?);
     assert_ne!(first, digest_for(descending_query_time)?);
     Ok(())
 }
@@ -622,7 +782,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         16,
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_368, true), (1_367, false)] {
+    for (memory_bytes, expected_complete) in [(1_432, true), (1_431, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -649,7 +809,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(3_095, true), (3_094, false)] {
+    for (memory_bytes, expected_complete) in [(3_223, true), (3_222, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,

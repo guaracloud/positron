@@ -10,6 +10,8 @@ pub enum ResultValueType {
     NativeValue,
     /// A signed Unix timestamp measured in nanoseconds.
     UnixNanoseconds,
+    /// An optional signed Unix timestamp; absence is a first-class value.
+    OptionalUnixNanoseconds,
     /// A monotonically increasing committed block position.
     CommitPosition,
     /// A record's stable ordinal within its committed block.
@@ -92,6 +94,7 @@ fn column_name(column: &crate::plan::ProjectionColumn) -> &'static str {
     match column {
         crate::plan::ProjectionColumn::Body => "body",
         crate::plan::ProjectionColumn::QueryTime => "query_time",
+        crate::plan::ProjectionColumn::EventTime => "event_time",
         crate::plan::ProjectionColumn::CommitPosition => "commit_position",
     }
 }
@@ -100,6 +103,7 @@ pub(crate) const fn column_type(column: crate::plan::ProjectionColumn) -> Result
     match column {
         crate::plan::ProjectionColumn::Body => ResultValueType::NativeValue,
         crate::plan::ProjectionColumn::QueryTime => ResultValueType::UnixNanoseconds,
+        crate::plan::ProjectionColumn::EventTime => ResultValueType::OptionalUnixNanoseconds,
         crate::plan::ProjectionColumn::CommitPosition => ResultValueType::CommitPosition,
     }
 }
@@ -242,9 +246,12 @@ pub struct QueryRecord {
     body: Option<positron_domain::value::ValidatedAttributeValue>,
     body_selected: bool,
     query_time: UnixNanoseconds,
+    event_time: Option<UnixNanoseconds>,
+    ordering_time: UnixNanoseconds,
     commit_position: CommitPosition,
     record_ordinal: RecordOrdinal,
     query_time_selected: bool,
+    event_time_selected: bool,
     commit_position_selected: bool,
     count: Option<u64>,
 }
@@ -254,18 +261,24 @@ impl QueryRecord {
         body: Option<positron_domain::value::ValidatedAttributeValue>,
         body_selected: bool,
         query_time: UnixNanoseconds,
+        event_time: Option<UnixNanoseconds>,
+        ordering_time: UnixNanoseconds,
         commit_position: CommitPosition,
         record_ordinal: RecordOrdinal,
         query_time_selected: bool,
+        event_time_selected: bool,
         commit_position_selected: bool,
     ) -> Self {
         Self {
             body,
             body_selected,
             query_time,
+            event_time,
+            ordering_time,
             commit_position,
             record_ordinal,
             query_time_selected,
+            event_time_selected,
             commit_position_selected,
             count: None,
         }
@@ -276,9 +289,12 @@ impl QueryRecord {
             body: None,
             body_selected: false,
             query_time: UnixNanoseconds::new(0),
+            event_time: None,
+            ordering_time: UnixNanoseconds::new(0),
             commit_position: CommitPosition::origin(),
             record_ordinal: RecordOrdinal::first(),
             query_time_selected: false,
+            event_time_selected: false,
             commit_position_selected: false,
             count: Some(count),
         }
@@ -288,6 +304,7 @@ impl QueryRecord {
         body: Option<positron_domain::value::ValidatedAttributeValue>,
         body_selected: bool,
         query_time: Option<UnixNanoseconds>,
+        event_time: Option<Option<UnixNanoseconds>>,
         commit_position: Option<CommitPosition>,
         count: u64,
     ) -> Self {
@@ -295,9 +312,12 @@ impl QueryRecord {
             body,
             body_selected,
             query_time: query_time.unwrap_or_else(|| UnixNanoseconds::new(0)),
+            event_time: event_time.flatten(),
+            ordering_time: UnixNanoseconds::new(0),
             commit_position: commit_position.unwrap_or_else(CommitPosition::origin),
             record_ordinal: RecordOrdinal::first(),
             query_time_selected: query_time.is_some(),
+            event_time_selected: event_time.is_some(),
             commit_position_selected: commit_position.is_some(),
             count: Some(count),
         }
@@ -314,6 +334,11 @@ impl QueryRecord {
     #[must_use]
     pub const fn query_time(&self) -> UnixNanoseconds {
         self.query_time
+    }
+    /// Returns Event Time exactly as received; missing Event Time remains absent.
+    #[must_use]
+    pub const fn event_time(&self) -> Option<UnixNanoseconds> {
+        self.event_time
     }
     #[must_use]
     pub const fn commit_position(&self) -> CommitPosition {
@@ -344,17 +369,27 @@ impl QueryRecord {
             0
         };
         let query_time_bytes = u64::from(self.query_time_selected) * 8;
+        let event_time_bytes = if self.event_time_selected {
+            1 + u64::from(self.event_time.is_some()) * 8
+        } else {
+            0
+        };
         let commit_position_bytes = u64::from(self.commit_position_selected) * 8;
         let count_bytes = u64::from(self.count.is_some()) * 8;
         body_bytes
             .checked_add(query_time_bytes)
+            .and_then(|bytes| bytes.checked_add(event_time_bytes))
             .and_then(|bytes| bytes.checked_add(commit_position_bytes))
             .and_then(|bytes| bytes.checked_add(count_bytes))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
     }
 
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition, RecordOrdinal) {
-        (self.query_time, self.commit_position, self.record_ordinal)
+        (
+            self.ordering_time,
+            self.commit_position,
+            self.record_ordinal,
+        )
     }
 
     pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {
@@ -371,9 +406,23 @@ impl QueryRecord {
     ) -> (
         Option<positron_domain::value::ValidatedAttributeValue>,
         UnixNanoseconds,
+        Option<UnixNanoseconds>,
         CommitPosition,
     ) {
-        (self.body, self.query_time, self.commit_position)
+        (
+            self.body,
+            self.query_time,
+            self.event_time,
+            self.commit_position,
+        )
+    }
+
+    pub(crate) const fn query_time_selected(&self) -> bool {
+        self.query_time_selected
+    }
+
+    pub(crate) const fn event_time_selected(&self) -> bool {
+        self.event_time_selected
     }
 }
 

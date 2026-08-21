@@ -429,7 +429,7 @@ fn parse_body_literal(
 }
 
 fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailure> {
-    if parts.is_empty() || parts.len() > 3 {
+    if parts.is_empty() || parts.len() > 4 {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     let mut projection = Vec::with_capacity(parts.len());
@@ -444,6 +444,7 @@ fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailur
         let column = match column {
             "body" => ProjectionColumn::Body,
             "query_time" => ProjectionColumn::QueryTime,
+            "event_time" => ProjectionColumn::EventTime,
             "commit_position" => ProjectionColumn::CommitPosition,
             _ => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
         };

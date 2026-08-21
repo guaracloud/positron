@@ -51,6 +51,7 @@ pub(crate) enum FilterPredicate {
 pub(crate) enum ProjectionColumn {
     Body,
     QueryTime,
+    EventTime,
     CommitPosition,
 }
 

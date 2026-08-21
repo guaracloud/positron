@@ -1,6 +1,7 @@
 use crate::{QueryFailure, QueryFailureCode, QueryRecord};
 
-pub(crate) const QUERY_RECORD_SLOT_BYTES: u64 = 96;
+/// Canonical conservative slot charge for every simultaneously retained typed query record.
+pub(crate) const QUERY_RECORD_SLOT_BYTES: u64 = 128;
 pub(crate) const GROUP_ENTRY_BYTES: u64 = 640;
 pub(crate) const GROUP_VALUE_SLOT_BYTES: u64 = 32;
 

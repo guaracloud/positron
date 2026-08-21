@@ -361,11 +361,25 @@ impl KernelFixture {
         event_time: i64,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
+        self.append_logs(
+            bodies
+                .into_iter()
+                .map(|body| (Some(event_time), body))
+                .collect(),
+            identity,
+        )
+    }
+
+    pub fn append_logs(
+        &self,
+        candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
         let mut records = Vec::new();
-        records.try_reserve_exact(bodies.len())?;
-        for body in bodies {
+        records.try_reserve_exact(candidates.len())?;
+        for (event_time, body) in candidates {
             let candidate =
-                NativeLogCandidate::new(Some(event_time), None, body, vec![], LogMetadata::empty());
+                NativeLogCandidate::new(event_time, None, body, vec![], LogMetadata::empty());
             let PolicyEvaluation::Accepted(evaluated) =
                 IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
             else {

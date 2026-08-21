@@ -18,16 +18,16 @@ pub(crate) fn query_record(
         return Ok(None);
     }
     let observed = record.observed_time();
+    let query_time = QueryTime::for_log(
+        &record.event_time(),
+        observed.as_ref(),
+        IngestTimeCandidate::new(record.ingest_time().instant()),
+    )
+    .instant();
+    let event_time = record.event_time().instant();
     let Some(ordering_time) = (match plan.temporal_axis() {
-        TemporalAxis::QueryTime => Some(
-            QueryTime::for_log(
-                &record.event_time(),
-                observed.as_ref(),
-                IngestTimeCandidate::new(record.ingest_time().instant()),
-            )
-            .instant(),
-        ),
-        TemporalAxis::EventTime => record.event_time().instant(),
+        TemporalAxis::QueryTime => Some(query_time),
+        TemporalAxis::EventTime => event_time,
     }) else {
         return Ok(None);
     };
@@ -50,10 +50,13 @@ pub(crate) fn query_record(
     Ok(Some(QueryRecord::new(
         body,
         body_selected,
+        query_time,
+        event_time,
         ordering_time,
         record.commit_position(),
         record.record_ordinal(),
         selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
+        selected_columns.contains(&crate::plan::ProjectionColumn::EventTime),
         selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition),
     )))
 }
@@ -82,6 +85,7 @@ fn try_retained_value(
 enum GroupValue {
     Body(Option<positron_domain::value::ValidatedAttributeValue>),
     QueryTime(positron_domain::time::UnixNanoseconds),
+    EventTime(Option<positron_domain::time::UnixNanoseconds>),
     CommitPosition(positron_domain::routing::CommitPosition),
 }
 
@@ -93,7 +97,7 @@ impl GroupKey {
         record: QueryRecord,
         columns: &[crate::plan::ProjectionColumn],
     ) -> Result<(Self, u64), QueryFailure> {
-        let (mut body, query_time, commit_position) = record.into_group_fields();
+        let (mut body, query_time, event_time, commit_position) = record.into_group_fields();
         let body_bytes = u64::try_from(
             body.as_ref()
                 .map_or(Ok(0), |body| body.retained_heap_bytes())
@@ -108,6 +112,7 @@ impl GroupKey {
             values.push(match column {
                 crate::plan::ProjectionColumn::Body => GroupValue::Body(body.take()),
                 crate::plan::ProjectionColumn::QueryTime => GroupValue::QueryTime(query_time),
+                crate::plan::ProjectionColumn::EventTime => GroupValue::EventTime(event_time),
                 crate::plan::ProjectionColumn::CommitPosition => {
                     GroupValue::CommitPosition(commit_position)
                 },
@@ -120,6 +125,7 @@ impl GroupKey {
         let mut body = None;
         let mut body_selected = false;
         let mut query_time = None;
+        let mut event_time = None;
         let mut commit_position = None;
         for value in self.0 {
             match value {
@@ -128,10 +134,18 @@ impl GroupKey {
                     body_selected = true;
                 },
                 GroupValue::QueryTime(value) => query_time = Some(value),
+                GroupValue::EventTime(value) => event_time = Some(value),
                 GroupValue::CommitPosition(value) => commit_position = Some(value),
             }
         }
-        QueryRecord::grouped_count_record(body, body_selected, query_time, commit_position, count)
+        QueryRecord::grouped_count_record(
+            body,
+            body_selected,
+            query_time,
+            event_time,
+            commit_position,
+            count,
+        )
     }
 }
 
@@ -336,6 +350,17 @@ pub(crate) fn batch_digest(
             body.append_canonical_encoding(&mut encoding)
                 .map_err(map_domain_value_failure)?;
         }
+        encoding.push(u8::from(record.query_time_selected()));
+        if record.query_time_selected() {
+            encoding.extend_from_slice(&record.query_time().value().to_be_bytes());
+        }
+        encoding.push(u8::from(record.event_time_selected()));
+        if record.event_time_selected() {
+            encoding.push(u8::from(record.event_time().is_some()));
+            if let Some(event_time) = record.event_time() {
+                encoding.extend_from_slice(&event_time.value().to_be_bytes());
+            }
+        }
         encoding.push(u8::from(record.count().is_some()));
         if let Some(count) = record.count() {
             encoding.extend_from_slice(&count.to_be_bytes());
@@ -409,6 +434,7 @@ const fn projection_column_tag(column: crate::plan::ProjectionColumn) -> u8 {
     match column {
         crate::plan::ProjectionColumn::Body => 0,
         crate::plan::ProjectionColumn::QueryTime => 1,
+        crate::plan::ProjectionColumn::EventTime => 3,
         crate::plan::ProjectionColumn::CommitPosition => 2,
     }
 }
@@ -417,6 +443,7 @@ const fn result_value_type_tag(value_type: crate::ResultValueType) -> u8 {
     match value_type {
         crate::ResultValueType::NativeValue => 0,
         crate::ResultValueType::UnixNanoseconds => 1,
+        crate::ResultValueType::OptionalUnixNanoseconds => 5,
         crate::ResultValueType::CommitPosition => 2,
         crate::ResultValueType::RecordOrdinal => 3,
         crate::ResultValueType::UnsignedInteger => 4,

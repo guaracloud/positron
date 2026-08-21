@@ -229,8 +229,8 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().records() == 1
-                && incomplete.stats().output_bytes() == 14
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
                 && incomplete.stats().result_digest() == [0; 32]
     ));
 
