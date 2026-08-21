@@ -217,7 +217,10 @@ fn pipeline_stages(source: &str) -> Result<Vec<&str>, QueryFailure> {
                 '\\' => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
                 '"' => quoted = !quoted,
                 '|' if !quoted => {
-                    stages.push(source[start..index].trim());
+                    let stage = source
+                        .get(start..index)
+                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+                    stages.push(stage.trim());
                     start = index
                         .checked_add(character.len_utf8())
                         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
@@ -229,12 +232,18 @@ fn pipeline_stages(source: &str) -> Result<Vec<&str>, QueryFailure> {
     if quoted || escaped {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
-    stages.push(source[start..].trim());
+    let stage = source
+        .get(start..)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+    stages.push(stage.trim());
     Ok(stages)
 }
 
 fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure> {
-    if stages.first() != Some(&"pipeline:v1 logs") {
+    let Some((&header, remaining_stages)) = stages.split_first() else {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    };
+    if header != "pipeline:v1 logs" {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     let mut range = None;
@@ -244,16 +253,19 @@ fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure
     let mut ordering = None;
     let mut limit = None;
     let mut stage_order = 0_u8;
-    for &stage in &stages[1..] {
+    for &stage in remaining_stages {
         if limit.is_some() || (!stage.starts_with("range ") && range.is_none()) {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         if let Some(arguments) = stage.strip_prefix("range ") {
             let tokens = arguments.split_ascii_whitespace().collect::<Vec<_>>();
-            if tokens.len() != 3 || range.is_some() || stage_order != 0 {
+            let &[axis, start, end] = tokens.as_slice() else {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            };
+            if range.is_some() || stage_order != 0 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            range = Some((tokens[0], tokens[1], tokens[2]));
+            range = Some((axis, start, end));
             stage_order = 1;
         } else if let Some(literal) = stage.strip_prefix("filter body == ") {
             if filter.is_some() || stage_order > 1 {
@@ -471,17 +483,15 @@ fn parse_aggregate(stage: &str) -> Result<AggregateSpec, QueryFailure> {
 
 fn parse_ordering(axis: TemporalAxis, specification: &str) -> Result<OrderSpec, QueryFailure> {
     let tokens = specification.split_ascii_whitespace().collect::<Vec<_>>();
-    if tokens.len() != 4 {
+    let &[primary, primary_direction, commit, commit_direction] = tokens.as_slice() else {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
-    let primary = tokens[0];
+    };
     let primary_direction = parse_direction(
-        tokens[1]
+        primary_direction
             .strip_suffix(',')
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
     )?;
-    let commit = tokens[2];
-    let commit_direction = parse_direction(tokens[3])?;
+    let commit_direction = parse_direction(commit_direction)?;
     let expected_axis = match axis {
         TemporalAxis::QueryTime => "query_time",
         TemporalAxis::EventTime => "event_time",
