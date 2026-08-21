@@ -3,7 +3,8 @@ use std::error::Error;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 use positron_query::{
-    QueryBudget, QueryCursor, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+    QueryBudget, QueryBudgetDimension, QueryCursor, QueryEvent, QueryFailureCode, QueryService,
+    QueryTerminal,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
@@ -222,6 +223,17 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
             .expect_err("zero temporal bound")
             .code(),
         QueryFailureCode::InvalidBudget
+    );
+    assert_eq!(
+        QueryBudget::new(1, 1, 1, 1, 1, 3_600)?.wall_seconds(),
+        3_600
+    );
+    let overlong_wall = QueryBudget::new(1, 1, 1, 1, 1, 3_601)
+        .expect_err("wall budget above the Release-1 lease ceiling");
+    assert_eq!(overlong_wall.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        overlong_wall.limiting_budget(),
+        Some(QueryBudgetDimension::WallSeconds)
     );
     assert!(QueryCursor::from_bytes(&[0; 340]).is_err());
     assert!(QueryCursor::from_bytes(&[0; 341]).is_ok());

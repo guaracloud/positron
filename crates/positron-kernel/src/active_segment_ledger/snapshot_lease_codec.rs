@@ -2,7 +2,9 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use super::format::position_from_value;
-use super::snapshot_lease::{LeaseBlock, LeaseRecord, SnapshotLeaseId};
+use super::snapshot_lease_record::{
+    LeaseBlock, LeaseRecord, SnapshotLeaseId, valid_lease_interval,
+};
 use super::{
     CommittedBlock, LedgerFailure, LedgerFailureCode, SegmentId, SegmentScope, StoreBlockIdentity,
 };
@@ -14,7 +16,9 @@ const LEASE_HEADER_BYTES: usize = 113;
 const LEASE_BLOCK_BYTES: usize = 40;
 
 pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
-    if record.blocks.len() > super::MAX_RETAINED_BLOCKS {
+    if record.blocks.len() > super::MAX_RETAINED_BLOCKS
+        || !valid_lease_interval(record.observed_at, record.expiry)
+    {
         return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
     }
     let mut bytes =
@@ -84,18 +88,23 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
             segment: SegmentId::new(exact(bytes, start + 24)?)?,
         });
     }
+    let observed_at = if version == 1 {
+        0
+    } else {
+        u64::from_be_bytes(exact(bytes, 95)?)
+    };
+    let expiry = u64::from_be_bytes(exact(bytes, if version == 1 { 95 } else { 103 })?);
+    if version != 1 && !valid_lease_interval(observed_at, expiry) {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+    }
     Ok(Some(LeaseRecord {
         identity: SnapshotLeaseId::new(exact(bytes, 10)?)?,
         scope,
         catalog_identity: crate::CatalogGenerationId::from_authenticated_bytes(exact(bytes, 47)?),
         catalog_generation: u64::from_be_bytes(exact(bytes, 79)?),
         frontier: position_from_value(u64::from_be_bytes(exact(bytes, 87)?))?,
-        observed_at: if version == 1 {
-            0
-        } else {
-            u64::from_be_bytes(exact(bytes, 95)?)
-        },
-        expiry: u64::from_be_bytes(exact(bytes, if version == 1 { 95 } else { 103 })?),
+        observed_at,
+        expiry,
         blocks,
     }))
 }

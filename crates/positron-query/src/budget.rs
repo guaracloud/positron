@@ -51,6 +51,12 @@ impl QueryBudget {
         {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
+        if wall_seconds > positron_kernel::MAX_SNAPSHOT_LEASE_TTL_SECONDS {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                QueryBudgetDimension::WallSeconds,
+            ));
+        }
         Ok(Self {
             scanned_bytes,
             decoded_records,

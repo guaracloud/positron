@@ -1,4 +1,5 @@
-use super::snapshot_lease::{MAX_SNAPSHOT_LEASES, SnapshotLeaseId};
+use super::snapshot_lease::MAX_SNAPSHOT_LEASES;
+use super::snapshot_lease_record::SnapshotLeaseId;
 use super::{LedgerFailure, LedgerFailureCode};
 
 /// Fixed-capacity cleanup intent owned by the ledger that owns snapshot leases.

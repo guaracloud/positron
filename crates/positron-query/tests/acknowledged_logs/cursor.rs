@@ -183,6 +183,9 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         ("zero cpu budget", |bytes: &mut Vec<u8>| {
             bytes[261..269].fill(0)
         }),
+        ("overlong wall budget", |bytes: &mut Vec<u8>| {
+            bytes[269..277].copy_from_slice(&3_601_u64.to_be_bytes())
+        }),
     ] {
         let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v1")?;
         assert_eq!(

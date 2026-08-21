@@ -631,6 +631,10 @@ costing, Query Budget admission, Query Snapshots, Snapshot Leases, execution,
 cross-signal Correlation, Result Batches, Query Cursors, terminal status, and
 Result Digests.
 
+Release 1 admits query wall time and its Snapshot Lease under the same compiled
+one-hour hard ceiling. The Storage Kernel owns that canonical lifetime bound;
+making it configurable is outside the Release 1 surface.
+
 Signal Stores receive typed plan fragments, never query strings. The Storage
 Kernel returns snapshot-scoped verified block readers, never filesystem paths
 or key material.
