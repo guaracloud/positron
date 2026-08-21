@@ -168,20 +168,13 @@ impl GroupKey {
             .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
         memory.acquire(memory_bytes)?;
         let mut encoding = Vec::new();
-        if encoding.try_reserve_exact(encoded_bytes).is_err() {
-            memory.release(memory_bytes)?;
-            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-        }
+        encoding
+            .try_reserve_exact(encoded_bytes)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         for value in &self.0 {
-            if let Err(failure) = append_group_value_comparison(value, &mut encoding) {
-                drop(encoding);
-                memory.release(memory_bytes)?;
-                return Err(failure);
-            }
+            append_group_value_comparison(value, &mut encoding)?;
         }
         if encoding.len() != encoded_bytes {
-            drop(encoding);
-            memory.release(memory_bytes)?;
             return Err(QueryFailure::new(QueryFailureCode::Internal));
         }
         Ok((encoding, memory_bytes))
@@ -223,10 +216,9 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     memory.acquire(group_slots)?;
     let mut groups = Vec::<GroupEntry>::new();
-    if groups.try_reserve_exact(group_capacity).is_err() {
-        memory.release(group_slots)?;
-        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-    }
+    groups
+        .try_reserve_exact(group_capacity)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
     let key_slots = u64::try_from(aggregate.group_by().len())
         .ok()
         .and_then(|count| count.checked_mul(crate::memory::GROUP_VALUE_SLOT_BYTES))
@@ -236,13 +228,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
         memory.acquire(key_slots)?;
-        let (key, body_bytes) = match GroupKey::for_record(record, aggregate.group_by()) {
-            Ok(key) => key,
-            Err(failure) => {
-                memory.release(key_slots)?;
-                return Err(failure);
-            },
-        };
+        let (key, body_bytes) = GroupKey::for_record(record, aggregate.group_by())?;
         let (comparison, comparison_bytes) = key.comparison_encoding(memory)?;
         match find_group(service, state, &groups, &comparison)? {
             Ok(index) => {

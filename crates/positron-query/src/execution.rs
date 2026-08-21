@@ -308,44 +308,35 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let mut delivered_state = state.clone();
         delivered_state.prior_digest = digest;
         let batch_stats = stats_with_current(&delivered_state);
+        macro_rules! framed_batch {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(failure) => {
+                        return self.incomplete_events(
+                            vec![header, batch],
+                            failure,
+                            &state,
+                            delivered_before,
+                            batch_stats,
+                        );
+                    },
+                }
+            };
+        }
         let terminal = if pagination && end < wanted {
-            state.offset = match u16::try_from(end) {
-                Ok(offset) => offset,
-                Err(_) => {
-                    return self.incomplete_events(
-                        vec![header, batch],
-                        QueryFailure::new(QueryFailureCode::Internal),
-                        &state,
-                        delivered_before,
-                        batch_stats,
-                    );
-                },
-            };
-            state.sequence = match state.sequence.checked_add(1) {
-                Some(sequence) => sequence,
-                None => {
-                    return self.incomplete_events(
-                        vec![header, batch],
-                        QueryFailure::new(QueryFailureCode::Internal),
-                        &state,
-                        delivered_before,
-                        batch_stats,
-                    );
-                },
-            };
+            state.offset = framed_batch!(
+                u16::try_from(end).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+            );
+            state.sequence = framed_batch!(
+                state
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
+            );
             state.prior_digest = digest;
-            let cursor = match cursor::encode(&self.ledger.control_tokens(), state.clone()) {
-                Ok(cursor) => cursor,
-                Err(failure) => {
-                    return self.incomplete_events(
-                        vec![header, batch],
-                        failure,
-                        &state,
-                        delivered_before,
-                        batch_stats,
-                    );
-                },
-            };
+            let cursor =
+                framed_batch!(cursor::encode(&self.ledger.control_tokens(), state.clone(),));
             QueryTerminal::Continued(cursor)
         } else {
             state.prior_digest = digest;

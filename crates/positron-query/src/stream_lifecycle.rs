@@ -52,40 +52,28 @@ impl<'lease> QueryStream<'lease> {
         batch_stats: QueryStats,
         cancellation: crate::QueryCancellation,
     ) -> Self {
-        if retain_for_resume {
-            return Self::new(
-                events,
-                Some(release),
-                true,
-                observed_stats,
-                batch_stats,
-                cancellation,
-            );
-        }
-        match release() {
-            Ok(()) => Self::new(
-                events,
-                None,
-                false,
-                observed_stats,
-                batch_stats,
-                cancellation,
-            ),
-            Err(failure) => {
-                events.retain(|event| !matches!(event, QueryEvent::Terminal(_)));
-                events.push(QueryEvent::Terminal(QueryTerminal::Incomplete(
-                    QueryIncomplete::new(failure, batch_stats),
-                )));
-                Self::new(
-                    events,
-                    Some(release),
-                    false,
-                    observed_stats,
-                    batch_stats,
-                    cancellation,
-                )
-            },
-        }
+        let release = if retain_for_resume {
+            Some(release)
+        } else {
+            match release() {
+                Ok(()) => None,
+                Err(failure) => {
+                    events.retain(|event| !matches!(event, QueryEvent::Terminal(_)));
+                    events.push(QueryEvent::Terminal(QueryTerminal::Incomplete(
+                        QueryIncomplete::new(failure, batch_stats),
+                    )));
+                    Some(release)
+                },
+            }
+        };
+        Self::new(
+            events,
+            release,
+            retain_for_resume,
+            observed_stats,
+            batch_stats,
+            cancellation,
+        )
     }
 
     pub fn cancel(&mut self) -> Result<(), QueryFailure> {
