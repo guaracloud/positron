@@ -278,6 +278,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             &self.ledger.control_tokens(),
             state.prior_digest,
             state.sequence,
+            &state.plan,
             &page,
             &state.cancellation,
         ) {

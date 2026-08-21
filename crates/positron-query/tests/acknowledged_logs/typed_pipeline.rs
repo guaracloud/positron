@@ -130,6 +130,40 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("typed-projection-digest")?;
+    fixture.kernel.append_log("not-selected", 1, 1)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 1, 8, 4, 60)?;
+
+    let digest_for = |source| -> Result<[u8; 32], Box<dyn Error>> {
+        let query = service.plan_pipeline(fixture.context, source, budget)?;
+        service
+            .execute(query)?
+            .find_map(|event| match event {
+                QueryEvent::Batch(batch) => Some(batch.digest()),
+                QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+            })
+            .ok_or_else(|| "result batch missing".into())
+    };
+    let query_time = "pipeline:v1 logs | range query_time -100 100 | project query_time | limit 1";
+    let commit_position =
+        "pipeline:v1 logs | range query_time -100 100 | project commit_position | limit 1";
+    let descending_query_time = "pipeline:v1 logs | range query_time -100 100 | project query_time | order by query_time desc, commit_position desc | limit 1";
+
+    let first = digest_for(query_time)?;
+    assert_eq!(first, digest_for(query_time)?);
+    assert_ne!(first, digest_for(commit_position)?);
+    assert_ne!(first, digest_for(descending_query_time)?);
+    Ok(())
+}
+
+#[test]
 fn versioned_pipeline_rejects_operator_combinations_it_cannot_execute() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("typed-operator-combinations")?;

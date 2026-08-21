@@ -267,12 +267,14 @@ pub(crate) fn batch_digest(
     protector: &positron_kernel::ControlTokenProtector<'_>,
     prior: [u8; 32],
     sequence: u64,
+    plan: &LogicalPlan,
     records: &[QueryRecord],
     cancellation: &crate::QueryCancellation,
 ) -> Result<[u8; 32], QueryFailure> {
     let mut encoding = Vec::new();
     encoding.extend_from_slice(&prior);
     encoding.extend_from_slice(&sequence.to_be_bytes());
+    encode_result_contract(&mut encoding, plan)?;
     encoding.extend_from_slice(
         &u64::try_from(records.len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
@@ -301,6 +303,58 @@ pub(crate) fn batch_digest(
     protector
         .digest(b"query-result-batch-v1", &encoding)
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+}
+
+fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<(), QueryFailure> {
+    let schema = plan
+        .aggregate()
+        .map(crate::plan::AggregateSpec::group_by)
+        .unwrap_or_else(|| plan.projection());
+    encoding.extend_from_slice(
+        &u64::try_from(schema.len() + usize::from(plan.aggregate().is_some()))
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
+            .to_be_bytes(),
+    );
+    for column in schema {
+        encoding.push(projection_column_tag(*column));
+    }
+    if plan.aggregate().is_some() {
+        encoding.push(3);
+        encoding.extend_from_slice(
+            &u64::try_from(schema.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
+                .to_be_bytes(),
+        );
+        for column in schema {
+            encoding.push(projection_column_tag(*column));
+            encoding.push(order_direction_tag(crate::plan::OrderDirection::Ascending));
+        }
+    } else {
+        encoding.extend_from_slice(&2_u64.to_be_bytes());
+        encoding.push(match plan.temporal_axis() {
+            crate::TemporalAxis::QueryTime => 4,
+            crate::TemporalAxis::EventTime => 5,
+        });
+        encoding.push(order_direction_tag(plan.ordering().primary_direction()));
+        encoding.push(2);
+        encoding.push(order_direction_tag(plan.ordering().commit_direction()));
+    }
+    Ok(())
+}
+
+const fn projection_column_tag(column: crate::plan::ProjectionColumn) -> u8 {
+    match column {
+        crate::plan::ProjectionColumn::Body => 0,
+        crate::plan::ProjectionColumn::QueryTime => 1,
+        crate::plan::ProjectionColumn::CommitPosition => 2,
+    }
+}
+
+const fn order_direction_tag(direction: crate::plan::OrderDirection) -> u8 {
+    match direction {
+        crate::plan::OrderDirection::Ascending => 0,
+        crate::plan::OrderDirection::Descending => 1,
+    }
 }
 
 pub(crate) fn map_ledger_failure(failure: positron_kernel::LedgerFailure) -> QueryFailure {
