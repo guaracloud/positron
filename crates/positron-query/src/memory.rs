@@ -5,6 +5,11 @@ pub(crate) const QUERY_RECORD_SLOT_BYTES: u64 = 128;
 pub(crate) const GROUP_ENTRY_BYTES: u64 = 128;
 pub(crate) const GROUP_VALUE_SLOT_BYTES: u64 = 32;
 
+const _: () = assert!(
+    std::mem::size_of::<QueryRecord>() <= QUERY_RECORD_SLOT_BYTES as usize,
+    "the canonical query-record slot charge must cover every retained row"
+);
+
 pub(crate) struct QueryMemory {
     limit: u64,
     current: u64,

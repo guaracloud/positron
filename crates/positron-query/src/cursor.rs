@@ -79,6 +79,7 @@ pub(crate) fn encode(
     bytes.push(match state.plan.temporal_axis() {
         TemporalAxis::QueryTime => 1,
         TemporalAxis::EventTime => 2,
+        TemporalAxis::IngestTime => 3,
     });
     bytes.extend_from_slice(
         &state
@@ -165,6 +166,7 @@ pub(crate) fn decode(
     let axis = match reader.array::<1>()?[0] {
         1 => TemporalAxis::QueryTime,
         2 => TemporalAxis::EventTime,
+        3 => TemporalAxis::IngestTime,
         _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
     };
     let range = TemporalRange::new(reader.i64()?, reader.i64()?)
@@ -254,6 +256,7 @@ fn plan_digest(
     encoding.push(match plan.temporal_axis() {
         TemporalAxis::QueryTime => 1,
         TemporalAxis::EventTime => 2,
+        TemporalAxis::IngestTime => 3,
     });
     encoding.extend_from_slice(&plan.temporal_range().start_nanoseconds().to_be_bytes());
     encoding.extend_from_slice(&plan.temporal_range().end_nanoseconds().to_be_bytes());

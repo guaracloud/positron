@@ -29,19 +29,19 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 16, 1, 16, 1_048_576, 60)?,
+        QueryBudget::new(1_048_576, 16, 1, 17, 1_048_576, 60)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.records() == 1 && stats.output_bytes() == 16
+            if stats.records() == 1 && stats.output_bytes() == 17
     ));
 
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 16, 1, 15, 1_048_576, 60)?,
+        QueryBudget::new(1_048_576, 16, 1, 16, 1_048_576, 60)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -100,10 +100,7 @@ fn projection_preserves_query_time_and_optional_event_time_simultaneously()
     assert_eq!(header.schema().columns(), ["query_time", "event_time"]);
     assert_eq!(
         header.schema().types(),
-        [
-            ResultValueType::UnixNanoseconds,
-            ResultValueType::OptionalUnixNanoseconds,
-        ]
+        [ResultValueType::QueryTime, ResultValueType::EventTime,]
     );
     let records = events
         .iter()
@@ -120,7 +117,127 @@ fn projection_preserves_query_time_and_optional_event_time_simultaneously()
     assert!(matches!(
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.records() == 2 && stats.output_bytes() == 26
+            if stats.records() == 2 && stats.output_bytes() == 30
+    ));
+    Ok(())
+}
+
+#[test]
+fn temporal_projection_preserves_provenance_quality_and_kernel_ingest_time()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::time::{QueryTimeProvenance, SourceTimeQuality};
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("lossless-temporal-projection")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(20),
+                Some(CandidateAttributeValue::string("usable".to_owned())),
+            ),
+            (
+                Some(0),
+                Some(CandidateAttributeValue::string("zero".to_owned())),
+            ),
+            (
+                None,
+                Some(CandidateAttributeValue::string("missing".to_owned())),
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range ingest_time 0 100 | project query_time, event_time, ingest_time, commit_position | order by ingest_time asc, commit_position asc | limit 3",
+        QueryBudget::new(1_048_576, 3, 3, 97, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let header = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("lossless temporal header missing")?;
+    assert_eq!(
+        header.schema().types(),
+        [
+            ResultValueType::QueryTime,
+            ResultValueType::EventTime,
+            ResultValueType::IngestTime,
+            ResultValueType::CommitPosition,
+        ]
+    );
+    assert_eq!(header.ordering().columns()[0], "ingest_time");
+    assert_eq!(header.ordering().types()[0], ResultValueType::IngestTime);
+
+    let records = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("lossless temporal batch missing")?;
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        records[0]
+            .query_time_value()
+            .ok_or("Query Time missing")?
+            .provenance(),
+        QueryTimeProvenance::Event
+    );
+    assert_eq!(
+        records[0]
+            .event_time_value()
+            .ok_or("Event Time missing")?
+            .quality(),
+        SourceTimeQuality::Usable
+    );
+    assert_eq!(
+        records[0]
+            .ingest_time_value()
+            .ok_or("Ingest Time missing")?
+            .instant()
+            .value(),
+        50
+    );
+    assert_eq!(
+        records[1]
+            .query_time_value()
+            .ok_or("Query Time missing")?
+            .provenance(),
+        QueryTimeProvenance::Ingest
+    );
+    assert_eq!(
+        records[1]
+            .event_time_value()
+            .ok_or("Event Time missing")?
+            .quality(),
+        SourceTimeQuality::Zero
+    );
+    assert_eq!(
+        records[2]
+            .query_time_value()
+            .ok_or("Query Time missing")?
+            .provenance(),
+        QueryTimeProvenance::Ingest
+    );
+    let missing_event_time = records[2]
+        .event_time_value()
+        .ok_or("Event Time field missing")?;
+    assert_eq!(missing_event_time.quality(), SourceTimeQuality::Missing);
+    assert_eq!(missing_event_time.instant(), None);
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.records() == 3 && stats.output_bytes() == 97
     ));
     Ok(())
 }
@@ -625,14 +742,14 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
         header.schema().types(),
         [
             ResultValueType::NativeValue,
-            ResultValueType::UnixNanoseconds,
+            ResultValueType::QueryTime,
             ResultValueType::CommitPosition,
         ]
     );
     assert_eq!(
         header.ordering().types(),
         [
-            ResultValueType::UnixNanoseconds,
+            ResultValueType::QueryTime,
             ResultValueType::CommitPosition,
             ResultValueType::RecordOrdinal,
         ]
@@ -669,7 +786,7 @@ fn grouped_schema_describes_native_keys_and_unsigned_counts() -> Result<(), Box<
         header.schema().types(),
         [
             ResultValueType::NativeValue,
-            ResultValueType::UnixNanoseconds,
+            ResultValueType::QueryTime,
             ResultValueType::CommitPosition,
             ResultValueType::UnsignedInteger,
         ]
@@ -678,7 +795,7 @@ fn grouped_schema_describes_native_keys_and_unsigned_counts() -> Result<(), Box<
         header.ordering().types(),
         [
             ResultValueType::NativeValue,
-            ResultValueType::UnixNanoseconds,
+            ResultValueType::QueryTime,
             ResultValueType::CommitPosition,
         ]
     );
@@ -1083,7 +1200,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?
+        QueryBudget::new(1_048_576, 16, 16, 94, 1_048_576, 60)?
             .with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -1123,13 +1240,13 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     assert!(matches!(
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.records() == 3 && stats.output_bytes() == 91
+            if stats.records() == 3 && stats.output_bytes() == 94
     ));
 
     let output_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 90, 1_048_576, 60)?
+        QueryBudget::new(1_048_576, 16, 16, 93, 1_048_576, 60)?
             .with_cpu_work_units(16)?,
     )?;
     let output_events = service.execute(output_exhausted)?.collect::<Vec<_>>();

@@ -1,4 +1,5 @@
-use positron_domain::time::{IngestTimeCandidate, QueryTime};
+use positron_domain::time::{EventTime, IngestTimeCandidate, QueryTime};
+use positron_kernel::IngestTime;
 use std::cmp::Ordering;
 
 use crate::cursor::CursorState;
@@ -20,16 +21,17 @@ pub(crate) fn query_record(
         return Ok(None);
     }
     let observed = record.observed_time();
+    let ingest_time = record.ingest_time();
     let query_time = QueryTime::for_log(
         &record.event_time(),
         observed.as_ref(),
-        IngestTimeCandidate::new(record.ingest_time().instant()),
-    )
-    .instant();
-    let event_time = record.event_time().instant();
+        IngestTimeCandidate::new(ingest_time.instant()),
+    );
+    let event_time = record.event_time();
     let Some(ordering_time) = (match plan.temporal_axis() {
-        TemporalAxis::QueryTime => Some(query_time),
-        TemporalAxis::EventTime => event_time,
+        TemporalAxis::QueryTime => Some(query_time.instant()),
+        TemporalAxis::EventTime => event_time.instant(),
+        TemporalAxis::IngestTime => Some(ingest_time.instant()),
     }) else {
         return Ok(None);
     };
@@ -54,6 +56,7 @@ pub(crate) fn query_record(
         crate::stream::QueryRecordTimes {
             query: query_time,
             event: event_time,
+            ingest: ingest_time,
             ordering: ordering_time,
         },
         record.commit_position(),
@@ -62,6 +65,7 @@ pub(crate) fn query_record(
             body: body_selected,
             query_time: selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
             event_time: selected_columns.contains(&crate::plan::ProjectionColumn::EventTime),
+            ingest_time: selected_columns.contains(&crate::plan::ProjectionColumn::IngestTime),
             commit_position: selected_columns
                 .contains(&crate::plan::ProjectionColumn::CommitPosition),
         },
@@ -91,10 +95,16 @@ fn try_retained_value(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum GroupValue {
     Body(Option<positron_domain::value::ValidatedAttributeValue>),
-    QueryTime(positron_domain::time::UnixNanoseconds),
-    EventTime(Option<positron_domain::time::UnixNanoseconds>),
+    QueryTime(QueryTime),
+    EventTime(EventTime),
+    IngestTime(IngestTime),
     CommitPosition(positron_domain::routing::CommitPosition),
 }
+
+const _: () = assert!(
+    std::mem::size_of::<GroupValue>() <= crate::memory::GROUP_VALUE_SLOT_BYTES as usize,
+    "the canonical group-value slot charge must cover every retained key component"
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GroupKey(Vec<GroupValue>);
@@ -104,7 +114,8 @@ impl GroupKey {
         record: QueryRecord,
         columns: &[crate::plan::ProjectionColumn],
     ) -> Result<(Self, u64), QueryFailure> {
-        let (mut body, query_time, event_time, commit_position) = record.into_group_fields();
+        let (mut body, query_time, event_time, ingest_time, commit_position) =
+            record.into_group_fields()?;
         let body_bytes = u64::try_from(
             body.as_ref()
                 .map_or(Ok(0), |body| body.retained_heap_bytes())
@@ -120,6 +131,7 @@ impl GroupKey {
                 crate::plan::ProjectionColumn::Body => GroupValue::Body(body.take()),
                 crate::plan::ProjectionColumn::QueryTime => GroupValue::QueryTime(query_time),
                 crate::plan::ProjectionColumn::EventTime => GroupValue::EventTime(event_time),
+                crate::plan::ProjectionColumn::IngestTime => GroupValue::IngestTime(ingest_time),
                 crate::plan::ProjectionColumn::CommitPosition => {
                     GroupValue::CommitPosition(commit_position)
                 },
@@ -133,6 +145,7 @@ impl GroupKey {
         let mut body_selected = false;
         let mut query_time = None;
         let mut event_time = None;
+        let mut ingest_time = None;
         let mut commit_position = None;
         for value in self.0 {
             match value {
@@ -142,6 +155,7 @@ impl GroupKey {
                 },
                 GroupValue::QueryTime(value) => query_time = Some(value),
                 GroupValue::EventTime(value) => event_time = Some(value),
+                GroupValue::IngestTime(value) => ingest_time = Some(value),
                 GroupValue::CommitPosition(value) => commit_position = Some(value),
             }
         }
@@ -150,6 +164,7 @@ impl GroupKey {
             body_selected,
             query_time,
             event_time,
+            ingest_time,
             commit_position,
             count,
         )
@@ -360,9 +375,9 @@ fn group_value_comparison_size(value: &GroupValue) -> Result<usize, QueryFailure
             .map_err(map_domain_value_failure)?
             .checked_add(2)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted)),
-        GroupValue::QueryTime(_) | GroupValue::CommitPosition(_) => Ok(9),
-        GroupValue::EventTime(None) => Ok(2),
-        GroupValue::EventTime(Some(_)) => Ok(10),
+        GroupValue::QueryTime(_) => Ok(10),
+        GroupValue::EventTime(value) => Ok(3 + usize::from(value.instant().is_some()) * 8),
+        GroupValue::IngestTime(_) | GroupValue::CommitPosition(_) => Ok(9),
     }
 }
 
@@ -381,16 +396,23 @@ fn append_group_value_comparison(
         },
         GroupValue::QueryTime(value) => {
             output.push(1);
-            let ordered = (value.value() as u64) ^ (1_u64 << 63);
+            let ordered = (value.instant().value() as u64) ^ (1_u64 << 63);
             output.extend_from_slice(&ordered.to_be_bytes());
+            output.push(query_time_provenance_tag(value.provenance()));
         },
         GroupValue::EventTime(value) => {
             output.push(2);
-            output.push(u8::from(value.is_some()));
-            if let Some(value) = value {
+            output.push(u8::from(value.instant().is_some()));
+            if let Some(value) = value.instant() {
                 let ordered = (value.value() as u64) ^ (1_u64 << 63);
                 output.extend_from_slice(&ordered.to_be_bytes());
             }
+            output.push(source_time_quality_tag(value.quality()));
+        },
+        GroupValue::IngestTime(value) => {
+            output.push(4);
+            let ordered = (value.instant().value() as u64) ^ (1_u64 << 63);
+            output.extend_from_slice(&ordered.to_be_bytes());
         },
         GroupValue::CommitPosition(value) => {
             output.push(3);
@@ -398,6 +420,24 @@ fn append_group_value_comparison(
         },
     }
     Ok(())
+}
+
+const fn query_time_provenance_tag(provenance: positron_domain::time::QueryTimeProvenance) -> u8 {
+    match provenance {
+        positron_domain::time::QueryTimeProvenance::Event => 0,
+        positron_domain::time::QueryTimeProvenance::Observed => 1,
+        positron_domain::time::QueryTimeProvenance::Ingest => 2,
+    }
+}
+
+const fn source_time_quality_tag(quality: positron_domain::time::SourceTimeQuality) -> u8 {
+    match quality {
+        positron_domain::time::SourceTimeQuality::Usable => 0,
+        positron_domain::time::SourceTimeQuality::Missing => 1,
+        positron_domain::time::SourceTimeQuality::Zero => 2,
+        positron_domain::time::SourceTimeQuality::Outlier => 3,
+        positron_domain::time::SourceTimeQuality::Contradictory => 4,
+    }
 }
 
 pub(crate) fn compare_records(
@@ -555,14 +595,29 @@ fn batch_digest_with_acquired_state(
         }
         digest.update(&[u8::from(record.query_time_selected())]);
         if record.query_time_selected() {
-            digest.update(&record.query_time().value().to_be_bytes());
+            let query_time = record
+                .query_time_value()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            digest.update(&query_time.instant().value().to_be_bytes());
+            digest.update(&[query_time_provenance_tag(query_time.provenance())]);
         }
         digest.update(&[u8::from(record.event_time_selected())]);
         if record.event_time_selected() {
-            digest.update(&[u8::from(record.event_time().is_some())]);
-            if let Some(event_time) = record.event_time() {
+            let event_time = record
+                .event_time_value()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            digest.update(&[u8::from(event_time.instant().is_some())]);
+            if let Some(event_time) = event_time.instant() {
                 digest.update(&event_time.value().to_be_bytes());
             }
+            digest.update(&[source_time_quality_tag(event_time.quality())]);
+        }
+        digest.update(&[u8::from(record.ingest_time_selected())]);
+        if record.ingest_time_selected() {
+            let ingest_time = record
+                .ingest_time_value()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            digest.update(&ingest_time.instant().value().to_be_bytes());
         }
         digest.update(&[u8::from(record.count().is_some())]);
         if let Some(count) = record.count() {
@@ -694,10 +749,13 @@ fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<
         encoding.push(match plan.temporal_axis() {
             crate::TemporalAxis::QueryTime => 4,
             crate::TemporalAxis::EventTime => 5,
+            crate::TemporalAxis::IngestTime => 7,
         });
-        encoding.push(result_value_type_tag(
-            crate::ResultValueType::UnixNanoseconds,
-        ));
+        encoding.push(result_value_type_tag(match plan.temporal_axis() {
+            crate::TemporalAxis::QueryTime => crate::ResultValueType::QueryTime,
+            crate::TemporalAxis::EventTime => crate::ResultValueType::EventTime,
+            crate::TemporalAxis::IngestTime => crate::ResultValueType::IngestTime,
+        }));
         encoding.push(order_direction_tag(plan.ordering().primary_direction()));
         encoding.push(2);
         encoding.push(result_value_type_tag(
@@ -716,6 +774,7 @@ const fn projection_column_tag(column: crate::plan::ProjectionColumn) -> u8 {
         crate::plan::ProjectionColumn::Body => 0,
         crate::plan::ProjectionColumn::QueryTime => 1,
         crate::plan::ProjectionColumn::EventTime => 3,
+        crate::plan::ProjectionColumn::IngestTime => 4,
         crate::plan::ProjectionColumn::CommitPosition => 2,
     }
 }
@@ -725,6 +784,9 @@ const fn result_value_type_tag(value_type: crate::ResultValueType) -> u8 {
         crate::ResultValueType::NativeValue => 0,
         crate::ResultValueType::UnixNanoseconds => 1,
         crate::ResultValueType::OptionalUnixNanoseconds => 5,
+        crate::ResultValueType::QueryTime => 6,
+        crate::ResultValueType::EventTime => 7,
+        crate::ResultValueType::IngestTime => 8,
         crate::ResultValueType::CommitPosition => 2,
         crate::ResultValueType::RecordOrdinal => 3,
         crate::ResultValueType::UnsignedInteger => 4,

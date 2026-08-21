@@ -1,5 +1,6 @@
 use positron_domain::routing::{CommitPosition, RecordOrdinal};
-use positron_domain::time::UnixNanoseconds;
+use positron_domain::time::{EventTime, QueryTime, UnixNanoseconds};
+use positron_kernel::IngestTime;
 
 use crate::{LogicalPlan, QueryBudget, QueryCursor, QueryFailure, QueryFailureCode, TemporalAxis};
 
@@ -12,6 +13,12 @@ pub enum ResultValueType {
     UnixNanoseconds,
     /// An optional signed Unix timestamp; absence is a first-class value.
     OptionalUnixNanoseconds,
+    /// A selected log Query Time with its source provenance.
+    QueryTime,
+    /// An exact source Event Time with its quality, including Missing.
+    EventTime,
+    /// A Storage Kernel-assigned Ingest Time.
+    IngestTime,
     /// A monotonically increasing committed block position.
     CommitPosition,
     /// A record's stable ordinal within its committed block.
@@ -95,6 +102,7 @@ fn column_name(column: &crate::plan::ProjectionColumn) -> &'static str {
         crate::plan::ProjectionColumn::Body => "body",
         crate::plan::ProjectionColumn::QueryTime => "query_time",
         crate::plan::ProjectionColumn::EventTime => "event_time",
+        crate::plan::ProjectionColumn::IngestTime => "ingest_time",
         crate::plan::ProjectionColumn::CommitPosition => "commit_position",
     }
 }
@@ -102,8 +110,9 @@ fn column_name(column: &crate::plan::ProjectionColumn) -> &'static str {
 pub(crate) const fn column_type(column: crate::plan::ProjectionColumn) -> ResultValueType {
     match column {
         crate::plan::ProjectionColumn::Body => ResultValueType::NativeValue,
-        crate::plan::ProjectionColumn::QueryTime => ResultValueType::UnixNanoseconds,
-        crate::plan::ProjectionColumn::EventTime => ResultValueType::OptionalUnixNanoseconds,
+        crate::plan::ProjectionColumn::QueryTime => ResultValueType::QueryTime,
+        crate::plan::ProjectionColumn::EventTime => ResultValueType::EventTime,
+        crate::plan::ProjectionColumn::IngestTime => ResultValueType::IngestTime,
         crate::plan::ProjectionColumn::CommitPosition => ResultValueType::CommitPosition,
     }
 }
@@ -134,12 +143,17 @@ impl ResultOrdering {
                 match plan.temporal_axis() {
                     TemporalAxis::QueryTime => "query_time",
                     TemporalAxis::EventTime => "event_time",
+                    TemporalAxis::IngestTime => "ingest_time",
                 },
                 "commit_position",
                 "record_ordinal",
             ],
             types: vec![
-                ResultValueType::UnixNanoseconds,
+                match plan.temporal_axis() {
+                    TemporalAxis::QueryTime => ResultValueType::QueryTime,
+                    TemporalAxis::EventTime => ResultValueType::EventTime,
+                    TemporalAxis::IngestTime => ResultValueType::IngestTime,
+                },
                 ResultValueType::CommitPosition,
                 ResultValueType::RecordOrdinal,
             ],
@@ -245,20 +259,23 @@ impl QueryHeader {
 pub struct QueryRecord {
     body: Option<positron_domain::value::ValidatedAttributeValue>,
     body_selected: bool,
-    query_time: UnixNanoseconds,
-    event_time: Option<UnixNanoseconds>,
+    query_time: Option<QueryTime>,
+    event_time: Option<EventTime>,
+    ingest_time: Option<IngestTime>,
     ordering_time: UnixNanoseconds,
     commit_position: CommitPosition,
     record_ordinal: RecordOrdinal,
     query_time_selected: bool,
     event_time_selected: bool,
+    ingest_time_selected: bool,
     commit_position_selected: bool,
     count: Option<u64>,
 }
 
 pub(crate) struct QueryRecordTimes {
-    pub(crate) query: UnixNanoseconds,
-    pub(crate) event: Option<UnixNanoseconds>,
+    pub(crate) query: QueryTime,
+    pub(crate) event: EventTime,
+    pub(crate) ingest: IngestTime,
     pub(crate) ordering: UnixNanoseconds,
 }
 
@@ -266,6 +283,7 @@ pub(crate) struct QueryRecordSelection {
     pub(crate) body: bool,
     pub(crate) query_time: bool,
     pub(crate) event_time: bool,
+    pub(crate) ingest_time: bool,
     pub(crate) commit_position: bool,
 }
 
@@ -280,13 +298,15 @@ impl QueryRecord {
         Self {
             body,
             body_selected: selection.body,
-            query_time: times.query,
-            event_time: times.event,
+            query_time: Some(times.query),
+            event_time: Some(times.event),
+            ingest_time: Some(times.ingest),
             ordering_time: times.ordering,
             commit_position,
             record_ordinal,
             query_time_selected: selection.query_time,
             event_time_selected: selection.event_time,
+            ingest_time_selected: selection.ingest_time,
             commit_position_selected: selection.commit_position,
             count: None,
         }
@@ -296,13 +316,15 @@ impl QueryRecord {
         Self {
             body: None,
             body_selected: false,
-            query_time: UnixNanoseconds::new(0),
+            query_time: None,
             event_time: None,
+            ingest_time: None,
             ordering_time: UnixNanoseconds::new(0),
             commit_position: CommitPosition::origin(),
             record_ordinal: RecordOrdinal::first(),
             query_time_selected: false,
             event_time_selected: false,
+            ingest_time_selected: false,
             commit_position_selected: false,
             count: Some(count),
         }
@@ -311,21 +333,24 @@ impl QueryRecord {
     pub(crate) fn grouped_count_record(
         body: Option<positron_domain::value::ValidatedAttributeValue>,
         body_selected: bool,
-        query_time: Option<UnixNanoseconds>,
-        event_time: Option<Option<UnixNanoseconds>>,
+        query_time: Option<QueryTime>,
+        event_time: Option<EventTime>,
+        ingest_time: Option<IngestTime>,
         commit_position: Option<CommitPosition>,
         count: u64,
     ) -> Self {
         Self {
             body,
             body_selected,
-            query_time: query_time.unwrap_or_else(|| UnixNanoseconds::new(0)),
-            event_time: event_time.flatten(),
+            query_time,
+            event_time,
+            ingest_time,
             ordering_time: UnixNanoseconds::new(0),
             commit_position: commit_position.unwrap_or_else(CommitPosition::origin),
             record_ordinal: RecordOrdinal::first(),
             query_time_selected: query_time.is_some(),
             event_time_selected: event_time.is_some(),
+            ingest_time_selected: ingest_time.is_some(),
             commit_position_selected: commit_position.is_some(),
             count: Some(count),
         }
@@ -341,12 +366,33 @@ impl QueryRecord {
     }
     #[must_use]
     pub const fn query_time(&self) -> UnixNanoseconds {
+        match self.query_time {
+            Some(query_time) => query_time.instant(),
+            None => UnixNanoseconds::new(0),
+        }
+    }
+    /// Returns Query Time with the provenance selected by the domain fallback rules.
+    #[must_use]
+    pub const fn query_time_value(&self) -> Option<QueryTime> {
         self.query_time
     }
     /// Returns Event Time exactly as received; missing Event Time remains absent.
     #[must_use]
     pub const fn event_time(&self) -> Option<UnixNanoseconds> {
+        match self.event_time {
+            Some(event_time) => event_time.instant(),
+            None => None,
+        }
+    }
+    /// Returns the exact Event Time and its source quality, including Missing.
+    #[must_use]
+    pub const fn event_time_value(&self) -> Option<EventTime> {
         self.event_time
+    }
+    /// Returns the Storage Kernel-assigned Ingest Time when this row represents a record.
+    #[must_use]
+    pub const fn ingest_time_value(&self) -> Option<IngestTime> {
+        self.ingest_time
     }
     #[must_use]
     pub const fn commit_position(&self) -> CommitPosition {
@@ -376,9 +422,25 @@ impl QueryRecord {
         } else {
             0
         };
-        let query_time_bytes = u64::from(self.query_time_selected) * 8;
+        let query_time_bytes = if self.query_time_selected {
+            self.query_time
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            9
+        } else {
+            0
+        };
         let event_time_bytes = if self.event_time_selected {
-            1 + u64::from(self.event_time.is_some()) * 8
+            let event_time = self
+                .event_time
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            2 + u64::from(event_time.instant().is_some()) * 8
+        } else {
+            0
+        };
+        let ingest_time_bytes = if self.ingest_time_selected {
+            self.ingest_time
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            8
         } else {
             0
         };
@@ -387,6 +449,7 @@ impl QueryRecord {
         body_bytes
             .checked_add(query_time_bytes)
             .and_then(|bytes| bytes.checked_add(event_time_bytes))
+            .and_then(|bytes| bytes.checked_add(ingest_time_bytes))
             .and_then(|bytes| bytes.checked_add(commit_position_bytes))
             .and_then(|bytes| bytes.checked_add(count_bytes))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
@@ -415,18 +478,26 @@ impl QueryRecord {
 
     pub(crate) fn into_group_fields(
         self,
-    ) -> (
-        Option<positron_domain::value::ValidatedAttributeValue>,
-        UnixNanoseconds,
-        Option<UnixNanoseconds>,
-        CommitPosition,
-    ) {
+    ) -> Result<
         (
+            Option<positron_domain::value::ValidatedAttributeValue>,
+            QueryTime,
+            EventTime,
+            IngestTime,
+            CommitPosition,
+        ),
+        QueryFailure,
+    > {
+        Ok((
             self.body,
-            self.query_time,
-            self.event_time,
+            self.query_time
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
+            self.event_time
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
+            self.ingest_time
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
             self.commit_position,
-        )
+        ))
     }
 
     pub(crate) const fn query_time_selected(&self) -> bool {
@@ -435,6 +506,10 @@ impl QueryRecord {
 
     pub(crate) const fn event_time_selected(&self) -> bool {
         self.event_time_selected
+    }
+
+    pub(crate) const fn ingest_time_selected(&self) -> bool {
+        self.ingest_time_selected
     }
 }
 

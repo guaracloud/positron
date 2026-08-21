@@ -354,6 +354,7 @@ fn plan(axis: &str, start: &str, end: &str, limit: &str) -> Result<LogicalPlan, 
     let axis = match axis {
         "query_time" => TemporalAxis::QueryTime,
         "event_time" => TemporalAxis::EventTime,
+        "ingest_time" => TemporalAxis::IngestTime,
         _ => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
     };
     let start = parse_timestamp(start)?;
@@ -429,7 +430,7 @@ fn parse_body_literal(
 }
 
 fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailure> {
-    if parts.is_empty() || parts.len() > 4 {
+    if parts.is_empty() || parts.len() > 5 {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     let mut projection = Vec::with_capacity(parts.len());
@@ -445,6 +446,7 @@ fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailur
             "body" => ProjectionColumn::Body,
             "query_time" => ProjectionColumn::QueryTime,
             "event_time" => ProjectionColumn::EventTime,
+            "ingest_time" => ProjectionColumn::IngestTime,
             "commit_position" => ProjectionColumn::CommitPosition,
             _ => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
         };
@@ -483,6 +485,7 @@ fn parse_ordering(axis: TemporalAxis, specification: &str) -> Result<OrderSpec, 
     let expected_axis = match axis {
         TemporalAxis::QueryTime => "query_time",
         TemporalAxis::EventTime => "event_time",
+        TemporalAxis::IngestTime => "ingest_time",
     };
     if primary != expected_axis || commit != "commit_position" {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));

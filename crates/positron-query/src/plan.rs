@@ -7,6 +7,7 @@ use crate::QueryBudget;
 pub enum TemporalAxis {
     QueryTime,
     EventTime,
+    IngestTime,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +53,7 @@ pub(crate) enum ProjectionColumn {
     Body,
     QueryTime,
     EventTime,
+    IngestTime,
     CommitPosition,
 }
 
