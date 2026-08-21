@@ -35,6 +35,11 @@ impl DetectedCapacity {
         require_capacity(amounts).map(|()| Self(amounts))
     }
 
+    #[cfg(all(feature = "test-support", not(any(test, fuzzing))))]
+    pub(super) fn new(amounts: ResourceAmounts) -> Result<Self, GovernorFailure> {
+        require_capacity(amounts).map(|()| Self(amounts))
+    }
+
     pub(super) const fn from_observed(amounts: ResourceAmounts) -> Self {
         Self(amounts)
     }
@@ -231,7 +236,7 @@ pub struct DiskObservation {
 
 impl DiskObservation {
     #[must_use]
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
     pub const fn new(usable_bytes: u64) -> Self {
         Self { usable_bytes }
     }

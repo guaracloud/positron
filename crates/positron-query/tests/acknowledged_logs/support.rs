@@ -11,13 +11,13 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, FixedLifecycleClockSource,
-    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
-    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
-    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
-    SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity,
-    TenantQuota, WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureThresholds,
+    FixedLifecycleClockSource, GovernorFailure, GovernorPolicy, InstanceId,
+    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
+    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
+    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
+    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, WorkClaim, WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
@@ -720,11 +720,23 @@ fn establish_authority(
     volume: positron_kernel::OwnedPrimaryDataVolume,
     tenant: TenantId,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    let configuration = fixture_configuration(&volume, tenant, FixtureInventory::Declared)?;
+    StorageKernelResourceAuthority::establish(volume, configuration)
+        .map_err(|_| "kernel authority establishment failed".into())
+}
+
+#[derive(Clone, Copy)]
+enum FixtureInventory {
+    Declared,
+    DetectedCpu(u64),
+}
+
+fn fixture_configuration(
+    volume: &positron_kernel::OwnedPrimaryDataVolume,
+    tenant: TenantId,
+    detected_inventory: FixtureInventory,
+) -> Result<ResourceGovernorConfiguration, Box<dyn Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
-    let observed = ObservedResourceEnvironment::observe(
-        &volume,
-        RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])?,
-    )?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);
@@ -738,7 +750,13 @@ fn establish_authority(
         add(recovery_capacity, ordinary_capacity)?,
         cardinality.governor_bootstrap_overhead(1)?,
     )?;
-    let disk = observed.initial_disk().usable_bytes();
+    let detected = match detected_inventory {
+        FixtureInventory::Declared => raw,
+        FixtureInventory::DetectedCpu(cpu_work_units) => with_cpu(raw, cpu_work_units),
+    };
+    let disk = detected.get(ResourceDimension::DiskHeadroomBytes);
+    let observed =
+        ObservedResourceEnvironment::for_test(volume, detected, DiskObservation::new(disk))?;
     let inventory = ResourceInventory::new_observed(
         observed,
         OperatorLimits::new(raw)?,
@@ -762,9 +780,9 @@ fn establish_authority(
     )?;
     let recovery =
         RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
-    let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;
-    StorageKernelResourceAuthority::establish(volume, configuration)
-        .map_err(|_| "kernel authority establishment failed".into())
+    Ok(ResourceGovernorConfiguration::new(
+        inventory, policy, recovery,
+    )?)
 }
 
 fn uniform(value: u64) -> ResourceAmounts {
@@ -806,4 +824,35 @@ fn add(left: ResourceAmounts, right: ResourceAmounts) -> Result<ResourceAmounts,
         value(ResourceDimension::FileDescriptors)?,
         value(ResourceDimension::DiskHeadroomBytes)?,
     ]))
+}
+
+#[test]
+fn four_core_capacity_cannot_admit_the_declared_acknowledged_logs_fixture_quota()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoots::new("four-core-capacity")?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let failure = match fixture_configuration(
+        &volume,
+        TenantId::from_bytes([0xa1; 16])?,
+        FixtureInventory::DetectedCpu(4_000),
+    ) {
+        Ok(_) => return Err("four logical CPUs unexpectedly admitted the fixture quota".into()),
+        Err(failure) => failure,
+    };
+
+    assert_eq!(
+        failure.downcast_ref::<GovernorFailure>(),
+        Some(&GovernorFailure::InvalidConfiguration)
+    );
+    Ok(())
+}
+
+#[test]
+fn acknowledged_logs_fixture_uses_its_declared_inventory_instead_of_live_host_capacity()
+-> Result<(), Box<dyn Error>> {
+    let _fixture = KernelFixture::new(
+        TenantId::from_bytes([0xa2; 16])?,
+        "deterministic-resource-inventory",
+    )?;
+    Ok(())
 }

@@ -11,6 +11,10 @@ homepage.workspace = true
 publish = false
 autotests = false
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-kw = { version = "=0.3.1", default-features = false, features = ["zeroize"] }

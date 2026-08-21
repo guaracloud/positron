@@ -20,5 +20,6 @@ positron-kernel = { path = "../positron-kernel" }
 positron-signals = { path = "../positron-signals" }
 
 [dev-dependencies]
+positron-kernel = { path = "../positron-kernel", features = ["test-support"] }
 positron-policy = { path = "../positron-policy" }
 positron-runtime = { path = "../positron-runtime" }
