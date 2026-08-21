@@ -274,6 +274,9 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let mut ordering = None;
     let mut limit = None;
     for stage in stages {
+        if limit.is_some() || (!stage.starts_with("range ") && range.is_none()) {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
         if let Some(arguments) = stage.strip_prefix("range ") {
             let tokens = arguments.split_ascii_whitespace().collect::<Vec<_>>();
             if tokens.len() != 3 || range.is_some() {

@@ -260,6 +260,15 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
         ))?,
         QueryFailureCode::ResourceAdmissionRefused
     );
+    for source in [
+        "pipeline:v1 logs | range query_time -100 100 | limit 1 | filter body == \"late\"",
+        "pipeline:v1 logs | filter body == \"late\" | range query_time -100 100 | limit 1",
+    ] {
+        assert_eq!(
+            failure_code(service.plan_pipeline(fixture.context, source, budget()))?,
+            QueryFailureCode::UnsupportedQuery
+        );
+    }
     Ok(())
 }
 
