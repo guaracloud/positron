@@ -35,21 +35,17 @@ impl StoredLogRecord {
         path: &SchemaPath,
     ) -> Result<Option<usize>, SchemaFailure> {
         let path_bytes = path.as_string()?.len();
-        let mut retained = path_bytes;
+        let profile = crate::log_store::LogStore::value_limit_profile();
+        let capacity = AttributeOccurrenceSet::projected_occurrence_capacity_bytes(profile)
+            .map_err(map_domain_failure)?;
+        let mut retained = path_bytes
+            .checked_add(capacity)
+            .ok_or(SchemaFailure::LimitExceeded)?;
         let mut found = false;
         visit_stored_terminals(self, path, &mut |value| {
             found = true;
             retained = retained
-                .checked_add(
-                    AttributeOccurrenceSet::retained_occurrence_bytes(value).map_err(
-                        |failure| match failure.code() {
-                            DomainFailureCode::AllocationUnavailable => {
-                                SchemaFailure::AllocationUnavailable
-                            },
-                            _ => SchemaFailure::LimitExceeded,
-                        },
-                    )?,
-                )
+                .checked_add(value.retained_heap_bytes().map_err(map_domain_failure)?)
                 .ok_or(SchemaFailure::LimitExceeded)?;
             Ok(true)
         })?;
@@ -61,22 +57,42 @@ impl StoredLogRecord {
         &self,
         path: &SchemaPath,
     ) -> Result<Option<AttributeOccurrenceSet>, SchemaFailure> {
+        let profile = crate::log_store::LogStore::value_limit_profile();
+        let maximum = usize::try_from(
+            profile
+                .effective_limits()
+                .dynamic_value()
+                .attributes_per_namespace()
+                .value(),
+        )
+        .map_err(|_| SchemaFailure::LimitExceeded)?;
+        let mut count = 0_usize;
+        visit_stored_terminals(self, path, &mut |_| {
+            count = count.checked_add(1).ok_or(SchemaFailure::LimitExceeded)?;
+            Ok(true)
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        if count > maximum {
+            return Err(SchemaFailure::LimitExceeded);
+        }
         let mut occurrences = Vec::new();
+        occurrences
+            .try_reserve_exact(count)
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        if occurrences.capacity() > maximum {
+            return Err(SchemaFailure::AllocationUnavailable);
+        }
         visit_stored_terminals(self, path, &mut |value| {
-            occurrences
-                .try_reserve(1)
-                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
             occurrences.push(value.try_clone().map_err(map_domain_failure)?);
             Ok(true)
         })?;
-        if occurrences.is_empty() {
-            return Ok(None);
-        }
         AttributeOccurrenceSet::from_validated(
             path.namespace(),
             path.as_string()?,
             occurrences,
-            crate::log_store::LogStore::value_limit_profile(),
+            profile,
         )
         .map(Some)
         .map_err(map_domain_failure)

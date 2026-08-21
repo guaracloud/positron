@@ -73,6 +73,12 @@ pub struct AttributeOccurrenceSet {
 }
 
 impl AttributeOccurrenceSet {
+    /// Canonical bytes reserved for one projected occurrence slot.
+    ///
+    /// The charge deliberately exceeds the current private representation so query
+    /// accounting is independent of allocator and enum layout details.
+    pub const PROJECTED_OCCURRENCE_SLOT_BYTES: usize = 64;
+
     /// Builds a projected occurrence set from values that already passed this profile.
     pub fn from_validated(
         namespace: AttributeNamespace,
@@ -158,6 +164,23 @@ impl AttributeOccurrenceSet {
         )
     }
 
+    /// Returns the canonical capacity charge for a projected occurrence vector.
+    pub fn projected_occurrence_capacity_bytes(
+        profile: ValueLimitProfile,
+    ) -> Result<usize, DomainFailure> {
+        let maximum = usize::try_from(
+            profile
+                .effective_limits()
+                .dynamic_value()
+                .attributes_per_namespace()
+                .value(),
+        )
+        .map_err(|_| DomainFailure::value_limit_exceeded())?;
+        maximum
+            .checked_mul(Self::PROJECTED_OCCURRENCE_SLOT_BYTES)
+            .ok_or_else(DomainFailure::value_limit_exceeded)
+    }
+
     /// Returns the self-delimiting canonical logical encoding length.
     pub fn canonical_encoded_size_bytes(&self) -> Result<usize, DomainFailure> {
         self.occurrences.iter().try_fold(
@@ -182,6 +205,11 @@ impl AttributeOccurrenceSet {
         visit(&[0])
     }
 }
+
+const _: () = assert!(
+    std::mem::size_of::<ValidatedAttributeValue>()
+        <= AttributeOccurrenceSet::PROJECTED_OCCURRENCE_SLOT_BYTES
+);
 
 const fn namespace_tag(namespace: AttributeNamespace) -> u8 {
     match namespace {

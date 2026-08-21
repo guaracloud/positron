@@ -89,11 +89,14 @@ fn project_attributes(
     columns: &[crate::plan::ProjectionColumn],
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<(Vec<crate::stream::AttributeProjection>, u64), QueryFailure> {
-    let slot_size = u64::try_from(std::mem::size_of::<crate::stream::AttributeProjection>())
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    const ATTRIBUTE_PROJECTION_SLOT_BYTES: u64 = 64;
+    const _: () = assert!(
+        std::mem::size_of::<crate::stream::AttributeProjection>()
+            <= ATTRIBUTE_PROJECTION_SLOT_BYTES as usize
+    );
     let slots = u64::try_from(columns.len())
         .ok()
-        .and_then(|count| count.checked_mul(slot_size))
+        .and_then(|count| count.checked_mul(ATTRIBUTE_PROJECTION_SLOT_BYTES))
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     memory.acquire(slots)?;
     let mut values = Vec::new();

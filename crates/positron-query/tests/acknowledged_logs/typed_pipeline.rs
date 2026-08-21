@@ -1027,6 +1027,75 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
 }
 
 #[test]
+fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
+    use positron_policy::NativeLogAttribute;
+
+    const EXACT_PEAK_BYTES: u64 = 66_498;
+
+    let fixture = QueryFixture::new("attribute-projection-memory")?;
+    fixture.kernel.append_attribute_logs(
+        vec![(
+            Some(10),
+            vec![NativeLogAttribute::new(
+                AttributeNamespace::Record,
+                "x".to_owned(),
+                vec![
+                    CandidateAttributeValue::null(),
+                    CandidateAttributeValue::null(),
+                ],
+            )],
+        )],
+        1,
+    )?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(0)),
+    );
+    let source = r#"pipeline:v1 logs | range query_time 0 100 | project record["x"] | limit 1"#;
+
+    let exact = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, EXACT_PEAK_BYTES, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+    let exact_events = service.execute(exact)?.collect::<Vec<_>>();
+    assert!(
+        exact_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        exact_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, EXACT_PEAK_BYTES - 1, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+    let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
+    assert!(
+        !exhausted_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+    ));
+    Ok(())
+}
+
+#[test]
 fn attribute_grouping_keeps_missing_distinct_from_the_full_occurrence_set()
 -> Result<(), Box<dyn Error>> {
     use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
