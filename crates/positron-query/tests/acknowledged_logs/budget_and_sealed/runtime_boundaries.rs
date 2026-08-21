@@ -163,13 +163,13 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
             "logs | range query_time -100 100 | limit 1",
             budget()?,
         )?;
-        assert_eq!(
-            service
-                .execute(planned)
-                .expect_err("runtime stage failure")
-                .code(),
-            QueryFailureCode::Internal
-        );
+        let events = service.execute(planned)?.collect::<Vec<_>>();
+        assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                if incomplete.code() == QueryFailureCode::Internal
+        ));
     }
 
     let service = QueryService::with_runtime(
@@ -186,13 +186,13 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
         "pipeline:v1 logs | range query_time -100 100 | project query_time | limit 1",
         budget()?,
     )?;
-    assert_eq!(
-        service
-            .execute(planned)
-            .expect_err("operator work meter failure")
-            .code(),
-        QueryFailureCode::Internal
-    );
+    let events = service.execute(planned)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Internal
+    ));
 
     let service = QueryService::with_clock(
         fixture.kernel.authority.governor(),

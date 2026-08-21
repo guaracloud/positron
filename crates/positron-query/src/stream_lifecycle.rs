@@ -44,6 +44,50 @@ impl<'lease> QueryStream<'lease> {
         }
     }
 
+    pub(crate) fn new_releasing(
+        mut events: Vec<QueryEvent>,
+        mut release: LeaseRelease<'lease>,
+        retain_for_resume: bool,
+        observed_stats: QueryStats,
+        batch_stats: QueryStats,
+        cancellation: crate::QueryCancellation,
+    ) -> Self {
+        if retain_for_resume {
+            return Self::new(
+                events,
+                Some(release),
+                true,
+                observed_stats,
+                batch_stats,
+                cancellation,
+            );
+        }
+        match release() {
+            Ok(()) => Self::new(
+                events,
+                None,
+                false,
+                observed_stats,
+                batch_stats,
+                cancellation,
+            ),
+            Err(failure) => {
+                events.retain(|event| !matches!(event, QueryEvent::Terminal(_)));
+                events.push(QueryEvent::Terminal(QueryTerminal::Incomplete(
+                    QueryIncomplete::new(failure, batch_stats),
+                )));
+                Self::new(
+                    events,
+                    Some(release),
+                    false,
+                    observed_stats,
+                    batch_stats,
+                    cancellation,
+                )
+            },
+        }
+    }
+
     pub fn cancel(&mut self) -> Result<(), QueryFailure> {
         self.cancellation.cancel();
         self.replace_pending_with_cancelled();
@@ -141,7 +185,46 @@ mod tests {
 
     use super::QueryStream;
     use crate::stream::QueryCounters;
-    use crate::{QueryEvent, QueryFailure, QueryFailureCode, QueryStats, QueryTerminal};
+    use crate::{
+        LogicalPlan, QueryBudget, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader,
+        QueryStats, QueryTerminal, ResultLease, ResultSnapshot, TemporalAxis, TemporalRange,
+    };
+
+    #[test]
+    fn initial_release_failure_keeps_header_and_frames_one_retryable_terminal() {
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&release_attempts);
+        let release = Box::new(move || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(QueryFailure::new(QueryFailureCode::StoreUnavailable))
+            } else {
+                Ok(())
+            }
+        });
+        let stats = empty_stats();
+        let mut stream = QueryStream::new_releasing(
+            vec![
+                QueryEvent::Header(test_header()),
+                QueryEvent::Terminal(QueryTerminal::Complete(stats)),
+            ],
+            release,
+            false,
+            stats,
+            stats,
+            crate::QueryCancellation::new(),
+        );
+
+        assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+        assert!(matches!(
+            stream.next(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                if incomplete.code() == QueryFailureCode::StoreUnavailable
+                    && incomplete.stats() == stats
+        ));
+        assert!(stream.next().is_none());
+        drop(stream);
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn cancellation_replaces_complete_truth_even_when_lease_release_needs_retry() {
@@ -231,6 +314,19 @@ mod tests {
             },
             None,
             [0; 32],
+        )
+    }
+
+    fn test_header() -> QueryHeader {
+        let range = TemporalRange::new(0, 1).expect("test range is valid");
+        let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
+        let budget = QueryBudget::new(1, 1, 1, 1, 1, 1).expect("test budget is valid");
+        QueryHeader::new(
+            plan,
+            budget,
+            ResultSnapshot::new([1; 32], 1, 1),
+            ResultLease::new([2; 16], 1),
+            None,
         )
     }
 }
