@@ -2,7 +2,7 @@ use crate::{
     QueryEvent, QueryFailure, QueryFailureCode, QueryIncomplete, QueryStats, QueryTerminal,
 };
 
-type LeaseRelease<'lease> = Box<dyn FnOnce() -> Result<(), QueryFailure> + 'lease>;
+type LeaseRelease<'lease> = Box<dyn FnMut() -> Result<(), QueryFailure> + 'lease>;
 
 pub struct QueryStream<'lease> {
     events: std::vec::IntoIter<QueryEvent>,
@@ -46,20 +46,27 @@ impl<'lease> QueryStream<'lease> {
 
     pub fn cancel(&mut self) -> Result<(), QueryFailure> {
         self.cancellation.cancel();
-        if let Some(release) = self.release.take() {
-            release()?;
-        }
         if self.terminal_observed {
             self.events = Vec::new().into_iter();
-            return Ok(());
+        } else {
+            self.events = vec![QueryEvent::Terminal(QueryTerminal::Incomplete(
+                QueryIncomplete::new(
+                    QueryFailure::new(QueryFailureCode::Cancelled),
+                    self.observed_stats,
+                ),
+            ))]
+            .into_iter();
         }
-        self.events = vec![QueryEvent::Terminal(QueryTerminal::Incomplete(
-            QueryIncomplete::new(
-                QueryFailure::new(QueryFailureCode::Cancelled),
-                self.observed_stats,
-            ),
-        ))]
-        .into_iter();
+        self.release_lease()?;
+        Ok(())
+    }
+
+    fn release_lease(&mut self) -> Result<(), QueryFailure> {
+        let Some(release) = self.release.as_mut() else {
+            return Ok(());
+        };
+        release()?;
+        self.release = None;
         Ok(())
     }
 }
@@ -104,9 +111,69 @@ impl Drop for QueryStream<'_> {
         if !(self.retain_for_resume
             && self.resumable_delivery_observed
             && !self.releasing_terminal_observed)
-            && let Some(release) = self.release.take()
+            && let Some(release) = self.release.as_mut()
         {
             let _ = release();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::QueryStream;
+    use crate::stream::QueryCounters;
+    use crate::{QueryEvent, QueryFailure, QueryFailureCode, QueryStats, QueryTerminal};
+
+    #[test]
+    fn cancellation_replaces_complete_truth_even_when_lease_release_needs_retry() {
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&release_attempts);
+        let release = Box::new(move || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(QueryFailure::new(QueryFailureCode::StoreUnavailable))
+            } else {
+                Ok(())
+            }
+        });
+        let stats = empty_stats();
+        let mut stream = QueryStream::new(
+            vec![QueryEvent::Terminal(QueryTerminal::Complete(stats))],
+            Some(release),
+            false,
+            stats,
+            stats,
+            crate::QueryCancellation::new(),
+        );
+
+        assert_eq!(
+            stream.cancel().expect_err("first release fails").code(),
+            QueryFailureCode::StoreUnavailable
+        );
+        assert!(matches!(
+            stream.next(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                if incomplete.code() == QueryFailureCode::Cancelled
+        ));
+        stream.cancel().expect("idempotent release retry succeeds");
+        assert!(stream.next().is_none());
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    fn empty_stats() -> QueryStats {
+        QueryStats::new(
+            QueryCounters {
+                records: 0,
+                scanned_bytes: 0,
+                decoded_records: 0,
+                output_bytes: 0,
+                cpu_work_units: 0,
+                wall_seconds: 0,
+            },
+            None,
+            [0; 32],
+        )
     }
 }
