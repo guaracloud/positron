@@ -25,6 +25,133 @@ use crate::{
 };
 
 #[test]
+fn stored_projection_compatibility_preserves_nested_occurrences_and_exact_matching()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x31; 16])?,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(31)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+    )?;
+    let store = LogStore::new();
+    let record = LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            vec![
+                CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                    "token".to_owned(),
+                    CandidateAttributeValue::boolean(true),
+                )]),
+                CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                    "token".to_owned(),
+                    CandidateAttributeValue::signed_integer(7),
+                )]),
+            ],
+        )],
+        PolicyProvenance::new(1, [0x36; 32], vec![])?,
+    )?;
+    let prepared = store.prepare(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(10))),
+        tenant,
+        shard,
+        StoreBlockIdentity::new([0x37; 16])?,
+        vec![record],
+    )?;
+    ledger.append(prepared.into_store_block())?;
+    let snapshot = ledger.snapshot()?;
+    let scan = store.scan(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+    )?;
+    let stored = scan
+        .records()
+        .first()
+        .ok_or("stored fixture missing")?
+        .stored();
+    let path = SchemaPath::new(AttributeNamespace::Record, "payload.token".to_owned())?;
+
+    let retained = stored
+        .projected_attribute_retained_bytes(&path)?
+        .ok_or("nested projection size missing")?;
+    let projected = stored
+        .project_attribute(&path)?
+        .ok_or("nested projection missing")?;
+    assert_eq!(projected.len(), 2);
+    assert_eq!(
+        projected.occurrence(0).and_then(|value| value.as_boolean()),
+        Some(true)
+    );
+    assert_eq!(
+        projected
+            .occurrence(1)
+            .and_then(|value| value.as_signed_integer()),
+        Some(7)
+    );
+
+    let mut observer = ProjectionObserver::default();
+    assert_eq!(
+        stored
+            .projected_attribute_retained_bytes_observed(&path, &mut observer)
+            .expect("observed retained sizing succeeds"),
+        Some(retained)
+    );
+    assert_eq!(
+        stored
+            .project_attribute_observed(&path, &mut observer)
+            .expect("observed projection succeeds"),
+        Some(projected)
+    );
+    assert!(observer.structures > 0);
+
+    let matches = SchemaQuery::value(
+        path,
+        OccurrenceSelector::Any,
+        SchemaValue::signed_integer(7),
+    );
+    assert!(matches.matches_stored_record(stored));
+    let missing = SchemaPath::root(AttributeNamespace::Record, "missing".to_owned())?;
+    assert_eq!(stored.projected_attribute_retained_bytes(&missing)?, None);
+    assert_eq!(stored.project_attribute(&missing)?, None);
+    Ok(())
+}
+
+#[derive(Default)]
+struct ProjectionObserver {
+    structures: usize,
+}
+
+impl NativeValueObserver for ProjectionObserver {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        self.structures += 1;
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[test]
 fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

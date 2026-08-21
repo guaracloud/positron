@@ -263,3 +263,134 @@ fn native_comparison_encoding_has_exactly_the_canonical_total_order() {
         }
     }
 }
+
+#[derive(Default)]
+struct CountingObserver {
+    structures: usize,
+    payload_chunks: usize,
+    fail_at_structure: Option<usize>,
+}
+
+impl NativeValueObserver for CountingObserver {
+    type Error = &'static str;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        self.structures += 1;
+        if self.fail_at_structure == Some(self.structures) {
+            return Err("cancelled traversal");
+        }
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        self.payload_chunks += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn observed_native_traversal_preserves_every_kind_and_bounds_payload_polls() {
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let value = CandidateAttributeValue::array(vec![
+        CandidateAttributeValue::null(),
+        CandidateAttributeValue::boolean(true),
+        CandidateAttributeValue::signed_integer(-7),
+        CandidateAttributeValue::floating_point_bits((-0.0_f64).to_bits()),
+        CandidateAttributeValue::string("s".repeat(1_025)),
+        CandidateAttributeValue::bytes(vec![0xa5; 1_025]),
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "nested".to_owned(),
+            CandidateAttributeValue::boolean(false),
+        )]),
+    ])
+    .validate_log_body(profile)
+    .expect("the mixed native fixture is within the release-one body bound");
+
+    let mut equality = CountingObserver::default();
+    assert!(
+        value
+            .equals_observed(&value, &mut equality)
+            .expect("observation succeeds")
+    );
+    assert!(equality.structures >= 16);
+    assert_eq!(equality.payload_chunks, 10);
+
+    let mut sizing = CountingObserver::default();
+    assert_eq!(
+        value
+            .retained_heap_bytes_observed(&mut sizing)
+            .expect("observed sizing succeeds"),
+        value
+            .retained_heap_bytes()
+            .expect("the bounded value has a retained size")
+    );
+    assert_eq!(sizing.payload_chunks, 5);
+
+    let mut cloning = CountingObserver::default();
+    assert_eq!(
+        value
+            .try_clone_observed(&mut cloning)
+            .expect("observed clone succeeds"),
+        value
+    );
+    assert_eq!(cloning.payload_chunks, 5);
+}
+
+#[test]
+fn observed_native_equality_is_exact_and_propagates_cancellation() {
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let validated = |candidate: CandidateAttributeValue| {
+        candidate
+            .validate_log_body(profile)
+            .expect("comparison fixture is bounded")
+    };
+    let cases = [
+        validated(CandidateAttributeValue::null()),
+        validated(CandidateAttributeValue::boolean(false)),
+        validated(CandidateAttributeValue::signed_integer(1)),
+        validated(CandidateAttributeValue::floating_point_bits(
+            1.0_f64.to_bits(),
+        )),
+        validated(CandidateAttributeValue::string("value".to_owned())),
+        validated(CandidateAttributeValue::bytes(vec![1, 2])),
+        validated(CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::boolean(true),
+        ])),
+        validated(CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new("key".to_owned(), CandidateAttributeValue::null()),
+        ])),
+    ];
+    for (index, left) in cases.iter().enumerate() {
+        for (other_index, right) in cases.iter().enumerate() {
+            let mut observer = CountingObserver::default();
+            assert_eq!(
+                left.equals_observed(right, &mut observer)
+                    .expect("comparison observation succeeds"),
+                index == other_index
+            );
+        }
+    }
+
+    let unequal_array = validated(CandidateAttributeValue::array(vec![]));
+    let unequal_key_values = validated(CandidateAttributeValue::key_value_list(vec![]));
+    let mut observer = CountingObserver::default();
+    assert!(
+        !cases[6]
+            .equals_observed(&unequal_array, &mut observer)
+            .expect("array length mismatch is explicit")
+    );
+    assert!(
+        !cases[7]
+            .equals_observed(&unequal_key_values, &mut observer)
+            .expect("key/value length mismatch is explicit")
+    );
+
+    let mut cancelled = CountingObserver {
+        fail_at_structure: Some(2),
+        ..CountingObserver::default()
+    };
+    assert_eq!(
+        cases[6].try_clone_observed(&mut cancelled),
+        Err(ObservedValueFailure::Observer("cancelled traversal"))
+    );
+}
