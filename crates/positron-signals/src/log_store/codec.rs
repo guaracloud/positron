@@ -137,6 +137,51 @@ pub(super) fn decode_block_cancellable(
     limit: usize,
     cancellation: &dyn super::ScanCancellation,
 ) -> Result<DecodedBlock, LogStoreFailure> {
+    let (mut input, version, limits, count) = decode_block_header(expected_tenant, bytes)?;
+    decode_block_records(
+        snapshot,
+        limit,
+        cancellation,
+        &mut input,
+        version,
+        limits,
+        count,
+    )
+}
+
+pub(super) fn preflight_block_record_count(
+    expected_tenant: TenantId,
+    bytes: &[u8],
+) -> Result<usize, LogStoreFailure> {
+    decode_block_header(expected_tenant, bytes).map(|(_, _, _, count)| count)
+}
+
+pub(super) fn validate_block_framing(
+    expected_tenant: TenantId,
+    bytes: &[u8],
+    cancellation: &dyn super::ScanCancellation,
+) -> Result<(), LogStoreFailure> {
+    let (mut input, version, limits, count) = decode_block_header(expected_tenant, bytes)?;
+    for _ in 0..count {
+        if cancellation.is_cancelled() {
+            return Err(LogStoreFailure::cancelled());
+        }
+        skip_record(&mut input, limits, version)?;
+    }
+    if cancellation.is_cancelled() {
+        return Err(LogStoreFailure::cancelled());
+    }
+    if input.is_empty() {
+        Ok(())
+    } else {
+        Err(LogStoreFailure::malformed_block())
+    }
+}
+
+fn decode_block_header<'bytes>(
+    expected_tenant: TenantId,
+    bytes: &'bytes [u8],
+) -> Result<(Input<'bytes>, u16, CodecLimits, usize), LogStoreFailure> {
     let mut input = Input::new(bytes);
     if input.take(MAGIC.len())? != MAGIC {
         return Err(LogStoreFailure::malformed_block());
@@ -157,13 +202,25 @@ pub(super) fn decode_block_cancellable(
     if count == 0 {
         return Err(LogStoreFailure::malformed_block());
     }
+    Ok((input, version, limits, count))
+}
+
+fn decode_block_records(
+    snapshot: &LedgerSnapshot<'_>,
+    limit: usize,
+    cancellation: &dyn super::ScanCancellation,
+    input: &mut Input<'_>,
+    version: u16,
+    limits: CodecLimits,
+    count: usize,
+) -> Result<DecodedBlock, LogStoreFailure> {
     let retained_count = count.min(limit);
     let mut records = bounded_vec(retained_count)?;
     for index in 0..count {
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
         }
-        let decoded = decode_record(&mut input, limits, version)?;
+        let decoded = decode_record(input, limits, version)?;
         if index < retained_count {
             records.push(decoded.into_stored(snapshot));
         }
@@ -287,6 +344,52 @@ fn decode_record(
         record,
         ingest_time,
     })
+}
+
+fn skip_record(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+    version: u16,
+) -> Result<(), LogStoreFailure> {
+    decode_event_time(input)?;
+    match input.u8()? {
+        0 => {},
+        1 => {
+            decode_observed_time(input)?;
+        },
+        _ => return Err(LogStoreFailure::malformed_block()),
+    }
+    if version != LEGACY_VERSION {
+        metadata::skip(input, limits)?;
+    }
+    input.take(8)?;
+    match input.u8()? {
+        0 => {},
+        1 => value::skip(input, limits.nesting_depth, limits.body_bytes, limits)?,
+        _ => return Err(LogStoreFailure::malformed_block()),
+    }
+    let attribute_count = input.count(limits.attribute_groups)?;
+    for _ in 0..attribute_count {
+        match input.u8()? {
+            1 | 2 => {},
+            _ => return Err(LogStoreFailure::malformed_block()),
+        }
+        decode_namespace(input.u8()?, version)?;
+        input.skip_string(limits.key_bytes)?;
+        let occurrence_count = input.count(limits.occurrences)?;
+        if occurrence_count == 0 {
+            return Err(LogStoreFailure::malformed_block());
+        }
+        for _ in 0..occurrence_count {
+            value::skip(input, limits.nesting_depth, limits.value_bytes, limits)?;
+        }
+    }
+    input.take(40)?;
+    let rule_count = input.count(64)?;
+    for _ in 0..rule_count {
+        input.skip_string(256)?;
+    }
+    Ok(())
 }
 
 fn decode_event_time(input: &mut Input<'_>) -> Result<EventTime, LogStoreFailure> {

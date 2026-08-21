@@ -50,6 +50,56 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
 }
 
 #[test]
+fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::CandidateAttributeValue;
+
+    let (_roots, paths) = bootstrap_paths("atomic-decoded-budget")?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "atomic-decoded-kernel")?;
+    fixture.append_logs(
+        vec![
+            (
+                Some(20),
+                Some(CandidateAttributeValue::string("one".to_owned())),
+            ),
+            (
+                Some(21),
+                Some(CandidateAttributeValue::string("two".to_owned())),
+            ),
+        ],
+        1,
+    )?;
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
+    let query = service.plan_pipeline(
+        context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().decoded_records() == 0
+    ));
+    Ok(())
+}
+
+#[test]
 fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
 -> Result<(), Box<dyn Error>> {
     let (_roots, paths) = bootstrap_paths("runtime-budget")?;

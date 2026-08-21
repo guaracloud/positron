@@ -107,6 +107,24 @@ impl<'a> Input<'a> {
         String::from_utf8(self.bytes(maximum)?).map_err(|_| LogStoreFailure::malformed_block())
     }
 
+    pub(super) fn skip_bytes(&mut self, maximum: usize) -> Result<(), LogStoreFailure> {
+        let count = usize::try_from(self.u32()?).map_err(|_| LogStoreFailure::malformed_block())?;
+        if count > maximum {
+            return Err(LogStoreFailure::malformed_block());
+        }
+        self.take(count).map(|_| ())
+    }
+
+    pub(super) fn skip_string(&mut self, maximum: usize) -> Result<(), LogStoreFailure> {
+        let count = usize::try_from(self.u32()?).map_err(|_| LogStoreFailure::malformed_block())?;
+        if count > maximum {
+            return Err(LogStoreFailure::malformed_block());
+        }
+        std::str::from_utf8(self.take(count)?)
+            .map(|_| ())
+            .map_err(|_| LogStoreFailure::malformed_block())
+    }
+
     pub(super) const fn is_empty(&self) -> bool {
         self.remaining.is_empty()
     }

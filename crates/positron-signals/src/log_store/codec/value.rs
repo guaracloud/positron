@@ -209,6 +209,47 @@ pub(super) fn decode(
     })
 }
 
+pub(super) fn skip(
+    input: &mut Input<'_>,
+    depth: u8,
+    value_bytes: usize,
+    limits: CodecLimits,
+) -> Result<(), LogStoreFailure> {
+    match input.u8()? {
+        0 => {},
+        1 => match input.u8()? {
+            0 | 1 => {},
+            _ => return Err(LogStoreFailure::malformed_block()),
+        },
+        2 | 3 => {
+            input.take(8)?;
+        },
+        4 => input.skip_string(value_bytes)?,
+        5 => input.skip_bytes(value_bytes)?,
+        6 => {
+            let next = depth
+                .checked_sub(1)
+                .ok_or_else(LogStoreFailure::malformed_block)?;
+            let count = input.count(limits.array_entries)?;
+            for _ in 0..count {
+                skip(input, next, value_bytes, limits)?;
+            }
+        },
+        7 => {
+            let next = depth
+                .checked_sub(1)
+                .ok_or_else(LogStoreFailure::malformed_block)?;
+            let count = input.count(limits.key_value_list_entries)?;
+            for _ in 0..count {
+                input.skip_string(limits.key_bytes)?;
+                skip(input, next, value_bytes, limits)?;
+            }
+        },
+        _ => return Err(LogStoreFailure::malformed_block()),
+    }
+    Ok(())
+}
+
 fn decode_array(
     input: &mut Input<'_>,
     depth: u8,

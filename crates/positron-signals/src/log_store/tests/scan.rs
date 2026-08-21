@@ -57,7 +57,7 @@ fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Er
         &snapshot,
         LogScan::all(ScanLimit::new(1)?),
     )?;
-    assert_eq!(bounded.records()[0].record(), &record);
+    assert!(bounded.records().is_empty());
     assert!(!bounded.complete());
     let wrong_tenant = store
         .scan(
@@ -156,8 +156,7 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
 }
 
 #[test]
-fn bounded_scan_holds_query_capacity_and_decodes_only_the_result_limit()
--> Result<(), Box<dyn Error>> {
+fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_kernel_authority(volume)?;
@@ -201,7 +200,7 @@ fn bounded_scan_holds_query_capacity_and_decodes_only_the_result_limit()
         &snapshot,
         LogScan::all(ScanLimit::new(1)?),
     )?;
-    assert_eq!(result.records().len(), 1);
+    assert!(result.records().is_empty());
     assert!(!result.complete());
     assert_eq!(
         authority
@@ -218,6 +217,15 @@ fn bounded_scan_holds_query_capacity_and_decodes_only_the_result_limit()
             .outstanding_for(WorkClass::InteractiveQueryTail),
         before
     );
+
+    let exact = LogStore::new().scan(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1_024)?),
+    )?;
+    assert_eq!(exact.records().len(), 1_024);
+    assert!(exact.complete());
     Ok(())
 }
 

@@ -8,6 +8,8 @@ pub(in crate::log_store) fn fuzz_decode_block(
     expected_tenant: TenantId,
     bytes: &[u8],
 ) -> Result<(), LogStoreFailure> {
+    super::preflight_block_record_count(expected_tenant, bytes)?;
+    super::validate_block_framing(expected_tenant, bytes, &super::super::scan::NeverCancelled)?;
     let mut input = Input::new(bytes);
     if input.take(MAGIC.len())? != MAGIC {
         return Err(LogStoreFailure::malformed_block());

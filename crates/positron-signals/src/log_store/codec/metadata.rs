@@ -53,6 +53,20 @@ pub(super) fn decode(
     ))
 }
 
+pub(super) fn skip(input: &mut Input<'_>, limits: CodecLimits) -> Result<(), LogStoreFailure> {
+    input.take(4)?;
+    input.skip_string(limits.record_bytes)?;
+    input.skip_string(limits.record_bytes)?;
+    skip_optional_id::<16>(input)?;
+    skip_optional_id::<8>(input)?;
+    input.take(12)?;
+    input.skip_string(limits.record_bytes)?;
+    input.skip_string(limits.record_bytes)?;
+    input.skip_string(limits.record_bytes)?;
+    input.take(4)?;
+    input.skip_string(limits.record_bytes)
+}
+
 pub(super) fn encoded_length(metadata: &LogMetadata) -> Result<usize, LogStoreFailure> {
     let fixed = 46_usize
         .checked_add(metadata.trace_id().map_or(0, |_| 16))
@@ -90,6 +104,14 @@ fn decode_optional_id<const N: usize>(
     match input.u8()? {
         0 => Ok(None),
         1 => Ok(Some(input.array()?)),
+        _ => Err(LogStoreFailure::malformed_block()),
+    }
+}
+
+fn skip_optional_id<const N: usize>(input: &mut Input<'_>) -> Result<(), LogStoreFailure> {
+    match input.u8()? {
+        0 => Ok(()),
+        1 => input.take(N).map(|_| ()),
         _ => Err(LogStoreFailure::malformed_block()),
     }
 }
