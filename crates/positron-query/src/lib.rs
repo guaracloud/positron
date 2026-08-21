@@ -10,6 +10,7 @@ mod execution_state;
 mod execution_support;
 mod failure;
 mod memory;
+mod native_literal;
 mod operators;
 mod plan;
 mod runtime;

@@ -689,7 +689,95 @@ fn projection_preserves_missing_and_native_body_values() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn version_one_equality_rejects_non_string_literal_syntax() -> Result<(), Box<dyn Error>> {
+fn typed_body_equality_accepts_every_native_literal_without_coercion() -> Result<(), Box<dyn Error>>
+{
+    use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile};
+
+    let fixture = QueryFixture::new("typed-body-literals")?;
+    let candidates = [
+        ("null", CandidateAttributeValue::null()),
+        ("bool(true)", CandidateAttributeValue::boolean(true)),
+        ("int(-42)", CandidateAttributeValue::signed_integer(-42)),
+        (
+            "float_bits(0x7ff8000000000001)",
+            CandidateAttributeValue::floating_point_bits(0x7ff8_0000_0000_0001),
+        ),
+        (
+            r#"string("a\|b")"#,
+            CandidateAttributeValue::string("a|b".to_owned()),
+        ),
+        (
+            "bytes(0x00ff)",
+            CandidateAttributeValue::bytes(vec![0x00, 0xff]),
+        ),
+        (
+            r#"array(int(1),string("x"))"#,
+            CandidateAttributeValue::array(vec![
+                CandidateAttributeValue::signed_integer(1),
+                CandidateAttributeValue::string("x".to_owned()),
+            ]),
+        ),
+        (
+            r#"kv("k"=bool(false),"k"=null)"#,
+            CandidateAttributeValue::key_value_list(vec![
+                CandidateKeyValue::new("k".to_owned(), CandidateAttributeValue::boolean(false)),
+                CandidateKeyValue::new("k".to_owned(), CandidateAttributeValue::null()),
+            ]),
+        ),
+    ];
+    let expected = candidates
+        .iter()
+        .map(|(_, candidate)| {
+            candidate
+                .clone()
+                .validate_log_body(ValueLimitProfile::release_1_system_maximum())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    fixture.kernel.append_logs(
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(index, (_, candidate))| {
+                let event_time = i64::try_from(index).map(|index| index + 1);
+                event_time.map(|event_time| (Some(event_time), Some(candidate.clone())))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+
+    for ((literal, _), expected) in candidates.iter().zip(&expected) {
+        let source = format!(
+            "pipeline:v1 logs | range query_time 0 100 | filter body == {literal} | limit 16"
+        );
+        let query = service.plan_pipeline(
+            fixture.context,
+            &source,
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
+                .with_cpu_work_units(16)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        let records = events
+            .iter()
+            .find_map(|event| match event {
+                QueryEvent::Batch(batch) => Some(batch.records()),
+                QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+            })
+            .ok_or_else(|| {
+                format!("typed body filter returned no batch for {literal}: {events:?}")
+            })?;
+        assert_eq!(records.len(), 1, "unexpected match count for {literal}");
+        assert_eq!(records[0].body_value(), Some(expected));
+    }
+    Ok(())
+}
+
+#[test]
+fn version_one_equality_rejects_untyped_literal_syntax() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("native-filter-boundary")?;
     let service = QueryService::new(
         fixture.kernel.authority.governor(),
@@ -697,7 +785,7 @@ fn version_one_equality_rejects_non_string_literal_syntax() -> Result<(), Box<dy
         16,
     );
 
-    for literal in ["true", "7", "null", "[1]"] {
+    for literal in ["true", "7", "[1]", "float(1.0)"] {
         let source = format!("pipeline:v1 logs | filter body == {literal} | limit 1");
         let failure = match service.plan_pipeline(
             fixture.context,

@@ -271,13 +271,13 @@ fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure
             if filter.is_some() || stage_order > 1 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            filter = Some(parse_body_literal(literal)?);
+            filter = Some(crate::native_literal::parse_body(literal)?);
             stage_order = 2;
         } else if let Some(literal) = stage.strip_prefix("search body == ") {
             if filter.is_some() || stage_order > 1 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            filter = Some(parse_body_literal(literal)?);
+            filter = Some(crate::native_literal::parse_search_string(literal)?);
             stage_order = 2;
         } else if let Some(columns) = stage.strip_prefix("project ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {
@@ -395,50 +395,6 @@ fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
     source
         .parse()
         .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
-}
-
-fn parse_body_literal(
-    source: &str,
-) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
-    let Some(inner) = source
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    else {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    };
-    if inner.len() > 65_536 {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
-    let mut decoded = String::new();
-    decoded
-        .try_reserve_exact(inner.len())
-        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-    let mut characters = inner.chars();
-    while let Some(character) = characters.next() {
-        if character == '\\' {
-            let escaped = characters
-                .next()
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-            if !matches!(escaped, '"' | '\\' | '|') {
-                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-            }
-            decoded.push(escaped);
-        } else if character == '"' {
-            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-        } else {
-            decoded.push(character);
-        }
-    }
-    positron_domain::value::CandidateAttributeValue::string(decoded)
-        .validate_log_body(positron_domain::value::ValueLimitProfile::release_1_system_maximum())
-        .map_err(|failure| {
-            if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable
-            {
-                QueryFailure::new(QueryFailureCode::ResourceExhausted)
-            } else {
-                QueryFailure::new(QueryFailureCode::UnsupportedQuery)
-            }
-        })
 }
 
 fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailure> {
