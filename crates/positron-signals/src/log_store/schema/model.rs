@@ -187,7 +187,8 @@ impl SchemaPath {
         Self::root(namespace, try_string(key)?)
     }
 
-    pub(crate) fn from_segments(
+    /// Creates a checked path from already separated producer-key segments.
+    pub fn from_segments(
         namespace: AttributeNamespace,
         segments: Vec<String>,
     ) -> Result<Self, SchemaFailure> {

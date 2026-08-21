@@ -14,13 +14,15 @@ pub(crate) const fn classify_log_store_failure_code(code: LogStoreFailureCode) -
             IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
         },
         LogStoreFailureCode::ResourceExhausted
+        | LogStoreFailureCode::BudgetExhausted
         | LogStoreFailureCode::ClockUnavailable
         | LogStoreFailureCode::ResourceAdmissionRefused => {
             IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
         },
-        LogStoreFailureCode::Kernel => {
+        LogStoreFailureCode::Kernel | LogStoreFailureCode::Internal => {
             IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
         },
+        LogStoreFailureCode::Cancelled => IngestOutcome::Retryable(IngestFailureCode::Cancelled),
     }
 }
 

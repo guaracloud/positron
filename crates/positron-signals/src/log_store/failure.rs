@@ -15,6 +15,9 @@ pub enum LogStoreFailureCode {
     ResourceExhausted,
     ClockUnavailable,
     ResourceAdmissionRefused,
+    Cancelled,
+    BudgetExhausted,
+    Internal,
 }
 
 /// Redacted Log Store failure that never contains telemetry values.
@@ -66,6 +69,26 @@ impl LogStoreFailure {
         }
     }
 
+    pub(super) const fn cancelled() -> Self {
+        Self {
+            code: LogStoreFailureCode::Cancelled,
+        }
+    }
+
+    pub(super) const fn observation(code: super::ScanObservationFailureCode) -> Self {
+        let code = match code {
+            super::ScanObservationFailureCode::BudgetExhausted => {
+                LogStoreFailureCode::BudgetExhausted
+            },
+            super::ScanObservationFailureCode::Cancelled => LogStoreFailureCode::Cancelled,
+            super::ScanObservationFailureCode::ResourceExhausted => {
+                LogStoreFailureCode::ResourceExhausted
+            },
+            super::ScanObservationFailureCode::Internal => LogStoreFailureCode::Internal,
+        };
+        Self { code }
+    }
+
     pub(super) const fn domain(failure: DomainFailure) -> Self {
         Self {
             code: classify_domain_failure_code(failure.code()),
@@ -105,3 +128,25 @@ impl Display for LogStoreFailure {
 }
 
 impl Error for LogStoreFailure {}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogStoreFailure, LogStoreFailureCode};
+
+    #[test]
+    fn infrastructure_failures_keep_distinct_redacted_public_codes() {
+        let resource = LogStoreFailure::resource_exhausted();
+        assert_eq!(resource.code(), LogStoreFailureCode::ResourceExhausted);
+        assert_eq!(resource.to_string(), "log store failure: ResourceExhausted");
+
+        let clock = LogStoreFailure::clock_unavailable();
+        assert_eq!(clock.code(), LogStoreFailureCode::ClockUnavailable);
+        assert_eq!(clock.to_string(), "log store failure: ClockUnavailable");
+
+        let ledger = positron_kernel::SnapshotLeaseId::new([0; 16])
+            .expect_err("zero lease identity must remain invalid");
+        let kernel = LogStoreFailure::kernel(ledger);
+        assert_eq!(kernel.code(), LogStoreFailureCode::Kernel);
+        assert_eq!(kernel.to_string(), "log store failure: Kernel");
+    }
+}

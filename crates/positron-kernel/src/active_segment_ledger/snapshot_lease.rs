@@ -6,30 +6,16 @@ use crate::catalog::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId}
 use crate::data_protection::DataProtection;
 use crate::{WorkClaim, WorkKind};
 
-use super::capacity::{lease_claim, snapshot_claim};
+use super::capacity::{lease_claim, snapshot_retained_claim};
 use super::snapshot_lease_codec::{decode, encode};
+use super::snapshot_lease_record::{
+    LeaseBlock, LeaseRecord, SnapshotLeaseId, valid_lease_interval, validate_active_lease,
+};
 use super::{
-    ActiveSegmentLedger, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, LedgerSnapshot, SegmentId,
-    SegmentScope, StoreBlockIdentity, map_frame_failure,
+    ActiveSegmentLedger, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
+    SegmentScope, map_frame_failure,
 };
 pub(super) const MAX_SNAPSHOT_LEASES: usize = 64;
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct SnapshotLeaseId([u8; 16]);
-
-impl SnapshotLeaseId {
-    pub fn new(bytes: [u8; 16]) -> Result<Self, LedgerFailure> {
-        if bytes.iter().all(|byte| *byte == 0) {
-            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
-        }
-        Ok(Self(bytes))
-    }
-
-    #[must_use]
-    pub const fn to_bytes(self) -> [u8; 16] {
-        self.0
-    }
-}
 
 pub struct SnapshotLeaseGrant<'kernel> {
     identity: SnapshotLeaseId,
@@ -70,42 +56,33 @@ impl<'kernel> SnapshotLeaseGrant<'kernel> {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct LeaseRecord {
-    pub(super) identity: SnapshotLeaseId,
-    pub(super) scope: SegmentScope,
-    pub(super) catalog_identity: crate::CatalogGenerationId,
-    pub(super) catalog_generation: u64,
-    pub(super) frontier: CommitPosition,
-    pub(super) observed_at: u64,
-    pub(super) expiry: u64,
-    pub(super) blocks: Vec<LeaseBlock>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct LeaseBlock {
-    pub(super) identity: StoreBlockIdentity,
-    pub(super) position: CommitPosition,
-    pub(super) segment: SegmentId,
-}
-
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    /// Creates a durable lease for an already-admitted query task. The caller's
+    /// query reservation covers construction CPU; the returned grant retains
+    /// only resources that remain live with its immutable snapshot.
     pub fn create_snapshot_lease(
         &self,
         now: u64,
         expiry: u64,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        if expiry <= now {
+        if !valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        self.retry_pending_releases(&mut state)?;
         reject_time_regression(&state, now)?;
         let basis = self.catalog.pin()?;
         let all_records = records(&basis)?;
         let expired = expired_in_scope(&all_records, self.scope, now);
+        for record in all_records
+            .iter()
+            .filter(|record| record.scope == self.scope && !expired.contains(&record.identity))
+        {
+            validate_active_lease(record, now)?;
+        }
         let active_count = all_records
             .iter()
             .filter(|record| record.scope == self.scope && !expired.contains(&record.identity))
@@ -124,6 +101,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             expiry,
             blocks: state.blocks.iter().map(LeaseBlock::from).collect(),
         };
+        // Admit every capacity needed by the returned grant before publishing its
+        // durable identity. Later failures then drop both reservations without
+        // leaving a catalog lease that no caller can release.
+        let snapshot = snapshot_from_record(self, &state, &record)?;
         let encoded = encode(&record)?;
         let claim = WorkClaim::tenant(
             self.scope.tenant,
@@ -140,7 +121,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         remove_reservations(&mut state, &expired);
         state.lease_reservations.insert(identity, retained);
         state.last_snapshot_lease_time = now;
-        let snapshot = snapshot_from_record(self, &state, &record)?;
         Ok(SnapshotLeaseGrant {
             identity,
             expiry,
@@ -148,6 +128,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         })
     }
 
+    /// Resumes a durable lease for an already-admitted query task. The caller's
+    /// query reservation covers construction CPU; the returned grant retains
+    /// only resources that remain live with its immutable snapshot.
     pub fn resume_snapshot_lease(
         &self,
         identity: SnapshotLeaseId,
@@ -157,6 +140,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        self.retry_pending_releases(&mut state)?;
         reject_time_regression(&state, now)?;
         let basis = self.catalog.pin()?;
         let all_records = records(&basis)?;
@@ -166,7 +150,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             remove_reservations(&mut state, &expired);
         }
         state.last_snapshot_lease_time = now;
-        let record = all_records
+        let mut record = all_records
             .into_iter()
             .find(|record| {
                 record.identity == identity
@@ -174,8 +158,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     && !expired.contains(&record.identity)
             })
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::SnapshotExpired))?;
+        validate_active_lease(&record, now)?;
         if !state.lease_reservations.contains_key(&identity) {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        if record.observed_at == 0 {
+            self.normalize_legacy_lease(&mut state, &mut record, now)?;
         }
         let snapshot = snapshot_from_record(self, &state, &record)?;
         Ok(SnapshotLeaseGrant {
@@ -190,21 +178,70 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
-        let basis = self.catalog.pin()?;
-        let Some(record) = records(&basis)?
-            .into_iter()
-            .find(|record| record.identity == identity && record.scope == self.scope)
-        else {
-            state.lease_reservations.remove(&identity);
+        state.pending_lease_releases.register(identity)?;
+        self.retry_pending_releases(&mut state)
+    }
+
+    fn retry_pending_releases(
+        &self,
+        state: &mut super::state::LedgerState<'kernel>,
+    ) -> Result<(), LedgerFailure> {
+        let pending = state
+            .pending_lease_releases
+            .identities()
+            .collect::<BTreeSet<_>>();
+        if pending.is_empty() {
             return Ok(());
-        };
-        publish(
+        }
+        let basis = self.catalog.pin()?;
+        let remove = records(&basis)?
+            .into_iter()
+            .filter(|record| record.scope == self.scope && pending.contains(&record.identity))
+            .map(|record| record.identity)
+            .collect::<BTreeSet<_>>();
+        if !remove.is_empty() {
+            publish(self.catalog, &basis, &remove, None)?;
+        }
+        for identity in pending {
+            state.lease_reservations.remove(&identity);
+        }
+        state.pending_lease_releases.clear();
+        Ok(())
+    }
+
+    fn normalize_legacy_lease(
+        &self,
+        state: &mut super::state::LedgerState<'kernel>,
+        record: &mut LeaseRecord,
+        now: u64,
+    ) -> Result<(), LedgerFailure> {
+        let mut normalized = record.clone();
+        normalized.observed_at = now;
+        let encoded = encode(&normalized)?;
+        let claim = WorkClaim::tenant(
+            self.scope.tenant,
+            WorkKind::InteractiveQueryTail,
+            lease_claim(encoded.len())?,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let retained = self
+            .authority
+            .governor()
+            .reserve(claim)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let basis = self.catalog.pin()?;
+        publish_many(
             self.catalog,
             &basis,
             &BTreeSet::from([record.identity]),
-            None,
+            vec![encoded],
         )?;
-        state.lease_reservations.remove(&identity);
+        let previous = state.lease_reservations.insert(record.identity, retained);
+        let Some(previous) = previous else {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        };
+        drop(previous);
+        *record = normalized;
         Ok(())
     }
 }
@@ -241,7 +278,7 @@ fn snapshot_from_record<'kernel>(
     let claim = WorkClaim::tenant(
         record.scope.tenant,
         WorkKind::InteractiveQueryTail,
-        snapshot_claim(bytes, blocks.len())?,
+        snapshot_retained_claim(bytes, blocks.len())?,
     )
     .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let capacity = ledger

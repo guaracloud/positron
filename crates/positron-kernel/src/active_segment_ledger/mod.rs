@@ -14,6 +14,8 @@ mod recovery;
 mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_codec;
+mod snapshot_lease_pending;
+mod snapshot_lease_record;
 mod snapshot_lease_recovery;
 mod state;
 mod storage;
@@ -34,11 +36,12 @@ use crate::{
     RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority, WorkClaim, WorkKind,
 };
 
-use capacity::{recovery_claim, retained_claim, snapshot_claim};
+use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
-pub use snapshot_lease::{SnapshotLeaseGrant, SnapshotLeaseId};
+pub use snapshot_lease::SnapshotLeaseGrant;
+pub use snapshot_lease_record::{MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId};
 use state::{LedgerState, retain_recovered};
 use storage::LedgerStorage;
 pub use types::*;
@@ -243,11 +246,15 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 next_sequence: 0,
                 poisoned: false,
                 lease_reservations: recovered_leases.reservations,
+                pending_lease_releases: snapshot_lease_pending::PendingLeaseReleases::new(),
                 last_snapshot_lease_time: recovered_leases.last_observed,
             }),
         })
     }
 
+    /// Builds an immutable snapshot for an already-admitted task. The caller's
+    /// task reservation covers construction CPU; the returned snapshot retains
+    /// only resources that remain live with the view.
     pub fn snapshot(&self) -> Result<LedgerSnapshot<'kernel>, LedgerFailure> {
         let state = self
             .state
@@ -256,7 +263,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let claim = WorkClaim::tenant(
             self.scope.tenant,
             WorkKind::InteractiveQueryTail,
-            snapshot_claim(state.retained_bytes, state.blocks.len())?,
+            snapshot_retained_claim(state.retained_bytes, state.blocks.len())?,
         )
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         let reservation = self

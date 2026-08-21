@@ -57,6 +57,8 @@ pub(super) fn recover(
             },
             _ => ServiceFailure::LedgerUnavailable,
         })?;
+        // `replay` retains the admitted repair CPU/task reservation while the
+        // immutable snapshot is constructed and replayed.
         let snapshot = ledger
             .snapshot()
             .map_err(|_| ServiceFailure::LedgerUnavailable)?;

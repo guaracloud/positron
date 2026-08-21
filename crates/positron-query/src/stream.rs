@@ -1,304 +1,263 @@
-use positron_domain::routing::CommitPosition;
-use positron_domain::time::UnixNanoseconds;
+mod contract;
+mod events;
 
-use crate::{LogicalPlan, QueryBudget, QueryCursor, QueryFailure, QueryFailureCode, TemporalAxis};
+pub(crate) use contract::column_type;
+pub use contract::{
+    QueryHeader, ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
+};
+pub(crate) use events::QueryCounters;
+pub use events::{QueryBatch, QueryEvent, QueryIncomplete, QueryStats, QueryTerminal};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResultSchema;
+use positron_domain::routing::{CommitPosition, RecordOrdinal};
+use positron_domain::time::{EventTime, QueryTime, UnixNanoseconds};
+use positron_kernel::IngestTime;
 
-impl ResultSchema {
-    #[must_use]
-    pub const fn columns(self) -> [&'static str; 1] {
-        ["body"]
-    }
-}
+use crate::{QueryFailure, QueryFailureCode};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResultSnapshot {
-    identity: [u8; 32],
-    generation: u64,
-    frontier: u64,
-}
-
-impl ResultSnapshot {
-    pub(crate) const fn new(identity: [u8; 32], generation: u64, frontier: u64) -> Self {
-        Self {
-            identity,
-            generation,
-            frontier,
-        }
-    }
-    #[must_use]
-    pub const fn identity(self) -> [u8; 32] {
-        self.identity
-    }
-    #[must_use]
-    pub const fn generation(self) -> u64 {
-        self.generation
-    }
-    #[must_use]
-    pub const fn frontier(self) -> u64 {
-        self.frontier
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResultOrdering(TemporalAxis);
-
-impl ResultOrdering {
-    #[must_use]
-    pub const fn columns(self) -> [&'static str; 2] {
-        [
-            match self.0 {
-                TemporalAxis::QueryTime => "query_time",
-                TemporalAxis::EventTime => "event_time",
-            },
-            "commit_position",
-        ]
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResultLease {
-    identity: [u8; 16],
-    expiry: u64,
-}
-
-impl ResultLease {
-    pub(crate) const fn new(identity: [u8; 16], expiry: u64) -> Self {
-        Self { identity, expiry }
-    }
-    #[must_use]
-    pub const fn identity(self) -> [u8; 16] {
-        self.identity
-    }
-    #[must_use]
-    pub const fn expiry(self) -> u64 {
-        self.expiry
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryHeader {
-    plan: LogicalPlan,
-    budget: QueryBudget,
-    snapshot: ResultSnapshot,
-    lease: ResultLease,
-    initial_cursor: Option<QueryCursor>,
-}
-
-impl QueryHeader {
-    pub(crate) const fn new(
-        plan: LogicalPlan,
-        budget: QueryBudget,
-        snapshot: ResultSnapshot,
-        lease: ResultLease,
-        initial_cursor: Option<QueryCursor>,
-    ) -> Self {
-        Self {
-            plan,
-            budget,
-            snapshot,
-            lease,
-            initial_cursor,
-        }
-    }
-    #[must_use]
-    pub const fn schema(&self) -> ResultSchema {
-        ResultSchema
-    }
-    #[must_use]
-    pub const fn snapshot(&self) -> ResultSnapshot {
-        self.snapshot
-    }
-    #[must_use]
-    pub const fn ordering(&self) -> ResultOrdering {
-        ResultOrdering(self.plan.temporal_axis())
-    }
-    #[must_use]
-    pub const fn budget(&self) -> QueryBudget {
-        self.budget
-    }
-    #[must_use]
-    pub const fn lease(&self) -> ResultLease {
-        self.lease
-    }
-    #[must_use]
-    pub const fn initial_cursor(&self) -> Option<&QueryCursor> {
-        self.initial_cursor.as_ref()
-    }
-}
+const INTERNAL: QueryFailure = QueryFailure::new(QueryFailureCode::Internal);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRecord {
-    body: Option<String>,
-    query_time: UnixNanoseconds,
+    body: Option<positron_domain::value::ValidatedAttributeValue>,
+    body_retained_bytes: u64,
+    body_selected: bool,
+    query_time: Option<QueryTime>,
+    event_time: Option<EventTime>,
+    ingest_time: Option<IngestTime>,
+    ordering_time: UnixNanoseconds,
     commit_position: CommitPosition,
+    record_ordinal: RecordOrdinal,
+    query_time_selected: bool,
+    event_time_selected: bool,
+    ingest_time_selected: bool,
+    commit_position_selected: bool,
+    count: Option<u64>,
+    attributes: Vec<AttributeProjection>,
+    attribute_retained_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AttributeProjection {
+    Intrinsic,
+    Attribute(Option<positron_domain::value::AttributeOccurrenceSet>),
+}
+
+pub(crate) struct QueryRecordTimes {
+    pub(crate) query: QueryTime,
+    pub(crate) event: EventTime,
+    pub(crate) ingest: IngestTime,
+    pub(crate) ordering: UnixNanoseconds,
+}
+
+pub(crate) struct QueryRecordSelection {
+    pub(crate) body: bool,
+    pub(crate) query_time: bool,
+    pub(crate) event_time: bool,
+    pub(crate) ingest_time: bool,
+    pub(crate) commit_position: bool,
+    pub(crate) attributes: Vec<AttributeProjection>,
+    pub(crate) attribute_retained_bytes: u64,
+}
+
+pub(crate) struct QueryGroupFields {
+    pub(crate) body: Option<positron_domain::value::ValidatedAttributeValue>,
+    pub(crate) body_retained_bytes: u64,
+    pub(crate) query_time: QueryTime,
+    pub(crate) event_time: EventTime,
+    pub(crate) ingest_time: IngestTime,
+    pub(crate) commit_position: CommitPosition,
+    pub(crate) attributes: Vec<AttributeProjection>,
+    pub(crate) attribute_retained_bytes: u64,
+}
+
+pub(crate) struct GroupedCountFields {
+    pub(crate) body: Option<positron_domain::value::ValidatedAttributeValue>,
+    pub(crate) body_retained_bytes: u64,
+    pub(crate) body_selected: bool,
+    pub(crate) query_time: Option<QueryTime>,
+    pub(crate) event_time: Option<EventTime>,
+    pub(crate) ingest_time: Option<IngestTime>,
+    pub(crate) commit_position: Option<CommitPosition>,
+    pub(crate) attributes: Vec<AttributeProjection>,
+    pub(crate) attribute_retained_bytes: u64,
 }
 
 impl QueryRecord {
-    pub(crate) const fn new(
-        body: Option<String>,
-        query_time: UnixNanoseconds,
+    pub(crate) fn new(
+        body: Option<positron_domain::value::ValidatedAttributeValue>,
+        body_retained_bytes: u64,
+        times: QueryRecordTimes,
         commit_position: CommitPosition,
+        record_ordinal: RecordOrdinal,
+        selection: QueryRecordSelection,
     ) -> Self {
         Self {
             body,
-            query_time,
+            body_retained_bytes,
+            body_selected: selection.body,
+            query_time: Some(times.query),
+            event_time: Some(times.event),
+            ingest_time: Some(times.ingest),
+            ordering_time: times.ordering,
             commit_position,
+            record_ordinal,
+            query_time_selected: selection.query_time,
+            event_time_selected: selection.event_time,
+            ingest_time_selected: selection.ingest_time,
+            commit_position_selected: selection.commit_position,
+            count: None,
+            attributes: selection.attributes,
+            attribute_retained_bytes: selection.attribute_retained_bytes,
         }
     }
+
+    pub(crate) const fn count_record(count: u64) -> Self {
+        Self {
+            body: None,
+            body_retained_bytes: 0,
+            body_selected: false,
+            query_time: None,
+            event_time: None,
+            ingest_time: None,
+            ordering_time: UnixNanoseconds::new(0),
+            commit_position: CommitPosition::origin(),
+            record_ordinal: RecordOrdinal::first(),
+            query_time_selected: false,
+            event_time_selected: false,
+            ingest_time_selected: false,
+            commit_position_selected: false,
+            count: Some(count),
+            attributes: Vec::new(),
+            attribute_retained_bytes: 0,
+        }
+    }
+
+    pub(crate) fn grouped_count_record(fields: GroupedCountFields, count: u64) -> Self {
+        Self {
+            body: fields.body,
+            body_retained_bytes: fields.body_retained_bytes,
+            body_selected: fields.body_selected,
+            query_time: fields.query_time,
+            event_time: fields.event_time,
+            ingest_time: fields.ingest_time,
+            ordering_time: UnixNanoseconds::new(0),
+            commit_position: fields
+                .commit_position
+                .unwrap_or_else(CommitPosition::origin),
+            record_ordinal: RecordOrdinal::first(),
+            query_time_selected: fields.query_time.is_some(),
+            event_time_selected: fields.event_time.is_some(),
+            ingest_time_selected: fields.ingest_time.is_some(),
+            commit_position_selected: fields.commit_position.is_some(),
+            count: Some(count),
+            attributes: fields.attributes,
+            attribute_retained_bytes: fields.attribute_retained_bytes,
+        }
+    }
+
     #[must_use]
     pub fn body_text(&self) -> Option<&str> {
-        self.body.as_deref()
+        self.body.as_ref().and_then(|body| body.as_str())
     }
-    pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition) {
-        (self.query_time, self.commit_position)
+    #[must_use]
+    pub const fn body_value(&self) -> Option<&positron_domain::value::ValidatedAttributeValue> {
+        self.body.as_ref()
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryBatch {
-    sequence: u64,
-    records: Vec<QueryRecord>,
-    prior_digest: [u8; 32],
-    digest: [u8; 32],
-}
-
-impl QueryBatch {
-    pub(crate) const fn new(
-        sequence: u64,
-        records: Vec<QueryRecord>,
-        prior_digest: [u8; 32],
-        digest: [u8; 32],
-    ) -> Self {
-        Self {
-            sequence,
-            records,
-            prior_digest,
-            digest,
+    #[must_use]
+    pub fn attribute_occurrence_set(
+        &self,
+        column: usize,
+    ) -> Option<&positron_domain::value::AttributeOccurrenceSet> {
+        match self.attributes.get(column) {
+            Some(AttributeProjection::Attribute(value)) => value.as_ref(),
+            Some(AttributeProjection::Intrinsic) | None => None,
         }
     }
     #[must_use]
-    pub fn records(&self) -> &[QueryRecord] {
-        &self.records
-    }
-    #[must_use]
-    pub const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-    #[must_use]
-    pub const fn prior_digest(&self) -> [u8; 32] {
-        self.prior_digest
-    }
-    #[must_use]
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QueryStats {
-    records: u64,
-    scanned_bytes: u64,
-    decoded_records: u64,
-    output_bytes: u64,
-    cpu_work_units: u64,
-    wall_seconds: u64,
-    last_sequence: Option<u64>,
-    result_digest: [u8; 32],
-}
-
-pub(crate) struct QueryCounters {
-    pub(crate) records: u64,
-    pub(crate) scanned_bytes: u64,
-    pub(crate) decoded_records: u64,
-    pub(crate) output_bytes: u64,
-    pub(crate) cpu_work_units: u64,
-    pub(crate) wall_seconds: u64,
-}
-
-impl QueryStats {
-    pub(crate) const fn new(
-        counters: QueryCounters,
-        last_sequence: Option<u64>,
-        result_digest: [u8; 32],
-    ) -> Self {
-        Self {
-            records: counters.records,
-            scanned_bytes: counters.scanned_bytes,
-            decoded_records: counters.decoded_records,
-            output_bytes: counters.output_bytes,
-            cpu_work_units: counters.cpu_work_units,
-            wall_seconds: counters.wall_seconds,
-            last_sequence,
-            result_digest,
+    pub const fn query_time(&self) -> UnixNanoseconds {
+        match self.query_time {
+            Some(value) => value.instant(),
+            None => UnixNanoseconds::new(0),
         }
     }
     #[must_use]
-    pub const fn records(self) -> u64 {
-        self.records
+    pub const fn query_time_value(&self) -> Option<QueryTime> {
+        self.query_time
     }
     #[must_use]
-    pub const fn scanned_bytes(self) -> u64 {
-        self.scanned_bytes
+    pub const fn event_time(&self) -> Option<UnixNanoseconds> {
+        match self.event_time {
+            Some(value) => value.instant(),
+            None => None,
+        }
     }
     #[must_use]
-    pub const fn decoded_records(self) -> u64 {
-        self.decoded_records
+    pub const fn event_time_value(&self) -> Option<EventTime> {
+        self.event_time
     }
     #[must_use]
-    pub const fn output_bytes(self) -> u64 {
-        self.output_bytes
+    pub const fn ingest_time_value(&self) -> Option<IngestTime> {
+        self.ingest_time
     }
     #[must_use]
-    pub const fn cpu_work_units(self) -> u64 {
-        self.cpu_work_units
+    pub const fn commit_position(&self) -> CommitPosition {
+        self.commit_position
     }
     #[must_use]
-    pub const fn wall_seconds(self) -> u64 {
-        self.wall_seconds
+    pub const fn record_ordinal(&self) -> RecordOrdinal {
+        self.record_ordinal
     }
     #[must_use]
-    pub const fn last_sequence(self) -> Option<u64> {
-        self.last_sequence
+    pub const fn count(&self) -> Option<u64> {
+        self.count
     }
-    #[must_use]
-    pub const fn result_digest(self) -> [u8; 32] {
-        self.result_digest
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryIncomplete {
-    failure: QueryFailure,
-    stats: QueryStats,
-}
-
-impl QueryIncomplete {
-    pub(crate) const fn new(failure: QueryFailure, stats: QueryStats) -> Self {
-        Self { failure, stats }
+    pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition, RecordOrdinal) {
+        (
+            self.ordering_time,
+            self.commit_position,
+            self.record_ordinal,
+        )
     }
-    #[must_use]
-    pub const fn code(&self) -> QueryFailureCode {
-        self.failure.code()
+    pub(crate) const fn ordering_time(&self) -> UnixNanoseconds {
+        self.ordering_time
     }
-    #[must_use]
-    pub const fn stats(&self) -> QueryStats {
-        self.stats
+    pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {
+        self.body_retained_bytes
+            .checked_add(self.attribute_retained_bytes)
+            .ok_or(INTERNAL)
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryTerminal {
-    Complete(QueryStats),
-    Continued(QueryCursor),
-    Incomplete(QueryIncomplete),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryEvent {
-    Header(QueryHeader),
-    Batch(QueryBatch),
-    Terminal(QueryTerminal),
+    pub(crate) const fn body_retained_bytes(&self) -> u64 {
+        self.body_retained_bytes
+    }
+    pub(crate) fn into_group_fields(self) -> Result<QueryGroupFields, QueryFailure> {
+        Ok(QueryGroupFields {
+            body: self.body,
+            body_retained_bytes: self.body_retained_bytes,
+            query_time: self.query_time.ok_or(INTERNAL)?,
+            event_time: self.event_time.ok_or(INTERNAL)?,
+            ingest_time: self.ingest_time.ok_or(INTERNAL)?,
+            commit_position: self.commit_position,
+            attributes: self.attributes,
+            attribute_retained_bytes: self.attribute_retained_bytes,
+        })
+    }
+    pub(crate) const fn query_time_selected(&self) -> bool {
+        self.query_time_selected
+    }
+    pub(crate) const fn body_selected(&self) -> bool {
+        self.body_selected
+    }
+    pub(crate) const fn event_time_selected(&self) -> bool {
+        self.event_time_selected
+    }
+    pub(crate) const fn ingest_time_selected(&self) -> bool {
+        self.ingest_time_selected
+    }
+    pub(crate) const fn commit_position_selected(&self) -> bool {
+        self.commit_position_selected
+    }
+    pub(crate) fn attribute_projections(&self) -> &[AttributeProjection] {
+        &self.attributes
+    }
 }

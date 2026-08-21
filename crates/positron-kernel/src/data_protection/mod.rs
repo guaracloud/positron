@@ -31,7 +31,9 @@ pub(crate) use context::{
     FrameObjectContext, FrameObjectId, FrameScope, FrameSequence, KeyEpoch, SegmentFramePurpose,
     SystemObjectKind,
 };
-pub use control_token::{ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector};
+pub use control_token::{
+    ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector, QueryResultDigest,
+};
 pub(crate) use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
 pub(crate) use key_envelope::{SegmentEnvelopeRoute, WrappedKeyContext};
 #[cfg(test)]

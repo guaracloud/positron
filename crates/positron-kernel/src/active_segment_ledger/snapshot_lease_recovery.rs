@@ -3,10 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{ResourceReservation, WorkClaim, WorkKind};
 
 use super::capacity::lease_claim;
-use super::snapshot_lease::{
-    MAX_SNAPSHOT_LEASES, SnapshotLeaseId, expired_in_scope, publish_many, records,
-};
+use super::snapshot_lease::{MAX_SNAPSHOT_LEASES, expired_in_scope, publish_many, records};
 use super::snapshot_lease_codec::encode;
+use super::snapshot_lease_record::{SnapshotLeaseId, validate_active_lease};
 use super::{LedgerFailure, LedgerFailureCode, SegmentScope};
 
 pub(super) struct RecoveredLeases<'kernel> {
@@ -38,6 +37,9 @@ pub(super) fn recover_reservations<'kernel>(
         .into_iter()
         .filter(|record| !expired.contains(&record.identity))
         .collect::<Vec<_>>();
+    for record in &active {
+        validate_active_lease(record, now)?;
+    }
     if active.len() > MAX_SNAPSHOT_LEASES {
         return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
     }

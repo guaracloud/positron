@@ -3,24 +3,25 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, FixedLifecycleClockSource,
-    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
-    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
-    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
-    SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity,
-    TenantQuota, WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureThresholds,
+    FixedLifecycleClockSource, GovernorFailure, GovernorPolicy, InstanceId,
+    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
+    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
+    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
+    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, WorkClaim, WorkKind,
 };
 use positron_policy::{
-    IngestPolicy, LogMetadata, NativeLogCandidate, PolicyEvaluation, PolicyReceiver,
+    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
+    PolicyReceiver,
 };
 use positron_signals::{LogRecord, LogStore};
 
@@ -49,9 +50,11 @@ pub struct TestWorkMeter;
 impl positron_query::QueryWorkMeter for TestWorkMeter {
     fn units(
         &self,
-        _stage: positron_query::QueryWorkStage,
+        stage: positron_query::QueryWorkStage,
     ) -> Result<u64, positron_query::QueryWorkFailure> {
-        Ok(1)
+        Ok(u64::from(
+            stage != positron_query::QueryWorkStage::ScanDecode,
+        ))
     }
 }
 
@@ -60,6 +63,25 @@ pub struct FailingClock;
 impl positron_query::QueryClock for FailingClock {
     fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
         Err(positron_query::QueryClockFailure)
+    }
+}
+
+pub struct PeriodicFailingClock(AtomicU64);
+
+impl PeriodicFailingClock {
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(0)))
+    }
+}
+
+impl positron_query::QueryClock for PeriodicFailingClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        let call = self.0.fetch_add(1, Ordering::SeqCst);
+        if call % 4 == 3 {
+            Err(positron_query::QueryClockFailure)
+        } else {
+            Ok(100)
+        }
     }
 }
 
@@ -101,6 +123,8 @@ impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
     ) -> Result<u64, positron_query::QueryWorkFailure> {
         if stage == self.0 {
             Err(positron_query::QueryWorkFailure)
+        } else if stage == positron_query::QueryWorkStage::ScanDecode {
+            Ok(0)
         } else {
             Ok(1)
         }
@@ -109,12 +133,302 @@ impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
 
 pub struct ConstantWorkMeter(pub u64);
 
+pub struct StageCountingWorkMeter {
+    calls: [AtomicU64; 4],
+}
+
+impl StageCountingWorkMeter {
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self {
+            calls: std::array::from_fn(|_| AtomicU64::new(0)),
+        })
+    }
+
+    pub fn calls(&self, stage: positron_query::QueryWorkStage) -> u64 {
+        self.calls[stage_index(stage)].load(Ordering::SeqCst)
+    }
+}
+
+impl positron_query::QueryWorkMeter for StageCountingWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        self.calls[stage_index(stage)].fetch_add(1, Ordering::SeqCst);
+        Ok(1)
+    }
+}
+
+const fn stage_index(stage: positron_query::QueryWorkStage) -> usize {
+    match stage {
+        positron_query::QueryWorkStage::Parse => 0,
+        positron_query::QueryWorkStage::ScanDecode => 1,
+        positron_query::QueryWorkStage::Operators => 2,
+        positron_query::QueryWorkStage::Output => 3,
+    }
+}
+
+pub struct ZeroScanWorkMeter;
+
+impl positron_query::QueryWorkMeter for ZeroScanWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(u64::from(
+            stage != positron_query::QueryWorkStage::ScanDecode,
+        ))
+    }
+}
+
 impl positron_query::QueryWorkMeter for ConstantWorkMeter {
     fn units(
         &self,
         _stage: positron_query::QueryWorkStage,
     ) -> Result<u64, positron_query::QueryWorkFailure> {
         Ok(self.0)
+    }
+}
+
+pub fn zero_work_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(0)),
+    )
+}
+
+pub fn zero_work_clock_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+    clock: Arc<dyn positron_query::QueryClock>,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        clock,
+        Arc::new(ConstantWorkMeter(0)),
+    )
+}
+
+pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        TestClock::shared(100),
+        Arc::new(ZeroScanWorkMeter),
+    )
+}
+
+pub fn stage_work_clock_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+    clock: Arc<dyn positron_query::QueryClock>,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        clock,
+        Arc::new(ZeroScanWorkMeter),
+    )
+}
+
+pub struct CancellingStageWorkMeter {
+    stage: positron_query::QueryWorkStage,
+    cancellation: Mutex<Option<positron_query::QueryCancellation>>,
+}
+
+pub struct CancellingOperatorCallMeter {
+    stage: positron_query::QueryWorkStage,
+    cancel_at: u64,
+    calls: AtomicU64,
+    cancellation: Mutex<Option<positron_query::QueryCancellation>>,
+}
+
+impl CancellingOperatorCallMeter {
+    pub fn shared(cancel_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            stage: positron_query::QueryWorkStage::Operators,
+            cancel_at,
+            calls: AtomicU64::new(0),
+            cancellation: Mutex::new(None),
+        })
+    }
+
+    pub fn shared_for_stage(stage: positron_query::QueryWorkStage, cancel_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            stage,
+            cancel_at,
+            calls: AtomicU64::new(0),
+            cancellation: Mutex::new(None),
+        })
+    }
+
+    pub fn bind(
+        &self,
+        cancellation: positron_query::QueryCancellation,
+    ) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut slot = self
+            .cancellation
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        *slot = Some(cancellation);
+        Ok(())
+    }
+}
+
+impl positron_query::QueryWorkMeter for CancellingOperatorCallMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage == self.stage {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_at
+                && let Some(cancellation) = self
+                    .cancellation
+                    .lock()
+                    .map_err(|_| positron_query::QueryWorkFailure)?
+                    .as_ref()
+            {
+                cancellation.cancel();
+            }
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+impl CancellingStageWorkMeter {
+    pub fn shared(stage: positron_query::QueryWorkStage) -> Arc<Self> {
+        Arc::new(Self {
+            stage,
+            cancellation: Mutex::new(None),
+        })
+    }
+
+    pub fn bind(
+        &self,
+        cancellation: positron_query::QueryCancellation,
+    ) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut slot = self
+            .cancellation
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        *slot = Some(cancellation);
+        Ok(())
+    }
+}
+
+impl positron_query::QueryWorkMeter for CancellingStageWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage == self.stage
+            && let Some(cancellation) = self
+                .cancellation
+                .lock()
+                .map_err(|_| positron_query::QueryWorkFailure)?
+                .as_ref()
+        {
+            cancellation.cancel();
+        }
+        Ok(u64::from(
+            stage != positron_query::QueryWorkStage::ScanDecode,
+        ))
+    }
+}
+
+pub struct BlockingOperatorWorkMeter {
+    block_at: u64,
+    operator_calls: AtomicU64,
+    state: Mutex<BlockingOperatorState>,
+    changed: Condvar,
+}
+
+struct BlockingOperatorState {
+    blocked: bool,
+    released: bool,
+}
+
+impl BlockingOperatorWorkMeter {
+    pub fn shared(block_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            block_at,
+            operator_calls: AtomicU64::new(0),
+            state: Mutex::new(BlockingOperatorState {
+                blocked: false,
+                released: false,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub fn wait_until_blocked(&self) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        while !state.blocked {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| positron_query::QueryWorkFailure)?;
+        }
+        Ok(())
+    }
+
+    pub fn release(&self) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        state.released = true;
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl positron_query::QueryWorkMeter for BlockingOperatorWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage != positron_query::QueryWorkStage::Operators {
+            return Ok(0);
+        }
+        if self.operator_calls.fetch_add(1, Ordering::SeqCst) + 1 != self.block_at {
+            return Ok(1);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        state.blocked = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| positron_query::QueryWorkFailure)?;
+        }
+        Ok(1)
     }
 }
 
@@ -228,22 +542,48 @@ impl KernelFixture {
         event_time: i64,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
-        let candidate = NativeLogCandidate::new(
-            Some(event_time),
-            None,
-            Some(CandidateAttributeValue::string(body.to_owned())),
-            vec![],
-            LogMetadata::empty(),
-        );
-        let PolicyEvaluation::Accepted(evaluated) =
-            IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
-        else {
-            return Err("preserving policy rejected the query fixture".into());
-        };
-        let record = LogRecord::checked_evaluated(
-            ValueLimitProfile::release_1_system_maximum(),
-            *evaluated,
-        )?;
+        self.append_log_bodies(
+            vec![Some(CandidateAttributeValue::string(body.to_owned()))],
+            event_time,
+            identity,
+        )
+    }
+
+    pub fn append_log_bodies(
+        &self,
+        bodies: Vec<Option<CandidateAttributeValue>>,
+        event_time: i64,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        self.append_logs(
+            bodies
+                .into_iter()
+                .map(|body| (Some(event_time), body))
+                .collect(),
+            identity,
+        )
+    }
+
+    pub fn append_logs(
+        &self,
+        candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut records = Vec::new();
+        records.try_reserve_exact(candidates.len())?;
+        for (event_time, body) in candidates {
+            let candidate =
+                NativeLogCandidate::new(event_time, None, body, vec![], LogMetadata::empty());
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
         let capacity = self.authority.governor().reserve(WorkClaim::tenant(
             self.tenant,
             WorkKind::Ingest,
@@ -255,10 +595,114 @@ impl KernelFixture {
             self.tenant,
             self.shard,
             StoreBlockIdentity::new([identity; 16])?,
-            vec![record],
+            records,
         )?;
         self.ledger()?.append(block.into_store_block())?;
         Ok(())
+    }
+
+    pub fn append_attribute_logs(
+        &self,
+        candidates: Vec<(Option<i64>, Vec<NativeLogAttribute>)>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut records = Vec::new();
+        records.try_reserve_exact(candidates.len())?;
+        for (event_time, attributes) in candidates {
+            let candidate =
+                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty());
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the attribute query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let block = LogStore::new().prepare(
+            capacity,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
+            self.tenant,
+            self.shard,
+            StoreBlockIdentity::new([identity; 16])?,
+            records,
+        )?;
+        self.ledger()?.append(block.into_store_block())?;
+        Ok(())
+    }
+
+    pub fn append_indexed_attribute_logs(
+        &self,
+        candidates: Vec<(Option<i64>, Vec<NativeLogAttribute>)>,
+        identity: u8,
+        indexed_path: &positron_signals::SchemaPath,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let schema_budget = positron_signals::SchemaBudget::new(8, 200_000, 8_000, 8_000)?;
+        let schema_capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 200_000)?,
+        )?)?;
+        let mut schema =
+            positron_signals::SchemaSessionStore::new(schema_capacity, self.tenant, schema_budget)?;
+        let mut records = Vec::new();
+        records.try_reserve_exact(candidates.len())?;
+        for (event_time, attributes) in candidates {
+            let candidate =
+                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty());
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the indexed query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
+        let delta = schema.stage_group(&mut records)?;
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let block = LogStore::new()
+            .prepare(
+                capacity,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
+                self.tenant,
+                self.shard,
+                StoreBlockIdentity::new([identity; 16])?,
+                records,
+            )?
+            .into_store_block();
+        let digest = block.content_digest()?;
+        self.ledger()?.append(block)?;
+        let block_identity = StoreBlockIdentity::new([identity; 16])?;
+        schema.commit(delta, block_identity, digest)?;
+        let snapshot = self.ledger()?.snapshot()?;
+        let indexed_block = snapshot
+            .blocks()
+            .iter()
+            .find(|block| block.identity() == block_identity)
+            .ok_or("indexed block missing from fixture snapshot")?;
+        let mut query_update = schema.stage_query_update()?;
+        query_update.record_query_use(indexed_path)?;
+        query_update.index_replayed_query_path(
+            self.tenant,
+            &snapshot,
+            indexed_block,
+            indexed_path,
+        )?;
+        schema.commit_query_update(query_update)?;
+        Ok(schema)
     }
 
     pub fn append_malformed_log_block(&self, identity: u8) -> Result<(), Box<dyn Error>> {
@@ -276,11 +720,23 @@ fn establish_authority(
     volume: positron_kernel::OwnedPrimaryDataVolume,
     tenant: TenantId,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    let configuration = fixture_configuration(&volume, tenant, FixtureInventory::Declared)?;
+    StorageKernelResourceAuthority::establish(volume, configuration)
+        .map_err(|_| "kernel authority establishment failed".into())
+}
+
+#[derive(Clone, Copy)]
+enum FixtureInventory {
+    Declared,
+    DetectedCpu(u64),
+}
+
+fn fixture_configuration(
+    volume: &positron_kernel::OwnedPrimaryDataVolume,
+    tenant: TenantId,
+    detected_inventory: FixtureInventory,
+) -> Result<ResourceGovernorConfiguration, Box<dyn Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
-    let observed = ObservedResourceEnvironment::observe(
-        &volume,
-        RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])?,
-    )?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);
@@ -288,13 +744,19 @@ fn establish_authority(
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
     let ordinary_capacity = ResourceAmounts::new([
-        8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+        8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 4_096, 32, 2_000_000,
     ]);
     let raw = add(
         add(recovery_capacity, ordinary_capacity)?,
         cardinality.governor_bootstrap_overhead(1)?,
     )?;
-    let disk = observed.initial_disk().usable_bytes();
+    let detected = match detected_inventory {
+        FixtureInventory::Declared => raw,
+        FixtureInventory::DetectedCpu(cpu_work_units) => with_cpu(raw, cpu_work_units),
+    };
+    let disk = detected.get(ResourceDimension::DiskHeadroomBytes);
+    let observed =
+        ObservedResourceEnvironment::for_test(volume, detected, DiskObservation::new(disk))?;
     let inventory = ResourceInventory::new_observed(
         observed,
         OperatorLimits::new(raw)?,
@@ -309,17 +771,38 @@ fn establish_authority(
     )?;
     let policy = GovernorPolicy::new(
         [TenantQuota::new(tenant, 1, ordinary_capacity)?],
-        OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2))?,
+        OrdinaryPoolPolicy::new(
+            with_cpu(uniform(8), 1_024),
+            with_cpu(uniform(6), 1_024),
+            with_cpu(uniform(4), 1_024),
+            uniform(2),
+        )?,
     )?;
     let recovery =
         RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
-    let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;
-    StorageKernelResourceAuthority::establish(volume, configuration)
-        .map_err(|_| "kernel authority establishment failed".into())
+    Ok(ResourceGovernorConfiguration::new(
+        inventory, policy, recovery,
+    )?)
 }
 
 fn uniform(value: u64) -> ResourceAmounts {
     ResourceAmounts::new([value; DIMENSIONS])
+}
+
+fn with_cpu(amounts: ResourceAmounts, cpu_work_units: u64) -> ResourceAmounts {
+    ResourceAmounts::new([
+        amounts.get(ResourceDimension::MemoryBytes),
+        amounts.get(ResourceDimension::QueueSlots),
+        amounts.get(ResourceDimension::TaskSlots),
+        amounts.get(ResourceDimension::BufferCacheBytes),
+        amounts.get(ResourceDimension::BatchItems),
+        amounts.get(ResourceDimension::LeaseSlots),
+        amounts.get(ResourceDimension::RetrySlots),
+        amounts.get(ResourceDimension::IoPermits),
+        cpu_work_units,
+        amounts.get(ResourceDimension::FileDescriptors),
+        amounts.get(ResourceDimension::DiskHeadroomBytes),
+    ])
 }
 
 fn add(left: ResourceAmounts, right: ResourceAmounts) -> Result<ResourceAmounts, Box<dyn Error>> {
@@ -341,4 +824,35 @@ fn add(left: ResourceAmounts, right: ResourceAmounts) -> Result<ResourceAmounts,
         value(ResourceDimension::FileDescriptors)?,
         value(ResourceDimension::DiskHeadroomBytes)?,
     ]))
+}
+
+#[test]
+fn four_core_capacity_cannot_admit_the_declared_acknowledged_logs_fixture_quota()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoots::new("four-core-capacity")?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let failure = match fixture_configuration(
+        &volume,
+        TenantId::from_bytes([0xa1; 16])?,
+        FixtureInventory::DetectedCpu(4_000),
+    ) {
+        Ok(_) => return Err("four logical CPUs unexpectedly admitted the fixture quota".into()),
+        Err(failure) => failure,
+    };
+
+    assert_eq!(
+        failure.downcast_ref::<GovernorFailure>(),
+        Some(&GovernorFailure::InvalidConfiguration)
+    );
+    Ok(())
+}
+
+#[test]
+fn acknowledged_logs_fixture_uses_its_declared_inventory_instead_of_live_host_capacity()
+-> Result<(), Box<dyn Error>> {
+    let _fixture = KernelFixture::new(
+        TenantId::from_bytes([0xa2; 16])?,
+        "deterministic-resource-inventory",
+    )?;
+    Ok(())
 }

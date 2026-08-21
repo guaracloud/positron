@@ -9,10 +9,12 @@ mod index;
 pub(crate) use index::{SchemaBlockIndex, SchemaIndexPath};
 mod model;
 mod observation;
+mod observed_coverage;
 mod promotion;
 mod query;
 mod representation;
 mod session;
+mod stored_query;
 
 pub use catalog::SchemaCatalog;
 pub use checkpoint::SchemaCheckpointFrontier;
@@ -27,6 +29,7 @@ pub use observation::SchemaObservation;
 pub use query::{OccurrenceSelector, SchemaQuery, SchemaQueryResult, SchemaValue};
 pub use representation::SchemaRepresentation;
 pub use session::{SchemaQueryUpdate, SchemaSessionStore};
+pub use stored_query::SchemaTraversalFailure;
 
 #[cfg(test)]
 mod tests;

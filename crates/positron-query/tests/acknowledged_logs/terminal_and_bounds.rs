@@ -3,11 +3,14 @@ use std::error::Error;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 use positron_query::{
-    QueryBudget, QueryCursor, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+    QueryBudget, QueryBudgetDimension, QueryCursor, QueryEvent, QueryFailureCode, QueryService,
+    QueryTerminal,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
-use super::support::{KernelFixture, TemporaryRoots, TestClock};
+use super::support::{
+    KernelFixture, SequenceClock, TemporaryRoots, TestClock, zero_work_clock_service,
+};
 
 #[test]
 fn cancellation_replaces_unsent_events_with_one_non_complete_terminal() -> Result<(), Box<dyn Error>>
@@ -88,6 +91,35 @@ fn empty_snapshot_completes_once_without_a_batch_and_terminal_cancel_is_idempote
 }
 
 #[test]
+fn response_header_exposes_every_effective_query_budget_limit() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("header-budget")?;
+    let service = fixture.service(1)?;
+    let expected = QueryBudget::new(101, 7, 5, 103, 107, 109)?
+        .with_cpu_work_units(11)?
+        .with_maximum_time_range_nanoseconds(113)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time 0 100 | limit 1",
+        expected,
+    )?;
+    let mut stream = service.execute(query)?;
+    let actual = match stream.next() {
+        Some(QueryEvent::Header(header)) => header.budget(),
+        _ => return Err("query header missing".into()),
+    };
+
+    assert_eq!(actual.scanned_bytes(), 101);
+    assert_eq!(actual.decoded_records(), 7);
+    assert_eq!(actual.output_rows(), 5);
+    assert_eq!(actual.output_bytes(), 103);
+    assert_eq!(actual.memory_bytes(), 107);
+    assert_eq!(actual.cpu_work_units(), 11);
+    assert_eq!(actual.wall_seconds(), 109);
+    assert_eq!(actual.maximum_time_range_nanoseconds(), 113);
+    Ok(())
+}
+
+#[test]
 fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("page-bounds")?;
@@ -105,7 +137,7 @@ fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Resul
         QueryFailureCode::InvalidBudget
     );
 
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -123,6 +155,73 @@ fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Resul
             .code(),
         QueryFailureCode::InvalidBudget
     );
+    Ok(())
+}
+
+#[test]
+fn paged_execution_classifies_elapsed_deadlines_before_snapshot_mutation()
+-> Result<(), Box<dyn Error>> {
+    for (label, execute_at) in [("page-exact-deadline", 101), ("page-past-deadline", 102)] {
+        let fixture = QueryFixture::new(label)?;
+        let service = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            1,
+            SequenceClock::shared([100, 100, execute_at]),
+        );
+        let before_resources = fixture.kernel.authority.governor().inspect()?;
+        let before_snapshot = fixture.kernel.ledger()?.snapshot()?;
+        let before_catalog = (
+            before_snapshot.catalog_identity(),
+            before_snapshot.catalog_generation(),
+        );
+        drop(before_snapshot);
+        let query = service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 1",
+            deadline_budget(),
+        )?;
+
+        let failure = service
+            .execute_page(query)
+            .expect_err("elapsed page deadline must fail before snapshot lease creation");
+        assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+        assert_eq!(
+            failure.limiting_budget(),
+            Some(QueryBudgetDimension::WallSeconds)
+        );
+        assert_eq!(
+            fixture.kernel.authority.governor().inspect()?,
+            before_resources
+        );
+        let after_snapshot = fixture.kernel.ledger()?.snapshot()?;
+        assert_eq!(
+            (
+                after_snapshot.catalog_identity(),
+                after_snapshot.catalog_generation(),
+            ),
+            before_catalog
+        );
+    }
+
+    let fixture = QueryFixture::new("page-within-deadline")?;
+    let service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        deadline_budget(),
+    )?;
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
     Ok(())
 }
 
@@ -148,7 +247,7 @@ fn scan_capacity_refusal_is_one_typed_non_complete_terminal() -> Result<(), Box<
         .reserve(WorkClaim::tenant(
             tenant,
             WorkKind::InteractiveQueryTail,
-            ResourceAmounts::only(ResourceDimension::MemoryBytes, 7_900_000)?,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 6_850_000)?,
         )?)?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     drop(held);
@@ -164,6 +263,10 @@ fn scan_capacity_refusal_is_one_typed_non_complete_terminal() -> Result<(), Box<
 #[test]
 fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result<(), Box<dyn Error>>
 {
+    assert_ne!(
+        QueryFailureCode::ResourceExhausted,
+        QueryFailureCode::BudgetExhausted
+    );
     assert_eq!(
         QueryBudget::new(1, 1_025, 1, 1, 1, 1)
             .expect_err("decoded record bound")
@@ -189,6 +292,17 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
             .expect_err("zero temporal bound")
             .code(),
         QueryFailureCode::InvalidBudget
+    );
+    assert_eq!(
+        QueryBudget::new(1, 1, 1, 1, 1, 3_600)?.wall_seconds(),
+        3_600
+    );
+    let overlong_wall = QueryBudget::new(1, 1, 1, 1, 1, 3_601)
+        .expect_err("wall budget above the Release-1 lease ceiling");
+    assert_eq!(overlong_wall.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        overlong_wall.limiting_budget(),
+        Some(QueryBudgetDimension::WallSeconds)
     );
     assert!(QueryCursor::from_bytes(&[0; 340]).is_err());
     assert!(QueryCursor::from_bytes(&[0; 341]).is_ok());
@@ -260,6 +374,44 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
         ))?,
         QueryFailureCode::ResourceAdmissionRefused
     );
+    for source in [
+        "pipeline:v1 logs | range query_time -100 100 | limit 1 | filter body == \"late\"",
+        "pipeline:v1 logs | filter body == \"late\" | range query_time -100 100 | limit 1",
+    ] {
+        assert_eq!(
+            failure_code(service.plan_pipeline(fixture.context, source, budget()))?,
+            QueryFailureCode::UnsupportedQuery
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn every_query_frontend_rejects_source_bytes_beyond_the_public_bound_before_parsing()
+-> Result<(), Box<dyn Error>> {
+    const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
+    let fixture = QueryFixture::new("source-byte-bound")?;
+    let service = fixture.service(16)?;
+    let shorthand = padded_source(
+        "logs | range query_time -100 100 | limit 1",
+        MAX_QUERY_SOURCE_BYTES,
+    )?;
+    let sql = padded_source(
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        MAX_QUERY_SOURCE_BYTES,
+    )?;
+
+    drop(service.plan_pipeline(fixture.context, &shorthand, budget())?);
+    drop(service.plan_sql(fixture.context, &sql, budget())?);
+
+    assert_eq!(
+        failure_code(service.plan_pipeline(fixture.context, &format!("{shorthand} "), budget(),))?,
+        QueryFailureCode::UnsupportedQuery
+    );
+    assert_eq!(
+        failure_code(service.plan_sql(fixture.context, &format!("{sql} "), budget()))?,
+        QueryFailureCode::UnsupportedQuery
+    );
     Ok(())
 }
 
@@ -304,7 +456,7 @@ impl QueryFixture {
         &self,
         batch_limit: u16,
     ) -> Result<QueryService<'static, 'static, '_>, Box<dyn Error>> {
-        Ok(QueryService::new(
+        Ok(super::support::zero_work_service(
             self.kernel.authority.governor(),
             self.kernel.ledger()?,
             batch_limit,
@@ -313,7 +465,12 @@ impl QueryFixture {
 }
 
 fn budget() -> QueryBudget {
-    QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 4, 60).expect("fixture budget")
+    QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 1_048_576, 60).expect("fixture budget")
+}
+
+fn deadline_budget() -> QueryBudget {
+    QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 1_048_576, 1)
+        .expect("deadline fixture budget")
 }
 
 fn terminal_count(events: &[QueryEvent]) -> usize {
@@ -330,4 +487,11 @@ fn failure_code<T>(
         Ok(_) => Err("query unexpectedly planned".into()),
         Err(failure) => Ok(failure.code()),
     }
+}
+
+fn padded_source(source: &str, bytes: usize) -> Result<String, Box<dyn Error>> {
+    let padding = bytes
+        .checked_sub(source.len())
+        .ok_or("query fixture exceeds its intended byte bound")?;
+    Ok(format!("{source}{:padding$}", ""))
 }

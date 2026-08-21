@@ -1,7 +1,11 @@
 use positron_domain::value::{AttributeOccurrenceSet, AttributeValueKind, ValidatedAttributeValue};
 
 use super::{SchemaCatalog, SchemaFailure, SchemaObservation, SchemaPath, SchemaRepresentation};
-use crate::log_store::{AttributeRepresentation, StoredLogRecord};
+
+mod traversal;
+pub(crate) use traversal::{
+    evaluate_observed, matches_observed, visit_terminals, visit_terminals_observed,
+};
 
 /// Explicit selection semantics for repeated attribute occurrences.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,7 +176,13 @@ impl SchemaValue {
 pub struct SchemaQuery {
     path: SchemaPath,
     selector: OccurrenceSelector,
-    value: SchemaValue,
+    value: QueryValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum QueryValue {
+    Scalar(SchemaValue),
+    Native(ValidatedAttributeValue),
 }
 
 impl SchemaQuery {
@@ -181,7 +191,34 @@ impl SchemaQuery {
         Self {
             path,
             selector,
-            value,
+            value: QueryValue::Scalar(value),
+        }
+    }
+
+    /// Builds an exact native-value predicate without scalar coercion.
+    #[must_use]
+    pub const fn native_value(
+        path: SchemaPath,
+        selector: OccurrenceSelector,
+        value: ValidatedAttributeValue,
+    ) -> Self {
+        Self {
+            path,
+            selector,
+            value: QueryValue::Native(value),
+        }
+    }
+
+    /// Builds an exact typed predicate while retaining scalar values in the
+    /// existing schema dictionary vocabulary and structural values losslessly.
+    pub fn exact_native_value(
+        path: SchemaPath,
+        selector: OccurrenceSelector,
+        value: ValidatedAttributeValue,
+    ) -> Result<Self, SchemaFailure> {
+        match SchemaValue::try_from_validated(&value)? {
+            Some(value) => Ok(Self::value(path, selector, value)),
+            None => Ok(Self::native_value(path, selector, value)),
         }
     }
     #[must_use]
@@ -194,20 +231,23 @@ impl SchemaQuery {
     }
     pub(crate) const fn expected_kind(&self) -> AttributeValueKind {
         match &self.value {
-            SchemaValue::Null => AttributeValueKind::Null,
-            SchemaValue::Boolean(_) => AttributeValueKind::Boolean,
-            SchemaValue::SignedInteger(_) => AttributeValueKind::SignedInteger,
-            SchemaValue::FloatingPointBits(_) => AttributeValueKind::FloatingPoint,
-            SchemaValue::String(_) => AttributeValueKind::String,
-            SchemaValue::Bytes(_) => AttributeValueKind::Bytes,
-            SchemaValue::Kind(kind) => *kind,
+            QueryValue::Scalar(SchemaValue::Null) => AttributeValueKind::Null,
+            QueryValue::Scalar(SchemaValue::Boolean(_)) => AttributeValueKind::Boolean,
+            QueryValue::Scalar(SchemaValue::SignedInteger(_)) => AttributeValueKind::SignedInteger,
+            QueryValue::Scalar(SchemaValue::FloatingPointBits(_)) => {
+                AttributeValueKind::FloatingPoint
+            },
+            QueryValue::Scalar(SchemaValue::String(_)) => AttributeValueKind::String,
+            QueryValue::Scalar(SchemaValue::Bytes(_)) => AttributeValueKind::Bytes,
+            QueryValue::Scalar(SchemaValue::Kind(kind)) => *kind,
+            QueryValue::Native(value) => value.kind(),
         }
     }
 
     pub(crate) const fn expected_scalar(&self) -> Option<&SchemaValue> {
-        match self.value {
-            SchemaValue::Kind(_) => None,
-            _ => Some(&self.value),
+        match &self.value {
+            QueryValue::Scalar(SchemaValue::Kind(_)) | QueryValue::Native(_) => None,
+            QueryValue::Scalar(value) => Some(value),
         }
     }
 }
@@ -239,35 +279,9 @@ impl SchemaCatalog {
             query,
         )
     }
-
-    pub(crate) fn query_stored_record(
-        &self,
-        record: &StoredLogRecord,
-        query: &SchemaQuery,
-    ) -> SchemaQueryResult {
-        let root = query.path().segments().first().map(String::as_str);
-        evaluate(
-            self.entry(query.path()),
-            record.attributes().iter().filter_map(|attribute| {
-                let set = attribute.occurrences();
-                (set.namespace() == query.path().namespace() && Some(set.key()) == root).then_some(
-                    (
-                        set,
-                        match attribute.representation() {
-                            AttributeRepresentation::Generic => SchemaRepresentation::Cataloged,
-                            AttributeRepresentation::SchemaOverflow => {
-                                SchemaRepresentation::Overflow
-                            },
-                        },
-                    ),
-                )
-            }),
-            query,
-        )
-    }
 }
 
-fn evaluate<'a>(
+pub(super) fn evaluate<'a>(
     entry: Option<&super::SchemaEntry>,
     attributes: impl Iterator<Item = (&'a AttributeOccurrenceSet, SchemaRepresentation)>,
     query: &SchemaQuery,
@@ -275,13 +289,17 @@ fn evaluate<'a>(
     let indexed = entry.is_some_and(super::SchemaEntry::promoted);
     let mut state = SelectionState::new(query.selector, &query.value);
     let mut reduced_pruning = !indexed;
+    let Some(remaining) = query.path.segments().get(1..) else {
+        return SchemaQueryResult {
+            matched: false,
+            reduced_pruning: true,
+        };
+    };
     for (attribute, representation) in attributes {
         reduced_pruning |= representation.is_overflow();
         for index in 0..attribute.len() {
             if let Some(value) = attribute.occurrence(index) {
-                visit_terminals(value, &query.path.segments()[1..], &mut |terminal| {
-                    state.visit(terminal)
-                });
+                visit_terminals(value, remaining, &mut |terminal| state.visit(terminal));
             }
             if state.complete() {
                 break;
@@ -299,7 +317,7 @@ fn evaluate<'a>(
 
 struct SelectionState<'a> {
     selector: OccurrenceSelector,
-    expected: &'a SchemaValue,
+    expected: &'a QueryValue,
     ordinal: usize,
     selected: usize,
     matched: bool,
@@ -307,7 +325,7 @@ struct SelectionState<'a> {
 }
 
 impl<'a> SelectionState<'a> {
-    const fn new(selector: OccurrenceSelector, expected: &'a SchemaValue) -> Self {
+    const fn new(selector: OccurrenceSelector, expected: &'a QueryValue) -> Self {
         Self {
             selector,
             expected,
@@ -324,7 +342,7 @@ impl<'a> SelectionState<'a> {
             return true;
         }
         self.selected = self.selected.saturating_add(1);
-        let matches = value_matches(value, self.expected);
+        let matches = traversal::value_matches(value, self.expected);
         match self.selector {
             OccurrenceSelector::Index(_) => {
                 self.matched = matches;
@@ -347,41 +365,5 @@ impl<'a> SelectionState<'a> {
     }
     const fn matched(&self) -> bool {
         self.selected > 0 && self.matched
-    }
-}
-
-fn visit_terminals(
-    value: &ValidatedAttributeValue,
-    segments: &[String],
-    visit: &mut impl FnMut(&ValidatedAttributeValue) -> bool,
-) -> bool {
-    let Some((segment, remaining)) = segments.split_first() else {
-        return visit(value);
-    };
-    let Some(count) = value.key_value_list_len() else {
-        return true;
-    };
-    for index in 0..count {
-        if let Some(entry) = value.key_value_entry(index)
-            && entry.key() == segment
-            && !visit_terminals(entry.value(), remaining, visit)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn value_matches(value: &ValidatedAttributeValue, expected: &SchemaValue) -> bool {
-    match expected {
-        SchemaValue::Null => value.is_null(),
-        SchemaValue::Boolean(expected) => value.as_boolean() == Some(*expected),
-        SchemaValue::SignedInteger(expected) => value.as_signed_integer() == Some(*expected),
-        SchemaValue::FloatingPointBits(expected) => {
-            value.as_floating_point_bits() == Some(*expected)
-        },
-        SchemaValue::String(expected) => value.as_str() == Some(expected.as_str()),
-        SchemaValue::Bytes(expected) => value.as_bytes() == Some(expected.as_slice()),
-        SchemaValue::Kind(expected) => value.kind() == *expected,
     }
 }

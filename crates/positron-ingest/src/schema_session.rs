@@ -225,10 +225,15 @@ impl TenantSchemaSession {
                     SchemaSessionFailure::Schema(SchemaFailure::LimitExceeded)
                 },
                 positron_signals::LogStoreFailureCode::ResourceExhausted
+                | positron_signals::LogStoreFailureCode::BudgetExhausted
                 | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused
                 | positron_signals::LogStoreFailureCode::ClockUnavailable
-                | positron_signals::LogStoreFailureCode::Kernel => {
+                | positron_signals::LogStoreFailureCode::Kernel
+                | positron_signals::LogStoreFailureCode::Internal => {
                     SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
+                },
+                positron_signals::LogStoreFailureCode::Cancelled => {
+                    SchemaSessionFailure::StateUnavailable
                 },
             })?;
         state.in_flight = Some(identity);

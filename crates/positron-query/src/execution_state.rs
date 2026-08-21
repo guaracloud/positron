@@ -7,7 +7,7 @@ use positron_kernel::{LedgerSnapshot, SnapshotLeaseId};
 
 use crate::cursor::CursorState;
 use crate::stream::QueryCounters;
-use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryIncomplete, QueryStats};
+use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryStats};
 
 pub(crate) fn stats_before_current(state: &CursorState) -> QueryStats {
     QueryStats::new(
@@ -24,6 +24,7 @@ pub(crate) fn stats_before_current(state: &CursorState) -> QueryStats {
             .flatten(),
         state.prior_digest,
     )
+    .with_reduced_pruning(state.reduced_pruning)
 }
 
 pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
@@ -39,10 +40,7 @@ pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
         Some(state.sequence),
         state.prior_digest,
     )
-}
-
-pub(crate) fn incomplete(failure: QueryFailure, state: &CursorState) -> QueryIncomplete {
-    QueryIncomplete::new(failure, stats_before_current(state))
+    .with_reduced_pruning(state.reduced_pruning)
 }
 
 pub(crate) fn initial_state(
@@ -59,7 +57,7 @@ pub(crate) fn initial_state(
         catalog_identity: snapshot.catalog_identity().to_bytes(),
         catalog_generation: snapshot.catalog_generation(),
         frontier: snapshot.frontier().value(),
-        plan: query.plan,
+        plan: query.plan.clone(),
         offset: 0,
         sequence: 0,
         prior_digest: [0; 32],
@@ -74,6 +72,8 @@ pub(crate) fn initial_state(
         last_observed_at: query.last_observed_at,
         cpu_work_units: query.cpu_work_units,
         elapsed_wall_seconds: query.last_observed_at.saturating_sub(query.started_at),
+        reduced_pruning: false,
+        cancellation: query.cancellation.clone(),
     }
 }
 

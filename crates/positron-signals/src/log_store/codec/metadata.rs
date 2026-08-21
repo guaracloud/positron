@@ -23,34 +23,30 @@ pub(super) fn decode(
     input: &mut Input<'_>,
     limits: CodecLimits,
 ) -> Result<LogMetadata, LogStoreFailure> {
-    let severity_number = input.i32()?;
-    let severity_text = input.string(limits.record_bytes)?;
-    let event_name = input.string(limits.record_bytes)?;
-    let trace_id = decode_optional_id(input)?;
-    let span_id = decode_optional_id(input)?;
-    let flags = input.u32()?;
-    let dropped_attributes_count = input.u32()?;
-    let resource_dropped_attributes_count = input.u32()?;
-    let resource_schema_url = input.string(limits.record_bytes)?;
-    let scope_name = input.string(limits.record_bytes)?;
-    let scope_version = input.string(limits.record_bytes)?;
-    let scope_dropped_attributes_count = input.u32()?;
-    let scope_schema_url = input.string(limits.record_bytes)?;
+    let fields = decode_fields(input, limits)?;
     Ok(LogMetadata::new_with_event_name(
-        severity_number,
-        severity_text,
-        event_name,
-        trace_id,
-        span_id,
-        flags,
-        dropped_attributes_count,
-        resource_dropped_attributes_count,
-        resource_schema_url,
-        scope_name,
-        scope_version,
-        scope_dropped_attributes_count,
-        scope_schema_url,
+        fields.severity_number,
+        try_string(fields.severity_text)?,
+        try_string(fields.event_name)?,
+        fields.trace_id,
+        fields.span_id,
+        fields.flags,
+        fields.dropped_attributes_count,
+        fields.resource_dropped_attributes_count,
+        try_string(fields.resource_schema_url)?,
+        try_string(fields.scope_name)?,
+        try_string(fields.scope_version)?,
+        fields.scope_dropped_attributes_count,
+        try_string(fields.scope_schema_url)?,
     ))
+}
+
+pub(super) fn validate(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+) -> Result<usize, LogStoreFailure> {
+    let fields = decode_fields(input, limits)?;
+    fields.decoded_size_bytes()
 }
 
 pub(super) fn encoded_length(metadata: &LogMetadata) -> Result<usize, LogStoreFailure> {
@@ -92,4 +88,69 @@ fn decode_optional_id<const N: usize>(
         1 => Ok(Some(input.array()?)),
         _ => Err(LogStoreFailure::malformed_block()),
     }
+}
+
+struct DecodedFields<'a> {
+    severity_number: i32,
+    severity_text: &'a str,
+    event_name: &'a str,
+    trace_id: Option<[u8; 16]>,
+    span_id: Option<[u8; 8]>,
+    flags: u32,
+    dropped_attributes_count: u32,
+    resource_dropped_attributes_count: u32,
+    resource_schema_url: &'a str,
+    scope_name: &'a str,
+    scope_version: &'a str,
+    scope_dropped_attributes_count: u32,
+    scope_schema_url: &'a str,
+}
+
+impl DecodedFields<'_> {
+    fn decoded_size_bytes(&self) -> Result<usize, LogStoreFailure> {
+        [
+            self.severity_text.len(),
+            self.event_name.len(),
+            self.resource_schema_url.len(),
+            self.scope_name.len(),
+            self.scope_version.len(),
+            self.scope_schema_url.len(),
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, bytes| {
+            total
+                .checked_add(bytes)
+                .ok_or_else(LogStoreFailure::malformed_block)
+        })
+    }
+}
+
+fn decode_fields<'a>(
+    input: &mut Input<'a>,
+    limits: CodecLimits,
+) -> Result<DecodedFields<'a>, LogStoreFailure> {
+    Ok(DecodedFields {
+        severity_number: input.i32()?,
+        severity_text: input.string_slice(limits.record_bytes)?,
+        event_name: input.string_slice(limits.record_bytes)?,
+        trace_id: decode_optional_id(input)?,
+        span_id: decode_optional_id(input)?,
+        flags: input.u32()?,
+        dropped_attributes_count: input.u32()?,
+        resource_dropped_attributes_count: input.u32()?,
+        resource_schema_url: input.string_slice(limits.record_bytes)?,
+        scope_name: input.string_slice(limits.record_bytes)?,
+        scope_version: input.string_slice(limits.record_bytes)?,
+        scope_dropped_attributes_count: input.u32()?,
+        scope_schema_url: input.string_slice(limits.record_bytes)?,
+    })
+}
+
+fn try_string(source: &str) -> Result<String, LogStoreFailure> {
+    let mut value = String::new();
+    value
+        .try_reserve_exact(source.len())
+        .map_err(|_| LogStoreFailure::resource_exhausted())?;
+    value.push_str(source);
+    Ok(value)
 }

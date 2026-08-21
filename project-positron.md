@@ -1274,7 +1274,10 @@ allowing it to change the bound query.
 A Snapshot Lease is a bounded persistent Resource Reservation that pins
 the immutable segments and catalog generations needed by a resumable
 query. Leases consume tenant counts, bytes, and lifetime quota, survive
-process restart, and have a documented maximum TTL. Compaction
+process restart, and have a Release 1 hard maximum TTL of one hour
+(3,600 seconds). Making that ceiling configurable is not a Release 1
+configuration surface. This follows the existing one-hour hard lease
+precedent for bounded key custody in ADR-0037. Compaction
 and Retention Policy may logically replace data but cannot physically
 reclaim a leased object until release or expiry. A lease never postpones
 Tenant Purge.

@@ -100,6 +100,55 @@ fn snapshot_lease_public_time_and_signal_boundaries_are_typed_and_restartable()
 }
 
 #[test]
+fn snapshot_lease_ttl_ceiling_is_exact_and_rejection_precedes_all_mutation()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let before_catalog = catalog.pin()?;
+        let before_resources = authority.governor().inspect()?;
+        assert_eq!(
+            ledger
+                .create_snapshot_lease(100, 3_701)
+                .expect_err("lease above the one-hour ceiling")
+                .code(),
+            LedgerFailureCode::InvalidInput
+        );
+        let after_catalog = catalog.pin()?;
+        assert_eq!(after_catalog.identity(), before_catalog.identity());
+        assert_eq!(after_catalog.number(), before_catalog.number());
+        let after_resources = authority.governor().inspect()?;
+        assert_eq!(
+            after_resources.outstanding_total(),
+            before_resources.outstanding_total()
+        );
+        for dimension in crate::ResourceDimension::ALL {
+            assert_eq!(
+                after_resources.usage(dimension),
+                before_resources.usage(dimension)
+            );
+        }
+
+        let exact = ledger.create_snapshot_lease(100, 3_700)?;
+        ledger.release_snapshot_lease(exact.identity())?;
+        let maximum = ledger.create_snapshot_lease(u64::MAX - 3_600, u64::MAX)?;
+        ledger.release_snapshot_lease(maximum.identity())?;
+        assert_eq!(
+            ledger
+                .create_snapshot_lease(0, u64::MAX)
+                .expect_err("checked lifetime arithmetic rejects an overlong interval")
+                .code(),
+            LedgerFailureCode::InvalidInput
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_creation_prunes_expired_capacity_without_releasing_active_leases()
 -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
@@ -117,6 +166,52 @@ fn snapshot_lease_creation_prunes_expired_capacity_without_releasing_active_leas
             ledger.resume_snapshot_lease(active, 166)?.identity(),
             active
         );
+        Ok(())
+    })
+}
+
+#[test]
+fn refused_snapshot_capacity_never_publishes_or_retains_a_lease() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        ledger.append(prepared(scope, b"snapshot-capacity")?)?;
+        let held = authority.governor().reserve(crate::WorkClaim::tenant(
+            scope.tenant,
+            crate::WorkKind::InteractiveQueryTail,
+            crate::ResourceAmounts::only(crate::ResourceDimension::QueueSlots, 16)?,
+        )?)?;
+        let baseline = authority.governor().inspect()?.outstanding_total();
+
+        for now in 100..=164 {
+            assert_eq!(
+                ledger
+                    .create_snapshot_lease(now, now + 100)
+                    .expect_err("snapshot capacity is unavailable")
+                    .code(),
+                LedgerFailureCode::ResourceAdmissionRefused
+            );
+            assert_eq!(
+                authority.governor().inspect()?.outstanding_total(),
+                baseline
+            );
+            assert_eq!(
+                catalog
+                    .pin()?
+                    .plaintext_objects()
+                    .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                    .count(),
+                0
+            );
+        }
+
+        drop(held);
+        let lease = ledger.create_snapshot_lease(165, 265)?;
+        ledger.release_snapshot_lease(lease.identity())?;
         Ok(())
     })
 }
@@ -234,8 +329,11 @@ fn snapshot_lease_release_fault_retains_retryable_idempotent_truth() -> Result<(
         .expect_err("failed release cannot erase durable resume truth");
         assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
         assert_eq!(
-            ledger.resume_snapshot_lease(identity, 101)?.identity(),
-            identity
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("resume retries the registered cleanup intent")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
         );
         ledger.release_snapshot_lease(identity)?;
         ledger.release_snapshot_lease(identity)?;
@@ -243,6 +341,39 @@ fn snapshot_lease_release_fault_retains_retryable_idempotent_truth() -> Result<(
             ledger
                 .resume_snapshot_lease(identity, 102)
                 .expect_err("idempotent release remains terminal")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn later_lease_activity_retries_a_failed_release_without_losing_its_identity()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            ledger.release_snapshot_lease(identity)
+        })
+        .expect_err("failed release stays pending in the ledger authority");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+
+        let replacement = ledger.create_snapshot_lease(101, 201)?.identity();
+        assert_eq!(
+            ledger.resume_snapshot_lease(replacement, 101)?.identity(),
+            replacement
+        );
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("later lease activity drains the pending release")
                 .code(),
             LedgerFailureCode::SnapshotExpired
         );
@@ -272,6 +403,86 @@ fn snapshot_lease_v1_catalog_record_remains_restart_resumable() -> Result<(), Bo
         let resumed = reopened.resume_snapshot_lease(identity, 101)?;
         assert_eq!(resumed.identity(), identity);
         assert_eq!(resumed.expiry(), 200);
+        let normalized_snapshot = catalog.pin()?;
+        let normalized = normalized_snapshot
+            .plaintext_objects()
+            .find(|bytes| bytes.starts_with(b"PSLEASE1"))
+            .ok_or("normalized snapshot lease missing")?;
+        assert_eq!(normalized.get(8..10), Some(2_u16.to_be_bytes().as_slice()));
+        Ok(())
+    })
+}
+
+#[test]
+fn legacy_snapshot_lease_recovery_rejects_only_unprovable_active_ttl() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xc2, |bytes| rewrite_v2_lease_as_v1(bytes, 3_702))?;
+        drop(ledger);
+
+        let failure = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )
+        .err()
+        .ok_or("overlong active legacy lease unexpectedly reopened")?;
+        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        assert!(catalog.pin()?.plaintext_objects().any(|bytes| {
+            bytes.starts_with(b"PSLEASE1")
+                && bytes.get(8..10) == Some(1_u16.to_be_bytes().as_slice())
+        }));
+        assert_ne!(identity.to_bytes(), [0; 16]);
+        Ok(())
+    })?;
+
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xc3, |bytes| rewrite_v2_lease_as_v1(bytes, 100))?;
+        drop(ledger);
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )?;
+        assert_eq!(
+            reopened
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("expired legacy lease must be pruned normally")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn maximum_v2_snapshot_lease_remains_restart_resumable() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 3_700)?.identity();
+        drop(ledger);
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )?;
+        let resumed = reopened.resume_snapshot_lease(identity, 101)?;
+        assert_eq!(resumed.expiry(), 3_700);
         Ok(())
     })
 }
@@ -283,6 +494,12 @@ fn malformed_snapshot_lease_catalog_records_fail_closed() -> Result<(), Box<dyn 
         (0xd2, |bytes: &mut Vec<u8>| bytes[42] = u8::MAX),
         (0xd3, truncate_lease_header),
         (0xd4, append_lease_trailing_byte),
+        (0xd5, |bytes: &mut Vec<u8>| {
+            bytes[103..111].copy_from_slice(&3_701_u64.to_be_bytes());
+        }),
+        (0xd7, |bytes: &mut Vec<u8>| {
+            bytes[103..111].copy_from_slice(&100_u64.to_be_bytes());
+        }),
     ] {
         with_fixture(|authority, catalog, scope| {
             let ledger = ActiveSegmentLedger::open(
@@ -304,6 +521,58 @@ fn malformed_snapshot_lease_catalog_records_fail_closed() -> Result<(), Box<dyn 
         })?;
     }
     Ok(())
+}
+
+#[test]
+fn active_legacy_lease_with_unprovable_remaining_ttl_fails_closed() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xd6, |bytes| rewrite_v2_lease_as_v1(bytes, 3_702))?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("legacy active lease exceeds the one-hour remaining bound")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn bounded_active_legacy_lease_is_normalized_when_resumed() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xd8, |bytes| rewrite_v2_lease_as_v1(bytes, 200))?;
+
+        assert_eq!(
+            ledger.resume_snapshot_lease(identity, 101)?.identity(),
+            identity
+        );
+        let normalized_snapshot = catalog.pin()?;
+        let normalized = normalized_snapshot
+            .plaintext_objects()
+            .find(|bytes| bytes.starts_with(b"PSLEASE1"))
+            .ok_or("normalized snapshot lease missing")?;
+        assert_eq!(normalized.get(8..10), Some(2_u16.to_be_bytes().as_slice()));
+        assert_eq!(
+            normalized.get(95..103),
+            Some(101_u64.to_be_bytes().as_slice())
+        );
+        Ok(())
+    })
 }
 
 fn publish_lease_rewrite(
@@ -347,6 +616,12 @@ fn truncate_lease_header(bytes: &mut Vec<u8>) {
 
 fn append_lease_trailing_byte(bytes: &mut Vec<u8>) {
     bytes.push(0);
+}
+
+fn rewrite_v2_lease_as_v1(bytes: &mut Vec<u8>, expiry: u64) {
+    bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    bytes.drain(95..103);
+    bytes[95..103].copy_from_slice(&expiry.to_be_bytes());
 }
 
 fn lease_clock(seconds: i64) -> crate::LifecycleClock<crate::FixedLifecycleClockSource> {

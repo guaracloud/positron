@@ -5,12 +5,13 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind,
-    CandidateAttributeValue, CandidateKeyValue,
+    CandidateAttributeValue, CandidateKeyValue, NativeValueObserver,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
+    LedgerSnapshot, LifecycleClock, MountQualification, PrimaryDataVolume, ResourceAmounts,
+    ResourceDimension, ResourceGovernor, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    WorkClaim, WorkKind,
 };
 
 use super::{LogRecord, LogScan, LogStore, PolicyProvenance, ScanLimit};
@@ -18,9 +19,137 @@ use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
 use crate::{
-    LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaDiscoveryRequest,
+    LogScanResult, LogStoreFailure, LogStoreFailureCode, OccurrenceSelector, ScanCancellation,
+    ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaCatalog, SchemaDiscoveryRequest,
     SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue,
 };
+
+#[test]
+fn stored_projection_compatibility_preserves_nested_occurrences_and_exact_matching()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x31; 16])?,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(31)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+    )?;
+    let store = LogStore::new();
+    let record = LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            vec![
+                CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                    "token".to_owned(),
+                    CandidateAttributeValue::boolean(true),
+                )]),
+                CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                    "token".to_owned(),
+                    CandidateAttributeValue::signed_integer(7),
+                )]),
+            ],
+        )],
+        PolicyProvenance::new(1, [0x36; 32], vec![])?,
+    )?;
+    let prepared = store.prepare(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(10))),
+        tenant,
+        shard,
+        StoreBlockIdentity::new([0x37; 16])?,
+        vec![record],
+    )?;
+    ledger.append(prepared.into_store_block())?;
+    let snapshot = ledger.snapshot()?;
+    let scan = store.scan(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+    )?;
+    let stored = scan
+        .records()
+        .first()
+        .ok_or("stored fixture missing")?
+        .stored();
+    let path = SchemaPath::new(AttributeNamespace::Record, "payload.token".to_owned())?;
+
+    let retained = stored
+        .projected_attribute_retained_bytes(&path)?
+        .ok_or("nested projection size missing")?;
+    let projected = stored
+        .project_attribute(&path)?
+        .ok_or("nested projection missing")?;
+    assert_eq!(projected.len(), 2);
+    assert_eq!(
+        projected.occurrence(0).and_then(|value| value.as_boolean()),
+        Some(true)
+    );
+    assert_eq!(
+        projected
+            .occurrence(1)
+            .and_then(|value| value.as_signed_integer()),
+        Some(7)
+    );
+
+    let mut observer = ProjectionObserver::default();
+    assert_eq!(
+        stored
+            .projected_attribute_retained_bytes_observed(&path, &mut observer)
+            .expect("observed retained sizing succeeds"),
+        Some(retained)
+    );
+    assert_eq!(
+        stored
+            .project_attribute_observed(&path, &mut observer)
+            .expect("observed projection succeeds"),
+        Some(projected)
+    );
+    assert!(observer.structures > 0);
+
+    let matches = SchemaQuery::value(
+        path,
+        OccurrenceSelector::Any,
+        SchemaValue::signed_integer(7),
+    );
+    assert!(matches.matches_stored_record(stored));
+    let missing = SchemaPath::root(AttributeNamespace::Record, "missing".to_owned())?;
+    assert_eq!(stored.projected_attribute_retained_bytes(&missing)?, None);
+    assert_eq!(stored.project_attribute(&missing)?, None);
+    Ok(())
+}
+
+#[derive(Default)]
+struct ProjectionObserver {
+    structures: usize,
+}
+
+impl NativeValueObserver for ProjectionObserver {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        self.structures += 1;
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 #[test]
 fn scalar_fallback_retains_its_vector_capacity_in_governed_stage_accounting()
@@ -1035,11 +1164,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     );
     let mut stale_digest = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     stale_digest.block_indexes[0].digest[0] ^= 1;
-    let stale = store.scan_schema(
+    let stale = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &stale_digest,
         &query("indexed", "one")?,
     )?;
@@ -1048,11 +1178,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
 
     let mut replacement_identity = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     replacement_identity.block_indexes[0].identity = StoreBlockIdentity::new([0x7a; 16])?;
-    let replacement = store.scan_schema(
+    let replacement = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &replacement_identity,
         &query("indexed", "one")?,
     )?;
@@ -1061,11 +1192,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
 
     let mut forged_kinds = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     forged_kinds.block_indexes[0].paths[0].kind_mask = 1 << 1;
-    let forged = store.scan_schema(
+    let forged = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &forged_kinds,
         &query("indexed", "one")?,
     )?;
@@ -1073,11 +1205,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     assert!(forged.reduced_pruning());
 
     let generic = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
-    let demoted = store.scan_schema(
+    let demoted = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &generic,
         &query("indexed", "one")?,
     )?;
@@ -1125,11 +1258,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         SchemaValue::kind(AttributeValueKind::Array),
         SchemaValue::kind(AttributeValueKind::KeyValueList),
     ] {
-        let composite = store.scan_schema(
+        let composite = observed_schema_scan(
+            &store,
             authority.governor(),
             tenant,
             &snapshot,
-            LogScan::all(ScanLimit::new(2)?),
+            LogScan::all(ScanLimit::new(3)?),
             &schema,
             &SchemaQuery::value(
                 SchemaPath::new(AttributeNamespace::Record, "indexed".to_owned())?,
@@ -1165,21 +1299,23 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         assert_eq!(typed.scanned_bytes() > 0, expected_scanned == 1);
     }
 
-    let overflow = store.scan_schema(
+    let overflow = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &schema,
         &query("overflow", "two")?,
     )?;
     assert_eq!(overflow.records().len(), 1);
     assert!(overflow.reduced_pruning());
-    let overflow_reopened = store.scan_schema(
+    let overflow_reopened = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &reopened,
         &query("overflow", "two")?,
     )?;
@@ -1570,4 +1706,54 @@ fn query(key: &str, value: &str) -> Result<SchemaQuery, Box<dyn Error>> {
         OccurrenceSelector::Any,
         SchemaValue::string(value),
     ))
+}
+
+fn observed_schema_scan<'kernel>(
+    store: &LogStore,
+    governor: ResourceGovernor<'kernel>,
+    tenant: TenantId,
+    snapshot: &LedgerSnapshot<'_>,
+    scan: LogScan,
+    schema: &SchemaCatalog,
+    query: &SchemaQuery,
+) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+    let mut observer = NoopSchemaScanObserver;
+    store.scan_schema_observed(
+        governor,
+        tenant,
+        snapshot,
+        scan,
+        schema,
+        query,
+        &NeverCancelledSchemaScan,
+        &mut observer,
+    )
+}
+
+struct NeverCancelledSchemaScan;
+
+impl ScanCancellation for NeverCancelledSchemaScan {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct NoopSchemaScanObserver;
+
+impl ScanObserver for NoopSchemaScanObserver {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+}
+
+impl NativeValueObserver for NoopSchemaScanObserver {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }

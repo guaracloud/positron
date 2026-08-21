@@ -1,5 +1,18 @@
 use crate::{QueryFailure, QueryFailureCode};
 
+/// Identifies the effective query-budget limit that stopped execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryBudgetDimension {
+    ScannedBytes,
+    DecodedRecords,
+    OutputRows,
+    OutputBytes,
+    MemoryBytes,
+    CpuWorkUnits,
+    WallSeconds,
+    MaximumTimeRangeNanoseconds,
+}
+
 /// Finite cumulative limits admitted before query text is parsed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryBudget {
@@ -38,6 +51,12 @@ impl QueryBudget {
         {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
+        if wall_seconds > positron_kernel::MAX_SNAPSHOT_LEASE_TTL_SECONDS {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                QueryBudgetDimension::WallSeconds,
+            ));
+        }
         Ok(Self {
             scanned_bytes,
             decoded_records,
@@ -69,11 +88,13 @@ impl QueryBudget {
         Ok(self)
     }
 
-    pub(crate) const fn scanned_bytes(self) -> u64 {
+    #[must_use]
+    pub const fn scanned_bytes(self) -> u64 {
         self.scanned_bytes
     }
 
-    pub(crate) const fn decoded_records(self) -> u64 {
+    #[must_use]
+    pub const fn decoded_records(self) -> u64 {
         self.decoded_records
     }
 
@@ -82,15 +103,18 @@ impl QueryBudget {
         self.output_rows
     }
 
-    pub(crate) const fn output_bytes(self) -> u64 {
+    #[must_use]
+    pub const fn output_bytes(self) -> u64 {
         self.output_bytes
     }
 
-    pub(crate) const fn memory_bytes(self) -> u64 {
+    #[must_use]
+    pub const fn memory_bytes(self) -> u64 {
         self.memory_bytes
     }
 
-    pub(crate) const fn wall_seconds(self) -> u64 {
+    #[must_use]
+    pub const fn wall_seconds(self) -> u64 {
         self.wall_seconds
     }
 
@@ -99,7 +123,8 @@ impl QueryBudget {
         self.cpu_work_units
     }
 
-    pub(crate) const fn maximum_time_range_nanoseconds(self) -> u64 {
+    #[must_use]
+    pub const fn maximum_time_range_nanoseconds(self) -> u64 {
         self.maximum_time_range_nanoseconds
     }
 }

@@ -25,13 +25,17 @@ use positron_kernel::{
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
 pub use metadata::LogMetadata;
 pub use policy_provenance::PolicyProvenance;
-pub use scan::{LogScan, LogScanResult, ScanLimit, ScannedLogRecord};
+pub use scan::{
+    LogScan, LogScanResult, ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver,
+    ScannedLogRecord,
+};
 pub use schema::{
     OccurrenceSelector, SchemaBudget, SchemaBudgetPressure, SchemaCatalog,
     SchemaCheckpointFrontier, SchemaDelta, SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry,
     SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
     SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
-    SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaValue,
+    SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaTraversalFailure,
+    SchemaValue,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
@@ -200,21 +204,59 @@ impl LogStore {
         snapshot: &LedgerSnapshot<'_>,
         scan: LogScan,
     ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        self.scan_cancellable(governor, tenant, snapshot, scan, &scan::NeverCancelled)
+    }
+
+    /// Scans verified committed blocks with cooperative caller cancellation.
+    pub fn scan_cancellable<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        cancellation: &dyn ScanCancellation,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        self.scan_observed(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            &scan::Unobserved,
+        )
+    }
+
+    /// Scans with cooperative cancellation and caller-owned bounded work observation.
+    pub fn scan_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
         let scope = snapshot.scope();
         if scope.tenant_id() != tenant || scope.signal_kind() != SignalKind::Logs {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
-        let encoded_bytes = snapshot
-            .blocks()
-            .iter()
-            .filter(|block| {
-                scan.frontier()
-                    .is_none_or(|frontier| block.position() <= frontier)
-            })
-            .try_fold(0_u64, |total, block| {
-                total.checked_add(u64::try_from(block.payload().len()).ok()?)
-            })
-            .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        check_scan_cancellation(cancellation)?;
+        let mut encoded_bytes = 0_u64;
+        for block in snapshot.blocks() {
+            check_scan_cancellation(cancellation)?;
+            if scan
+                .frontier()
+                .is_some_and(|frontier| block.position() > frontier)
+            {
+                continue;
+            }
+            encoded_bytes = encoded_bytes
+                .checked_add(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        }
         let memory = encoded_bytes
             .checked_add(
                 u64::try_from(scan.limit().value())
@@ -230,16 +272,26 @@ impl LogStore {
         let capacity = governor
             .reserve(claim)
             .map_err(|_| LogStoreFailure::resource_admission_refused())?;
+        check_scan_cancellation(cancellation)?;
         let mut records = Vec::new();
+        records
+            .try_reserve_exact(scan.limit().value())
+            .map_err(|_| LogStoreFailure::resource_exhausted())?;
         let mut scanned_bytes = 0_u64;
         let limit = scan.limit().value();
         let mut complete = true;
         for block in snapshot.blocks() {
+            check_scan_cancellation(cancellation)?;
             if scan
                 .frontier()
                 .is_some_and(|frontier| block.position() > frontier)
             {
                 continue;
+            }
+            let remaining = limit.saturating_sub(records.len());
+            if remaining == 0 {
+                complete = false;
+                break;
             }
             scanned_bytes = scanned_bytes
                 .checked_add(
@@ -247,29 +299,73 @@ impl LogStore {
                         .map_err(|_| LogStoreFailure::limit_exceeded())?,
                 )
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;
-            let remaining = limit.saturating_sub(records.len());
-            let decoded = codec::decode_block(tenant, snapshot, block.payload(), remaining)?;
+            let decode =
+                codec::BlockDecode::observed(tenant, block.payload(), cancellation, observer)?;
+            let block_records = decode.record_count();
+            if block_records > remaining {
+                decode.validate(cancellation)?;
+                complete = false;
+                break;
+            }
+            let decoded = decode.decode(snapshot, remaining, cancellation)?;
             if decoded.truncated {
                 complete = false;
             }
-            for record in decoded.records {
+            for (ordinal, record) in decoded.records.into_iter().enumerate() {
                 if records.len() == limit {
                     complete = false;
                     break;
                 }
-                records.push(ScannedLogRecord::new(record, block.position()));
+                let ordinal = u16::try_from(ordinal)
+                    .ok()
+                    .and_then(|ordinal| positron_domain::routing::RecordOrdinal::new(ordinal).ok())
+                    .ok_or_else(LogStoreFailure::malformed_block)?;
+                records.push(ScannedLogRecord::new(record, block.position(), ordinal));
             }
             if !complete {
                 break;
             }
         }
+        check_scan_cancellation(cancellation)?;
+        let decoded_records =
+            u64::try_from(records.len()).map_err(|_| LogStoreFailure::limit_exceeded())?;
+        let retained_size_bytes = retained_scan_bytes(scan.limit(), &mut records)?;
         Ok(LogScanResult::new(
             records,
+            decoded_records,
             complete,
             scanned_bytes,
+            retained_size_bytes,
             false,
             capacity,
         ))
+    }
+}
+
+const SCANNED_RECORD_SLOT_BYTES: u64 = 512;
+
+pub(super) fn retained_scan_bytes(
+    limit: ScanLimit,
+    records: &mut [ScannedLogRecord],
+) -> Result<u64, LogStoreFailure> {
+    let slots = u64::try_from(limit.value())
+        .map_err(|_| LogStoreFailure::limit_exceeded())?
+        .checked_mul(SCANNED_RECORD_SLOT_BYTES)
+        .ok_or_else(LogStoreFailure::limit_exceeded)?;
+    records.iter_mut().try_fold(slots, |total, record| {
+        let retained = record.stored().retained_dynamic_bytes()?;
+        record.set_body_retained_bytes(retained.body_heap);
+        total
+            .checked_add(retained.total)
+            .ok_or_else(LogStoreFailure::limit_exceeded)
+    })
+}
+
+fn check_scan_cancellation(cancellation: &dyn ScanCancellation) -> Result<(), LogStoreFailure> {
+    if cancellation.is_cancelled() {
+        Err(LogStoreFailure::cancelled())
+    } else {
+        Ok(())
     }
 }
 

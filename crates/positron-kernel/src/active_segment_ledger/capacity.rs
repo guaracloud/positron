@@ -31,7 +31,10 @@ pub(super) fn retained_claim(
     ]))
 }
 
-pub(super) fn snapshot_claim(
+/// Capacity retained for the lifetime of an immutable snapshot. Snapshot
+/// construction CPU belongs to the caller's already-admitted task and must not
+/// remain pinned after construction completes.
+pub(super) fn snapshot_retained_claim(
     bytes: usize,
     blocks: usize,
 ) -> Result<ResourceAmounts, LedgerFailure> {
@@ -44,7 +47,7 @@ pub(super) fn snapshot_claim(
         0,
         0,
         0,
-        1,
+        0,
         0,
         0,
     ]))
@@ -75,7 +78,8 @@ mod tests {
         for failure in [
             append_claim(usize::MAX).expect_err("frame arithmetic overflow"),
             retained_claim(usize::MAX, usize::MAX).expect_err("retained arithmetic overflow"),
-            snapshot_claim(usize::MAX, usize::MAX).expect_err("snapshot arithmetic overflow"),
+            snapshot_retained_claim(usize::MAX, usize::MAX)
+                .expect_err("snapshot arithmetic overflow"),
             lease_claim(usize::MAX).expect_err("lease arithmetic overflow"),
         ] {
             assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);

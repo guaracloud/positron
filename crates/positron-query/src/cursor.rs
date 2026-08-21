@@ -36,7 +36,7 @@ impl std::fmt::Debug for QueryCursor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct CursorState {
     pub(crate) principal: PrincipalId,
     pub(crate) tenant: TenantId,
@@ -59,6 +59,8 @@ pub(crate) struct CursorState {
     pub(crate) last_observed_at: u64,
     pub(crate) cpu_work_units: u64,
     pub(crate) elapsed_wall_seconds: u64,
+    pub(crate) reduced_pruning: bool,
+    pub(crate) cancellation: crate::QueryCancellation,
 }
 
 pub(crate) fn encode(
@@ -78,6 +80,7 @@ pub(crate) fn encode(
     bytes.push(match state.plan.temporal_axis() {
         TemporalAxis::QueryTime => 1,
         TemporalAxis::EventTime => 2,
+        TemporalAxis::IngestTime => 3,
     });
     bytes.extend_from_slice(
         &state
@@ -88,7 +91,7 @@ pub(crate) fn encode(
     );
     bytes.extend_from_slice(&state.plan.temporal_range().end_nanoseconds().to_be_bytes());
     bytes.extend_from_slice(&state.plan.limit().to_be_bytes());
-    bytes.extend_from_slice(&plan_digest(protector, state.plan)?);
+    bytes.extend_from_slice(&plan_digest(protector, &state.plan)?);
     bytes.extend_from_slice(&state.offset.to_be_bytes());
     bytes.extend_from_slice(&state.sequence.to_be_bytes());
     bytes.extend_from_slice(&state.prior_digest);
@@ -164,12 +167,13 @@ pub(crate) fn decode(
     let axis = match reader.array::<1>()?[0] {
         1 => TemporalAxis::QueryTime,
         2 => TemporalAxis::EventTime,
+        3 => TemporalAxis::IngestTime,
         _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
     };
     let range = TemporalRange::new(reader.i64()?, reader.i64()?)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let plan = LogicalPlan::logs(axis, range, reader.u16()?);
-    if reader.array::<32>()? != plan_digest(protector, plan)? {
+    if reader.array::<32>()? != plan_digest(protector, &plan)? {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let offset = reader.u16()?;
@@ -234,6 +238,8 @@ pub(crate) fn decode(
         last_observed_at,
         cpu_work_units: actual_cpu_work_units,
         elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
+        reduced_pruning: false,
+        cancellation: crate::QueryCancellation::new(),
     };
     if !reader.empty()
         || state.plan.limit() == 0
@@ -246,12 +252,13 @@ pub(crate) fn decode(
 
 fn plan_digest(
     protector: &ControlTokenProtector<'_>,
-    plan: LogicalPlan,
+    plan: &LogicalPlan,
 ) -> Result<[u8; 32], QueryFailure> {
     let mut encoding = Vec::with_capacity(19);
     encoding.push(match plan.temporal_axis() {
         TemporalAxis::QueryTime => 1,
         TemporalAxis::EventTime => 2,
+        TemporalAxis::IngestTime => 3,
     });
     encoding.extend_from_slice(&plan.temporal_range().start_nanoseconds().to_be_bytes());
     encoding.extend_from_slice(&plan.temporal_range().end_nanoseconds().to_be_bytes());

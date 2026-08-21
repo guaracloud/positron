@@ -32,7 +32,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
     fixture.append_log("first", 20, 1)?;
     fixture.append_log("second", 21, 2)?;
     let clock = TestClock::shared(100);
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.authority.governor(),
         fixture.ledger()?,
         1,
@@ -41,7 +41,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
     let plan = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?.with_cpu_work_units(16)?,
     )?;
     let first = service.execute_page(plan)?.collect::<Vec<_>>();
     let cursor = continuation(&first)?.clone();
@@ -49,23 +49,24 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
 
     fixture.append_log("future", 22, 3)?;
     clock.set(101);
-    let resumed = QueryService::with_clock(
+    let mut resumed = super::support::zero_work_clock_service(
         fixture.authority.governor(),
         fixture.ledger()?,
         1,
         clock.clone(),
     )
     .resume(context, &cursor)?;
+    let resumed_events = resumed.by_ref().take(2).collect::<Vec<_>>();
+    drop(resumed);
     let repeated = service.resume(context, &cursor)?;
-    let resumed = resumed.collect::<Vec<_>>();
-    assert_eq!(bodies(&resumed), ["second"]);
+    assert_eq!(bodies(&resumed_events), ["second"]);
+    let repeated = repeated.collect::<Vec<_>>();
     assert!(matches!(
-        resumed.last(),
+        repeated.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
     ));
-    let repeated = repeated.collect::<Vec<_>>();
-    assert_eq!(batch_identity(&resumed)?, batch_identity(&repeated)?);
-    assert_ne!(first_batch, batch_identity(&resumed)?);
+    assert_eq!(batch_identity(&resumed_events)?, batch_identity(&repeated)?);
+    assert_ne!(first_batch, batch_identity(&resumed_events)?);
     Ok(())
 }
 
@@ -87,7 +88,7 @@ fn result_envelope_identifies_snapshot_schema_budget_order_lease_and_digest_chai
     assert!(header.snapshot().generation() > 0);
     assert_eq!(
         header.ordering().columns(),
-        ["query_time", "commit_position"]
+        ["query_time", "commit_position", "record_ordinal"]
     );
     assert_eq!(header.budget().output_rows(), 16);
     assert_ne!(header.lease().identity(), [0; 16]);
@@ -155,7 +156,7 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
             .tenant_id(),
         "cursor-frontier-regression",
     )?;
-    let behind = QueryService::new(empty.authority.governor(), empty.ledger()?, 1);
+    let behind = super::support::zero_work_service(empty.authority.governor(), empty.ledger()?, 1);
     assert_eq!(
         behind
             .resume(fixture.context, &fixture.cursor)
@@ -181,6 +182,9 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         ("zero lease", |bytes: &mut Vec<u8>| bytes[197..213].fill(0)),
         ("zero cpu budget", |bytes: &mut Vec<u8>| {
             bytes[261..269].fill(0)
+        }),
+        ("overlong wall budget", |bytes: &mut Vec<u8>| {
+            bytes[269..277].copy_from_slice(&3_601_u64.to_be_bytes())
         }),
     ] {
         let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v1")?;
@@ -269,7 +273,7 @@ impl CursorFixture {
         kernel.append_log("first", 20, 1)?;
         kernel.append_log("second", 21, 2)?;
         let clock = TestClock::shared(100);
-        let service = QueryService::with_clock(
+        let service = super::support::zero_work_clock_service(
             kernel.authority.governor(),
             kernel.ledger()?,
             1,
@@ -278,7 +282,8 @@ impl CursorFixture {
         let plan = service.plan_pipeline(
             context,
             "logs | range query_time -100 100 | limit 2",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
+                .with_cpu_work_units(16)?,
         )?;
         let events = service.execute_page(plan)?.collect::<Vec<_>>();
         let cursor = continuation(&events)?.clone();
@@ -294,7 +299,7 @@ impl CursorFixture {
     }
 
     fn service(&self) -> QueryService<'static, 'static, '_> {
-        QueryService::with_clock(
+        super::support::zero_work_clock_service(
             self.kernel.authority.governor(),
             self.kernel.ledger().expect("fixture ledger"),
             1,
