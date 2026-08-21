@@ -112,3 +112,25 @@ impl Display for LogStoreFailure {
 }
 
 impl Error for LogStoreFailure {}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogStoreFailure, LogStoreFailureCode};
+
+    #[test]
+    fn infrastructure_failures_keep_distinct_redacted_public_codes() {
+        let resource = LogStoreFailure::resource_exhausted();
+        assert_eq!(resource.code(), LogStoreFailureCode::ResourceExhausted);
+        assert_eq!(resource.to_string(), "log store failure: ResourceExhausted");
+
+        let clock = LogStoreFailure::clock_unavailable();
+        assert_eq!(clock.code(), LogStoreFailureCode::ClockUnavailable);
+        assert_eq!(clock.to_string(), "log store failure: ClockUnavailable");
+
+        let ledger = positron_kernel::SnapshotLeaseId::new([0; 16])
+            .expect_err("zero lease identity must remain invalid");
+        let kernel = LogStoreFailure::kernel(ledger);
+        assert_eq!(kernel.code(), LogStoreFailureCode::Kernel);
+        assert_eq!(kernel.to_string(), "log store failure: Kernel");
+    }
+}
