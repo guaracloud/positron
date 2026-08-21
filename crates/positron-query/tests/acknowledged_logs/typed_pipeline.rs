@@ -239,6 +239,41 @@ fn temporal_projection_preserves_provenance_quality_and_kernel_ingest_time()
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
             if stats.records() == 3 && stats.output_bytes() == 97
     ));
+
+    let grouping_service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(2_000_000_000),
+        Arc::new(ConstantWorkMeter(0)),
+    );
+    let grouped = grouping_service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time 0 100 | aggregate count by ingest_time | limit 3",
+        QueryBudget::new(1_048_576, 3, 3, 16, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let grouped_events = grouping_service.execute(grouped)?.collect::<Vec<_>>();
+    let grouped_record = grouped_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch.records().first(),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("Ingest Time group missing")?;
+    assert_eq!(grouped_record.count(), Some(3));
+    assert_eq!(
+        grouped_record
+            .ingest_time_value()
+            .ok_or("grouped Ingest Time missing")?
+            .instant()
+            .value(),
+        50
+    );
+    assert!(matches!(
+        grouped_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.records() == 1 && stats.output_bytes() == 16
+    ));
     Ok(())
 }
 
@@ -288,8 +323,22 @@ fn event_time_grouping_orders_missing_before_present_on_a_query_time_range()
         .ok_or("grouped result batch missing")?;
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].event_time(), None);
+    assert_eq!(
+        records[0]
+            .event_time_value()
+            .ok_or("missing Event Time group absent")?
+            .quality(),
+        positron_domain::time::SourceTimeQuality::Missing
+    );
     assert_eq!(records[0].count(), Some(1));
     assert_eq!(records[1].event_time().map(|time| time.value()), Some(20));
+    assert_eq!(
+        records[1]
+            .event_time_value()
+            .ok_or("present Event Time group absent")?
+            .quality(),
+        positron_domain::time::SourceTimeQuality::Usable
+    );
     assert_eq!(records[1].count(), Some(2));
     Ok(())
 }
