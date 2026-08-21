@@ -1125,3 +1125,38 @@ fn operator_wall_budget_is_checked_before_output() -> Result<(), Box<dyn Error>>
     ));
     Ok(())
 }
+
+#[test]
+fn post_digest_wall_expiry_never_claims_an_unqueued_batch() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("post-digest-wall")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        SequenceClock::shared([100, 100, 100, 100, 100, 100, 100, 160]),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"one\" | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().result_digest() == [0; 32]
+    ));
+    Ok(())
+}

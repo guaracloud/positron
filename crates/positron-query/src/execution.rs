@@ -295,9 +295,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             Err(failure) => return Err(failure),
         };
         if self.observe_state(&mut state)? {
-            output_state.last_observed_at = state.last_observed_at;
-            output_state.elapsed_wall_seconds = state.elapsed_wall_seconds;
-            state = output_state;
             return self.stopped_page(
                 Some(header),
                 QueryFailureCode::BudgetExhausted,
