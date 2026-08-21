@@ -24,6 +24,7 @@ pub(crate) fn stats_before_current(state: &CursorState) -> QueryStats {
             .flatten(),
         state.prior_digest,
     )
+    .with_reduced_pruning(state.reduced_pruning)
 }
 
 pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
@@ -39,6 +40,7 @@ pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
         Some(state.sequence),
         state.prior_digest,
     )
+    .with_reduced_pruning(state.reduced_pruning)
 }
 
 pub(crate) fn initial_state(
@@ -70,6 +72,7 @@ pub(crate) fn initial_state(
         last_observed_at: query.last_observed_at,
         cpu_work_units: query.cpu_work_units,
         elapsed_wall_seconds: query.last_observed_at.saturating_sub(query.started_at),
+        reduced_pruning: false,
         cancellation: query.cancellation.clone(),
     }
 }

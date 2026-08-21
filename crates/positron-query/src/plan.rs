@@ -166,6 +166,10 @@ impl LogicalPlan {
         self.filter.as_ref()
     }
 
+    pub(crate) const fn requires_post_decode_predicate_fallback(&self) -> bool {
+        self.filter.is_some()
+    }
+
     pub(crate) fn with_projection(mut self, projection: Vec<ProjectionColumn>) -> Self {
         self.projection = projection;
         self

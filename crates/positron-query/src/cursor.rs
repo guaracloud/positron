@@ -59,6 +59,7 @@ pub(crate) struct CursorState {
     pub(crate) last_observed_at: u64,
     pub(crate) cpu_work_units: u64,
     pub(crate) elapsed_wall_seconds: u64,
+    pub(crate) reduced_pruning: bool,
     pub(crate) cancellation: crate::QueryCancellation,
 }
 
@@ -237,6 +238,7 @@ pub(crate) fn decode(
         last_observed_at,
         cpu_work_units: actual_cpu_work_units,
         elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
+        reduced_pruning: false,
         cancellation: crate::QueryCancellation::new(),
     };
     if !reader.empty()

@@ -20,7 +20,7 @@ mod service;
 mod stream;
 mod stream_lifecycle;
 
-pub use budget::QueryBudget;
+pub use budget::{QueryBudget, QueryBudgetDimension};
 pub use cancellation::QueryCancellation;
 pub use cursor::QueryCursor;
 pub use failure::{QueryFailure, QueryFailureCode};

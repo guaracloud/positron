@@ -1,7 +1,9 @@
 use std::error::Error;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
+use positron_query::{
+    QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+};
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
 use positron_kernel::{ResourceDimension, WorkClass};
@@ -40,6 +42,9 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
             if failure.code() == QueryFailureCode::BudgetExhausted
+                && failure.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::ScannedBytes)
+                && !failure.stats().reduced_pruning()
     ));
     assert_eq!(
         events
@@ -104,6 +109,8 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().decoded_records() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::DecodedRecords)
     ));
 
     let observed_cpu = events
@@ -141,6 +148,8 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
                 && incomplete.stats().decoded_records() == 0
                 && incomplete.stats().scanned_bytes() == 0
                 && incomplete.stats().cpu_work_units() > preflight_exhaustion.cpu_work_units()
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::CpuWorkUnits)
     ));
 
     let meter = CancellingStageWorkMeter::shared(positron_query::QueryWorkStage::ScanDecode);
@@ -217,6 +226,8 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().cpu_work_units() == 2
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::CpuWorkUnits)
     ));
 
     let wall_service = super::support::zero_work_clock_service(
@@ -236,6 +247,8 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().wall_seconds() == 4
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::WallSeconds)
     ));
     Ok(())
 }

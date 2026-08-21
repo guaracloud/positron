@@ -1,4 +1,4 @@
-use crate::{QueryFailure, QueryFailureCode, QueryRecord};
+use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord};
 
 /// Canonical conservative slot charge for every simultaneously retained typed query record.
 pub(crate) const QUERY_RECORD_SLOT_BYTES: u64 = 192;
@@ -29,9 +29,11 @@ impl QueryMemory {
         let next = self
             .current
             .checked_add(bytes)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
         if next > self.limit {
-            return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::MemoryBytes,
+            ));
         }
         self.current = next;
         self.peak = self.peak.max(next);
@@ -61,7 +63,7 @@ impl RecordBuffer {
         let slot_bytes = u64::try_from(capacity)
             .ok()
             .and_then(|count| count.checked_mul(QUERY_RECORD_SLOT_BYTES))
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
         memory.acquire(slot_bytes)?;
         let mut records = Vec::new();
         if records.try_reserve_exact(capacity).is_err() {

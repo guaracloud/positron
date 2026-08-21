@@ -1,4 +1,4 @@
-use crate::{QueryFailure, QueryFailureCode};
+use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode};
 
 pub(crate) fn map_domain_value_failure(
     failure: positron_domain::outcome::DomainFailure,
@@ -26,7 +26,15 @@ pub(crate) fn map_ledger_failure(failure: positron_kernel::LedgerFailure) -> Que
 }
 
 pub(crate) fn map_store_failure(failure: positron_signals::LogStoreFailure) -> QueryFailure {
-    QueryFailure::new(map_store_failure_code(failure.code()))
+    match failure.code() {
+        positron_signals::LogStoreFailureCode::LimitExceeded => {
+            QueryFailure::budget_exhausted(QueryBudgetDimension::DecodedRecords)
+        },
+        positron_signals::LogStoreFailureCode::BudgetExhausted => {
+            QueryFailure::budget_exhausted(QueryBudgetDimension::CpuWorkUnits)
+        },
+        code => QueryFailure::new(map_store_failure_code(code)),
+    }
 }
 
 const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> QueryFailureCode {

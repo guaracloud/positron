@@ -6,7 +6,9 @@ use positron_kernel::{
     ActiveSegmentLedger, ResourceAmounts, ResourceGovernor, WorkClaim, WorkKind,
 };
 
-use crate::{LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode};
+use crate::{
+    LogicalPlan, PlannedQuery, QueryBudget, QueryBudgetDimension, QueryFailure, QueryFailureCode,
+};
 
 const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
 
@@ -105,20 +107,34 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if last_observed_at < started_at {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
         }
-        if last_observed_at.saturating_sub(started_at) >= budget.wall_seconds()
-            || cpu_work_units > budget.cpu_work_units()
-        {
-            return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+        if last_observed_at.saturating_sub(started_at) >= budget.wall_seconds() {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::WallSeconds,
+            ));
         }
-        if plan.limit() == 0
-            || plan.limit() > 1_024
-            || u64::from(plan.limit()) > budget.output_rows()
-            || plan
-                .temporal_range()
-                .duration()
-                .is_none_or(|duration| duration > budget.maximum_time_range_nanoseconds())
-        {
+        if cpu_work_units > budget.cpu_work_units() {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::CpuWorkUnits,
+            ));
+        }
+        if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
+        }
+        if u64::from(plan.limit()) > budget.output_rows() {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                QueryBudgetDimension::OutputRows,
+            ));
+        }
+        if plan
+            .temporal_range()
+            .duration()
+            .is_none_or(|duration| duration > budget.maximum_time_range_nanoseconds())
+        {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                QueryBudgetDimension::MaximumTimeRangeNanoseconds,
+            ));
         }
         Ok(PlannedQuery {
             context,

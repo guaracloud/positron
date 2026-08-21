@@ -22,7 +22,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .checked_add(query.budget.wall_seconds())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
         if now >= expiry {
-            return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+            return Err(QueryFailure::budget_exhausted(
+                crate::QueryBudgetDimension::WallSeconds,
+            ));
         }
         let lease = self
             .ledger

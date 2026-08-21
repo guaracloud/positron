@@ -44,10 +44,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         )
     }
 
-    pub(super) fn stopped_page_with_stats(
+    pub(super) fn failed_page_with_stats(
         &self,
         header: Option<QueryEvent>,
-        code: QueryFailureCode,
+        failure: QueryFailure,
         state: &CursorState,
         delivered_before: QueryStats,
         terminal_stats: QueryStats,
@@ -55,7 +55,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         self.incomplete_page(
             header,
-            QueryFailure::new(code),
+            failure,
             state,
             delivered_before,
             terminal_stats,

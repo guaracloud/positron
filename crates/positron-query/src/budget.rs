@@ -1,5 +1,18 @@
 use crate::{QueryFailure, QueryFailureCode};
 
+/// Identifies the effective query-budget limit that stopped execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryBudgetDimension {
+    ScannedBytes,
+    DecodedRecords,
+    OutputRows,
+    OutputBytes,
+    MemoryBytes,
+    CpuWorkUnits,
+    WallSeconds,
+    MaximumTimeRangeNanoseconds,
+}
+
 /// Finite cumulative limits admitted before query text is parsed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryBudget {

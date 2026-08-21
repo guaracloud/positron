@@ -1,7 +1,9 @@
 use std::error::Error;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
+use positron_query::{
+    QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+};
 use positron_runtime::{InitializationPlan, InstanceBootstrap};
 
 use super::super::support::{
@@ -73,13 +75,15 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         SequenceClock::shared([100, 104]),
         std::sync::Arc::new(TestWorkMeter),
     );
+    let wall_failure = failure(service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 4)?,
+    ))?;
+    assert_eq!(wall_failure.code(), QueryFailureCode::BudgetExhausted);
     assert_eq!(
-        failure_code(service.plan_pipeline(
-            fixture.context,
-            "logs | range query_time -100 100 | limit 1",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 4)?,
-        ))?,
-        QueryFailureCode::BudgetExhausted
+        wall_failure.limiting_budget(),
+        Some(QueryBudgetDimension::WallSeconds)
     );
 
     let service = QueryService::with_runtime(
@@ -89,16 +93,15 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         TestClock::shared(100),
         std::sync::Arc::new(ConstantWorkMeter(2)),
     );
+    let cpu_failure = failure(service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1)?,
+    ))?;
+    assert_eq!(cpu_failure.code(), QueryFailureCode::BudgetExhausted);
     assert_eq!(
-        failure_code(
-            service.plan_pipeline(
-                fixture.context,
-                "logs | range query_time -100 100 | limit 1",
-                QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
-                    .with_cpu_work_units(1)?,
-            )
-        )?,
-        QueryFailureCode::BudgetExhausted
+        cpu_failure.limiting_budget(),
+        Some(QueryBudgetDimension::CpuWorkUnits)
     );
 
     let service = super::super::support::zero_work_clock_service(
@@ -137,6 +140,45 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
             .expect_err("execution starts at the wall bound")
             .code(),
         QueryFailureCode::BudgetExhausted
+    );
+    Ok(())
+}
+
+#[test]
+fn planning_failures_identify_the_effective_budget_limit() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("planning-budget-dimension")?;
+    let service = super::super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let output_rows = match service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time 0 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    ) {
+        Ok(_) => return Err("query exceeded its admitted output-row budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(output_rows.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        output_rows.limiting_budget(),
+        Some(QueryBudgetDimension::OutputRows)
+    );
+
+    let maximum_range = match service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time 0 101 | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?
+            .with_maximum_time_range_nanoseconds(100)?,
+    ) {
+        Ok(_) => return Err("query exceeded its admitted time-range budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(maximum_range.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        maximum_range.limiting_budget(),
+        Some(QueryBudgetDimension::MaximumTimeRangeNanoseconds)
     );
     Ok(())
 }
@@ -263,5 +305,14 @@ fn failure_code<T>(
     match result {
         Ok(_) => Err("query unexpectedly planned".into()),
         Err(failure) => Ok(failure.code()),
+    }
+}
+
+fn failure<T>(
+    result: Result<T, positron_query::QueryFailure>,
+) -> Result<positron_query::QueryFailure, Box<dyn Error>> {
+    match result {
+        Ok(_) => Err("query unexpectedly planned".into()),
+        Err(failure) => Ok(failure),
     }
 }

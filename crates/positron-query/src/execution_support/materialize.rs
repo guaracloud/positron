@@ -1,6 +1,8 @@
 use positron_domain::time::{IngestTimeCandidate, QueryTime};
 
-use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
+use crate::{
+    LogicalPlan, QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis,
+};
 
 use super::failure::map_domain_value_failure;
 
@@ -97,7 +99,7 @@ fn project_attributes(
     let slots = u64::try_from(columns.len())
         .ok()
         .and_then(|count| count.checked_mul(ATTRIBUTE_PROJECTION_SLOT_BYTES))
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
     memory.acquire(slots)?;
     let mut values = Vec::new();
     if values.try_reserve_exact(columns.len()).is_err() {
@@ -121,7 +123,9 @@ fn project_attributes(
             Ok(value) => value.unwrap_or(0),
             Err(_) => {
                 memory.release(retained)?;
-                return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+                return Err(QueryFailure::budget_exhausted(
+                    QueryBudgetDimension::MemoryBytes,
+                ));
             },
         };
         if let Err(failure) = memory.acquire(bytes) {
@@ -133,7 +137,9 @@ fn project_attributes(
             None => {
                 memory.release(bytes)?;
                 memory.release(retained)?;
-                return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+                return Err(QueryFailure::budget_exhausted(
+                    QueryBudgetDimension::MemoryBytes,
+                ));
             },
         };
         match record.project_attribute(path) {
@@ -153,7 +159,7 @@ fn map_schema_failure(failure: positron_signals::SchemaFailure) -> QueryFailure 
             QueryFailure::new(QueryFailureCode::ResourceExhausted)
         },
         positron_signals::SchemaFailure::LimitExceeded => {
-            QueryFailure::new(QueryFailureCode::BudgetExhausted)
+            QueryFailure::new(QueryFailureCode::ResourceExhausted)
         },
         _ => QueryFailure::new(QueryFailureCode::Internal),
     }
@@ -168,7 +174,7 @@ fn try_retained_value(
             .retained_heap_bytes()
             .map_err(map_domain_value_failure)?,
     )
-    .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+    .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
     memory.acquire(bytes)?;
     match value.try_clone() {
         Ok(retained) => Ok((retained, bytes)),

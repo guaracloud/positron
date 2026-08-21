@@ -55,6 +55,8 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().records() == 0
                 && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::OutputBytes)
     ));
     Ok(())
 }
@@ -474,8 +476,9 @@ fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"\" | limit 2",
         QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
-    let records = service
-        .execute(query)?
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let records = events
+        .iter()
         .find_map(|event| match event {
             QueryEvent::Batch(batch) => Some(batch.records().to_vec()),
             QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
@@ -483,6 +486,11 @@ fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(
         .ok_or("result batch missing")?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].body_text(), Some(""));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.reduced_pruning() && stats.limiting_budget().is_none()
+    ));
     Ok(())
 }
 
@@ -665,7 +673,7 @@ fn projection_preserves_missing_and_native_body_values() -> Result<(), Box<dyn E
     assert!(matches!(
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.output_bytes() == 17
+            if stats.output_bytes() == 17 && !stats.reduced_pruning()
     ));
 
     let exhausted = service.plan_pipeline(
@@ -684,6 +692,8 @@ fn projection_preserves_missing_and_native_body_values() -> Result<(), Box<dyn E
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::OutputBytes)
     ));
     Ok(())
 }
@@ -1091,6 +1101,8 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
     ));
     Ok(())
 }
@@ -1932,6 +1944,8 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().records() == 0
                 && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::OutputBytes)
     ));
 
     let memory_exhausted = service.plan_pipeline(
@@ -1950,6 +1964,8 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
         memory_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
     ));
 
     let metered_service = QueryService::with_runtime(
@@ -1975,6 +1991,8 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().cpu_work_units() == 5
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
     ));
 
     let commit_groups = service.plan_pipeline(
@@ -2062,6 +2080,8 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().cpu_work_units() == 17
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
     ));
     Ok(())
 }
@@ -2094,6 +2114,8 @@ fn group_key_construction_charges_large_native_values_before_lookup() -> Result<
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().cpu_work_units() == 10
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
     ));
     assert!(
         !events

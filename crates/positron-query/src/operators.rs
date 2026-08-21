@@ -2,7 +2,9 @@ use crate::cursor::CursorState;
 use crate::execution_support::{
     aggregate_records, charge_work, compare_records, exhausted, query_record,
 };
-use crate::{QueryFailure, QueryFailureCode, QueryRecord, QueryService, QueryWorkStage};
+use crate::{
+    QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, QueryService, QueryWorkStage,
+};
 use std::cmp::Ordering;
 
 pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
@@ -19,11 +21,15 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
             let operator_units = service
                 .work_units(QueryWorkStage::Operators)?
                 .checked_mul(operator_count)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+                .ok_or_else(|| {
+                    QueryFailure::budget_exhausted(QueryBudgetDimension::CpuWorkUnits)
+                })?;
             check_cancellation(state)?;
             charge_work(state, operator_units)?;
             if exhausted(state) {
-                return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+                return Err(QueryFailure::budget_exhausted(
+                    QueryBudgetDimension::CpuWorkUnits,
+                ));
             }
         }
         if let Some(record) = query_record(record, &state.plan, memory)? {
@@ -125,7 +131,9 @@ fn compare_with_work<'kernel, 'catalog, 'ledger>(
     check_cancellation(state)?;
     charge_work(state, work)?;
     if exhausted(state) {
-        return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+        return Err(QueryFailure::budget_exhausted(
+            QueryBudgetDimension::CpuWorkUnits,
+        ));
     }
     check_cancellation(state)?;
     Ok(compare_records(left, right, state.plan.ordering()))

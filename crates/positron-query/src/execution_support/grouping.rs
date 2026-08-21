@@ -2,7 +2,7 @@ use positron_domain::time::{EventTime, QueryTime};
 use positron_kernel::IngestTime;
 
 use crate::cursor::CursorState;
-use crate::{QueryFailure, QueryFailureCode, QueryRecord};
+use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord};
 
 use super::accounting::{charge_work, exhausted};
 use super::vocabulary::{query_time_provenance_tag, source_time_quality_tag};
@@ -185,7 +185,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
     }
     if aggregate.group_by().is_empty() {
         let count = u64::try_from(records.len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
         let (_, slot_bytes, dynamic_bytes) = records.into_parts();
         memory.release(slot_bytes)?;
         memory.release(dynamic_bytes)?;
@@ -198,7 +198,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
     let group_slots = u64::try_from(group_capacity)
         .ok()
         .and_then(|count| count.checked_mul(crate::memory::GROUP_ENTRY_BYTES))
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
     memory.acquire(group_slots)?;
     let mut groups = Vec::<GroupEntry>::new();
     groups
@@ -207,7 +207,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
     let key_slots = u64::try_from(aggregate.group_by().len())
         .ok()
         .and_then(|count| count.checked_mul(crate::memory::GROUP_VALUE_SLOT_BYTES))
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
     for record in records {
         if state.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
@@ -223,7 +223,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
                 entry.count = entry
                     .count
                     .checked_add(1)
-                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
                 drop(comparison);
                 memory.release(comparison_bytes)?;
                 memory.release(key_slots)?;
@@ -231,7 +231,7 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
             },
             Err(index) => {
                 if groups.len() >= MAX_GROUPS {
-                    return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+                    return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
                 }
                 charge_group_moves(service, state, groups.len().saturating_sub(index))?;
                 groups.insert(
@@ -287,7 +287,9 @@ pub(super) fn charge_group_unit<'kernel, 'catalog, 'ledger>(
     }
     charge_work(state, units)?;
     if exhausted(state) {
-        return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+        return Err(QueryFailure::budget_exhausted(
+            QueryBudgetDimension::CpuWorkUnits,
+        ));
     }
     if state.cancellation.is_cancelled() {
         return Err(QueryFailure::new(QueryFailureCode::Cancelled));
@@ -360,11 +362,11 @@ fn append_metered_group_bytes(
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
         let length = u64::try_from(output.len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+            .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
         if length == *memory_bytes {
             let next_memory_bytes = memory_bytes
                 .checked_add(GROUP_ENCODING_CHUNK_BYTES)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+                .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
             memory.acquire(GROUP_ENCODING_CHUNK_BYTES)?;
             let reserve = usize::try_from(GROUP_ENCODING_CHUNK_BYTES)
                 .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
