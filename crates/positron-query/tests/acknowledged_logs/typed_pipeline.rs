@@ -4,6 +4,7 @@ use std::sync::Arc;
 use positron_kernel::{SnapshotLeaseId, WorkClass};
 use positron_query::{
     OrderDirection, QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+    ResultValueType,
 };
 
 use super::support::{
@@ -318,7 +319,7 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
     );
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position asc | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time, commit_position | order by query_time desc, commit_position asc | limit 1",
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -336,6 +337,67 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
             OrderDirection::Descending,
             OrderDirection::Ascending,
             OrderDirection::Ascending,
+        ]
+    );
+    assert_eq!(
+        header.schema().types(),
+        [
+            ResultValueType::NativeValue,
+            ResultValueType::UnixNanoseconds,
+            ResultValueType::CommitPosition,
+        ]
+    );
+    assert_eq!(
+        header.ordering().types(),
+        [
+            ResultValueType::UnixNanoseconds,
+            ResultValueType::CommitPosition,
+            ResultValueType::RecordOrdinal,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn grouped_schema_describes_native_keys_and_unsigned_counts() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("typed-group-schema")?;
+    fixture.kernel.append_log("group", 20, 1)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time, commit_position | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let header = match events.first() {
+        Some(QueryEvent::Header(header)) => header,
+        _ => return Err("grouped query header missing".into()),
+    };
+
+    assert_eq!(
+        header.schema().columns(),
+        ["body", "query_time", "commit_position", "count"]
+    );
+    assert_eq!(
+        header.schema().types(),
+        [
+            ResultValueType::NativeValue,
+            ResultValueType::UnixNanoseconds,
+            ResultValueType::CommitPosition,
+            ResultValueType::UnsignedInteger,
+        ]
+    );
+    assert_eq!(
+        header.ordering().types(),
+        [
+            ResultValueType::NativeValue,
+            ResultValueType::UnixNanoseconds,
+            ResultValueType::CommitPosition,
         ]
     );
     Ok(())

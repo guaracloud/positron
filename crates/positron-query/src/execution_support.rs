@@ -366,9 +366,13 @@ fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<
     );
     for column in schema {
         encoding.push(projection_column_tag(*column));
+        encoding.push(result_value_type_tag(crate::stream::column_type(*column)));
     }
     if plan.aggregate().is_some() {
         encoding.push(3);
+        encoding.push(result_value_type_tag(
+            crate::ResultValueType::UnsignedInteger,
+        ));
         encoding.extend_from_slice(
             &u64::try_from(schema.len())
                 .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
@@ -376,6 +380,7 @@ fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<
         );
         for column in schema {
             encoding.push(projection_column_tag(*column));
+            encoding.push(result_value_type_tag(crate::stream::column_type(*column)));
             encoding.push(order_direction_tag(crate::plan::OrderDirection::Ascending));
         }
     } else {
@@ -384,10 +389,17 @@ fn encode_result_contract(encoding: &mut Vec<u8>, plan: &LogicalPlan) -> Result<
             crate::TemporalAxis::QueryTime => 4,
             crate::TemporalAxis::EventTime => 5,
         });
+        encoding.push(result_value_type_tag(
+            crate::ResultValueType::UnixNanoseconds,
+        ));
         encoding.push(order_direction_tag(plan.ordering().primary_direction()));
         encoding.push(2);
+        encoding.push(result_value_type_tag(
+            crate::ResultValueType::CommitPosition,
+        ));
         encoding.push(order_direction_tag(plan.ordering().commit_direction()));
         encoding.push(6);
+        encoding.push(result_value_type_tag(crate::ResultValueType::RecordOrdinal));
         encoding.push(order_direction_tag(plan.ordering().commit_direction()));
     }
     Ok(())
@@ -398,6 +410,16 @@ const fn projection_column_tag(column: crate::plan::ProjectionColumn) -> u8 {
         crate::plan::ProjectionColumn::Body => 0,
         crate::plan::ProjectionColumn::QueryTime => 1,
         crate::plan::ProjectionColumn::CommitPosition => 2,
+    }
+}
+
+const fn result_value_type_tag(value_type: crate::ResultValueType) -> u8 {
+    match value_type {
+        crate::ResultValueType::NativeValue => 0,
+        crate::ResultValueType::UnixNanoseconds => 1,
+        crate::ResultValueType::CommitPosition => 2,
+        crate::ResultValueType::RecordOrdinal => 3,
+        crate::ResultValueType::UnsignedInteger => 4,
     }
 }
 

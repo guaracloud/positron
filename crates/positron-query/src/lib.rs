@@ -28,7 +28,7 @@ pub use runtime::{
 pub use service::QueryService;
 pub use stream::{
     QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryTerminal,
-    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot,
+    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
 };
 pub use stream_lifecycle::QueryStream;
 

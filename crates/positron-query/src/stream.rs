@@ -3,9 +3,25 @@ use positron_domain::time::UnixNanoseconds;
 
 use crate::{LogicalPlan, QueryBudget, QueryCursor, QueryFailure, QueryFailureCode, TemporalAxis};
 
+/// A stable logical type carried by a result column or hidden ordering key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultValueType {
+    /// A lossless bounded dynamic value, including native null and containers.
+    NativeValue,
+    /// A signed Unix timestamp measured in nanoseconds.
+    UnixNanoseconds,
+    /// A monotonically increasing committed block position.
+    CommitPosition,
+    /// A record's stable ordinal within its committed block.
+    RecordOrdinal,
+    /// An unsigned integer aggregate.
+    UnsignedInteger,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultSchema {
     columns: Vec<&'static str>,
+    types: Vec<ResultValueType>,
 }
 
 impl ResultSchema {
@@ -16,16 +32,30 @@ impl ResultSchema {
                 .iter()
                 .map(column_name)
                 .collect::<Vec<_>>();
+            let mut types = aggregate
+                .group_by()
+                .iter()
+                .copied()
+                .map(column_type)
+                .collect::<Vec<_>>();
             columns.push("count");
-            return Self { columns };
+            types.push(ResultValueType::UnsignedInteger);
+            return Self { columns, types };
         }
         let columns = plan.projection().iter().map(column_name).collect();
-        Self { columns }
+        let types = plan.projection().iter().copied().map(column_type).collect();
+        Self { columns, types }
     }
 
     #[must_use]
     pub fn columns(&self) -> Vec<&'static str> {
         self.columns.clone()
+    }
+
+    /// Returns a type descriptor for each result column in the same order as [`Self::columns`].
+    #[must_use]
+    pub fn types(&self) -> &[ResultValueType] {
+        &self.types
     }
 }
 
@@ -66,9 +96,18 @@ fn column_name(column: &crate::plan::ProjectionColumn) -> &'static str {
     }
 }
 
+pub(crate) const fn column_type(column: crate::plan::ProjectionColumn) -> ResultValueType {
+    match column {
+        crate::plan::ProjectionColumn::Body => ResultValueType::NativeValue,
+        crate::plan::ProjectionColumn::QueryTime => ResultValueType::UnixNanoseconds,
+        crate::plan::ProjectionColumn::CommitPosition => ResultValueType::CommitPosition,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultOrdering {
     columns: Vec<&'static str>,
+    types: Vec<ResultValueType>,
     directions: Vec<crate::OrderDirection>,
 }
 
@@ -77,6 +116,12 @@ impl ResultOrdering {
         if let Some(aggregate) = plan.aggregate() {
             return Self {
                 columns: aggregate.group_by().iter().map(column_name).collect(),
+                types: aggregate
+                    .group_by()
+                    .iter()
+                    .copied()
+                    .map(column_type)
+                    .collect(),
                 directions: vec![crate::OrderDirection::Ascending; aggregate.group_by().len()],
             };
         }
@@ -89,6 +134,11 @@ impl ResultOrdering {
                 "commit_position",
                 "record_ordinal",
             ],
+            types: vec![
+                ResultValueType::UnixNanoseconds,
+                ResultValueType::CommitPosition,
+                ResultValueType::RecordOrdinal,
+            ],
             directions: vec![
                 plan.ordering().primary_direction(),
                 plan.ordering().commit_direction(),
@@ -100,6 +150,12 @@ impl ResultOrdering {
     #[must_use]
     pub fn columns(&self) -> &[&'static str] {
         &self.columns
+    }
+
+    /// Returns a type descriptor for each total-order key in [`Self::columns`].
+    #[must_use]
+    pub fn types(&self) -> &[ResultValueType] {
+        &self.types
     }
 
     #[must_use]
