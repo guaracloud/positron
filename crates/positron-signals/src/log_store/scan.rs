@@ -11,11 +11,33 @@ pub trait ScanCancellation: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
 
+/// Stable caller-owned failure from bounded scan work observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanObservationFailureCode {
+    BudgetExhausted,
+    Cancelled,
+    ResourceExhausted,
+    Internal,
+}
+
+/// Query-agnostic capability for accounting bounded Signal Store scan work.
+pub trait ScanObserver {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode>;
+}
+
 pub(super) struct NeverCancelled;
 
 impl ScanCancellation for NeverCancelled {
     fn is_cancelled(&self) -> bool {
         false
+    }
+}
+
+pub(super) struct Unobserved;
+
+impl ScanObserver for Unobserved {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
     }
 }
 

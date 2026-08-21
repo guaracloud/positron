@@ -18,6 +18,36 @@ impl super::super::ScanCancellation for CancelDuringPreflight {
     }
 }
 
+struct NeverCancelled;
+
+impl super::super::ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct RecordingScanObserver(AtomicU64);
+
+impl super::super::ScanObserver for RecordingScanObserver {
+    fn observe_work(&self, units: u64) -> Result<(), super::super::ScanObservationFailureCode> {
+        self.0.fetch_add(units, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct BudgetedScanObserver(AtomicU64);
+
+impl super::super::ScanObserver for BudgetedScanObserver {
+    fn observe_work(&self, units: u64) -> Result<(), super::super::ScanObservationFailureCode> {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(units)
+            })
+            .map(|_| ())
+            .map_err(|_| super::super::ScanObservationFailureCode::BudgetExhausted)
+    }
+}
+
 #[test]
 fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
@@ -226,6 +256,94 @@ fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn
     )?;
     assert_eq!(exact.records().len(), 1_024);
     assert!(exact.complete());
+    Ok(())
+}
+
+#[test]
+fn oversized_block_preflight_has_an_exact_observed_work_boundary() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x7d; 16])?,
+        CatalogSecret::from_owned(Box::new([0x7e; 32]), Box::new([0x7f; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(80)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x52; 32])),
+    )?;
+    ledger.append(
+        LogStore::new()
+            .prepare(
+                preparation_capacity(&authority, tenant)?,
+                &clock(124),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x7d; 16])?,
+                vec![minimal_record("first", 1)?, minimal_record("second", 2)?],
+            )?
+            .into_store_block(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let scan = LogScan::all(ScanLimit::new(1)?);
+    let recording = RecordingScanObserver(AtomicU64::new(0));
+    let result = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        scan,
+        &NeverCancelled,
+        &recording,
+    )?;
+    assert!(result.records().is_empty());
+    assert!(!result.complete());
+    drop(result);
+    let exact_work = recording.0.load(Ordering::SeqCst);
+    assert!(exact_work > 0);
+
+    let exact = BudgetedScanObserver(AtomicU64::new(exact_work));
+    let exact_result = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        scan,
+        &NeverCancelled,
+        &exact,
+    )?;
+    assert!(exact_result.records().is_empty());
+    assert!(!exact_result.complete());
+    assert_eq!(exact.0.load(Ordering::SeqCst), 0);
+    drop(exact_result);
+
+    let before = authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let exhausted = BudgetedScanObserver(AtomicU64::new(exact_work - 1));
+    let failure = LogStore::new()
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            scan,
+            &NeverCancelled,
+            &exhausted,
+        )
+        .expect_err("one less preflight work unit must fail without a prefix");
+    assert_eq!(failure.code(), LogStoreFailureCode::BudgetExhausted);
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        before
+    );
     Ok(())
 }
 

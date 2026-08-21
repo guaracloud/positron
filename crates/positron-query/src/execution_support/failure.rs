@@ -42,6 +42,8 @@ const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> 
             QueryFailureCode::ResourceExhausted
         },
         positron_signals::LogStoreFailureCode::Cancelled => QueryFailureCode::Cancelled,
+        positron_signals::LogStoreFailureCode::BudgetExhausted => QueryFailureCode::BudgetExhausted,
+        positron_signals::LogStoreFailureCode::Internal => QueryFailureCode::Internal,
         _ => QueryFailureCode::StoreUnavailable,
     }
 }

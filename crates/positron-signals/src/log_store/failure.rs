@@ -16,6 +16,8 @@ pub enum LogStoreFailureCode {
     ClockUnavailable,
     ResourceAdmissionRefused,
     Cancelled,
+    BudgetExhausted,
+    Internal,
 }
 
 /// Redacted Log Store failure that never contains telemetry values.
@@ -71,6 +73,20 @@ impl LogStoreFailure {
         Self {
             code: LogStoreFailureCode::Cancelled,
         }
+    }
+
+    pub(super) const fn observation(code: super::ScanObservationFailureCode) -> Self {
+        let code = match code {
+            super::ScanObservationFailureCode::BudgetExhausted => {
+                LogStoreFailureCode::BudgetExhausted
+            },
+            super::ScanObservationFailureCode::Cancelled => LogStoreFailureCode::Cancelled,
+            super::ScanObservationFailureCode::ResourceExhausted => {
+                LogStoreFailureCode::ResourceExhausted
+            },
+            super::ScanObservationFailureCode::Internal => LogStoreFailureCode::Internal,
+        };
+        Self { code }
     }
 
     pub(super) const fn domain(failure: DomainFailure) -> Self {

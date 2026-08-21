@@ -32,14 +32,37 @@ pub(super) fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), LogSto
 
 pub(super) struct Input<'a> {
     remaining: &'a [u8],
+    observer: Option<&'a dyn crate::log_store::ScanObserver>,
 }
 
 impl<'a> Input<'a> {
     pub(super) const fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
+        Self {
+            remaining: bytes,
+            observer: None,
+        }
+    }
+
+    pub(super) const fn observed(
+        bytes: &'a [u8],
+        observer: &'a dyn crate::log_store::ScanObserver,
+    ) -> Self {
+        Self {
+            remaining: bytes,
+            observer: Some(observer),
+        }
     }
 
     pub(super) fn take(&mut self, count: usize) -> Result<&'a [u8], LogStoreFailure> {
+        if let Some(observer) = self.observer {
+            let units = u64::try_from(count)
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(LogStoreFailure::malformed_block)?;
+            observer
+                .observe_work(units)
+                .map_err(LogStoreFailure::observation)?;
+        }
         let (value, remaining) = self
             .remaining
             .split_at_checked(count)

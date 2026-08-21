@@ -4,8 +4,8 @@ use positron_signals::{LogScan, LogStore, ScanLimit};
 use crate::cursor::{self, CursorState};
 use crate::execution_state::{commit_position, stats_before_current, stats_with_current};
 use crate::execution_support::{
-    batch_digest, charge_output, charge_scan, charge_work, exhausted, map_ledger_failure,
-    map_store_failure,
+    QueryScanObserver, batch_digest, charge_output, charge_scan, charge_work, exhausted,
+    map_ledger_failure, map_store_failure,
 };
 use crate::{
     QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader, QueryIncomplete,
@@ -67,17 +67,22 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_limit = framed!(
             ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
         );
-        let result = framed!(
-            LogStore::new()
-                .scan_cancellable(
-                    self.governor,
-                    state.tenant,
-                    snapshot,
-                    LogScan::through(scan_limit, frontier),
-                    &state.cancellation,
-                )
-                .map_err(map_store_failure)
+        let observer = QueryScanObserver::new(
+            self.work_meter.as_ref(),
+            state.cancellation.clone(),
+            state.cpu_work_units,
+            state.budget.cpu_work_units(),
         );
+        let scan_result = LogStore::new().scan_observed(
+            self.governor,
+            state.tenant,
+            snapshot,
+            LogScan::through(scan_limit, frontier),
+            &state.cancellation,
+            &observer,
+        );
+        state.cpu_work_units = observer.consumed();
+        let result = framed!(scan_result.map_err(map_store_failure));
         let scan_work = framed!(self.work_units(crate::QueryWorkStage::ScanDecode));
         framed!(charge_scan(&mut state, &result, scan_work));
         let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());

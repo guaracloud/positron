@@ -25,7 +25,10 @@ use positron_kernel::{
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
 pub use metadata::LogMetadata;
 pub use policy_provenance::PolicyProvenance;
-pub use scan::{LogScan, LogScanResult, ScanCancellation, ScanLimit, ScannedLogRecord};
+pub use scan::{
+    LogScan, LogScanResult, ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver,
+    ScannedLogRecord,
+};
 pub use schema::{
     OccurrenceSelector, SchemaBudget, SchemaBudgetPressure, SchemaCatalog,
     SchemaCheckpointFrontier, SchemaDelta, SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry,
@@ -212,6 +215,26 @@ impl LogStore {
         scan: LogScan,
         cancellation: &dyn ScanCancellation,
     ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        self.scan_observed(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            &scan::Unobserved,
+        )
+    }
+
+    /// Scans with cooperative cancellation and caller-owned bounded work observation.
+    pub fn scan_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
         let scope = snapshot.scope();
         if scope.tenant_id() != tenant || scope.signal_kind() != SignalKind::Logs {
             return Err(LogStoreFailure::physical_scope_mismatch());
@@ -277,7 +300,7 @@ impl LogStore {
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;
             let block_records = codec::preflight_block_record_count(tenant, block.payload())?;
             if block_records > remaining {
-                codec::validate_block_framing(tenant, block.payload(), cancellation)?;
+                codec::validate_block(tenant, block.payload(), cancellation, observer)?;
                 complete = false;
                 break;
             }

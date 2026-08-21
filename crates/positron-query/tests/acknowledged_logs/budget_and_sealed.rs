@@ -6,7 +6,9 @@ use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
 use positron_kernel::{ResourceDimension, WorkClass};
 
-use super::support::{KernelFixture, StepClock, TemporaryRoots, TestClock, TestWorkMeter};
+use super::support::{
+    CancellingStageWorkMeter, KernelFixture, StepClock, TemporaryRoots, TestClock, TestWorkMeter,
+};
 
 #[path = "budget_and_sealed/runtime_boundaries.rs"]
 mod runtime_boundaries;
@@ -95,6 +97,73 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().decoded_records() == 0
+    ));
+
+    let observed_cpu = events
+        .last()
+        .and_then(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)) => {
+                Some(incomplete.stats().cpu_work_units())
+            },
+            QueryEvent::Header(_)
+            | QueryEvent::Batch(_)
+            | QueryEvent::Terminal(QueryTerminal::Complete(_))
+            | QueryEvent::Terminal(QueryTerminal::Continued(_)) => None,
+        })
+        .ok_or("atomic preflight terminal omitted its work statistics")?;
+    assert!(
+        observed_cpu > 2,
+        "validate-only traversal must add work beyond parse and coarse scan accounting"
+    );
+    let preflight_exhaustion = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?
+        .with_cpu_work_units(
+            observed_cpu
+                .checked_sub(2)
+                .ok_or("atomic preflight did not account parser and scan work")?,
+        )?;
+    let exhausted = service.plan_pipeline(
+        context,
+        "logs | range query_time -100 100 | limit 1",
+        preflight_exhaustion,
+    )?;
+    let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().decoded_records() == 0
+                && incomplete.stats().scanned_bytes() == 0
+                && incomplete.stats().cpu_work_units() > preflight_exhaustion.cpu_work_units()
+    ));
+
+    let meter = CancellingStageWorkMeter::shared(positron_query::QueryWorkStage::ScanDecode);
+    let cancelling_service = QueryService::with_runtime(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        16,
+        TestClock::shared(2_000_000_000),
+        std::sync::Arc::clone(&meter) as std::sync::Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let cancelling = cancelling_service.plan_pipeline(
+        context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    meter.bind(cancelling.cancellation())?;
+    let cancelled_events = cancelling_service
+        .execute(cancelling)
+        .expect("mid-preflight cancellation must remain a framed query result")
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        cancelled_events.first(),
+        Some(QueryEvent::Header(_))
+    ));
+    assert!(matches!(
+        cancelled_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().decoded_records() == 0
+                && incomplete.stats().scanned_bytes() == 0
     ));
     Ok(())
 }

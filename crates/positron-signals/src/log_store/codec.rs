@@ -155,12 +155,18 @@ pub(super) fn preflight_block_record_count(
     decode_block_header(expected_tenant, bytes).map(|(_, _, _, count)| count)
 }
 
-pub(super) fn validate_block_framing(
+pub(super) fn validate_block(
     expected_tenant: TenantId,
     bytes: &[u8],
     cancellation: &dyn super::ScanCancellation,
+    observer: &dyn super::ScanObserver,
 ) -> Result<(), LogStoreFailure> {
-    let (mut input, version, limits, count) = decode_block_header(expected_tenant, bytes)?;
+    let observed = PreflightObserver {
+        cancellation,
+        observer,
+    };
+    let (mut input, version, limits, count) =
+        decode_block_header_with(expected_tenant, Input::observed(bytes, &observed))?;
     for _ in 0..count {
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
@@ -181,7 +187,13 @@ fn decode_block_header<'bytes>(
     expected_tenant: TenantId,
     bytes: &'bytes [u8],
 ) -> Result<(Input<'bytes>, u16, CodecLimits, usize), LogStoreFailure> {
-    let mut input = Input::new(bytes);
+    decode_block_header_with(expected_tenant, Input::new(bytes))
+}
+
+fn decode_block_header_with<'input>(
+    expected_tenant: TenantId,
+    mut input: Input<'input>,
+) -> Result<(Input<'input>, u16, CodecLimits, usize), LogStoreFailure> {
     if input.take(MAGIC.len())? != MAGIC {
         return Err(LogStoreFailure::malformed_block());
     }
@@ -202,6 +214,20 @@ fn decode_block_header<'bytes>(
         return Err(LogStoreFailure::malformed_block());
     }
     Ok((input, version, limits, count))
+}
+
+struct PreflightObserver<'a> {
+    cancellation: &'a dyn super::ScanCancellation,
+    observer: &'a dyn super::ScanObserver,
+}
+
+impl super::ScanObserver for PreflightObserver<'_> {
+    fn observe_work(&self, units: u64) -> Result<(), super::ScanObservationFailureCode> {
+        if self.cancellation.is_cancelled() {
+            return Err(super::ScanObservationFailureCode::Cancelled);
+        }
+        self.observer.observe_work(units)
+    }
 }
 
 fn decode_block_records(

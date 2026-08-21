@@ -10,12 +10,12 @@ mod log_store;
 pub use log_store::{
     AttributeRepresentation, LogMetadata, LogRecord, LogScan, LogScanResult, LogStore,
     LogStoreFailure, LogStoreFailureCode, OccurrenceSelector, PolicyProvenance, PreparedLogBlock,
-    ScanCancellation, ScanLimit, ScannedLogRecord, SchemaBudget, SchemaBudgetPressure,
-    SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta, SchemaDiscovery, SchemaDiscoveryRequest,
-    SchemaEntry, SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
-    SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
-    SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaValue, StoredLogAttribute,
-    StoredLogRecord,
+    ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver, ScannedLogRecord,
+    SchemaBudget, SchemaBudgetPressure, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta,
+    SchemaDiscovery, SchemaDiscoveryRequest, SchemaEntry, SchemaFailure, SchemaObservation,
+    SchemaPath, SchemaPathDigest, SchemaPathSummary, SchemaPromotionDecision,
+    SchemaPromotionReason, SchemaQuery, SchemaQueryResult, SchemaQueryUpdate, SchemaRepresentation,
+    SchemaSessionStore, SchemaValue, StoredLogAttribute, StoredLogRecord,
 };
 
 #[cfg(fuzzing)]
