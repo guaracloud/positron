@@ -11,6 +11,8 @@ use crate::{
     TemporalRange,
 };
 
+const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
+
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
     pub(crate) ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
@@ -95,6 +97,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .filter(|attribution| attribution.scope() == Scope::Query)
             .map(|attribution| attribution.tenant_id())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
+        if source.len() > MAX_QUERY_SOURCE_BYTES {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
         let cpu_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
@@ -182,9 +187,6 @@ pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> 
 }
 
 fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
-    if source.len() > 4_096 {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
     let mut stages = source.split('|').map(str::trim);
     if stages.next() != Some("pipeline:v1 logs") {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));

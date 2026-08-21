@@ -276,6 +276,35 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
     Ok(())
 }
 
+#[test]
+fn every_query_frontend_rejects_source_bytes_beyond_the_public_bound_before_parsing()
+-> Result<(), Box<dyn Error>> {
+    const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
+    let fixture = QueryFixture::new("source-byte-bound")?;
+    let service = fixture.service(16)?;
+    let shorthand = padded_source(
+        "logs | range query_time -100 100 | limit 1",
+        MAX_QUERY_SOURCE_BYTES,
+    )?;
+    let sql = padded_source(
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        MAX_QUERY_SOURCE_BYTES,
+    )?;
+
+    drop(service.plan_pipeline(fixture.context, &shorthand, budget())?);
+    drop(service.plan_sql(fixture.context, &sql, budget())?);
+
+    assert_eq!(
+        failure_code(service.plan_pipeline(fixture.context, &format!("{shorthand} "), budget(),))?,
+        QueryFailureCode::UnsupportedQuery
+    );
+    assert_eq!(
+        failure_code(service.plan_sql(fixture.context, &format!("{sql} "), budget()))?,
+        QueryFailureCode::UnsupportedQuery
+    );
+    Ok(())
+}
+
 pub(crate) struct QueryFixture {
     _roots: TemporaryRoots,
     pub(crate) kernel: KernelFixture,
@@ -343,4 +372,11 @@ fn failure_code<T>(
         Ok(_) => Err("query unexpectedly planned".into()),
         Err(failure) => Ok(failure.code()),
     }
+}
+
+fn padded_source(source: &str, bytes: usize) -> Result<String, Box<dyn Error>> {
+    let padding = bytes
+        .checked_sub(source.len())
+        .ok_or("query fixture exceeds its intended byte bound")?;
+    Ok(format!("{source}{:padding$}", ""))
 }
