@@ -168,6 +168,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
 }
 
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
+    if source.starts_with("pipeline:v1 ") {
+        return parse_versioned_pipeline(source);
+    }
     let tokens = source.split_ascii_whitespace().collect::<Vec<_>>();
     match tokens.as_slice() {
         [
@@ -252,6 +255,67 @@ pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> 
         },
         _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
     }
+}
+
+fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
+    if source.len() > 4_096 {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    let mut stages = source.split('|').map(str::trim);
+    if stages.next() != Some("pipeline:v1 logs") {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    let mut range = None;
+    let mut filter = None;
+    let mut projection = None;
+    let mut limit = None;
+    for stage in stages {
+        if let Some(arguments) = stage.strip_prefix("range ") {
+            let tokens = arguments.split_ascii_whitespace().collect::<Vec<_>>();
+            if tokens.len() != 3 || range.is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            range = Some((tokens[0], tokens[1], tokens[2]));
+        } else if let Some(literal) = stage.strip_prefix("filter body == ") {
+            if filter.is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            filter = Some(parse_body_literal(literal)?);
+        } else if let Some(literal) = stage.strip_prefix("search body == ") {
+            if filter.is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            filter = Some(parse_body_literal(literal)?);
+        } else if let Some(columns) = stage.strip_prefix("project ") {
+            if projection.is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            projection = Some(parse_projection(
+                &columns.split_ascii_whitespace().collect::<Vec<_>>(),
+            )?);
+        } else if let Some(value) = stage.strip_prefix("limit ") {
+            if limit.is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            limit = Some(value);
+        } else {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
+    }
+    let (axis, start, end) = range.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+    let mut plan = plan(
+        axis,
+        start,
+        end,
+        limit.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
+    )?;
+    if let Some(filter) = filter {
+        plan = plan.with_filter(FilterPredicate::BodyEquals(filter));
+    }
+    if let Some(projection) = projection {
+        plan = plan.with_projection(projection);
+    }
+    Ok(plan)
 }
 
 pub(crate) fn parse_sql(source: &str) -> Result<LogicalPlan, QueryFailure> {
