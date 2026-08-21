@@ -33,6 +33,25 @@ impl<'service, 'state, 'kernel, 'catalog, 'ledger>
             stage,
         }
     }
+
+    pub(crate) fn observe_search_text(&mut self, text: &str) -> Result<(), QueryFailure> {
+        self.observe_structure()?;
+        for _chunk in text
+            .as_bytes()
+            .chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES)
+        {
+            check_cancellation(&self.cancellation)?;
+            let units = self.service.work_units(self.stage)?;
+            check_cancellation(&self.cancellation)?;
+            charge_work_counter(self.consumed, units)?;
+            if cpu_work_exhausted(*self.consumed, self.limit) {
+                return Err(QueryFailure::budget_exhausted(
+                    QueryBudgetDimension::CpuWorkUnits,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl NativeValueObserver for QueryValueObserver<'_, '_, '_, '_, '_> {

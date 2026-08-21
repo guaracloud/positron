@@ -2514,6 +2514,13 @@ structured filtering, full-text search, projection, sorting, limiting,
 grouping, aggregation, JSON and logfmt parsing, explicit casts, trace
 structure, critical-path traversal, and service relationships.
 
+Log full-text search is a case-sensitive substring predicate over string
+bodies. Regular-expression search uses a bounded finite-automaton matcher;
+patterns have explicit size, nesting, and compiled-program limits, and
+unsupported or over-limit patterns are rejected before execution. Both
+search forms remain subject to the query's cumulative CPU, memory, decoded
+record, scan, output, wall-time, and cancellation budgets.
+
 Cross-signal correlation is explicit and tenant-scoped through identities
 such as `trace_id` and `span_id`. Release 1 has no arbitrary joins.
 

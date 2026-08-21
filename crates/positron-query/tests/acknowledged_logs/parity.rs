@@ -311,15 +311,22 @@ fn versioned_pipeline_supports_bounded_exact_body_search() -> Result<(), Box<dyn
         .filter_map(|record| record.body_text())
         .collect::<Vec<_>>();
     assert_eq!(bodies, ["exact match"]);
-    let unsupported = service.plan_pipeline(
+    let regex = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | search body =~ \"exact\" | limit 16",
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
-    );
-    assert!(matches!(
-        unsupported,
-        Err(failure) if failure.code() == positron_query::QueryFailureCode::UnsupportedQuery
-    ));
+    )?;
+    let regex_events = service.execute(regex)?.collect::<Vec<_>>();
+    let regex_bodies = regex_events
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(regex_bodies, ["exact match"]);
     Ok(())
 }
 

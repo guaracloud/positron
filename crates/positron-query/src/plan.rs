@@ -46,6 +46,8 @@ impl TemporalRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FilterPredicate {
     BodyEquals(positron_domain::value::ValidatedAttributeValue),
+    BodyContains(String),
+    BodyRegex(crate::search::BoundedRegex),
     AttributeEquals(positron_signals::SchemaQuery),
 }
 
@@ -169,7 +171,20 @@ impl LogicalPlan {
     pub(crate) fn schema_query(&self) -> Option<&positron_signals::SchemaQuery> {
         match self.filter.as_ref() {
             Some(FilterPredicate::AttributeEquals(query)) => Some(query),
-            Some(FilterPredicate::BodyEquals(_)) | None => None,
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::BodyContains(_))
+            | Some(FilterPredicate::BodyRegex(_))
+            | None => None,
+        }
+    }
+
+    pub(crate) fn search_memory_bytes(&self) -> u64 {
+        match self.filter.as_ref() {
+            Some(FilterPredicate::BodyContains(_)) => crate::search::text_memory_bytes(),
+            Some(FilterPredicate::BodyRegex(regex)) => regex.memory_bytes(),
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => 0,
         }
     }
 

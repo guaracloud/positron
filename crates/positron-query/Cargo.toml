@@ -18,6 +18,7 @@ positron-domain = { path = "../positron-domain" }
 positron-governance = { path = "../positron-governance" }
 positron-kernel = { path = "../positron-kernel" }
 positron-signals = { path = "../positron-signals" }
+regex = "=1.12.3"
 
 [dev-dependencies]
 positron-kernel = { path = "../positron-kernel", features = ["test-support"] }

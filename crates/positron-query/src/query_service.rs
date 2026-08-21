@@ -117,6 +117,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::CpuWorkUnits,
             ));
         }
+        if plan.search_memory_bytes() > budget.memory_bytes() {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                QueryBudgetDimension::MemoryBytes,
+            ));
+        }
         if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }

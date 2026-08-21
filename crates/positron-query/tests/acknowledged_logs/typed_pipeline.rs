@@ -3230,3 +3230,148 @@ fn post_digest_wall_expiry_never_claims_an_unqueued_batch() -> Result<(), Box<dy
     ));
     Ok(())
 }
+
+#[test]
+fn versioned_pipeline_searches_body_text_without_matching_other_records()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-full-text-search")?;
+    fixture.kernel.append_log("request timed out", 20, 1)?;
+    fixture.kernel.append_log("request accepted", 21, 2)?;
+    fixture.kernel.append_log("timeout disabled", 22, 3)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"timed out\" | limit 16",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let bodies = events
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+
+    assert_eq!(bodies, ["request timed out"]);
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn versioned_pipeline_regex_search_is_anchored_and_rejects_unbounded_patterns()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-regex-search")?;
+    fixture.kernel.append_log("error-42", 20, 1)?;
+    fixture.kernel.append_log("error-x", 21, 2)?;
+    fixture.kernel.append_log("prefix-error-42", 22, 3)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "^error-[0-9]+$" | limit 16"#,
+        budget,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let bodies = events
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["error-42"]);
+
+    for pattern in [
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "[" | limit 16"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "" | limit 16"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "" | limit 16"#,
+    ] {
+        assert_eq!(
+            service
+                .plan_pipeline(fixture.context, pattern, budget)
+                .err()
+                .ok_or("invalid regex was accepted")?
+                .code(),
+            QueryFailureCode::UnsupportedQuery
+        );
+    }
+
+    let oversized = format!(
+        "pipeline:v1 logs | range query_time -100 100 | search body =~ \"{}\" | limit 16",
+        "a".repeat(1_025)
+    );
+    assert_eq!(
+        service
+            .plan_pipeline(fixture.context, &oversized, budget)
+            .err()
+            .ok_or("oversized regex was accepted")?
+            .code(),
+        QueryFailureCode::UnsupportedQuery
+    );
+
+    let insufficient_memory = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1, 60)?;
+    let failure = service
+        .plan_pipeline(
+            fixture.context,
+            r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "error" | limit 16"#,
+            insufficient_memory,
+        )
+        .err()
+        .ok_or("regex memory reservation was not enforced")?;
+    assert_eq!(failure.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    );
+    Ok(())
+}
+
+#[test]
+fn body_search_polls_cancellation_during_matching() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-search-cancellation")?;
+    fixture.kernel.append_log("request timed out", 20, 1)?;
+    let meter = CancellingOperatorCallMeter::shared(2);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"timeout\" | limit 16",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}

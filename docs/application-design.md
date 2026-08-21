@@ -639,6 +639,13 @@ Signal Stores receive typed plan fragments, never query strings. The Storage
 Kernel returns snapshot-scoped verified block readers, never filesystem paths
 or key material.
 
+The Query module's typed search fragment distinguishes exact native-body
+predicates, case-sensitive string-substring search, and bounded regular
+expressions. Regex compilation uses a finite-automaton implementation with
+explicit pattern, nesting, and compiled-program limits; query execution
+charges search work through the same cumulative operator and cancellation
+authority as other native-value traversal.
+
 A Query Snapshot pins each involved Signal Store's committed high-water mark.
 It does not claim one transactionally atomic cross-signal instant. Cursor
 resume reauthenticates, rechecks lifecycle and scope, retains the same snapshot,

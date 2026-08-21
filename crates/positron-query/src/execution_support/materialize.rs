@@ -28,6 +28,44 @@ pub(crate) fn query_record(
                 },
                 None => false,
             },
+            crate::plan::FilterPredicate::BodyContains(expected) => match record.body() {
+                Some(value) => {
+                    let mut observer = super::QueryValueObserver::new(
+                        service,
+                        &mut state.cpu_work_units,
+                        state.budget.cpu_work_units(),
+                        state.cancellation.clone(),
+                        crate::QueryWorkStage::Operators,
+                    );
+                    match value.as_str() {
+                        Some(text) => {
+                            observer.observe_search_text(text)?;
+                            text.contains(expected)
+                        },
+                        None => false,
+                    }
+                },
+                None => false,
+            },
+            crate::plan::FilterPredicate::BodyRegex(expected) => match record.body() {
+                Some(value) => {
+                    let mut observer = super::QueryValueObserver::new(
+                        service,
+                        &mut state.cpu_work_units,
+                        state.budget.cpu_work_units(),
+                        state.cancellation.clone(),
+                        crate::QueryWorkStage::Operators,
+                    );
+                    match value.as_str() {
+                        Some(text) => {
+                            observer.observe_search_text(text)?;
+                            expected.has_literal_candidate(text) && expected.is_match(text)
+                        },
+                        None => false,
+                    }
+                },
+                None => false,
+            },
             crate::plan::FilterPredicate::AttributeEquals(query) => {
                 let mut observer = super::QueryValueObserver::new(
                     service,

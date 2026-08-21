@@ -16,6 +16,7 @@ mod operators;
 mod plan;
 mod query_service;
 mod runtime;
+mod search;
 mod service;
 mod stream;
 mod stream_lifecycle;
