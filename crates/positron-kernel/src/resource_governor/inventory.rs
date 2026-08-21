@@ -224,11 +224,14 @@ impl ResourceInventory {
 }
 
 /// One trusted observation of currently usable disk bytes.
-///
-/// ```compile_fail
-/// # use positron_kernel::DiskObservation;
-/// let _ = DiskObservation::new(1);
-/// ```
+#[cfg_attr(
+    not(feature = "test-support"),
+    doc = "```compile_fail\n# use positron_kernel::DiskObservation;\nlet _ = DiskObservation::new(1);\n```"
+)]
+#[cfg_attr(
+    feature = "test-support",
+    doc = "```\n# use positron_kernel::DiskObservation;\nlet _ = DiskObservation::new(1);\n```"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiskObservation {
     pub(super) usable_bytes: u64,
