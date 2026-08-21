@@ -3,8 +3,8 @@ use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis, TemporalR
 
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let stages = pipeline_stages(source)?;
-    if stages.first() == Some(&"pipeline:v1 logs") {
-        return parse_versioned_pipeline(&stages);
+    if let Some((&"pipeline:v1 logs", remaining)) = stages.split_first() {
+        return parse_versioned_pipeline(remaining);
     }
     match stages.as_slice() {
         ["logs", range, limit] => {
@@ -67,13 +67,7 @@ fn pipeline_stages(source: &str) -> Result<Vec<&str>, QueryFailure> {
     Ok(stages)
 }
 
-fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure> {
-    let Some((&header, remaining_stages)) = stages.split_first() else {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    };
-    if header != "pipeline:v1 logs" {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
+fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, QueryFailure> {
     let mut range = None;
     let mut filter = None;
     let mut projection = None;
@@ -138,9 +132,6 @@ fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure
             ordering = Some(specification.to_owned());
             stage_order = 4;
         } else if let Some(value) = stage.strip_prefix("limit ") {
-            if limit.is_some() {
-                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-            }
             limit = Some(value);
         } else {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
@@ -245,14 +236,10 @@ fn parse_projection(source: &str) -> Result<Vec<ProjectionColumn>, QueryFailure>
     let mut escaped = false;
     for (index, character) in source.char_indices() {
         if escaped {
-            if !matches!(character, '"' | '\\' | '|') {
-                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-            }
             escaped = false;
         } else {
             match character {
                 '\\' if quoted => escaped = true,
-                '\\' => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
                 '"' => quoted = !quoted,
                 ',' if !quoted => {
                     let column = source
@@ -266,9 +253,6 @@ fn parse_projection(source: &str) -> Result<Vec<ProjectionColumn>, QueryFailure>
                 _ => {},
             }
         }
-    }
-    if quoted || escaped {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     let column = source
         .get(start..)

@@ -14,6 +14,8 @@ use positron_kernel::IngestTime;
 
 use crate::{QueryFailure, QueryFailureCode};
 
+const INTERNAL: QueryFailure = QueryFailure::new(QueryFailureCode::Internal);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRecord {
     body: Option<positron_domain::value::ValidatedAttributeValue>,
@@ -216,28 +218,28 @@ impl QueryRecord {
                 .body
                 .as_ref()
                 .map_or(Ok(0), |body| body.canonical_encoded_size_bytes())
-                .map_err(map_value_failure)?;
+                .map_err(crate::execution_support::map_domain_value_failure)?;
             u64::try_from(encoded)
                 .ok()
                 .and_then(|value| value.checked_add(1))
-                .ok_or_else(internal)?
+                .ok_or(INTERNAL)?
         } else {
             0
         };
         let query_time_bytes = if self.query_time_selected {
-            self.query_time.ok_or_else(internal)?;
+            self.query_time.ok_or(INTERNAL)?;
             9
         } else {
             0
         };
         let event_time_bytes = if self.event_time_selected {
-            let value = self.event_time.ok_or_else(internal)?;
+            let value = self.event_time.ok_or(INTERNAL)?;
             2 + u64::from(value.instant().is_some()) * 8
         } else {
             0
         };
         let ingest_time_bytes = if self.ingest_time_selected {
-            self.ingest_time.ok_or_else(internal)?;
+            self.ingest_time.ok_or(INTERNAL)?;
             8
         } else {
             0
@@ -249,11 +251,11 @@ impl QueryRecord {
             let encoded = value
                 .as_ref()
                 .map_or(Ok(0), |set| set.canonical_encoded_size_bytes())
-                .map_err(map_value_failure)?;
+                .map_err(crate::execution_support::map_domain_value_failure)?;
             total
                 .checked_add(1)
                 .and_then(|value| value.checked_add(u64::try_from(encoded).ok()?))
-                .ok_or_else(internal)
+                .ok_or(INTERNAL)
         })?;
         body_bytes
             .checked_add(query_time_bytes)
@@ -262,7 +264,7 @@ impl QueryRecord {
             .and_then(|value| value.checked_add(u64::from(self.commit_position_selected) * 8))
             .and_then(|value| value.checked_add(u64::from(self.count.is_some()) * 8))
             .and_then(|value| value.checked_add(attribute_bytes))
-            .ok_or_else(internal)
+            .ok_or(INTERNAL)
     }
 
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition, RecordOrdinal) {
@@ -278,15 +280,15 @@ impl QueryRecord {
     pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {
         self.body_retained_bytes
             .checked_add(self.attribute_retained_bytes)
-            .ok_or_else(internal)
+            .ok_or(INTERNAL)
     }
     pub(crate) fn into_group_fields(self) -> Result<QueryGroupFields, QueryFailure> {
         Ok(QueryGroupFields {
             body: self.body,
             body_retained_bytes: self.body_retained_bytes,
-            query_time: self.query_time.ok_or_else(internal)?,
-            event_time: self.event_time.ok_or_else(internal)?,
-            ingest_time: self.ingest_time.ok_or_else(internal)?,
+            query_time: self.query_time.ok_or(INTERNAL)?,
+            event_time: self.event_time.ok_or(INTERNAL)?,
+            ingest_time: self.ingest_time.ok_or(INTERNAL)?,
             commit_position: self.commit_position,
             attributes: self.attributes,
             attribute_retained_bytes: self.attribute_retained_bytes,
@@ -304,16 +306,4 @@ impl QueryRecord {
     pub(crate) fn attribute_projections(&self) -> &[AttributeProjection] {
         &self.attributes
     }
-}
-
-fn map_value_failure(failure: positron_domain::outcome::DomainFailure) -> QueryFailure {
-    if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable {
-        QueryFailure::new(QueryFailureCode::ResourceExhausted)
-    } else {
-        internal()
-    }
-}
-
-const fn internal() -> QueryFailure {
-    QueryFailure::new(QueryFailureCode::Internal)
 }

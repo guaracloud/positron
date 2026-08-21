@@ -37,8 +37,6 @@ pub(crate) fn parse_search_string(
 struct Cursor<'source> {
     remaining: &'source str,
     maximum_depth: u16,
-    maximum_array_entries: usize,
-    maximum_key_value_entries: usize,
 }
 
 impl<'source> Cursor<'source> {
@@ -47,12 +45,6 @@ impl<'source> Cursor<'source> {
         Ok(Self {
             remaining: source,
             maximum_depth: limits.dynamic_value().nesting_depth().value(),
-            maximum_array_entries: usize::try_from(limits.dynamic_value().array_entries().value())
-                .map_err(|_| unsupported())?,
-            maximum_key_value_entries: usize::try_from(
-                limits.dynamic_value().key_value_list_entries().value(),
-            )
-            .map_err(|_| unsupported())?,
         })
     }
 
@@ -137,9 +129,6 @@ impl<'source> Cursor<'source> {
             return Ok(values);
         }
         loop {
-            if values.len() == self.maximum_array_entries {
-                return Err(unsupported());
-            }
             values
                 .try_reserve(1)
                 .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
@@ -157,9 +146,6 @@ impl<'source> Cursor<'source> {
             return Ok(values);
         }
         loop {
-            if values.len() == self.maximum_key_value_entries {
-                return Err(unsupported());
-            }
             let key = self.parse_quoted()?;
             self.expect('=')?;
             let value = self.parse_value(depth)?;

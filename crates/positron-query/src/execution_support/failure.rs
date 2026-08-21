@@ -1,6 +1,6 @@
 use crate::{QueryFailure, QueryFailureCode};
 
-pub(super) fn map_domain_value_failure(
+pub(crate) fn map_domain_value_failure(
     failure: positron_domain::outcome::DomainFailure,
 ) -> QueryFailure {
     if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable {

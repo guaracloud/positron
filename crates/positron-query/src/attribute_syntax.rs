@@ -96,9 +96,6 @@ fn split_path(source: &str) -> Result<(&str, &str), QueryFailure> {
     let mut escaped = false;
     for (index, character) in source.char_indices() {
         if escaped {
-            if !matches!(character, '"' | '\\' | '|') {
-                return Err(unsupported());
-            }
             escaped = false;
         } else if quoted && character == '\\' {
             escaped = true;

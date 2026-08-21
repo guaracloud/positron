@@ -717,6 +717,7 @@ fn typed_body_equality_accepts_every_native_literal_without_coercion() -> Result
                 CandidateAttributeValue::string("x".to_owned()),
             ]),
         ),
+        ("array()", CandidateAttributeValue::array(vec![])),
         (
             r#"kv("k"=bool(false),"k"=null)"#,
             CandidateAttributeValue::key_value_list(vec![
@@ -724,6 +725,7 @@ fn typed_body_equality_accepts_every_native_literal_without_coercion() -> Result
                 CandidateKeyValue::new("k".to_owned(), CandidateAttributeValue::null()),
             ]),
         ),
+        ("kv()", CandidateAttributeValue::key_value_list(vec![])),
     ];
     let expected = candidates
         .iter()
@@ -838,7 +840,8 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
     let source = concat!(
         "pipeline:v1 logs | range query_time 0 100 | ",
         "filter resource[\"service.name\"] any == int(7) | ",
-        "project resource[\"service.name\"], record[\"payload\"][\"token\"] | limit 2"
+        "project resource[\"service.name\"], record[\"payload\"][\"token\"], ",
+        "scope[\"enabled\"] | limit 2"
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -858,6 +861,7 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
         [
             r#"resource["service.name"]"#,
             r#"record["payload"]["token"]"#,
+            r#"scope["enabled"]"#,
         ]
     );
     assert_eq!(
@@ -865,9 +869,10 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
         [
             ResultValueType::AttributeOccurrenceSet,
             ResultValueType::AttributeOccurrenceSet,
+            ResultValueType::AttributeOccurrenceSet,
         ]
     );
-    assert_eq!(header.schema().nullable(), [true, true]);
+    assert_eq!(header.schema().nullable(), [true, true, true]);
     let record = events
         .iter()
         .find_map(|event| match event {
@@ -907,10 +912,32 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
         tokens.occurrence(1).and_then(|value| value.as_str()),
         Some("second")
     );
+    let enabled = record
+        .attribute_occurrence_set(2)
+        .ok_or("scope occurrence set missing")?;
+    assert_eq!(
+        enabled.namespace(),
+        AttributeNamespace::InstrumentationScope
+    );
+    assert_eq!(enabled.len(), 2);
+    assert_eq!(
+        enabled.occurrence(0).and_then(|value| value.as_boolean()),
+        Some(true)
+    );
+    assert_eq!(
+        enabled.occurrence(1).and_then(|value| value.as_boolean()),
+        Some(true)
+    );
 
     for predicate in [
         r#"scope["enabled"] all == bool(true)"#,
         r#"resource["service.name"] index(0) == string("api")"#,
+        r#"resource["service.name"] any == null"#,
+        r#"resource["strange \|\"\\ key"] any == bool(true)"#,
+        concat!(
+            r#"record["payload"] any == "#,
+            r#"kv("token"=string("first"),"token"=string("second"))"#,
+        ),
     ] {
         let source =
             format!("pipeline:v1 logs | range query_time 0 100 | filter {predicate} | limit 2");
@@ -924,6 +951,29 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
             events.iter().any(
                 |event| matches!(event, QueryEvent::Batch(batch) if batch.records().len() == 1)
             )
+        );
+    }
+
+    for predicate in [
+        r#"record["absent"] any == null"#,
+        r#"record["absent"] index(0) == null"#,
+        r#"resource["service.name"] index(3) == null"#,
+        r#"resource["service.name"] all == string("api")"#,
+        r#"resource["service.name"] any == bool(true)"#,
+    ] {
+        let source =
+            format!("pipeline:v1 logs | range query_time 0 100 | filter {predicate} | limit 2");
+        let query = service.plan_pipeline(
+            fixture.context,
+            &source,
+            QueryBudget::new(1_048_576, 2, 2, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, QueryEvent::Batch(_))),
+            "unexpected match for {predicate}: {events:?}"
         );
     }
 
@@ -958,6 +1008,21 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
         escaped_header.schema().columns(),
         [r#"resource["strange \|\"\\ key"]"#]
     );
+
+    let missing_projection = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time 0 100 | project record["absent"] | limit 2"#,
+        QueryBudget::new(1_048_576, 2, 2, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let missing_events = service.execute(missing_projection)?.collect::<Vec<_>>();
+    let missing_record = missing_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch.records().first(),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("missing-attribute projection produced no row")?;
+    assert_eq!(missing_record.attribute_occurrence_set(0), None);
     Ok(())
 }
 
@@ -1050,7 +1115,9 @@ fn version_one_equality_rejects_untyped_literal_syntax() -> Result<(), Box<dyn E
     );
 
     for literal in ["true", "7", "[1]", "float(1.0)"] {
-        let source = format!("pipeline:v1 logs | filter body == {literal} | limit 1");
+        let source = format!(
+            "pipeline:v1 logs | range query_time 0 100 | filter body == {literal} | limit 1"
+        );
         let failure = match service.plan_pipeline(
             fixture.context,
             &source,
@@ -1061,6 +1128,127 @@ fn version_one_equality_rejects_untyped_literal_syntax() -> Result<(), Box<dyn E
         };
         assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
     }
+    Ok(())
+}
+
+#[test]
+fn version_one_rejects_malformed_or_noncanonical_typed_literals() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("native-literal-errors")?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
+
+    for literal in [
+        "bool(neither)",
+        "bool(true",
+        "int()",
+        "int(+1)",
+        "int(01)",
+        "int(-01)",
+        "int(9223372036854775808)",
+        "float_bits(7ff8000000000001)",
+        "float_bits(0x7FF8000000000001)",
+        "float_bits(0x01)",
+        "bytes(00ff)",
+        "bytes(0x0)",
+        "bytes(0xGG)",
+        "array(int(1)",
+        "array(unknown)",
+        r#"kv("key"int(1))"#,
+        r#"kv("key"=int(1)"#,
+        r#"kv(""=null)"#,
+        r#""value" trailing"#,
+        r#"string("bad\nescape")"#,
+        r#"string("unterminated)"#,
+        "null trailing",
+    ] {
+        let source = format!(
+            "pipeline:v1 logs | range query_time 0 100 | filter body == {literal} | limit 1"
+        );
+        let failure = service
+            .plan_pipeline(fixture.context, &source, budget)
+            .err()
+            .ok_or_else(|| format!("accepted malformed native literal: {literal}"))?;
+        assert_eq!(
+            failure.code(),
+            QueryFailureCode::UnsupportedQuery,
+            "wrong failure for {literal}"
+        );
+    }
+
+    let mut too_deep = String::new();
+    for _ in 0..130 {
+        too_deep.push_str("array(");
+    }
+    too_deep.push_str("null");
+    for _ in 0..130 {
+        too_deep.push(')');
+    }
+    let source =
+        format!("pipeline:v1 logs | range query_time 0 100 | filter body == {too_deep} | limit 1");
+    let failure = service
+        .plan_pipeline(fixture.context, &source, budget)
+        .err()
+        .ok_or("accepted native literal beyond the bounded nesting depth")?;
+    assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    Ok(())
+}
+
+#[test]
+fn version_one_rejects_malformed_attribute_paths_and_selectors() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("attribute-path-errors")?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
+
+    for predicate in [
+        r#"stream["key"] any == null"#,
+        r#"unknown["key"] any == null"#,
+        r#"resource.key any == null"#,
+        r#"resource["key" any == null"#,
+        r#"resource["bad\nescape"] any == null"#,
+        r#"resource["key"] == null"#,
+        r#"resource["key"] some == null"#,
+        r#"resource["key"] index() == null"#,
+        r#"resource["key"] index(+1) == null"#,
+        r#"resource["key"] index(01) == null"#,
+        r#"resource["key"] index(65536) == null"#,
+        r#"resource["key"] index(0) = null"#,
+        r#"resource[""] any == null"#,
+        r#"resource["key"]"#,
+        r#"resource\key any == null"#,
+    ] {
+        let source =
+            format!("pipeline:v1 logs | range query_time 0 100 | filter {predicate} | limit 1");
+        let failure = service
+            .plan_pipeline(fixture.context, &source, budget)
+            .err()
+            .ok_or_else(|| format!("accepted malformed attribute predicate: {predicate}"))?;
+        assert_eq!(
+            failure.code(),
+            QueryFailureCode::UnsupportedQuery,
+            "wrong failure for {predicate}"
+        );
+    }
+
+    let mut excessive_path = String::from("resource");
+    for _ in 0..=positron_signals::SchemaPath::system_max_segments() {
+        excessive_path.push_str(r#"["x"]"#);
+    }
+    let source = format!(
+        "pipeline:v1 logs | range query_time 0 100 | filter {excessive_path} any == null | limit 1"
+    );
+    let failure = service
+        .plan_pipeline(fixture.context, &source, budget)
+        .err()
+        .ok_or("accepted attribute path beyond the segment bound")?;
+    assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
     Ok(())
 }
 
@@ -1086,6 +1274,16 @@ fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
             if stats.records() == 1 && stats.output_bytes() == 8
     ));
+    let count_record = exact_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch.records().first(),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("count result row missing")?;
+    assert_eq!(count_record.query_time().value(), 0);
+    assert_eq!(count_record.event_time(), None);
+    assert_eq!(count_record.attribute_occurrence_set(0), None);
 
     let exhausted = service.plan_pipeline(
         fixture.context,
@@ -1572,7 +1770,10 @@ fn versioned_pipeline_rejects_operator_combinations_it_cannot_execute() -> Resul
         "pipeline:v1 logs | range query_time -100 100 | project body | filter body == \"late\" | limit 1",
         "pipeline:v1 logs | range query_time -100 100 | aggregate count | filter body == \"late\" | limit 1",
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"one\" | search body == \"two\" | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | filter record[\"a\"] any == null | filter record[\"b\"] any == null | limit 1",
         "pipeline:v1 logs | range query_time -100 100 | project body | project query_time | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time, event_time, ingest_time, commit_position, body | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project ,body | limit 1",
         "pipeline:v1 logs | range query_time -100 100 | aggregate count | aggregate count | limit 1",
     ] {
         let failure = service
