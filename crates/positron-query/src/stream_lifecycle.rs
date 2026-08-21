@@ -178,6 +178,41 @@ mod tests {
         assert_eq!(release_attempts.load(Ordering::SeqCst), 2);
     }
 
+    #[test]
+    fn retained_cancellation_retries_a_failed_release_after_one_cancelled_terminal() {
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&release_attempts);
+        let release = Box::new(move || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(QueryFailure::new(QueryFailureCode::StoreUnavailable))
+            } else {
+                Ok(())
+            }
+        });
+        let stats = empty_stats();
+        let cancellation = crate::QueryCancellation::new();
+        let retained = cancellation.clone();
+        let mut stream = QueryStream::new(
+            vec![QueryEvent::Terminal(QueryTerminal::Complete(stats))],
+            Some(release),
+            false,
+            stats,
+            stats,
+            cancellation,
+        );
+
+        retained.cancel();
+        assert!(matches!(
+            stream.next(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                if incomplete.code() == QueryFailureCode::Cancelled
+        ));
+        assert!(stream.next().is_none());
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 1);
+        drop(stream);
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 2);
+    }
+
     fn empty_stats() -> QueryStats {
         QueryStats::new(
             QueryCounters {
