@@ -177,8 +177,13 @@ fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box
         "pipeline:v1 logs | range query_time -100 100 | limit 1",
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
     )?;
+    assert_eq!(query.logical_plan().version(), 1);
     let events = service.execute(query)?.collect::<Vec<_>>();
-    assert!(events.iter().any(|event| matches!(event, QueryEvent::Batch(_))));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
     Ok(())
 }
 
@@ -313,7 +318,8 @@ fn versioned_pipeline_supports_bounded_exact_body_search() -> Result<(), Box<dyn
 }
 
 #[test]
-fn versioned_pipeline_counts_filtered_records_with_a_typed_aggregate() -> Result<(), Box<dyn Error>> {
+fn versioned_pipeline_counts_filtered_records_with_a_typed_aggregate() -> Result<(), Box<dyn Error>>
+{
     let roots = TemporaryRoots::new("pipeline-count")?;
     let paths = BootstrapPaths::new(
         &roots.data(),
@@ -412,7 +418,10 @@ fn native_operator_work_consumes_the_cumulative_query_budget() -> Result<(), Box
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-operator-budget-kernel")?;
+    let fixture = KernelFixture::new(
+        instance.default_tenant_id(),
+        "pipeline-operator-budget-kernel",
+    )?;
     fixture.append_log("keep", 20, 1)?;
     let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?.with_cpu_work_units(3)?;

@@ -124,6 +124,11 @@ impl LogicalPlan {
         }
     }
 
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
     pub(crate) fn with_filter(mut self, filter: FilterPredicate) -> Self {
         self.filter = Some(filter);
         self

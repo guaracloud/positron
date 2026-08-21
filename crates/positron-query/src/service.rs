@@ -5,12 +5,10 @@ use positron_kernel::{
 };
 use std::sync::Arc;
 
+use crate::plan::{AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn};
 use crate::{
     LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis,
     TemporalRange,
-};
-use crate::plan::{
-    AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn,
 };
 
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
@@ -247,11 +245,21 @@ pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> 
             "limit",
             limit,
         ] => plan(axis, start, end, limit).and_then(|plan| {
-            parse_projection(&[first, second, third]).map(|projection| plan.with_projection(projection))
+            parse_projection(&[first, second, third])
+                .map(|projection| plan.with_projection(projection))
         }),
-        ["pipeline:v1", "logs", "|", "range", axis, start, end, "|", "limit", limit] => {
-            plan(axis, start, end, limit)
-        },
+        [
+            "pipeline:v1",
+            "logs",
+            "|",
+            "range",
+            axis,
+            start,
+            end,
+            "|",
+            "limit",
+            limit,
+        ] => plan(axis, start, end, limit),
         ["logs", "|", "range", axis, start, end, "|", "limit", limit] => {
             plan(axis, start, end, limit)
         },
@@ -318,7 +326,8 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
     }
-    let (axis, start, end) = range.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+    let (axis, start, end) =
+        range.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
     let mut plan = plan(
         axis,
         start,
@@ -428,9 +437,8 @@ fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailur
         let column = if is_last {
             *part
         } else {
-            part.strip_suffix(',').ok_or_else(|| {
-                QueryFailure::new(QueryFailureCode::UnsupportedQuery)
-            })?
+            part.strip_suffix(',')
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?
         };
         let column = match column {
             "body" => ProjectionColumn::Body,

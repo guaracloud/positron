@@ -178,9 +178,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .iter()
             .filter_map(|record| query_record(record, &state.plan))
             .collect::<Vec<_>>();
-        records.sort_by(|left, right| {
-            compare_records(left, right, state.plan.ordering())
-        });
+        records.sort_by(|left, right| compare_records(left, right, state.plan.ordering()));
         if state.plan.aggregate().is_some() {
             records = vec![QueryRecord::count_record(
                 u64::try_from(records.len())
@@ -310,7 +308,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .checked_add(1)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
             state.prior_digest = digest;
-            QueryTerminal::Continued(cursor::encode(&self.ledger.control_tokens(), state.clone())?)
+            QueryTerminal::Continued(cursor::encode(
+                &self.ledger.control_tokens(),
+                state.clone(),
+            )?)
         } else {
             state.prior_digest = digest;
             QueryTerminal::Complete(stats_with_current(&state))
