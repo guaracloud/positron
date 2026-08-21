@@ -8,11 +8,12 @@ use std::cmp::Ordering;
 pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
     service: &QueryService<'kernel, 'catalog, 'ledger>,
     state: &mut CursorState,
-    scanned: &[positron_signals::ScannedLogRecord],
-) -> Result<Vec<QueryRecord>, QueryFailure> {
+    scanned: positron_signals::LogScanResult<'kernel>,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<crate::memory::RecordBuffer, QueryFailure> {
     let operator_count = state.plan.operator_count();
-    let mut records = Vec::with_capacity(scanned.len());
-    for record in scanned {
+    let mut records = crate::memory::RecordBuffer::allocate(scanned.records().len(), memory)?;
+    for record in scanned.records() {
         check_cancellation(state)?;
         if operator_count > 0 {
             let operator_units = service
@@ -25,21 +26,19 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
                 return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
             }
         }
-        if let Some(record) = query_record(record, &state.plan) {
-            records.push(record);
+        if let Some(record) = query_record(record, &state.plan, memory)? {
+            let dynamic_bytes = record.retained_dynamic_bytes()?;
+            records.push_acquired(record, dynamic_bytes)?;
         }
     }
+    memory.release(scanned.retained_size_bytes())?;
+    drop(scanned);
 
     if let Some(aggregate) = state.plan.aggregate().cloned() {
-        return aggregate_records(
-            records,
-            &aggregate,
-            state.budget.memory_bytes(),
-            &state.cancellation,
-        );
+        return aggregate_records(records, &aggregate, memory, &state.cancellation);
     }
     check_cancellation(state)?;
-    sort_records(service, state, &mut records)?;
+    sort_records(service, state, records.as_mut_slice())?;
     check_cancellation(state)?;
     Ok(records)
 }

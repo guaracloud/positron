@@ -25,7 +25,7 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 16, 1, 16, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 1, 16, 1_048_576, 60)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
@@ -37,7 +37,7 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 16, 1, 15, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 1, 15, 1_048_576, 60)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -69,7 +69,7 @@ fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 16, 1, 8, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 1, 8, 1_048_576, 60)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
@@ -81,7 +81,7 @@ fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 16, 1, 7, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 1, 7, 1_048_576, 60)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -111,7 +111,7 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position asc | limit 1",
-        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let header = match events.first() {
@@ -139,7 +139,7 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
         fixture.kernel.ledger()?,
         16,
     );
-    let budget = QueryBudget::new(1_048_576, 16, 1, 8, 4, 60)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 8, 1_048_576, 60)?;
 
     let digest_for = |source| -> Result<[u8; 32], Box<dyn Error>> {
         let query = service.plan_pipeline(fixture.context, source, budget)?;
@@ -179,7 +179,7 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 12, 1_024, 60)?.with_cpu_work_units(4)?,
+        QueryBudget::new(1_048_576, 2, 2, 12, 1_048_576, 60)?.with_cpu_work_units(4)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
@@ -191,7 +191,7 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 12, 1_024, 60)?.with_cpu_work_units(3)?,
+        QueryBudget::new(1_048_576, 2, 2, 12, 1_048_576, 60)?.with_cpu_work_units(3)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(matches!(
@@ -205,6 +205,70 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
             .iter()
             .any(|event| matches!(event, QueryEvent::Batch(_)))
     );
+    Ok(())
+}
+
+#[test]
+fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("typed-peak-memory")?;
+    fixture.kernel.append_log("later", 20, 1)?;
+    fixture.kernel.append_log("earlier", 10, 2)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let ordinary = "logs | range query_time -100 100 | limit 2";
+    for (memory_bytes, expected_complete) in [(1_304, true), (1_303, false)] {
+        let query = service.plan_pipeline(
+            fixture.context,
+            ordinary,
+            QueryBudget::new(1_048_576, 2, 2, 12, memory_bytes, 60)?.with_cpu_work_units(16)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert_eq!(
+            matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+            ),
+            expected_complete
+        );
+        if !expected_complete {
+            assert!(matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                    if incomplete.code() == QueryFailureCode::BudgetExhausted
+            ));
+        }
+    }
+
+    fixture.kernel.append_log("third", 30, 3)?;
+    fixture.kernel.append_log("fourth", 40, 4)?;
+    let grouped =
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
+    for (memory_bytes, expected_complete) in [(2_967, true), (2_966, false)] {
+        let query = service.plan_pipeline(
+            fixture.context,
+            grouped,
+            QueryBudget::new(1_048_576, 4, 4, 64, memory_bytes, 60)?.with_cpu_work_units(16)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert_eq!(
+            matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+            ),
+            expected_complete
+        );
+        if !expected_complete {
+            assert!(matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                    if incomplete.code() == QueryFailureCode::BudgetExhausted
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -225,7 +289,7 @@ fn default_total_order_observes_cancellation_inside_sorting() -> Result<(), Box<
     let query = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 3",
-        QueryBudget::new(1_048_576, 3, 3, 16, 1_024, 60)?,
+        QueryBudget::new(1_048_576, 3, 3, 16, 1_048_576, 60)?,
     )?;
     meter.bind(query.cancellation())?;
 
@@ -264,7 +328,7 @@ fn cancellation_interrupts_substantial_default_sort_work() -> Result<(), Box<dyn
     let query = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 8",
-        QueryBudget::new(1_048_576, 8, 8, 64, 1_024, 60)?,
+        QueryBudget::new(1_048_576, 8, 8, 64, 1_048_576, 60)?,
     )?;
     let cancellation = query.cancellation();
 
@@ -308,7 +372,7 @@ fn versioned_pipeline_rejects_operator_combinations_it_cannot_execute() -> Resul
         fixture.kernel.ledger()?,
         16,
     );
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     for source in [
         "pipeline:v1 logs | range query_time -100 100 | project body | aggregate count | limit 1",
         "pipeline:v1 logs | range query_time -100 100 | aggregate count | project body | limit 1",
@@ -344,7 +408,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 61, 1_024, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 61, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let header = match events.first() {
@@ -389,7 +453,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let output_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 60, 1_024, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 60, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let output_events = service.execute(output_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -408,7 +472,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let memory_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(228, 16, 16, 61, 1_024, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 61, 8_737, 60)?.with_cpu_work_units(16)?,
     )?;
     let memory_events = service.execute(memory_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -425,7 +489,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let work_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 61, 1_024, 60)?.with_cpu_work_units(5)?,
+        QueryBudget::new(1_048_576, 16, 16, 61, 1_048_576, 60)?.with_cpu_work_units(5)?,
     )?;
     let work_events = service.execute(work_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -443,7 +507,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let commit_groups = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by commit_position | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 64, 1_024, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let commit_events = service.execute(commit_groups)?.collect::<Vec<_>>();
     let commit_header = match commit_events.first() {
@@ -500,7 +564,7 @@ fn cancellation_interrupts_grouping_and_releases_query_resources() -> Result<(),
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 8",
-        QueryBudget::new(1_048_576, 8, 8, 1_048_576, 1_024, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 8, 8, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let cancellation = query.cancellation();
     assert_eq!(
@@ -582,7 +646,7 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 3, 1_024, 60)?,
+        QueryBudget::new(1_048_576, 1, 1, 3, 1_048_576, 60)?,
     )?;
     query.cancellation().cancel();
     assert_eq!(
@@ -608,7 +672,7 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
         let query = service.plan_pipeline(
             fixture.context,
             "pipeline:v1 logs | range query_time -100 100 | project query_time | limit 1",
-            QueryBudget::new(1_048_576, 1, 1, 8, 1_024, 60)?,
+            QueryBudget::new(1_048_576, 1, 1, 8, 1_048_576, 60)?,
         )?;
         meter.bind(query.cancellation())?;
         let events = service.execute(query)?.collect::<Vec<_>>();
@@ -643,7 +707,7 @@ fn operator_wall_budget_is_checked_before_output() -> Result<(), Box<dyn Error>>
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"one\" | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 3, 1_024, 60)?,
+        QueryBudget::new(1_048_576, 1, 1, 3, 1_048_576, 60)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     assert!(

@@ -144,12 +144,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ResultLease::new(state.lease_identity, state.expiry),
             initial_cursor,
         ));
+        let scan_limit = usize::try_from(state.budget.decoded_records())
+            .ok()
+            .map(|limit| limit.min(MAX_SCAN_RECORDS))
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
         let result = match LogStore::new().scan_cancellable(
             self.governor,
             state.tenant,
             snapshot,
             LogScan::through(
-                ScanLimit::new(MAX_SCAN_RECORDS)
+                ScanLimit::new(scan_limit)
                     .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
                 frontier,
             ),
@@ -170,6 +174,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             &result,
             self.work_units(crate::QueryWorkStage::ScanDecode)?,
         )?;
+        let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
+        if let Err(failure) = memory.acquire(result.retained_size_bytes()) {
+            return self.failed_page(Some(header), failure, &state, delivered_before);
+        }
         if state.cancellation.is_cancelled() {
             return self.stopped_page(
                 Some(header),
@@ -188,7 +196,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
 
         let operator_count = state.plan.operator_count();
-        let records = match crate::operators::execute(self, &mut state, result.records()) {
+        let records = match crate::operators::execute(self, &mut state, result, &mut memory) {
             Ok(records) => records,
             Err(failure)
                 if matches!(
@@ -215,10 +223,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .checked_add(usize::from(batch_limit))
             .map(|end| end.min(wanted))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        let page = records
-            .get(start..end)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
-            .to_vec();
+        let page = materialize_page(records, start, end, &mut memory)?;
         let before_batch = stats_before_current(&state);
         charge_work(&mut state, self.work_units(crate::QueryWorkStage::Output)?)?;
         if state.cancellation.is_cancelled() {
@@ -453,4 +458,27 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         state.elapsed_wall_seconds = now.saturating_sub(state.started_at);
         Ok(now >= state.expiry)
     }
+}
+
+fn materialize_page(
+    records: crate::memory::RecordBuffer,
+    start: usize,
+    end: usize,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<Vec<crate::QueryRecord>, QueryFailure> {
+    if start > end || end > records.len() {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
+    let mut page = crate::memory::RecordBuffer::allocate(end - start, memory)?;
+    let (records, input_slots, _) = records.into_parts();
+    for (index, record) in records.into_iter().enumerate() {
+        let dynamic_bytes = record.retained_dynamic_bytes()?;
+        if (start..end).contains(&index) {
+            page.push_acquired(record, dynamic_bytes)?;
+        } else {
+            memory.release(dynamic_bytes)?;
+        }
+    }
+    memory.release(input_slots)?;
+    Ok(page.into_parts().0)
 }

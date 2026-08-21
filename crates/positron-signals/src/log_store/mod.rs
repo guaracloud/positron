@@ -245,6 +245,9 @@ impl LogStore {
             .map_err(|_| LogStoreFailure::resource_admission_refused())?;
         check_scan_cancellation(cancellation)?;
         let mut records = Vec::new();
+        records
+            .try_reserve_exact(scan.limit().value())
+            .map_err(|_| LogStoreFailure::resource_exhausted())?;
         let mut scanned_bytes = 0_u64;
         let limit = scan.limit().value();
         let mut complete = true;
@@ -285,14 +288,33 @@ impl LogStore {
             }
         }
         check_scan_cancellation(cancellation)?;
+        let retained_size_bytes = retained_scan_bytes(scan.limit(), &records)?;
         Ok(LogScanResult::new(
             records,
             complete,
             scanned_bytes,
+            retained_size_bytes,
             false,
             capacity,
         ))
     }
+}
+
+const SCANNED_RECORD_SLOT_BYTES: u64 = 512;
+
+pub(super) fn retained_scan_bytes(
+    limit: ScanLimit,
+    records: &[ScannedLogRecord],
+) -> Result<u64, LogStoreFailure> {
+    let slots = u64::try_from(limit.value())
+        .map_err(|_| LogStoreFailure::limit_exceeded())?
+        .checked_mul(SCANNED_RECORD_SLOT_BYTES)
+        .ok_or_else(LogStoreFailure::limit_exceeded)?;
+    records.iter().try_fold(slots, |total, record| {
+        total
+            .checked_add(record.stored().retained_dynamic_bytes()?)
+            .ok_or_else(LogStoreFailure::limit_exceeded)
+    })
 }
 
 fn check_scan_cancellation(cancellation: &dyn ScanCancellation) -> Result<(), LogStoreFailure> {

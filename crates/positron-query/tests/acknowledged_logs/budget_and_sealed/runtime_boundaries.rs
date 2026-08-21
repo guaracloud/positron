@@ -41,7 +41,7 @@ fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<d
         failure_code(service.plan_pipeline(
             context,
             "logs | range query_time -100 100 | limit 1",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
         ))?,
         QueryFailureCode::Internal
     );
@@ -56,7 +56,7 @@ fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<d
         failure_code(service.plan_pipeline(
             context,
             "logs | range query_time -100 100 | limit 1",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
         ))?,
         QueryFailureCode::Internal
     );
@@ -77,7 +77,7 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         failure_code(service.plan_pipeline(
             fixture.context,
             "logs | range query_time -100 100 | limit 1",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 4)?,
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 4)?,
         ))?,
         QueryFailureCode::BudgetExhausted
     );
@@ -90,11 +90,14 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         std::sync::Arc::new(ConstantWorkMeter(2)),
     );
     assert_eq!(
-        failure_code(service.plan_pipeline(
-            fixture.context,
-            "logs | range query_time -100 100 | limit 1",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?.with_cpu_work_units(1)?,
-        ))?,
+        failure_code(
+            service.plan_pipeline(
+                fixture.context,
+                "logs | range query_time -100 100 | limit 1",
+                QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
+                    .with_cpu_work_units(1)?,
+            )
+        )?,
         QueryFailureCode::BudgetExhausted
     );
 
@@ -107,7 +110,7 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
     let planned = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     assert_eq!(
         service
@@ -126,7 +129,7 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
     let planned = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     assert_eq!(
         service
@@ -143,7 +146,7 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
 {
     let fixture = QueryFixture::new("runtime-stages")?;
     fixture.kernel.append_log("long", 20, 1)?;
-    let budget = || QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60);
+    let budget = || QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60);
     for stage in [
         positron_query::QueryWorkStage::ScanDecode,
         positron_query::QueryWorkStage::Output,
@@ -240,7 +243,7 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
     let planned = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1, 1_048_576, 60)?,
     )?;
     let events = service.execute(planned)?.collect::<Vec<_>>();
     assert!(matches!(

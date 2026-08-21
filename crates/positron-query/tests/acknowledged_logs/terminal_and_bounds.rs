@@ -148,7 +148,7 @@ fn scan_capacity_refusal_is_one_typed_non_complete_terminal() -> Result<(), Box<
         .reserve(WorkClaim::tenant(
             tenant,
             WorkKind::InteractiveQueryTail,
-            ResourceAmounts::only(ResourceDimension::MemoryBytes, 7_900_000)?,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 6_850_000)?,
         )?)?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     drop(held);
@@ -326,7 +326,7 @@ impl QueryFixture {
 }
 
 fn budget() -> QueryBudget {
-    QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 4, 60).expect("fixture budget")
+    QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 1_048_576, 60).expect("fixture budget")
 }
 
 fn terminal_count(events: &[QueryEvent]) -> usize {

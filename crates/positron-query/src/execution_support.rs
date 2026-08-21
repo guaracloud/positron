@@ -6,20 +6,19 @@ use crate::cursor::CursorState;
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
 
 const MAX_GROUPS: usize = 1_024;
-const GROUP_ENTRY_BASE_BYTES: u64 = 32;
-const GROUP_VALUE_SLOT_BYTES: u64 = 16;
 
 pub(crate) fn query_record(
     record: &positron_signals::ScannedLogRecord,
     plan: &LogicalPlan,
-) -> Option<QueryRecord> {
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<Option<QueryRecord>, QueryFailure> {
     if let Some(crate::plan::FilterPredicate::BodyEquals(expected)) = plan.filter()
         && record.body().and_then(|body| body.as_str()) != Some(expected.as_str())
     {
-        return None;
+        return Ok(None);
     }
     let observed = record.observed_time();
-    let ordering_time = match plan.temporal_axis() {
+    let Some(ordering_time) = (match plan.temporal_axis() {
         TemporalAxis::QueryTime => Some(
             QueryTime::for_log(
                 &record.event_time(),
@@ -29,30 +28,48 @@ pub(crate) fn query_record(
             .instant(),
         ),
         TemporalAxis::EventTime => record.event_time().instant(),
-    }?;
+    }) else {
+        return Ok(None);
+    };
     if !plan.temporal_range().contains(ordering_time) {
-        return None;
+        return Ok(None);
     }
     let selected_columns = plan
         .aggregate()
         .map(crate::plan::AggregateSpec::group_by)
         .unwrap_or_else(|| plan.projection());
-    let body = selected_columns
-        .contains(&crate::plan::ProjectionColumn::Body)
-        .then(|| {
-            record
-                .body()
-                .and_then(|body| body.as_str())
-                .map(str::to_owned)
-        })
-        .flatten();
-    Some(QueryRecord::new(
+    let body = if selected_columns.contains(&crate::plan::ProjectionColumn::Body) {
+        record
+            .body()
+            .and_then(|body| body.as_str())
+            .map(|body| try_retained_string(body, memory))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Some(QueryRecord::new(
         body,
         ordering_time,
         record.commit_position(),
         selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
         selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition),
-    ))
+    )))
+}
+
+fn try_retained_string(
+    value: &str,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<String, QueryFailure> {
+    let bytes = u64::try_from(value.len())
+        .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+    memory.acquire(bytes)?;
+    let mut retained = String::new();
+    if retained.try_reserve_exact(value.len()).is_err() {
+        memory.release(bytes)?;
+        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+    }
+    retained.push_str(value);
+    Ok(retained)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -66,39 +83,27 @@ enum GroupValue {
 struct GroupKey(Vec<GroupValue>);
 
 impl GroupKey {
-    fn for_record(record: &QueryRecord, columns: &[crate::plan::ProjectionColumn]) -> Self {
-        Self(
-            columns
-                .iter()
-                .map(|column| match column {
-                    crate::plan::ProjectionColumn::Body => {
-                        GroupValue::Body(record.body_text().map(str::to_owned))
-                    },
-                    crate::plan::ProjectionColumn::QueryTime => {
-                        GroupValue::QueryTime(record.query_time())
-                    },
-                    crate::plan::ProjectionColumn::CommitPosition => {
-                        GroupValue::CommitPosition(record.commit_position())
-                    },
-                })
-                .collect(),
-        )
-    }
-
-    fn retained_bytes(&self) -> Result<u64, QueryFailure> {
-        self.0
-            .iter()
-            .try_fold(GROUP_ENTRY_BASE_BYTES, |total, value| {
-                let value_bytes = match value {
-                    GroupValue::Body(body) => u64::try_from(body.as_deref().map_or(0, str::len))
-                        .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
-                    GroupValue::QueryTime(_) | GroupValue::CommitPosition(_) => 8,
-                };
-                total
-                    .checked_add(GROUP_VALUE_SLOT_BYTES)
-                    .and_then(|bytes| bytes.checked_add(value_bytes))
-                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))
-            })
+    fn for_record(
+        record: QueryRecord,
+        columns: &[crate::plan::ProjectionColumn],
+    ) -> Result<(Self, u64), QueryFailure> {
+        let (mut body, query_time, commit_position) = record.into_group_fields();
+        let body_bytes = u64::try_from(body.as_deref().map_or(0, str::len))
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(columns.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        for column in columns {
+            values.push(match column {
+                crate::plan::ProjectionColumn::Body => GroupValue::Body(body.take()),
+                crate::plan::ProjectionColumn::QueryTime => GroupValue::QueryTime(query_time),
+                crate::plan::ProjectionColumn::CommitPosition => {
+                    GroupValue::CommitPosition(commit_position)
+                },
+            });
+        }
+        Ok((Self(values), body_bytes))
     }
 
     fn into_record(self, count: u64) -> QueryRecord {
@@ -117,28 +122,42 @@ impl GroupKey {
 }
 
 pub(crate) fn aggregate_records(
-    records: Vec<QueryRecord>,
+    records: crate::memory::RecordBuffer,
     aggregate: &crate::plan::AggregateSpec,
-    memory_budget: u64,
+    memory: &mut crate::memory::QueryMemory,
     cancellation: &crate::QueryCancellation,
-) -> Result<Vec<QueryRecord>, QueryFailure> {
+) -> Result<crate::memory::RecordBuffer, QueryFailure> {
     if cancellation.is_cancelled() {
         return Err(QueryFailure::new(QueryFailureCode::Cancelled));
     }
     if aggregate.group_by().is_empty() {
-        return Ok(vec![QueryRecord::count_record(
-            u64::try_from(records.len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
-        )]);
+        let count = u64::try_from(records.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+        let (_, slot_bytes, dynamic_bytes) = records.into_parts();
+        memory.release(slot_bytes)?;
+        memory.release(dynamic_bytes)?;
+        let mut counted = crate::memory::RecordBuffer::allocate(1, memory)?;
+        counted.push_acquired(QueryRecord::count_record(count), 0)?;
+        return Ok(counted);
     }
     let mut groups = BTreeMap::<GroupKey, u64>::new();
-    let mut retained_bytes = 0_u64;
-    for record in &records {
+    let (records, record_slots, _) = records.into_parts();
+    let key_slots = u64::try_from(aggregate.group_by().len())
+        .ok()
+        .and_then(|count| count.checked_mul(crate::memory::GROUP_VALUE_SLOT_BYTES))
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+    for record in records {
         if cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
-        let key = GroupKey::for_record(record, aggregate.group_by());
-        let key_bytes = key.retained_bytes()?;
+        memory.acquire(key_slots)?;
+        let (key, body_bytes) = match GroupKey::for_record(record, aggregate.group_by()) {
+            Ok(key) => key,
+            Err(failure) => {
+                memory.release(key_slots)?;
+                return Err(failure);
+            },
+        };
         let at_capacity = groups.len() >= MAX_GROUPS;
         match groups.entry(key) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
@@ -147,27 +166,29 @@ pub(crate) fn aggregate_records(
                     .checked_add(1)
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
                 *entry.get_mut() = count;
+                memory.release(key_slots)?;
+                memory.release(body_bytes)?;
             },
             std::collections::btree_map::Entry::Vacant(entry) => {
                 if at_capacity {
                     return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
                 }
-                retained_bytes = retained_bytes
-                    .checked_add(key_bytes)
-                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-                if retained_bytes > memory_budget {
-                    return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
-                }
+                memory.acquire(crate::memory::GROUP_ENTRY_BYTES)?;
                 entry.insert(1);
             },
         }
     }
-    let mut grouped = Vec::with_capacity(groups.len());
+    memory.release(record_slots)?;
+    let mut grouped = crate::memory::RecordBuffer::allocate(groups.len(), memory)?;
     for (key, count) in groups {
         if cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
-        grouped.push(key.into_record(count));
+        let record = key.into_record(count);
+        let dynamic_bytes = record.retained_dynamic_bytes()?;
+        grouped.push_acquired(record, dynamic_bytes)?;
+        memory.release(key_slots)?;
+        memory.release(crate::memory::GROUP_ENTRY_BYTES)?;
     }
     Ok(grouped)
 }

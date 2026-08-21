@@ -29,7 +29,7 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     let events = service.execute(planned)?.collect::<Vec<_>>();
     assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
@@ -64,7 +64,7 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
     let fixture = KernelFixture::new(instance.default_tenant_id(), "runtime-budget-kernel")?;
     fixture.append_log("bounded", 20, 1)?;
     let cpu_budget =
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?.with_cpu_work_units(2)?;
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(2)?;
     let clock = TestClock::shared(100);
     let service = QueryService::with_runtime(
         fixture.authority.governor(),
@@ -102,7 +102,7 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
     let planned = wall_service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 4)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 4)?,
     )?;
     let events = wall_service.execute(planned)?.collect::<Vec<_>>();
     assert!(matches!(
@@ -138,7 +138,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 10)?.with_cpu_work_units(4)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 10)?.with_cpu_work_units(4)?,
     )?;
     let first = service.execute_page(planned)?.collect::<Vec<_>>();
     let cursor = match first.last() {
@@ -187,7 +187,7 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     let query = service.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     let first = service
         .execute(query)?
@@ -211,7 +211,7 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     let query = restarted.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     let after_restart = restarted
         .execute(query)?

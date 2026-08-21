@@ -78,6 +78,7 @@ pub struct LogScanResult<'kernel> {
     records: Vec<ScannedLogRecord>,
     complete: bool,
     scanned_bytes: u64,
+    retained_size_bytes: u64,
     reduced_pruning: bool,
     _capacity: ResourceReservation<'kernel>,
 }
@@ -87,6 +88,7 @@ impl<'kernel> LogScanResult<'kernel> {
         records: Vec<ScannedLogRecord>,
         complete: bool,
         scanned_bytes: u64,
+        retained_size_bytes: u64,
         reduced_pruning: bool,
         capacity: ResourceReservation<'kernel>,
     ) -> Self {
@@ -94,6 +96,7 @@ impl<'kernel> LogScanResult<'kernel> {
             records,
             complete,
             scanned_bytes,
+            retained_size_bytes,
             reduced_pruning,
             _capacity: capacity,
         }
@@ -112,6 +115,12 @@ impl<'kernel> LogScanResult<'kernel> {
     #[must_use]
     pub const fn scanned_bytes(&self) -> u64 {
         self.scanned_bytes
+    }
+
+    /// Returns the canonical conservative bytes retained by the decoded result.
+    #[must_use]
+    pub const fn retained_size_bytes(&self) -> u64 {
+        self.retained_size_bytes
     }
 
     /// Reports that generic or Schema Overflow records required fallback decoding.

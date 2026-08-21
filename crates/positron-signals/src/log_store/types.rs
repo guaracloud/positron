@@ -8,6 +8,7 @@ use positron_kernel::{IngestTime, PreparedStoreBlock};
 use super::{LogMetadata, PolicyProvenance, failure::LogStoreFailure};
 
 mod evaluated;
+mod retained;
 
 /// The M1 physical dynamic-attribute representation carried by a Log Block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

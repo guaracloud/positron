@@ -31,7 +31,7 @@ fn pipeline_and_sql_share_one_plan_and_read_acknowledged_active_logs() -> Result
     fixture.append_log("acknowledged", 20, 1)?;
 
     let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     let pipeline = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 16",
@@ -94,7 +94,7 @@ fn pipeline_and_sql_require_the_same_explicit_bounded_temporal_range() -> Result
     fixture.append_log("exclusive-end", 30, 3)?;
     fixture.append_log("outside", 40, 4)?;
     let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     let pipeline =
         service.plan_pipeline(context, "logs | range event_time 10 30 | limit 16", budget)?;
     let sql = service.plan_sql(
@@ -175,7 +175,7 @@ fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     assert_eq!(query.logical_plan().version(), 1);
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -210,7 +210,7 @@ fn versioned_pipeline_filters_on_an_intrinsic_body_literal() -> Result<(), Box<d
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let bodies = events
@@ -248,7 +248,7 @@ fn versioned_pipeline_projects_bounded_intrinsic_columns() -> Result<(), Box<dyn
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | project query_time, commit_position | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let header = match events.first() {
@@ -292,7 +292,7 @@ fn versioned_pipeline_supports_bounded_exact_body_search() -> Result<(), Box<dyn
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | search body == \"exact match\" | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let bodies = events
@@ -308,7 +308,7 @@ fn versioned_pipeline_supports_bounded_exact_body_search() -> Result<(), Box<dyn
     let unsupported = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | search body =~ \"exact\" | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     );
     assert!(matches!(
         unsupported,
@@ -335,7 +335,7 @@ fn versioned_pipeline_rejects_unimplemented_or_malformed_stages() -> Result<(), 
     )?;
     let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-rejections-kernel")?;
     let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
 
     for source in [
         "pipeline:v1 logs",
@@ -421,7 +421,7 @@ fn advanced_native_page_execution_stays_with_the_pagination_authority() -> Resul
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time 0 1 | filter body == \"bounded\" | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
     let failure = service
         .execute_page(query)
@@ -459,7 +459,7 @@ fn versioned_pipeline_counts_filtered_records_with_a_typed_aggregate() -> Result
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | aggregate count | limit 1",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
             .with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -544,7 +544,8 @@ fn native_operator_work_consumes_the_cumulative_query_budget() -> Result<(), Box
     )?;
     fixture.append_log("keep", 20, 1)?;
     let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?.with_cpu_work_units(3)?;
+    let budget =
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(3)?;
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | limit 16",

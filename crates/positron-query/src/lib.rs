@@ -9,6 +9,7 @@ mod execution;
 mod execution_state;
 mod execution_support;
 mod failure;
+mod memory;
 mod operators;
 mod plan;
 mod runtime;

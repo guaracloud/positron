@@ -314,7 +314,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
 }
 
 fn budget() -> QueryBudget {
-    QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)
+    QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)
         .and_then(|budget| budget.with_cpu_work_units(16))
         .expect("fixture budget")
 }

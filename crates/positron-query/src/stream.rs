@@ -266,6 +266,15 @@ impl QueryRecord {
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition) {
         (self.query_time, self.commit_position)
     }
+
+    pub(crate) fn retained_dynamic_bytes(&self) -> Result<u64, QueryFailure> {
+        u64::try_from(self.body_text().map_or(0, str::len))
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+    }
+
+    pub(crate) fn into_group_fields(self) -> (Option<String>, UnixNanoseconds, CommitPosition) {
+        (self.body, self.query_time, self.commit_position)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
