@@ -194,42 +194,50 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let mut aggregate = None;
     let mut ordering = None;
     let mut limit = None;
+    let mut stage_order = 0_u8;
     for stage in stages {
         if limit.is_some() || (!stage.starts_with("range ") && range.is_none()) {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         if let Some(arguments) = stage.strip_prefix("range ") {
             let tokens = arguments.split_ascii_whitespace().collect::<Vec<_>>();
-            if tokens.len() != 3 || range.is_some() {
+            if tokens.len() != 3 || range.is_some() || stage_order != 0 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             range = Some((tokens[0], tokens[1], tokens[2]));
+            stage_order = 1;
         } else if let Some(literal) = stage.strip_prefix("filter body == ") {
-            if filter.is_some() {
+            if filter.is_some() || stage_order > 1 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(parse_body_literal(literal)?);
+            stage_order = 2;
         } else if let Some(literal) = stage.strip_prefix("search body == ") {
-            if filter.is_some() {
+            if filter.is_some() || stage_order > 1 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(parse_body_literal(literal)?);
+            stage_order = 2;
         } else if let Some(columns) = stage.strip_prefix("project ") {
-            if projection.is_some() {
+            if projection.is_some() || aggregate.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             projection = Some(parse_projection(
                 &columns.split_ascii_whitespace().collect::<Vec<_>>(),
             )?);
+            stage_order = 3;
         } else if stage == "aggregate count" {
-            if aggregate.replace(AggregateSpec::Count).is_some() {
+            if projection.is_some() || aggregate.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
+            aggregate = Some(AggregateSpec::Count);
+            stage_order = 3;
         } else if let Some(specification) = stage.strip_prefix("order by ") {
-            if ordering.is_some() {
+            if ordering.is_some() || aggregate.is_some() || stage_order > 3 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             ordering = Some(specification.to_owned());
+            stage_order = 4;
         } else if let Some(value) = stage.strip_prefix("limit ") {
             if limit.is_some() {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));

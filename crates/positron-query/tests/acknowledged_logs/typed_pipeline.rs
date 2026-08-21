@@ -123,3 +123,33 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
     );
     Ok(())
 }
+
+#[test]
+fn versioned_pipeline_rejects_operator_combinations_it_cannot_execute() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("typed-operator-combinations")?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?;
+    for source in [
+        "pipeline:v1 logs | range query_time -100 100 | project body | aggregate count | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count | project body | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count | order by query_time asc, commit_position asc | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time asc, commit_position asc | filter body == \"late\" | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | filter body == \"late\" | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count | filter body == \"late\" | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"one\" | search body == \"two\" | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | project query_time | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count | aggregate count | limit 1",
+    ] {
+        let failure = service
+            .plan_pipeline(fixture.context, source, budget)
+            .err()
+            .ok_or("unexecuted operator combination was accepted")?;
+        assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    }
+    Ok(())
+}
