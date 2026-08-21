@@ -313,6 +313,41 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
     Ok(())
 }
 
+#[test]
+fn retained_cancellation_handle_stops_result_delivery_with_delivered_only_truth()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("cancel-delivery")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    fixture.kernel.append_log("two", 21, 2)?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 2",
+        budget(),
+    )?;
+    let cancellation = query.cancellation();
+    let mut stream = service.execute_page(query)?;
+    assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+    cancellation.cancel();
+    assert!(matches!(
+        stream.next(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+                && incomplete.stats().scanned_bytes() == 0
+                && incomplete.stats().last_sequence().is_none()
+                && incomplete.stats().result_digest() == [0; 32]
+    ));
+    assert!(stream.next().is_none());
+    Ok(())
+}
+
 fn budget() -> QueryBudget {
     QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)
         .and_then(|budget| budget.with_cpu_work_units(16))

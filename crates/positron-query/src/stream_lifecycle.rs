@@ -46,6 +46,12 @@ impl<'lease> QueryStream<'lease> {
 
     pub fn cancel(&mut self) -> Result<(), QueryFailure> {
         self.cancellation.cancel();
+        self.replace_pending_with_cancelled();
+        self.release_lease()?;
+        Ok(())
+    }
+
+    fn replace_pending_with_cancelled(&mut self) {
         if self.terminal_observed {
             self.events = Vec::new().into_iter();
         } else {
@@ -57,8 +63,6 @@ impl<'lease> QueryStream<'lease> {
             ))]
             .into_iter();
         }
-        self.release_lease()?;
-        Ok(())
     }
 
     fn release_lease(&mut self) -> Result<(), QueryFailure> {
@@ -75,6 +79,10 @@ impl Iterator for QueryStream<'_> {
     type Item = QueryEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.cancellation.is_cancelled() && !self.terminal_observed {
+            self.replace_pending_with_cancelled();
+            let _ = self.release_lease();
+        }
         let event = self.events.next();
         if matches!(
             event.as_ref(),
