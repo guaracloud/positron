@@ -5,8 +5,13 @@ use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord, TemporalAx
 
 pub(crate) fn query_record(
     record: &positron_signals::ScannedLogRecord,
-    plan: LogicalPlan,
+    plan: &LogicalPlan,
 ) -> Option<QueryRecord> {
+    if let Some(crate::plan::FilterPredicate::BodyEquals(expected)) = plan.filter()
+        && record.body().and_then(|body| body.as_str()) != Some(expected.as_str())
+    {
+        return None;
+    }
     let observed = record.observed_time();
     let ordering_time = match plan.temporal_axis() {
         TemporalAxis::QueryTime => Some(

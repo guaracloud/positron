@@ -42,12 +42,18 @@ impl TemporalRange {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FilterPredicate {
+    BodyEquals(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalPlan {
     version: u8,
     axis: TemporalAxis,
     range: TemporalRange,
     limit: u16,
+    filter: Option<FilterPredicate>,
 }
 
 impl LogicalPlan {
@@ -57,20 +63,34 @@ impl LogicalPlan {
             axis,
             range,
             limit,
+            filter: None,
         }
     }
 
-    pub(crate) const fn limit(self) -> u16 {
+    pub(crate) fn with_filter(mut self, filter: FilterPredicate) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    pub(crate) fn has_advanced_operators(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
+        self.filter.as_ref()
+    }
+
+    pub(crate) const fn limit(&self) -> u16 {
         self.limit
     }
 
     #[must_use]
-    pub const fn temporal_axis(self) -> TemporalAxis {
+    pub const fn temporal_axis(&self) -> TemporalAxis {
         self.axis
     }
 
     #[must_use]
-    pub const fn temporal_range(self) -> TemporalRange {
+    pub const fn temporal_range(&self) -> TemporalRange {
         self.range
     }
 }
@@ -87,7 +107,7 @@ pub struct PlannedQuery<'kernel> {
 
 impl PlannedQuery<'_> {
     #[must_use]
-    pub const fn logical_plan(&self) -> LogicalPlan {
-        self.plan
+    pub fn logical_plan(&self) -> LogicalPlan {
+        self.plan.clone()
     }
 }

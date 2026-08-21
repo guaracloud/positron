@@ -9,6 +9,7 @@ use crate::{
     LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis,
     TemporalRange,
 };
+use crate::plan::FilterPredicate;
 
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
@@ -169,6 +170,26 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let tokens = source.split_ascii_whitespace().collect::<Vec<_>>();
     match tokens.as_slice() {
+        [
+            "pipeline:v1",
+            "logs",
+            "|",
+            "range",
+            axis,
+            start,
+            end,
+            "|",
+            "filter",
+            "body",
+            "==",
+            literal,
+            "|",
+            "limit",
+            limit,
+        ] => plan(axis, start, end, limit).and_then(|plan| {
+            parse_body_literal(literal)
+                .map(|literal| plan.with_filter(FilterPredicate::BodyEquals(literal)))
+        }),
         ["pipeline:v1", "logs", "|", "range", axis, start, end, "|", "limit", limit] => {
             plan(axis, start, end, limit)
         },
@@ -241,4 +262,17 @@ fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
     source
         .parse()
         .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
+}
+
+fn parse_body_literal(source: &str) -> Result<String, QueryFailure> {
+    let Some(inner) = source
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    };
+    if inner.is_empty() || inner.len() > 65_536 || inner.contains('"') {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    Ok(inner.to_owned())
 }

@@ -48,6 +48,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if self.batch_limit == 0 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
+        if query.plan.has_advanced_operators() {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
         let now_seconds = self.observe_planned(&query)?;
         let expiry = query
             .started_at
@@ -129,10 +132,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let frontier = commit_position(state.frontier)?;
         let initial_cursor = pagination
-            .then(|| cursor::encode(&self.ledger.control_tokens(), state))
+            .then(|| cursor::encode(&self.ledger.control_tokens(), state.clone()))
             .transpose()?;
         let header = QueryEvent::Header(QueryHeader::new(
-            state.plan,
+            state.plan.clone(),
             state.budget,
             ResultSnapshot::new(
                 state.catalog_identity,
@@ -173,7 +176,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let mut records = result
             .records()
             .iter()
-            .filter_map(|record| query_record(record, state.plan))
+            .filter_map(|record| query_record(record, &state.plan))
             .collect::<Vec<_>>();
         records.sort_by_key(QueryRecord::order_key);
         let wanted = usize::from(state.plan.limit()).min(records.len());
@@ -225,7 +228,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 stats,
             );
         }
-        let mut output_state = state;
+        let mut output_state = state.clone();
         charge_output(&mut output_state, &page)?;
         if exhausted(&output_state) {
             return self.stream(
@@ -280,7 +283,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state.prior_digest,
             digest,
         ));
-        let mut delivered_state = state;
+        let mut delivered_state = state.clone();
         delivered_state.prior_digest = digest;
         let batch_stats = stats_with_current(&delivered_state);
         let terminal = if pagination && end < wanted {
@@ -291,7 +294,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .checked_add(1)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
             state.prior_digest = digest;
-            QueryTerminal::Continued(cursor::encode(&self.ledger.control_tokens(), state)?)
+            QueryTerminal::Continued(cursor::encode(&self.ledger.control_tokens(), state.clone())?)
         } else {
             state.prior_digest = digest;
             QueryTerminal::Complete(stats_with_current(&state))

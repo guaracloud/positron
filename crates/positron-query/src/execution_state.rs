@@ -59,7 +59,7 @@ pub(crate) fn initial_state(
         catalog_identity: snapshot.catalog_identity().to_bytes(),
         catalog_generation: snapshot.catalog_generation(),
         frontier: snapshot.frontier().value(),
-        plan: query.plan,
+        plan: query.plan.clone(),
         offset: 0,
         sequence: 0,
         prior_digest: [0; 32],

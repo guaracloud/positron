@@ -181,3 +181,42 @@ fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box
     assert!(events.iter().any(|event| matches!(event, QueryEvent::Batch(_))));
     Ok(())
 }
+
+#[test]
+fn versioned_pipeline_filters_on_an_intrinsic_body_literal() -> Result<(), Box<dyn Error>> {
+    let roots = TemporaryRoots::new("pipeline-filter")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-filter-kernel")?;
+    fixture.append_log("keep", 20, 1)?;
+    fixture.append_log("discard", 21, 2)?;
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
+    let query = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | limit 16",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let bodies = events
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["keep"]);
+    Ok(())
+}

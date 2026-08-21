@@ -36,7 +36,7 @@ impl std::fmt::Debug for QueryCursor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct CursorState {
     pub(crate) principal: PrincipalId,
     pub(crate) tenant: TenantId,
@@ -88,7 +88,7 @@ pub(crate) fn encode(
     );
     bytes.extend_from_slice(&state.plan.temporal_range().end_nanoseconds().to_be_bytes());
     bytes.extend_from_slice(&state.plan.limit().to_be_bytes());
-    bytes.extend_from_slice(&plan_digest(protector, state.plan)?);
+    bytes.extend_from_slice(&plan_digest(protector, &state.plan)?);
     bytes.extend_from_slice(&state.offset.to_be_bytes());
     bytes.extend_from_slice(&state.sequence.to_be_bytes());
     bytes.extend_from_slice(&state.prior_digest);
@@ -169,7 +169,7 @@ pub(crate) fn decode(
     let range = TemporalRange::new(reader.i64()?, reader.i64()?)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let plan = LogicalPlan::logs(axis, range, reader.u16()?);
-    if reader.array::<32>()? != plan_digest(protector, plan)? {
+    if reader.array::<32>()? != plan_digest(protector, &plan)? {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let offset = reader.u16()?;
@@ -246,7 +246,7 @@ pub(crate) fn decode(
 
 fn plan_digest(
     protector: &ControlTokenProtector<'_>,
-    plan: LogicalPlan,
+    plan: &LogicalPlan,
 ) -> Result<[u8; 32], QueryFailure> {
     let mut encoding = Vec::with_capacity(19);
     encoding.push(match plan.temporal_axis() {
