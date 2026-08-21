@@ -877,7 +877,10 @@ const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::map_store_failure_code;
+    use super::{
+        check_digest_cancellation, map_domain_value_failure, map_store_failure_code,
+        query_time_provenance_tag, result_value_type_tag, source_time_quality_tag,
+    };
     use crate::QueryFailureCode;
 
     #[test]
@@ -893,6 +896,49 @@ mod tests {
         assert_eq!(
             map_store_failure_code(positron_signals::LogStoreFailureCode::Cancelled),
             QueryFailureCode::Cancelled
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::PhysicalScopeMismatch),
+            QueryFailureCode::StoreUnavailable
+        );
+    }
+
+    #[test]
+    fn typed_digest_vocabulary_and_domain_failures_remain_stable() {
+        use positron_domain::time::{QueryTimeProvenance, SourceTimeQuality};
+        use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
+
+        assert_eq!(
+            result_value_type_tag(crate::ResultValueType::UnixNanoseconds),
+            1
+        );
+        assert_eq!(
+            result_value_type_tag(crate::ResultValueType::OptionalUnixNanoseconds),
+            5
+        );
+        assert_eq!(query_time_provenance_tag(QueryTimeProvenance::Observed), 1);
+        assert_eq!(source_time_quality_tag(SourceTimeQuality::Outlier), 3);
+        assert_eq!(source_time_quality_tag(SourceTimeQuality::Contradictory), 4);
+
+        let cancellation = crate::QueryCancellation::new();
+        cancellation.cancel();
+        assert_eq!(
+            check_digest_cancellation(&cancellation)
+                .expect_err("cancelled digest work must fail")
+                .code(),
+            QueryFailureCode::Cancelled
+        );
+
+        let domain_failure = CandidateAttributeValue::array(
+            (0..1_025)
+                .map(|_| CandidateAttributeValue::null())
+                .collect(),
+        )
+        .validate_log_body(ValueLimitProfile::release_1_system_maximum())
+        .expect_err("oversized native values must fail domain validation");
+        assert_eq!(
+            map_domain_value_failure(domain_failure).code(),
+            QueryFailureCode::Internal
         );
     }
 }
