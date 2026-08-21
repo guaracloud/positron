@@ -394,3 +394,64 @@ fn observed_native_equality_is_exact_and_propagates_cancellation() {
         Err(ObservedValueFailure::Observer("cancelled traversal"))
     );
 }
+
+#[test]
+fn projected_occurrence_accounting_and_encoding_cover_the_complete_bounded_set() {
+    let profile = profile();
+    let occurrences = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Resource,
+        "service.name".to_owned(),
+        vec![
+            CandidateAttributeValue::string("api".to_owned()),
+            CandidateAttributeValue::boolean(true),
+        ],
+    )
+    .validate(profile)
+    .expect("the projected occurrence fixture is bounded");
+    let first = occurrences
+        .occurrence(0)
+        .expect("the first occurrence exists");
+    assert!(AttributeOccurrenceSet::retained_occurrence_bytes(first).expect("size is bounded") > 3);
+    assert_eq!(
+        AttributeOccurrenceSet::projected_occurrence_capacity_bytes(profile)
+            .expect("profile capacity is bounded"),
+        usize::try_from(
+            profile
+                .effective_limits()
+                .dynamic_value()
+                .attributes_per_namespace()
+                .value()
+        )
+        .expect("test profile count fits usize")
+            * AttributeOccurrenceSet::PROJECTED_OCCURRENCE_SLOT_BYTES
+    );
+    assert!(
+        occurrences
+            .canonical_encoded_size_bytes()
+            .expect("logical encoding is bounded")
+            > occurrences.key().len()
+    );
+    let mut comparison = Vec::new();
+    occurrences
+        .visit_comparison_encoding(&mut |bytes| {
+            comparison.extend_from_slice(bytes);
+            Ok::<(), core::convert::Infallible>(())
+        })
+        .expect("comparison visitor is infallible");
+    assert!(!comparison.is_empty());
+    assert_eq!(
+        occurrences.try_clone().expect("bounded clone succeeds"),
+        occurrences
+    );
+
+    assert!(
+        AttributeOccurrenceSet::from_validated(
+            AttributeNamespace::Record,
+            String::new(),
+            vec![first.try_clone().expect("bounded value clone succeeds")],
+            profile,
+        )
+        .is_err(),
+        "an empty projected key remains invalid"
+    );
+}
