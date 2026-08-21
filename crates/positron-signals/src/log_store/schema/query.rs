@@ -3,7 +3,9 @@ use positron_domain::value::{AttributeOccurrenceSet, AttributeValueKind, Validat
 use super::{SchemaCatalog, SchemaFailure, SchemaObservation, SchemaPath, SchemaRepresentation};
 
 mod traversal;
-pub(crate) use traversal::{matches_observed, visit_terminals, visit_terminals_observed};
+pub(crate) use traversal::{
+    evaluate_observed, matches_observed, visit_terminals, visit_terminals_observed,
+};
 
 /// Explicit selection semantics for repeated attribute occurrences.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +206,19 @@ impl SchemaQuery {
             path,
             selector,
             value: QueryValue::Native(value),
+        }
+    }
+
+    /// Builds an exact typed predicate while retaining scalar values in the
+    /// existing schema dictionary vocabulary and structural values losslessly.
+    pub fn exact_native_value(
+        path: SchemaPath,
+        selector: OccurrenceSelector,
+        value: ValidatedAttributeValue,
+    ) -> Result<Self, SchemaFailure> {
+        match SchemaValue::try_from_validated(&value)? {
+            Some(value) => Ok(Self::value(path, selector, value)),
+            None => Ok(Self::native_value(path, selector, value)),
         }
     }
     #[must_use]

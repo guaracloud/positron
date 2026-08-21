@@ -137,6 +137,27 @@ fn immutable_inspection_and_replay_are_tenant_and_governor_bound() {
     );
 }
 
+#[test]
+fn immutable_catalog_guard_is_released_before_returned_delivery_is_consumed() {
+    let fixture = crate::tests::support::fixture().expect("fixture");
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let session = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("session");
+    let delivery_session = session.clone();
+    let mut delivery = session
+        .with_catalog_view(fixture.tenant, |_| {
+            std::iter::once_with(move || delivery_session.checkpoint())
+        })
+        .expect("catalog view");
+
+    let checkpoint = delivery
+        .next()
+        .expect("first delivery")
+        .expect("catalog guard remained held during delivery");
+    assert_eq!(checkpoint.entry_count(), 0);
+}
+
 fn catalog<'fixture>(
     fixture: &'fixture crate::tests::support::Fixture,
     marker: u8,

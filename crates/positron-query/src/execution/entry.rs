@@ -13,6 +13,24 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        self.execute_inner(query, None)
+    }
+
+    /// Executes against one immutable tenant schema view. The view is used
+    /// eagerly and is never retained by the returned materialized stream.
+    pub fn execute_with_schema(
+        &self,
+        query: PlannedQuery<'kernel>,
+        schema: &positron_signals::SchemaCatalog,
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        self.execute_inner(query, Some(schema))
+    }
+
+    fn execute_inner(
+        &self,
+        query: PlannedQuery<'kernel>,
+        schema: Option<&positron_signals::SchemaCatalog>,
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
@@ -34,7 +52,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
         let limit = query.plan.limit();
         let resources = ExecutionResources::new(query._reservation, lease.identity());
-        self.run_page(state, lease.snapshot(), limit, false, resources)
+        self.run_page(state, lease.snapshot(), limit, false, schema, resources)
     }
 
     pub fn execute_page(
@@ -62,7 +80,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let tenant = query_tenant(query.context)?;
         let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
         let resources = ExecutionResources::new(query._reservation, lease.identity());
-        self.run_page(state, lease.snapshot(), self.batch_limit, true, resources)
+        self.run_page(
+            state,
+            lease.snapshot(),
+            self.batch_limit,
+            true,
+            None,
+            resources,
+        )
     }
 
     pub fn resume(
@@ -108,7 +133,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let mut state = state;
         state.last_observed_at = now_seconds;
         state.elapsed_wall_seconds = now_seconds.saturating_sub(state.started_at);
-        self.run_page(state, lease.snapshot(), self.batch_limit, true, resources)
+        self.run_page(
+            state,
+            lease.snapshot(),
+            self.batch_limit,
+            true,
+            None,
+            resources,
+        )
     }
 
     fn observe_planned(&self, query: &PlannedQuery<'_>) -> Result<u64, QueryFailure> {

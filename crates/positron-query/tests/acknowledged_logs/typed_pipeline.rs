@@ -9,7 +9,7 @@ use positron_query::{
 
 use super::support::{
     BlockingOperatorWorkMeter, CancellingOperatorCallMeter, CancellingStageWorkMeter,
-    ConstantWorkMeter, SequenceClock, TestClock, TestWorkMeter,
+    ConstantWorkMeter, SequenceClock, StageCountingWorkMeter, TestClock, TestWorkMeter,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -2575,6 +2575,379 @@ fn cancellation_interrupts_deep_attribute_projection_before_allocation_delivery(
             .outstanding_for(WorkClass::InteractiveQueryTail),
         before
     );
+    Ok(())
+}
+
+#[test]
+fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_results()
+-> Result<(), Box<dyn Error>> {
+    use positron_domain::value::AttributeNamespace;
+    use positron_policy::NativeLogAttribute;
+    use positron_signals::{
+        LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaBudget, SchemaCatalog, SchemaPath,
+        SchemaQuery, SchemaValue,
+    };
+
+    let mut fixture = QueryFixture::new("schema-aware-query")?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?;
+    let schema = fixture.kernel.append_indexed_attribute_logs(
+        vec![(
+            Some(20),
+            vec![NativeLogAttribute::new(
+                AttributeNamespace::Record,
+                "indexed".to_owned(),
+                vec![positron_domain::value::CandidateAttributeValue::string(
+                    "one".to_owned(),
+                )],
+            )],
+        )],
+        1,
+        &path,
+    )?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let budget =
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?;
+    let snapshot = fixture.kernel.ledger()?.snapshot()?;
+    let stored_pruned = LogStore::new().scan_schema(
+        fixture.kernel.authority.governor(),
+        fixture
+            .context
+            .tenant_attribution()
+            .ok_or("tenant")?
+            .tenant_id(),
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        schema.catalog(),
+        &SchemaQuery::value(
+            path.clone(),
+            OccurrenceSelector::Any,
+            SchemaValue::string("absent"),
+        ),
+    )?;
+    assert_eq!(stored_pruned.scanned_bytes(), 0);
+    let absent = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("absent") | limit 1"#,
+        budget,
+    )?;
+    let pruned = service
+        .execute_with_schema(absent, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        !pruned
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    let Some(QueryEvent::Terminal(QueryTerminal::Complete(pruned_stats))) = pruned.last() else {
+        return Err("schema-pruned query did not complete".into());
+    };
+    assert_eq!(pruned_stats.scanned_bytes(), 0);
+    assert_eq!(pruned_stats.decoded_records(), 0);
+    assert!(!pruned_stats.reduced_pruning());
+
+    let present = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("one") | project record["indexed"] | limit 1"#,
+        budget,
+    )?;
+    let exact = service
+        .execute_with_schema(present, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        exact
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        exact.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.scanned_bytes() > 0
+                && stats.decoded_records() == 1
+                && !stats.reduced_pruning()
+    ));
+
+    let generic = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("absent") | limit 1"#,
+        budget,
+    )?;
+    let fallback = service.execute(generic)?.collect::<Vec<_>>();
+    assert!(matches!(
+        fallback.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.scanned_bytes() > 0
+                && stats.decoded_records() == 1
+                && stats.reduced_pruning()
+    ));
+
+    let tenant = fixture
+        .context
+        .tenant_attribution()
+        .ok_or("tenant")?
+        .tenant_id();
+    let missing_catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let missing_evidence = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("one") | limit 1"#,
+        budget,
+    )?;
+    let missing_events = service
+        .execute_with_schema(missing_evidence, &missing_catalog)?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        missing_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.scanned_bytes() > 0
+                && stats.decoded_records() == 1
+                && stats.reduced_pruning()
+    ));
+
+    let meter = StageCountingWorkMeter::shared();
+    let metered_service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let source = r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("absent") | limit 1"#;
+    let exhausted = metered_service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(7)?,
+    )?;
+    let exhausted_events = metered_service
+        .execute_with_schema(exhausted, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 8
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    let exact = metered_service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(8)?,
+    )?;
+    let exact_events = metered_service
+        .execute_with_schema(exact, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        exact_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.cpu_work_units() == 8
+                && stats.scanned_bytes() == 0
+                && stats.decoded_records() == 0
+    ));
+
+    let cancelling_meter = CancellingOperatorCallMeter::shared_for_stage(
+        positron_query::QueryWorkStage::ScanDecode,
+        1,
+    );
+    let cancelling_service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&cancelling_meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let cancelled = cancelling_service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?,
+    )?;
+    cancelling_meter.bind(cancelled.cancellation())?;
+    let cancelled_events = cancelling_service
+        .execute_with_schema(cancelled, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        cancelled_events.first(),
+        Some(QueryEvent::Header(_))
+    ));
+    assert!(matches!(
+        cancelled_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+    ));
+    assert_eq!(
+        cancelled_events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+
+    drop(stored_pruned);
+    drop(snapshot);
+    drop(service);
+    drop(metered_service);
+    drop(cancelling_service);
+    let reopened_schema = positron_signals::SchemaCatalog::decode_catalog_object(
+        &schema.catalog().encode_catalog_object()?,
+    )?;
+    fixture.kernel.seal_and_reopen()?;
+    let verified_service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    for (literal, expected_batch) in [("one", true), ("absent", false)] {
+        let verified = verified_service.plan_pipeline(
+            fixture.context,
+            &format!(
+                r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("{literal}") | limit 1"#
+            ),
+            budget,
+        )?;
+        let verified_events = verified_service
+            .execute_with_schema(verified, &reopened_schema)?
+            .collect::<Vec<_>>();
+        assert_eq!(
+            verified_events
+                .iter()
+                .any(|event| matches!(event, QueryEvent::Batch(_))),
+            expected_batch
+        );
+        assert!(matches!(
+            verified_events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if !stats.reduced_pruning()
+                    && stats.decoded_records() == u64::from(expected_batch)
+        ));
+    }
+    drop(verified_service);
+
+    fixture.kernel.append_attribute_logs(
+        vec![(
+            Some(21),
+            vec![NativeLogAttribute::new(
+                AttributeNamespace::Record,
+                "indexed".to_owned(),
+                vec![positron_domain::value::CandidateAttributeValue::string(
+                    "two".to_owned(),
+                )],
+            )],
+        )],
+        2,
+    )?;
+    fixture.kernel.append_attribute_logs(
+        vec![
+            (
+                Some(22),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Record,
+                    "indexed".to_owned(),
+                    vec![positron_domain::value::CandidateAttributeValue::array(
+                        vec![positron_domain::value::CandidateAttributeValue::null()],
+                    )],
+                )],
+            ),
+            (
+                Some(23),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Record,
+                    "indexed".to_owned(),
+                    vec![
+                        positron_domain::value::CandidateAttributeValue::key_value_list(vec![
+                            positron_domain::value::CandidateKeyValue::new(
+                                "k".to_owned(),
+                                positron_domain::value::CandidateAttributeValue::boolean(true),
+                            ),
+                        ]),
+                    ],
+                )],
+            ),
+        ],
+        3,
+    )?;
+    let active_service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let active_budget =
+        QueryBudget::new(1_048_576, 3, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?;
+    let active_fallback = active_service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("two") | limit 1"#,
+        active_budget,
+    )?;
+    let active_events = active_service
+        .execute_with_schema(active_fallback, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        active_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "active fallback events: {active_events:?}"
+    );
+    assert!(matches!(
+        active_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.scanned_bytes() > 0
+                && stats.decoded_records() == 3
+                && stats.reduced_pruning()
+    ));
+    let structural_budget =
+        QueryBudget::new(1_048_576, 4, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?;
+    for literal in ["array(null)", r#"kv("k"=bool(true))"#] {
+        let structural = active_service.plan_pipeline(
+            fixture.context,
+            &format!(
+                r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == {literal} | limit 1"#
+            ),
+            structural_budget,
+        )?;
+        let structural_events = active_service
+            .execute_with_schema(structural, schema.catalog())?
+            .collect::<Vec<_>>();
+        assert!(
+            structural_events
+                .iter()
+                .any(|event| matches!(event, QueryEvent::Batch(_))),
+            "structural {literal} events: {structural_events:?}"
+        );
+        assert!(matches!(
+            structural_events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if stats.decoded_records() == 4 && stats.reduced_pruning()
+        ));
+    }
+    drop(active_service);
+    fixture.kernel.seal_and_reopen()?;
+    let fallback_reopened_service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let reopened_fallback = fallback_reopened_service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("two") | limit 1"#,
+        active_budget,
+    )?;
+    let reopened_fallback_events = fallback_reopened_service
+        .execute_with_schema(reopened_fallback, &reopened_schema)?
+        .collect::<Vec<_>>();
+    assert!(
+        reopened_fallback_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        reopened_fallback_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.scanned_bytes() > 0
+                && stats.decoded_records() == 3
+                && stats.reduced_pruning()
+    ));
     Ok(())
 }
 

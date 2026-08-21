@@ -9,6 +9,7 @@ mod index;
 pub(crate) use index::{SchemaBlockIndex, SchemaIndexPath};
 mod model;
 mod observation;
+mod observed_coverage;
 mod promotion;
 mod query;
 mod representation;

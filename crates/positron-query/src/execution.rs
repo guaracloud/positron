@@ -27,6 +27,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         snapshot: &LedgerSnapshot<'kernel>,
         batch_limit: u16,
         pagination: bool,
+        schema: Option<&positron_signals::SchemaCatalog>,
         resources: ExecutionResources,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let delivered_before = stats_before_current(&state);
@@ -95,20 +96,34 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_limit = framed!(
             ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
         );
-        let observer = QueryScanObserver::new(
+        let mut observer = QueryScanObserver::new(
             self.work_meter.as_ref(),
             state.cancellation.clone(),
             state.cpu_work_units,
             state.budget.cpu_work_units(),
         );
-        let scan_result = LogStore::new().scan_observed(
-            self.governor,
-            state.tenant,
-            snapshot,
-            LogScan::through(scan_limit, frontier),
-            &state.cancellation,
-            &observer,
-        );
+        let schema_query = state.plan.schema_query();
+        let schema_filter_used = schema.zip(schema_query).is_some();
+        let scan_result = match schema.zip(schema_query) {
+            Some((schema, query)) => LogStore::new().scan_schema_observed(
+                self.governor,
+                state.tenant,
+                snapshot,
+                LogScan::through(scan_limit, frontier),
+                schema,
+                query,
+                &state.cancellation,
+                &mut observer,
+            ),
+            None => LogStore::new().scan_observed(
+                self.governor,
+                state.tenant,
+                snapshot,
+                LogScan::through(scan_limit, frontier),
+                &state.cancellation,
+                &observer,
+            ),
+        };
         state.cpu_work_units = observer.consumed();
         let result = framed!(scan_result.map_err(map_store_failure));
         state.reduced_pruning |= result.reduced_pruning();
@@ -138,11 +153,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
 
         let operator_count = state.plan.operator_count();
-        state.reduced_pruning |= state.plan.requires_post_decode_predicate_fallback();
+        state.reduced_pruning |=
+            state.plan.requires_post_decode_predicate_fallback() && !schema_filter_used;
         let records = framed!(crate::operators::execute(
             self,
             &mut state,
             result,
+            schema_filter_used,
             &mut memory,
         ));
         let operator_wall_exhausted = if operator_count > 0 {

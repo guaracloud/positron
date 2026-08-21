@@ -30,16 +30,18 @@ impl<'a> QueryScanObserver<'a> {
     pub(crate) const fn consumed(&self) -> u64 {
         self.consumed.get()
     }
-}
 
-impl ScanObserver for QueryScanObserver<'_> {
-    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+    fn observe_stage(
+        &self,
+        stage: QueryWorkStage,
+        units: u64,
+    ) -> Result<(), ScanObservationFailureCode> {
         if self.cancellation.is_cancelled() {
             return Err(ScanObservationFailureCode::Cancelled);
         }
         let unit_cost = self
             .work_meter
-            .units(QueryWorkStage::ScanDecode)
+            .units(stage)
             .map_err(|_| ScanObservationFailureCode::Internal)?;
         let work = units
             .checked_mul(unit_cost)
@@ -54,5 +56,30 @@ impl ScanObserver for QueryScanObserver<'_> {
             return Err(ScanObservationFailureCode::BudgetExhausted);
         }
         Ok(())
+    }
+}
+
+impl ScanObserver for QueryScanObserver<'_> {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.observe_stage(QueryWorkStage::ScanDecode, units)
+    }
+}
+
+impl positron_domain::value::NativeValueObserver for QueryScanObserver<'_> {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        self.observe_stage(QueryWorkStage::Operators, 1)
+    }
+
+    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        if payload.len() > positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES {
+            return Err(ScanObservationFailureCode::Internal);
+        }
+        if self.cancellation.is_cancelled() {
+            Err(ScanObservationFailureCode::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }

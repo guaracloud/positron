@@ -5,12 +5,13 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind,
-    CandidateAttributeValue, CandidateKeyValue,
+    CandidateAttributeValue, CandidateKeyValue, NativeValueObserver,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
+    LedgerSnapshot, LifecycleClock, MountQualification, PrimaryDataVolume, ResourceAmounts,
+    ResourceDimension, ResourceGovernor, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    WorkClaim, WorkKind,
 };
 
 use super::{LogRecord, LogScan, LogStore, PolicyProvenance, ScanLimit};
@@ -18,7 +19,8 @@ use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
 use crate::{
-    LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaDiscoveryRequest,
+    LogScanResult, LogStoreFailure, LogStoreFailureCode, OccurrenceSelector, ScanCancellation,
+    ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaCatalog, SchemaDiscoveryRequest,
     SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue,
 };
 
@@ -1035,11 +1037,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     );
     let mut stale_digest = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     stale_digest.block_indexes[0].digest[0] ^= 1;
-    let stale = store.scan_schema(
+    let stale = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &stale_digest,
         &query("indexed", "one")?,
     )?;
@@ -1048,11 +1051,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
 
     let mut replacement_identity = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     replacement_identity.block_indexes[0].identity = StoreBlockIdentity::new([0x7a; 16])?;
-    let replacement = store.scan_schema(
+    let replacement = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &replacement_identity,
         &query("indexed", "one")?,
     )?;
@@ -1061,11 +1065,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
 
     let mut forged_kinds = SchemaCatalog::decode_catalog_object(&checkpoint)?;
     forged_kinds.block_indexes[0].paths[0].kind_mask = 1 << 1;
-    let forged = store.scan_schema(
+    let forged = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &forged_kinds,
         &query("indexed", "one")?,
     )?;
@@ -1073,11 +1078,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
     assert!(forged.reduced_pruning());
 
     let generic = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
-    let demoted = store.scan_schema(
+    let demoted = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &generic,
         &query("indexed", "one")?,
     )?;
@@ -1125,11 +1131,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         SchemaValue::kind(AttributeValueKind::Array),
         SchemaValue::kind(AttributeValueKind::KeyValueList),
     ] {
-        let composite = store.scan_schema(
+        let composite = observed_schema_scan(
+            &store,
             authority.governor(),
             tenant,
             &snapshot,
-            LogScan::all(ScanLimit::new(2)?),
+            LogScan::all(ScanLimit::new(3)?),
             &schema,
             &SchemaQuery::value(
                 SchemaPath::new(AttributeNamespace::Record, "indexed".to_owned())?,
@@ -1165,21 +1172,23 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         assert_eq!(typed.scanned_bytes() > 0, expected_scanned == 1);
     }
 
-    let overflow = store.scan_schema(
+    let overflow = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &schema,
         &query("overflow", "two")?,
     )?;
     assert_eq!(overflow.records().len(), 1);
     assert!(overflow.reduced_pruning());
-    let overflow_reopened = store.scan_schema(
+    let overflow_reopened = observed_schema_scan(
+        &store,
         authority.governor(),
         tenant,
         &snapshot,
-        LogScan::all(ScanLimit::new(2)?),
+        LogScan::all(ScanLimit::new(3)?),
         &reopened,
         &query("overflow", "two")?,
     )?;
@@ -1570,4 +1579,54 @@ fn query(key: &str, value: &str) -> Result<SchemaQuery, Box<dyn Error>> {
         OccurrenceSelector::Any,
         SchemaValue::string(value),
     ))
+}
+
+fn observed_schema_scan<'kernel>(
+    store: &LogStore,
+    governor: ResourceGovernor<'kernel>,
+    tenant: TenantId,
+    snapshot: &LedgerSnapshot<'_>,
+    scan: LogScan,
+    schema: &SchemaCatalog,
+    query: &SchemaQuery,
+) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+    let mut observer = NoopSchemaScanObserver;
+    store.scan_schema_observed(
+        governor,
+        tenant,
+        snapshot,
+        scan,
+        schema,
+        query,
+        &NeverCancelledSchemaScan,
+        &mut observer,
+    )
+}
+
+struct NeverCancelledSchemaScan;
+
+impl ScanCancellation for NeverCancelledSchemaScan {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct NoopSchemaScanObserver;
+
+impl ScanObserver for NoopSchemaScanObserver {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+}
+
+impl NativeValueObserver for NoopSchemaScanObserver {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }

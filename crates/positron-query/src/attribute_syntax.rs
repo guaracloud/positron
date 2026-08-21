@@ -21,7 +21,7 @@ pub(crate) fn parse_predicate(source: &str) -> Result<SchemaQuery, QueryFailure>
         return Err(unsupported());
     };
     let value = crate::native_literal::parse_attribute(literal)?;
-    Ok(SchemaQuery::native_value(path, selector, value))
+    SchemaQuery::exact_native_value(path, selector, value).map_err(map_schema_failure)
 }
 
 pub(crate) fn parse_path(source: &str) -> Result<SchemaPath, QueryFailure> {

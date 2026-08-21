@@ -327,9 +327,12 @@ impl LogStore {
             }
         }
         check_scan_cancellation(cancellation)?;
+        let decoded_records =
+            u64::try_from(records.len()).map_err(|_| LogStoreFailure::limit_exceeded())?;
         let retained_size_bytes = retained_scan_bytes(scan.limit(), &mut records)?;
         Ok(LogScanResult::new(
             records,
+            decoded_records,
             complete,
             scanned_bytes,
             retained_size_bytes,

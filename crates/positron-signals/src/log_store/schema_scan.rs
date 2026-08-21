@@ -1,12 +1,13 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::SignalKind;
+use positron_domain::value::{NativeValueObserver, ObservedValueFailure};
 use positron_kernel::{
     LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, WorkClaim, WorkKind,
 };
 
 use super::{
-    LogScan, LogScanResult, LogStore, LogStoreFailure, ScannedLogRecord, SchemaCatalog,
-    SchemaQuery, codec,
+    LogScan, LogScanResult, LogStore, LogStoreFailure, ScanCancellation,
+    ScanObservationFailureCode, ScanObserver, ScannedLogRecord, SchemaCatalog, SchemaQuery, codec,
 };
 
 impl LogStore {
@@ -24,6 +25,66 @@ impl LogStore {
         schema: &SchemaCatalog,
         query: &SchemaQuery,
     ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        let mut observer = super::scan::Unobserved;
+        self.scan_schema_inner(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            schema,
+            query,
+            &super::scan::NeverCancelled,
+            &mut observer,
+            SchemaScanLimit::Results,
+        )
+    }
+
+    /// Runs the schema-aware scan with the same cooperative cancellation and
+    /// cumulative work authority used by ordinary authenticated decoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_schema_observed<'kernel, O>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        schema: &SchemaCatalog,
+        query: &SchemaQuery,
+        cancellation: &dyn ScanCancellation,
+        observer: &mut O,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure>
+    where
+        O: ScanObserver + NativeValueObserver<Error = ScanObservationFailureCode>,
+    {
+        self.scan_schema_inner(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            schema,
+            query,
+            cancellation,
+            observer,
+            SchemaScanLimit::DecodedRecords,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_schema_inner<'kernel, O>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        schema: &SchemaCatalog,
+        query: &SchemaQuery,
+        cancellation: &dyn ScanCancellation,
+        observer: &mut O,
+        limit_kind: SchemaScanLimit,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure>
+    where
+        O: ScanObserver + NativeValueObserver<Error = ScanObservationFailureCode>,
+    {
         let scope = snapshot.scope();
         if scope.tenant_id() != tenant
             || scope.signal_kind() != SignalKind::Logs
@@ -31,17 +92,23 @@ impl LogStore {
         {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
-        let encoded_bytes = snapshot
-            .blocks()
-            .iter()
-            .filter(|block| {
-                scan.frontier()
-                    .is_none_or(|frontier| block.position() <= frontier)
-            })
-            .try_fold(0_u64, |total, block| {
-                total.checked_add(u64::try_from(block.payload().len()).ok()?)
-            })
-            .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        check_cancellation(cancellation)?;
+        let mut encoded_bytes = 0_u64;
+        for block in snapshot.blocks() {
+            check_cancellation(cancellation)?;
+            if scan
+                .frontier()
+                .is_some_and(|frontier| block.position() > frontier)
+            {
+                continue;
+            }
+            encoded_bytes = encoded_bytes
+                .checked_add(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        }
         let output_memory = u64::try_from(scan.limit().value())
             .map_err(|_| LogStoreFailure::limit_exceeded())?
             .checked_mul(512)
@@ -57,15 +124,17 @@ impl LogStore {
         let capacity = governor
             .reserve(claim)
             .map_err(|_| LogStoreFailure::resource_admission_refused())?;
-
+        check_cancellation(cancellation)?;
         let mut records = Vec::new();
         records
             .try_reserve_exact(scan.limit().value())
             .map_err(|_| LogStoreFailure::resource_exhausted())?;
         let mut scanned_bytes = 0_u64;
+        let mut decoded_records = 0_usize;
         let mut complete = true;
         let mut reduced_pruning = false;
         'blocks: for block in snapshot.blocks() {
+            check_cancellation(cancellation)?;
             if scan
                 .frontier()
                 .is_some_and(|frontier| block.position() > frontier)
@@ -73,23 +142,23 @@ impl LogStore {
                 continue;
             }
             let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
-            let coverage = query.expected_scalar().map_or_else(
-                || {
-                    schema.verified_block_kind(
-                        block.identity(),
-                        digest,
-                        query.path(),
-                        query.expected_kind(),
-                    )
-                },
-                |expected| {
-                    schema.verified_block_value(block.identity(), digest, query.path(), expected)
-                },
-            );
+            let coverage = schema
+                .verified_query_coverage_observed(block.identity(), digest, query, observer)
+                .map_err(LogStoreFailure::observation)?;
             match coverage {
                 Some(false) => continue,
                 Some(true) => {},
                 None => reduced_pruning = true,
+            }
+            let remaining = match limit_kind {
+                SchemaScanLimit::DecodedRecords => {
+                    scan.limit().value().saturating_sub(decoded_records)
+                },
+                SchemaScanLimit::Results => usize::MAX,
+            };
+            if remaining == 0 {
+                complete = false;
+                break;
             }
             scanned_bytes = scanned_bytes
                 .checked_add(
@@ -97,16 +166,26 @@ impl LogStore {
                         .map_err(|_| LogStoreFailure::limit_exceeded())?,
                 )
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;
-            // The v2 decoder enforces the canonical per-block record ceiling.
-            // A schema scan must inspect every valid record before applying its
-            // predicate, so an additional result-sized decode limit would be
-            // both redundant and incorrect.
-            let decoded = codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?;
+            let decode =
+                codec::BlockDecode::observed(tenant, block.payload(), cancellation, &*observer)?;
+            if decode.record_count() > remaining {
+                decode.validate(cancellation)?;
+                complete = false;
+                break;
+            }
+            let decoded = decode.decode(snapshot, remaining, cancellation)?;
+            decoded_records = decoded_records
+                .checked_add(decoded.records.len())
+                .ok_or_else(LogStoreFailure::limit_exceeded)?;
             for (ordinal, record) in decoded.records.into_iter().enumerate() {
-                let result = schema.query_stored_record(&record, query);
+                let result = schema
+                    .query_stored_record_observed(&record, query, observer)
+                    .map_err(map_traversal_failure)?;
                 reduced_pruning |= result.reduced_pruning();
                 if result.is_match() {
-                    if records.len() == scan.limit().value() {
+                    if matches!(limit_kind, SchemaScanLimit::Results)
+                        && records.len() == scan.limit().value()
+                    {
                         complete = false;
                         break 'blocks;
                     }
@@ -120,14 +199,39 @@ impl LogStore {
                 }
             }
         }
+        check_cancellation(cancellation)?;
         let retained_size_bytes = super::retained_scan_bytes(scan.limit(), &mut records)?;
         Ok(LogScanResult::new(
             records,
+            u64::try_from(decoded_records).map_err(|_| LogStoreFailure::limit_exceeded())?,
             complete,
             scanned_bytes,
             retained_size_bytes,
             reduced_pruning,
             capacity,
         ))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SchemaScanLimit {
+    DecodedRecords,
+    Results,
+}
+
+fn check_cancellation(cancellation: &dyn ScanCancellation) -> Result<(), LogStoreFailure> {
+    if cancellation.is_cancelled() {
+        Err(LogStoreFailure::cancelled())
+    } else {
+        Ok(())
+    }
+}
+
+fn map_traversal_failure(
+    failure: ObservedValueFailure<ScanObservationFailureCode>,
+) -> LogStoreFailure {
+    match failure {
+        ObservedValueFailure::Domain(failure) => LogStoreFailure::domain(failure),
+        ObservedValueFailure::Observer(failure) => LogStoreFailure::observation(failure),
     }
 }

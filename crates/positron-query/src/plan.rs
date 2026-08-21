@@ -166,6 +166,13 @@ impl LogicalPlan {
         self.filter.as_ref()
     }
 
+    pub(crate) fn schema_query(&self) -> Option<&positron_signals::SchemaQuery> {
+        match self.filter.as_ref() {
+            Some(FilterPredicate::AttributeEquals(query)) => Some(query),
+            Some(FilterPredicate::BodyEquals(_)) | None => None,
+        }
+    }
+
     pub(crate) const fn requires_post_decode_predicate_fallback(&self) -> bool {
         self.filter.is_some()
     }

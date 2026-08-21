@@ -9,13 +9,10 @@ pub(crate) fn charge_scan(
         .scanned_bytes
         .checked_add(result.scanned_bytes())
         .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::ScannedBytes))?;
-    state.decoded_records =
-        state
-            .decoded_records
-            .checked_add(u64::try_from(result.records().len()).map_err(|_| {
-                QueryFailure::budget_exhausted(QueryBudgetDimension::DecodedRecords)
-            })?)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::DecodedRecords))?;
+    state.decoded_records = state
+        .decoded_records
+        .checked_add(result.decoded_records())
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::DecodedRecords))?;
     Ok(())
 }
 

@@ -46,15 +46,17 @@ impl SchemaQuery {
 }
 
 impl SchemaCatalog {
-    pub(crate) fn query_stored_record(
+    pub(crate) fn query_stored_record_observed<O: NativeValueObserver>(
         &self,
         record: &StoredLogRecord,
         query: &SchemaQuery,
-    ) -> SchemaQueryResult {
-        super::query::evaluate(
+        observer: &mut O,
+    ) -> Result<SchemaQueryResult, ObservedValueFailure<O::Error>> {
+        super::query::evaluate_observed(
             self.entry(query.path()),
             matching_attributes(record, query.path()),
             query,
+            observer,
         )
     }
 }

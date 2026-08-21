@@ -2,7 +2,11 @@ use positron_domain::value::{
     AttributeOccurrenceSet, NativeValueObserver, ObservedValueFailure, ValidatedAttributeValue,
 };
 
-use super::{OccurrenceSelector, QueryValue, SchemaQuery, SchemaRepresentation, SchemaValue};
+use super::super::SchemaEntry;
+use super::{
+    OccurrenceSelector, QueryValue, SchemaQuery, SchemaQueryResult, SchemaRepresentation,
+    SchemaValue,
+};
 pub(crate) fn visit_terminals(
     value: &ValidatedAttributeValue,
     segments: &[String],
@@ -51,17 +55,34 @@ pub(crate) fn matches_observed<'a, O: NativeValueObserver>(
     query: &SchemaQuery,
     observer: &mut O,
 ) -> Result<bool, ObservedValueFailure<O::Error>> {
+    evaluate_observed(None, attributes, query, observer).map(SchemaQueryResult::is_match)
+}
+
+pub(crate) fn evaluate_observed<'a, O: NativeValueObserver>(
+    entry: Option<&SchemaEntry>,
+    attributes: impl Iterator<Item = (&'a AttributeOccurrenceSet, SchemaRepresentation)>,
+    query: &SchemaQuery,
+    observer: &mut O,
+) -> Result<SchemaQueryResult, ObservedValueFailure<O::Error>> {
     let Some(remaining) = query.path.segments().get(1..) else {
-        return Ok(false);
+        return Ok(SchemaQueryResult {
+            matched: false,
+            reduced_pruning: true,
+        });
     };
     let mut selection = ObservedSelection::new(query.selector, &query.value);
-    for (attribute, _) in attributes {
+    let mut reduced_pruning = entry.is_none_or(|entry| !entry.promoted());
+    for (attribute, representation) in attributes {
+        reduced_pruning |= representation.is_overflow();
         observe_structure(observer)?;
         observe_payload(attribute.key().as_bytes(), observer)?;
         for index in 0..attribute.len() {
             observe_structure(observer)?;
             let Some(value) = attribute.occurrence(index) else {
-                return Ok(false);
+                return Ok(SchemaQueryResult {
+                    matched: false,
+                    reduced_pruning: true,
+                });
             };
             if !visit_terminals_observed(value, remaining, observer, &mut |terminal, observer| {
                 selection.visit(terminal, observer)
@@ -74,7 +95,10 @@ pub(crate) fn matches_observed<'a, O: NativeValueObserver>(
             break;
         }
     }
-    Ok(selection.selected > 0 && selection.matched)
+    Ok(SchemaQueryResult {
+        matched: selection.selected > 0 && selection.matched,
+        reduced_pruning,
+    })
 }
 
 pub(crate) fn visit_terminals_observed<O: NativeValueObserver>(

@@ -43,6 +43,18 @@ impl ScanObserver for Unobserved {
     }
 }
 
+impl positron_domain::value::NativeValueObserver for Unobserved {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 /// Explicit finite record bound for one logical scan result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScanLimit(usize);
@@ -100,6 +112,7 @@ impl LogScan {
 #[derive(Debug)]
 pub struct LogScanResult<'kernel> {
     records: Vec<ScannedLogRecord>,
+    decoded_records: u64,
     complete: bool,
     scanned_bytes: u64,
     retained_size_bytes: u64,
@@ -110,6 +123,7 @@ pub struct LogScanResult<'kernel> {
 impl<'kernel> LogScanResult<'kernel> {
     pub(super) const fn new(
         records: Vec<ScannedLogRecord>,
+        decoded_records: u64,
         complete: bool,
         scanned_bytes: u64,
         retained_size_bytes: u64,
@@ -118,6 +132,7 @@ impl<'kernel> LogScanResult<'kernel> {
     ) -> Self {
         Self {
             records,
+            decoded_records,
             complete,
             scanned_bytes,
             retained_size_bytes,
@@ -135,6 +150,13 @@ impl<'kernel> LogScanResult<'kernel> {
     #[must_use]
     pub fn into_records(self) -> Vec<ScannedLogRecord> {
         self.records
+    }
+
+    /// Returns every authenticated record decoded during this scan, including
+    /// records rejected by a schema predicate.
+    #[must_use]
+    pub const fn decoded_records(&self) -> u64 {
+        self.decoded_records
     }
 
     #[must_use]

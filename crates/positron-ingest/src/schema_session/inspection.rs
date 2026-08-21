@@ -4,6 +4,23 @@ use positron_kernel::{LedgerSnapshot, ResourceGovernor, ResourceReservation, Sto
 use super::{SchemaSessionFailure, TenantSchemaSession, recovery};
 
 impl TenantSchemaSession {
+    /// Runs one eager read against the immutable tenant schema while retaining
+    /// the session lock only for the duration of the supplied operation.
+    pub fn with_catalog_view<T>(
+        &self,
+        tenant: TenantId,
+        operation: impl FnOnce(&positron_signals::SchemaCatalog) -> T,
+    ) -> Result<T, SchemaSessionFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        if state.tenant != tenant {
+            return Err(SchemaSessionFailure::TenantConflict);
+        }
+        Ok(operation(state.catalog.catalog()))
+    }
+
     pub(crate) fn append_reachable_indexes(
         &self,
         snapshot: &LedgerSnapshot<'_>,

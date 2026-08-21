@@ -8,9 +8,10 @@ pub(crate) fn query_record(
     service: &crate::QueryService<'_, '_, '_>,
     state: &mut crate::cursor::CursorState,
     record: &mut positron_signals::ScannedLogRecord,
+    predicate_applied: bool,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<Option<QueryRecord>, QueryFailure> {
-    if let Some(filter) = state.plan.filter() {
+    if !predicate_applied && let Some(filter) = state.plan.filter() {
         let matched = match filter {
             crate::plan::FilterPredicate::BodyEquals(expected) => match record.body() {
                 Some(value) => {

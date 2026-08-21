@@ -638,6 +638,73 @@ impl KernelFixture {
         Ok(())
     }
 
+    pub fn append_indexed_attribute_logs(
+        &self,
+        candidates: Vec<(Option<i64>, Vec<NativeLogAttribute>)>,
+        identity: u8,
+        indexed_path: &positron_signals::SchemaPath,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let schema_budget = positron_signals::SchemaBudget::new(8, 200_000, 8_000, 8_000)?;
+        let schema_capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 200_000)?,
+        )?)?;
+        let mut schema =
+            positron_signals::SchemaSessionStore::new(schema_capacity, self.tenant, schema_budget)?;
+        let mut records = Vec::new();
+        records.try_reserve_exact(candidates.len())?;
+        for (event_time, attributes) in candidates {
+            let candidate =
+                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty());
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the indexed query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
+        let delta = schema.stage_group(&mut records)?;
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let block = LogStore::new()
+            .prepare(
+                capacity,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
+                self.tenant,
+                self.shard,
+                StoreBlockIdentity::new([identity; 16])?,
+                records,
+            )?
+            .into_store_block();
+        let digest = block.content_digest()?;
+        self.ledger()?.append(block)?;
+        let block_identity = StoreBlockIdentity::new([identity; 16])?;
+        schema.commit(delta, block_identity, digest)?;
+        let snapshot = self.ledger()?.snapshot()?;
+        let indexed_block = snapshot
+            .blocks()
+            .iter()
+            .find(|block| block.identity() == block_identity)
+            .ok_or("indexed block missing from fixture snapshot")?;
+        let mut query_update = schema.stage_query_update()?;
+        query_update.record_query_use(indexed_path)?;
+        query_update.index_replayed_query_path(
+            self.tenant,
+            &snapshot,
+            indexed_block,
+            indexed_path,
+        )?;
+        schema.commit_query_update(query_update)?;
+        Ok(schema)
+    }
+
     pub fn append_malformed_log_block(&self, identity: u8) -> Result<(), Box<dyn Error>> {
         let block = PreparedStoreBlock::new(
             SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),

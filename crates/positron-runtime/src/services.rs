@@ -287,8 +287,15 @@ impl ServiceHandle {
         let query = service
             .plan_pipeline(context, source, budget)
             .map_err(|_| ServiceFailure::InvalidRequest)?;
-        let events = service
-            .execute(query)
+        let schema = self
+            .schema_sessions
+            .session(instance.tenant, instance.resource_governor())
+            .map_err(|_| ServiceFailure::CapacityUnavailable)?;
+        let events = schema
+            .with_catalog_view(instance.tenant, |catalog| {
+                service.execute_with_schema(query, catalog)
+            })
+            .map_err(|_| ServiceFailure::StorageUnavailable)?
             .map_err(|_| ServiceFailure::StorageUnavailable)?;
         Ok(events
             .filter_map(|event| match event {
