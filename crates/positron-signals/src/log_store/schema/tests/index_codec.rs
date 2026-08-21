@@ -324,6 +324,37 @@ fn legacy_mutation_upgrades_to_v2_framing_before_accounting_publication()
 }
 
 #[test]
+fn legacy_survivor_upgrade_and_new_index_budget_refusal_are_atomic() -> Result<(), Box<dyn Error>> {
+    let (legacy, index_bytes) = exact_legacy_budget_checkpoint(2)?;
+    let legacy_len = legacy.len();
+    let mut bounded = legacy.clone();
+    bounded[42..50].copy_from_slice(&u64::try_from(legacy_len + 1)?.to_be_bytes());
+    bounded[50..58].copy_from_slice(&u64::try_from(index_bytes + 1)?.to_be_bytes());
+    let (mut decoded, _) = SchemaCatalog::decode_checkpoint_object(&bounded)?;
+    let path = path(AttributeNamespace::Record, "indexed");
+    let incoming = super::super::index::SchemaIndexPath::from_variants_and_values(
+        &path,
+        &[positron_domain::value::AttributeValueKind::String],
+        &[SchemaValue::string("new")],
+    )?;
+    assert_eq!(
+        decoded.install_query_index(super::super::index::SchemaBlockIndex::one(
+            StoreBlockIdentity::new([0x11; 16])?,
+            [0x51; 32],
+            incoming,
+        )?),
+        Err(SchemaFailure::LimitExceeded)
+    );
+    assert_eq!(decoded.persistent_bytes(), legacy_len);
+    assert_eq!(decoded.index_bytes(), index_bytes);
+    assert_eq!(
+        decoded.encode_catalog_object(),
+        Err(SchemaFailure::LimitExceeded)
+    );
+    Ok(())
+}
+
+#[test]
 fn governed_v1_exact_budget_demotion_releases_legacy_block_bytes() -> Result<(), Box<dyn Error>> {
     let (legacy, _) = exact_legacy_budget_checkpoint(1)?;
     with_governed_legacy_session(&legacy, |session| {

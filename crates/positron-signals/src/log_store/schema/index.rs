@@ -325,13 +325,6 @@ impl SchemaBlockIndex {
         Self::paths_encoded_bytes_with_framing(paths, self.scalar_framing)
     }
 
-    pub(crate) fn paths_encoded_bytes_after_mutation(
-        &self,
-        paths: &[SchemaIndexPath],
-    ) -> Result<usize, SchemaFailure> {
-        Self::paths_encoded_bytes_with_framing(paths, self.scalar_framing.for_mutation())
-    }
-
     pub(crate) fn covers_kind(&self, path: &SchemaPath, kind: AttributeValueKind) -> Option<bool> {
         if matches!(
             kind,
