@@ -179,6 +179,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .filter_map(|record| query_record(record, &state.plan))
             .collect::<Vec<_>>();
         records.sort_by_key(QueryRecord::order_key);
+        if state.plan.aggregate().is_some() {
+            records = vec![QueryRecord::count_record(
+                u64::try_from(records.len())
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
+            )];
+        }
         let wanted = usize::from(state.plan.limit()).min(records.len());
         let start = usize::from(state.offset);
         let end = start

@@ -311,3 +311,46 @@ fn versioned_pipeline_supports_bounded_exact_body_search() -> Result<(), Box<dyn
     ));
     Ok(())
 }
+
+#[test]
+fn versioned_pipeline_counts_filtered_records_with_a_typed_aggregate() -> Result<(), Box<dyn Error>> {
+    let roots = TemporaryRoots::new("pipeline-count")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-count-kernel")?;
+    fixture.append_log("keep", 20, 1)?;
+    fixture.append_log("keep", 21, 2)?;
+    fixture.append_log("discard", 22, 3)?;
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
+    let query = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | aggregate count | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let header = match events.first() {
+        Some(QueryEvent::Header(header)) => header,
+        _ => return Err("query header missing".into()),
+    };
+    assert_eq!(header.schema().columns(), ["count"]);
+    let record = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch.records().first(),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("aggregate record missing")?;
+    assert_eq!(record.count(), Some(2));
+    Ok(())
+}

@@ -54,6 +54,11 @@ pub(crate) enum ProjectionColumn {
     CommitPosition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AggregateSpec {
+    Count,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalPlan {
     version: u8,
@@ -62,6 +67,7 @@ pub struct LogicalPlan {
     limit: u16,
     filter: Option<FilterPredicate>,
     projection: Vec<ProjectionColumn>,
+    aggregate: Option<AggregateSpec>,
 }
 
 impl LogicalPlan {
@@ -73,6 +79,7 @@ impl LogicalPlan {
             limit,
             filter: None,
             projection: vec![ProjectionColumn::Body],
+            aggregate: None,
         }
     }
 
@@ -82,7 +89,9 @@ impl LogicalPlan {
     }
 
     pub(crate) fn has_advanced_operators(&self) -> bool {
-        self.filter.is_some() || self.projection != [ProjectionColumn::Body]
+        self.filter.is_some()
+            || self.projection != [ProjectionColumn::Body]
+            || self.aggregate.is_some()
     }
 
     pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
@@ -96,6 +105,15 @@ impl LogicalPlan {
 
     pub(crate) fn projection(&self) -> &[ProjectionColumn] {
         &self.projection
+    }
+
+    pub(crate) fn with_aggregate(mut self, aggregate: AggregateSpec) -> Self {
+        self.aggregate = Some(aggregate);
+        self
+    }
+
+    pub(crate) const fn aggregate(&self) -> Option<AggregateSpec> {
+        self.aggregate
     }
 
     pub(crate) const fn limit(&self) -> u16 {

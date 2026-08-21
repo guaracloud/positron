@@ -10,6 +10,11 @@ pub struct ResultSchema {
 
 impl ResultSchema {
     pub(crate) fn for_plan(plan: &LogicalPlan) -> Self {
+        if plan.aggregate().is_some() {
+            return Self {
+                columns: vec!["count"],
+            };
+        }
         let columns = plan
             .projection()
             .iter()
@@ -151,6 +156,7 @@ pub struct QueryRecord {
     body: Option<String>,
     query_time: UnixNanoseconds,
     commit_position: CommitPosition,
+    count: Option<u64>,
 }
 
 impl QueryRecord {
@@ -163,6 +169,16 @@ impl QueryRecord {
             body,
             query_time,
             commit_position,
+            count: None,
+        }
+    }
+
+    pub(crate) const fn count_record(count: u64) -> Self {
+        Self {
+            body: None,
+            query_time: UnixNanoseconds::new(0),
+            commit_position: CommitPosition::origin(),
+            count: Some(count),
         }
     }
     #[must_use]
@@ -176,6 +192,10 @@ impl QueryRecord {
     #[must_use]
     pub const fn commit_position(&self) -> CommitPosition {
         self.commit_position
+    }
+    #[must_use]
+    pub const fn count(&self) -> Option<u64> {
+        self.count
     }
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition) {
         (self.query_time, self.commit_position)

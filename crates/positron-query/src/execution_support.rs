@@ -127,12 +127,17 @@ pub(crate) fn batch_digest(
         encoding.extend_from_slice(&query_time.value().to_be_bytes());
         encoding.extend_from_slice(&position.value().to_be_bytes());
         let body = record.body_text().unwrap_or_default().as_bytes();
+        encoding.push(u8::from(record.body_text().is_some()));
         encoding.extend_from_slice(
             &u64::try_from(body.len())
                 .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
                 .to_be_bytes(),
         );
         encoding.extend_from_slice(body);
+        encoding.push(u8::from(record.count().is_some()));
+        if let Some(count) = record.count() {
+            encoding.extend_from_slice(&count.to_be_bytes());
+        }
     }
     protector
         .digest(b"query-result-batch-v1", &encoding)

@@ -9,7 +9,7 @@ use crate::{
     LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis,
     TemporalRange,
 };
-use crate::plan::{FilterPredicate, ProjectionColumn};
+use crate::plan::{AggregateSpec, FilterPredicate, ProjectionColumn};
 
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
@@ -268,6 +268,7 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let mut range = None;
     let mut filter = None;
     let mut projection = None;
+    let mut aggregate = None;
     let mut limit = None;
     for stage in stages {
         if let Some(arguments) = stage.strip_prefix("range ") {
@@ -293,6 +294,10 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
             projection = Some(parse_projection(
                 &columns.split_ascii_whitespace().collect::<Vec<_>>(),
             )?);
+        } else if stage == "aggregate count" {
+            if aggregate.replace(AggregateSpec::Count).is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
         } else if let Some(value) = stage.strip_prefix("limit ") {
             if limit.is_some() {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
@@ -314,6 +319,9 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     }
     if let Some(projection) = projection {
         plan = plan.with_projection(projection);
+    }
+    if let Some(aggregate) = aggregate {
+        plan = plan.with_aggregate(aggregate);
     }
     Ok(plan)
 }
