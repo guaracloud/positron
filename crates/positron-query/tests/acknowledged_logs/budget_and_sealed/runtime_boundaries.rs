@@ -169,6 +169,28 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
         );
     }
 
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        std::sync::Arc::new(FailingStageWorkMeter(
+            positron_query::QueryWorkStage::Operators,
+        )),
+    );
+    let planned = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project query_time | limit 1",
+        budget()?,
+    )?;
+    assert_eq!(
+        service
+            .execute(planned)
+            .expect_err("operator work meter failure")
+            .code(),
+        QueryFailureCode::Internal
+    );
+
     let service = QueryService::with_clock(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,

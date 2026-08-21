@@ -24,6 +24,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        if query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
         let now = self.observe_planned(&query)?;
         let expiry = query
             .started_at
@@ -45,6 +48,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        if query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
         if self.batch_limit == 0 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
@@ -115,24 +121,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         pagination: bool,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let delivered_before = stats_before_current(&state);
-        if state.cancellation.is_cancelled() {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
-                None,
-                QueryFailure::new(QueryFailureCode::Cancelled),
-                &state,
-                delivered_before,
-                stats,
-            );
-        }
         if self.observe_state(&mut state)? {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
+            return self.stopped_page(
                 None,
-                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
-                stats,
             );
         }
         let frontier = commit_position(state.frontier)?;
@@ -150,16 +144,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ResultLease::new(state.lease_identity, state.expiry),
             initial_cursor,
         ));
-        if state.cancellation.is_cancelled() {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
-                Some(header),
-                QueryFailure::new(QueryFailureCode::Cancelled),
-                &state,
-                delivered_before,
-                stats,
-            );
-        }
         let result = match LogStore::new().scan(
             self.governor,
             state.tenant,
@@ -172,13 +156,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         ) {
             Ok(result) => result,
             Err(failure) => {
-                let stats = stats_before_current(&state);
-                return self.incomplete_page(
+                return self.failed_page(
                     Some(header),
                     map_store_failure(failure),
                     &state,
                     delivered_before,
-                    stats,
                 );
             },
         };
@@ -188,23 +170,19 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             self.work_units(crate::QueryWorkStage::ScanDecode)?,
         )?;
         if state.cancellation.is_cancelled() {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
+            return self.stopped_page(
                 Some(header),
-                QueryFailure::new(QueryFailureCode::Cancelled),
+                QueryFailureCode::Cancelled,
                 &state,
                 delivered_before,
-                stats,
             );
         }
         if self.observe_state(&mut state)? || exhausted(&state) || !result.complete() {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
+            return self.stopped_page(
                 Some(header),
-                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
-                stats,
             );
         }
 
@@ -217,25 +195,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     QueryFailureCode::BudgetExhausted | QueryFailureCode::Cancelled
                 ) =>
             {
-                let stats = stats_before_current(&state);
-                return self.incomplete_page(
-                    Some(header),
-                    failure,
-                    &state,
-                    delivered_before,
-                    stats,
-                );
+                return self.failed_page(Some(header), failure, &state, delivered_before);
             },
             Err(failure) => return Err(failure),
         };
         if operator_count > 0 && self.observe_state(&mut state)? {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
+            return self.stopped_page(
                 Some(header),
-                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
-                stats,
             );
         }
 
@@ -250,65 +219,48 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
             .to_vec();
         let before_batch = stats_before_current(&state);
-        if state.cancellation.is_cancelled() {
-            return self.incomplete_page(
-                Some(header),
-                QueryFailure::new(QueryFailureCode::Cancelled),
-                &state,
-                delivered_before,
-                before_batch,
-            );
-        }
         charge_work(&mut state, self.work_units(crate::QueryWorkStage::Output)?)?;
         if state.cancellation.is_cancelled() {
-            return self.incomplete_page(
+            return self.stopped_page_with_stats(
                 Some(header),
-                QueryFailure::new(QueryFailureCode::Cancelled),
+                QueryFailureCode::Cancelled,
                 &state,
                 delivered_before,
                 before_batch,
             );
         }
         if self.observe_state(&mut state)? || exhausted(&state) {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
+            return self.stopped_page(
                 Some(header),
-                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
-                stats,
             );
         }
         let mut output_state = state.clone();
         match charge_output(&mut output_state, &page, &state.cancellation) {
             Ok(()) => {},
             Err(failure) if failure.code() == QueryFailureCode::Cancelled => {
-                return self.incomplete_page(
-                    Some(header),
-                    failure,
-                    &state,
-                    delivered_before,
-                    before_batch,
-                );
+                return self.failed_page(Some(header), failure, &state, delivered_before);
             },
             Err(failure) => return Err(failure),
         }
         if exhausted(&output_state) {
-            return self.incomplete_page(
+            return self.stopped_page_with_stats(
                 Some(header),
-                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
                 before_batch,
             );
         }
-        state = output_state;
         if page.is_empty() {
+            state = output_state;
             let stats = stats_before_current(&state);
             if state.cancellation.is_cancelled() {
-                return self.incomplete_page(
+                return self.stopped_page_with_stats(
                     Some(header),
-                    QueryFailure::new(QueryFailureCode::Cancelled),
+                    QueryFailureCode::Cancelled,
                     &state,
                     delivered_before,
                     stats,
@@ -331,35 +283,24 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         ) {
             Ok(digest) => digest,
             Err(failure) if failure.code() == QueryFailureCode::Cancelled => {
-                return self.incomplete_page(
-                    Some(header),
-                    failure,
-                    &state,
-                    delivered_before,
-                    before_batch,
-                );
+                return self.failed_page(Some(header), failure, &state, delivered_before);
             },
             Err(failure) => return Err(failure),
         };
-        if state.cancellation.is_cancelled() {
-            return self.incomplete_page(
-                Some(header),
-                QueryFailure::new(QueryFailureCode::Cancelled),
-                &state,
-                delivered_before,
-                before_batch,
-            );
-        }
         if self.observe_state(&mut state)? {
-            let stats = stats_before_current(&state);
-            return self.incomplete_page(
+            output_state.last_observed_at = state.last_observed_at;
+            output_state.elapsed_wall_seconds = state.elapsed_wall_seconds;
+            state = output_state;
+            return self.stopped_page(
                 Some(header),
-                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+                QueryFailureCode::BudgetExhausted,
                 &state,
                 delivered_before,
-                stats,
             );
         }
+        output_state.last_observed_at = state.last_observed_at;
+        output_state.elapsed_wall_seconds = state.elapsed_wall_seconds;
+        state = output_state;
         let batch = QueryEvent::Batch(QueryBatch::new(
             state.sequence,
             page,
@@ -391,6 +332,49 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             pagination,
             delivered_before,
             batch_stats,
+        )
+    }
+
+    fn stopped_page(
+        &self,
+        header: Option<QueryEvent>,
+        code: QueryFailureCode,
+        state: &CursorState,
+        delivered_before: QueryStats,
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        self.failed_page(header, QueryFailure::new(code), state, delivered_before)
+    }
+
+    fn failed_page(
+        &self,
+        header: Option<QueryEvent>,
+        failure: QueryFailure,
+        state: &CursorState,
+        delivered_before: QueryStats,
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        self.incomplete_page(
+            header,
+            failure,
+            state,
+            delivered_before,
+            stats_before_current(state),
+        )
+    }
+
+    fn stopped_page_with_stats(
+        &self,
+        header: Option<QueryEvent>,
+        code: QueryFailureCode,
+        state: &CursorState,
+        delivered_before: QueryStats,
+        terminal_stats: QueryStats,
+    ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        self.incomplete_page(
+            header,
+            QueryFailure::new(code),
+            state,
+            delivered_before,
+            terminal_stats,
         )
     }
 

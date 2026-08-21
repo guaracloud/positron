@@ -118,6 +118,50 @@ impl positron_query::QueryWorkMeter for ConstantWorkMeter {
     }
 }
 
+pub struct CancellingStageWorkMeter {
+    stage: positron_query::QueryWorkStage,
+    cancellation: Mutex<Option<positron_query::QueryCancellation>>,
+}
+
+impl CancellingStageWorkMeter {
+    pub fn shared(stage: positron_query::QueryWorkStage) -> Arc<Self> {
+        Arc::new(Self {
+            stage,
+            cancellation: Mutex::new(None),
+        })
+    }
+
+    pub fn bind(
+        &self,
+        cancellation: positron_query::QueryCancellation,
+    ) -> Result<(), positron_query::QueryWorkFailure> {
+        let mut slot = self
+            .cancellation
+            .lock()
+            .map_err(|_| positron_query::QueryWorkFailure)?;
+        *slot = Some(cancellation);
+        Ok(())
+    }
+}
+
+impl positron_query::QueryWorkMeter for CancellingStageWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage == self.stage
+            && let Some(cancellation) = self
+                .cancellation
+                .lock()
+                .map_err(|_| positron_query::QueryWorkFailure)?
+                .as_ref()
+        {
+            cancellation.cancel();
+        }
+        Ok(1)
+    }
+}
+
 pub struct BlockingOperatorWorkMeter {
     block_at: u64,
     operator_calls: AtomicU64,
