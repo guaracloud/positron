@@ -34,7 +34,21 @@ impl ExecutionResources {
         }
     }
 
+    pub(super) fn validate_lease_identity(
+        self,
+        ledger: &ActiveSegmentLedger<'_, '_>,
+        expected: [u8; 16],
+    ) -> Result<Self, QueryFailure> {
+        if self.lease.to_bytes() == expected {
+            return Ok(self);
+        }
+        Err(self.fail_before_stream(ledger, QueryFailure::new(crate::QueryFailureCode::Internal)))
+    }
+
     pub(super) fn into_stream(self) -> (TransferredResourceReservation, SnapshotLeaseId) {
         (self.admission, self.lease)
     }
 }
+
+#[cfg(test)]
+mod tests;

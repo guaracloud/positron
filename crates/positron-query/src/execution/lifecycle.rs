@@ -98,10 +98,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         resources: ExecutionResources,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let ledger = self.ledger;
+        let resources = resources.validate_lease_identity(ledger, state.lease_identity)?;
         let (admission, identity) = resources.into_stream();
-        if identity.to_bytes() != state.lease_identity {
-            return Err(QueryFailure::new(crate::QueryFailureCode::Internal));
-        }
         let cancellation = state.cancellation.clone();
         let release = Box::new(move || {
             ledger
