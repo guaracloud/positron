@@ -117,7 +117,7 @@ impl LiveLokiHarness {
         Ok(services.query_log_bodies(
             &self.query_secret,
             query,
-            positron_query::QueryBudget::new(1_048_576, 32, 32, 1_048_576, 4, 60)?,
+            positron_query::QueryBudget::new(1_048_576, 32, 32, 1_048_576, 1_048_576, 60)?,
         )?)
     }
 
