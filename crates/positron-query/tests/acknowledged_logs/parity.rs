@@ -378,8 +378,9 @@ fn versioned_pipeline_orders_by_intrinsic_time_with_commit_tie_breaking()
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-order-kernel")?;
+    let mut fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-order-kernel")?;
     fixture.append_log("later", 20, 1)?;
+    fixture.seal_and_reopen()?;
     fixture.append_log("earlier", 10, 2)?;
     fixture.append_log("same-time", 20, 3)?;
     let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
