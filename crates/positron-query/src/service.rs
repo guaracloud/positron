@@ -174,21 +174,67 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
 }
 
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
-    if source.starts_with("pipeline:v1 ") {
-        return parse_versioned_pipeline(source);
+    let stages = pipeline_stages(source)?;
+    if stages.first() == Some(&"pipeline:v1 logs") {
+        return parse_versioned_pipeline(&stages);
     }
-    let tokens = source.split_ascii_whitespace().collect::<Vec<_>>();
-    match tokens.as_slice() {
-        ["logs", "|", "range", axis, start, end, "|", "limit", limit] => {
-            plan(axis, start, end, limit)
+    match stages.as_slice() {
+        ["logs", range, limit] => {
+            let range = range.split_ascii_whitespace().collect::<Vec<_>>();
+            let limit = limit.split_ascii_whitespace().collect::<Vec<_>>();
+            match (range.as_slice(), limit.as_slice()) {
+                (["range", axis, start, end], ["limit", limit]) => plan(axis, start, end, limit),
+                _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+            }
         },
         _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
     }
 }
 
-fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
-    let mut stages = source.split('|').map(str::trim);
-    if stages.next() != Some("pipeline:v1 logs") {
+fn pipeline_stages(source: &str) -> Result<Vec<&str>, QueryFailure> {
+    let capacity = source
+        .bytes()
+        .filter(|byte| *byte == b'|')
+        .count()
+        .checked_add(1)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+    let mut stages = Vec::new();
+    stages
+        .try_reserve_exact(capacity)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in source.char_indices() {
+        if escaped {
+            if !matches!(character, '"' | '\\' | '|') {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            escaped = false;
+        } else {
+            match character {
+                '\\' if quoted => escaped = true,
+                '\\' => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+                '"' => quoted = !quoted,
+                '|' if !quoted => {
+                    stages.push(source[start..index].trim());
+                    start = index
+                        .checked_add(character.len_utf8())
+                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+                },
+                _ => {},
+            }
+        }
+    }
+    if quoted || escaped {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    stages.push(source[start..].trim());
+    Ok(stages)
+}
+
+fn parse_versioned_pipeline(stages: &[&str]) -> Result<LogicalPlan, QueryFailure> {
+    if stages.first() != Some(&"pipeline:v1 logs") {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     let mut range = None;
@@ -198,7 +244,7 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let mut ordering = None;
     let mut limit = None;
     let mut stage_order = 0_u8;
-    for stage in stages {
+    for &stage in &stages[1..] {
         if limit.is_some() || (!stage.starts_with("range ") && range.is_none()) {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
@@ -347,10 +393,30 @@ fn parse_body_literal(
     else {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     };
-    if inner.len() > 65_536 || inner.contains('"') {
+    if inner.len() > 65_536 {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
-    positron_domain::value::CandidateAttributeValue::string(inner.to_owned())
+    let mut decoded = String::new();
+    decoded
+        .try_reserve_exact(inner.len())
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let escaped = characters
+                .next()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+            if !matches!(escaped, '"' | '\\' | '|') {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            decoded.push(escaped);
+        } else if character == '"' {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        } else {
+            decoded.push(character);
+        }
+    }
+    positron_domain::value::CandidateAttributeValue::string(decoded)
         .validate_log_body(positron_domain::value::ValueLimitProfile::release_1_system_maximum())
         .map_err(|failure| {
             if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable

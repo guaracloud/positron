@@ -367,6 +367,8 @@ fn versioned_pipeline_rejects_unimplemented_or_malformed_stages() -> Result<(), 
         "pipeline:v1 logs | range query_time 1 nope | limit 1",
         "pipeline:v1 logs | range query_time 0 1 | limit 01",
         "pipeline:v1 logs | range query_time 0 1 | limit nope",
+        "pipeline:v1 logs | range query_time 0 1 | filter body == \"unterminated | limit 1",
+        "pipeline:v1 logs | range query_time 0 1 | filter body == \"invalid\\n-escape\" | limit 1",
         "pipeline:v2 logs | range query_time 0 1 | limit 1",
     ] {
         let failure = service

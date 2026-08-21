@@ -94,6 +94,59 @@ fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(
 }
 
 #[test]
+fn quoted_pipeline_literals_preserve_stage_delimiters_as_body_data() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("quoted-stage-delimiter")?;
+    fixture.kernel.append_log("a|b", 20, 1)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"a|b\" | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 16, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let records = service
+        .execute(query)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records().to_vec()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("result batch missing")?;
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].body_text(), Some("a|b"));
+    Ok(())
+}
+
+#[test]
+fn escaped_pipeline_literals_round_trip_quote_backslash_and_pipe() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("escaped-body-literal")?;
+    fixture.kernel.append_log("a\"b\\c|d", 20, 1)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter body == "a\"b\\c\|d" | limit 1"#,
+        QueryBudget::new(1_048_576, 1, 1, 32, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let record = service
+        .execute(query)?
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch.records().first().cloned(),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("result record missing")?;
+
+    assert_eq!(record.body_text(), Some("a\"b\\c|d"));
+    Ok(())
+}
+
+#[test]
 fn grouping_and_projection_preserve_every_native_body_kind_without_coercion()
 -> Result<(), Box<dyn Error>> {
     use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile};
