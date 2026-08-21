@@ -136,58 +136,7 @@ pub(super) fn decode_block_cancellable(
     limit: usize,
     cancellation: &dyn super::ScanCancellation,
 ) -> Result<DecodedBlock, LogStoreFailure> {
-    let (mut input, version, limits, count) = decode_block_header(expected_tenant, bytes)?;
-    decode_block_records(
-        snapshot,
-        limit,
-        cancellation,
-        &mut input,
-        version,
-        limits,
-        count,
-    )
-}
-
-pub(super) fn preflight_block_record_count(
-    expected_tenant: TenantId,
-    bytes: &[u8],
-) -> Result<usize, LogStoreFailure> {
-    decode_block_header(expected_tenant, bytes).map(|(_, _, _, count)| count)
-}
-
-pub(super) fn validate_block(
-    expected_tenant: TenantId,
-    bytes: &[u8],
-    cancellation: &dyn super::ScanCancellation,
-    observer: &dyn super::ScanObserver,
-) -> Result<(), LogStoreFailure> {
-    let observed = PreflightObserver {
-        cancellation,
-        observer,
-    };
-    let (mut input, version, limits, count) =
-        decode_block_header_with(expected_tenant, Input::observed(bytes, &observed))?;
-    for _ in 0..count {
-        if cancellation.is_cancelled() {
-            return Err(LogStoreFailure::cancelled());
-        }
-        record::validate(&mut input, limits, version)?;
-    }
-    if cancellation.is_cancelled() {
-        return Err(LogStoreFailure::cancelled());
-    }
-    if input.is_empty() {
-        Ok(())
-    } else {
-        Err(LogStoreFailure::malformed_block())
-    }
-}
-
-fn decode_block_header<'bytes>(
-    expected_tenant: TenantId,
-    bytes: &'bytes [u8],
-) -> Result<(Input<'bytes>, u16, CodecLimits, usize), LogStoreFailure> {
-    decode_block_header_with(expected_tenant, Input::new(bytes))
+    BlockDecode::new(expected_tenant, bytes)?.decode(snapshot, limit, cancellation)
 }
 
 fn decode_block_header_with<'input>(
@@ -216,17 +165,88 @@ fn decode_block_header_with<'input>(
     Ok((input, version, limits, count))
 }
 
-struct PreflightObserver<'a> {
-    cancellation: &'a dyn super::ScanCancellation,
-    observer: &'a dyn super::ScanObserver,
+pub(super) struct BlockDecode<'input> {
+    input: Input<'input>,
+    version: u16,
+    limits: CodecLimits,
+    count: usize,
 }
 
-impl super::ScanObserver for PreflightObserver<'_> {
-    fn observe_work(&self, units: u64) -> Result<(), super::ScanObservationFailureCode> {
-        if self.cancellation.is_cancelled() {
-            return Err(super::ScanObservationFailureCode::Cancelled);
+impl<'input> BlockDecode<'input> {
+    fn new(expected_tenant: TenantId, bytes: &'input [u8]) -> Result<Self, LogStoreFailure> {
+        Self::from_input(expected_tenant, Input::new(bytes))
+    }
+
+    pub(super) fn observed(
+        expected_tenant: TenantId,
+        bytes: &'input [u8],
+        cancellation: &'input dyn super::ScanCancellation,
+        observer: &'input dyn super::ScanObserver,
+    ) -> Result<Self, LogStoreFailure> {
+        Self::from_input(
+            expected_tenant,
+            Input::observed(bytes, cancellation, observer),
+        )
+    }
+
+    fn from_input(
+        expected_tenant: TenantId,
+        input: Input<'input>,
+    ) -> Result<Self, LogStoreFailure> {
+        let (input, version, limits, count) = decode_block_header_with(expected_tenant, input)?;
+        Ok(Self {
+            input,
+            version,
+            limits,
+            count,
+        })
+    }
+
+    pub(super) const fn record_count(&self) -> usize {
+        self.count
+    }
+
+    pub(super) fn validate(
+        mut self,
+        cancellation: &dyn super::ScanCancellation,
+    ) -> Result<(), LogStoreFailure> {
+        for _ in 0..self.count {
+            check_decode_cancellation(cancellation)?;
+            record::validate(&mut self.input, self.limits, self.version)?;
         }
-        self.observer.observe_work(units)
+        check_decode_cancellation(cancellation)?;
+        if self.input.is_empty() {
+            Ok(())
+        } else {
+            Err(LogStoreFailure::malformed_block())
+        }
+    }
+
+    pub(super) fn decode(
+        mut self,
+        snapshot: &LedgerSnapshot<'_>,
+        limit: usize,
+        cancellation: &dyn super::ScanCancellation,
+    ) -> Result<DecodedBlock, LogStoreFailure> {
+        decode_block_records(
+            snapshot,
+            limit,
+            cancellation,
+            &mut self.input,
+            self.version,
+            self.limits,
+            self.count,
+        )
+    }
+}
+
+fn check_decode_cancellation(
+    cancellation: &dyn super::ScanCancellation,
+) -> Result<(), LogStoreFailure> {
+    if cancellation.is_cancelled() {
+        Err(LogStoreFailure::cancelled())
+    } else {
+        Ok(())
     }
 }
 

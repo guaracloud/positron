@@ -101,8 +101,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         );
         state.cpu_work_units = observer.consumed();
         let result = framed!(scan_result.map_err(map_store_failure));
-        let scan_work = framed!(self.work_units(crate::QueryWorkStage::ScanDecode));
-        framed!(charge_scan(&mut state, &result, scan_work));
+        framed!(charge_scan(&mut state, &result));
         let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
         framed!(memory.acquire(result.retained_size_bytes()));
         if state.cancellation.is_cancelled() {

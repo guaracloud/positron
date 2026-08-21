@@ -134,7 +134,7 @@ fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Resul
         QueryFailureCode::InvalidBudget
     );
 
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -375,7 +375,7 @@ impl QueryFixture {
         &self,
         batch_limit: u16,
     ) -> Result<QueryService<'static, 'static, '_>, Box<dyn Error>> {
-        Ok(QueryService::new(
+        Ok(super::support::zero_work_service(
             self.kernel.authority.governor(),
             self.kernel.ledger()?,
             batch_limit,

@@ -81,7 +81,7 @@ impl QueryFixtureForAxis {
         )?));
         kernel.append_log("first", 20, 1)?;
         kernel.append_log("second", 21, 2)?;
-        let service = QueryService::with_clock(
+        let service = super::super::support::zero_work_clock_service(
             kernel.authority.governor(),
             kernel.ledger()?,
             1,

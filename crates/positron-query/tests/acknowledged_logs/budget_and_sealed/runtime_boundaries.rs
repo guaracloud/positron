@@ -101,7 +101,7 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         QueryFailureCode::BudgetExhausted
     );
 
-    let service = QueryService::with_clock(
+    let service = super::super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -120,7 +120,7 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         QueryFailureCode::Internal
     );
 
-    let service = QueryService::with_clock(
+    let service = super::super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -194,7 +194,7 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
             if incomplete.code() == QueryFailureCode::Internal
     ));
 
-    let service = QueryService::with_clock(
+    let service = super::super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -213,7 +213,7 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
                 && incomplete.stats().wall_seconds() == 60
     ));
 
-    let service = QueryService::with_clock(
+    let service = super::super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -234,7 +234,7 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
                 && incomplete.stats().result_digest() == [0; 32]
     ));
 
-    let service = QueryService::with_clock(
+    let service = super::super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,

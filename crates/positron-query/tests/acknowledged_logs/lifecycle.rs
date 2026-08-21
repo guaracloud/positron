@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use positron_kernel::{LedgerFailureCode, SnapshotLeaseId, WorkClass};
-use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
+use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal};
 
 use super::support::{PeriodicFailingClock, TestClock};
 use super::terminal_and_bounds::QueryFixture;
@@ -11,7 +11,7 @@ fn sequential_non_resumable_completion_reclaims_every_snapshot_lease() -> Result
 {
     let fixture = QueryFixture::new("lease-reclaim")?;
     let clock = TestClock::shared(100);
-    let service = QueryService::with_clock(
+    let service = super::support::stage_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -48,7 +48,7 @@ fn admission_and_snapshot_lease_remain_owned_until_stream_terminal_or_drop()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("stream-resource-ownership")?;
     fixture.kernel.append_log("one", 20, 1)?;
-    let service = QueryService::with_clock(
+    let service = super::support::stage_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -92,7 +92,7 @@ fn admission_and_snapshot_lease_remain_owned_until_stream_terminal_or_drop()
 fn repeated_pre_stream_failures_release_admission_and_snapshot_leases() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("pre-stream-resource-ownership")?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -130,7 +130,7 @@ fn paged_drop_retains_only_after_a_resume_cursor_is_delivered() -> Result<(), Bo
     fixture.kernel.append_log("one", 20, 1)?;
     fixture.kernel.append_log("two", 21, 2)?;
     let clock = TestClock::shared(100);
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -164,7 +164,7 @@ fn paged_drop_retains_only_after_a_resume_cursor_is_delivered() -> Result<(), Bo
 #[test]
 fn paged_drop_before_header_delivery_reclaims_every_snapshot_lease() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("paged-drop-before-header")?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -184,7 +184,7 @@ fn paged_drop_before_header_delivery_reclaims_every_snapshot_lease() -> Result<(
 #[test]
 fn observed_paged_completion_reclaims_every_snapshot_lease() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("paged-complete-reclaim")?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -209,7 +209,7 @@ fn observed_paged_completion_reclaims_every_snapshot_lease() -> Result<(), Box<d
 fn paged_drop_after_batch_before_terminal_replays_the_same_batch() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("paged-batch-ambiguity")?;
     fixture.kernel.append_log("one", 20, 1)?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -248,7 +248,7 @@ fn paged_drop_after_batch_before_terminal_replays_the_same_batch() -> Result<(),
 #[test]
 fn observed_paged_completion_makes_its_cursor_unavailable() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("paged-complete-terminal")?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -280,7 +280,7 @@ fn observed_paged_completion_makes_its_cursor_unavailable() -> Result<(), Box<dy
 fn observed_paged_incomplete_is_terminal_and_not_resumable() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("paged-incomplete-terminal")?;
     fixture.kernel.append_log("one", 20, 1)?;
-    let service = QueryService::with_clock(
+    let service = super::support::stage_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -289,7 +289,7 @@ fn observed_paged_incomplete_is_terminal_and_not_resumable() -> Result<(), Box<d
     let query = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 1",
-        budget().with_cpu_work_units(2)?,
+        budget().with_cpu_work_units(1)?,
     )?;
     let events = service.execute_page(query)?.collect::<Vec<_>>();
     let cursor = match events.first() {
@@ -319,7 +319,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
     let fixture = QueryFixture::new("cancel-truth")?;
     fixture.kernel.append_log("one", 20, 1)?;
     fixture.kernel.append_log("two", 21, 2)?;
-    let service = QueryService::with_clock(
+    let service = super::support::stage_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -377,7 +377,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
                 && incomplete.stats().scanned_bytes() > 0
                 && incomplete.stats().decoded_records() == 2
                 && incomplete.stats().output_bytes() == u64::try_from(output_bytes)?
-                && incomplete.stats().cpu_work_units() == 4
+                && incomplete.stats().cpu_work_units() == 3
                 && incomplete.stats().wall_seconds() == 0
                 && incomplete.stats().last_sequence() == Some(0)
                 && incomplete.stats().result_digest() == digest
@@ -402,7 +402,7 @@ fn retained_cancellation_handle_stops_result_delivery_with_delivered_only_truth(
     let fixture = QueryFixture::new("cancel-delivery")?;
     fixture.kernel.append_log("one", 20, 1)?;
     fixture.kernel.append_log("two", 21, 2)?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,

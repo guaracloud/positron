@@ -6,11 +6,8 @@ pub(in crate::log_store) fn fuzz_decode_block(
     expected_tenant: TenantId,
     bytes: &[u8],
 ) -> Result<(), LogStoreFailure> {
-    super::preflight_block_record_count(expected_tenant, bytes)?;
-    super::validate_block(
-        expected_tenant,
-        bytes,
-        &super::super::scan::NeverCancelled,
-        &super::super::scan::Unobserved,
-    )
+    let cancellation = super::super::scan::NeverCancelled;
+    let observer = super::super::scan::Unobserved;
+    super::BlockDecode::observed(expected_tenant, bytes, &cancellation, &observer)?
+        .validate(&cancellation)
 }

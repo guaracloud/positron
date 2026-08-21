@@ -348,6 +348,92 @@ fn oversized_block_preflight_has_an_exact_observed_work_boundary() -> Result<(),
 }
 
 #[test]
+fn fitting_block_decode_has_an_exact_observed_work_boundary() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x4d; 16])?,
+        CatalogSecret::from_owned(Box::new([0x4e; 32]), Box::new([0x4f; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(81)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x53; 32])),
+    )?;
+    ledger.append(
+        LogStore::new()
+            .prepare(
+                preparation_capacity(&authority, tenant)?,
+                &clock(125),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x4d; 16])?,
+                vec![minimal_record("observed-fitting-record", 1)?],
+            )?
+            .into_store_block(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let scan = LogScan::all(ScanLimit::new(1)?);
+    let recording = RecordingScanObserver(AtomicU64::new(0));
+    let result = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        scan,
+        &NeverCancelled,
+        &recording,
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert!(result.complete());
+    let exact_work = recording.0.load(Ordering::SeqCst);
+    assert!(exact_work > 0, "ordinary decode work must be observed");
+    drop(result);
+
+    let exact = BudgetedScanObserver(AtomicU64::new(exact_work));
+    let exact_result = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        scan,
+        &NeverCancelled,
+        &exact,
+    )?;
+    assert_eq!(exact_result.records().len(), 1);
+    assert_eq!(exact.0.load(Ordering::SeqCst), 0);
+    drop(exact_result);
+
+    let before = authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let exhausted = BudgetedScanObserver(AtomicU64::new(exact_work - 1));
+    let failure = LogStore::new()
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            scan,
+            &NeverCancelled,
+            &exhausted,
+        )
+        .expect_err("one less decode work unit must fail without a prefix");
+    assert_eq!(failure.code(), LogStoreFailureCode::BudgetExhausted);
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        before
+    );
+    Ok(())
+}
+
+#[test]
 fn exact_result_limit_stops_before_decoding_a_later_committed_block() -> Result<(), Box<dyn Error>>
 {
     let root = TemporaryRoot::new()?;

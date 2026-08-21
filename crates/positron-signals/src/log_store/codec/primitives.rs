@@ -33,6 +33,7 @@ pub(super) fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), LogSto
 pub(super) struct Input<'a> {
     remaining: &'a [u8],
     observer: Option<&'a dyn crate::log_store::ScanObserver>,
+    cancellation: Option<&'a dyn crate::log_store::ScanCancellation>,
 }
 
 impl<'a> Input<'a> {
@@ -40,20 +41,29 @@ impl<'a> Input<'a> {
         Self {
             remaining: bytes,
             observer: None,
+            cancellation: None,
         }
     }
 
     pub(super) const fn observed(
         bytes: &'a [u8],
+        cancellation: &'a dyn crate::log_store::ScanCancellation,
         observer: &'a dyn crate::log_store::ScanObserver,
     ) -> Self {
         Self {
             remaining: bytes,
             observer: Some(observer),
+            cancellation: Some(cancellation),
         }
     }
 
     pub(super) fn take(&mut self, count: usize) -> Result<&'a [u8], LogStoreFailure> {
+        if self
+            .cancellation
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            return Err(LogStoreFailure::cancelled());
+        }
         if let Some(observer) = self.observer {
             let units = u64::try_from(count)
                 .ok()

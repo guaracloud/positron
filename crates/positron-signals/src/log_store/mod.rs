@@ -298,19 +298,15 @@ impl LogStore {
                         .map_err(|_| LogStoreFailure::limit_exceeded())?,
                 )
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;
-            let block_records = codec::preflight_block_record_count(tenant, block.payload())?;
+            let decode =
+                codec::BlockDecode::observed(tenant, block.payload(), cancellation, observer)?;
+            let block_records = decode.record_count();
             if block_records > remaining {
-                codec::validate_block(tenant, block.payload(), cancellation, observer)?;
+                decode.validate(cancellation)?;
                 complete = false;
                 break;
             }
-            let decoded = codec::decode_block_cancellable(
-                tenant,
-                snapshot,
-                block.payload(),
-                remaining,
-                cancellation,
-            )?;
+            let decoded = decode.decode(snapshot, remaining, cancellation)?;
             if decoded.truncated {
                 complete = false;
             }

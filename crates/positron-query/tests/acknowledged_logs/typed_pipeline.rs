@@ -19,7 +19,7 @@ type OrderedBodyBatch = (Vec<(String, u16)>, [u8; 32]);
 fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-projection-bytes")?;
     fixture.kernel.append_log("body-is-not-selected", 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::stage_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -78,7 +78,7 @@ fn projection_preserves_query_time_and_optional_event_time_simultaneously()
         ],
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::stage_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -146,7 +146,7 @@ fn temporal_projection_preserves_provenance_quality_and_kernel_ingest_time()
         ],
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -361,7 +361,7 @@ fn event_time_range_excludes_records_without_event_time() -> Result<(), Box<dyn 
         ],
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -408,7 +408,7 @@ fn event_time_ordering_uses_selected_axis_and_intrinsic_ties_in_both_directions(
         ],
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -464,7 +464,7 @@ fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(
         20,
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -490,7 +490,7 @@ fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(
 fn quoted_pipeline_literals_preserve_stage_delimiters_as_body_data() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("quoted-stage-delimiter")?;
     fixture.kernel.append_log("a|b", 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -517,7 +517,7 @@ fn quoted_pipeline_literals_preserve_stage_delimiters_as_body_data() -> Result<(
 fn escaped_pipeline_literals_round_trip_quote_backslash_and_pipe() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("escaped-body-literal")?;
     fixture.kernel.append_log("a\"b\\c|d", 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -638,7 +638,7 @@ fn projection_preserves_missing_and_native_body_values() -> Result<(), Box<dyn E
         10,
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -746,7 +746,7 @@ fn typed_body_equality_accepts_every_native_literal_without_coercion() -> Result
             .collect::<Result<Vec<_>, _>>()?,
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -832,7 +832,7 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
         ],
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1177,7 +1177,7 @@ fn attribute_grouping_keeps_missing_distinct_from_the_full_occurrence_set()
 #[test]
 fn version_one_equality_rejects_untyped_literal_syntax() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("native-filter-boundary")?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1203,7 +1203,7 @@ fn version_one_equality_rejects_untyped_literal_syntax() -> Result<(), Box<dyn E
 #[test]
 fn version_one_rejects_malformed_or_noncanonical_typed_literals() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("native-literal-errors")?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1269,7 +1269,7 @@ fn version_one_rejects_malformed_or_noncanonical_typed_literals() -> Result<(), 
 #[test]
 fn version_one_rejects_malformed_attribute_paths_and_selectors() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("attribute-path-errors")?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1325,7 +1325,7 @@ fn version_one_rejects_malformed_attribute_paths_and_selectors() -> Result<(), B
 fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-count-bytes")?;
     fixture.kernel.append_log("counted", 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1379,7 +1379,7 @@ fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>
 fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-order-header")?;
     fixture.kernel.append_log("ordered", 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1429,7 +1429,7 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
 fn grouped_schema_describes_native_keys_and_unsigned_counts() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-group-schema")?;
     fixture.kernel.append_log("group", 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1475,7 +1475,7 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-projection-digest")?;
     fixture.kernel.append_log("not-selected", 1, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1512,7 +1512,7 @@ fn batch_digest_streams_valid_bodies_larger_than_control_token_payloads()
     let fixture = QueryFixture::new("streamed-result-digest")?;
     let body = "x".repeat(5_000);
     fixture.kernel.append_log(&body, 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1562,7 +1562,7 @@ fn same_time_records_in_one_block_have_a_stable_total_identity_across_reopen()
     )?;
 
     let execute = |fixture: &QueryFixture| -> Result<OrderedBodyBatch, Box<dyn Error>> {
-        let service = QueryService::new(
+        let service = super::support::zero_work_service(
             fixture.kernel.authority.governor(),
             fixture.kernel.ledger()?,
             16,
@@ -1625,7 +1625,7 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
     let fixture = QueryFixture::new("default-sort-work")?;
     fixture.kernel.append_log("later", 20, 1)?;
     fixture.kernel.append_log("earlier", 10, 2)?;
-    let service = QueryService::new(
+    let service = super::support::stage_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1635,26 +1635,26 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(4)?,
+        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(3)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.cpu_work_units() == 4
+            if stats.cpu_work_units() == 3
     ));
 
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(3)?,
+        QueryBudget::new(1_048_576, 2, 2, 32, 1_048_576, 60)?.with_cpu_work_units(2)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(matches!(
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 4
+                && incomplete.stats().cpu_work_units() == 3
     ));
     assert!(
         !exhausted_events
@@ -1825,7 +1825,7 @@ fn cancellation_interrupts_substantial_default_sort_work() -> Result<(), Box<dyn
 fn versioned_pipeline_rejects_operator_combinations_it_cannot_execute() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("typed-operator-combinations")?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -1962,7 +1962,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let work_exhausted = metered_service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?.with_cpu_work_units(5)?,
+        QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?.with_cpu_work_units(4)?,
     )?;
     let work_events = metered_service.execute(work_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -1974,7 +1974,7 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
         work_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 6
+                && incomplete.stats().cpu_work_units() == 5
     ));
 
     let commit_groups = service.plan_pipeline(
@@ -2027,7 +2027,7 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
         20,
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::stage_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -2037,19 +2037,19 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(18)?,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(17)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.cpu_work_units() == 18
+            if stats.cpu_work_units() == 17
     ));
 
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(17)?,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -2061,7 +2061,7 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 18
+                && incomplete.stats().cpu_work_units() == 17
     ));
     Ok(())
 }
@@ -2077,7 +2077,7 @@ fn group_key_construction_charges_large_native_values_before_lookup() -> Result<
         20,
         1,
     )?;
-    let service = QueryService::new(
+    let service = super::support::stage_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
@@ -2085,7 +2085,7 @@ fn group_key_construction_charges_large_native_values_before_lookup() -> Result<
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 8_192, 1_048_576, 60)?.with_cpu_work_units(10)?,
+        QueryBudget::new(1_048_576, 1, 1, 8_192, 1_048_576, 60)?.with_cpu_work_units(9)?,
     )?;
 
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -2093,7 +2093,7 @@ fn group_key_construction_charges_large_native_values_before_lookup() -> Result<
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 11
+                && incomplete.stats().cpu_work_units() == 10
     ));
     assert!(
         !events
@@ -2251,7 +2251,7 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
 {
     let fixture = QueryFixture::new("typed-stage-cancellation")?;
     fixture.kernel.append_log("one", 20, 1)?;
-    let service = QueryService::new(
+    let service = super::support::zero_work_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -2311,7 +2311,7 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
 fn operator_wall_budget_is_checked_before_output() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-operator-wall")?;
     fixture.kernel.append_log("one", 20, 1)?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
@@ -2341,7 +2341,7 @@ fn operator_wall_budget_is_checked_before_output() -> Result<(), Box<dyn Error>>
 fn post_digest_wall_expiry_never_claims_an_unqueued_batch() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("post-digest-wall")?;
     fixture.kernel.append_log("one", 20, 1)?;
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,

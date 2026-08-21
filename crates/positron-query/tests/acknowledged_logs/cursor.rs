@@ -32,7 +32,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
     fixture.append_log("first", 20, 1)?;
     fixture.append_log("second", 21, 2)?;
     let clock = TestClock::shared(100);
-    let service = QueryService::with_clock(
+    let service = super::support::zero_work_clock_service(
         fixture.authority.governor(),
         fixture.ledger()?,
         1,
@@ -49,7 +49,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
 
     fixture.append_log("future", 22, 3)?;
     clock.set(101);
-    let mut resumed = QueryService::with_clock(
+    let mut resumed = super::support::zero_work_clock_service(
         fixture.authority.governor(),
         fixture.ledger()?,
         1,
@@ -156,7 +156,7 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
             .tenant_id(),
         "cursor-frontier-regression",
     )?;
-    let behind = QueryService::new(empty.authority.governor(), empty.ledger()?, 1);
+    let behind = super::support::zero_work_service(empty.authority.governor(), empty.ledger()?, 1);
     assert_eq!(
         behind
             .resume(fixture.context, &fixture.cursor)
@@ -270,7 +270,7 @@ impl CursorFixture {
         kernel.append_log("first", 20, 1)?;
         kernel.append_log("second", 21, 2)?;
         let clock = TestClock::shared(100);
-        let service = QueryService::with_clock(
+        let service = super::support::zero_work_clock_service(
             kernel.authority.governor(),
             kernel.ledger()?,
             1,
@@ -296,7 +296,7 @@ impl CursorFixture {
     }
 
     fn service(&self) -> QueryService<'static, 'static, '_> {
-        QueryService::with_clock(
+        super::support::zero_work_clock_service(
             self.kernel.authority.governor(),
             self.kernel.ledger().expect("fixture ledger"),
             1,

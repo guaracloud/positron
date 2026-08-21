@@ -50,9 +50,11 @@ pub struct TestWorkMeter;
 impl positron_query::QueryWorkMeter for TestWorkMeter {
     fn units(
         &self,
-        _stage: positron_query::QueryWorkStage,
+        stage: positron_query::QueryWorkStage,
     ) -> Result<u64, positron_query::QueryWorkFailure> {
-        Ok(1)
+        Ok(u64::from(
+            stage != positron_query::QueryWorkStage::ScanDecode,
+        ))
     }
 }
 
@@ -121,6 +123,8 @@ impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
     ) -> Result<u64, positron_query::QueryWorkFailure> {
         if stage == self.0 {
             Err(positron_query::QueryWorkFailure)
+        } else if stage == positron_query::QueryWorkStage::ScanDecode {
+            Ok(0)
         } else {
             Ok(1)
         }
@@ -129,6 +133,19 @@ impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
 
 pub struct ConstantWorkMeter(pub u64);
 
+pub struct ZeroScanWorkMeter;
+
+impl positron_query::QueryWorkMeter for ZeroScanWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(u64::from(
+            stage != positron_query::QueryWorkStage::ScanDecode,
+        ))
+    }
+}
+
 impl positron_query::QueryWorkMeter for ConstantWorkMeter {
     fn units(
         &self,
@@ -136,6 +153,64 @@ impl positron_query::QueryWorkMeter for ConstantWorkMeter {
     ) -> Result<u64, positron_query::QueryWorkFailure> {
         Ok(self.0)
     }
+}
+
+pub fn zero_work_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(0)),
+    )
+}
+
+pub fn zero_work_clock_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+    clock: Arc<dyn positron_query::QueryClock>,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        clock,
+        Arc::new(ConstantWorkMeter(0)),
+    )
+}
+
+pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        TestClock::shared(100),
+        Arc::new(ZeroScanWorkMeter),
+    )
+}
+
+pub fn stage_work_clock_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+    clock: Arc<dyn positron_query::QueryClock>,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        clock,
+        Arc::new(ZeroScanWorkMeter),
+    )
 }
 
 pub struct CancellingStageWorkMeter {
@@ -176,17 +251,20 @@ impl positron_query::QueryWorkMeter for CancellingOperatorCallMeter {
         &self,
         stage: positron_query::QueryWorkStage,
     ) -> Result<u64, positron_query::QueryWorkFailure> {
-        if stage == positron_query::QueryWorkStage::Operators
-            && self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_at
-            && let Some(cancellation) = self
-                .cancellation
-                .lock()
-                .map_err(|_| positron_query::QueryWorkFailure)?
-                .as_ref()
-        {
-            cancellation.cancel();
+        if stage == positron_query::QueryWorkStage::Operators {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_at
+                && let Some(cancellation) = self
+                    .cancellation
+                    .lock()
+                    .map_err(|_| positron_query::QueryWorkFailure)?
+                    .as_ref()
+            {
+                cancellation.cancel();
+            }
+            Ok(1)
+        } else {
+            Ok(0)
         }
-        Ok(1)
     }
 }
 
@@ -225,7 +303,9 @@ impl positron_query::QueryWorkMeter for CancellingStageWorkMeter {
         {
             cancellation.cancel();
         }
-        Ok(1)
+        Ok(u64::from(
+            stage != positron_query::QueryWorkStage::ScanDecode,
+        ))
     }
 }
 
@@ -284,9 +364,10 @@ impl positron_query::QueryWorkMeter for BlockingOperatorWorkMeter {
         &self,
         stage: positron_query::QueryWorkStage,
     ) -> Result<u64, positron_query::QueryWorkFailure> {
-        if stage != positron_query::QueryWorkStage::Operators
-            || self.operator_calls.fetch_add(1, Ordering::SeqCst) + 1 != self.block_at
-        {
+        if stage != positron_query::QueryWorkStage::Operators {
+            return Ok(0);
+        }
+        if self.operator_calls.fetch_add(1, Ordering::SeqCst) + 1 != self.block_at {
             return Ok(1);
         }
         let mut state = self
@@ -538,7 +619,7 @@ fn establish_authority(
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
     let ordinary_capacity = ResourceAmounts::new([
-        8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 64, 32, 2_000_000,
+        8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 4_096, 32, 2_000_000,
     ]);
     let raw = add(
         add(recovery_capacity, ordinary_capacity)?,
@@ -560,9 +641,9 @@ fn establish_authority(
     let policy = GovernorPolicy::new(
         [TenantQuota::new(tenant, 1, ordinary_capacity)?],
         OrdinaryPoolPolicy::new(
-            with_cpu(uniform(8), 18),
-            with_cpu(uniform(6), 17),
-            with_cpu(uniform(4), 16),
+            with_cpu(uniform(8), 1_024),
+            with_cpu(uniform(6), 1_024),
+            with_cpu(uniform(4), 1_024),
             uniform(2),
         )?,
     )?;

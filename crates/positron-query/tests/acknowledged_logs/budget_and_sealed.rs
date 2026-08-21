@@ -27,7 +27,8 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
     )?;
     let fixture = KernelFixture::new(instance.default_tenant_id(), "budget-kernel")?;
     fixture.append_log("larger-than-the-scan-budget", 20, 1)?;
-    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 1",
@@ -78,11 +79,17 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         ],
         1,
     )?;
-    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
+    let service = QueryService::with_runtime(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        16,
+        TestClock::shared(100),
+        std::sync::Arc::new(super::support::ConstantWorkMeter(1)),
+    );
     let query = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?,
+        QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?.with_cpu_work_units(1_024)?,
     )?;
 
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -113,7 +120,7 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         .ok_or("atomic preflight terminal omitted its work statistics")?;
     assert!(
         observed_cpu > 2,
-        "validate-only traversal must add work beyond parse and coarse scan accounting"
+        "validate-only traversal must add work beyond parsing"
     );
     let preflight_exhaustion = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?
         .with_cpu_work_units(
@@ -183,7 +190,7 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
     let fixture = KernelFixture::new(instance.default_tenant_id(), "runtime-budget-kernel")?;
     fixture.append_log("bounded", 20, 1)?;
     let cpu_budget =
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(2)?;
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1)?;
     let clock = TestClock::shared(100);
     let service = QueryService::with_runtime(
         fixture.authority.governor(),
@@ -202,17 +209,17 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
     assert_eq!(admitted.outstanding_for(WorkClass::InteractiveQueryTail), 1);
     assert_eq!(
         admitted.usage(ResourceDimension::CpuWorkUnits),
-        before.usage(ResourceDimension::CpuWorkUnits) + 2
+        before.usage(ResourceDimension::CpuWorkUnits) + 1
     );
     let events = service.execute(planned)?.collect::<Vec<_>>();
     assert!(matches!(
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 3
+                && incomplete.stats().cpu_work_units() == 2
     ));
 
-    let wall_service = QueryService::with_clock(
+    let wall_service = super::support::zero_work_clock_service(
         fixture.authority.governor(),
         fixture.ledger()?,
         16,
@@ -248,7 +255,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
     fixture.append_log("one", 20, 1)?;
     fixture.append_log("two", 21, 2)?;
     let clock = TestClock::shared(100);
-    let service = QueryService::with_clock(
+    let service = super::support::stage_work_clock_service(
         fixture.authority.governor(),
         fixture.ledger()?,
         1,
@@ -257,7 +264,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 10)?.with_cpu_work_units(4)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 10)?.with_cpu_work_units(3)?,
     )?;
     let first = service.execute_page(planned)?.collect::<Vec<_>>();
     let cursor = match first.last() {
@@ -271,7 +278,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().records() == 1
-                && incomplete.stats().cpu_work_units() == 5
+                && incomplete.stats().cpu_work_units() == 4
                 && incomplete.stats().wall_seconds() == 2
                 && incomplete.stats().last_sequence() == Some(0)
                 && incomplete.stats().result_digest() != [0; 32]
@@ -302,7 +309,8 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     fixture.append_log("sealed", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active", 21, 2)?;
-    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let query = service.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
@@ -326,7 +334,8 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     assert_eq!(first, ["sealed", "active"]);
 
     fixture.seal_and_reopen()?;
-    let restarted = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 100);
+    let restarted =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let query = restarted.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",

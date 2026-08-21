@@ -4,7 +4,6 @@ use crate::{QueryFailure, QueryFailureCode, QueryRecord};
 pub(crate) fn charge_scan(
     state: &mut CursorState,
     result: &positron_signals::LogScanResult<'_>,
-    cpu_work_units: u64,
 ) -> Result<(), QueryFailure> {
     state.scanned_bytes = state
         .scanned_bytes
@@ -16,10 +15,6 @@ pub(crate) fn charge_scan(
             u64::try_from(result.records().len())
                 .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
         )
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-    state.cpu_work_units = state
-        .cpu_work_units
-        .checked_add(cpu_work_units)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     Ok(())
 }
