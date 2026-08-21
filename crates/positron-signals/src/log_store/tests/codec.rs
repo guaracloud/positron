@@ -129,7 +129,7 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         tenant,
         VirtualShardId::new(2)?,
         StoreBlockIdentity::new([0x62; 16])?,
-        vec![record.clone()],
+        vec![record.clone(), minimal_record("second", 1_001)?],
     )?;
     let catalog = Catalog::open(
         &authority,
@@ -143,12 +143,24 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         SegmentProtectionKey::from_owned(Box::new([0x52; 32])),
     )?;
     ledger.append(prepared.into_store_block())?;
-    let result = store.scan(
+    let bounded = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
         LogScan::all(ScanLimit::new(1)?),
     )?;
+    assert!(bounded.records().is_empty());
+    assert!(!bounded.complete());
+    drop(bounded);
+
+    let result = store.scan(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(2)?),
+    )?;
+    assert_eq!(result.records().len(), 2);
+    assert!(result.complete());
     assert_eq!(result.records()[0].record(), &record);
     assert_eq!(
         result.records()[0].attributes()[1].representation(),
