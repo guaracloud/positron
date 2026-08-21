@@ -165,6 +165,12 @@ mod tests {
         );
 
         assert_eq!(
+            format!("{stream:?}"),
+            "QueryStream { <bounded-events> }",
+            "stream diagnostics must not expose retained result data"
+        );
+
+        assert_eq!(
             stream.cancel().expect_err("first release fails").code(),
             QueryFailureCode::StoreUnavailable
         );
