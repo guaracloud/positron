@@ -373,17 +373,39 @@ pub(crate) fn map_ledger_failure(failure: positron_kernel::LedgerFailure) -> Que
 }
 
 pub(crate) fn map_store_failure(failure: positron_signals::LogStoreFailure) -> QueryFailure {
-    match failure.code() {
+    QueryFailure::new(map_store_failure_code(failure.code()))
+}
+
+const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> QueryFailureCode {
+    match code {
         positron_signals::LogStoreFailureCode::MalformedBlock => {
-            QueryFailure::new(QueryFailureCode::MalformedPersistentData)
+            QueryFailureCode::MalformedPersistentData
         },
         positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
-            QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused)
+            QueryFailureCode::ResourceAdmissionRefused
         },
-        positron_signals::LogStoreFailureCode::LimitExceeded
-        | positron_signals::LogStoreFailureCode::ResourceExhausted => {
-            QueryFailure::new(QueryFailureCode::BudgetExhausted)
+        positron_signals::LogStoreFailureCode::LimitExceeded => QueryFailureCode::BudgetExhausted,
+        positron_signals::LogStoreFailureCode::ResourceExhausted => {
+            QueryFailureCode::ResourceExhausted
         },
-        _ => QueryFailure::new(QueryFailureCode::StoreUnavailable),
+        _ => QueryFailureCode::StoreUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_store_failure_code;
+    use crate::QueryFailureCode;
+
+    #[test]
+    fn storage_allocation_exhaustion_is_not_reported_as_tenant_budget_exhaustion() {
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::ResourceExhausted),
+            QueryFailureCode::ResourceExhausted
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::LimitExceeded),
+            QueryFailureCode::BudgetExhausted
+        );
     }
 }

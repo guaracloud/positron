@@ -164,6 +164,10 @@ fn scan_capacity_refusal_is_one_typed_non_complete_terminal() -> Result<(), Box<
 #[test]
 fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result<(), Box<dyn Error>>
 {
+    assert_ne!(
+        QueryFailureCode::ResourceExhausted,
+        QueryFailureCode::BudgetExhausted
+    );
     assert_eq!(
         QueryBudget::new(1, 1_025, 1, 1, 1, 1)
             .expect_err("decoded record bound")

@@ -10,6 +10,7 @@ pub enum QueryFailureCode {
     AuthorizationChanged,
     Cancelled,
     ResourceAdmissionRefused,
+    ResourceExhausted,
     UnsupportedQuery,
     StoreUnavailable,
     MalformedPersistentData,
