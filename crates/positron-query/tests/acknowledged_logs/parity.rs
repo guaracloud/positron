@@ -395,3 +395,37 @@ fn versioned_pipeline_orders_by_intrinsic_time_with_commit_tie_breaking()
     assert_eq!(bodies, ["later", "same-time", "earlier"]);
     Ok(())
 }
+
+#[test]
+fn native_operator_work_consumes_the_cumulative_query_budget() -> Result<(), Box<dyn Error>> {
+    let roots = TemporaryRoots::new("pipeline-operator-budget")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-operator-budget-kernel")?;
+    fixture.append_log("keep", 20, 1)?;
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?.with_cpu_work_units(3)?;
+    let query = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | limit 16",
+        budget,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == positron_query::QueryFailureCode::BudgetExhausted
+    ));
+    Ok(())
+}

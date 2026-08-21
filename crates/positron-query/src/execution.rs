@@ -187,6 +187,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?,
             )];
         }
+        let operator_count = state.plan.operator_count();
+        if operator_count > 0 {
+            let operator_units = self
+                .work_units(crate::QueryWorkStage::Operators)?
+                .checked_mul(operator_count)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+            charge_work(&mut state, operator_units)?;
+        }
         let wanted = usize::from(state.plan.limit()).min(records.len());
         let start = usize::from(state.offset);
         let end = start

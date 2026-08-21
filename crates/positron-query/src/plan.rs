@@ -167,6 +167,13 @@ impl LogicalPlan {
         self.ordering
     }
 
+    pub(crate) fn operator_count(&self) -> u64 {
+        u64::from(self.filter.is_some())
+            + u64::from(self.projection != [ProjectionColumn::Body])
+            + u64::from(self.aggregate.is_some())
+            + u64::from(self.ordering != OrderSpec::ascending(self.axis))
+    }
+
     pub(crate) const fn limit(&self) -> u16 {
         self.limit
     }

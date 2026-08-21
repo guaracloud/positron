@@ -11,6 +11,7 @@ pub trait QueryClock: Send + Sync {
 pub enum QueryWorkStage {
     Parse,
     ScanDecode,
+    Operators,
     Output,
 }
 
