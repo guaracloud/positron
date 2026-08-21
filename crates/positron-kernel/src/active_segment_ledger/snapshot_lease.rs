@@ -6,7 +6,7 @@ use crate::catalog::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId}
 use crate::data_protection::DataProtection;
 use crate::{WorkClaim, WorkKind};
 
-use super::capacity::{lease_claim, snapshot_claim};
+use super::capacity::{lease_claim, snapshot_retained_claim};
 use super::snapshot_lease_codec::{decode, encode};
 use super::{
     ActiveSegmentLedger, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, LedgerSnapshot, SegmentId,
@@ -90,6 +90,9 @@ pub(super) struct LeaseBlock {
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    /// Creates a durable lease for an already-admitted query task. The caller's
+    /// query reservation covers construction CPU; the returned grant retains
+    /// only resources that remain live with its immutable snapshot.
     pub fn create_snapshot_lease(
         &self,
         now: u64,
@@ -152,6 +155,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         })
     }
 
+    /// Resumes a durable lease for an already-admitted query task. The caller's
+    /// query reservation covers construction CPU; the returned grant retains
+    /// only resources that remain live with its immutable snapshot.
     pub fn resume_snapshot_lease(
         &self,
         identity: SnapshotLeaseId,
@@ -259,7 +265,7 @@ fn snapshot_from_record<'kernel>(
     let claim = WorkClaim::tenant(
         record.scope.tenant,
         WorkKind::InteractiveQueryTail,
-        snapshot_claim(bytes, blocks.len())?,
+        snapshot_retained_claim(bytes, blocks.len())?,
     )
     .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let capacity = ledger

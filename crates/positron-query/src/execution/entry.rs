@@ -44,6 +44,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 crate::QueryBudgetDimension::WallSeconds,
             ));
         }
+        // PlannedQuery still owns its admitted CPU reservation while the
+        // immutable lease snapshot is constructed.
         let lease = self
             .ledger
             .create_snapshot_lease(now, expiry)
@@ -73,6 +75,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .started_at
             .checked_add(query.budget.wall_seconds())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
+        // PlannedQuery still owns its admitted CPU reservation while the
+        // immutable lease snapshot is constructed.
         let lease = self
             .ledger
             .create_snapshot_lease(now_seconds, expiry)
@@ -115,6 +119,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let reservation = self.reserve_query(tenant, state.budget)?;
         let lease_id = SnapshotLeaseId::new(state.lease_identity)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        // The resumed page reservation is live before snapshot reconstruction.
         let lease = self
             .ledger
             .resume_snapshot_lease(lease_id, now_seconds)

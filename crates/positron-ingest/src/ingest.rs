@@ -189,6 +189,8 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         if capacity.try_resize(accepted_amounts).is_err() {
             return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
         }
+        // `capacity` is the admitted ingest-group CPU/task reservation that
+        // covers this snapshot's bounded construction work.
         let snapshot = match self.ledger.snapshot() {
             Ok(snapshot) => snapshot,
             Err(failure) => return map_ledger_failure(&failure),

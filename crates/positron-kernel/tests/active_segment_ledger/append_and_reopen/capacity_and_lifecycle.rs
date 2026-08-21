@@ -34,10 +34,28 @@ fn snapshots_hold_governed_capacity_until_drop_and_repeated_snapshots_are_bounde
         SegmentProtectionKey::from_owned(Box::new([0x58; 32])),
     )?;
     let committed = ledger.append(prepared(scope, 8, b"snapshot-capacity".to_vec())?)?;
-    let baseline = authority.governor().inspect()?.outstanding_total();
+    let baseline = authority.governor().inspect()?;
     let active = root.path().join("segments/active");
     let before = directory_file_bytes(&active)?;
     let mut snapshots = vec![ledger.snapshot()?];
+    let retained = authority.governor().inspect()?;
+    assert!(
+        retained.usage(positron_kernel::ResourceDimension::MemoryBytes)
+            > baseline.usage(positron_kernel::ResourceDimension::MemoryBytes)
+    );
+    for dimension in [
+        positron_kernel::ResourceDimension::QueueSlots,
+        positron_kernel::ResourceDimension::TaskSlots,
+        positron_kernel::ResourceDimension::BufferCacheBytes,
+        positron_kernel::ResourceDimension::BatchItems,
+    ] {
+        assert_eq!(retained.usage(dimension), baseline.usage(dimension) + 1);
+    }
+    assert_eq!(
+        retained.usage(positron_kernel::ResourceDimension::CpuWorkUnits),
+        baseline.usage(positron_kernel::ResourceDimension::CpuWorkUnits),
+        "an immutable snapshot must not retain transient construction CPU"
+    );
     let failure = loop {
         match ledger.snapshot() {
             Ok(snapshot) => snapshots.push(snapshot),
@@ -65,10 +83,11 @@ fn snapshots_hold_governed_capacity_until_drop_and_repeated_snapshots_are_bounde
     );
     assert_eq!(directory_file_bytes(&active)?, before);
     drop(snapshots);
-    assert_eq!(
-        authority.governor().inspect()?.outstanding_total(),
-        baseline
-    );
+    let released = authority.governor().inspect()?;
+    assert_eq!(released.outstanding_total(), baseline.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(released.usage(dimension), baseline.usage(dimension));
+    }
     drop(root);
     Ok(())
 }

@@ -35,7 +35,7 @@ use crate::{
     RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority, WorkClaim, WorkKind,
 };
 
-use capacity::{recovery_claim, retained_claim, snapshot_claim};
+use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
@@ -250,6 +250,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         })
     }
 
+    /// Builds an immutable snapshot for an already-admitted task. The caller's
+    /// task reservation covers construction CPU; the returned snapshot retains
+    /// only resources that remain live with the view.
     pub fn snapshot(&self) -> Result<LedgerSnapshot<'kernel>, LedgerFailure> {
         let state = self
             .state
@@ -258,7 +261,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let claim = WorkClaim::tenant(
             self.scope.tenant,
             WorkKind::InteractiveQueryTail,
-            snapshot_claim(state.retained_bytes, state.blocks.len())?,
+            snapshot_retained_claim(state.retained_bytes, state.blocks.len())?,
         )
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         let reservation = self
