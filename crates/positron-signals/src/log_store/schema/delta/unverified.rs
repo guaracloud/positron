@@ -17,14 +17,20 @@ impl SchemaDelta {
         &mut self,
         catalog: &SchemaCatalog,
         root: &[SchemaEntry],
+        root_path: &SchemaPath,
     ) -> Result<(), SchemaFailure> {
         for entry in catalog.entries().filter(|entry| {
             entry.query_uses > 0
                 && entry.promoted
-                && root.iter().any(|observed| {
-                    observed.path.namespace() == entry.path.namespace()
-                        && observed.path.segments().first() == entry.path.segments().first()
-                })
+                && if root.is_empty() {
+                    entry.path.namespace() == root_path.namespace()
+                        && entry.path.segments().first() == root_path.segments().first()
+                } else {
+                    root.iter().any(|observed| {
+                        observed.path.namespace() == entry.path.namespace()
+                            && observed.path.segments().first() == entry.path.segments().first()
+                    })
+                }
         }) {
             self.mark_path_unverified(catalog, &entry.path)?;
         }

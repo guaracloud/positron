@@ -386,12 +386,18 @@ fn live_discovery_exhaustion_invalidates_unseen_promoted_descendants() -> Result
         }
         noisy_values.push(CandidateAttributeValue::key_value_list(noisy_entries));
     }
-    noisy_values.push(CandidateAttributeValue::key_value_list(vec![
-        CandidateKeyValue::new(
-            "token".to_owned(),
-            CandidateAttributeValue::signed_integer(4_096),
-        ),
-    ]));
+    let noisy = LogRecord::checked_receiver_candidate(
+        LogStore::value_limit_profile(),
+        None,
+        None,
+        Some(CandidateAttributeValue::string("body".to_owned())),
+        vec![AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "noise".to_owned(),
+            noisy_values,
+        )],
+        PolicyProvenance::new(1, [0x72; 32], vec![])?,
+    )?;
     let second = LogRecord::checked_receiver_candidate(
         LogStore::value_limit_profile(),
         None,
@@ -400,18 +406,38 @@ fn live_discovery_exhaustion_invalidates_unseen_promoted_descendants() -> Result
         vec![AttributeOccurrenceSetCandidate::new(
             AttributeNamespace::Record,
             "payload".to_owned(),
-            noisy_values,
+            vec![CandidateAttributeValue::key_value_list(vec![
+                CandidateKeyValue::new(
+                    "token".to_owned(),
+                    CandidateAttributeValue::signed_integer(4_096),
+                ),
+            ])],
         )],
-        PolicyProvenance::new(1, [0x72; 32], vec![])?,
+        PolicyProvenance::new(1, [0x73; 32], vec![])?,
     )?;
-    let identity = StoreBlockIdentity::new([0x6a; 16])?;
+    let first_identity = StoreBlockIdentity::new([0x6a; 16])?;
+    let (first_prepared, first_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(105))),
+        tenant,
+        shard,
+        first_identity,
+        vec![first],
+        &schema,
+    )?;
+    let first_block = first_prepared.into_store_block();
+    let first_digest = first_block.content_digest()?;
+    ledger.append(first_block)?;
+    store.apply_schema_delta(&mut schema, first_delta, first_identity, first_digest)?;
+
+    let identity = StoreBlockIdentity::new([0x6b; 16])?;
     let (prepared, delta) = store.prepare_with_schema_delta(
         preparation_capacity(&authority, tenant)?,
         &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(105))),
         tenant,
         shard,
         identity,
-        vec![first, second],
+        vec![noisy, second],
         &schema,
     )?;
     let block = prepared.into_store_block();

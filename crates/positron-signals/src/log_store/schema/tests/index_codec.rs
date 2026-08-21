@@ -355,6 +355,60 @@ fn legacy_survivor_upgrade_and_new_index_budget_refusal_are_atomic() -> Result<(
 }
 
 #[test]
+fn ordinary_apply_delta_upgrades_legacy_survivors_before_checkpoint_publication()
+-> Result<(), Box<dyn Error>> {
+    let (legacy, index_bytes) = exact_legacy_budget_checkpoint(2)?;
+    let legacy_len = legacy.len();
+    let mut bounded = legacy.clone();
+    bounded[42..50].copy_from_slice(&u64::try_from(legacy_len + 256)?.to_be_bytes());
+    bounded[50..58].copy_from_slice(&u64::try_from(index_bytes + 256)?.to_be_bytes());
+    let mut tight_bytes = legacy;
+    tight_bytes[42..50].copy_from_slice(&u64::try_from(legacy_len + 1)?.to_be_bytes());
+    tight_bytes[50..58].copy_from_slice(&u64::try_from(index_bytes + 1)?.to_be_bytes());
+    let (mut tight, _) = SchemaCatalog::decode_checkpoint_object(&tight_bytes)?;
+    let tight_delta = super::super::SchemaDelta::empty(tight.tenant(), true);
+    let tight_path = path(AttributeNamespace::Record, "indexed");
+    let tight_variants = tight
+        .entry(&tight_path)
+        .ok_or("indexed entry")?
+        .variants()
+        .to_vec();
+    let tight_index = super::super::index::SchemaBlockIndex::one(
+        StoreBlockIdentity::new([0x14; 16])?,
+        [0x54; 32],
+        super::super::index::SchemaIndexPath::from_variants(&tight_path, &tight_variants)?,
+    )?;
+    assert_eq!(
+        tight.apply_delta(tight_delta, Some(tight_index)),
+        Err(SchemaFailure::LimitExceeded)
+    );
+    assert_eq!(tight.persistent_bytes(), legacy_len);
+    assert_eq!(tight.index_bytes(), index_bytes);
+    let (mut decoded, _) = SchemaCatalog::decode_checkpoint_object(&bounded)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("new".to_owned()),
+    )?;
+    let mut delta = super::super::SchemaDelta::empty(decoded.tenant(), true);
+    decoded.stage_record(
+        std::slice::from_ref(&attribute),
+        &mut delta,
+        &mut super::super::delta::DiscoveryMeter::new(),
+    )?;
+    let identity = StoreBlockIdentity::new([0x13; 16])?;
+    let digest = [0x53; 32];
+    let (delta, block_index) = delta.into_block_index(identity, digest);
+    decoded.apply_delta(delta, block_index)?;
+    let encoded = decoded.encode_catalog_object()?;
+    assert_eq!(decoded.persistent_bytes(), encoded.len());
+    let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
+    assert_eq!(reopened.persistent_bytes(), encoded.len());
+    assert_eq!(reopened.index_bytes(), decoded.index_bytes());
+    Ok(())
+}
+
+#[test]
 fn governed_v1_exact_budget_demotion_releases_legacy_block_bytes() -> Result<(), Box<dyn Error>> {
     let (legacy, _) = exact_legacy_budget_checkpoint(1)?;
     with_governed_legacy_session(&legacy, |session| {

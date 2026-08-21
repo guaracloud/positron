@@ -247,7 +247,7 @@ impl SchemaCatalog {
                 stage_index_root(self, delta, &root, attributes)?;
                 merge_root(delta, root)?;
             } else {
-                delta.mark_paths_unverified(self, &root)?;
+                delta.mark_paths_unverified(self, &root, &path)?;
                 record_overflow_bytes = record_overflow_bytes
                     .checked_add(attribute_bytes(set)?)
                     .ok_or(SchemaFailure::LimitExceeded)?;

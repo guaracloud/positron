@@ -1,6 +1,6 @@
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
-use super::index::{INDEX_HEADER_BYTES, MAX_INDEX_VALUES};
+use super::index::MAX_INDEX_VALUES;
 use super::model::{SchemaPath, promoted_index_bytes};
 
 impl SchemaCatalog {
@@ -30,7 +30,7 @@ impl SchemaCatalog {
                 next.push(block.try_clone()?);
             }
         }
-        self.replace_block_indexes(next, 0)
+        self.replace_block_indexes(next, 0, 0, 0, 0)
     }
 
     pub(crate) fn retain_reachable_indexes(
@@ -48,7 +48,7 @@ impl SchemaCatalog {
                 next.push(index.try_clone()?);
             }
         }
-        self.replace_block_indexes(next, 0)
+        self.replace_block_indexes(next, 0, 0, 0, 0)
     }
 
     pub(crate) fn install_query_index(
@@ -140,7 +140,7 @@ impl SchemaCatalog {
                 next.get_mut(position)
                     .ok_or(SchemaFailure::InvalidValue)?
                     .paths = projected;
-                return self.replace_block_indexes(next, 0);
+                return self.replace_block_indexes(next, 0, 0, 0, 0);
             },
             Err(insertion) => insertion,
         };
@@ -151,7 +151,7 @@ impl SchemaCatalog {
             .try_reserve_exact(1)
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
         known.paths.insert(insertion, path);
-        self.replace_block_indexes(next, 0)
+        self.replace_block_indexes(next, 0, 0, 0, 0)
     }
 
     fn insert_query_index(
@@ -166,87 +166,7 @@ impl SchemaCatalog {
         next.try_reserve_exact(1)
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
         next.insert(position, index);
-        self.replace_block_indexes(next, 0)
-    }
-
-    fn clone_block_indexes(&self) -> Result<Vec<super::index::SchemaBlockIndex>, SchemaFailure> {
-        let mut next = Vec::new();
-        next.try_reserve_exact(self.block_indexes.len())
-            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-        for block in &self.block_indexes {
-            next.push(block.try_clone()?);
-        }
-        Ok(next)
-    }
-
-    fn replace_block_indexes(
-        &mut self,
-        mut next: Vec<super::index::SchemaBlockIndex>,
-        entry_index_reduction: usize,
-    ) -> Result<(), SchemaFailure> {
-        for block in &mut next {
-            block.scalar_framing = block.scalar_framing.for_mutation();
-        }
-        let old_wire = Self::block_indexes_wire(&self.block_indexes)?;
-        let new_wire = Self::block_indexes_wire(&next)?;
-        let old_memory = Self::block_indexes_memory(&self.block_indexes)?;
-        let new_memory = Self::block_indexes_memory(&next)?;
-        let next_persistent = self
-            .persistent_bytes
-            .checked_sub(old_wire)
-            .and_then(|bytes| bytes.checked_add(new_wire))
-            .ok_or(SchemaFailure::InvalidValue)?;
-        let next_index = self
-            .index_bytes
-            .checked_sub(old_wire)
-            .and_then(|bytes| bytes.checked_add(new_wire))
-            .and_then(|bytes| bytes.checked_sub(entry_index_reduction))
-            .ok_or(SchemaFailure::InvalidValue)?;
-        let next_memory = self
-            .memory_bytes
-            .checked_sub(old_memory)
-            .and_then(|bytes| bytes.checked_add(new_memory))
-            .ok_or(SchemaFailure::InvalidValue)?;
-        if next_persistent > self.budget.max_persistent_bytes()
-            || next_index > self.budget.max_index_bytes()
-            || next_memory > self.budget.max_memory_bytes()
-        {
-            return Err(SchemaFailure::LimitExceeded);
-        }
-        self.block_indexes = next;
-        self.persistent_bytes = next_persistent;
-        self.index_bytes = next_index;
-        self.memory_bytes = next_memory;
-        Ok(())
-    }
-
-    fn block_indexes_wire(
-        blocks: &[super::index::SchemaBlockIndex],
-    ) -> Result<usize, SchemaFailure> {
-        if blocks.is_empty() {
-            return Ok(0);
-        }
-        blocks.iter().try_fold(INDEX_HEADER_BYTES, |total, block| {
-            total
-                .checked_add(block.encoded_bytes()?)
-                .ok_or(SchemaFailure::LimitExceeded)
-        })
-    }
-
-    fn block_indexes_memory(
-        blocks: &[super::index::SchemaBlockIndex],
-    ) -> Result<usize, SchemaFailure> {
-        blocks.iter().try_fold(0_usize, |total, block| {
-            let paths = block.paths.iter().try_fold(
-                super::SchemaBudget::block_index_memory_bytes(),
-                |memory, path| {
-                    memory
-                        .checked_add(path.memory_bytes()?)
-                        .ok_or(SchemaFailure::LimitExceeded)
-                },
-            )?;
-            total.checked_add(paths).ok_or(SchemaFailure::LimitExceeded)
-        })
+        self.replace_block_indexes(next, 0, 0, 0, 0)
     }
 
     pub(crate) fn record_query_use(&mut self, path: &SchemaPath) -> Result<(), SchemaFailure> {
@@ -329,6 +249,6 @@ impl SchemaCatalog {
                 next.push(candidate);
             }
         }
-        self.replace_block_indexes(next, entry_index_reduction)
+        self.replace_block_indexes(next, entry_index_reduction, 0, 0, 0)
     }
 }
