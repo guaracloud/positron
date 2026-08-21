@@ -1,6 +1,8 @@
 use std::error::Error;
 
-use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
+use positron_query::{
+    OrderDirection, QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+};
 
 use super::terminal_and_bounds::QueryFixture;
 
@@ -89,5 +91,35 @@ fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>
                 && incomplete.stats().records() == 0
                 && incomplete.stats().output_bytes() == 0
     ));
+    Ok(())
+}
+
+#[test]
+fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("typed-order-header")?;
+    fixture.kernel.append_log("ordered", 20, 1)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position asc | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 4, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let header = match events.first() {
+        Some(QueryEvent::Header(header)) => header,
+        _ => return Err("query header missing".into()),
+    };
+    assert_eq!(
+        header.ordering().columns(),
+        ["query_time", "commit_position"]
+    );
+    assert_eq!(
+        header.ordering().directions(),
+        [OrderDirection::Descending, OrderDirection::Ascending]
+    );
     Ok(())
 }

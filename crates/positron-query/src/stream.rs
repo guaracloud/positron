@@ -63,18 +63,35 @@ impl ResultSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResultOrdering(TemporalAxis);
+pub struct ResultOrdering {
+    axis: TemporalAxis,
+    primary_direction: crate::OrderDirection,
+    commit_direction: crate::OrderDirection,
+}
 
 impl ResultOrdering {
+    pub(crate) const fn for_plan(plan: &LogicalPlan) -> Self {
+        Self {
+            axis: plan.temporal_axis(),
+            primary_direction: plan.ordering().primary_direction(),
+            commit_direction: plan.ordering().commit_direction(),
+        }
+    }
+
     #[must_use]
     pub const fn columns(self) -> [&'static str; 2] {
         [
-            match self.0 {
+            match self.axis {
                 TemporalAxis::QueryTime => "query_time",
                 TemporalAxis::EventTime => "event_time",
             },
             "commit_position",
         ]
+    }
+
+    #[must_use]
+    pub const fn directions(self) -> [crate::OrderDirection; 2] {
+        [self.primary_direction, self.commit_direction]
     }
 }
 
@@ -135,7 +152,7 @@ impl QueryHeader {
     }
     #[must_use]
     pub const fn ordering(&self) -> ResultOrdering {
-        ResultOrdering(self.plan.temporal_axis())
+        ResultOrdering::for_plan(&self.plan)
     }
     #[must_use]
     pub const fn budget(&self) -> QueryBudget {

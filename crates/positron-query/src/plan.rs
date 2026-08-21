@@ -60,7 +60,7 @@ pub(crate) enum AggregateSpec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OrderDirection {
+pub enum OrderDirection {
     Ascending,
     Descending,
 }

@@ -17,7 +17,7 @@ mod stream_lifecycle;
 pub use budget::QueryBudget;
 pub use cursor::QueryCursor;
 pub use failure::{QueryFailure, QueryFailureCode};
-pub use plan::{LogicalPlan, PlannedQuery, TemporalAxis, TemporalRange};
+pub use plan::{LogicalPlan, OrderDirection, PlannedQuery, TemporalAxis, TemporalRange};
 pub use runtime::{
     QueryClock, QueryClockFailure, QueryWorkFailure, QueryWorkMeter, QueryWorkStage,
 };
