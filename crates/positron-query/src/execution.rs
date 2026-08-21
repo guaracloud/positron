@@ -261,15 +261,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if page.is_empty() {
             state = output_state;
             let stats = stats_before_current(&state);
-            if state.cancellation.is_cancelled() {
-                return self.stopped_page_with_stats(
-                    Some(header),
-                    QueryFailureCode::Cancelled,
-                    &state,
-                    delivered_before,
-                    stats,
-                );
-            }
             return self.stream(
                 vec![header, QueryEvent::Terminal(QueryTerminal::Complete(stats))],
                 &state,
