@@ -42,6 +42,10 @@ pub(crate) fn query_record(
         body,
         ordering_time,
         record.commit_position(),
+        plan.projection()
+            .contains(&crate::plan::ProjectionColumn::QueryTime),
+        plan.projection()
+            .contains(&crate::plan::ProjectionColumn::CommitPosition),
     ))
 }
 
@@ -111,11 +115,13 @@ pub(crate) fn charge_output(
         )
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     let page_bytes = page.iter().try_fold(0_u64, |total, record| {
-        total.checked_add(u64::try_from(record.body_text().map_or(0, str::len)).ok()?)
-    });
+        total
+            .checked_add(record.emitted_size_bytes()?)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
+    })?;
     state.output_bytes = state
         .output_bytes
-        .checked_add(page_bytes.ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?)
+        .checked_add(page_bytes)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     Ok(())
 }

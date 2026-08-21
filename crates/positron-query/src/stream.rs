@@ -156,6 +156,8 @@ pub struct QueryRecord {
     body: Option<String>,
     query_time: UnixNanoseconds,
     commit_position: CommitPosition,
+    query_time_selected: bool,
+    commit_position_selected: bool,
     count: Option<u64>,
 }
 
@@ -164,11 +166,15 @@ impl QueryRecord {
         body: Option<String>,
         query_time: UnixNanoseconds,
         commit_position: CommitPosition,
+        query_time_selected: bool,
+        commit_position_selected: bool,
     ) -> Self {
         Self {
             body,
             query_time,
             commit_position,
+            query_time_selected,
+            commit_position_selected,
             count: None,
         }
     }
@@ -178,6 +184,8 @@ impl QueryRecord {
             body: None,
             query_time: UnixNanoseconds::new(0),
             commit_position: CommitPosition::origin(),
+            query_time_selected: false,
+            commit_position_selected: false,
             count: Some(count),
         }
     }
@@ -197,6 +205,18 @@ impl QueryRecord {
     pub const fn count(&self) -> Option<u64> {
         self.count
     }
+
+    pub(crate) fn emitted_size_bytes(&self) -> Result<u64, QueryFailure> {
+        let body_bytes = u64::try_from(self.body_text().map_or(0, str::len))
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let query_time_bytes = u64::from(self.query_time_selected) * 8;
+        let commit_position_bytes = u64::from(self.commit_position_selected) * 8;
+        body_bytes
+            .checked_add(query_time_bytes)
+            .and_then(|bytes| bytes.checked_add(commit_position_bytes))
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
+    }
+
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition) {
         (self.query_time, self.commit_position)
     }
