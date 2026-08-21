@@ -9,7 +9,9 @@ use crate::{
     LogicalPlan, PlannedQuery, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis,
     TemporalRange,
 };
-use crate::plan::{AggregateSpec, FilterPredicate, ProjectionColumn};
+use crate::plan::{
+    AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn,
+};
 
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
@@ -269,6 +271,7 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let mut filter = None;
     let mut projection = None;
     let mut aggregate = None;
+    let mut ordering = None;
     let mut limit = None;
     for stage in stages {
         if let Some(arguments) = stage.strip_prefix("range ") {
@@ -298,6 +301,11 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
             if aggregate.replace(AggregateSpec::Count).is_some() {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
+        } else if let Some(specification) = stage.strip_prefix("order by ") {
+            if ordering.is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            ordering = Some(specification.to_owned());
         } else if let Some(value) = stage.strip_prefix("limit ") {
             if limit.is_some() {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
@@ -322,6 +330,10 @@ fn parse_versioned_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     }
     if let Some(aggregate) = aggregate {
         plan = plan.with_aggregate(aggregate);
+    }
+    if let Some(ordering) = ordering {
+        let parsed = parse_ordering(plan.temporal_axis(), &ordering)?;
+        plan = plan.with_ordering(parsed);
     }
     Ok(plan)
 }
@@ -429,4 +441,31 @@ fn parse_projection(parts: &[&str]) -> Result<Vec<ProjectionColumn>, QueryFailur
         projection.push(column);
     }
     Ok(projection)
+}
+
+fn parse_ordering(axis: TemporalAxis, specification: &str) -> Result<OrderSpec, QueryFailure> {
+    let tokens = specification.split_ascii_whitespace().collect::<Vec<_>>();
+    if tokens.len() != 4 {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    let primary = tokens[0];
+    let primary_direction = parse_direction(tokens[1].trim_end_matches(','))?;
+    let commit = tokens[2].trim_end_matches(',');
+    let commit_direction = parse_direction(tokens[3])?;
+    let expected_axis = match axis {
+        TemporalAxis::QueryTime => "query_time",
+        TemporalAxis::EventTime => "event_time",
+    };
+    if primary != expected_axis || commit != "commit_position" {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
+    Ok(OrderSpec::new(primary_direction, commit_direction))
+}
+
+fn parse_direction(source: &str) -> Result<OrderDirection, QueryFailure> {
+    match source {
+        "asc" => Ok(OrderDirection::Ascending),
+        "desc" => Ok(OrderDirection::Descending),
+        _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+    }
 }

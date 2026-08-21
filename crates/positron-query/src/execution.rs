@@ -8,8 +8,8 @@ use crate::execution_state::{
     stats_with_current, validate_authorization,
 };
 use crate::execution_support::{
-    batch_digest, charge_output, charge_scan, charge_work, exhausted, map_ledger_failure,
-    map_store_failure, query_record,
+    batch_digest, charge_output, charge_scan, charge_work, compare_records, exhausted,
+    map_ledger_failure, map_store_failure, query_record,
 };
 use crate::{
     PlannedQuery, QueryBatch, QueryCursor, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader,
@@ -178,7 +178,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .iter()
             .filter_map(|record| query_record(record, &state.plan))
             .collect::<Vec<_>>();
-        records.sort_by_key(QueryRecord::order_key);
+        records.sort_by(|left, right| {
+            compare_records(left, right, state.plan.ordering())
+        });
         if state.plan.aggregate().is_some() {
             records = vec![QueryRecord::count_record(
                 u64::try_from(records.len())

@@ -1,4 +1,5 @@
 use positron_domain::time::{IngestTimeCandidate, QueryTime};
+use std::cmp::Ordering;
 
 use crate::cursor::CursorState;
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
@@ -42,6 +43,26 @@ pub(crate) fn query_record(
         ordering_time,
         record.commit_position(),
     ))
+}
+
+pub(crate) fn compare_records(
+    left: &QueryRecord,
+    right: &QueryRecord,
+    ordering: crate::plan::OrderSpec,
+) -> Ordering {
+    let primary = left.query_time().cmp(&right.query_time());
+    let primary = match ordering.primary_direction() {
+        crate::plan::OrderDirection::Ascending => primary,
+        crate::plan::OrderDirection::Descending => primary.reverse(),
+    };
+    if primary != Ordering::Equal {
+        return primary;
+    }
+    let commit = left.commit_position().cmp(&right.commit_position());
+    match ordering.commit_direction() {
+        crate::plan::OrderDirection::Ascending => commit,
+        crate::plan::OrderDirection::Descending => commit.reverse(),
+    }
 }
 
 pub(crate) fn charge_scan(

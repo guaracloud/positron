@@ -59,6 +59,45 @@ pub(crate) enum AggregateSpec {
     Count,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OrderDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrderSpec {
+    primary_direction: OrderDirection,
+    commit_direction: OrderDirection,
+}
+
+impl OrderSpec {
+    pub(crate) const fn new(
+        primary_direction: OrderDirection,
+        commit_direction: OrderDirection,
+    ) -> Self {
+        Self {
+            primary_direction,
+            commit_direction,
+        }
+    }
+
+    pub(crate) const fn ascending(_axis: TemporalAxis) -> Self {
+        Self {
+            primary_direction: OrderDirection::Ascending,
+            commit_direction: OrderDirection::Ascending,
+        }
+    }
+
+    pub(crate) const fn primary_direction(self) -> OrderDirection {
+        self.primary_direction
+    }
+
+    pub(crate) const fn commit_direction(self) -> OrderDirection {
+        self.commit_direction
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalPlan {
     version: u8,
@@ -68,6 +107,7 @@ pub struct LogicalPlan {
     filter: Option<FilterPredicate>,
     projection: Vec<ProjectionColumn>,
     aggregate: Option<AggregateSpec>,
+    ordering: OrderSpec,
 }
 
 impl LogicalPlan {
@@ -80,6 +120,7 @@ impl LogicalPlan {
             filter: None,
             projection: vec![ProjectionColumn::Body],
             aggregate: None,
+            ordering: OrderSpec::ascending(axis),
         }
     }
 
@@ -92,6 +133,7 @@ impl LogicalPlan {
         self.filter.is_some()
             || self.projection != [ProjectionColumn::Body]
             || self.aggregate.is_some()
+            || self.ordering != OrderSpec::ascending(self.axis)
     }
 
     pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
@@ -114,6 +156,15 @@ impl LogicalPlan {
 
     pub(crate) const fn aggregate(&self) -> Option<AggregateSpec> {
         self.aggregate
+    }
+
+    pub(crate) fn with_ordering(mut self, ordering: OrderSpec) -> Self {
+        self.ordering = ordering;
+        self
+    }
+
+    pub(crate) const fn ordering(&self) -> OrderSpec {
+        self.ordering
     }
 
     pub(crate) const fn limit(&self) -> u16 {
