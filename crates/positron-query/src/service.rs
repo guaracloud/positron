@@ -373,8 +373,12 @@ fn parse_ordering(axis: TemporalAxis, specification: &str) -> Result<OrderSpec, 
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
     let primary = tokens[0];
-    let primary_direction = parse_direction(tokens[1].trim_end_matches(','))?;
-    let commit = tokens[2].trim_end_matches(',');
+    let primary_direction = parse_direction(
+        tokens[1]
+            .strip_suffix(',')
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
+    )?;
+    let commit = tokens[2];
     let commit_direction = parse_direction(tokens[3])?;
     let expected_axis = match axis {
         TemporalAxis::QueryTime => "query_time",
