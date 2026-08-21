@@ -6,6 +6,9 @@ use crate::cursor::CursorState;
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
 
 const MAX_GROUPS: usize = 1_024;
+const DIGEST_STATE_BYTES: u64 = 256;
+const DIGEST_CONTRACT_BYTES: usize = 128;
+const DIGEST_CHUNK_BYTES: usize = 1_024;
 
 pub(crate) fn query_record(
     record: &positron_signals::ScannedLogRecord,
@@ -49,15 +52,20 @@ pub(crate) fn query_record(
     };
     Ok(Some(QueryRecord::new(
         body,
-        body_selected,
-        query_time,
-        event_time,
-        ordering_time,
+        crate::stream::QueryRecordTimes {
+            query: query_time,
+            event: event_time,
+            ordering: ordering_time,
+        },
         record.commit_position(),
         record.record_ordinal(),
-        selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
-        selected_columns.contains(&crate::plan::ProjectionColumn::EventTime),
-        selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition),
+        crate::stream::QueryRecordSelection {
+            body: body_selected,
+            query_time: selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime),
+            event_time: selected_columns.contains(&crate::plan::ProjectionColumn::EventTime),
+            commit_position: selected_columns
+                .contains(&crate::plan::ProjectionColumn::CommitPosition),
+        },
     )))
 }
 
@@ -327,48 +335,150 @@ pub(crate) fn batch_digest(
     plan: &LogicalPlan,
     records: &[QueryRecord],
     cancellation: &crate::QueryCancellation,
+    memory: &mut crate::memory::QueryMemory,
 ) -> Result<[u8; 32], QueryFailure> {
-    let mut encoding = Vec::new();
-    encoding.extend_from_slice(&prior);
-    encoding.extend_from_slice(&sequence.to_be_bytes());
-    encode_result_contract(&mut encoding, plan)?;
-    encoding.extend_from_slice(
+    memory.acquire(DIGEST_STATE_BYTES)?;
+    let result = batch_digest_with_acquired_state(
+        protector,
+        prior,
+        sequence,
+        plan,
+        records,
+        cancellation,
+        memory,
+    );
+    memory.release(DIGEST_STATE_BYTES)?;
+    result
+}
+
+fn batch_digest_with_acquired_state(
+    protector: &positron_kernel::ControlTokenProtector<'_>,
+    prior: [u8; 32],
+    sequence: u64,
+    plan: &LogicalPlan,
+    records: &[QueryRecord],
+    cancellation: &crate::QueryCancellation,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<[u8; 32], QueryFailure> {
+    check_digest_cancellation(cancellation)?;
+    let mut digest = protector
+        .query_result_digest()
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    digest.update(&prior);
+    digest.update(&sequence.to_be_bytes());
+    update_result_contract_digest(&mut digest, plan, cancellation, memory)?;
+    digest.update(
         &u64::try_from(records.len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
             .to_be_bytes(),
     );
     for record in records {
-        if cancellation.is_cancelled() {
-            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
-        }
+        check_digest_cancellation(cancellation)?;
         let (query_time, position, ordinal) = record.order_key();
-        encoding.extend_from_slice(&query_time.value().to_be_bytes());
-        encoding.extend_from_slice(&position.value().to_be_bytes());
-        encoding.extend_from_slice(&ordinal.value().to_be_bytes());
-        encoding.push(u8::from(record.body_value().is_some()));
+        digest.update(&query_time.value().to_be_bytes());
+        digest.update(&position.value().to_be_bytes());
+        digest.update(&ordinal.value().to_be_bytes());
+        digest.update(&[u8::from(record.body_value().is_some())]);
         if let Some(body) = record.body_value() {
-            body.append_canonical_encoding(&mut encoding)
-                .map_err(map_domain_value_failure)?;
+            update_native_value_digest(&mut digest, body, cancellation, memory)?;
         }
-        encoding.push(u8::from(record.query_time_selected()));
+        digest.update(&[u8::from(record.query_time_selected())]);
         if record.query_time_selected() {
-            encoding.extend_from_slice(&record.query_time().value().to_be_bytes());
+            digest.update(&record.query_time().value().to_be_bytes());
         }
-        encoding.push(u8::from(record.event_time_selected()));
+        digest.update(&[u8::from(record.event_time_selected())]);
         if record.event_time_selected() {
-            encoding.push(u8::from(record.event_time().is_some()));
+            digest.update(&[u8::from(record.event_time().is_some())]);
             if let Some(event_time) = record.event_time() {
-                encoding.extend_from_slice(&event_time.value().to_be_bytes());
+                digest.update(&event_time.value().to_be_bytes());
             }
         }
-        encoding.push(u8::from(record.count().is_some()));
+        digest.update(&[u8::from(record.count().is_some())]);
         if let Some(count) = record.count() {
-            encoding.extend_from_slice(&count.to_be_bytes());
+            digest.update(&count.to_be_bytes());
         }
     }
-    protector
-        .digest(b"query-result-batch-v1", &encoding)
+    check_digest_cancellation(cancellation)?;
+    digest
+        .finalize()
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+}
+
+fn update_result_contract_digest(
+    digest: &mut positron_kernel::QueryResultDigest,
+    plan: &LogicalPlan,
+    cancellation: &crate::QueryCancellation,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<(), QueryFailure> {
+    check_digest_cancellation(cancellation)?;
+    let scratch_bytes = u64::try_from(DIGEST_CONTRACT_BYTES)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    memory.acquire(scratch_bytes)?;
+    let mut encoding = Vec::new();
+    if encoding.try_reserve_exact(DIGEST_CONTRACT_BYTES).is_err() {
+        memory.release(scratch_bytes)?;
+        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+    }
+    let encoded = encode_result_contract(&mut encoding, plan);
+    if encoding.len() > DIGEST_CONTRACT_BYTES {
+        drop(encoding);
+        memory.release(scratch_bytes)?;
+        return Err(QueryFailure::new(QueryFailureCode::Internal));
+    }
+    if let Err(failure) = encoded {
+        drop(encoding);
+        memory.release(scratch_bytes)?;
+        return Err(failure);
+    }
+    digest.update(&encoding);
+    drop(encoding);
+    memory.release(scratch_bytes)?;
+    Ok(())
+}
+
+fn update_native_value_digest(
+    digest: &mut positron_kernel::QueryResultDigest,
+    value: &positron_domain::value::ValidatedAttributeValue,
+    cancellation: &crate::QueryCancellation,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<(), QueryFailure> {
+    check_digest_cancellation(cancellation)?;
+    let encoded_bytes = value
+        .canonical_encoded_size_bytes()
+        .map_err(map_domain_value_failure)?;
+    let memory_bytes =
+        u64::try_from(encoded_bytes).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    memory.acquire(memory_bytes)?;
+    let mut encoding = Vec::new();
+    if encoding.try_reserve_exact(encoded_bytes).is_err() {
+        memory.release(memory_bytes)?;
+        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+    }
+    if let Err(failure) = value.append_canonical_encoding(&mut encoding) {
+        drop(encoding);
+        memory.release(memory_bytes)?;
+        return Err(map_domain_value_failure(failure));
+    }
+    if encoding.len() != encoded_bytes {
+        drop(encoding);
+        memory.release(memory_bytes)?;
+        return Err(QueryFailure::new(QueryFailureCode::Internal));
+    }
+    for chunk in encoding.chunks(DIGEST_CHUNK_BYTES) {
+        check_digest_cancellation(cancellation)?;
+        digest.update(chunk);
+    }
+    drop(encoding);
+    memory.release(memory_bytes)?;
+    Ok(())
+}
+
+fn check_digest_cancellation(cancellation: &crate::QueryCancellation) -> Result<(), QueryFailure> {
+    if cancellation.is_cancelled() {
+        Err(QueryFailure::new(QueryFailureCode::Cancelled))
+    } else {
+        Ok(())
+    }
 }
 
 fn map_domain_value_failure(failure: positron_domain::outcome::DomainFailure) -> QueryFailure {

@@ -91,6 +91,7 @@ pub use active_segment_ledger::{
 pub use data_protection::{
     BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
     BootstrapObjectPurpose, ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector,
+    QueryResultDigest,
 };
 
 pub use instance_bootstrap_storage::{

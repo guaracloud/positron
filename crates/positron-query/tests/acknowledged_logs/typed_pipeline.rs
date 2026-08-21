@@ -651,6 +651,44 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
 }
 
 #[test]
+fn batch_digest_streams_valid_bodies_larger_than_control_token_payloads()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("streamed-result-digest")?;
+    let body = "x".repeat(5_000);
+    fixture.kernel.append_log(&body, 20, 1)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source = "pipeline:v1 logs | range query_time -100 100 | project body | limit 1";
+    let execute = || -> Result<[u8; 32], Box<dyn Error>> {
+        let query = service.plan_pipeline(
+            fixture.context,
+            source,
+            QueryBudget::new(1_048_576, 1, 1, 8_192, 1_048_576, 60)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if stats.records() == 1 && stats.result_digest() != [0; 32]
+        ));
+        events
+            .iter()
+            .find_map(|event| match event {
+                QueryEvent::Batch(batch) => Some(batch.digest()),
+                QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+            })
+            .ok_or_else(|| "large-body result batch missing".into())
+    };
+
+    assert_eq!(execute()?, execute()?);
+    Ok(())
+}
+
+#[test]
 fn same_time_records_in_one_block_have_a_stable_total_identity_across_reopen()
 -> Result<(), Box<dyn Error>> {
     let mut fixture = QueryFixture::new("same-block-total-order")?;

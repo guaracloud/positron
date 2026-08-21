@@ -287,6 +287,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             &state.plan,
             &page,
             &state.cancellation,
+            &mut memory,
         ) {
             Ok(digest) => digest,
             Err(failure) if failure.code() == QueryFailureCode::Cancelled => {

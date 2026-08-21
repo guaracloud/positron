@@ -256,30 +256,38 @@ pub struct QueryRecord {
     count: Option<u64>,
 }
 
+pub(crate) struct QueryRecordTimes {
+    pub(crate) query: UnixNanoseconds,
+    pub(crate) event: Option<UnixNanoseconds>,
+    pub(crate) ordering: UnixNanoseconds,
+}
+
+pub(crate) struct QueryRecordSelection {
+    pub(crate) body: bool,
+    pub(crate) query_time: bool,
+    pub(crate) event_time: bool,
+    pub(crate) commit_position: bool,
+}
+
 impl QueryRecord {
     pub(crate) const fn new(
         body: Option<positron_domain::value::ValidatedAttributeValue>,
-        body_selected: bool,
-        query_time: UnixNanoseconds,
-        event_time: Option<UnixNanoseconds>,
-        ordering_time: UnixNanoseconds,
+        times: QueryRecordTimes,
         commit_position: CommitPosition,
         record_ordinal: RecordOrdinal,
-        query_time_selected: bool,
-        event_time_selected: bool,
-        commit_position_selected: bool,
+        selection: QueryRecordSelection,
     ) -> Self {
         Self {
             body,
-            body_selected,
-            query_time,
-            event_time,
-            ordering_time,
+            body_selected: selection.body,
+            query_time: times.query,
+            event_time: times.event,
+            ordering_time: times.ordering,
             commit_position,
             record_ordinal,
-            query_time_selected,
-            event_time_selected,
-            commit_position_selected,
+            query_time_selected: selection.query_time,
+            event_time_selected: selection.event_time,
+            commit_position_selected: selection.commit_position,
             count: None,
         }
     }
