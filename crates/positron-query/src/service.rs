@@ -169,6 +169,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let tokens = source.split_ascii_whitespace().collect::<Vec<_>>();
     match tokens.as_slice() {
+        ["pipeline:v1", "logs", "|", "range", axis, start, end, "|", "limit", limit] => {
+            plan(axis, start, end, limit)
+        },
         ["logs", "|", "range", axis, start, end, "|", "limit", limit] => {
             plan(axis, start, end, limit)
         },

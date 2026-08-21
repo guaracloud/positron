@@ -44,6 +44,7 @@ impl TemporalRange {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalPlan {
+    version: u8,
     axis: TemporalAxis,
     range: TemporalRange,
     limit: u16,
@@ -51,7 +52,12 @@ pub struct LogicalPlan {
 
 impl LogicalPlan {
     pub(crate) const fn logs(axis: TemporalAxis, range: TemporalRange, limit: u16) -> Self {
-        Self { axis, range, limit }
+        Self {
+            version: 1,
+            axis,
+            range,
+            limit,
+        }
     }
 
     pub(crate) const fn limit(self) -> u16 {
