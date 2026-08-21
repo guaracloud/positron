@@ -152,3 +152,32 @@ fn pipeline_and_sql_require_the_same_explicit_bounded_temporal_range() -> Result
     );
     Ok(())
 }
+
+#[test]
+fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box<dyn Error>> {
+    let roots = TemporaryRoots::new("versioned-pipeline")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "versioned-pipeline-kernel")?;
+    fixture.append_log("versioned", 20, 1)?;
+    let service = QueryService::new(fixture.authority.governor(), fixture.ledger()?, 16);
+    let query = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(event, QueryEvent::Batch(_))));
+    Ok(())
+}
