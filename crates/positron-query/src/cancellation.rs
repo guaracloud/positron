@@ -26,3 +26,9 @@ impl QueryCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 }
+
+impl positron_signals::ScanCancellation for QueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}

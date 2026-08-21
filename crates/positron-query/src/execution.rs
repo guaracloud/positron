@@ -144,7 +144,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ResultLease::new(state.lease_identity, state.expiry),
             initial_cursor,
         ));
-        let result = match LogStore::new().scan(
+        let result = match LogStore::new().scan_cancellable(
             self.governor,
             state.tenant,
             snapshot,
@@ -153,6 +153,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
                 frontier,
             ),
+            &state.cancellation,
         ) {
             Ok(result) => result,
             Err(failure) => {

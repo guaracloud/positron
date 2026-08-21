@@ -388,6 +388,7 @@ const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> 
         positron_signals::LogStoreFailureCode::ResourceExhausted => {
             QueryFailureCode::ResourceExhausted
         },
+        positron_signals::LogStoreFailureCode::Cancelled => QueryFailureCode::Cancelled,
         _ => QueryFailureCode::StoreUnavailable,
     }
 }
@@ -398,7 +399,7 @@ mod tests {
     use crate::QueryFailureCode;
 
     #[test]
-    fn storage_allocation_exhaustion_is_not_reported_as_tenant_budget_exhaustion() {
+    fn storage_failures_preserve_resource_and_cancellation_truth() {
         assert_eq!(
             map_store_failure_code(positron_signals::LogStoreFailureCode::ResourceExhausted),
             QueryFailureCode::ResourceExhausted
@@ -406,6 +407,10 @@ mod tests {
         assert_eq!(
             map_store_failure_code(positron_signals::LogStoreFailureCode::LimitExceeded),
             QueryFailureCode::BudgetExhausted
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::Cancelled),
+            QueryFailureCode::Cancelled
         );
     }
 }

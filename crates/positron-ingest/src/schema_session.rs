@@ -230,6 +230,9 @@ impl TenantSchemaSession {
                 | positron_signals::LogStoreFailureCode::Kernel => {
                     SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
                 },
+                positron_signals::LogStoreFailureCode::Cancelled => {
+                    SchemaSessionFailure::StateUnavailable
+                },
             })?;
         state.in_flight = Some(identity);
         Ok(delta)

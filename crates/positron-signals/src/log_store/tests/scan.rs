@@ -1,5 +1,14 @@
 use super::*;
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkClass, WorkKind};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct CancelDuringDecode(AtomicU64);
+
+impl super::super::ScanCancellation for CancelDuringDecode {
+    fn is_cancelled(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst) >= 4
+    }
+}
 
 #[test]
 fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Error>> {
@@ -271,6 +280,64 @@ fn insufficient_query_budget_refuses_before_decode_and_releases_on_error()
         )
         .expect_err("malformed authenticated bytes fail closed");
     assert_eq!(malformed.code(), LogStoreFailureCode::MalformedBlock);
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        baseline
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellable_scan_stops_between_decoded_records_and_releases_capacity()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x71; 16])?,
+        CatalogSecret::from_owned(Box::new([0x72; 32]), Box::new([0x73; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(81)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x74; 32])),
+    )?;
+    for identity in [0x75_u8, 0x76] {
+        ledger.append(
+            LogStore::new()
+                .prepare(
+                    preparation_capacity(&authority, tenant)?,
+                    &clock(i64::from(identity)),
+                    tenant,
+                    shard,
+                    StoreBlockIdentity::new([identity; 16])?,
+                    vec![minimal_record("cancel-me", i64::from(identity))?],
+                )?
+                .into_store_block(),
+        )?;
+    }
+    let baseline = authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+
+    let failure = LogStore::new()
+        .scan_cancellable(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            LogScan::all(ScanLimit::new(2)?),
+            &CancelDuringDecode(AtomicU64::new(0)),
+        )
+        .expect_err("cancellation must interrupt bounded block decoding");
+    assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
     assert_eq!(
         authority
             .governor()

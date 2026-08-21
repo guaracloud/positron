@@ -121,6 +121,22 @@ pub(super) fn decode_block(
     bytes: &[u8],
     limit: usize,
 ) -> Result<DecodedBlock, LogStoreFailure> {
+    decode_block_cancellable(
+        expected_tenant,
+        snapshot,
+        bytes,
+        limit,
+        &super::scan::NeverCancelled,
+    )
+}
+
+pub(super) fn decode_block_cancellable(
+    expected_tenant: TenantId,
+    snapshot: &LedgerSnapshot<'_>,
+    bytes: &[u8],
+    limit: usize,
+    cancellation: &dyn super::ScanCancellation,
+) -> Result<DecodedBlock, LogStoreFailure> {
     let mut input = Input::new(bytes);
     if input.take(MAGIC.len())? != MAGIC {
         return Err(LogStoreFailure::malformed_block());
@@ -144,6 +160,9 @@ pub(super) fn decode_block(
     let retained_count = count.min(limit);
     let mut records = bounded_vec(retained_count)?;
     for index in 0..count {
+        if cancellation.is_cancelled() {
+            return Err(LogStoreFailure::cancelled());
+        }
         let decoded = decode_record(&mut input, limits, version)?;
         if index < retained_count {
             records.push(decoded.into_stored(snapshot));
@@ -152,6 +171,9 @@ pub(super) fn decode_block(
     let truncated = retained_count < count;
     if !input.is_empty() {
         return Err(LogStoreFailure::malformed_block());
+    }
+    if cancellation.is_cancelled() {
+        return Err(LogStoreFailure::cancelled());
     }
     Ok(DecodedBlock { records, truncated })
 }

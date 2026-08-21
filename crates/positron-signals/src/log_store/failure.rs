@@ -15,6 +15,7 @@ pub enum LogStoreFailureCode {
     ResourceExhausted,
     ClockUnavailable,
     ResourceAdmissionRefused,
+    Cancelled,
 }
 
 /// Redacted Log Store failure that never contains telemetry values.
@@ -63,6 +64,12 @@ impl LogStoreFailure {
     pub(super) const fn resource_admission_refused() -> Self {
         Self {
             code: LogStoreFailureCode::ResourceAdmissionRefused,
+        }
+    }
+
+    pub(super) const fn cancelled() -> Self {
+        Self {
+            code: LogStoreFailureCode::Cancelled,
         }
     }
 

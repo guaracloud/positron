@@ -21,6 +21,7 @@ pub(crate) const fn classify_log_store_failure_code(code: LogStoreFailureCode) -
         LogStoreFailureCode::Kernel => {
             IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
         },
+        LogStoreFailureCode::Cancelled => IngestOutcome::Retryable(IngestFailureCode::Cancelled),
     }
 }
 

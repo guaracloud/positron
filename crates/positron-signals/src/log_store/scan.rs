@@ -5,6 +5,20 @@ use super::{LogStoreFailure, StoredLogRecord};
 
 const MAX_SCAN_RECORDS: usize = 1_024;
 
+/// Cooperative cancellation capability for bounded Signal Store scans.
+pub trait ScanCancellation: Send + Sync {
+    /// Reports whether the caller has cancelled the scan.
+    fn is_cancelled(&self) -> bool;
+}
+
+pub(super) struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 /// Explicit finite record bound for one logical scan result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScanLimit(usize);
