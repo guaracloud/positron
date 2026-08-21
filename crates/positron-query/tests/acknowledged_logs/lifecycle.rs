@@ -294,7 +294,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
                 && incomplete.stats().scanned_bytes() > 0
                 && incomplete.stats().decoded_records() == 2
                 && incomplete.stats().output_bytes() == u64::try_from(output_bytes)?
-                && incomplete.stats().cpu_work_units() == 3
+                && incomplete.stats().cpu_work_units() == 4
                 && incomplete.stats().wall_seconds() == 0
                 && incomplete.stats().last_sequence() == Some(0)
                 && incomplete.stats().result_digest() == digest
@@ -314,5 +314,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
 }
 
 fn budget() -> QueryBudget {
-    QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60).expect("fixture budget")
+    QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)
+        .and_then(|budget| budget.with_cpu_work_units(16))
+        .expect("fixture budget")
 }

@@ -505,7 +505,8 @@ fn versioned_pipeline_orders_by_intrinsic_time_with_commit_tie_breaking()
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position asc | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let bodies = events

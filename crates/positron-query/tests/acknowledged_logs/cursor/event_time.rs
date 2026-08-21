@@ -67,7 +67,7 @@ impl QueryFixtureForAxis {
         let plan = service.plan_pipeline(
             context,
             "logs | range event_time -100 100 | limit 2",
-            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?,
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4, 60)?.with_cpu_work_units(16)?,
         )?;
         Ok(Self {
             _roots: roots,

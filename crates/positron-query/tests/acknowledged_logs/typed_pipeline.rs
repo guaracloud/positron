@@ -164,6 +164,142 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
 }
 
 #[test]
+fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("default-sort-work")?;
+    fixture.kernel.append_log("later", 20, 1)?;
+    fixture.kernel.append_log("earlier", 10, 2)?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source = "logs | range query_time -100 100 | limit 2";
+
+    let exact = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 2, 2, 12, 1_024, 60)?.with_cpu_work_units(4)?,
+    )?;
+    let exact_events = service.execute(exact)?.collect::<Vec<_>>();
+    assert!(matches!(
+        exact_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.cpu_work_units() == 4
+    ));
+
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 2, 2, 12, 1_024, 60)?.with_cpu_work_units(3)?,
+    )?;
+    let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 4
+    ));
+    assert!(
+        !exhausted_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn default_total_order_observes_cancellation_inside_sorting() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("default-sort-cancel")?;
+    fixture.kernel.append_log("third", 30, 1)?;
+    fixture.kernel.append_log("first", 10, 2)?;
+    fixture.kernel.append_log("second", 20, 3)?;
+    let meter = CancellingStageWorkMeter::shared(positron_query::QueryWorkStage::Operators);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 3",
+        QueryBudget::new(1_048_576, 3, 3, 16, 1_024, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_interrupts_substantial_default_sort_work() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("default-sort-mid-cancel")?;
+    for identity in 1_u8..=8 {
+        fixture.kernel.append_log(
+            &format!("record-{identity}"),
+            i64::from(9_u8.saturating_sub(identity)),
+            identity,
+        )?;
+    }
+    let meter = BlockingOperatorWorkMeter::shared(3);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 8",
+        QueryBudget::new(1_048_576, 8, 8, 64, 1_024, 60)?,
+    )?;
+    let cancellation = query.cancellation();
+
+    let events = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let service = &service;
+        let worker = scope.spawn(move || service.execute(query).map(Iterator::collect::<Vec<_>>));
+        meter.wait_until_blocked()?;
+        cancellation.cancel();
+        meter.release()?;
+        worker
+            .join()
+            .map_err(|_| "query execution thread panicked")?
+            .map_err(Into::into)
+    })?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
 fn versioned_pipeline_rejects_operator_combinations_it_cannot_execute() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("typed-operator-combinations")?;
