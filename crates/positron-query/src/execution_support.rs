@@ -1,6 +1,5 @@
 use positron_domain::time::{IngestTimeCandidate, QueryTime};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 
 use crate::cursor::CursorState;
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
@@ -89,7 +88,7 @@ fn try_retained_value(
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum GroupValue {
     Body(Option<positron_domain::value::ValidatedAttributeValue>),
     QueryTime(positron_domain::time::UnixNanoseconds),
@@ -97,7 +96,7 @@ enum GroupValue {
     CommitPosition(positron_domain::routing::CommitPosition),
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GroupKey(Vec<GroupValue>);
 
 impl GroupKey {
@@ -155,15 +154,55 @@ impl GroupKey {
             count,
         )
     }
+
+    fn comparison_encoding(
+        &self,
+        memory: &mut crate::memory::QueryMemory,
+    ) -> Result<(Vec<u8>, u64), QueryFailure> {
+        let encoded_bytes = self.0.iter().try_fold(0_usize, |total, value| {
+            total
+                .checked_add(group_value_comparison_size(value)?)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))
+        })?;
+        let memory_bytes = u64::try_from(encoded_bytes)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+        memory.acquire(memory_bytes)?;
+        let mut encoding = Vec::new();
+        if encoding.try_reserve_exact(encoded_bytes).is_err() {
+            memory.release(memory_bytes)?;
+            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+        }
+        for value in &self.0 {
+            if let Err(failure) = append_group_value_comparison(value, &mut encoding) {
+                drop(encoding);
+                memory.release(memory_bytes)?;
+                return Err(failure);
+            }
+        }
+        if encoding.len() != encoded_bytes {
+            drop(encoding);
+            memory.release(memory_bytes)?;
+            return Err(QueryFailure::new(QueryFailureCode::Internal));
+        }
+        Ok((encoding, memory_bytes))
+    }
 }
 
-pub(crate) fn aggregate_records(
+struct GroupEntry {
+    key: GroupKey,
+    comparison: Vec<u8>,
+    comparison_bytes: u64,
+    count: u64,
+}
+
+pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
+    service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
     records: crate::memory::RecordBuffer,
     aggregate: &crate::plan::AggregateSpec,
     memory: &mut crate::memory::QueryMemory,
-    cancellation: &crate::QueryCancellation,
 ) -> Result<crate::memory::RecordBuffer, QueryFailure> {
-    if cancellation.is_cancelled() {
+    if state.cancellation.is_cancelled() {
         return Err(QueryFailure::new(QueryFailureCode::Cancelled));
     }
     if aggregate.group_by().is_empty() {
@@ -176,14 +215,24 @@ pub(crate) fn aggregate_records(
         counted.push_acquired(QueryRecord::count_record(count), 0)?;
         return Ok(counted);
     }
-    let mut groups = BTreeMap::<GroupKey, u64>::new();
     let (records, record_slots, _) = records.into_parts();
+    let group_capacity = records.len().min(MAX_GROUPS);
+    let group_slots = u64::try_from(group_capacity)
+        .ok()
+        .and_then(|count| count.checked_mul(crate::memory::GROUP_ENTRY_BYTES))
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
+    memory.acquire(group_slots)?;
+    let mut groups = Vec::<GroupEntry>::new();
+    if groups.try_reserve_exact(group_capacity).is_err() {
+        memory.release(group_slots)?;
+        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+    }
     let key_slots = u64::try_from(aggregate.group_by().len())
         .ok()
         .and_then(|count| count.checked_mul(crate::memory::GROUP_VALUE_SLOT_BYTES))
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
     for record in records {
-        if cancellation.is_cancelled() {
+        if state.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
         memory.acquire(key_slots)?;
@@ -194,39 +243,175 @@ pub(crate) fn aggregate_records(
                 return Err(failure);
             },
         };
-        let at_capacity = groups.len() >= MAX_GROUPS;
-        match groups.entry(key) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
+        let (comparison, comparison_bytes) = key.comparison_encoding(memory)?;
+        match find_group(service, state, &groups, &comparison)? {
+            Ok(index) => {
+                let entry = groups
+                    .get_mut(index)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
                 let count = entry
-                    .get()
+                    .count
                     .checked_add(1)
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted))?;
-                *entry.get_mut() = count;
+                entry.count = count;
+                drop(comparison);
+                memory.release(comparison_bytes)?;
                 memory.release(key_slots)?;
                 memory.release(body_bytes)?;
             },
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                if at_capacity {
+            Err(index) => {
+                if groups.len() >= MAX_GROUPS {
                     return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
                 }
-                memory.acquire(crate::memory::GROUP_ENTRY_BYTES)?;
-                entry.insert(1);
+                charge_group_moves(service, state, groups.len().saturating_sub(index))?;
+                groups.insert(
+                    index,
+                    GroupEntry {
+                        key,
+                        comparison,
+                        comparison_bytes,
+                        count: 1,
+                    },
+                );
             },
         }
     }
     memory.release(record_slots)?;
     let mut grouped = crate::memory::RecordBuffer::allocate(groups.len(), memory)?;
-    for (key, count) in groups {
-        if cancellation.is_cancelled() {
+    for entry in groups {
+        if state.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
-        let record = key.into_record(count);
+        let record = entry.key.into_record(entry.count);
         let dynamic_bytes = record.retained_dynamic_bytes()?;
         grouped.push_acquired(record, dynamic_bytes)?;
+        drop(entry.comparison);
+        memory.release(entry.comparison_bytes)?;
         memory.release(key_slots)?;
-        memory.release(crate::memory::GROUP_ENTRY_BYTES)?;
     }
+    memory.release(group_slots)?;
     Ok(grouped)
+}
+
+fn find_group<'kernel, 'catalog, 'ledger>(
+    service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+    groups: &[GroupEntry],
+    wanted: &[u8],
+) -> Result<Result<usize, usize>, QueryFailure> {
+    let mut start = 0_usize;
+    let mut end = groups.len();
+    while start < end {
+        let middle = start
+            .checked_add((end - start) / 2)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let existing = groups
+            .get(middle)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        match compare_group_bytes(service, state, &existing.comparison, wanted)? {
+            Ordering::Less => start = middle + 1,
+            Ordering::Greater => end = middle,
+            Ordering::Equal => return Ok(Ok(middle)),
+        }
+    }
+    Ok(Err(start))
+}
+
+fn compare_group_bytes<'kernel, 'catalog, 'ledger>(
+    service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+    left: &[u8],
+    right: &[u8],
+) -> Result<Ordering, QueryFailure> {
+    for (left, right) in left.iter().zip(right) {
+        charge_group_unit(service, state)?;
+        match left.cmp(right) {
+            Ordering::Equal => {},
+            ordering => return Ok(ordering),
+        }
+    }
+    charge_group_unit(service, state)?;
+    Ok(left.len().cmp(&right.len()))
+}
+
+fn charge_group_moves<'kernel, 'catalog, 'ledger>(
+    service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+    moves: usize,
+) -> Result<(), QueryFailure> {
+    for _ in 0..moves {
+        charge_group_unit(service, state)?;
+    }
+    Ok(())
+}
+
+fn charge_group_unit<'kernel, 'catalog, 'ledger>(
+    service: &crate::QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+) -> Result<(), QueryFailure> {
+    if state.cancellation.is_cancelled() {
+        return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+    }
+    let units = service.work_units(crate::QueryWorkStage::Operators)?;
+    if state.cancellation.is_cancelled() {
+        return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+    }
+    charge_work(state, units)?;
+    if exhausted(state) {
+        return Err(QueryFailure::new(QueryFailureCode::BudgetExhausted));
+    }
+    if state.cancellation.is_cancelled() {
+        return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+    }
+    Ok(())
+}
+
+fn group_value_comparison_size(value: &GroupValue) -> Result<usize, QueryFailure> {
+    match value {
+        GroupValue::Body(None) => Ok(2),
+        GroupValue::Body(Some(value)) => value
+            .comparison_encoded_size_bytes()
+            .map_err(map_domain_value_failure)?
+            .checked_add(2)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::BudgetExhausted)),
+        GroupValue::QueryTime(_) | GroupValue::CommitPosition(_) => Ok(9),
+        GroupValue::EventTime(None) => Ok(2),
+        GroupValue::EventTime(Some(_)) => Ok(10),
+    }
+}
+
+fn append_group_value_comparison(
+    value: &GroupValue,
+    output: &mut Vec<u8>,
+) -> Result<(), QueryFailure> {
+    match value {
+        GroupValue::Body(body) => {
+            output.push(0);
+            output.push(u8::from(body.is_some()));
+            if let Some(body) = body {
+                body.append_comparison_encoding(output)
+                    .map_err(map_domain_value_failure)?;
+            }
+        },
+        GroupValue::QueryTime(value) => {
+            output.push(1);
+            let ordered = (value.value() as u64) ^ (1_u64 << 63);
+            output.extend_from_slice(&ordered.to_be_bytes());
+        },
+        GroupValue::EventTime(value) => {
+            output.push(2);
+            output.push(u8::from(value.is_some()));
+            if let Some(value) = value {
+                let ordered = (value.value() as u64) ^ (1_u64 << 63);
+                output.extend_from_slice(&ordered.to_be_bytes());
+            }
+        },
+        GroupValue::CommitPosition(value) => {
+            output.push(3);
+            output.extend_from_slice(&value.value().to_be_bytes());
+        },
+    }
+    Ok(())
 }
 
 pub(crate) fn compare_records(

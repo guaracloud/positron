@@ -35,7 +35,7 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
     drop(scanned);
 
     if let Some(aggregate) = state.plan.aggregate().cloned() {
-        return aggregate_records(records, &aggregate, memory, &state.cancellation);
+        return aggregate_records(service, state, records, &aggregate, memory);
     }
     check_cancellation(state)?;
     sort_records(service, state, records.as_mut_slice())?;

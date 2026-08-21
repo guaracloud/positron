@@ -184,3 +184,82 @@ fn native_values_have_exact_total_order_and_self_delimiting_encoding() {
     assert_eq!(value.canonical_encoded_size_bytes(), Ok(29));
     assert_eq!(value.retained_heap_bytes(), Ok(130));
 }
+
+#[test]
+fn native_comparison_encoding_has_exactly_the_canonical_total_order() {
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let values = [
+        CandidateAttributeValue::null(),
+        CandidateAttributeValue::boolean(false),
+        CandidateAttributeValue::boolean(true),
+        CandidateAttributeValue::signed_integer(i64::MIN),
+        CandidateAttributeValue::signed_integer(-1),
+        CandidateAttributeValue::signed_integer(0),
+        CandidateAttributeValue::signed_integer(i64::MAX),
+        CandidateAttributeValue::floating_point_bits(0xfff8_0000_0000_0002),
+        CandidateAttributeValue::floating_point_bits(0xfff8_0000_0000_0001),
+        CandidateAttributeValue::floating_point_bits(f64::NEG_INFINITY.to_bits()),
+        CandidateAttributeValue::floating_point_bits((-0.0_f64).to_bits()),
+        CandidateAttributeValue::floating_point_bits(0.0_f64.to_bits()),
+        CandidateAttributeValue::floating_point_bits(f64::INFINITY.to_bits()),
+        CandidateAttributeValue::floating_point_bits(0x7ff8_0000_0000_0001),
+        CandidateAttributeValue::floating_point_bits(0x7ff8_0000_0000_0002),
+        CandidateAttributeValue::string(String::new()),
+        CandidateAttributeValue::string("a".to_owned()),
+        CandidateAttributeValue::string("aa".to_owned()),
+        CandidateAttributeValue::string("b".to_owned()),
+        CandidateAttributeValue::bytes(vec![]),
+        CandidateAttributeValue::bytes(vec![0]),
+        CandidateAttributeValue::bytes(vec![0, 0]),
+        CandidateAttributeValue::bytes(vec![1]),
+        CandidateAttributeValue::array(vec![]),
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::null()]),
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::boolean(false)]),
+        CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::boolean(false),
+            CandidateAttributeValue::null(),
+        ]),
+        CandidateAttributeValue::key_value_list(vec![]),
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "a".to_owned(),
+            CandidateAttributeValue::null(),
+        )]),
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "a".to_owned(),
+            CandidateAttributeValue::boolean(false),
+        )]),
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "b".to_owned(),
+            CandidateAttributeValue::null(),
+        )]),
+    ]
+    .into_iter()
+    .map(|candidate| {
+        candidate
+            .validate_log_body(profile)
+            .expect("comparison fixture is bounded")
+    })
+    .collect::<Vec<_>>();
+
+    for left in &values {
+        for right in &values {
+            let mut left_key = Vec::new();
+            left.append_comparison_encoding(&mut left_key)
+                .expect("comparison encoding is bounded");
+            let mut right_key = Vec::new();
+            right
+                .append_comparison_encoding(&mut right_key)
+                .expect("comparison encoding is bounded");
+            assert_eq!(
+                left.cmp(right),
+                left_key.cmp(&right_key),
+                "comparison encoding diverged for {left:?} and {right:?}"
+            );
+            assert_eq!(
+                left_key.len(),
+                left.comparison_encoded_size_bytes()
+                    .expect("comparison size is bounded")
+            );
+        }
+    }
+}

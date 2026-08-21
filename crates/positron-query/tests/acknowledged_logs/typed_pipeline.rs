@@ -8,7 +8,8 @@ use positron_query::{
 };
 
 use super::support::{
-    BlockingOperatorWorkMeter, CancellingStageWorkMeter, SequenceClock, TestClock,
+    BlockingOperatorWorkMeter, CancellingStageWorkMeter, ConstantWorkMeter, SequenceClock,
+    TestClock, TestWorkMeter,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -147,10 +148,12 @@ fn event_time_grouping_orders_missing_before_present_on_a_query_time_range()
         ],
         1,
     )?;
-    let service = QueryService::new(
+    let service = QueryService::with_runtime(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(0)),
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -342,10 +345,12 @@ fn grouping_and_projection_preserve_every_native_body_kind_without_coercion()
     bodies.extend(candidates.into_iter().map(Some));
     fixture.kernel.append_log_bodies(bodies, 20, 1)?;
 
-    let service = QueryService::new(
+    let service = QueryService::with_runtime(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(0)),
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -814,10 +819,12 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     let fixture = QueryFixture::new("typed-peak-memory")?;
     fixture.kernel.append_log("later", 20, 1)?;
     fixture.kernel.append_log("earlier", 10, 2)?;
-    let service = QueryService::new(
+    let service = QueryService::with_runtime(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
     for (memory_bytes, expected_complete) in [(1_432, true), (1_431, false)] {
@@ -847,7 +854,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(3_223, true), (3_222, false)] {
+    for (memory_bytes, expected_complete) in [(2_862, true), (2_861, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
@@ -1000,15 +1007,18 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     fixture.kernel.append_log("alpha", 10, 2)?;
     fixture.kernel.append_log("beta", 20, 3)?;
     fixture.kernel.append_log("beta", 10, 4)?;
-    let service = QueryService::new(
+    let service = QueryService::with_runtime(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(0)),
     );
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
     )?;
     let events = service.execute(query)?.collect::<Vec<_>>();
     let header = match events.first() {
@@ -1053,7 +1063,8 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let output_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 90, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 90, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
     )?;
     let output_events = service.execute(output_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -1072,7 +1083,8 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let memory_exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 91, 8_737, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 91, 8_737, 60)?
+            .with_cpu_work_units(16)?,
     )?;
     let memory_events = service.execute(memory_exhausted)?.collect::<Vec<_>>();
     assert!(
@@ -1086,12 +1098,19 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
             if incomplete.code() == QueryFailureCode::BudgetExhausted
     ));
 
-    let work_exhausted = service.plan_pipeline(
+    let metered_service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        Arc::new(TestWorkMeter),
+    );
+    let work_exhausted = metered_service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body, query_time | limit 16",
         QueryBudget::new(1_048_576, 16, 16, 91, 1_048_576, 60)?.with_cpu_work_units(5)?,
     )?;
-    let work_events = service.execute(work_exhausted)?.collect::<Vec<_>>();
+    let work_events = metered_service.execute(work_exhausted)?.collect::<Vec<_>>();
     assert!(
         !work_events
             .iter()
@@ -1107,7 +1126,8 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
     let commit_groups = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by commit_position | limit 16",
-        QueryBudget::new(1_048_576, 16, 16, 64, 1_048_576, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 64, 1_048_576, 60)?
+            .with_cpu_work_units(16)?,
     )?;
     let commit_events = service.execute(commit_groups)?.collect::<Vec<_>>();
     let commit_header = match commit_events.first() {
@@ -1135,6 +1155,59 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
         commit_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
             if stats.records() == 4 && stats.output_bytes() == 64
+    ));
+    Ok(())
+}
+
+#[test]
+fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<(), Box<dyn Error>>
+{
+    use positron_domain::value::CandidateAttributeValue;
+
+    let fixture = QueryFixture::new("group-comparison-work")?;
+    fixture.kernel.append_log_bodies(
+        vec![
+            Some(CandidateAttributeValue::string("a".to_owned())),
+            Some(CandidateAttributeValue::string("b".to_owned())),
+        ],
+        20,
+        1,
+    )?;
+    let service = QueryService::new(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source = "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 2";
+
+    let exact = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(10)?,
+    )?;
+    let exact_events = service.execute(exact)?.collect::<Vec<_>>();
+    assert!(matches!(
+        exact_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.cpu_work_units() == 10
+    ));
+
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 2, 2, 64, 1_048_576, 60)?.with_cpu_work_units(9)?,
+    )?;
+    let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
+    assert!(
+        !exhausted_events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 10
     ));
     Ok(())
 }
