@@ -14,6 +14,7 @@ pub struct QueryStream<'lease> {
     observed_stats: QueryStats,
     batch_stats: QueryStats,
     cancellation: crate::QueryCancellation,
+    cancellation_transitioned: bool,
 }
 
 impl std::fmt::Debug for QueryStream<'_> {
@@ -41,6 +42,7 @@ impl<'lease> QueryStream<'lease> {
             observed_stats,
             batch_stats,
             cancellation,
+            cancellation_transitioned: false,
         }
     }
 
@@ -78,12 +80,25 @@ impl<'lease> QueryStream<'lease> {
 
     pub fn cancel(&mut self) -> Result<(), QueryFailure> {
         self.cancellation.cancel();
-        self.replace_pending_with_cancelled();
-        self.release_lease()?;
-        Ok(())
+        self.begin_cancellation();
+        match self.release_lease() {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.replace_pending_with_failure(failure.clone());
+                Err(failure)
+            },
+        }
     }
 
-    fn replace_pending_with_cancelled(&mut self) {
+    fn begin_cancellation(&mut self) {
+        if self.cancellation_transitioned {
+            return;
+        }
+        self.cancellation_transitioned = true;
+        self.replace_pending_with_failure(QueryFailure::new(QueryFailureCode::Cancelled));
+    }
+
+    fn replace_pending_with_failure(&mut self, failure: QueryFailure) {
         if self.terminal_observed {
             self.events = Vec::new().into_iter();
         } else {
@@ -96,10 +111,7 @@ impl<'lease> QueryStream<'lease> {
             let mut events = Vec::with_capacity(usize::from(pending_header.is_some()) + 1);
             events.extend(pending_header);
             events.push(QueryEvent::Terminal(QueryTerminal::Incomplete(
-                QueryIncomplete::new(
-                    QueryFailure::new(QueryFailureCode::Cancelled),
-                    self.observed_stats,
-                ),
+                QueryIncomplete::new(failure, self.observed_stats),
             )));
             self.events = events.into_iter();
         }
@@ -119,9 +131,14 @@ impl Iterator for QueryStream<'_> {
     type Item = QueryEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cancellation.is_cancelled() && !self.terminal_observed {
-            self.replace_pending_with_cancelled();
-            let _ = self.release_lease();
+        if self.cancellation.is_cancelled()
+            && !self.cancellation_transitioned
+            && !self.terminal_observed
+        {
+            self.begin_cancellation();
+            if let Err(failure) = self.release_lease() {
+                self.replace_pending_with_failure(failure);
+            }
         }
         let event = self.events.next();
         if matches!(
@@ -161,7 +178,9 @@ impl Drop for QueryStream<'_> {
             && !self.releasing_terminal_observed)
             && let Some(release) = self.release.as_mut()
         {
-            let _ = release();
+            match release() {
+                Ok(()) | Err(_) => {},
+            }
         }
     }
 }
@@ -248,7 +267,7 @@ mod tests {
         assert!(matches!(
             stream.next(),
             Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
-                if incomplete.code() == QueryFailureCode::Cancelled
+                if incomplete.code() == QueryFailureCode::StoreUnavailable
         ));
         stream.cancel().expect("idempotent release retry succeeds");
         assert!(stream.next().is_none());
@@ -256,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_cancellation_retries_a_failed_release_after_one_cancelled_terminal() {
+    fn retained_cancellation_surfaces_cleanup_failure_and_retries_on_drop() {
         let release_attempts = Arc::new(AtomicU64::new(0));
         let attempts = Arc::clone(&release_attempts);
         let release = Box::new(move || {
@@ -270,7 +289,10 @@ mod tests {
         let cancellation = crate::QueryCancellation::new();
         let retained = cancellation.clone();
         let mut stream = QueryStream::new(
-            vec![QueryEvent::Terminal(QueryTerminal::Complete(stats))],
+            vec![
+                QueryEvent::Header(test_header()),
+                QueryEvent::Terminal(QueryTerminal::Complete(stats)),
+            ],
             Some(release),
             false,
             stats,
@@ -279,10 +301,12 @@ mod tests {
         );
 
         retained.cancel();
+        assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
         assert!(matches!(
             stream.next(),
             Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
-                if incomplete.code() == QueryFailureCode::Cancelled
+                if incomplete.code() == QueryFailureCode::StoreUnavailable
+                    && incomplete.stats() == stats
         ));
         assert!(stream.next().is_none());
         assert_eq!(release_attempts.load(Ordering::SeqCst), 1);
