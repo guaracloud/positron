@@ -222,6 +222,66 @@ fn bounded_scan_holds_query_capacity_and_decodes_only_the_result_limit()
 }
 
 #[test]
+fn exact_result_limit_stops_before_decoding_a_later_committed_block() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x4a; 16])?,
+        CatalogSecret::from_owned(Box::new([0x4b; 32]), Box::new([0x4c; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(74)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x4e; 32])),
+    )?;
+    ledger.append(
+        LogStore::new()
+            .prepare(
+                preparation_capacity(&authority, tenant)?,
+                &clock(1),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x4f; 16])?,
+                vec![minimal_record("first", 1)?],
+            )?
+            .into_store_block(),
+    )?;
+    ledger.append(PreparedStoreBlock::new(
+        scope,
+        StoreBlockIdentity::new([0x50; 16])?,
+        b"authenticated-but-not-a-log-block".to_vec(),
+    )?)?;
+    let snapshot = ledger.snapshot()?;
+    let first_block_bytes = u64::try_from(
+        snapshot
+            .blocks()
+            .first()
+            .ok_or("first committed block missing")?
+            .payload()
+            .len(),
+    )?;
+
+    let result = LogStore::new().scan(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+    )?;
+
+    assert_eq!(result.records().len(), 1);
+    assert!(!result.complete());
+    assert_eq!(result.scanned_bytes(), first_block_bytes);
+    Ok(())
+}
+
+#[test]
 fn insufficient_query_budget_refuses_before_decode_and_releases_on_error()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

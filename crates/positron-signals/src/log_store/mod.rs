@@ -264,13 +264,17 @@ impl LogStore {
             {
                 continue;
             }
+            let remaining = limit.saturating_sub(records.len());
+            if remaining == 0 {
+                complete = false;
+                break;
+            }
             scanned_bytes = scanned_bytes
                 .checked_add(
                     u64::try_from(block.payload().len())
                         .map_err(|_| LogStoreFailure::limit_exceeded())?,
                 )
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;
-            let remaining = limit.saturating_sub(records.len());
             let decoded = codec::decode_block_cancellable(
                 tenant,
                 snapshot,
