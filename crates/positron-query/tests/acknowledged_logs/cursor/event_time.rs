@@ -8,7 +8,7 @@ use super::super::support::{KernelFixture, TemporaryRoots, TestClock};
 
 #[test]
 fn event_time_cursor_preserves_its_temporal_axis_across_resume() -> Result<(), Box<dyn Error>> {
-    let fixture = QueryFixtureForAxis::new()?;
+    let fixture = QueryFixtureForAxis::new("event_time")?;
     let first = fixture
         .service
         .execute_page(fixture.plan)?
@@ -29,6 +29,29 @@ fn event_time_cursor_preserves_its_temporal_axis_across_resume() -> Result<(), B
     Ok(())
 }
 
+#[test]
+fn ingest_time_cursor_preserves_its_temporal_axis_across_resume() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixtureForAxis::new("ingest_time")?;
+    let first = fixture
+        .service
+        .execute_page(fixture.plan)?
+        .collect::<Vec<_>>();
+    let resumed = fixture
+        .service
+        .resume(fixture.context, super::continuation(&first)?)?
+        .collect::<Vec<_>>();
+    let header = match resumed.first() {
+        Some(QueryEvent::Header(header)) => header,
+        _ => return Err("resumed result header missing".into()),
+    };
+    assert_eq!(
+        header.ordering().columns(),
+        ["ingest_time", "commit_position", "record_ordinal"]
+    );
+    assert_eq!(super::bodies(&resumed), ["second"]);
+    Ok(())
+}
+
 struct QueryFixtureForAxis {
     _roots: TemporaryRoots,
     context: positron_governance::AuthorizedContext,
@@ -37,7 +60,7 @@ struct QueryFixtureForAxis {
 }
 
 impl QueryFixtureForAxis {
-    fn new() -> Result<Self, Box<dyn Error>> {
+    fn new(axis: &str) -> Result<Self, Box<dyn Error>> {
         let roots = TemporaryRoots::new("event-time-cursor")?;
         let paths = BootstrapPaths::new(
             &roots.data(),
@@ -64,9 +87,10 @@ impl QueryFixtureForAxis {
             1,
             TestClock::shared(100),
         );
+        let source = format!("logs | range {axis} -100 100 | limit 2");
         let plan = service.plan_pipeline(
             context,
-            "logs | range event_time -100 100 | limit 2",
+            &source,
             QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
                 .with_cpu_work_units(16)?,
         )?;
