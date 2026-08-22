@@ -54,3 +54,11 @@ fn planner_failures_preserve_permanent_retryable_and_invariant_classes() {
         ServiceFailure::Internal
     );
 }
+
+#[test]
+fn cancellation_is_not_reclassified_as_a_storage_failure() {
+    assert_eq!(
+        ServiceFailure::Cancelled.bootstrap_code(),
+        crate::BootstrapFailureCode::ResourceUnavailable
+    );
+}

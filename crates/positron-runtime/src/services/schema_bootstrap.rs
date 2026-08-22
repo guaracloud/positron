@@ -69,12 +69,18 @@ pub(super) fn recover(
                 positron_ingest::SchemaSessionFailure::ReplayIntegrity
                 | positron_ingest::SchemaSessionFailure::TenantConflict
                 | positron_ingest::SchemaSessionFailure::Schema(_) => ServiceFailure::CorruptState,
+                positron_ingest::SchemaSessionFailure::Cancelled => ServiceFailure::Cancelled,
                 _ => ServiceFailure::Internal,
             })?;
         drop(snapshot);
         drop(ledger);
     }
-    let current = replay.finish().map_err(|_| ServiceFailure::CorruptState)?;
+    let current = replay
+        .finish_cancellable(cancellation)
+        .map_err(|failure| match failure {
+            positron_ingest::SchemaSessionFailure::Cancelled => ServiceFailure::Cancelled,
+            _ => ServiceFailure::CorruptState,
+        })?;
     let dirty = checkpoint
         .as_deref()
         .is_none_or(|persisted| persisted != current.catalog_bytes());

@@ -182,6 +182,9 @@ impl<'authority> SchemaReplayBuilder<'authority> {
             cancellation,
             &observer,
         )?;
+        if cancellation.is_cancelled() {
+            return Err(SchemaSessionFailure::Cancelled);
+        }
         self.session.checkpoint()
     }
 }

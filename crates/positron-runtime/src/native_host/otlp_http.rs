@@ -303,7 +303,7 @@ fn service_response_with_encoding(
             "OTLP Logs ingest is temporarily unavailable",
             encoding,
         ),
-        ServiceFailure::CorruptState | ServiceFailure::Internal => {
+        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
             failure(500, INTERNAL, "OTLP Logs ingest failed", encoding)
         },
     }

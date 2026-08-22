@@ -76,3 +76,47 @@ fn bootstrap_rejects_a_structurally_valid_mismatched_replay_frontier() -> Result
     ));
     Ok(())
 }
+
+#[test]
+fn bootstrap_cancellation_is_typed_and_releases_replay_resources() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("cancelled-replay").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    drop(services);
+
+    let before = initialized._authority.governor().inspect()?;
+    let cancellation = crate::TaskCancellation::new();
+    cancellation.cancel();
+    assert!(matches!(
+        ServiceHandle::new_with_cancellation(Arc::clone(&initialized), Some(&cancellation)),
+        Err(ServiceFailure::Cancelled)
+    ));
+    let after = initialized._authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), before.outstanding_total());
+    assert_eq!(after.outstanding_ordinary(), before.outstanding_ordinary());
+    assert_eq!(after.outstanding_recovery(), before.outstanding_recovery());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), before.usage(dimension));
+    }
+    Ok(())
+}
+
+#[test]
+fn bootstrap_cancellation_during_finalization_is_typed() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _) = fixture.initialized()?;
+    let cancellation = crate::TaskCancellation::new();
+    cancellation.cancel();
+
+    assert!(matches!(
+        ServiceHandle::new_with_cancellation(Arc::clone(&initialized), Some(&cancellation)),
+        Err(ServiceFailure::Cancelled)
+    ));
+    Ok(())
+}

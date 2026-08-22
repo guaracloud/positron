@@ -244,7 +244,7 @@ fn service_status(failure: ServiceFailure) -> Status {
         | ServiceFailure::StorageUnavailable => {
             Status::unavailable("OTLP Logs ingest is temporarily unavailable")
         },
-        ServiceFailure::CorruptState | ServiceFailure::Internal => {
+        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
             Status::internal("OTLP Logs ingest failed")
         },
     }

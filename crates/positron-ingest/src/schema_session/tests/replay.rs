@@ -618,6 +618,58 @@ fn bootstrap_finish_observes_reachable_index_retention() {
     assert!(!checkpoint.catalog_bytes().is_empty());
 }
 
+#[test]
+fn bootstrap_finish_cancellation_after_replay_is_atomic_and_releases_capacity() {
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xc1; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(309).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xc4);
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let live = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("live session");
+    ingest(&fixture, &ledger, shard, live, 0xc5);
+    let snapshot = ledger.snapshot().expect("snapshot");
+    drop(registry);
+
+    let before = fixture.authority.governor().inspect().expect("governor");
+    let mut replay =
+        crate::SchemaReplayBuilder::new(fixture.tenant, None, fixture.authority.recovery())
+            .expect("bootstrap replay");
+    replay
+        .replay_snapshot(&snapshot)
+        .expect("final block replay");
+    let cancellation = CancelAfterPolls::new(3);
+    assert!(matches!(
+        replay.finish_cancellable(&cancellation),
+        Err(SchemaSessionFailure::Cancelled)
+    ));
+
+    let after = fixture.authority.governor().inspect().expect("governor");
+    assert_eq!(after.outstanding_total(), before.outstanding_total());
+    assert_eq!(after.outstanding_ordinary(), before.outstanding_ordinary());
+    assert_eq!(after.outstanding_recovery(), before.outstanding_recovery());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), before.usage(dimension));
+    }
+    let catalog_snapshot = catalog.pin().expect("catalog snapshot");
+    assert!(
+        crate::load_schema_checkpoint(
+            &catalog_snapshot,
+            fixture.tenant,
+            fixture.authority.governor()
+        )
+        .expect("schema checkpoint load")
+        .is_none()
+    );
+}
+
 fn replay(
     fixture: &crate::tests::support::Fixture,
     snapshots: [&positron_kernel::LedgerSnapshot<'_>; 2],
