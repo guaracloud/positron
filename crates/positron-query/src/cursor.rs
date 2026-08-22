@@ -1,5 +1,6 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_kernel::{ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector};
+use std::sync::Arc;
 
 use crate::{
     LogicalPlan, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange,
@@ -44,7 +45,7 @@ pub(crate) struct CursorState {
     pub(crate) catalog_identity: [u8; 32],
     pub(crate) catalog_generation: u64,
     pub(crate) frontier: u64,
-    pub(crate) plan: LogicalPlan,
+    pub(crate) plan: Arc<LogicalPlan>,
     pub(crate) offset: u16,
     pub(crate) sequence: u64,
     pub(crate) prior_digest: [u8; 32],
@@ -224,7 +225,7 @@ pub(crate) fn decode(
         catalog_identity,
         catalog_generation,
         frontier,
-        plan,
+        plan: Arc::new(plan),
         offset,
         sequence,
         prior_digest,

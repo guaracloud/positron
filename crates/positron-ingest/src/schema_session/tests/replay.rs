@@ -1,16 +1,20 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
+use positron_domain::value::CandidateAttributeValue;
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
     LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_policy::IngestPolicy;
-use positron_signals::{ScanCancellation, SchemaCatalog, SchemaCheckpointFrontier};
+use positron_signals::{LogStore, ScanCancellation, SchemaCatalog, SchemaCheckpointFrontier};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::{SchemaSessionFailure, TenantSchemaRegistry};
-use crate::{IngestOutcome, LogIngest, OtlpLogsReceiver};
+use crate::{
+    IngestOutcome, LogIngest, LogMetadata, NativeLogBatch, NativeLogCandidate, OtlpLogsReceiver,
+    PolicyReceiver,
+};
 
 #[test]
 fn rebuild_from_committed_custom_shards_is_canonical_and_idempotent() {
@@ -68,12 +72,104 @@ fn rebuild_from_committed_custom_shards_is_canonical_and_idempotent() {
     bootstrap
         .replay_snapshot(&second_snapshot)
         .expect("second bootstrap snapshot");
-    assert_eq!(
-        bootstrap
-            .finish()
-            .expect("bootstrap checkpoint")
-            .catalog_bytes(),
-        expected
+    let bootstrap_left = bootstrap
+        .finish()
+        .expect("bootstrap checkpoint")
+        .catalog_bytes()
+        .to_vec();
+    let mut reversed_bootstrap =
+        crate::SchemaReplayBuilder::new(fixture.tenant, None, fixture.authority.recovery())
+            .expect("reversed bootstrap replay");
+    reversed_bootstrap
+        .replay_snapshot(&second_snapshot)
+        .expect("reversed second bootstrap snapshot");
+    reversed_bootstrap
+        .replay_snapshot(&first_snapshot)
+        .expect("reversed first bootstrap snapshot");
+    let bootstrap_right = reversed_bootstrap
+        .finish()
+        .expect("reversed bootstrap checkpoint")
+        .catalog_bytes()
+        .to_vec();
+    assert_eq!(bootstrap_left, bootstrap_right);
+    assert_ne!(bootstrap_left, expected);
+}
+
+#[test]
+fn bootstrap_replay_keeps_mandatory_discovery_when_text_is_not_admitted() {
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xd8; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xd9; 32]), Box::new([0xda; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(307).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xdb);
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let live = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("live session");
+    let live_view = live.clone();
+    let body = "small body".to_owned();
+    let decoded_bytes = u64::try_from(body.len()).expect("bounded body");
+    let candidate = NativeLogCandidate::new(
+        None,
+        None,
+        Some(CandidateAttributeValue::string(body)),
+        Vec::new(),
+        LogMetadata::empty(),
+    );
+    let batch = NativeLogBatch::new(
+        crate::tests::support::attribution(),
+        vec![candidate],
+        LogStore::value_limit_profile(),
+        decoded_bytes,
+        None,
+        PolicyReceiver::OtlpGrpc,
+    )
+    .expect("body-only batch");
+    let policy = IngestPolicy::preserving(1).expect("policy");
+    assert!(matches!(
+        LogIngest::new(
+            &fixture.authority,
+            &ledger,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+            &policy,
+            fixture.tenant,
+            shard,
+            live,
+        )
+        .accept(
+            batch,
+            StoreBlockIdentity::new([0xdc; 16]).expect("identity"),
+        ),
+        IngestOutcome::Full(_)
+    ));
+    let live_catalog = live_view
+        .checkpoint()
+        .expect("live checkpoint")
+        .catalog_bytes()
+        .to_vec();
+    let snapshot = ledger.snapshot().expect("snapshot");
+    drop(registry);
+
+    let mut bootstrap =
+        crate::SchemaReplayBuilder::new(fixture.tenant, None, fixture.authority.recovery())
+            .expect("bootstrap replay");
+    bootstrap
+        .replay_snapshot(&snapshot)
+        .expect("mandatory schema discovery survives omitted text evidence");
+    let bootstrap_catalog = bootstrap
+        .finish()
+        .expect("bootstrap checkpoint")
+        .catalog_bytes()
+        .to_vec();
+    assert!(!bootstrap_catalog.is_empty());
+    assert!(
+        bootstrap_catalog != live_catalog,
+        "bootstrap omits optional text evidence when only mandatory work is admitted"
     );
 }
 

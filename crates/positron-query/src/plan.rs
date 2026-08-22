@@ -1,5 +1,6 @@
 use positron_governance::AuthorizedContext;
 use positron_kernel::ResourceReservation;
+use std::sync::Arc;
 
 use crate::QueryBudget;
 
@@ -294,7 +295,7 @@ impl LogicalPlan {
 
 pub struct PlannedQuery<'kernel> {
     pub(crate) context: AuthorizedContext,
-    pub(crate) plan: LogicalPlan,
+    pub(crate) plan: Arc<LogicalPlan>,
     pub(crate) budget: QueryBudget,
     pub(crate) _reservation: ResourceReservation<'kernel>,
     pub(crate) started_at: u64,
@@ -306,7 +307,7 @@ pub struct PlannedQuery<'kernel> {
 impl PlannedQuery<'_> {
     #[must_use]
     pub fn logical_plan(&self) -> LogicalPlan {
-        self.plan.clone()
+        self.plan.as_ref().clone()
     }
 
     /// Returns the query-scoped handle used to propagate disconnects and deadlines.

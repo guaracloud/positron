@@ -58,7 +58,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
         };
         let header = match QueryHeader::new(
-            state.plan.clone(),
+            &state.plan,
             state.budget,
             ResultSnapshot::new(
                 state.catalog_identity,

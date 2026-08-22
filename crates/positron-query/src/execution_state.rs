@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_domain::routing::CommitPosition;
 use positron_governance::AuthorizedContext;
-use positron_kernel::{LedgerSnapshot, SnapshotLeaseId};
+use positron_kernel::{LedgerSnapshot, ResourceReservation, SnapshotLeaseId};
 
 use crate::cursor::CursorState;
 use crate::stream::QueryCounters;
@@ -45,39 +45,52 @@ pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
     .with_reduced_pruning(state.reduced_pruning)
 }
 
-pub(crate) fn initial_state(
-    query: &PlannedQuery<'_>,
-    snapshot: &LedgerSnapshot<'_>,
+pub(crate) fn initial_state<'kernel>(
+    query: PlannedQuery<'kernel>,
+    snapshot: &LedgerSnapshot<'kernel>,
     tenant: TenantId,
     expiry: u64,
     lease_identity: SnapshotLeaseId,
-) -> CursorState {
-    CursorState {
-        principal: query.context.principal_id(),
-        tenant,
-        authorization_generation: query.context.authorization_generation(),
-        catalog_identity: snapshot.catalog_identity().to_bytes(),
-        catalog_generation: snapshot.catalog_generation(),
-        frontier: snapshot.frontier().value(),
-        plan: query.plan.clone(),
-        offset: 0,
-        sequence: 0,
-        prior_digest: [0; 32],
-        lease_identity: lease_identity.to_bytes(),
-        expiry,
-        budget: query.budget,
-        scanned_bytes: 0,
-        decoded_records: 0,
-        output_rows: 0,
-        output_bytes: 0,
-        memory_peak_bytes: 0,
-        started_at: query.started_at,
-        last_observed_at: query.last_observed_at,
-        cpu_work_units: query.cpu_work_units,
-        elapsed_wall_seconds: query.last_observed_at.saturating_sub(query.started_at),
-        reduced_pruning: false,
-        cancellation: query.cancellation.clone(),
-    }
+) -> (CursorState, ResourceReservation<'kernel>) {
+    let PlannedQuery {
+        context,
+        plan,
+        budget,
+        _reservation,
+        started_at,
+        last_observed_at,
+        cpu_work_units,
+        cancellation,
+    } = query;
+    (
+        CursorState {
+            principal: context.principal_id(),
+            tenant,
+            authorization_generation: context.authorization_generation(),
+            catalog_identity: snapshot.catalog_identity().to_bytes(),
+            catalog_generation: snapshot.catalog_generation(),
+            frontier: snapshot.frontier().value(),
+            plan,
+            offset: 0,
+            sequence: 0,
+            prior_digest: [0; 32],
+            lease_identity: lease_identity.to_bytes(),
+            expiry,
+            budget,
+            scanned_bytes: 0,
+            decoded_records: 0,
+            output_rows: 0,
+            output_bytes: 0,
+            memory_peak_bytes: 0,
+            started_at,
+            last_observed_at,
+            cpu_work_units,
+            elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
+            reduced_pruning: false,
+            cancellation,
+        },
+        _reservation,
+    )
 }
 
 pub(crate) fn query_tenant(context: AuthorizedContext) -> Result<TenantId, QueryFailure> {

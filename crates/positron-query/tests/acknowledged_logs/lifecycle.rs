@@ -89,6 +89,38 @@ fn admission_and_snapshot_lease_remain_owned_until_stream_terminal_or_drop()
 }
 
 #[test]
+fn compiled_matcher_stream_drop_reclaims_its_single_query_admission() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("matcher-stream-resource-ownership")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let service = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let before = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"one\" | limit 1",
+        budget(),
+    )?;
+    let stream = service.execute(query)?;
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        1
+    );
+    drop(stream);
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, before);
+    Ok(())
+}
+
+#[test]
 fn repeated_pre_stream_failures_release_admission_and_snapshot_leases() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("pre-stream-resource-ownership")?;

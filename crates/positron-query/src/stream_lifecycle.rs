@@ -345,7 +345,7 @@ mod tests {
         let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
         let budget = QueryBudget::new(1, 1, 1, 1, 1, 1).expect("test budget is valid");
         QueryHeader::new(
-            plan,
+            &plan,
             budget,
             ResultSnapshot::new([1; 32], 1, 1),
             ResultLease::new([2; 16], 1),

@@ -226,15 +226,15 @@ pub struct QueryHeader {
 
 impl QueryHeader {
     pub(crate) fn new(
-        plan: LogicalPlan,
+        plan: &LogicalPlan,
         budget: QueryBudget,
         snapshot: ResultSnapshot,
         lease: ResultLease,
         initial_cursor: Option<QueryCursor>,
     ) -> Result<Self, QueryFailure> {
         Ok(Self {
-            schema: ResultSchema::for_plan(&plan)?,
-            ordering: ResultOrdering::for_plan(&plan)?,
+            schema: ResultSchema::for_plan(plan)?,
+            ordering: ResultOrdering::for_plan(plan)?,
             budget,
             snapshot,
             lease,

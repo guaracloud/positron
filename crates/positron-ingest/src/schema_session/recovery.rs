@@ -244,9 +244,19 @@ impl TenantSchemaSession {
                 recovery.granted().get(ResourceDimension::CpuWorkUnits),
                 cancellation,
             );
+            // Bootstrap reserves only the mandatory decode/discovery budget.
+            // Text evidence is optional and must not consume that reservation;
+            // serving replay admits it separately when capacity is available.
             let delta = state
                 .catalog
-                .replay_observed_cancellable(tenant, snapshot, block, cancellation, &observer)
+                .replay_observed_cancellable_with_text_observer(
+                    tenant,
+                    snapshot,
+                    block,
+                    cancellation,
+                    &observer,
+                    None,
+                )
                 .map_err(map_replay_observed_failure)?;
             ensure_frontier_slot(&state, snapshot.scope().shard_id())?;
             let frontier = validated_frontier(

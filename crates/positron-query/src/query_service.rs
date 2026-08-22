@@ -157,7 +157,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         Ok(PlannedQuery {
             context,
-            plan,
+            plan: Arc::new(plan),
             budget,
             _reservation: reservation,
             started_at,

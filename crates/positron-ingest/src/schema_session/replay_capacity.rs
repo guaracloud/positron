@@ -157,10 +157,9 @@ pub(super) fn resize_replay_work(
     recovery: &mut ResourceReservation<'_>,
     payload_bytes: usize,
 ) -> Result<(), SchemaSessionFailure> {
-    // Repair reservations are interruptible: a failed growth cancels the
-    // existing grant. Bootstrap therefore admits the structural bound before
-    // decode and lets the observed summary fail closed to reduced pruning
-    // when its complete text bound cannot fit that one reservation.
+    // Bootstrap reserves only mandatory decode/discovery work. Optional text
+    // evidence is deliberately omitted here; serving replay admits it in a
+    // separate optional reservation when complete capacity is available.
     let reduced_work = SchemaBudget::replay_decode_work_units(payload_bytes)
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     let current = recovery.granted().get(ResourceDimension::MemoryBytes);
