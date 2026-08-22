@@ -39,8 +39,7 @@ pub(crate) fn query_record(
                     );
                     match value.as_str() {
                         Some(text) => {
-                            observer.observe_search_text(text)?;
-                            text.contains(expected)
+                            crate::search::contains_observed(text, expected, &mut observer)?
                         },
                         None => false,
                     }
@@ -57,10 +56,7 @@ pub(crate) fn query_record(
                         crate::QueryWorkStage::Operators,
                     );
                     match value.as_str() {
-                        Some(text) => {
-                            observer.observe_search_text(text)?;
-                            expected.has_literal_candidate(text) && expected.is_match(text)
-                        },
+                        Some(text) => expected.is_match_observed(text, &mut observer)?,
                         None => false,
                     }
                 },

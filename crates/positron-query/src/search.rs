@@ -1,4 +1,5 @@
-use regex::Regex;
+use regex_automata::Input;
+use regex_automata::dfa::{Automaton, StartKind, dense};
 use regex_syntax::hir::literal::{ExtractKind, Extractor};
 
 use crate::{QueryFailure, QueryFailureCode};
@@ -10,6 +11,15 @@ pub(crate) const MAX_SEARCH_LITERAL_BYTES: usize = 1_024;
 const MAX_SEARCH_LITERAL_COUNT: usize = 32;
 const MAX_REGEX_COMPILED_BYTES: usize = 64 * 1024;
 const MAX_REGEX_NESTING: u32 = 32;
+const MAX_REGEX_BUILD_BYTES: usize = MAX_REGEX_COMPILED_BYTES * 2;
+const MAX_SEARCH_SCRATCH_BYTES: usize =
+    std::mem::size_of::<Vec<usize>>() + MAX_SEARCH_LITERAL_BYTES * std::mem::size_of::<usize>();
+
+pub(crate) trait SearchObserver {
+    fn observe_search_structure(&mut self) -> Result<(), QueryFailure>;
+
+    fn observe_search_chunk(&mut self) -> Result<(), QueryFailure>;
+}
 
 const fn max_candidate_memory_bytes() -> u64 {
     (std::mem::size_of::<Vec<Vec<u8>>>()
@@ -20,7 +30,7 @@ const fn max_candidate_memory_bytes() -> u64 {
 #[derive(Clone, Debug)]
 pub(crate) struct BoundedRegex {
     source: String,
-    compiled: Regex,
+    compiled: Box<dense::DFA<Vec<u32>>>,
     pruning_literals: Vec<Vec<u8>>,
 }
 
@@ -29,43 +39,79 @@ impl BoundedRegex {
         if source.is_empty() || source.len() > MAX_SEARCH_LITERAL_BYTES {
             return Err(unsupported());
         }
-        let compiled = regex::RegexBuilder::new(&source)
-            .size_limit(MAX_REGEX_COMPILED_BYTES)
-            .dfa_size_limit(MAX_REGEX_COMPILED_BYTES)
-            .nest_limit(MAX_REGEX_NESTING)
-            .build()
-            .map_err(|_| unsupported())?;
+        let mut builder = dense::Builder::new();
+        builder
+            .configure(
+                dense::Config::new()
+                    .start_kind(StartKind::Unanchored)
+                    // Unicode word boundaries require quit-state handling
+                    // that is not part of this static stepping loop. ASCII
+                    // boundaries remain available through (?-u:\b...).
+                    .unicode_word_boundary(false)
+                    .dfa_size_limit(Some(MAX_REGEX_COMPILED_BYTES))
+                    .determinize_size_limit(Some(MAX_REGEX_COMPILED_BYTES)),
+            )
+            .syntax(
+                regex_automata::util::syntax::Config::new()
+                    .unicode(true)
+                    .nest_limit(MAX_REGEX_NESTING),
+            );
+        let compiled = builder.build(&source).map_err(|_| unsupported())?;
         let pruning_literals = mandatory_literals(&source)?;
         Ok(Self {
             source,
-            compiled,
+            compiled: Box::new(compiled),
             pruning_literals,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn is_match(&self, text: &str) -> bool {
-        self.compiled.is_match(text)
+        let mut observer = UnobservedSearch;
+        self.is_match_observed(text, &mut observer)
+            .is_ok_and(|matched| matched)
     }
 
-    /// Performs the cheap candidate check before invoking the regex engine.
-    /// Every retained literal is a mandatory prefix or suffix candidate from
-    /// the bounded HIR extractor, so this check can only produce false
-    /// positives and can never reject a valid regex match.
-    pub(crate) fn has_literal_candidate(&self, text: &str) -> bool {
-        self.pruning_literals.is_empty()
-            || self.pruning_literals.iter().any(|literal| {
-                text.as_bytes()
-                    .windows(literal.len())
-                    .any(|window| window == literal)
-            })
+    pub(crate) fn is_match_observed<O: SearchObserver>(
+        &self,
+        text: &str,
+        observer: &mut O,
+    ) -> Result<bool, QueryFailure> {
+        observer.observe_search_structure()?;
+        let input = Input::new(text.as_bytes());
+        let mut state = self
+            .compiled
+            .start_state_forward(&input)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        for chunk in text
+            .as_bytes()
+            .chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES)
+        {
+            observer.observe_search_chunk()?;
+            for &byte in chunk {
+                state = self.compiled.next_state(state, byte);
+                if self.compiled.is_match_state(state) {
+                    return Ok(true);
+                }
+            }
+        }
+        state = self.compiled.next_eoi_state(state);
+        Ok(self.compiled.is_match_state(state))
     }
 
     pub(crate) fn pruning_literals(&self) -> &[Vec<u8>] {
         &self.pruning_literals
     }
 
-    pub(crate) const fn memory_bytes(&self) -> u64 {
-        MAX_REGEX_COMPILED_BYTES as u64 + max_candidate_memory_bytes()
+    pub(crate) fn memory_bytes(&self) -> u64 {
+        let automaton = match u64::try_from(self.compiled.memory_usage()) {
+            Ok(bytes) => bytes.saturating_add(std::mem::size_of::<dense::DFA<Vec<u32>>>() as u64),
+            Err(_) => return u64::MAX,
+        };
+        automaton
+            .saturating_add(MAX_REGEX_BUILD_BYTES as u64)
+            .saturating_add(MAX_SEARCH_LITERAL_BYTES as u64)
+            .saturating_add(max_candidate_memory_bytes())
     }
 }
 
@@ -85,7 +131,66 @@ pub(crate) fn search_text(source: String) -> Result<String, QueryFailure> {
 }
 
 pub(crate) const fn text_memory_bytes() -> u64 {
-    max_candidate_memory_bytes()
+    (MAX_SEARCH_LITERAL_BYTES + MAX_SEARCH_SCRATCH_BYTES) as u64 + max_candidate_memory_bytes()
+}
+
+pub(crate) fn contains_observed<O: SearchObserver>(
+    text: &str,
+    pattern: &str,
+    observer: &mut O,
+) -> Result<bool, QueryFailure> {
+    observer.observe_search_structure()?;
+    let pattern = pattern.as_bytes();
+    let mut prefix = Vec::new();
+    prefix
+        .try_reserve_exact(pattern.len())
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    prefix.resize(pattern.len(), 0);
+    let mut matched = 0;
+    for index in 1..pattern.len() {
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+    if pattern.is_empty() {
+        return Ok(true);
+    }
+    for chunk in text
+        .as_bytes()
+        .chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES)
+    {
+        observer.observe_search_chunk()?;
+        for &byte in chunk {
+            while matched > 0 && byte != pattern[matched] {
+                matched = prefix[matched - 1];
+            }
+            if byte == pattern[matched] {
+                matched += 1;
+                if matched == pattern.len() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+struct UnobservedSearch;
+
+#[cfg(test)]
+impl SearchObserver for UnobservedSearch {
+    fn observe_search_structure(&mut self) -> Result<(), QueryFailure> {
+        Ok(())
+    }
+
+    fn observe_search_chunk(&mut self) -> Result<(), QueryFailure> {
+        Ok(())
+    }
 }
 
 fn mandatory_literals(source: &str) -> Result<Vec<Vec<u8>>, QueryFailure> {
@@ -141,113 +246,4 @@ const fn unsupported() -> QueryFailure {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{BoundedRegex, MAX_SEARCH_LITERAL_BYTES, search_text};
-    use crate::QueryFailureCode;
-
-    #[test]
-    fn bounded_regex_keeps_only_safe_literal_candidates() {
-        let anchored = BoundedRegex::new("^error-42$".to_owned()).expect("regex is valid");
-        assert!(anchored.has_literal_candidate("error-42"));
-        assert!(!anchored.has_literal_candidate("error-41"));
-        assert!(anchored.is_match("error-42"));
-
-        let escaped = BoundedRegex::new(r"error\|42".to_owned()).expect("regex is valid");
-        assert!(escaped.has_literal_candidate("error|42"));
-        assert!(escaped.is_match("error|42"));
-
-        let dynamic = BoundedRegex::new(r"error-\d+".to_owned()).expect("regex is valid");
-        assert!(dynamic.has_literal_candidate("error-42"));
-        assert!(dynamic.is_match("error-42"));
-        assert_eq!(
-            anchored,
-            BoundedRegex::new("^error-42$".to_owned()).expect("regex is valid")
-        );
-        assert_ne!(anchored, dynamic);
-
-        let empty_match = BoundedRegex::new("^$".to_owned()).expect("regex is valid");
-        assert!(empty_match.has_literal_candidate(""));
-        assert!(empty_match.is_match(""));
-    }
-
-    #[test]
-    fn bounded_regex_uses_upstream_mandatory_literal_extraction() {
-        let dynamic = BoundedRegex::new(r"error-\d+".to_owned()).expect("regex is valid");
-        assert!(dynamic.pruning_literals().is_empty());
-
-        let suffix = BoundedRegex::new(r".*foobar".to_owned()).expect("regex is valid");
-        assert!(suffix.pruning_literals().is_empty());
-
-        let short_alternative = BoundedRegex::new(r"a|foobar".to_owned()).expect("regex is valid");
-        assert!(short_alternative.pruning_literals().is_empty());
-
-        let boundary = BoundedRegex::new(r"\bquux\b".to_owned()).expect("regex is valid");
-        assert_eq!(boundary.pruning_literals(), [b"quux".to_vec()]);
-    }
-
-    #[test]
-    fn extracted_literals_never_reject_a_regex_match() {
-        let patterns = [
-            r"error-\d+",
-            r".*foobar",
-            r"a|foobar",
-            r"\bquux\b",
-            r"(foo|bar)[0-9]+",
-            r"foo.*bar",
-            r"привет|hello",
-        ];
-        let bodies = [
-            "error-42",
-            "prefix error-7 suffix",
-            "foobar",
-            "a",
-            "quux",
-            "foo123",
-            "bar9",
-            "foo and bar",
-            "привет мир",
-            "hello world",
-        ];
-        for pattern in patterns {
-            let regex = BoundedRegex::new(pattern.to_owned()).expect("bounded regex");
-            for body in bodies {
-                if regex.is_match(body) {
-                    assert!(
-                        regex.has_literal_candidate(body),
-                        "candidate rejected a match: {pattern:?} / {body:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn truncated_extraction_falls_back_instead_of_using_inexact_literals() {
-        let regex = BoundedRegex::new(r"[ab]{8}".to_owned()).expect("bounded regex");
-        assert!(regex.pruning_literals().is_empty());
-        assert!(regex.is_match("bbbbbbbb"));
-        assert!(regex.has_literal_candidate("bbbbbbbb"));
-    }
-
-    #[test]
-    fn bounded_search_patterns_reject_invalid_and_over_limit_input() {
-        assert_eq!(
-            BoundedRegex::new("[".to_owned())
-                .expect_err("invalid regex must be rejected")
-                .code(),
-            QueryFailureCode::UnsupportedQuery
-        );
-        assert_eq!(
-            BoundedRegex::new(String::new())
-                .expect_err("empty regex must be rejected")
-                .code(),
-            QueryFailureCode::UnsupportedQuery
-        );
-        assert_eq!(
-            search_text("a".repeat(MAX_SEARCH_LITERAL_BYTES + 1))
-                .expect_err("oversized literal must be rejected")
-                .code(),
-            QueryFailureCode::UnsupportedQuery
-        );
-    }
-}
+mod tests;

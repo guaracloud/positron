@@ -3269,6 +3269,97 @@ fn versioned_pipeline_searches_body_text_without_matching_other_records()
 }
 
 #[test]
+fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("schema-text-budget")?;
+    let schema = fixture
+        .kernel
+        .append_indexed_text_logs(vec!["prefix needle suffix"], 1)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(1)),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(11)?,
+    )?;
+    let events = service
+        .execute_with_schema(query, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "events: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if stats.cpu_work_units() == 11 && stats.decoded_records() == 1
+        ),
+        "events: {events:?}"
+    );
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(10)?,
+    )?;
+    let exhausted_events = service
+        .execute_with_schema(exhausted, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 11
+    ));
+    Ok(())
+}
+
+#[test]
+fn schema_backed_regex_search_keeps_index_and_dfa_work_bounded() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("schema-regex-budget")?;
+    let schema = fixture
+        .kernel
+        .append_indexed_text_logs(vec!["prefix needle suffix"], 1)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(1)),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "needle" | limit 1"#,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(11)?,
+    )?;
+    let events = service
+        .execute_with_schema(query, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "events: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if stats.cpu_work_units() == 11 && stats.decoded_records() == 1
+        ),
+        "events: {events:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn versioned_pipeline_regex_search_is_anchored_and_rejects_unbounded_patterns()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("pipeline-regex-search")?;
@@ -3347,8 +3438,8 @@ fn versioned_pipeline_regex_search_is_anchored_and_rejects_unbounded_patterns()
 #[test]
 fn body_search_polls_cancellation_during_matching() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("pipeline-search-cancellation")?;
-    fixture.kernel.append_log("request timed out", 20, 1)?;
-    let meter = CancellingOperatorCallMeter::shared(2);
+    fixture.kernel.append_log(&"x".repeat(2_048), 20, 1)?;
+    let meter = CancellingOperatorCallMeter::shared(3);
     let service = QueryService::with_runtime(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,

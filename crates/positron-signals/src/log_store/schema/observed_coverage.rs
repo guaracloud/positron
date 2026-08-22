@@ -23,15 +23,13 @@ impl SchemaCatalog {
             let Some(summary) = index.text_summary.as_ref() else {
                 return Ok(None);
             };
-            for trigram in summary.trigrams() {
-                observer.observe_work(1)?;
-                poll_payload(trigram, observer)?;
-            }
-            for literal in candidate.literals() {
-                observer.observe_work(1)?;
-                poll_payload(literal, observer)?;
-            }
-            return Ok(summary.might_contain(candidate));
+            // The summary is a sorted, bounded set. Charge the physical
+            // lookup once, then poll cancellation while doing its bounded
+            // binary searches. Charging every stored trigram would make the
+            // cost depend on the index representation rather than the
+            // caller's one candidate lookup.
+            observer.observe_work(1)?;
+            return summary.might_contain_observed(candidate, observer);
         }
         Ok(None)
     }

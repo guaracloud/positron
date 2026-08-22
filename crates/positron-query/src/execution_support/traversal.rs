@@ -6,6 +6,7 @@ use crate::{
 };
 
 use super::{charge_work_counter, cpu_work_exhausted, map_domain_value_failure};
+use crate::search::SearchObserver;
 
 pub(crate) struct QueryValueObserver<'service, 'state, 'kernel, 'catalog, 'ledger> {
     service: &'service QueryService<'kernel, 'catalog, 'ledger>,
@@ -33,22 +34,22 @@ impl<'service, 'state, 'kernel, 'catalog, 'ledger>
             stage,
         }
     }
+}
 
-    pub(crate) fn observe_search_text(&mut self, text: &str) -> Result<(), QueryFailure> {
-        self.observe_structure()?;
-        for _chunk in text
-            .as_bytes()
-            .chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES)
-        {
-            check_cancellation(&self.cancellation)?;
-            let units = self.service.work_units(self.stage)?;
-            check_cancellation(&self.cancellation)?;
-            charge_work_counter(self.consumed, units)?;
-            if cpu_work_exhausted(*self.consumed, self.limit) {
-                return Err(QueryFailure::budget_exhausted(
-                    QueryBudgetDimension::CpuWorkUnits,
-                ));
-            }
+impl SearchObserver for QueryValueObserver<'_, '_, '_, '_, '_> {
+    fn observe_search_structure(&mut self) -> Result<(), QueryFailure> {
+        self.observe_structure()
+    }
+
+    fn observe_search_chunk(&mut self) -> Result<(), QueryFailure> {
+        check_cancellation(&self.cancellation)?;
+        let units = self.service.work_units(self.stage)?;
+        check_cancellation(&self.cancellation)?;
+        charge_work_counter(self.consumed, units)?;
+        if cpu_work_exhausted(*self.consumed, self.limit) {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::CpuWorkUnits,
+            ));
         }
         Ok(())
     }

@@ -1,6 +1,15 @@
 #[cfg(test)]
 mod tests {
     use super::{TextBlockSummary, TextSearchCandidate};
+    use crate::log_store::{ScanObservationFailureCode, ScanObserver};
+
+    struct Unobserved;
+
+    impl ScanObserver for Unobserved {
+        fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn complete_summary_proves_trigram_absence_without_false_negatives() {
@@ -12,8 +21,19 @@ mod tests {
         let absent = TextSearchCandidate::literal("zzz")
             .expect("candidate construction")
             .expect("literal is long enough");
-        assert_eq!(summary.might_contain(&present), Some(true));
-        assert_eq!(summary.might_contain(&absent), Some(false));
+        let observer = Unobserved;
+        assert_eq!(
+            summary
+                .might_contain_observed(&present, &observer)
+                .expect("lookup succeeds"),
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .might_contain_observed(&absent, &observer)
+                .expect("lookup succeeds"),
+            Some(false)
+        );
     }
 
     #[test]
@@ -70,17 +90,22 @@ mod tests {
         let summary = TextBlockSummary::from_bodies(bodies.iter().map(String::as_str).map(Some))
             .expect("summary construction");
         assert!(!summary.complete());
+        let observer = Unobserved;
         assert_eq!(
-            summary.might_contain(
-                &TextSearchCandidate::literal("000")
-                    .expect("candidate")
-                    .expect("candidate")
-            ),
+            summary
+                .might_contain_observed(
+                    &TextSearchCandidate::literal("000")
+                        .expect("candidate")
+                        .expect("candidate"),
+                    &observer,
+                )
+                .expect("lookup succeeds"),
             None
         );
     }
 }
 use super::failure::SchemaFailure;
+use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 
 pub(crate) const MAX_TEXT_TRIGRAMS: usize = 4_096;
 /// Text coverage is an optional physical optimization. Keep its retained
@@ -232,17 +257,28 @@ impl TextBlockSummary {
         })
     }
 
-    pub(crate) fn might_contain(&self, candidate: &TextSearchCandidate) -> Option<bool> {
+    pub(crate) fn might_contain_observed(
+        &self,
+        candidate: &TextSearchCandidate,
+        observer: &dyn ScanObserver,
+    ) -> Result<Option<bool>, ScanObservationFailureCode> {
         if !self.complete {
-            return None;
+            return Ok(None);
         }
-        Some(candidate.literals().iter().any(|literal| {
-            literal.as_slice().windows(TRIGRAM_BYTES).all(|window| {
-                self.trigrams
-                    .binary_search(&[window[0], window[1], window[2]])
-                    .is_ok()
-            })
-        }))
+        for literal in candidate.literals() {
+            let mut present = true;
+            for window in literal.windows(TRIGRAM_BYTES) {
+                let trigram = [window[0], window[1], window[2]];
+                if !observed_binary_search(&self.trigrams, trigram, observer)? {
+                    present = false;
+                    break;
+                }
+            }
+            if present {
+                return Ok(Some(true));
+            }
+        }
+        Ok(Some(false))
     }
 
     pub(crate) fn trigrams(&self) -> &[[u8; TRIGRAM_BYTES]] {
@@ -255,4 +291,26 @@ impl TextBlockSummary {
     ) -> Self {
         Self { complete, trigrams }
     }
+}
+
+fn observed_binary_search(
+    trigrams: &[[u8; TRIGRAM_BYTES]],
+    needle: [u8; TRIGRAM_BYTES],
+    observer: &dyn ScanObserver,
+) -> Result<bool, ScanObservationFailureCode> {
+    let mut low = 0;
+    let mut high = trigrams.len();
+    while low < high {
+        observer.observe_work(0)?;
+        let middle = low + (high - low) / 2;
+        let value = trigrams
+            .get(middle)
+            .ok_or(ScanObservationFailureCode::Internal)?;
+        match value.cmp(&needle) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Equal => return Ok(true),
+            std::cmp::Ordering::Greater => high = middle,
+        }
+    }
+    Ok(false)
 }
