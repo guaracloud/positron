@@ -958,6 +958,7 @@ dependencies = [
  "positron-kernel",
  "positron-signals",
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]

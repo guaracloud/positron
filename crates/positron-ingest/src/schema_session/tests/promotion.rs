@@ -7,7 +7,7 @@ use positron_kernel::{
     LifecycleClock, ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope,
     StoreBlockIdentity, WorkClaim, WorkKind,
 };
-use positron_policy::{IngestPolicy, PolicyEvaluation};
+use positron_policy::{IngestPolicy, NativeLogCandidate, PolicyEvaluation};
 use positron_signals::{
     LogRecord, LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaCatalog,
     SchemaDiscoveryRequest, SchemaPath, SchemaQuery, SchemaValue,
@@ -256,7 +256,7 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
     assert_eq!(
         reopened_promoted.retained_charge_bytes(),
         promoted_charge,
-        "checkpoint-loaded sidecar capacity remains separately attributable"
+        "checkpoint-loaded scalar sidecar capacity remains separately attributable"
     );
     let reopened_base_charge = reopened_promoted.base_charge_bytes();
     reopened_session
@@ -298,14 +298,21 @@ fn records() -> Vec<LogRecord> {
     let policy = IngestPolicy::preserving(1).expect("policy");
     candidates
         .into_iter()
-        .filter_map(
-            |candidate| match policy.evaluate(candidate, receiver).expect("policy") {
+        .filter_map(|candidate| {
+            let bodyless = NativeLogCandidate::new(
+                candidate.event_time_unix_nanos(),
+                candidate.observed_time_unix_nanos(),
+                None,
+                candidate.attributes().to_vec(),
+                candidate.metadata().clone(),
+            );
+            match policy.evaluate(bodyless, receiver).expect("policy") {
                 PolicyEvaluation::Accepted(record) => {
                     Some(LogRecord::checked_evaluated(profile, *record).expect("record"))
                 },
                 PolicyEvaluation::Rejected => None,
-            },
-        )
+            }
+        })
         .collect()
 }
 
