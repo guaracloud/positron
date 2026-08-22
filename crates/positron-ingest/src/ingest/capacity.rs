@@ -9,7 +9,7 @@ const SCHEMA_DISCOVERY_NODES_PER_CPU_WORK_UNIT: u64 = 64;
 // A text sidecar is optional physical evidence. Requests whose conservative
 // construction bound exceeds this admission slice intentionally fall back to
 // authenticated body scans instead of making ordinary ingest unavailable.
-const MAX_ADMITTED_TEXT_WORK_UNITS: u64 = 256;
+const MAX_ADMITTED_TEXT_WORK_UNITS: u64 = 31;
 
 #[derive(Clone, Copy)]
 pub(super) struct SchemaAdmissionEstimate {

@@ -225,7 +225,9 @@ fn observed_text_replay_has_an_exact_work_boundary_and_falls_back_atomically()
             tenant,
             shard,
             identity,
-            vec![make_text_record("abc")?],
+            (0..32)
+                .map(|_| make_text_record("abc"))
+                .collect::<Result<Vec<_>, _>>()?,
         )?
         .into_store_block();
     ledger.append(block)?;

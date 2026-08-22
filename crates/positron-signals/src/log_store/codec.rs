@@ -189,6 +189,18 @@ impl<'input> BlockDecode<'input> {
         )
     }
 
+    pub(super) fn observed_quantized(
+        expected_tenant: TenantId,
+        bytes: &'input [u8],
+        cancellation: &'input dyn super::ScanCancellation,
+        observer: &'input dyn super::ScanObserver,
+    ) -> Result<Self, LogStoreFailure> {
+        Self::from_input(
+            expected_tenant,
+            Input::observed_quantized(bytes, cancellation, observer),
+        )
+    }
+
     fn from_input(
         expected_tenant: TenantId,
         input: Input<'input>,
@@ -215,6 +227,7 @@ impl<'input> BlockDecode<'input> {
             check_decode_cancellation(cancellation)?;
             record::validate(&mut self.input, self.limits, self.version)?;
         }
+        self.input.finish_component_observation()?;
         check_decode_cancellation(cancellation)?;
         if self.input.is_empty() {
             Ok(())
@@ -271,6 +284,7 @@ fn decode_block_records(
             records.push(decoded.into_stored(snapshot));
         }
     }
+    input.finish_component_observation()?;
     if !input.is_empty() {
         return Err(LogStoreFailure::malformed_block());
     }

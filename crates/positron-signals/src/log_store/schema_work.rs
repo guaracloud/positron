@@ -168,10 +168,13 @@ impl super::LogStore {
         observer: Option<&dyn ScanObserver>,
     ) -> Result<SchemaDelta, LogStoreFailure> {
         let decoded = match (cancellation, observer) {
-            (Some(cancellation), Some(observer)) => {
-                codec::BlockDecode::observed(tenant, block.payload(), cancellation, observer)?
-                    .decode(snapshot, usize::MAX, cancellation)?
-            },
+            (Some(cancellation), Some(observer)) => codec::BlockDecode::observed_quantized(
+                tenant,
+                block.payload(),
+                cancellation,
+                observer,
+            )?
+            .decode(snapshot, usize::MAX, cancellation)?,
             _ => codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?,
         };
         if schema.tenant() != tenant {

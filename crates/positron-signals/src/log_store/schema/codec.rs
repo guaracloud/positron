@@ -15,6 +15,7 @@ const MAX_SEGMENTS_ON_WIRE: usize = 128;
 mod encode;
 mod index;
 mod preflight;
+mod value;
 
 pub(super) const fn legacy_version(version: u16) -> bool {
     version == LEGACY_VERSION

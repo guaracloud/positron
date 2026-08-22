@@ -3,7 +3,7 @@ use super::text_index::{MAX_TEXT_TRIGRAMS, TextBlockSummary};
 use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 
 const TRIGRAM_BYTES: usize = 3;
-pub(crate) const WORK_QUANTUM_OPERATIONS: usize = 64;
+pub(crate) const WORK_QUANTUM_OPERATIONS: usize = 128;
 const MAX_BINARY_COMPARISONS: usize = 13;
 
 /// Failure returned when observed physical text evidence cannot finish.
@@ -33,7 +33,7 @@ pub(crate) fn work_units(body_bytes: usize) -> Option<u64> {
     let collected = windows.min(MAX_TEXT_TRIGRAMS);
     let canonical_operations = collected.checked_mul(MAX_BINARY_COMPARISONS + 1)?;
     let canonicalization = ceil_units(canonical_operations)?;
-    let encoding = ceil_units(MAX_TEXT_TRIGRAMS)?;
+    let encoding = ceil_units(collected)?;
     u64::try_from(
         traversal
             .checked_add(canonicalization)?
@@ -115,7 +115,7 @@ const fn ceil_units(operations: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextSummaryFailure, ceil_units};
+    use super::{TextSummaryFailure, ceil_units, from_bodies};
     use crate::log_store::schema::SchemaFailure;
 
     #[test]
@@ -125,5 +125,12 @@ mod tests {
             TextSummaryFailure::from(SchemaFailure::LimitExceeded),
             TextSummaryFailure::Schema(SchemaFailure::LimitExceeded)
         );
+    }
+
+    #[test]
+    fn empty_body_set_is_a_complete_zero_work_summary() {
+        let summary = from_bodies([Some("")], None).expect("empty body summary");
+        assert!(summary.complete);
+        assert!(summary.trigrams.is_empty());
     }
 }

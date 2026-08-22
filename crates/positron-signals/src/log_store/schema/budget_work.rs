@@ -25,20 +25,30 @@ impl SchemaBudget {
     /// Conservative replay work bound for one authenticated payload.
     #[must_use]
     pub fn replay_schema_work_units(payload_bytes: usize) -> Option<u64> {
-        // The codec observer accounts structural components in bounded
-        // payload quanta; raw bytes remain separately accounted as scanned
-        // storage. A 64 KiB quantum is the fixed replay work unit.
+        Self::replay_decode_work_units(payload_bytes)?
+            .checked_add(Self::text_index_work_units(payload_bytes)?)
+    }
+
+    /// Conservative structural decode and schema-discovery work bound before
+    /// decoded bodies reveal the text-summary size. A replay admission may
+    /// use this bound as a reduced-pruning fallback when the complete bound
+    /// cannot fit the protected recovery pool.
+    #[must_use]
+    pub fn replay_decode_work_units(payload_bytes: usize) -> Option<u64> {
+        // The replay codec observes structural components in fixed 64-byte
+        // component quanta; raw bytes remain separately accounted as scanned
+        // storage. A 64-byte quantum is conservative because each observed
+        // component consumes at least one authenticated payload byte.
         let decode = u64::try_from(payload_bytes)
             .ok()?
-            .checked_add(65_535)?
-            .checked_div(65_536)?;
-        let discovery = Self::system_max_discovery_nodes()
+            .checked_add(63)?
+            .checked_div(64)?;
+        let discovery_nodes = payload_bytes.min(Self::system_max_discovery_nodes());
+        let discovery = discovery_nodes
             .checked_add(63)?
             .checked_div(64)
             .and_then(|value| u64::try_from(value).ok())?;
-        decode
-            .checked_add(discovery)?
-            .checked_add(Self::text_index_work_units(payload_bytes)?)
+        decode.checked_add(discovery)
     }
 
     /// Conservative retained-memory cost of one indexed path copy.

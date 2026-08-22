@@ -15,6 +15,7 @@ mod inspection;
 mod observer;
 mod recovery;
 mod registry;
+mod replay_capacity;
 mod stage;
 pub use checkpoint::TenantSchemaCheckpoint;
 pub(crate) use observer::SchemaBuildObserver;

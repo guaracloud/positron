@@ -6,7 +6,8 @@ use positron_kernel::{
     LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_policy::IngestPolicy;
-use positron_signals::{SchemaCatalog, SchemaCheckpointFrontier};
+use positron_signals::{ScanCancellation, SchemaCatalog, SchemaCheckpointFrontier};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::{SchemaSessionFailure, TenantSchemaRegistry};
 use crate::{IngestOutcome, LogIngest, OtlpLogsReceiver};
@@ -57,6 +58,23 @@ fn rebuild_from_committed_custom_shards_is_canonical_and_idempotent() {
     assert_eq!(left, expected);
     assert_eq!(right, expected);
     assert_eq!(left, right);
+
+    let mut bootstrap =
+        crate::SchemaReplayBuilder::new(fixture.tenant, None, fixture.authority.recovery())
+            .expect("bootstrap replay");
+    bootstrap
+        .replay_snapshot(&first_snapshot)
+        .expect("first bootstrap snapshot");
+    bootstrap
+        .replay_snapshot(&second_snapshot)
+        .expect("second bootstrap snapshot");
+    assert_eq!(
+        bootstrap
+            .finish()
+            .expect("bootstrap checkpoint")
+            .catalog_bytes(),
+        expected
+    );
 }
 
 #[test]
@@ -142,6 +160,65 @@ fn checkpoint_frontier_rejects_identity_or_digest_mismatch() {
     }
 }
 
+#[test]
+fn replay_cancellation_does_not_publish_a_partial_frontier_or_catalog() {
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xf1; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xf2; 32]), Box::new([0xf3; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(304).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xf4);
+    let live_registry = TenantSchemaRegistry::new(1).expect("registry");
+    let live = live_registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("session");
+    ingest(&fixture, &ledger, shard, live, 0xf5);
+    let snapshot = ledger.snapshot().expect("snapshot");
+    drop(live_registry);
+
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let session = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("session");
+    let before = session
+        .checkpoint()
+        .expect("empty checkpoint")
+        .catalog_bytes()
+        .to_vec();
+    let cancellation = CancelAfterPolls::new(4);
+    assert_eq!(
+        session.replay_snapshot_cancellable(
+            fixture.tenant,
+            &snapshot,
+            fixture.authority.governor(),
+            &cancellation,
+        ),
+        Err(SchemaSessionFailure::StateUnavailable)
+    );
+    assert_eq!(
+        session
+            .checkpoint()
+            .expect("checkpoint after cancellation")
+            .catalog_bytes(),
+        before
+    );
+
+    session
+        .replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor())
+        .expect("retry replay");
+    assert_ne!(
+        session
+            .checkpoint()
+            .expect("replayed checkpoint")
+            .catalog_bytes(),
+        before
+    );
+}
+
 fn replay(
     fixture: &crate::tests::support::Fixture,
     snapshots: [&positron_kernel::LedgerSnapshot<'_>; 2],
@@ -221,4 +298,24 @@ fn ledger<'authority, 'catalog>(
         SegmentProtectionKey::from_owned(Box::new([marker; 32])),
     )
     .expect("ledger")
+}
+
+struct CancelAfterPolls {
+    polls: AtomicUsize,
+    cancel_after: usize,
+}
+
+impl CancelAfterPolls {
+    const fn new(cancel_after: usize) -> Self {
+        Self {
+            polls: AtomicUsize::new(0),
+            cancel_after,
+        }
+    }
+}
+
+impl ScanCancellation for CancelAfterPolls {
+    fn is_cancelled(&self) -> bool {
+        self.polls.fetch_add(1, Ordering::Relaxed) >= self.cancel_after
+    }
 }

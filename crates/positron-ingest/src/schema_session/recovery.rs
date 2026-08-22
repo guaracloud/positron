@@ -4,10 +4,15 @@ use positron_kernel::{
     LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation,
     StoreBlockIdentity,
 };
-use positron_signals::{ScanCancellation, SchemaBudget, SchemaCheckpointFrontier};
+use positron_signals::{ScanCancellation, SchemaCheckpointFrontier};
 
 use super::SchemaBuildObserver;
+use super::replay_capacity::{
+    ensure_replay_capacity, reserve_replay_decode_capacity, resize_replay_work,
+};
 use super::{MAX_REPLAY_SHARDS, SchemaSessionFailure, SessionState, TenantSchemaSession};
+
+pub(super) use super::replay_capacity::reserve_query_index_capacity;
 
 struct NeverCancelled;
 
@@ -141,6 +146,7 @@ impl TenantSchemaSession {
             let digest = block
                 .content_digest()
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+            resize_replay_work(recovery, block.payload().len())?;
             ensure_replay_capacity(recovery, block.payload().len())?;
             let observer = SchemaBuildObserver::new_scan(
                 recovery.granted().get(ResourceDimension::CpuWorkUnits),
@@ -270,27 +276,6 @@ pub(super) fn reconcile_pending(
     Ok(())
 }
 
-fn reserve_replay_decode_capacity(
-    tenant: TenantId,
-    payload_bytes: usize,
-    governor: ResourceGovernor<'_>,
-) -> Result<ResourceReservation<'_>, SchemaSessionFailure> {
-    let bytes = u64::try_from(
-        SchemaBudget::replay_working_memory_bytes(payload_bytes)
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
-    )
-    .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    let cpu_work = SchemaBudget::replay_schema_work_units(payload_bytes)
-        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-    let amounts = ResourceAmounts::new([bytes, 0, 0, 0, 0, 0, 0, 0, cpu_work, 0, 0]);
-    let claim =
-        positron_kernel::WorkClaim::tenant(tenant, positron_kernel::WorkKind::Ingest, amounts)
-            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    governor
-        .reserve(claim)
-        .map_err(|_| SchemaSessionFailure::StateUnavailable)
-}
-
 fn map_replay_observed_failure(failure: positron_signals::LogStoreFailure) -> SchemaSessionFailure {
     match failure.code() {
         positron_signals::LogStoreFailureCode::BudgetExhausted
@@ -307,29 +292,6 @@ fn map_replay_observed_failure(failure: positron_signals::LogStoreFailure) -> Sc
         | positron_signals::LogStoreFailureCode::ClockUnavailable
         | positron_signals::LogStoreFailureCode::Internal => SchemaSessionFailure::ReplayIntegrity,
     }
-}
-
-pub(super) fn reserve_query_index_capacity(
-    tenant: TenantId,
-    payload_bytes: usize,
-    governor: ResourceGovernor<'_>,
-) -> Result<ResourceReservation<'_>, SchemaSessionFailure> {
-    reserve_replay_decode_capacity(tenant, payload_bytes, governor)
-}
-
-fn ensure_replay_capacity(
-    capacity: &ResourceReservation<'_>,
-    payload_bytes: usize,
-) -> Result<(), SchemaSessionFailure> {
-    let required = u64::try_from(
-        SchemaBudget::replay_working_memory_bytes(payload_bytes)
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
-    )
-    .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    if capacity.granted().get(ResourceDimension::MemoryBytes) < required {
-        return Err(SchemaSessionFailure::StateUnavailable);
-    }
-    Ok(())
 }
 
 fn ensure_retained_slot(state: &SessionState, adding: bool) -> Result<(), SchemaSessionFailure> {
