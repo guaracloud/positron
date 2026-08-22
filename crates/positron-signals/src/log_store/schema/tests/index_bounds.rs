@@ -156,6 +156,27 @@ fn replay_apply_accounts_sorted_block_index_shifts() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn replay_reconciliation_capacity_includes_catalog_entry_shifts() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    for index in 0..4_095 {
+        let attribute = occurrence(
+            AttributeNamespace::Record,
+            &format!("key-{index:04}"),
+            CandidateAttributeValue::string("value".to_owned()),
+        )?;
+        catalog.observe(std::slice::from_ref(&attribute))?;
+    }
+
+    assert_eq!(
+        catalog.replay_reconciliation_work_units(1)?,
+        4_107,
+        "replay admission must cover a first-path insertion across the catalog"
+    );
+    Ok(())
+}
+
+#[test]
 fn replay_reconcile_observes_before_cloning_stale_indexes() -> Result<(), Box<dyn Error>> {
     let tenant = tenant();
     let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;

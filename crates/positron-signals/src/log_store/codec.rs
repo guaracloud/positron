@@ -280,7 +280,7 @@ fn decode_block_records(
     // detached structural cursor so malformed bytes still fail closed while
     // no tail record is built or charged as decoded work.
     input.finish_component_observation()?;
-    let mut tail = Input::new(input.remaining());
+    let mut tail = input.remaining_input();
     for _ in retained_count..count {
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());

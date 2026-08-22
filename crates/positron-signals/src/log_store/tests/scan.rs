@@ -269,6 +269,45 @@ fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn
         before
     );
 
+    let recording = RecordingScanObserver(AtomicU64::new(0));
+    let observed = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &recording,
+    )?;
+    assert!(
+        recording.0.load(Ordering::SeqCst) >= 1_024,
+        "every structurally validated tail record must be observed"
+    );
+    let exact_work = recording.0.load(Ordering::SeqCst);
+    drop(observed);
+    let exact = BudgetedScanObserver(AtomicU64::new(exact_work));
+    let exact_result = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &exact,
+    )?;
+    assert_eq!(exact.0.load(Ordering::SeqCst), 0);
+    drop(exact_result);
+    let below = BudgetedScanObserver(AtomicU64::new(exact_work - 1));
+    let failure = LogStore::new()
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &NeverCancelled,
+            &below,
+        )
+        .expect_err("one less tail-validation work unit must fail closed");
+    assert_eq!(failure.code(), LogStoreFailureCode::BudgetExhausted);
+
     for threshold in 1..=256 {
         let cancellation = CancelAfterPolls::new(threshold);
         let failure = LogStore::new()

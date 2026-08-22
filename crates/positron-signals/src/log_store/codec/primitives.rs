@@ -205,7 +205,13 @@ impl<'a> Input<'a> {
         self.remaining.is_empty()
     }
 
-    pub(super) const fn remaining(&self) -> &'a [u8] {
-        self.remaining
+    pub(super) const fn remaining_input(&self) -> Self {
+        Self {
+            remaining: self.remaining,
+            observer: self.observer,
+            cancellation: self.cancellation,
+            quantized_components: self.quantized_components,
+            pending_components: Cell::new(0),
+        }
     }
 }

@@ -110,9 +110,22 @@ impl SchemaCatalog {
             .checked_mul(10)
             .and_then(|value| value.checked_add(1))
             .ok_or(SchemaFailure::LimitExceeded)?;
+        // Replay applies entries through sorted Vec insertion.  A new path
+        // may shift every bounded catalog slot, so reserve that complete
+        // worst-case traversal before the candidate is mutated.  Each
+        // admitted block gets one new-entry slot here; the delta observer
+        // charges any additional staged entries before mutation and rejects
+        // the transaction atomically when the reservation cannot cover them.
+        let entry_shifts = self
+            .entries
+            .len()
+            .checked_add(blocks)
+            .and_then(|value| value.checked_mul(blocks))
+            .ok_or(SchemaFailure::LimitExceeded)?;
         u64::try_from(per_block)
             .ok()
             .and_then(|value| value.checked_mul(u64::try_from(blocks).ok()?))
+            .and_then(|value| value.checked_add(u64::try_from(entry_shifts).ok()?))
             .ok_or(SchemaFailure::LimitExceeded)
     }
 

@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
@@ -49,6 +50,30 @@ impl ScanObserver for RejectObservedWork {
         } else {
             Ok(())
         }
+    }
+}
+
+struct BudgetedTextWork(AtomicU64);
+
+impl ScanObserver for BudgetedTextWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.0
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(units),
+            )
+            .map(|_| ())
+            .map_err(|_| ScanObservationFailureCode::BudgetExhausted)
+    }
+}
+
+struct RecordingTextWork(AtomicU64);
+
+impl ScanObserver for RecordingTextWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.0.fetch_add(units, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -252,6 +277,90 @@ fn text_summary_prunes_absent_blocks_and_survives_reopen() -> Result<(), Box<dyn
     )?;
     assert_eq!(stale_result.records(), decoded.records());
     assert!(stale_result.reduced_pruning());
+    Ok(())
+}
+
+#[test]
+fn text_scan_limit_stops_before_next_block_candidate_work() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let kernel_catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x96; 16])?,
+        CatalogSecret::from_owned(Box::new([0x97; 32]), Box::new([0x98; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(92)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &kernel_catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x99; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let candidate = TextSearchCandidate::literal("target")?.ok_or("candidate became generic")?;
+    let first_identity = StoreBlockIdentity::new([0x9a; 16])?;
+    let (first, first_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        first_identity,
+        vec![super::minimal_record("target", 100)?],
+        &schema,
+    )?;
+    let first = first.into_store_block();
+    let first_digest = first.content_digest()?;
+    ledger.append(first)?;
+    store.apply_schema_delta(&mut schema, first_delta, first_identity, first_digest)?;
+    let first_snapshot = ledger.snapshot()?;
+    let first_observer = RecordingTextWork(AtomicU64::new(0));
+    let first_result = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &first_snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &candidate,
+        &NeverCancelled,
+        &first_observer,
+    )?;
+    assert_eq!(first_result.records().len(), 1);
+    drop(first_result);
+    let first_work = first_observer.0.load(Ordering::SeqCst);
+
+    let second_identity = StoreBlockIdentity::new([0x9b; 16])?;
+    let (second, second_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+        tenant,
+        shard,
+        second_identity,
+        vec![super::minimal_record("target", 101)?],
+        &schema,
+    )?;
+    let second = second.into_store_block();
+    let second_digest = second.content_digest()?;
+    ledger.append(second)?;
+    store.apply_schema_delta(&mut schema, second_delta, second_identity, second_digest)?;
+
+    let budget = BudgetedTextWork(AtomicU64::new(first_work));
+    let result = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &candidate,
+        &NeverCancelled,
+        &budget,
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert!(!result.complete());
+    assert_eq!(budget.0.load(Ordering::SeqCst), 0);
     Ok(())
 }
 

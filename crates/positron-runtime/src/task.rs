@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{HealthState, ServiceHandle};
@@ -21,12 +23,20 @@ pub enum TaskRole {
 #[derive(Clone, Debug)]
 pub struct TaskCancellation {
     cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    polls: Arc<AtomicU64>,
+    #[cfg(test)]
+    cancel_after: Arc<AtomicU64>,
 }
 
 impl TaskCancellation {
     pub(crate) fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            polls: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cancel_after: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -34,8 +44,25 @@ impl TaskCancellation {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn cancel_after_polls(&self, polls: u64) {
+        self.cancel_after.store(polls, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_count(&self) -> u64 {
+        self.polls.load(Ordering::Acquire)
+    }
+
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
+        #[cfg(test)]
+        {
+            let polls = self.polls.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+            if polls >= self.cancel_after.load(Ordering::Acquire) {
+                self.cancel();
+            }
+        }
         self.cancelled.load(Ordering::Acquire)
     }
 }

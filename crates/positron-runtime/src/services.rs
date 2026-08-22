@@ -67,7 +67,13 @@ impl ServiceHandle {
         let fallback = crate::TaskCancellation::new();
         let cancellation = cancellation.unwrap_or(&fallback);
         let recovered = schema_bootstrap::recover(&instance, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(ServiceFailure::Cancelled);
+        }
         if let Some(checkpoint) = recovered.dirty_checkpoint {
+            if cancellation.is_cancelled() {
+                return Err(ServiceFailure::Cancelled);
+            }
             schema_maintenance::publish_quiescent_checkpoint(&instance, checkpoint)?;
         }
         Ok(Self {

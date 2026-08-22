@@ -62,3 +62,33 @@ fn cancellation_is_not_reclassified_as_a_storage_failure() {
         crate::BootstrapFailureCode::ResourceUnavailable
     );
 }
+
+#[test]
+fn replay_failures_preserve_resource_integrity_and_cancellation_classes() {
+    assert_eq!(
+        super::schema_bootstrap::classify_replay_failure(
+            positron_ingest::SchemaSessionFailure::StateUnavailable
+        ),
+        ServiceFailure::CapacityUnavailable
+    );
+    assert_eq!(
+        super::schema_bootstrap::classify_replay_failure(
+            positron_ingest::SchemaSessionFailure::ReplayLimitExceeded
+        ),
+        ServiceFailure::CapacityUnavailable
+    );
+    assert_eq!(
+        super::schema_bootstrap::classify_replay_failure(
+            positron_ingest::SchemaSessionFailure::Schema(
+                positron_signals::SchemaFailure::MalformedCatalog,
+            )
+        ),
+        ServiceFailure::CorruptState
+    );
+    assert_eq!(
+        super::schema_bootstrap::classify_replay_failure(
+            positron_ingest::SchemaSessionFailure::Cancelled
+        ),
+        ServiceFailure::Cancelled
+    );
+}

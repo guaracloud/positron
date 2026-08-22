@@ -104,6 +104,11 @@ impl LogStore {
             {
                 continue;
             }
+            let remaining = limit.saturating_sub(records.len());
+            if remaining == 0 {
+                complete = false;
+                break;
+            }
             if let Some((schema, candidate)) = text {
                 observer
                     .observe_work(1)
@@ -117,11 +122,6 @@ impl LogStore {
                     Some(true) => {},
                     None => reduced_pruning = true,
                 }
-            }
-            let remaining = limit.saturating_sub(records.len());
-            if remaining == 0 {
-                complete = false;
-                break;
             }
             scanned_bytes = scanned_bytes
                 .checked_add(
