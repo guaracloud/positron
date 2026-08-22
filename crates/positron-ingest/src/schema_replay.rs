@@ -123,10 +123,21 @@ fn peak_resources(source_bytes: u64) -> Result<ResourceAmounts, SchemaSessionFai
     .ok()
     .and_then(|bytes| bytes.checked_add(source_bytes))
     .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-    active_resources(memory)
+    active_resources_with_work(
+        memory,
+        SchemaBudget::replay_schema_work_units(1_048_576)
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+    )
 }
 
 fn active_resources(memory: u64) -> Result<ResourceAmounts, SchemaSessionFailure> {
+    active_resources_with_work(memory, 0)
+}
+
+fn active_resources_with_work(
+    memory: u64,
+    cpu_work_units: u64,
+) -> Result<ResourceAmounts, SchemaSessionFailure> {
     Ok(ResourceAmounts::new([
         memory.max(1),
         0,
@@ -136,7 +147,7 @@ fn active_resources(memory: u64) -> Result<ResourceAmounts, SchemaSessionFailure
         0,
         0,
         1,
-        1,
+        cpu_work_units,
         0,
         0,
     ]))

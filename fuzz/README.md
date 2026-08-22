@@ -28,6 +28,13 @@ Current storage target:
 cargo +nightly fuzz run primary_data_volume_stateful
 ```
 
+The bounded query matcher target exercises substring matching, the static
+regex automaton, and conservative text-pruning candidate extraction:
+
+```console
+cargo +nightly fuzz run query_search_matcher
+```
+
 Current authenticated-frame target:
 
 ```console

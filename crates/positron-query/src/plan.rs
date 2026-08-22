@@ -181,11 +181,20 @@ impl LogicalPlan {
     pub(crate) fn search_memory_bytes(&self) -> u64 {
         match self.filter.as_ref() {
             Some(FilterPredicate::BodyContains(_)) => crate::search::text_memory_bytes(),
-            Some(FilterPredicate::BodyRegex(regex)) => regex.memory_bytes(),
+            Some(FilterPredicate::BodyRegex(regex)) => regex
+                .memory_bytes()
+                .max(crate::search::regex_peak_memory_bytes()),
             Some(FilterPredicate::BodyEquals(_))
             | Some(FilterPredicate::AttributeEquals(_))
             | None => 0,
         }
+    }
+
+    pub(crate) fn compile_search(&mut self) -> Result<(), crate::QueryFailure> {
+        if let Some(FilterPredicate::BodyRegex(regex)) = self.filter.as_mut() {
+            regex.compile()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn text_search_candidate(

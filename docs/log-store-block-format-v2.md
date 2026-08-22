@@ -3,8 +3,9 @@
 This document remains the byte-level authority for native Log Store Block
 version 2. Version 2 extends, and does not reinterpret, the version 1 format in
 [`log-store-block-format-v1.md`](log-store-block-format-v1.md). Readers retain
-the complete version 1 contract. Current writers emit version 2; current
-readers continue to accept versions 1 and 2.
+the complete version 1 contract. Store Block writers emit version 2. PSCHEMA1
+readers accept versions 1, 2, and 3; catalog writers emit version 2 without a
+text sidecar and version 3 when a text sidecar is present.
 
 The block envelope is unchanged except that its version field is `2`. All
 version 1 bounds, byte order, rejection rules, record ordering, body encoding,
@@ -61,7 +62,8 @@ version 2 format uses tag `4` only for the native Stream Attribute namespace.
 
 The Log Store owns a bounded Tenant Schema Catalog separately from Store Block
 payloads. Its immutable Catalog Object uses the ASCII magic `PSCHEMA1`.
-Current writers emit version `3`; readers accept versions `1`, `2`, and `3`.
+Writers emit version `2` when no physical text framing is present and version
+`3` when a text sidecar is present; readers accept versions `1`, `2`, and `3`.
 The header is followed by the tenant identity, entry/memory/persistent-byte/
 index-byte budgets, overflow record and byte counters, and deterministic
 namespace-qualified path entries. Each entry preserves observed typed
@@ -90,7 +92,10 @@ text framing and remain readable, while a version 1 object is never parsed as
 version 2 or 3. Version 1 bytes beginning with `PVALUES\0` therefore remain
 the next identity, not an optional trailer. These sidecars do not add a Store
 Block tag or version. Each scalar String or Bytes payload is bounded to the
-canonical native value limit of 65,536 bytes. When a legacy block is mutated
+canonical native value limit of 65,536 bytes. Text summaries are rebuilt only
+from authenticated decoded bodies; missing, legacy, stale, replaced, generic,
+overflow, or incomplete coverage falls back to authoritative decoding and
+reports reduced pruning. When a legacy block is mutated
 by replay, promotion, path removal, or text-summary publication, the in-memory
 index atomically upgrades its surviving physical entry to the current scalar
 and text framing and charges every added presence byte before publication;

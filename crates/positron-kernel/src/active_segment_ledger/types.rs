@@ -170,7 +170,8 @@ impl AppendCancellation {
         self.0.store(true, Ordering::Release);
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 }

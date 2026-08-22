@@ -238,6 +238,20 @@ fn planning_failures_identify_the_effective_budget_limit() -> Result<(), Box<dyn
         maximum_range.limiting_budget(),
         Some(QueryBudgetDimension::MaximumTimeRangeNanoseconds)
     );
+
+    let regex_memory = match service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time 0 100 | search body =~ "needle" | limit 1"#,
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1, 60)?,
+    ) {
+        Ok(_) => return Err("regex compilation exceeded its admitted memory budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(regex_memory.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        regex_memory.limiting_budget(),
+        Some(QueryBudgetDimension::MemoryBytes)
+    );
     Ok(())
 }
 

@@ -1,3 +1,4 @@
+mod budget_work;
 mod catalog;
 mod checkpoint;
 mod codec;
@@ -5,6 +6,7 @@ pub(crate) mod delta;
 mod discovery;
 mod failure;
 mod index;
+mod index_path;
 #[cfg(test)]
 pub(crate) use index::{SchemaBlockIndex, SchemaIndexPath};
 mod model;
@@ -15,7 +17,9 @@ mod query;
 mod representation;
 mod session;
 mod stored_query;
+mod text_builder;
 mod text_index;
+pub(super) use text_builder::TextSummaryFailure;
 
 pub use catalog::SchemaCatalog;
 pub use checkpoint::SchemaCheckpointFrontier;

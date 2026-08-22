@@ -8,6 +8,7 @@ use super::super::index::{
 use super::super::text_index::TextBlockSummary;
 use super::SchemaDelta;
 use super::accounting::{projected_cost, staged_memory_bytes};
+use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 
 impl SchemaDelta {
     pub(crate) fn into_block_index(
@@ -44,14 +45,63 @@ impl SchemaDelta {
         catalog: &SchemaCatalog,
         summary: TextBlockSummary,
     ) -> Result<(), SchemaFailure> {
+        self.attach_text_summary_inner(catalog, summary, None)
+            .map_err(|failure| match failure {
+                TextSummaryAttachFailure::Schema(failure) => failure,
+                TextSummaryAttachFailure::Observation(_) => SchemaFailure::AllocationUnavailable,
+            })
+    }
+
+    pub(crate) fn attach_text_summary_observed(
+        &mut self,
+        catalog: &SchemaCatalog,
+        summary: TextBlockSummary,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), crate::log_store::LogStoreFailure> {
+        self.attach_text_summary_inner(catalog, summary, Some(observer))
+            .map_err(|failure| match failure {
+                TextSummaryAttachFailure::Schema(failure) => {
+                    crate::log_store::map_schema_failure(failure)
+                },
+                TextSummaryAttachFailure::Observation(failure) => {
+                    crate::log_store::LogStoreFailure::observation(failure)
+                },
+            })
+    }
+
+    fn attach_text_summary_inner(
+        &mut self,
+        catalog: &SchemaCatalog,
+        summary: TextBlockSummary,
+        observer: Option<&dyn ScanObserver>,
+    ) -> Result<(), TextSummaryAttachFailure> {
         if !self.build_physical_index || self.text_summary.is_some() {
             return Ok(());
         }
-        let summary_memory = summary.memory_bytes()?;
+        let summary_memory = summary
+            .memory_bytes()
+            .map_err(TextSummaryAttachFailure::Schema)?;
         let summary_wire = summary
             .encoded_bytes()?
             .checked_add(1)
-            .ok_or(SchemaFailure::LimitExceeded)?;
+            .ok_or(SchemaFailure::LimitExceeded)
+            .map_err(TextSummaryAttachFailure::Schema)?;
+        if let Some(observer) = observer {
+            let units = summary
+                .trigrams()
+                .len()
+                .checked_add(super::super::text_builder::WORK_QUANTUM_OPERATIONS - 1)
+                .ok_or(SchemaFailure::LimitExceeded)
+                .map_err(TextSummaryAttachFailure::Schema)?
+                / super::super::text_builder::WORK_QUANTUM_OPERATIONS;
+            if units > 0 {
+                observer
+                    .observe_work(u64::try_from(units).map_err(|_| {
+                        TextSummaryAttachFailure::Schema(SchemaFailure::LimitExceeded)
+                    })?)
+                    .map_err(TextSummaryAttachFailure::Observation)?;
+            }
+        }
         let old_memory = self.physical_memory_bytes;
         let old_wire = self.physical_index_bytes;
         self.physical_memory_bytes = self
@@ -119,5 +169,16 @@ impl SchemaDelta {
         self.index_bytes = index;
         self.staged_memory_bytes = staged_memory_bytes(self)?;
         Ok(())
+    }
+}
+
+enum TextSummaryAttachFailure {
+    Schema(SchemaFailure),
+    Observation(ScanObservationFailureCode),
+}
+
+impl From<SchemaFailure> for TextSummaryAttachFailure {
+    fn from(failure: SchemaFailure) -> Self {
+        Self::Schema(failure)
     }
 }

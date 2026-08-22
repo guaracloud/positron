@@ -142,22 +142,12 @@ impl LogStore {
                 break;
             }
             let decoded = decode.decode(snapshot, remaining, cancellation)?;
-            if decoded.truncated {
-                complete = false;
-            }
             for (ordinal, record) in decoded.records.into_iter().enumerate() {
-                if records.len() == limit {
-                    complete = false;
-                    break;
-                }
                 let ordinal = u16::try_from(ordinal)
                     .ok()
                     .and_then(|ordinal| positron_domain::routing::RecordOrdinal::new(ordinal).ok())
                     .ok_or_else(LogStoreFailure::malformed_block)?;
                 records.push(ScannedLogRecord::new(record, block.position(), ordinal));
-            }
-            if !complete {
-                break;
             }
         }
         check_scan_cancellation(cancellation)?;

@@ -102,7 +102,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
         let cpu_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
-        let plan = parser(source)?;
+        let mut plan = parser(source)?;
         let last_observed_at = self.now()?;
         if last_observed_at < started_at {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
@@ -123,6 +123,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::MemoryBytes,
             ));
         }
+        plan.compile_search()?;
         if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }

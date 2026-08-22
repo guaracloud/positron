@@ -17,6 +17,8 @@ fn schema(memory: u64) -> SchemaAdmissionEstimate {
         staging_memory_bytes: memory,
         retained_memory_bytes: memory,
         discovery_nodes: 1,
+        text_work_units: 0,
+        schema_work_units: 1,
     }
 }
 

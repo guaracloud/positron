@@ -271,19 +271,17 @@ fn decode_block_records(
             records.push(decoded.into_stored(snapshot));
         }
     }
-    let truncated = retained_count < count;
     if !input.is_empty() {
         return Err(LogStoreFailure::malformed_block());
     }
     if cancellation.is_cancelled() {
         return Err(LogStoreFailure::cancelled());
     }
-    Ok(DecodedBlock { records, truncated })
+    Ok(DecodedBlock { records })
 }
 
 pub(super) struct DecodedBlock {
     pub(super) records: Vec<StoredLogRecord>,
-    pub(super) truncated: bool,
 }
 
 pub(super) fn bounded_vec<T>(count: usize) -> Result<Vec<T>, LogStoreFailure> {

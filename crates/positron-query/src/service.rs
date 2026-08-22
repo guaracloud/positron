@@ -139,7 +139,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?
                 .to_owned();
             filter = Some(FilterPredicate::BodyRegex(
-                crate::search::BoundedRegex::new(text)?,
+                crate::search::BoundedRegex::from_source(text)?,
             ));
             stage_order = 2;
         } else if let Some(columns) = stage.strip_prefix("project ") {

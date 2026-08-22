@@ -11,7 +11,11 @@ const SCHEMA_DISCOVERY_NODES_PER_CPU_WORK_UNIT: u64 = 64;
 pub(super) struct SchemaAdmissionEstimate {
     staging_memory_bytes: u64,
     retained_memory_bytes: u64,
+    #[allow(dead_code)]
     discovery_nodes: u64,
+    #[allow(dead_code)]
+    text_work_units: u64,
+    schema_work_units: u64,
 }
 
 impl SchemaAdmissionEstimate {
@@ -23,8 +27,18 @@ impl SchemaAdmissionEstimate {
         self.retained_memory_bytes
     }
 
+    #[allow(dead_code)]
     pub(super) const fn discovery_nodes(self) -> u64 {
         self.discovery_nodes
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn text_work_units(self) -> u64 {
+        self.text_work_units
+    }
+
+    pub(super) const fn schema_work_units(self) -> u64 {
+        self.schema_work_units
     }
 }
 
@@ -35,6 +49,7 @@ pub(super) fn schema_admission_estimate(
     let mut schema_bytes = u64::try_from(std::mem::size_of::<Vec<SchemaEntry>>()).ok()?;
     let mut discovery_nodes = 0_u64;
     let mut text_body_bytes = 0_usize;
+    let mut text_work_units = 0_u64;
     let mut has_text_body = false;
     let discovery_limit = u64::try_from(SchemaBudget::system_max_discovery_nodes()).ok()?;
     for record in records {
@@ -60,6 +75,7 @@ pub(super) fn schema_admission_estimate(
             )?)
             .ok()?,
         )?;
+        text_work_units = SchemaBudget::text_index_work_units(text_body_bytes)?;
     }
     if discovery_nodes > 0 {
         schema_bytes = schema_bytes
@@ -75,6 +91,8 @@ pub(super) fn schema_admission_estimate(
         staging_memory_bytes,
         retained_memory_bytes,
         discovery_nodes,
+        text_work_units,
+        schema_work_units: schema_discovery_cpu_work_units(discovery_nodes)?.max(text_work_units),
     })
 }
 
@@ -90,8 +108,7 @@ pub(super) fn group_work_amounts(
     let policy_and_store_work = evaluation_work.checked_mul(record_count)?.checked_add(1)?;
     // Policy and discovery execute sequentially within the admission group;
     // reserve their conservative peak rather than fabricating concurrency.
-    let cpu_work =
-        policy_and_store_work.max(schema_discovery_cpu_work_units(schema.discovery_nodes())?);
+    let cpu_work = policy_and_store_work.max(schema.schema_work_units());
     let per_record = policy.reserved_memory_bytes()?;
     let policy_memory = per_record.checked_mul(record_count)?;
     let memory = 1_048_576_u64

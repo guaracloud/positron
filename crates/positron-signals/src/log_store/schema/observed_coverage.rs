@@ -106,7 +106,7 @@ fn poll_payload(
     observer: &dyn ScanObserver,
 ) -> Result<(), ScanObservationFailureCode> {
     for _ in payload.chunks(NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
-        observer.observe_work(0)?;
+        observer.observe_work(1)?;
     }
     Ok(())
 }

@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::{TextBlockSummary, TextSearchCandidate};
     use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 
@@ -8,6 +10,45 @@ mod tests {
     impl ScanObserver for Unobserved {
         fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
             Ok(())
+        }
+    }
+
+    struct Meter {
+        consumed: Cell<u64>,
+        limit: u64,
+        cancel_after: Option<u64>,
+    }
+
+    impl Meter {
+        const fn bounded(limit: u64) -> Self {
+            Self {
+                consumed: Cell::new(0),
+                limit,
+                cancel_after: None,
+            }
+        }
+
+        const fn cancelling(after: u64) -> Self {
+            Self {
+                consumed: Cell::new(0),
+                limit: u64::MAX,
+                cancel_after: Some(after),
+            }
+        }
+    }
+
+    impl ScanObserver for Meter {
+        fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+            let consumed = self.consumed.get().saturating_add(units);
+            self.consumed.set(consumed);
+            if self.cancel_after.is_some_and(|after| consumed > after) {
+                return Err(ScanObservationFailureCode::Cancelled);
+            }
+            if consumed > self.limit {
+                Err(ScanObservationFailureCode::BudgetExhausted)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -103,6 +144,37 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn observed_summary_has_an_exact_work_boundary() {
+        let bodies = [Some("abcdefghijk")];
+        let meter = Meter::bounded(u64::MAX);
+        TextBlockSummary::from_bodies_observed(bodies, &meter).expect("summary construction");
+        let consumed = meter.consumed.get();
+        assert!(consumed > 0);
+
+        let exact_minus_one = Meter::bounded(consumed - 1);
+        assert_eq!(
+            TextBlockSummary::from_bodies_observed(bodies, &exact_minus_one)
+                .expect_err("one unit below the observed work must fail"),
+            super::super::text_builder::TextSummaryFailure::Observation(
+                ScanObservationFailureCode::BudgetExhausted
+            )
+        );
+    }
+
+    #[test]
+    fn observed_summary_polls_cancellation_during_a_large_body() {
+        let body = "x".repeat(2_048);
+        let meter = Meter::cancelling(1);
+        assert_eq!(
+            TextBlockSummary::from_bodies_observed([Some(body.as_str())], &meter)
+                .expect_err("summary construction must be interruptible"),
+            super::super::text_builder::TextSummaryFailure::Observation(
+                ScanObservationFailureCode::Cancelled
+            )
+        );
+    }
 }
 use super::failure::SchemaFailure;
 use crate::log_store::{ScanObservationFailureCode, ScanObserver};
@@ -119,6 +191,9 @@ pub(crate) const MIN_TEXT_INDEX_BUDGET_BYTES: usize = 256;
 const TRIGRAM_BYTES: usize = 3;
 const MAX_SEARCH_LITERALS: usize = 32;
 const MAX_SEARCH_LITERAL_BYTES: usize = 1_024;
+// A lookup unit covers at most 64 binary-search comparisons. Cancellation is
+// still polled at each unit boundary, but no comparison is free CPU work.
+const LOOKUP_COMPARISONS_PER_WORK_UNIT: usize = 64;
 
 /// A bounded set of byte literals that every matching body contains at least
 /// one of. Query owns the parser; this type is only the storage pruning input.
@@ -181,8 +256,8 @@ impl TextSearchCandidate {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TextBlockSummary {
-    complete: bool,
-    trigrams: Vec<[u8; TRIGRAM_BYTES]>,
+    pub(super) complete: bool,
+    pub(super) trigrams: Vec<[u8; TRIGRAM_BYTES]>,
 }
 
 impl TextBlockSummary {
@@ -198,29 +273,19 @@ impl TextBlockSummary {
     pub(crate) fn from_bodies<'a>(
         bodies: impl IntoIterator<Item = Option<&'a str>>,
     ) -> Result<Self, SchemaFailure> {
-        let mut trigrams = Vec::new();
-        let mut complete = true;
-        'bodies: for body in bodies {
-            let Some(body) = body else { continue };
-            for window in body.as_bytes().windows(TRIGRAM_BYTES) {
-                let trigram = [window[0], window[1], window[2]];
-                match trigrams.binary_search(&trigram) {
-                    Ok(_) => continue,
-                    Err(position) if trigrams.len() < MAX_TEXT_TRIGRAMS => {
-                        trigrams
-                            .try_reserve_exact(1)
-                            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-                        trigrams.insert(position, trigram);
-                    },
-                    Err(_) => {
-                        complete = false;
-                        break 'bodies;
-                    },
-                }
-            }
-        }
-        trigrams.shrink_to_fit();
-        Ok(Self { complete, trigrams })
+        super::text_builder::from_bodies(bodies, None).map_err(|failure| match failure {
+            super::text_builder::TextSummaryFailure::Schema(failure) => failure,
+            super::text_builder::TextSummaryFailure::Observation(_) => {
+                SchemaFailure::AllocationUnavailable
+            },
+        })
+    }
+
+    pub(crate) fn from_bodies_observed<'a>(
+        bodies: impl IntoIterator<Item = Option<&'a str>>,
+        observer: &dyn ScanObserver,
+    ) -> Result<Self, super::text_builder::TextSummaryFailure> {
+        super::text_builder::from_bodies(bodies, Some(observer))
     }
 
     pub(crate) const fn complete(&self) -> bool {
@@ -300,8 +365,12 @@ fn observed_binary_search(
 ) -> Result<bool, ScanObservationFailureCode> {
     let mut low = 0;
     let mut high = trigrams.len();
+    let mut comparisons = 0_usize;
     while low < high {
-        observer.observe_work(0)?;
+        if comparisons.is_multiple_of(LOOKUP_COMPARISONS_PER_WORK_UNIT) {
+            observer.observe_work(1)?;
+        }
+        comparisons += 1;
         let middle = low + (high - low) / 2;
         let value = trigrams
             .get(middle)

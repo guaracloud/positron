@@ -2335,7 +2335,7 @@ fn deep_native_output_and_digest_share_the_cumulative_cpu_budget() -> Result<(),
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(9)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(10)?,
     )?;
 
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -2778,23 +2778,26 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
     let exhausted = metered_service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(7)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(10)?,
     )?;
     let exhausted_events = metered_service
         .execute_with_schema(exhausted, schema.catalog())?
         .collect::<Vec<_>>();
-    assert!(matches!(
-        exhausted_events.last(),
-        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
-            if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 8
-                && incomplete.stats().limiting_budget()
-                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
-    ));
+    assert!(
+        matches!(
+            exhausted_events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                if incomplete.code() == QueryFailureCode::BudgetExhausted
+                    && incomplete.stats().cpu_work_units() == 11
+                    && incomplete.stats().limiting_budget()
+                        == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+        ),
+        "events: {exhausted_events:?}"
+    );
     let exact = metered_service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(8)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(11)?,
     )?;
     let exact_events = metered_service
         .execute_with_schema(exact, schema.catalog())?
@@ -2802,7 +2805,7 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.cpu_work_units() == 8
+            if stats.cpu_work_units() == 11
                 && stats.scanned_bytes() == 0
                 && stats.decoded_records() == 0
     ));
@@ -3285,7 +3288,7 @@ fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(11)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
     )?;
     let events = service
         .execute_with_schema(query, schema.catalog())?
@@ -3300,14 +3303,14 @@ fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<
         matches!(
             events.last(),
             Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-                if stats.cpu_work_units() == 11 && stats.decoded_records() == 1
+                if stats.cpu_work_units() == 15 && stats.decoded_records() == 1
         ),
         "events: {events:?}"
     );
     let exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(10)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(14)?,
     )?;
     let exhausted_events = service
         .execute_with_schema(exhausted, schema.catalog())?
@@ -3316,7 +3319,7 @@ fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 11
+                && incomplete.stats().cpu_work_units() == 15
     ));
     Ok(())
 }
@@ -3337,7 +3340,7 @@ fn schema_backed_regex_search_keeps_index_and_dfa_work_bounded() -> Result<(), B
     let query = service.plan_pipeline(
         fixture.context,
         r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "needle" | limit 1"#,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(11)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
     )?;
     let events = service
         .execute_with_schema(query, schema.catalog())?
@@ -3352,10 +3355,24 @@ fn schema_backed_regex_search_keeps_index_and_dfa_work_bounded() -> Result<(), B
         matches!(
             events.last(),
             Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-                if stats.cpu_work_units() == 11 && stats.decoded_records() == 1
+                if stats.cpu_work_units() == 15 && stats.decoded_records() == 1
         ),
         "events: {events:?}"
     );
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "needle" | limit 1"#,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(14)?,
+    )?;
+    let exhausted_events = service
+        .execute_with_schema(exhausted, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 15
+    ));
     Ok(())
 }
 

@@ -5,7 +5,7 @@ use positron_kernel::{
 };
 
 use super::{SchemaBudget, SchemaCatalog, SchemaDelta, SchemaFailure};
-use crate::log_store::{LogRecord, LogStore, LogStoreFailure};
+use crate::log_store::{LogRecord, LogStore, LogStoreFailure, ScanObserver};
 
 /// Opaque tenant-bound schema store owned by the governed ingest session.
 ///
@@ -101,6 +101,14 @@ impl SchemaSessionStore {
         LogStore::new().stage_schema_group(records, &self.catalog)
     }
 
+    pub fn stage_group_observed(
+        &self,
+        records: &mut [LogRecord],
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().stage_schema_group_observed(records, &self.catalog, observer)
+    }
+
     pub fn commit(
         &mut self,
         delta: SchemaDelta,
@@ -117,6 +125,22 @@ impl SchemaSessionStore {
         block: &CommittedBlock,
     ) -> Result<SchemaDelta, LogStoreFailure> {
         LogStore::new().replay_schema_block(tenant, snapshot, block, &self.catalog)
+    }
+
+    pub fn replay_observed(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().replay_schema_block_observed(
+            tenant,
+            snapshot,
+            block,
+            &self.catalog,
+            observer,
+        )
     }
 
     pub fn stage_query_update(&self) -> Result<SchemaQueryUpdate, SchemaFailure> {

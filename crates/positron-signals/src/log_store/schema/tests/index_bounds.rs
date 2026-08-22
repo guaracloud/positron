@@ -1,6 +1,8 @@
 use std::error::Error;
 
-use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
+use positron_domain::value::{
+    AttributeNamespace, AttributeValueKind, CandidateAttributeValue, CandidateKeyValue,
+};
 use positron_kernel::StoreBlockIdentity;
 
 use super::*;
@@ -220,6 +222,81 @@ fn composite_kinds_always_fall_back_while_scalar_kinds_remain_prunable()
             None
         );
     }
+    Ok(())
+}
+
+#[test]
+fn nested_index_evidence_falls_back_at_the_value_ceiling() -> Result<(), Box<dyn Error>> {
+    let indexed_path = path(AttributeNamespace::Record, "nested.child");
+    let variants = [AttributeValueKind::SignedInteger];
+    let sets = (0..=super::super::index::MAX_INDEX_VALUES)
+        .map(|value| {
+            occurrence(
+                AttributeNamespace::Record,
+                "nested",
+                CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                    "child".to_owned(),
+                    CandidateAttributeValue::signed_integer(
+                        i64::try_from(value).expect("test value fits signed integer"),
+                    ),
+                )]),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fallback = super::super::index::SchemaIndexPath::from_variants_and_attributes(
+        &indexed_path,
+        &variants,
+        &sets,
+    )?;
+    assert!(fallback.values.is_empty());
+
+    let scalar = occurrence(
+        AttributeNamespace::Record,
+        "nested",
+        CandidateAttributeValue::string("not-a-list".to_owned()),
+    )?;
+    let scalar_fallback = super::super::index::SchemaIndexPath::from_variants_and_attributes(
+        &indexed_path,
+        &variants,
+        &[scalar],
+    )?;
+    assert!(scalar_fallback.values.is_empty());
+
+    let complete = occurrence(
+        AttributeNamespace::Record,
+        "nested",
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "child".to_owned(),
+            CandidateAttributeValue::signed_integer(7),
+        )]),
+    )?;
+    let complete_index = super::super::index::SchemaIndexPath::from_variants_and_attributes(
+        &indexed_path,
+        &variants,
+        &[complete],
+    )?;
+    assert_eq!(complete_index.values, vec![SchemaValue::signed_integer(7)]);
+    assert!(complete_index.encoded_bytes()? > 0);
+
+    assert_eq!(
+        super::super::index::SchemaIndexPath::from_variants_and_values(
+            &indexed_path,
+            &variants,
+            &[SchemaValue::kind(AttributeValueKind::String)],
+        ),
+        Err(super::super::SchemaFailure::InvalidValue)
+    );
+    let too_many = (0..=super::super::index::MAX_INDEX_VALUES)
+        .map(|value| SchemaValue::signed_integer(i64::try_from(value).expect("bounded value")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        super::super::index::SchemaIndexPath::from_variants_and_values(
+            &indexed_path,
+            &variants,
+            &too_many,
+        ),
+        Err(super::super::SchemaFailure::LimitExceeded)
+    );
     Ok(())
 }
 

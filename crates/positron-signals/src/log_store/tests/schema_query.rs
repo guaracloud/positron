@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use positron_domain::identity::TenantId;
-use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind,
@@ -89,6 +89,19 @@ fn text_summary_prunes_absent_blocks_and_survives_reopen() -> Result<(), Box<dyn
     let snapshot = ledger.snapshot()?;
     let cancellation = NeverCancelled;
     let observer = Unobserved;
+
+    let before_frontier = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::through(ScanLimit::new(1)?, CommitPosition::origin()),
+        &schema,
+        &TextSearchCandidate::literal("pha")?.ok_or("frontier candidate was generic")?,
+        &cancellation,
+        &observer,
+    )?;
+    assert!(before_frontier.records().is_empty());
+    assert_eq!(before_frontier.scanned_bytes(), 0);
 
     let absent = TextSearchCandidate::literal("zzz")?
         .ok_or("absent literal candidate was unexpectedly generic")?;

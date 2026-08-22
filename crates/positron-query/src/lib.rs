@@ -48,3 +48,29 @@ pub fn fuzz_query_inputs(data: &[u8]) {
     }
     let _ = QueryCursor::from_bytes(data);
 }
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_query_search_matcher(data: &[u8]) {
+    if data.is_empty() || data.len() > 4_096 {
+        return;
+    }
+    let pattern_len = usize::from(data[0]).min(data.len().saturating_sub(1));
+    let (pattern, body) = data[1..].split_at(pattern_len);
+    let Ok(pattern) = std::str::from_utf8(pattern) else {
+        return;
+    };
+    let Ok(body) = std::str::from_utf8(body) else {
+        return;
+    };
+    let Ok(mut regex) = search::BoundedRegex::from_source(pattern.to_owned()) else {
+        return;
+    };
+    if regex.compile().is_err() {
+        return;
+    }
+    let mut observer = search::UnobservedSearch;
+    let _ = regex.is_match_observed(body, &mut observer);
+    let _ = search::contains_observed(body, pattern, &mut observer);
+    let _ = positron_signals::TextSearchCandidate::any_of_bytes(regex.pruning_literals());
+}

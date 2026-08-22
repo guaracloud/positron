@@ -6,6 +6,7 @@ use positron_kernel::{
 };
 use positron_signals::{SchemaBudget, SchemaCheckpointFrontier};
 
+use super::SchemaBuildObserver;
 use super::{MAX_REPLAY_SHARDS, SchemaSessionFailure, SessionState, TenantSchemaSession};
 
 impl TenantSchemaSession {
@@ -41,10 +42,16 @@ impl TenantSchemaSession {
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
             let decode_capacity =
                 reserve_replay_decode_capacity(tenant, block.payload().len(), governor)?;
+            let observer = SchemaBuildObserver::new(
+                decode_capacity
+                    .granted()
+                    .get(ResourceDimension::CpuWorkUnits),
+                None,
+            );
             let delta = state
                 .catalog
-                .replay(tenant, snapshot, block)
-                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+                .replay_observed(tenant, snapshot, block, &observer)
+                .map_err(map_replay_observed_failure)?;
             let retained_bytes = u64::try_from(delta.retained_memory_bytes())
                 .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
             let next_retained = state
@@ -106,10 +113,14 @@ impl TenantSchemaSession {
                 .content_digest()
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
             ensure_replay_capacity(recovery, block.payload().len())?;
+            let observer = SchemaBuildObserver::new(
+                recovery.granted().get(ResourceDimension::CpuWorkUnits),
+                None,
+            );
             let delta = state
                 .catalog
-                .replay(tenant, snapshot, block)
-                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+                .replay_observed(tenant, snapshot, block, &observer)
+                .map_err(map_replay_observed_failure)?;
             ensure_frontier_slot(&state, snapshot.scope().shard_id())?;
             let frontier = validated_frontier(
                 snapshot.scope().shard_id(),
@@ -191,10 +202,16 @@ pub(super) fn reconcile_pending(
     }
     let decode_capacity =
         reserve_replay_decode_capacity(state.tenant, block.payload().len(), governor)?;
+    let observer = SchemaBuildObserver::new(
+        decode_capacity
+            .granted()
+            .get(ResourceDimension::CpuWorkUnits),
+        None,
+    );
     let replayed = state
         .catalog
-        .replay(state.tenant, snapshot, block)
-        .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+        .replay_observed(state.tenant, snapshot, block, &observer)
+        .map_err(map_replay_observed_failure)?;
     let retained_bytes = u64::try_from(replayed.retained_memory_bytes())
         .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
     let next_retained = state
@@ -234,14 +251,33 @@ fn reserve_replay_decode_capacity(
             .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
     )
     .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
-        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+    let cpu_work = SchemaBudget::replay_schema_work_units(payload_bytes)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let amounts = ResourceAmounts::new([bytes, 0, 0, 0, 0, 0, 0, 0, cpu_work, 0, 0]);
     let claim =
         positron_kernel::WorkClaim::tenant(tenant, positron_kernel::WorkKind::Ingest, amounts)
             .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
     governor
         .reserve(claim)
         .map_err(|_| SchemaSessionFailure::StateUnavailable)
+}
+
+fn map_replay_observed_failure(failure: positron_signals::LogStoreFailure) -> SchemaSessionFailure {
+    match failure.code() {
+        positron_signals::LogStoreFailureCode::BudgetExhausted
+        | positron_signals::LogStoreFailureCode::ResourceExhausted
+        | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
+            SchemaSessionFailure::StateUnavailable
+        },
+        positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::StateUnavailable,
+        positron_signals::LogStoreFailureCode::InvalidInput
+        | positron_signals::LogStoreFailureCode::LimitExceeded
+        | positron_signals::LogStoreFailureCode::MalformedBlock
+        | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch
+        | positron_signals::LogStoreFailureCode::Kernel
+        | positron_signals::LogStoreFailureCode::ClockUnavailable
+        | positron_signals::LogStoreFailureCode::Internal => SchemaSessionFailure::ReplayIntegrity,
+    }
 }
 
 pub(super) fn reserve_query_index_capacity(
