@@ -146,6 +146,7 @@ pub(super) fn map_schema_session_failure(failure: SchemaSessionFailure) -> Inges
         | SchemaSessionFailure::StateUnavailable => {
             IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
         },
+        SchemaSessionFailure::Cancelled => IngestOutcome::Retryable(IngestFailureCode::Cancelled),
         SchemaSessionFailure::InFlight
         | SchemaSessionFailure::PendingReconciliationRequired
         | SchemaSessionFailure::ReplayIntegrity => {

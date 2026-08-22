@@ -331,6 +331,7 @@ mod tests {
                 scanned_bytes: 0,
                 decoded_records: 0,
                 output_bytes: 0,
+                memory_peak_bytes: 0,
                 cpu_work_units: 0,
                 wall_seconds: 0,
             },

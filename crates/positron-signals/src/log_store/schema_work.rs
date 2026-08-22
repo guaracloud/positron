@@ -117,7 +117,7 @@ impl super::LogStore {
         block: &CommittedBlock,
         schema: &SchemaCatalog,
     ) -> Result<SchemaDelta, LogStoreFailure> {
-        self.replay_schema_block_inner(tenant, snapshot, block, schema, None, None)
+        self.replay_schema_block_inner(tenant, snapshot, block, schema, None, None, None)
     }
 
     #[allow(dead_code)]
@@ -148,6 +148,28 @@ impl super::LogStore {
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<SchemaDelta, LogStoreFailure> {
+        self.replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            snapshot,
+            block,
+            schema,
+            cancellation,
+            observer,
+            Some(observer),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replay_schema_block_observed_cancellable_with_text_observer(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        schema: &SchemaCatalog,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        text_observer: Option<&dyn ScanObserver>,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
         self.replay_schema_block_inner(
             tenant,
             snapshot,
@@ -155,9 +177,11 @@ impl super::LogStore {
             schema,
             Some(cancellation),
             Some(observer),
+            text_observer,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replay_schema_block_inner(
         &self,
         tenant: positron_domain::identity::TenantId,
@@ -166,6 +190,7 @@ impl super::LogStore {
         schema: &SchemaCatalog,
         cancellation: Option<&dyn ScanCancellation>,
         observer: Option<&dyn ScanObserver>,
+        text_observer: Option<&dyn ScanObserver>,
     ) -> Result<SchemaDelta, LogStoreFailure> {
         let decoded = match (cancellation, observer) {
             (Some(cancellation), Some(observer)) => codec::BlockDecode::observed_quantized(
@@ -194,7 +219,7 @@ impl super::LogStore {
                 .records
                 .iter()
                 .map(|record| record.body().and_then(|body| body.as_str()));
-            match observer {
+            match text_observer.or(observer) {
                 Some(observer) => {
                     match schema::TextBlockSummary::from_bodies_observed(bodies, observer) {
                         Ok(summary) => Some(summary),
@@ -226,7 +251,7 @@ impl super::LogStore {
             && schema.may_add_text_summary()
             && schema.budget().max_index_bytes() >= schema::MIN_TEXT_INDEX_BUDGET_BYTES
         {
-            match observer {
+            match text_observer.or(observer) {
                 Some(observer) => match delta
                     .attach_text_summary_observed(schema, summary, observer)
                 {

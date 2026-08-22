@@ -25,6 +25,57 @@ pub(super) fn reserve_replay_decode_capacity(
     })
 }
 
+/// Admits one replay transaction for all blocks selected by a snapshot.  The
+/// returned flag records whether optional text evidence was admitted; the
+/// mandatory decode/discovery/reachable-index work is never run without a
+/// reservation for its full cumulative bound.
+pub(super) fn reserve_replay_snapshot_capacity<'authority>(
+    tenant: TenantId,
+    payload_bytes: &[usize],
+    governor: ResourceGovernor<'authority>,
+) -> Result<(ResourceReservation<'authority>, bool), SchemaSessionFailure> {
+    let maximum_payload = payload_bytes.iter().copied().max().unwrap_or(0);
+    let memory = u64::try_from(
+        SchemaBudget::replay_working_memory_bytes(maximum_payload)
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+    )
+    .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+    let (mandatory_work, optional_work) = replay_snapshot_work_bounds(payload_bytes)?;
+    match mandatory_work.checked_add(optional_work) {
+        Some(complete_work) => reserve_with_work(tenant, memory, complete_work, governor)
+            .map(|reservation| (reservation, true))
+            .or_else(|_| {
+                reserve_with_work(tenant, memory, mandatory_work, governor)
+                    .map(|reservation| (reservation, false))
+            }),
+        None => reserve_with_work(tenant, memory, mandatory_work, governor)
+            .map(|reservation| (reservation, false)),
+    }
+}
+
+pub(super) fn replay_snapshot_work_bounds(
+    payload_bytes: &[usize],
+) -> Result<(u64, u64), SchemaSessionFailure> {
+    let mut mandatory_work = 0_u64;
+    let mut optional_work = 0_u64;
+    for payload in payload_bytes {
+        mandatory_work = mandatory_work
+            .checked_add(
+                SchemaBudget::replay_decode_work_units(*payload)
+                    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+            )
+            .and_then(|work| work.checked_add(1))
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        optional_work = optional_work
+            .checked_add(
+                SchemaBudget::text_index_work_units(*payload)
+                    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+            )
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    }
+    Ok((mandatory_work, optional_work))
+}
+
 fn reserve_with_work(
     tenant: TenantId,
     memory: u64,

@@ -6,7 +6,10 @@ use positron_kernel::{
 };
 use positron_signals::{ScanCancellation, SchemaBudget};
 
-use crate::{SchemaSessionFailure, TenantSchemaCheckpoint, TenantSchemaSession};
+use crate::{
+    SchemaSessionFailure, TenantSchemaCheckpoint, TenantSchemaSession,
+    schema_session::SchemaBuildObserver,
+};
 
 /// Bounded bootstrap-only schema reconstruction without a serving lifetime reservation.
 pub struct SchemaReplayBuilder<'authority> {
@@ -15,6 +18,7 @@ pub struct SchemaReplayBuilder<'authority> {
     source_bytes: u64,
     recovery: ResourceReservation<'authority>,
     reachable_indexes: Vec<(StoreBlockIdentity, [u8; 32])>,
+    failed: bool,
 }
 
 struct NeverCancelled;
@@ -86,6 +90,7 @@ impl<'authority> SchemaReplayBuilder<'authority> {
             source_bytes,
             recovery,
             reachable_indexes,
+            failed: false,
         })
     }
 
@@ -101,6 +106,21 @@ impl<'authority> SchemaReplayBuilder<'authority> {
         snapshot: &LedgerSnapshot<'_>,
         cancellation: &dyn ScanCancellation,
     ) -> Result<(), SchemaSessionFailure> {
+        if self.failed {
+            return Err(SchemaSessionFailure::StateUnavailable);
+        }
+        let result = self.replay_snapshot_cancellable_inner(snapshot, cancellation);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn replay_snapshot_cancellable_inner(
+        &mut self,
+        snapshot: &LedgerSnapshot<'_>,
+        cancellation: &dyn ScanCancellation,
+    ) -> Result<(), SchemaSessionFailure> {
         self.recovery
             .try_resize(peak_resources(self.source_bytes)?)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
@@ -110,12 +130,29 @@ impl<'authority> SchemaReplayBuilder<'authority> {
             &mut self.recovery,
             cancellation,
         )?;
-        self.session
-            .append_reachable_indexes(snapshot, &mut self.reachable_indexes)?;
+        self.recovery
+            .try_resize(peak_resources_with_work(
+                self.source_bytes,
+                u64::try_from(snapshot.blocks().len())
+                    .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?,
+            )?)
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        let reachable_work = u64::try_from(snapshot.blocks().len())
+            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+        let observer = SchemaBuildObserver::new_scan(reachable_work, cancellation);
+        self.session.append_reachable_indexes_observed(
+            snapshot,
+            &mut self.reachable_indexes,
+            cancellation,
+            &observer,
+        )?;
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {
+        if self.failed {
+            return Err(SchemaSessionFailure::StateUnavailable);
+        }
         self.recovery
             .try_resize(peak_resources(self.source_bytes)?)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
@@ -144,6 +181,30 @@ fn peak_resources(source_bytes: u64) -> Result<ResourceAmounts, SchemaSessionFai
     .and_then(|bytes| bytes.checked_add(source_bytes))
     .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     active_resources_with_work(memory, 1)
+}
+
+fn peak_resources_with_work(
+    source_bytes: u64,
+    reachable_work: u64,
+) -> Result<ResourceAmounts, SchemaSessionFailure> {
+    let working = SchemaBudget::replay_working_memory_bytes(1_048_576)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let reachable = SchemaBudget::system_max_entries()
+        .checked_mul(std::mem::size_of::<(StoreBlockIdentity, [u8; 32])>())
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let serialized = SchemaBudget::release_1()
+        .map_err(SchemaSessionFailure::Schema)?
+        .max_persistent_bytes();
+    let memory = u64::try_from(
+        working
+            .checked_add(reachable)
+            .and_then(|bytes| bytes.checked_add(serialized))
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
+    )
+    .ok()
+    .and_then(|bytes| bytes.checked_add(source_bytes))
+    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    active_resources_with_work(memory, reachable_work)
 }
 
 fn active_resources(memory: u64) -> Result<ResourceAmounts, SchemaSessionFailure> {

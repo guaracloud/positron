@@ -96,6 +96,6 @@ fn map_stage_failure(failure: positron_signals::LogStoreFailure) -> SchemaSessio
         | positron_signals::LogStoreFailureCode::Internal => {
             SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
         },
-        positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::StateUnavailable,
+        positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
     }
 }

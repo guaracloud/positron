@@ -14,6 +14,7 @@ mod checkpoint;
 mod inspection;
 mod observer;
 mod recovery;
+mod recovery_support;
 mod registry;
 mod replay_capacity;
 mod stage;
@@ -58,6 +59,7 @@ pub enum SchemaSessionFailure {
     TenantConflict,
     Schema(SchemaFailure),
     StateUnavailable,
+    Cancelled,
     ReplayLimitExceeded,
     RegistryLimitExceeded,
     InFlight,

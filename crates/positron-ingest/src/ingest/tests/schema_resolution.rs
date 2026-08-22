@@ -12,6 +12,7 @@ use positron_signals::SchemaFailure;
 use positron_signals::{
     LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaDelta, SchemaSessionStore,
 };
+use positron_signals::{ScanObservationFailureCode, ScanObserver};
 
 use super::super::schema_admission_estimate;
 use super::{
@@ -89,6 +90,18 @@ fn production_observed_schema_stage_publishes_a_complete_text_summary() {
 }
 
 #[test]
+fn rejected_observed_work_does_not_poison_the_cumulative_budget() {
+    let observer = SchemaBuildObserver::new(3, None);
+    observer.observe_work(3).expect("exact work fits");
+    assert_eq!(observer.consumed(), 3);
+    assert_eq!(
+        observer.observe_work(1),
+        Err(ScanObservationFailureCode::BudgetExhausted)
+    );
+    assert_eq!(observer.consumed(), 3);
+}
+
+#[test]
 fn schema_failures_keep_their_closed_ingest_outcomes() {
     let cases = [
         (
@@ -134,6 +147,10 @@ fn schema_failures_keep_their_closed_ingest_outcomes() {
         (
             SchemaSessionFailure::StateUnavailable,
             IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable),
+        ),
+        (
+            SchemaSessionFailure::Cancelled,
+            IngestOutcome::Retryable(IngestFailureCode::Cancelled),
         ),
         (
             SchemaSessionFailure::InFlight,

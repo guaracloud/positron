@@ -47,6 +47,10 @@ impl QueryMemory {
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
         Ok(())
     }
+
+    pub(crate) const fn peak(&self) -> u64 {
+        self.peak
+    }
 }
 
 pub(crate) struct RecordBuffer {

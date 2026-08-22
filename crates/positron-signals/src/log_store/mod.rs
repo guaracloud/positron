@@ -101,9 +101,10 @@ impl LogStore {
     }
 
     /// Prepares a block and its bounded schema delta without mutating live schema state.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_with_schema_delta<'capacity, S: LifecycleClockSource>(
+    pub fn prepare_with_schema_delta<'capacity, S: LifecycleClockSource>(
         &self,
         capacity: ResourceReservation<'capacity>,
         clock: &LifecycleClock<S>,
@@ -119,7 +120,8 @@ impl LogStore {
     }
 
     /// Applies a previously staged delta after its v2 block is durably resolved.
-    pub(crate) fn apply_schema_delta(
+    #[doc(hidden)]
+    pub fn apply_schema_delta(
         &self,
         schema: &mut SchemaCatalog,
         delta: SchemaDelta,

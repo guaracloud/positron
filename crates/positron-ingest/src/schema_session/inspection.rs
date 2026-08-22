@@ -1,5 +1,6 @@
 use positron_domain::identity::TenantId;
 use positron_kernel::{LedgerSnapshot, ResourceGovernor, ResourceReservation, StoreBlockIdentity};
+use positron_signals::{ScanCancellation, ScanObservationFailureCode, ScanObserver};
 
 use super::{SchemaSessionFailure, TenantSchemaSession, recovery};
 
@@ -21,6 +22,7 @@ impl TenantSchemaSession {
         Ok(operation(state.catalog.catalog()))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn append_reachable_indexes(
         &self,
         snapshot: &LedgerSnapshot<'_>,
@@ -46,6 +48,44 @@ impl TenantSchemaSession {
             reachable
                 .try_reserve_exact(1)
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+            reachable.insert(position, (block.identity(), digest));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_reachable_indexes_observed(
+        &self,
+        snapshot: &LedgerSnapshot<'_>,
+        reachable: &mut Vec<(StoreBlockIdentity, [u8; 32])>,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaSessionFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        for block in snapshot.blocks() {
+            if cancellation.is_cancelled() {
+                return Err(SchemaSessionFailure::Cancelled);
+            }
+            observer.observe_work(1).map_err(|failure| match failure {
+                ScanObservationFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
+                ScanObservationFailureCode::BudgetExhausted
+                | ScanObservationFailureCode::ResourceExhausted
+                | ScanObservationFailureCode::Internal => SchemaSessionFailure::StateUnavailable,
+            })?;
+            let digest = block
+                .content_digest()
+                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+            if !state.catalog.has_verified_block(block.identity(), digest) {
+                continue;
+            }
+            let Err(position) = reachable.binary_search(&(block.identity(), digest)) else {
+                continue;
+            };
+            if reachable.len() == positron_signals::SchemaBudget::system_max_entries() {
+                return Err(SchemaSessionFailure::ReplayLimitExceeded);
+            }
             reachable.insert(position, (block.identity(), digest));
         }
         Ok(())

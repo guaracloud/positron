@@ -52,10 +52,10 @@ impl ScanObserver for SchemaBuildObserver<'_> {
             .get()
             .checked_add(units)
             .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
-        self.consumed.set(consumed);
         if consumed > self.limit {
             Err(ScanObservationFailureCode::BudgetExhausted)
         } else {
+            self.consumed.set(consumed);
             Ok(())
         }
     }

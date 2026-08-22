@@ -96,6 +96,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_limit = framed!(
             ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
         );
+        let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
+        framed!(memory.acquire(state.plan.search_memory_bytes()));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let mut observer = QueryScanObserver::new(
             self.work_meter.as_ref(),
             state.cancellation.clone(),
@@ -140,8 +143,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let result = framed!(scan_result.map_err(map_store_failure));
         state.reduced_pruning |= result.reduced_pruning();
         framed!(charge_scan(&mut state, &result));
-        let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
         framed!(memory.acquire(result.retained_size_bytes()));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         if state.cancellation.is_cancelled() {
             return self.failed_page(
                 Some(header),
@@ -175,6 +178,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             schema_filter_used,
             &mut memory,
         ));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let operator_wall_exhausted = if has_operator_work {
             framed!(self.observe_state(&mut state))
         } else {
@@ -199,6 +203,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
         );
         let page = framed!(materialize_page(records, start, end, &mut memory));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let before_batch = stats_before_current(&state);
         if state.cancellation.is_cancelled() {
             return self.failed_page_with_stats(
@@ -271,6 +276,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             },
             &mut memory,
         ));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let post_digest_expired = framed!(self.observe_state(&mut state));
         if post_digest_expired {
             return self.failed_page(

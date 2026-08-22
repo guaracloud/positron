@@ -3272,6 +3272,106 @@ fn versioned_pipeline_searches_body_text_without_matching_other_records()
 }
 
 #[test]
+fn body_search_memory_peak_includes_matcher_and_retained_rows() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-search-memory-peak")?;
+    fixture.kernel.append_log("request timed out", 20, 1)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source = "pipeline:v1 logs | range query_time -100 100 | search body contains \"timed out\" | limit 1";
+
+    let high = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let high_events = service.execute(high)?.collect::<Vec<_>>();
+    let peak = high_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats.memory_peak_bytes()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("search did not complete")?;
+    assert!(peak > 40_000, "matcher memory was not retained: {peak}");
+
+    for (memory_bytes, expected_complete) in [(peak, true), (peak - 1, false)] {
+        let query = service.plan_pipeline(
+            fixture.context,
+            source,
+            QueryBudget::new(1_048_576, 1, 1, 1_048_576, memory_bytes, 60)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert_eq!(
+            matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+            ),
+            expected_complete,
+            "events: {events:?}"
+        );
+        if !expected_complete {
+            assert!(matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                    if incomplete.code() == QueryFailureCode::BudgetExhausted
+                        && incomplete.stats().limiting_budget()
+                            == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn body_regex_memory_peak_includes_automaton_and_retained_rows() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-regex-memory-peak")?;
+    fixture.kernel.append_log("request timed out", 20, 1)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source =
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "timed.*out" | limit 1"#;
+
+    let high = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let high_events = service.execute(high)?.collect::<Vec<_>>();
+    let peak = high_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats.memory_peak_bytes()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("regex search did not complete")?;
+    assert!(
+        peak > 100_000,
+        "regex automaton memory was not retained: {peak}"
+    );
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, peak - 1, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    ));
+    Ok(())
+}
+
+#[test]
 fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("schema-text-budget")?;

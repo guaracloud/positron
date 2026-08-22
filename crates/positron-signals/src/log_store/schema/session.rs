@@ -97,6 +97,27 @@ impl SchemaSessionStore {
         self._capacity.can_reclaim_with(governor)
     }
 
+    /// Builds an unpublished catalog copy while transferring the caller's
+    /// already-admitted replay capacity into that candidate.
+    pub fn try_clone_with_reservation(
+        &self,
+        reservation: ResourceReservation<'_>,
+    ) -> Result<Self, SchemaFailure> {
+        let required =
+            u64::try_from(self.catalog.memory_bytes()).map_err(|_| SchemaFailure::LimitExceeded)?;
+        if !reservation.authorizes_tenant_schema_session(self.tenant(), required) {
+            return Err(SchemaFailure::AllocationUnavailable);
+        }
+        let capacity_bytes = reservation
+            .granted()
+            .get(positron_kernel::ResourceDimension::MemoryBytes);
+        Ok(Self {
+            catalog: self.catalog.try_clone()?,
+            _capacity: reservation.transfer(),
+            capacity_bytes,
+        })
+    }
+
     pub fn stage_group(&self, records: &mut [LogRecord]) -> Result<SchemaDelta, LogStoreFailure> {
         LogStore::new().stage_schema_group(records, &self.catalog)
     }
@@ -158,6 +179,26 @@ impl SchemaSessionStore {
             &self.catalog,
             cancellation,
             observer,
+        )
+    }
+
+    pub fn replay_observed_cancellable_with_text_observer(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        text_observer: Option<&dyn ScanObserver>,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            snapshot,
+            block,
+            &self.catalog,
+            cancellation,
+            observer,
+            text_observer,
         )
     }
 

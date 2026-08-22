@@ -1,16 +1,18 @@
 use positron_domain::identity::TenantId;
-use positron_domain::routing::{CommitPosition, VirtualShardId};
-use positron_kernel::{
-    LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation,
-    StoreBlockIdentity,
-};
-use positron_signals::{ScanCancellation, SchemaCheckpointFrontier};
+use positron_kernel::{LedgerSnapshot, ResourceDimension, ResourceGovernor, ResourceReservation};
+use positron_signals::{ScanCancellation, ScanObserver};
 
 use super::SchemaBuildObserver;
-use super::replay_capacity::{
-    ensure_replay_capacity, reserve_replay_decode_capacity, resize_replay_work,
+pub(super) use super::recovery_support::{
+    ensure_frontier_slot, ensure_frontier_slot_values, map_observation_failure,
+    map_replay_observed_failure, publish_frontier, publish_frontier_values, reconcile_pending,
+    reserve_schema_memory, validated_frontier, verify_frontier,
 };
-use super::{MAX_REPLAY_SHARDS, SchemaSessionFailure, SessionState, TenantSchemaSession};
+use super::replay_capacity::{
+    ensure_replay_capacity, replay_snapshot_work_bounds, reserve_replay_snapshot_capacity,
+    resize_replay_work,
+};
+use super::{MAX_REPLAY_SHARDS, SchemaFailure, SchemaSessionFailure, TenantSchemaSession};
 
 pub(super) use super::replay_capacity::reserve_query_index_capacity;
 
@@ -55,56 +57,126 @@ impl TenantSchemaSession {
             .find(|frontier| frontier.shard() == snapshot.scope().shard_id())
             .copied();
         verify_frontier(snapshot, frontier)?;
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(snapshot.blocks().len())
+            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
         for block in snapshot
             .blocks()
             .iter()
             .filter(|block| frontier.is_none_or(|known| block.position() > known.position()))
         {
-            let digest = block
-                .content_digest()
-                .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-            let decode_capacity =
-                reserve_replay_decode_capacity(tenant, block.payload().len(), governor)?;
-            let observer = SchemaBuildObserver::new_scan(
-                decode_capacity
-                    .granted()
-                    .get(ResourceDimension::CpuWorkUnits),
-                cancellation,
+            if cancellation.is_cancelled() {
+                return Err(SchemaSessionFailure::Cancelled);
+            }
+            blocks.push(block);
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let mut payload_bytes = Vec::new();
+        payload_bytes
+            .try_reserve_exact(blocks.len())
+            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+        let mut digests = Vec::new();
+        digests
+            .try_reserve_exact(blocks.len())
+            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+        for block in &blocks {
+            if cancellation.is_cancelled() {
+                return Err(SchemaSessionFailure::Cancelled);
+            }
+            payload_bytes.push(block.payload().len());
+            digests.push(
+                block
+                    .content_digest()
+                    .map_err(|_| SchemaSessionFailure::StateUnavailable)?,
             );
-            let delta = state
-                .catalog
-                .replay_observed_cancellable(tenant, snapshot, block, cancellation, &observer)
+        }
+        let (replay_capacity, complete_text) =
+            reserve_replay_snapshot_capacity(tenant, &payload_bytes, governor)?;
+        let replay_work = replay_capacity
+            .granted()
+            .get(ResourceDimension::CpuWorkUnits);
+        let (mandatory_work, optional_work) = replay_snapshot_work_bounds(&payload_bytes)?;
+        if replay_work < mandatory_work {
+            return Err(SchemaSessionFailure::StateUnavailable);
+        }
+        let mandatory_observer = SchemaBuildObserver::new_scan(mandatory_work, cancellation);
+        let optional_observer =
+            complete_text.then(|| SchemaBuildObserver::new_scan(optional_work, cancellation));
+        let mut candidate_catalog = state
+            .catalog
+            .try_clone_with_reservation(replay_capacity)
+            .map_err(SchemaSessionFailure::Schema)?;
+        let mut candidate_frontiers = Vec::new();
+        candidate_frontiers
+            .try_reserve_exact(MAX_REPLAY_SHARDS)
+            .map_err(|_| SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable))?;
+        candidate_frontiers.extend_from_slice(&state.frontiers);
+        let mut new_retained_capacity = Vec::new();
+        new_retained_capacity
+            .try_reserve_exact(blocks.len())
+            .map_err(|_| SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable))?;
+        let mut candidate_retained_charge = state.retained_charge_bytes;
+        for (block, digest) in blocks.iter().zip(&digests) {
+            if cancellation.is_cancelled() {
+                return Err(SchemaSessionFailure::Cancelled);
+            }
+            mandatory_observer
+                .observe_work(1)
+                .map_err(map_observation_failure)?;
+            let delta = candidate_catalog
+                .replay_observed_cancellable_with_text_observer(
+                    tenant,
+                    snapshot,
+                    block,
+                    cancellation,
+                    &mandatory_observer,
+                    optional_observer
+                        .as_ref()
+                        .map(|observer| observer as &dyn positron_signals::ScanObserver),
+                )
                 .map_err(map_replay_observed_failure)?;
             let retained_bytes = u64::try_from(delta.retained_memory_bytes())
                 .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-            let next_retained = state
-                .retained_charge_bytes
+            let next_retained = candidate_retained_charge
                 .checked_add(retained_bytes)
                 .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
             let capacity = reserve_schema_memory(tenant, retained_bytes, governor)?;
-            ensure_retained_slot(&state, capacity.is_some())?;
-            ensure_frontier_slot(&state, snapshot.scope().shard_id())?;
+            if capacity.is_some()
+                && state.retained_capacity.len() + new_retained_capacity.len()
+                    >= state.retained_capacity.capacity()
+            {
+                return Err(SchemaSessionFailure::ReplayLimitExceeded);
+            }
+            ensure_frontier_slot_values(&candidate_frontiers, snapshot.scope().shard_id())?;
             let frontier = validated_frontier(
                 snapshot.scope().shard_id(),
                 block.position(),
                 block.identity(),
-                digest,
+                *digest,
             )?;
-            state
-                .catalog
-                .reconcile_block_identity(block.identity(), digest)
+            candidate_catalog
+                .reconcile_block_identity(block.identity(), *digest)
                 .map_err(SchemaSessionFailure::Schema)?;
-            state
-                .catalog
-                .commit(delta, block.identity(), digest)
+            candidate_catalog
+                .commit(delta, block.identity(), *digest)
                 .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
-            drop(decode_capacity);
             if let Some(capacity) = capacity {
-                state.retained_capacity.push(capacity.transfer());
+                new_retained_capacity.push(capacity.transfer());
             }
-            state.retained_charge_bytes = next_retained;
-            publish_frontier(&mut state, frontier);
+            candidate_retained_charge = next_retained;
+            publish_frontier_values(&mut candidate_frontiers, frontier);
         }
+        if cancellation.is_cancelled() {
+            return Err(SchemaSessionFailure::Cancelled);
+        }
+        let old_catalog = std::mem::replace(&mut state.catalog, candidate_catalog);
+        drop(old_catalog);
+        state.frontiers = candidate_frontiers;
+        state.retained_capacity.extend(new_retained_capacity);
+        state.retained_charge_bytes = candidate_retained_charge;
         Ok(())
     }
 
@@ -175,188 +247,4 @@ impl TenantSchemaSession {
         }
         Ok(())
     }
-}
-
-fn verify_frontier(
-    snapshot: &LedgerSnapshot<'_>,
-    frontier: Option<SchemaCheckpointFrontier>,
-) -> Result<(), SchemaSessionFailure> {
-    let Some(frontier) = frontier else {
-        return Ok(());
-    };
-    let committed = snapshot
-        .blocks()
-        .iter()
-        .find(|block| block.position() == frontier.position())
-        .ok_or(SchemaSessionFailure::ReplayIntegrity)?;
-    if committed.identity() != frontier.identity()
-        || committed
-            .content_digest()
-            .map_err(|_| SchemaSessionFailure::StateUnavailable)?
-            != frontier.digest()
-    {
-        return Err(SchemaSessionFailure::ReplayIntegrity);
-    }
-    Ok(())
-}
-
-pub(super) fn reconcile_pending(
-    state: &mut SessionState,
-    snapshot: &LedgerSnapshot<'_>,
-    governor: ResourceGovernor<'_>,
-) -> Result<(), SchemaSessionFailure> {
-    let Some(pending) = state.pending.as_ref() else {
-        return Ok(());
-    };
-    let identity = pending.identity;
-    let shard = pending.shard;
-    let digest = pending.digest;
-    if snapshot.scope().shard_id() != shard {
-        return Err(SchemaSessionFailure::PendingReconciliationRequired);
-    }
-    let Some(block) = snapshot
-        .blocks()
-        .iter()
-        .find(|block| block.identity() == identity)
-    else {
-        return Err(SchemaSessionFailure::PendingReconciliationRequired);
-    };
-    if block
-        .content_digest()
-        .map_err(|_| SchemaSessionFailure::StateUnavailable)?
-        != digest
-    {
-        return Err(SchemaSessionFailure::ReplayIntegrity);
-    }
-    if pending
-        .capacity
-        .as_ref()
-        .is_some_and(|capacity| !capacity.can_reclaim_with(governor))
-    {
-        return Err(SchemaSessionFailure::StateUnavailable);
-    }
-    let decode_capacity =
-        reserve_replay_decode_capacity(state.tenant, block.payload().len(), governor)?;
-    let observer = SchemaBuildObserver::new(
-        decode_capacity
-            .granted()
-            .get(ResourceDimension::CpuWorkUnits),
-        None,
-    );
-    let replayed = state
-        .catalog
-        .replay_observed(state.tenant, snapshot, block, &observer)
-        .map_err(map_replay_observed_failure)?;
-    let retained_bytes = u64::try_from(replayed.retained_memory_bytes())
-        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    let next_retained = state
-        .retained_charge_bytes
-        .checked_add(retained_bytes)
-        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-    ensure_frontier_slot(state, shard)?;
-    let frontier = validated_frontier(shard, block.position(), identity, digest)?;
-    let retained_capacity = reserve_schema_memory(state.tenant, retained_bytes, governor)?;
-    ensure_retained_slot(state, retained_capacity.is_some())?;
-    state
-        .catalog
-        .commit(replayed, block.identity(), digest)
-        .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
-    drop(decode_capacity);
-    publish_frontier(state, frontier);
-    let pending = state
-        .pending
-        .take()
-        .ok_or(SchemaSessionFailure::StateUnavailable)?;
-    drop(pending);
-    if let Some(capacity) = retained_capacity {
-        state.retained_capacity.push(capacity.transfer());
-    }
-    state.retained_charge_bytes = next_retained;
-    state.in_flight = None;
-    Ok(())
-}
-
-fn map_replay_observed_failure(failure: positron_signals::LogStoreFailure) -> SchemaSessionFailure {
-    match failure.code() {
-        positron_signals::LogStoreFailureCode::BudgetExhausted
-        | positron_signals::LogStoreFailureCode::ResourceExhausted
-        | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
-            SchemaSessionFailure::StateUnavailable
-        },
-        positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::StateUnavailable,
-        positron_signals::LogStoreFailureCode::InvalidInput
-        | positron_signals::LogStoreFailureCode::LimitExceeded
-        | positron_signals::LogStoreFailureCode::MalformedBlock
-        | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch
-        | positron_signals::LogStoreFailureCode::Kernel
-        | positron_signals::LogStoreFailureCode::ClockUnavailable
-        | positron_signals::LogStoreFailureCode::Internal => SchemaSessionFailure::ReplayIntegrity,
-    }
-}
-
-fn ensure_retained_slot(state: &SessionState, adding: bool) -> Result<(), SchemaSessionFailure> {
-    if adding && state.retained_capacity.len() == state.retained_capacity.capacity() {
-        Err(SchemaSessionFailure::ReplayLimitExceeded)
-    } else {
-        Ok(())
-    }
-}
-
-pub(super) fn ensure_frontier_slot(
-    state: &SessionState,
-    shard: VirtualShardId,
-) -> Result<(), SchemaSessionFailure> {
-    if state
-        .frontiers
-        .iter()
-        .any(|frontier| frontier.shard() == shard)
-    {
-        return Ok(());
-    }
-    if state.frontiers.len() >= MAX_REPLAY_SHARDS {
-        return Err(SchemaSessionFailure::ReplayLimitExceeded);
-    }
-    Ok(())
-}
-
-pub(super) fn validated_frontier(
-    shard: VirtualShardId,
-    position: CommitPosition,
-    identity: StoreBlockIdentity,
-    digest: [u8; 32],
-) -> Result<SchemaCheckpointFrontier, SchemaSessionFailure> {
-    SchemaCheckpointFrontier::new(shard, position, identity, digest)
-        .map_err(SchemaSessionFailure::Schema)
-}
-
-pub(super) fn publish_frontier(state: &mut SessionState, frontier: SchemaCheckpointFrontier) {
-    if let Some(known) = state
-        .frontiers
-        .iter_mut()
-        .find(|known| known.shard() == frontier.shard())
-    {
-        *known = frontier;
-        return;
-    }
-    state.frontiers.push(frontier);
-    state.frontiers.sort_by_key(|known| known.shard());
-}
-
-pub(super) fn reserve_schema_memory<'authority>(
-    tenant: TenantId,
-    bytes: u64,
-    governor: ResourceGovernor<'authority>,
-) -> Result<Option<ResourceReservation<'authority>>, SchemaSessionFailure> {
-    if bytes == 0 {
-        return Ok(None);
-    }
-    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
-        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    let claim =
-        positron_kernel::WorkClaim::tenant(tenant, positron_kernel::WorkKind::Ingest, amounts)
-            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    governor
-        .reserve(claim)
-        .map(Some)
-        .map_err(|_| SchemaSessionFailure::StateUnavailable)
 }
