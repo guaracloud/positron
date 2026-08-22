@@ -1,5 +1,6 @@
 use regex_automata::Input;
 use regex_automata::dfa::{Automaton, StartKind, dense};
+use regex_automata::nfa::thompson;
 use regex_syntax::hir::literal::{ExtractKind, Extractor};
 
 use crate::{QueryFailure, QueryFailureCode};
@@ -55,7 +56,8 @@ impl BoundedRegex {
                 regex_automata::util::syntax::Config::new()
                     .unicode(true)
                     .nest_limit(MAX_REGEX_NESTING),
-            );
+            )
+            .thompson(thompson::Config::new().nfa_size_limit(Some(MAX_REGEX_COMPILED_BYTES)));
         let compiled = builder.build(&source).map_err(|_| unsupported())?;
         let pruning_literals = mandatory_literals(&source)?;
         Ok(Self {

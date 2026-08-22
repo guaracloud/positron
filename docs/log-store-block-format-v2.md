@@ -60,8 +60,9 @@ version 2 format uses tag `4` only for the native Stream Attribute namespace.
 ## Schema Catalog and overflow
 
 The Log Store owns a bounded Tenant Schema Catalog separately from Store Block
-payloads. Its immutable Catalog Object uses the ASCII magic `PSCHEMA1` and
-version `2`, followed by the tenant identity, entry/memory/persistent-byte/
+payloads. Its immutable Catalog Object uses the ASCII magic `PSCHEMA1`.
+Current writers emit version `3`; readers accept versions `1`, `2`, and `3`.
+The header is followed by the tenant identity, entry/memory/persistent-byte/
 index-byte budgets, overflow record and byte counters, and deterministic
 namespace-qualified path entries. Each entry preserves observed typed
 variants, observation and conflict counts, query-use count, promotion state,
@@ -71,24 +72,29 @@ in addition to the type mask; a legacy or type-only sidecar remains valid
 coverage only for type pruning. A bounded
 `REPLAY1` trailer records one canonical authenticated replay frontier per
 shard. The allocation-free reader preflight accounts catalog entries, physical
-index paths, and frontier vector storage before construction. Each physical
-dictionary is keyed by the exact Store Block identity and authenticated payload
-digest, and its paths and type masks must match promoted catalog members. A
-query may prune only when all of those facts match; missing, stale,
-unreachable, replacement, or demoted coverage falls back to the authoritative
-v2 value and reports reduced pruning. Version 2 frames every physical index
-block with an explicit one-byte scalar-sidecar-presence field (`0` absent,
-`1` present), followed by `PVALUES\0` and the bounded per-path dictionaries
-only when present. Readers accept version 1 objects without scalar sidecars
-(their values are rebuilt from the authoritative Store Blocks) and accept
-version 2 objects using the explicit framing; a version 1 object is never
-parsed as version 2. Version 1 bytes beginning with `PVALUES\0` therefore
-remain the next identity, not an optional trailer. These sidecars do not add
-a Store Block tag or version. Each scalar String or Bytes payload is bounded to
-the canonical native value limit of 65,536 bytes. When a legacy version 1
-block is mutated by replay, promotion, or path removal, the in-memory index
-atomically upgrades that block to version 2 framing and charges its one-byte
-presence field before publication; insufficient budget rejects the mutation.
+index paths, text summaries, and frontier vector storage before construction.
+Each physical dictionary or text summary is keyed by the exact Store Block
+identity and authenticated payload digest, and its paths and type masks must
+match promoted catalog members. A query may prune only when all of those facts
+match; missing, stale, unreachable, replacement, or demoted coverage falls
+back to the authoritative v2 value and reports reduced pruning. Version 2
+frames every physical index block with an explicit one-byte scalar-sidecar-
+presence field (`0` absent, `1` present), followed by `PVALUES\0` and the
+bounded per-path dictionaries only when present. Version 3 retains that scalar
+framing and adds one explicit text-sidecar-presence byte to every physical
+block (`0` absent, `1` present). When present, the text sidecar is encoded as
+`complete` (`0` or `1`), a bounded trigram count, and sorted three-byte UTF-8
+byte trigrams. An incomplete summary is valid metadata but can only trigger
+fallback; it can never prove absence. Version 1 and version 2 objects have no
+text framing and remain readable, while a version 1 object is never parsed as
+version 2 or 3. Version 1 bytes beginning with `PVALUES\0` therefore remain
+the next identity, not an optional trailer. These sidecars do not add a Store
+Block tag or version. Each scalar String or Bytes payload is bounded to the
+canonical native value limit of 65,536 bytes. When a legacy block is mutated
+by replay, promotion, path removal, or text-summary publication, the in-memory
+index atomically upgrades its surviving physical entry to the current scalar
+and text framing and charges every added presence byte before publication;
+insufficient budget rejects the mutation.
 The object is
 content-addressed and published only through
 the Storage Kernel Catalog Writer with the generation precondition and typed
