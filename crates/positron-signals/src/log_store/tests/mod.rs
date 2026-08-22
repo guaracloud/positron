@@ -17,7 +17,8 @@ use positron_kernel::{
 
 use super::{
     AttributeRepresentation, LogMetadata, LogRecord, LogScan, LogStore, LogStoreFailureCode,
-    PolicyProvenance, ScanLimit, StoredLogAttribute, StoredLogRecord,
+    PolicyProvenance, ScanLimit, ScanObservationFailureCode, SchemaFailure, StoredLogAttribute,
+    StoredLogRecord,
 };
 use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
@@ -35,6 +36,47 @@ mod schema_query;
 pub(crate) mod support;
 mod time;
 mod value_limits;
+
+#[test]
+fn schema_failure_mapping_preserves_stable_public_classes() {
+    let cases = [
+        (
+            SchemaFailure::AllocationUnavailable,
+            LogStoreFailureCode::ResourceExhausted,
+        ),
+        (
+            SchemaFailure::LimitExceeded,
+            LogStoreFailureCode::LimitExceeded,
+        ),
+        (
+            SchemaFailure::InvalidBudget,
+            LogStoreFailureCode::LimitExceeded,
+        ),
+        (
+            SchemaFailure::PathTooLong,
+            LogStoreFailureCode::LimitExceeded,
+        ),
+        (
+            SchemaFailure::InvalidPath,
+            LogStoreFailureCode::InvalidInput,
+        ),
+        (
+            SchemaFailure::InvalidValue,
+            LogStoreFailureCode::InvalidInput,
+        ),
+        (
+            SchemaFailure::MalformedCatalog,
+            LogStoreFailureCode::InvalidInput,
+        ),
+        (
+            SchemaFailure::Observed(ScanObservationFailureCode::BudgetExhausted),
+            LogStoreFailureCode::BudgetExhausted,
+        ),
+    ];
+    for (failure, expected) in cases {
+        assert_eq!(super::map_schema_failure(failure).code(), expected);
+    }
+}
 
 fn minimal_record(body: &str, _ingest_time: i64) -> Result<LogRecord, Box<dyn Error>> {
     Ok(LogRecord::checked_minimal(

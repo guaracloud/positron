@@ -100,6 +100,27 @@ impl SchemaDelta {
                     .map_err(TextSummaryAttachFailure::Observation)?;
             }
         }
+        let mut legacy_framed_blocks = 0_usize;
+        for (index, block) in catalog.block_indexes.iter().enumerate() {
+            if let Some(observer) = observer
+                && index.is_multiple_of(super::super::text_builder::WORK_QUANTUM_OPERATIONS / 2)
+            {
+                observer
+                    .observe_work(1)
+                    .map_err(TextSummaryAttachFailure::Observation)?;
+            }
+            if block.text_framing == TextIndexFraming::LegacyV2 {
+                legacy_framed_blocks = legacy_framed_blocks
+                    .checked_add(1)
+                    .ok_or(SchemaFailure::LimitExceeded)?;
+            }
+        }
+        let text_version_upgrade = legacy_framed_blocks
+            .checked_mul(TextIndexFraming::V1.encoded_bytes())
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        if let Some(observer) = observer {
+            observe_projection_work(self, observer)?;
+        }
         let old_memory = self.physical_memory_bytes;
         let old_wire = self.physical_index_bytes;
         self.physical_memory_bytes = self
@@ -135,13 +156,6 @@ impl SchemaDelta {
             })
             .ok_or(SchemaFailure::LimitExceeded)?;
         let (memory, persistent, index, _) = projected_cost(catalog, self, None)?;
-        let text_version_upgrade = catalog
-            .block_indexes
-            .iter()
-            .filter(|block| block.text_framing == TextIndexFraming::LegacyV2)
-            .count()
-            .checked_mul(TextIndexFraming::V1.encoded_bytes())
-            .ok_or(SchemaFailure::LimitExceeded)?;
         let fits = catalog
             .memory_bytes
             .checked_add(memory)
@@ -168,6 +182,33 @@ impl SchemaDelta {
         self.staged_memory_bytes = staged_memory_bytes(self)?;
         Ok(())
     }
+}
+
+fn observe_projection_work(
+    delta: &SchemaDelta,
+    observer: &dyn ScanObserver,
+) -> Result<(), TextSummaryAttachFailure> {
+    for entry in &delta.entries {
+        observer
+            .observe_work(1)
+            .map_err(TextSummaryAttachFailure::Observation)?;
+        for _segment in entry.path().segments() {
+            observer
+                .observe_work(1)
+                .map_err(TextSummaryAttachFailure::Observation)?;
+        }
+    }
+    for path in &delta.unverified_paths {
+        observer
+            .observe_work(1)
+            .map_err(TextSummaryAttachFailure::Observation)?;
+        for _segment in path.segments() {
+            observer
+                .observe_work(1)
+                .map_err(TextSummaryAttachFailure::Observation)?;
+        }
+    }
+    Ok(())
 }
 
 enum TextSummaryAttachFailure {

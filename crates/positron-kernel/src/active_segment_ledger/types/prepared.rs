@@ -33,8 +33,13 @@ impl<'capacity> PreparedStoreBlock<'capacity> {
         }
         let digest = DataProtection::hash(&self.payload)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-        let _ = self.content_digest.set(digest);
-        Ok(digest)
+        match self.content_digest.set(digest) {
+            Ok(()) => Ok(digest),
+            Err(existing) => match self.content_digest.get() {
+                Some(stored) => Ok(*stored),
+                None => Ok(existing),
+            },
+        }
     }
 
     pub fn new_with_preparation_capacity(

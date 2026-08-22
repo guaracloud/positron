@@ -69,7 +69,12 @@ pub(crate) fn from_bodies<'a>(
                 complete = false;
                 break 'bodies;
             }
-            trigrams.push([window[0], window[1], window[2]]);
+            let (Some(&first), Some(&second), Some(&third)) =
+                (window.first(), window.get(1), window.get(2))
+            else {
+                return Err(SchemaFailure::InvalidValue.into());
+            };
+            trigrams.push([first, second, third]);
         }
     }
     if !complete {

@@ -137,6 +137,24 @@ impl LogStore {
             .map_err(map_schema_failure)
     }
 
+    #[doc(hidden)]
+    pub fn apply_schema_delta_replay_observed(
+        &self,
+        schema: &mut SchemaCatalog,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), LogStoreFailure> {
+        if schema.tenant() != delta.tenant() {
+            return Err(LogStoreFailure::physical_scope_mismatch());
+        }
+        let (delta, block_index) = delta.into_block_index(identity, digest);
+        schema
+            .apply_replay_delta(delta, block_index, observer)
+            .map_err(map_schema_failure)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_internal<'capacity, S: LifecycleClockSource>(
         &self,

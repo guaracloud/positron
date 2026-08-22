@@ -12,6 +12,7 @@ use super::model::{
 #[cfg(test)]
 use super::observation::SchemaObservation;
 use super::text_index::TextBlockSummary;
+use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 
 /// Observable typed schema and overflow state for one tenant.
 #[derive(Debug, Eq, PartialEq)]
@@ -144,6 +145,25 @@ impl SchemaCatalog {
             .filter(|block| block.text_summary.is_some())
             .count();
         count < super::text_index::MAX_TEXT_SUMMARY_BLOCKS
+    }
+
+    pub(crate) fn may_add_text_summary_observed(
+        &self,
+        observer: &dyn ScanObserver,
+    ) -> Result<bool, ScanObservationFailureCode> {
+        let mut count = 0_usize;
+        for (index, block) in self.block_indexes.iter().enumerate() {
+            if index.is_multiple_of(super::text_builder::WORK_QUANTUM_OPERATIONS / 2) {
+                observer.observe_work(1)?;
+            }
+            if block.text_summary.is_some() {
+                count = count.saturating_add(1);
+                if count >= super::text_index::MAX_TEXT_SUMMARY_BLOCKS {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn entry_index(&self, path: &SchemaPath) -> Result<usize, usize> {

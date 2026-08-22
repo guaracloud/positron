@@ -121,6 +121,26 @@ fn compiled_matcher_stream_drop_reclaims_its_single_query_admission() -> Result<
 }
 
 #[test]
+fn repeated_logical_plan_access_borrows_one_admitted_plan() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("logical-plan-access-ownership")?;
+    let service = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
+        budget(),
+    )?;
+    let first = query.logical_plan();
+    let second = query.logical_plan();
+    assert!(std::ptr::eq(first, second));
+    Ok(())
+}
+
+#[test]
 fn repeated_pre_stream_failures_release_admission_and_snapshot_leases() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("pre-stream-resource-ownership")?;

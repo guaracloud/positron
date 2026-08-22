@@ -89,6 +89,16 @@ impl TenantSchemaSession {
         if block_count == 0 {
             return Ok(());
         }
+        let catalog_clone_work = state
+            .catalog
+            .catalog()
+            .replay_clone_work_units()
+            .map_err(SchemaSessionFailure::Schema)?;
+        let catalog_mutation_work = state
+            .catalog
+            .catalog()
+            .replay_mutation_setup_work_units()
+            .map_err(SchemaSessionFailure::Schema)?;
         let bounds = ReplaySnapshotBounds::new(
             block_count,
             total_payload_bytes,
@@ -96,6 +106,9 @@ impl TenantSchemaSession {
             mandatory_work,
             optional_work,
             state.catalog.catalog().memory_bytes(),
+            catalog_clone_work
+                .checked_add(catalog_mutation_work)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
         )?;
         debug_assert!(bounds.total_payload_bytes >= bounds.maximum_payload_bytes);
         let (replay_capacity, complete_text) =
@@ -111,7 +124,10 @@ impl TenantSchemaSession {
             .then(|| SchemaBuildObserver::new_scan(bounds.optional_work, cancellation));
         let mut candidate_catalog = state
             .catalog
-            .try_clone_for_replay(&replay_capacity)
+            .try_clone_for_replay_observed(&replay_capacity, &mandatory_observer)
+            .map_err(SchemaSessionFailure::Schema)?;
+        candidate_catalog
+            .prepare_replay_mutation_observed(&mandatory_observer)
             .map_err(SchemaSessionFailure::Schema)?;
         let mut candidate_frontiers = Vec::new();
         candidate_frontiers
@@ -176,8 +192,8 @@ impl TenantSchemaSession {
                 .reconcile_block_identity(block.identity(), digest)
                 .map_err(SchemaSessionFailure::Schema)?;
             candidate_catalog
-                .commit(delta, block.identity(), digest)
-                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+                .commit_observed(delta, block.identity(), digest, &mandatory_observer)
+                .map_err(map_replay_observed_failure)?;
             if let Some(capacity) = capacity {
                 new_retained_capacity.push(capacity.transfer());
             }
@@ -271,8 +287,8 @@ impl TenantSchemaSession {
                 .map_err(SchemaSessionFailure::Schema)?;
             state
                 .catalog
-                .commit(delta, block.identity(), digest)
-                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+                .commit_observed(delta, block.identity(), digest, &observer)
+                .map_err(map_replay_observed_failure)?;
             publish_frontier(&mut state, frontier);
         }
         Ok(())

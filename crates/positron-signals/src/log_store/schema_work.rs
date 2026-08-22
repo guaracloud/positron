@@ -74,7 +74,7 @@ impl super::LogStore {
         if has_text_body
             && !has_schema_overflow
             && !delta.has_index_paths()
-            && schema.may_add_text_summary()
+            && may_add_text_summary(schema, observer)?
             && schema.budget().max_index_bytes() >= schema::MIN_TEXT_INDEX_BUDGET_BYTES
         {
             let bodies = records
@@ -205,37 +205,45 @@ impl super::LogStore {
         if schema.tenant() != tenant {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
-        let has_schema_overflow = decoded.records.iter().any(|record| {
-            record.attributes().iter().any(|attribute| {
-                attribute.representation() == AttributeRepresentation::SchemaOverflow
-            })
-        });
-        let has_text_body = decoded
-            .records
-            .iter()
-            .any(|record| record.body().and_then(|body| body.as_str()).is_some());
-        let summary = if has_text_body && !has_schema_overflow {
-            let bodies = decoded
+        // A reduced replay explicitly declined optional text work. Branch
+        // before inspecting bodies so fallback does not traverse discarded
+        // evidence outside the admitted text authority.
+        let summary = if observer.is_some() && text_observer.is_none() {
+            None
+        } else {
+            let has_schema_overflow = decoded.records.iter().any(|record| {
+                record.attributes().iter().any(|attribute| {
+                    attribute.representation() == AttributeRepresentation::SchemaOverflow
+                })
+            });
+            let has_text_body = decoded
                 .records
                 .iter()
-                .map(|record| record.body().and_then(|body| body.as_str()));
-            match text_observer {
-                Some(observer) => {
-                    match schema::TextBlockSummary::from_bodies_observed(bodies, observer) {
-                        Ok(summary) => Some(summary),
-                        Err(schema::TextSummaryFailure::Observation(
-                            ScanObservationFailureCode::BudgetExhausted,
-                        )) => None,
-                        Err(failure) => return Err(map_text_summary_failure(failure)),
-                    }
-                },
-                None if observer.is_none() => Some(
-                    schema::TextBlockSummary::from_bodies(bodies).map_err(map_schema_failure)?,
-                ),
-                None => None,
+                .any(|record| record.body().and_then(|body| body.as_str()).is_some());
+            if !has_text_body || has_schema_overflow {
+                None
+            } else {
+                let bodies = decoded
+                    .records
+                    .iter()
+                    .map(|record| record.body().and_then(|body| body.as_str()));
+                match text_observer {
+                    Some(observer) => {
+                        match schema::TextBlockSummary::from_bodies_observed(bodies, observer) {
+                            Ok(summary) => Some(summary),
+                            Err(schema::TextSummaryFailure::Observation(
+                                ScanObservationFailureCode::BudgetExhausted,
+                            )) => None,
+                            Err(failure) => return Err(map_text_summary_failure(failure)),
+                        }
+                    },
+                    None if observer.is_none() => Some(
+                        schema::TextBlockSummary::from_bodies(bodies)
+                            .map_err(map_schema_failure)?,
+                    ),
+                    None => None,
+                }
             }
-        } else {
-            None
         };
         let mut delta = SchemaDelta::empty(tenant, true);
         let mut meter = observer.map_or_else(
@@ -249,7 +257,7 @@ impl super::LogStore {
         }
         if let Some(summary) = summary
             && !delta.has_index_paths()
-            && schema.may_add_text_summary()
+            && may_add_text_summary(schema, text_observer)?
             && schema.budget().max_index_bytes() >= schema::MIN_TEXT_INDEX_BUDGET_BYTES
         {
             if let Some(observer) = text_observer {
@@ -265,6 +273,20 @@ impl super::LogStore {
             }
         }
         Ok(delta)
+    }
+}
+
+fn may_add_text_summary(
+    schema: &SchemaCatalog,
+    observer: Option<&dyn ScanObserver>,
+) -> Result<bool, LogStoreFailure> {
+    match observer {
+        Some(observer) => match schema.may_add_text_summary_observed(observer) {
+            Ok(value) => Ok(value),
+            Err(ScanObservationFailureCode::BudgetExhausted) => Ok(false),
+            Err(failure) => Err(LogStoreFailure::observation(failure)),
+        },
+        None => Ok(schema.may_add_text_summary()),
     }
 }
 

@@ -157,6 +157,29 @@ fn bounded_substring_compiles_prefix_once_and_reuses_it_across_records() {
 }
 
 #[test]
+fn compiled_matchers_are_idempotent_and_uncompiled_matching_fails_closed() {
+    let mut substring = BoundedSubstring::from_source("needle".to_owned()).expect("substring");
+    substring.compile().expect("substring compiles");
+    substring
+        .compile()
+        .expect("reusing the compiled prefix is safe");
+
+    let mut regex = BoundedRegex::from_source("needle".to_owned()).expect("regex");
+    regex.compile().expect("regex compiles");
+    regex.compile().expect("reusing the compiled DFA is safe");
+
+    let uncompiled = BoundedSubstring::from_source("needle".to_owned()).expect("substring");
+    let mut observer = UnobservedSearch;
+    assert_eq!(
+        uncompiled
+            .is_match_observed("needle", &mut observer)
+            .expect_err("matching before admission must fail closed")
+            .code(),
+        QueryFailureCode::Internal
+    );
+}
+
+#[test]
 fn matching_polls_cancellation_between_body_chunks() {
     let body = "x".repeat(2_048);
     let regex = BoundedRegex::new("needle".to_owned()).expect("bounded regex");

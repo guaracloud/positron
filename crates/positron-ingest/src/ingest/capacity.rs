@@ -94,13 +94,19 @@ pub(super) fn schema_admission_estimate(
         .checked_mul(2)?
         .checked_add(schema_bytes.min(schema_stage_ceiling_bytes()?))?
         .max(1);
+    let text_optional_work = if has_text_body {
+        SchemaBudget::text_stage_optional_work_units()
+    } else {
+        0
+    };
     Some(SchemaAdmissionEstimate {
         staging_memory_bytes,
         retained_memory_bytes,
         discovery_nodes,
         text_work_units,
         schema_work_units: schema_discovery_cpu_work_units(discovery_nodes)?
-            .checked_add(text_work_units)?,
+            .checked_add(text_work_units)?
+            .checked_add(text_optional_work)?,
     })
 }
 

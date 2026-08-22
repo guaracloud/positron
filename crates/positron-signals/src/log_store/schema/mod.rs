@@ -15,6 +15,7 @@ mod observation;
 mod observed_coverage;
 mod promotion;
 mod query;
+mod replay;
 mod representation;
 mod session;
 mod stored_query;

@@ -1,5 +1,7 @@
-use std::error::Error;
+use std::{cell::Cell, error::Error};
 
+use crate::log_store::{ScanObservationFailureCode, ScanObserver};
+use positron_domain::identity::TenantId;
 use positron_domain::value::{
     AttributeNamespace, AttributeValueKind, CandidateAttributeValue, CandidateKeyValue,
 };
@@ -64,6 +66,165 @@ fn staged_index(
     )?;
     let identity = StoreBlockIdentity::new(sequence.to_be_bytes())?;
     Ok(delta.into_block_index(identity, [0x61; 32]))
+}
+
+#[test]
+fn replay_apply_charges_many_block_mutations_at_the_exact_boundary() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
+    let meter = ReplayMeter::bounded(64);
+    for sequence in 1_u128..=65 {
+        let (delta, index) = staged_index(&catalog, tenant, &attribute, sequence)?;
+        let result = catalog.apply_replay_delta(delta, index, &meter);
+        if sequence == 65 {
+            assert_eq!(
+                result,
+                Err(super::super::SchemaFailure::Observed(
+                    ScanObservationFailureCode::BudgetExhausted,
+                ))
+            );
+        } else {
+            result?;
+        }
+    }
+    assert_eq!(meter.consumed.get(), 65);
+    assert_eq!(catalog.replay_clone_work_units()?, 2);
+    assert_eq!(catalog.replay_mutation_setup_work_units()?, 2);
+    let clone_meter = ReplayMeter::bounded(4);
+    let mut clone = catalog.try_clone_observed(&clone_meter)?;
+    clone.prepare_replay_mutation_observed(&clone_meter)?;
+    assert_eq!(clone_meter.consumed.get(), 4);
+    let cancelled = ReplayMeter::bounded(0);
+    assert_eq!(
+        catalog.try_clone_observed(&cancelled),
+        Err(super::super::SchemaFailure::Observed(
+            ScanObservationFailureCode::BudgetExhausted,
+        ))
+    );
+    let mut unobserved_clone = catalog.try_clone()?;
+    assert_eq!(
+        unobserved_clone.prepare_replay_mutation_observed(&cancelled),
+        Err(super::super::SchemaFailure::Observed(
+            ScanObservationFailureCode::BudgetExhausted,
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_apply_accounts_sorted_block_index_shifts() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
+
+    let meter = ReplayMeter::bounded(u64::MAX);
+    for sequence in [2_u128, 3] {
+        let (delta, index) = staged_index(&catalog, tenant, &attribute, sequence)?;
+        catalog.apply_replay_delta(delta, index, &meter)?;
+    }
+    let before = meter.consumed.get();
+    let (delta, index) = staged_index(&catalog, tenant, &attribute, 1)?;
+    let limited = ReplayMeter::bounded(2);
+    assert_eq!(
+        catalog.apply_replay_delta(delta, index, &limited),
+        Err(super::super::SchemaFailure::Observed(
+            ScanObservationFailureCode::BudgetExhausted,
+        ))
+    );
+    assert!(
+        !catalog.has_verified_block(StoreBlockIdentity::new(1_u128.to_be_bytes())?, [0x61; 32])
+    );
+
+    let (delta, index) = staged_index(&catalog, tenant, &attribute, 1)?;
+    catalog.apply_replay_delta(delta, index, &meter)?;
+
+    assert_eq!(meter.consumed.get(), before + 3);
+    Ok(())
+}
+
+#[test]
+fn replay_apply_rejects_cross_tenant_and_invalid_or_duplicate_indexes() -> Result<(), Box<dyn Error>>
+{
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
+    let meter = ReplayMeter::bounded(u64::MAX);
+
+    let (wrong_tenant_delta, _) =
+        staged_index(&catalog, TenantId::from_bytes([0x72; 16])?, &attribute, 1)?;
+    assert_eq!(
+        catalog.apply_replay_delta(wrong_tenant_delta, None, &meter),
+        Err(super::super::SchemaFailure::InvalidValue)
+    );
+
+    let (delta, index) = staged_index(&catalog, tenant, &attribute, 2)?;
+    catalog.apply_replay_delta(delta, index, &meter)?;
+    let (duplicate_delta, duplicate) = staged_index(&catalog, tenant, &attribute, 2)?;
+    assert_eq!(
+        catalog.apply_replay_delta(duplicate_delta, duplicate, &meter),
+        Ok(())
+    );
+
+    let (invalid_delta, _) = staged_index(&catalog, tenant, &attribute, 3)?;
+    let invalid_index = super::super::index::SchemaBlockIndex::one(
+        StoreBlockIdentity::new(3_u128.to_be_bytes())?,
+        [0x61; 32],
+        super::super::index::SchemaIndexPath {
+            path: path(AttributeNamespace::Record, "not-indexed"),
+            kind_mask: 1,
+            values: Vec::new(),
+        },
+    )?;
+    assert_eq!(
+        catalog.apply_replay_delta(invalid_delta, Some(invalid_index), &meter),
+        Err(super::super::SchemaFailure::InvalidValue)
+    );
+    Ok(())
+}
+
+struct ReplayMeter {
+    consumed: Cell<u64>,
+    limit: u64,
+}
+
+impl ReplayMeter {
+    const fn bounded(limit: u64) -> Self {
+        Self {
+            consumed: Cell::new(0),
+            limit,
+        }
+    }
+}
+
+impl ScanObserver for ReplayMeter {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let consumed = self.consumed.get().saturating_add(units);
+        self.consumed.set(consumed);
+        if consumed > self.limit {
+            Err(ScanObservationFailureCode::BudgetExhausted)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[test]

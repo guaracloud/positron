@@ -72,13 +72,24 @@ impl BoundedSubstring {
         prefix.resize(pattern.len(), 0);
         let mut matched = 0;
         for index in 1..pattern.len() {
-            while matched > 0 && pattern[index] != pattern[matched] {
-                matched = prefix[matched - 1];
+            let byte = pattern
+                .get(index)
+                .copied()
+                .ok_or(QueryFailure::new(QueryFailureCode::Internal))?;
+            while matched > 0 && pattern.get(matched).copied() != Some(byte) {
+                let fallback = prefix
+                    .get(matched - 1)
+                    .copied()
+                    .ok_or(QueryFailure::new(QueryFailureCode::Internal))?;
+                matched = fallback;
             }
-            if pattern[index] == pattern[matched] {
+            if pattern.get(matched).copied() == Some(byte) {
                 matched += 1;
             }
-            prefix[index] = matched;
+            let slot = prefix
+                .get_mut(index)
+                .ok_or(QueryFailure::new(QueryFailureCode::Internal))?;
+            *slot = matched;
         }
         self.prefix = Some(prefix.into_boxed_slice());
         Ok(())
@@ -119,10 +130,14 @@ impl BoundedSubstring {
         {
             observer.observe_search_chunk()?;
             for &byte in chunk {
-                while matched > 0 && byte != pattern[matched] {
-                    matched = prefix[matched - 1];
+                while matched > 0 && pattern.get(matched).copied() != Some(byte) {
+                    let fallback = prefix
+                        .get(matched - 1)
+                        .copied()
+                        .ok_or(QueryFailure::new(QueryFailureCode::Internal))?;
+                    matched = fallback;
                 }
-                if byte == pattern[matched] {
+                if pattern.get(matched).copied() == Some(byte) {
                     matched += 1;
                     if matched == pattern.len() {
                         return Ok(true);

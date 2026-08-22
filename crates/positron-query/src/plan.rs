@@ -306,8 +306,8 @@ pub struct PlannedQuery<'kernel> {
 
 impl PlannedQuery<'_> {
     #[must_use]
-    pub fn logical_plan(&self) -> LogicalPlan {
-        self.plan.as_ref().clone()
+    pub fn logical_plan(&self) -> &LogicalPlan {
+        self.plan.as_ref()
     }
 
     /// Returns the query-scoped handle used to propagate disconnects and deadlines.

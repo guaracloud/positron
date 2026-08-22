@@ -22,11 +22,38 @@ impl SchemaBudget {
         super::text_builder::work_units(body_bytes)
     }
 
+    /// Conservative work bound for one optional text-summary catalog walk.
+    #[must_use]
+    pub fn text_catalog_work_units() -> Option<u64> {
+        u64::try_from(
+            super::index::MAX_BLOCK_INDEXES
+                .div_ceil(super::text_builder::WORK_QUANTUM_OPERATIONS / 2),
+        )
+        .ok()
+    }
+
+    /// Small live-ingest admission slice for optional text sidecar setup.
+    ///
+    /// The runtime observer still charges the actual catalog walk and falls
+    /// back to body scanning when an existing catalog needs more work. This
+    /// slice keeps ordinary ingest available while admitting the common empty
+    /// or small-catalog path.
+    #[must_use]
+    pub const fn text_stage_optional_work_units() -> u64 {
+        6
+    }
+
+    /// Conservative replay bound including one optional catalog walk.
+    #[must_use]
+    pub fn text_replay_work_units(body_bytes: usize) -> Option<u64> {
+        Self::text_index_work_units(body_bytes)?.checked_add(Self::text_catalog_work_units()?)
+    }
+
     /// Conservative replay work bound for one authenticated payload.
     #[must_use]
     pub fn replay_schema_work_units(payload_bytes: usize) -> Option<u64> {
         Self::replay_decode_work_units(payload_bytes)?
-            .checked_add(Self::text_index_work_units(payload_bytes)?)
+            .checked_add(Self::text_replay_work_units(payload_bytes)?)
     }
 
     /// Conservative structural decode and schema-discovery work bound before

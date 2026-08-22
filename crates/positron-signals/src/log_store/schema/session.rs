@@ -113,13 +113,32 @@ impl SchemaSessionStore {
         &self,
         reservation: &'reservation ResourceReservation<'_>,
     ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
+        self.try_clone_for_replay_inner(reservation, None)
+    }
+
+    pub fn try_clone_for_replay_observed<'reservation>(
+        &self,
+        reservation: &'reservation ResourceReservation<'_>,
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
+        self.try_clone_for_replay_inner(reservation, Some(observer))
+    }
+
+    fn try_clone_for_replay_inner<'reservation>(
+        &self,
+        reservation: &'reservation ResourceReservation<'_>,
+        observer: Option<&dyn ScanObserver>,
+    ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
         let required =
             u64::try_from(self.catalog.memory_bytes()).map_err(|_| SchemaFailure::LimitExceeded)?;
         if !reservation.authorizes_tenant_schema_session(self.tenant(), required) {
             return Err(SchemaFailure::AllocationUnavailable);
         }
         Ok(SchemaReplayCandidate {
-            catalog: self.catalog.try_clone()?,
+            catalog: match observer {
+                Some(observer) => self.catalog.try_clone_observed(observer)?,
+                None => self.catalog.try_clone()?,
+            },
             _reservation: PhantomData,
         })
     }
@@ -143,6 +162,22 @@ impl SchemaSessionStore {
         digest: [u8; 32],
     ) -> Result<(), LogStoreFailure> {
         LogStore::new().apply_schema_delta(&mut self.catalog, delta, identity, digest)
+    }
+
+    pub fn commit_observed(
+        &mut self,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), LogStoreFailure> {
+        LogStore::new().apply_schema_delta_replay_observed(
+            &mut self.catalog,
+            delta,
+            identity,
+            digest,
+            observer,
+        )
     }
 
     pub fn replay(
@@ -277,6 +312,13 @@ impl SchemaQueryUpdate {
 }
 
 impl SchemaReplayCandidate<'_> {
+    pub fn prepare_replay_mutation_observed(
+        &mut self,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        self.catalog.prepare_replay_mutation_observed(observer)
+    }
+
     pub fn commit(
         &mut self,
         delta: SchemaDelta,
@@ -284,6 +326,22 @@ impl SchemaReplayCandidate<'_> {
         digest: [u8; 32],
     ) -> Result<(), LogStoreFailure> {
         LogStore::new().apply_schema_delta(&mut self.catalog, delta, identity, digest)
+    }
+
+    pub fn commit_observed(
+        &mut self,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), LogStoreFailure> {
+        LogStore::new().apply_schema_delta_replay_observed(
+            &mut self.catalog,
+            delta,
+            identity,
+            digest,
+            observer,
+        )
     }
 
     pub fn replay_observed_cancellable_with_text_observer(
@@ -312,36 +370,6 @@ impl SchemaReplayCandidate<'_> {
         digest: [u8; 32],
     ) -> Result<(), SchemaFailure> {
         self.catalog.reconcile_block_identity(identity, digest)
-    }
-}
-
-impl SchemaCatalog {
-    fn try_clone(&self) -> Result<Self, SchemaFailure> {
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.entries.capacity())
-            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-        for entry in &self.entries {
-            entries.push(entry.try_clone()?);
-        }
-        let mut block_indexes = Vec::new();
-        block_indexes
-            .try_reserve_exact(self.block_indexes.len())
-            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-        for block in &self.block_indexes {
-            block_indexes.push(block.try_clone()?);
-        }
-        Ok(Self {
-            tenant: self.tenant,
-            budget: self.budget,
-            entries,
-            memory_bytes: self.memory_bytes,
-            persistent_bytes: self.persistent_bytes,
-            index_bytes: self.index_bytes,
-            overflow_records: self.overflow_records,
-            overflow_bytes: self.overflow_bytes,
-            block_indexes,
-        })
     }
 }
 

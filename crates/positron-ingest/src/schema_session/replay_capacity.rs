@@ -33,6 +33,7 @@ impl ReplaySnapshotBounds {
         mandatory_work: u64,
         optional_work: u64,
         catalog_memory_bytes: usize,
+        catalog_clone_work: u64,
     ) -> Result<Self, SchemaSessionFailure> {
         if total_payload_bytes < maximum_payload_bytes {
             return Err(SchemaSessionFailure::ReplayLimitExceeded);
@@ -54,7 +55,9 @@ impl ReplaySnapshotBounds {
             block_count,
             total_payload_bytes,
             maximum_payload_bytes,
-            mandatory_work,
+            mandatory_work: mandatory_work
+                .checked_add(catalog_clone_work)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
             optional_work,
             scratch_memory_bytes,
         })
@@ -108,9 +111,9 @@ pub(super) fn replay_snapshot_block_work(
 ) -> Result<(u64, u64), SchemaSessionFailure> {
     let mandatory_work = SchemaBudget::replay_decode_work_units(payload_bytes)
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?
-        .checked_add(1)
+        .checked_add(2)
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-    let optional_work = SchemaBudget::text_index_work_units(payload_bytes)
+    let optional_work = SchemaBudget::text_replay_work_units(payload_bytes)
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     Ok((mandatory_work, optional_work))
 }
@@ -162,6 +165,9 @@ pub(super) fn resize_replay_work(
     // separate optional reservation when complete capacity is available.
     let reduced_work = SchemaBudget::replay_decode_work_units(payload_bytes)
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let reduced_work = reduced_work
+        .checked_add(1)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     let current = recovery.granted().get(ResourceDimension::MemoryBytes);
     let reduced = ResourceAmounts::new([current, 0, 0, 0, 0, 0, 0, 0, reduced_work, 0, 0]);
     recovery
@@ -177,7 +183,7 @@ mod tests {
 
     #[test]
     fn replay_snapshot_memory_admission_counts_tiny_block_slots_exactly() {
-        let bounds = ReplaySnapshotBounds::new(64, 64, 1, 64, 128, 0).expect("bounds");
+        let bounds = ReplaySnapshotBounds::new(64, 64, 1, 64, 128, 0, 0).expect("bounds");
         let exact_memory = u64::try_from(bounds.scratch_memory_bytes).expect("bound");
         let exact_fixture = crate::tests::support::fixture_with_ordinary_memory(
             exact_memory.checked_add(20).expect("protected headroom"),
@@ -210,6 +216,21 @@ mod tests {
                 under_fixture.authority.governor(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn replay_snapshot_work_admission_includes_catalog_clone_work() {
+        let bounds =
+            ReplaySnapshotBounds::new(64, 64, 1, 64, 128, 0, 7).expect("bounded replay work");
+        assert_eq!(bounds.mandatory_work, 71);
+    }
+
+    #[test]
+    fn replay_snapshot_rejects_payload_totals_that_cannot_cover_the_largest_block() {
+        assert_eq!(
+            ReplaySnapshotBounds::new(1, 2, 3, 1, 0, 0, 0),
+            Err(crate::schema_session::SchemaSessionFailure::ReplayLimitExceeded)
         );
     }
 }
