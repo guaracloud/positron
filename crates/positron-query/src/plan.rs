@@ -197,6 +197,16 @@ impl LogicalPlan {
         Ok(())
     }
 
+    pub(crate) fn search_compile_work_units(&self) -> u64 {
+        match self.filter.as_ref() {
+            Some(FilterPredicate::BodyRegex(regex)) => regex.compile_work_units(),
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::BodyContains(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => 0,
+        }
+    }
+
     pub(crate) fn text_search_candidate(
         &self,
     ) -> Result<Option<positron_signals::TextSearchCandidate>, crate::QueryFailure> {

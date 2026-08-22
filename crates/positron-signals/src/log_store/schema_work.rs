@@ -219,7 +219,7 @@ impl super::LogStore {
                 .records
                 .iter()
                 .map(|record| record.body().and_then(|body| body.as_str()));
-            match text_observer.or(observer) {
+            match text_observer {
                 Some(observer) => {
                     match schema::TextBlockSummary::from_bodies_observed(bodies, observer) {
                         Ok(summary) => Some(summary),
@@ -229,9 +229,10 @@ impl super::LogStore {
                         Err(failure) => return Err(map_text_summary_failure(failure)),
                     }
                 },
-                None => Some(
+                None if observer.is_none() => Some(
                     schema::TextBlockSummary::from_bodies(bodies).map_err(map_schema_failure)?,
                 ),
+                None => None,
             }
         } else {
             None
@@ -251,17 +252,16 @@ impl super::LogStore {
             && schema.may_add_text_summary()
             && schema.budget().max_index_bytes() >= schema::MIN_TEXT_INDEX_BUDGET_BYTES
         {
-            match text_observer.or(observer) {
-                Some(observer) => match delta
-                    .attach_text_summary_observed(schema, summary, observer)
-                {
+            if let Some(observer) = text_observer {
+                match delta.attach_text_summary_observed(schema, summary, observer) {
                     Ok(()) => {},
                     Err(failure) if failure.code() == LogStoreFailureCode::BudgetExhausted => {},
                     Err(failure) => return Err(failure),
-                },
-                None => delta
+                }
+            } else if observer.is_none() {
+                delta
                     .attach_text_summary(schema, summary)
-                    .map_err(map_schema_failure)?,
+                    .map_err(map_schema_failure)?;
             }
         }
         Ok(delta)

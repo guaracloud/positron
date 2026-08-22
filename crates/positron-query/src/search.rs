@@ -13,6 +13,7 @@ const MAX_SEARCH_LITERAL_COUNT: usize = 32;
 const MAX_REGEX_COMPILED_BYTES: usize = 64 * 1024;
 const MAX_REGEX_NESTING: u32 = 32;
 const MAX_REGEX_BUILD_BYTES: usize = MAX_REGEX_COMPILED_BYTES * 2;
+const REGEX_COMPILE_WORK_QUANTUM_BYTES: usize = 32 * 1024;
 const MAX_SEARCH_SCRATCH_BYTES: usize =
     std::mem::size_of::<Vec<usize>>() + MAX_SEARCH_LITERAL_BYTES * std::mem::size_of::<usize>();
 
@@ -81,6 +82,17 @@ impl BoundedRegex {
         self.compiled = Some(Box::new(compiled));
         self.pruning_literals = Some(pruning_literals);
         Ok(())
+    }
+
+    /// Conservative deterministic parse work for the bounded compiler. Each
+    /// unit admits one fixed 32-KiB source/program quantum plus one nesting
+    /// quantum, covering the complete configured source and DFA/NFA limits
+    /// before the compiler is allowed to allocate.
+    pub(crate) fn compile_work_units(&self) -> u64 {
+        let source_quanta = self.source.len().div_ceil(REGEX_COMPILE_WORK_QUANTUM_BYTES);
+        let program_quanta = MAX_REGEX_COMPILED_BYTES.div_ceil(REGEX_COMPILE_WORK_QUANTUM_BYTES);
+        let nesting_quanta = 1_usize;
+        (source_quanta + program_quanta + nesting_quanta) as u64
     }
 
     #[cfg(test)]

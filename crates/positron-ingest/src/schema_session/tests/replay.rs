@@ -255,11 +255,9 @@ fn replay_cancellation_on_later_block_is_atomic_for_catalog_frontier_and_capacit
     let session = registry
         .session(fixture.tenant, fixture.authority.governor())
         .expect("session");
-    let before_checkpoint = session
-        .checkpoint()
-        .expect("empty checkpoint")
-        .catalog_bytes()
-        .to_vec();
+    let before_checkpoint_view = session.checkpoint().expect("empty checkpoint");
+    let before_base_charge = before_checkpoint_view.base_charge_bytes();
+    let before_checkpoint = before_checkpoint_view.catalog_bytes().to_vec();
     let before_governor = fixture.authority.governor().inspect().expect("governor");
     let cancellation = CancelAfterPolls::new(70);
     assert_eq!(
@@ -303,12 +301,42 @@ fn replay_cancellation_on_later_block_is_atomic_for_catalog_frontier_and_capacit
     session
         .replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor())
         .expect("retry replay");
+    let replayed_checkpoint = session.checkpoint().expect("replayed checkpoint");
+    assert_eq!(replayed_checkpoint.catalog_bytes(), expected);
+    assert_eq!(replayed_checkpoint.base_charge_bytes(), before_base_charge);
+    let after_success = fixture.authority.governor().inspect().expect("governor");
+    let retained_memory = after_success
+        .usage(positron_kernel::ResourceDimension::MemoryBytes)
+        .checked_sub(before_governor.usage(positron_kernel::ResourceDimension::MemoryBytes))
+        .expect("replay retained memory is monotonic");
+    assert_eq!(retained_memory, replayed_checkpoint.retained_charge_bytes());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        let expected_usage = if dimension == positron_kernel::ResourceDimension::MemoryBytes {
+            before_governor
+                .usage(dimension)
+                .checked_add(replayed_checkpoint.retained_charge_bytes())
+                .expect("retained memory does not overflow")
+        } else {
+            before_governor.usage(dimension)
+        };
+        assert_eq!(
+            after_success.usage(dimension),
+            expected_usage,
+            "resource drift for {dimension:?}"
+        );
+    }
+    let stable_usage = after_success.usage(positron_kernel::ResourceDimension::MemoryBytes);
+    session
+        .replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor())
+        .expect("idempotent replay");
     assert_eq!(
-        session
-            .checkpoint()
-            .expect("replayed checkpoint")
-            .catalog_bytes(),
-        expected
+        fixture
+            .authority
+            .governor()
+            .inspect()
+            .expect("governor")
+            .usage(positron_kernel::ResourceDimension::MemoryBytes),
+        stable_usage
     );
     drop(session);
     drop(registry);

@@ -22,8 +22,9 @@ use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
 use crate::{
-    LogStoreFailureCode, OccurrenceSelector, ScanObservationFailureCode, ScanObserver,
-    SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue,
+    LogStoreFailureCode, OccurrenceSelector, ScanCancellation, ScanObservationFailureCode,
+    ScanObserver, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery, SchemaSessionStore,
+    SchemaValue,
 };
 
 #[test]
@@ -86,7 +87,15 @@ fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(
     let replay_budget = SchemaBudget::new(1, 8_192, 512, 256)?;
     let permit_capacity = preparation_capacity(&authority, tenant)?;
     let mut replayed = SchemaSessionStore::new(permit_capacity, tenant, replay_budget)?;
-    let replay_delta = replayed.replay(tenant, &snapshot, block)?;
+    let replay_observer = ObservationMeter::bounded(u64::MAX);
+    let replay_delta = replayed.replay_observed_cancellable_with_text_observer(
+        tenant,
+        &snapshot,
+        block,
+        &NeverCancelled,
+        &replay_observer,
+        None,
+    )?;
     replayed.commit(replay_delta, block.identity(), block.content_digest()?)?;
     assert_eq!(replayed.catalog(), &schema);
 
@@ -246,6 +255,34 @@ fn observed_text_replay_has_an_exact_work_boundary_and_falls_back_atomically()
         store.replay_schema_block_observed(tenant, &snapshot, block, &schema, &exact_minus_one)?;
     assert_eq!(fallback.physical_memory_bytes(), 0);
 
+    let mandatory = ObservationMeter::bounded(u64::MAX);
+    let text_budget = ObservationMeter::bounded(0);
+    let reduced_with_text_budget = store
+        .replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            &snapshot,
+            block,
+            &schema,
+            &NeverCancelled,
+            &mandatory,
+            Some(&text_budget),
+        )?;
+    assert_eq!(reduced_with_text_budget.physical_memory_bytes(), 0);
+    let mandatory_work = mandatory.consumed.get();
+    let mandatory_only = ObservationMeter::bounded(mandatory_work);
+    let reduced_without_text_budget = store
+        .replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            &snapshot,
+            block,
+            &schema,
+            &NeverCancelled,
+            &mandatory_only,
+            None,
+        )?;
+    assert_eq!(reduced_without_text_budget.physical_memory_bytes(), 0);
+    assert_eq!(mandatory_only.consumed.get(), mandatory_work);
+
     let unobserved = store.replay_schema_block(tenant, &snapshot, block, &schema)?;
     assert!(unobserved.physical_memory_bytes() > 0);
     let foreign = SchemaCatalog::new(
@@ -288,6 +325,14 @@ fn observed_text_replay_has_an_exact_work_boundary_and_falls_back_atomically()
     };
     assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
     Ok(())
+}
+
+struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 struct ObservationMeter {

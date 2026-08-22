@@ -74,15 +74,32 @@ fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
     };
     assert_eq!(receipt.segment_id(), segment);
     assert_eq!(receipt.frontier_authenticator(), [3; 32]);
+    let prepared = PreparedStoreBlock::new(
+        prepared_scope,
+        StoreBlockIdentity::new([5; 16]).expect("identity"),
+        b"prepared".to_vec(),
+    )
+    .expect("prepared block");
+    let prepared_digest = prepared.content_digest().expect("prepared digest");
+    assert_eq!(
+        prepared_digest,
+        prepared.content_digest().expect("cached prepared digest")
+    );
+    assert_eq!(
+        prepared_digest,
+        crate::data_protection::DataProtection::hash(b"prepared").expect("hash")
+    );
     let block = CommittedBlock {
         identity: StoreBlockIdentity::new([1; 16]).expect("identity"),
         position: receipt.position(),
         payload: b"block".to_vec(),
+        content_digest: [4; 32],
         segment,
         frontier_authenticator: [3; 32],
     };
     assert_eq!(block.position(), receipt.position());
     assert_eq!(block.payload(), b"block");
+    assert_eq!(block.content_digest().expect("committed digest"), [4; 32]);
     let sealed = SealedSegment {
         segment,
         frontier: receipt.position(),

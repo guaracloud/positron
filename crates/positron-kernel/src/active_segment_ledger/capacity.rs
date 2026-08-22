@@ -62,9 +62,11 @@ pub(super) fn lease_claim(encoded_bytes: usize) -> Result<ResourceAmounts, Ledge
 }
 
 fn retained_memory(bytes: usize, blocks: usize) -> Result<u64, LedgerFailure> {
+    // 96 bytes cover the immutable block owner; the cached plaintext digest
+    // adds one more 32-byte retained field per snapshot-visible block.
     u64::try_from(bytes)
         .ok()
-        .and_then(|value| value.checked_add(u64::try_from(blocks).ok()?.checked_mul(96)?))
+        .and_then(|value| value.checked_add(u64::try_from(blocks).ok()?.checked_mul(128)?))
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
 }

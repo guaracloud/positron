@@ -3,6 +3,7 @@ use positron_kernel::{
     CommittedBlock, LedgerSnapshot, ResourceGovernor, ResourceReservation, StoreBlockIdentity,
     TransferredResourceReservation,
 };
+use std::marker::PhantomData;
 
 use super::{SchemaBudget, SchemaCatalog, SchemaDelta, SchemaFailure};
 use crate::log_store::{LogRecord, LogStore, LogStoreFailure, ScanCancellation, ScanObserver};
@@ -18,10 +19,18 @@ pub struct SchemaSessionStore {
     capacity_bytes: u64,
 }
 
-/// Fallibly constructed, unpublished query-evidence replacement.
+/// Fallibly constructed, unpublished catalog replacement.
 #[doc(hidden)]
 pub struct SchemaQueryUpdate {
     catalog: SchemaCatalog,
+}
+
+/// Unpublished replay state whose lifetime is tied to the temporary replay
+/// reservation. It cannot be published after that reservation is dropped.
+#[doc(hidden)]
+pub struct SchemaReplayCandidate<'reservation> {
+    catalog: SchemaCatalog,
+    _reservation: PhantomData<&'reservation ()>,
 }
 
 impl SchemaSessionStore {
@@ -97,24 +106,21 @@ impl SchemaSessionStore {
         self._capacity.can_reclaim_with(governor)
     }
 
-    /// Builds an unpublished catalog copy while transferring the caller's
-    /// already-admitted replay capacity into that candidate.
-    pub fn try_clone_with_reservation(
+    /// Builds an unpublished catalog copy under the caller's already-admitted
+    /// replay reservation. The candidate borrows no capacity and therefore
+    /// cannot transfer the live session's base grant at publication time.
+    pub fn try_clone_for_replay<'reservation>(
         &self,
-        reservation: ResourceReservation<'_>,
-    ) -> Result<Self, SchemaFailure> {
+        reservation: &'reservation ResourceReservation<'_>,
+    ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
         let required =
             u64::try_from(self.catalog.memory_bytes()).map_err(|_| SchemaFailure::LimitExceeded)?;
         if !reservation.authorizes_tenant_schema_session(self.tenant(), required) {
             return Err(SchemaFailure::AllocationUnavailable);
         }
-        let capacity_bytes = reservation
-            .granted()
-            .get(positron_kernel::ResourceDimension::MemoryBytes);
-        Ok(Self {
+        Ok(SchemaReplayCandidate {
             catalog: self.catalog.try_clone()?,
-            _capacity: reservation.transfer(),
-            capacity_bytes,
+            _reservation: PhantomData,
         })
     }
 
@@ -216,6 +222,17 @@ impl SchemaSessionStore {
         Ok(())
     }
 
+    pub fn commit_replay_candidate<'reservation>(
+        &mut self,
+        candidate: SchemaReplayCandidate<'reservation>,
+    ) -> Result<(), SchemaFailure> {
+        if self.catalog.tenant() != candidate.catalog.tenant() {
+            return Err(SchemaFailure::InvalidValue);
+        }
+        self.catalog = candidate.catalog;
+        Ok(())
+    }
+
     pub fn retain_reachable_indexes(
         &mut self,
         reachable: &[(StoreBlockIdentity, [u8; 32])],
@@ -256,6 +273,45 @@ impl SchemaQueryUpdate {
     #[must_use]
     pub const fn memory_bytes(&self) -> usize {
         self.catalog.memory_bytes()
+    }
+}
+
+impl SchemaReplayCandidate<'_> {
+    pub fn commit(
+        &mut self,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> Result<(), LogStoreFailure> {
+        LogStore::new().apply_schema_delta(&mut self.catalog, delta, identity, digest)
+    }
+
+    pub fn replay_observed_cancellable_with_text_observer(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        text_observer: Option<&dyn ScanObserver>,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            snapshot,
+            block,
+            &self.catalog,
+            cancellation,
+            observer,
+            text_observer,
+        )
+    }
+
+    pub fn reconcile_block_identity(
+        &mut self,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> Result<(), SchemaFailure> {
+        self.catalog.reconcile_block_identity(identity, digest)
     }
 }
 

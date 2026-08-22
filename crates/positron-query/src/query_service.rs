@@ -101,8 +101,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
-        let cpu_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
+        let parse_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
         let mut plan = parser(source)?;
+        let compile_work_units = plan.search_compile_work_units();
+        let cpu_work_units = if compile_work_units == 0 {
+            parse_work_units
+        } else {
+            let compile_unit_cost = self.work_units(crate::QueryWorkStage::Parse)?;
+            let compile_work = compile_unit_cost
+                .checked_mul(compile_work_units)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            parse_work_units
+                .checked_add(compile_work)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+        };
         let last_observed_at = self.now()?;
         if last_observed_at < started_at {
             return Err(QueryFailure::new(QueryFailureCode::Internal));

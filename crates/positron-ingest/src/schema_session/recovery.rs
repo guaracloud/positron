@@ -107,7 +107,7 @@ impl TenantSchemaSession {
             complete_text.then(|| SchemaBuildObserver::new_scan(optional_work, cancellation));
         let mut candidate_catalog = state
             .catalog
-            .try_clone_with_reservation(replay_capacity)
+            .try_clone_for_replay(&replay_capacity)
             .map_err(SchemaSessionFailure::Schema)?;
         let mut candidate_frontiers = Vec::new();
         candidate_frontiers
@@ -172,8 +172,10 @@ impl TenantSchemaSession {
         if cancellation.is_cancelled() {
             return Err(SchemaSessionFailure::Cancelled);
         }
-        let old_catalog = std::mem::replace(&mut state.catalog, candidate_catalog);
-        drop(old_catalog);
+        state
+            .catalog
+            .commit_replay_candidate(candidate_catalog)
+            .map_err(SchemaSessionFailure::Schema)?;
         state.frontiers = candidate_frontiers;
         state.retained_capacity.extend(new_retained_capacity);
         state.retained_charge_bytes = candidate_retained_charge;

@@ -35,6 +35,14 @@ regex automaton, and conservative text-pruning candidate extraction:
 cargo +nightly fuzz run query_search_matcher
 ```
 
+The physical query-search target builds bounded authenticated Store Blocks and
+schema text coverage, then exercises identity/digest validation, pruning,
+fallback, decoding, and the actual matcher through the production scan path:
+
+```console
+cargo +nightly fuzz run query_search_physical --sanitizer none -- -runs=1000
+```
+
 Current authenticated-frame target:
 
 ```console

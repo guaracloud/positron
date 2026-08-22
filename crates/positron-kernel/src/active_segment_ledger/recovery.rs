@@ -171,6 +171,8 @@ pub(super) fn read_blocks(
             .get(16..)
             .filter(|bytes| !bytes.is_empty())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let content_digest = DataProtection::hash(payload)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         plaintext_bytes = plaintext_bytes
             .checked_add(payload.len())
             .filter(|bytes| *bytes <= MAX_RETAINED_BLOCK_BYTES)
@@ -204,6 +206,7 @@ pub(super) fn read_blocks(
             identity,
             position,
             payload: payload.to_vec(),
+            content_digest,
             segment,
             frontier_authenticator,
         });
