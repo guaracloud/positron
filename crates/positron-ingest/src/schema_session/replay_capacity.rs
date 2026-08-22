@@ -159,14 +159,16 @@ pub(super) fn ensure_replay_capacity(
 pub(super) fn resize_replay_work(
     recovery: &mut ResourceReservation<'_>,
     payload_bytes: usize,
+    reconciliation_work: u64,
 ) -> Result<(), SchemaSessionFailure> {
-    // Bootstrap reserves only mandatory decode/discovery work. Optional text
-    // evidence is deliberately omitted here; serving replay admits it in a
-    // separate optional reservation when complete capacity is available.
+    // Bootstrap reserves mandatory decode/discovery work plus the bounded
+    // reconciliation traversal. Optional text evidence is deliberately
+    // omitted here; serving replay admits it separately when capacity allows.
     let reduced_work = SchemaBudget::replay_decode_work_units(payload_bytes)
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     let reduced_work = reduced_work
         .checked_add(1)
+        .and_then(|work| work.checked_add(reconciliation_work))
         .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     let current = recovery.granted().get(ResourceDimension::MemoryBytes);
     let reduced = ResourceAmounts::new([current, 0, 0, 0, 0, 0, 0, 0, reduced_work, 0, 0]);
@@ -180,6 +182,7 @@ pub(super) fn resize_replay_work(
 mod tests {
     use super::{ReplaySnapshotBounds, reserve_replay_snapshot_capacity};
     use positron_kernel::ResourceDimension;
+    use positron_signals::SchemaBudget;
 
     #[test]
     fn replay_snapshot_memory_admission_counts_tiny_block_slots_exactly() {
@@ -224,6 +227,23 @@ mod tests {
         let bounds =
             ReplaySnapshotBounds::new(64, 64, 1, 64, 128, 0, 7).expect("bounded replay work");
         assert_eq!(bounds.mandatory_work, 71);
+    }
+
+    #[test]
+    fn replay_snapshot_optional_work_includes_bounded_projection_capacity() {
+        let payload_bytes = 257_usize;
+        let expected = SchemaBudget::text_index_work_units(payload_bytes)
+            .expect("text work")
+            .checked_add(SchemaBudget::text_catalog_work_units().expect("catalog work"))
+            .and_then(|work| {
+                work.checked_add(
+                    SchemaBudget::text_projection_work_units(payload_bytes)
+                        .expect("projection work"),
+                )
+            })
+            .expect("optional work");
+        let (_, optional) = super::replay_snapshot_block_work(payload_bytes).expect("bound");
+        assert_eq!(optional, expected);
     }
 
     #[test]

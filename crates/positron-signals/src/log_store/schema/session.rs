@@ -14,7 +14,7 @@ use crate::log_store::{LogRecord, LogStore, LogStoreFailure, ScanCancellation, S
 /// outlive or be copied independently from its capacity.
 #[doc(hidden)]
 pub struct SchemaSessionStore {
-    catalog: SchemaCatalog,
+    pub(super) catalog: SchemaCatalog,
     _capacity: TransferredResourceReservation,
     capacity_bytes: u64,
 }
@@ -29,7 +29,7 @@ pub struct SchemaQueryUpdate {
 /// reservation. It cannot be published after that reservation is dropped.
 #[doc(hidden)]
 pub struct SchemaReplayCandidate<'reservation> {
-    catalog: SchemaCatalog,
+    pub(super) catalog: SchemaCatalog,
     _reservation: PhantomData<&'reservation ()>,
 }
 

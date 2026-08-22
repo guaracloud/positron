@@ -1788,6 +1788,19 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
     assert!(!bounded.complete());
     drop(bounded);
 
+    let observed = observed_schema_scan(
+        &store,
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &query("match", "value")?,
+    )?;
+    assert_eq!(observed.records().len(), 1);
+    assert!(!observed.complete());
+    drop(observed);
+
     let foreign = TenantId::from_bytes([0x42; 16])?;
     let failure = store
         .scan_schema(

@@ -6,6 +6,7 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue,
+    NativeValueObserver,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
@@ -335,6 +336,14 @@ impl ScanCancellation for NeverCancelled {
     }
 }
 
+struct AlwaysCancelled;
+
+impl ScanCancellation for AlwaysCancelled {
+    fn is_cancelled(&self) -> bool {
+        true
+    }
+}
+
 struct ObservationMeter {
     consumed: Cell<u64>,
     limit: u64,
@@ -371,6 +380,18 @@ impl ScanObserver for ObservationMeter {
         } else {
             Ok(())
         }
+    }
+}
+
+impl NativeValueObserver for ObservationMeter {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        self.observe_work(1)
+    }
+
+    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        self.observe_work(u64::try_from(payload.len()).unwrap_or(u64::MAX))
     }
 }
 
@@ -526,6 +547,42 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
     )?;
     assert_eq!(result.records().len(), 1);
     assert!(result.reduced_pruning());
+
+    let mut observed = ObservationMeter::bounded(u64::MAX);
+    let bounded = store.scan_schema_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &SchemaQuery::value(
+            path.clone(),
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(42),
+        ),
+        &NeverCancelled,
+        &mut observed,
+    )?;
+    assert_eq!(bounded.decoded_records(), 1);
+    assert!(!bounded.complete());
+
+    let cancelled = store
+        .scan_schema_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            LogScan::all(ScanLimit::new(1)?),
+            &schema,
+            &SchemaQuery::value(
+                path.clone(),
+                OccurrenceSelector::Any,
+                SchemaValue::signed_integer(42),
+            ),
+            &AlwaysCancelled,
+            &mut observed,
+        )
+        .expect_err("schema scan cancellation must be checked before admission");
+    assert_eq!(cancelled.code(), LogStoreFailureCode::Cancelled);
 
     let snapshot = ledger.snapshot()?;
     let replay_capacity = preparation_capacity(&authority, tenant)?;

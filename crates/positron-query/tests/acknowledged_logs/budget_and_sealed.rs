@@ -151,7 +151,7 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().decoded_records() == 0
+                && incomplete.stats().decoded_records() == 1
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::DecodedRecords)
     ));

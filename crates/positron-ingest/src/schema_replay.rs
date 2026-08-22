@@ -150,14 +150,38 @@ impl<'authority> SchemaReplayBuilder<'authority> {
     }
 
     pub fn finish(mut self) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {
+        self.finish_cancellable_inner(&NeverCancelled)
+    }
+
+    pub fn finish_cancellable(
+        mut self,
+        cancellation: &dyn ScanCancellation,
+    ) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {
+        self.finish_cancellable_inner(cancellation)
+    }
+
+    fn finish_cancellable_inner(
+        &mut self,
+        cancellation: &dyn ScanCancellation,
+    ) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {
         if self.failed {
             return Err(SchemaSessionFailure::StateUnavailable);
         }
+        let retention_work = self.session.retain_reachable_indexes_work_units()?;
         self.recovery
-            .try_resize(peak_resources(self.source_bytes)?)
+            .try_resize(peak_resources_with_work(self.source_bytes, retention_work)?)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-        self.session
-            .retain_reachable_indexes(&self.reachable_indexes)?;
+        let observer = SchemaBuildObserver::new_scan(
+            self.recovery
+                .granted()
+                .get(positron_kernel::ResourceDimension::CpuWorkUnits),
+            cancellation,
+        );
+        self.session.retain_reachable_indexes_observed(
+            &self.reachable_indexes,
+            cancellation,
+            &observer,
+        )?;
         self.session.checkpoint()
     }
 }

@@ -280,6 +280,10 @@ fn replay_cancellation_does_not_publish_a_partial_frontier_or_catalog() {
     let session = registry
         .session(fixture.tenant, fixture.authority.governor())
         .expect("session");
+    assert_eq!(
+        session.with_catalog_view(TenantId::from_bytes([0x42; 16]).expect("tenant"), |_| ()),
+        Err(SchemaSessionFailure::TenantConflict)
+    );
     let before = session
         .checkpoint()
         .expect("empty checkpoint")
@@ -445,6 +449,10 @@ fn replay_cancellation_on_later_block_is_atomic_for_catalog_frontier_and_capacit
         bootstrap.replay_snapshot_cancellable(&snapshot, &bootstrap_cancellation),
         Err(SchemaSessionFailure::Cancelled)
     );
+    assert_eq!(
+        bootstrap.replay_snapshot(&snapshot),
+        Err(SchemaSessionFailure::StateUnavailable)
+    );
     assert!(matches!(
         bootstrap.finish(),
         Err(SchemaSessionFailure::StateUnavailable)
@@ -493,7 +501,8 @@ fn replay_preflight_admits_many_tiny_blocks_before_allocating_transaction_scratc
 
 #[test]
 fn reachable_index_collection_honors_cancellation_before_publication() {
-    let fixture = crate::tests::support::fixture().expect("fixture");
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
     let catalog = Catalog::open(
         &fixture.authority,
         InstanceId::new([0xb1; 16]).expect("instance"),
@@ -546,6 +555,67 @@ fn reachable_index_collection_honors_cancellation_before_publication() {
         .append_reachable_indexes_observed(&snapshot, &mut reachable, &no_cancellation, &observer)
         .expect("unverified blocks are skipped");
     assert!(reachable.is_empty());
+
+    session
+        .replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor())
+        .expect("publish the verified block");
+    let observer = super::super::SchemaBuildObserver::new_scan(u64::MAX, &no_cancellation);
+    session
+        .append_reachable_indexes_observed(&snapshot, &mut reachable, &no_cancellation, &observer)
+        .expect("verified blocks are retained");
+    assert_eq!(reachable.len(), 1);
+    session
+        .append_reachable_indexes_observed(&snapshot, &mut reachable, &no_cancellation, &observer)
+        .expect("duplicate reachability is idempotent");
+    assert_eq!(reachable.len(), 1);
+
+    let cancelled = CancelAfterPolls::new(1);
+    let observer = super::super::SchemaBuildObserver::new_scan(u64::MAX, &cancelled);
+    assert_eq!(
+        session.retain_reachable_indexes_observed(&[], &cancelled, &observer),
+        Err(SchemaSessionFailure::Cancelled)
+    );
+    let immediately_cancelled = CancelAfterPolls::new(0);
+    let observer = super::super::SchemaBuildObserver::new_scan(u64::MAX, &immediately_cancelled);
+    assert_eq!(
+        session.retain_reachable_indexes_observed(&[], &immediately_cancelled, &observer,),
+        Err(SchemaSessionFailure::Cancelled)
+    );
+    let observer = super::super::SchemaBuildObserver::new_scan(0, &no_cancellation);
+    assert!(matches!(
+        session.retain_reachable_indexes_observed(&[], &no_cancellation, &observer),
+        Err(SchemaSessionFailure::Schema(_))
+    ));
+}
+
+#[test]
+fn bootstrap_finish_observes_reachable_index_retention() {
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000).expect("fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xb6; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xb7; 32]), Box::new([0xb8; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(308).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xb9);
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let live = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("session");
+    ingest(&fixture, &ledger, shard, live, 0xba);
+    let snapshot = ledger.snapshot().expect("snapshot");
+    drop(registry);
+
+    let mut builder =
+        crate::SchemaReplayBuilder::new(fixture.tenant, None, fixture.authority.recovery())
+            .expect("bootstrap replay");
+    builder.replay_snapshot(&snapshot).expect("replay snapshot");
+    let no_cancellation = CancelAfterPolls::new(usize::MAX);
+    let checkpoint = builder
+        .finish_cancellable(&no_cancellation)
+        .expect("finish after observed retention");
+    assert!(!checkpoint.catalog_bytes().is_empty());
 }
 
 fn replay(

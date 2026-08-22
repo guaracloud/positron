@@ -156,6 +156,83 @@ fn replay_apply_accounts_sorted_block_index_shifts() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn replay_reconcile_observes_before_cloning_stale_indexes() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
+    let meter = ReplayMeter::bounded(u64::MAX);
+    for sequence in 1_u128..=65 {
+        let (delta, index) = staged_index(&catalog, tenant, &attribute, sequence)?;
+        catalog.apply_replay_delta(delta, index, &meter)?;
+    }
+    let before = catalog.encode_catalog_object()?;
+    let identity = StoreBlockIdentity::new(1_u128.to_be_bytes())?;
+    let result =
+        catalog.reconcile_block_identity_observed(identity, [0x62; 32], &ReplayMeter::bounded(0));
+    assert_eq!(
+        result,
+        Err(super::super::SchemaFailure::Observed(
+            ScanObservationFailureCode::BudgetExhausted,
+        ))
+    );
+    assert_eq!(catalog.encode_catalog_object()?, before);
+
+    let result = catalog.reconcile_block_identity_observed(
+        identity,
+        [0x62; 32],
+        &ReplayMeter::bounded(65 + 65 * 2 + 64 * 7 + 1),
+    );
+    assert!(result.is_ok());
+    assert!(!catalog.has_verified_block(identity, [0x61; 32]));
+    Ok(())
+}
+
+#[test]
+fn observed_replay_noops_and_retains_only_admitted_indexes() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
+    let (delta, index) = staged_index(&catalog, tenant, &attribute, 1)?;
+    catalog.apply_replay_delta(delta, index, &ReplayMeter::bounded(u64::MAX))?;
+    let identity = StoreBlockIdentity::new(1_u128.to_be_bytes())?;
+    let digest = [0x61; 32];
+
+    let meter = ReplayMeter::bounded(0);
+    catalog.reconcile_block_identity_observed(identity, digest, &meter)?;
+    catalog.reconcile_block_identity_observed(
+        StoreBlockIdentity::new(2_u128.to_be_bytes())?,
+        [0x62; 32],
+        &meter,
+    )?;
+    assert_eq!(meter.consumed.get(), 0);
+
+    assert_eq!(
+        catalog.retain_reachable_indexes_observed(&[], &ReplayMeter::bounded(0)),
+        Err(super::super::SchemaFailure::Observed(
+            ScanObservationFailureCode::BudgetExhausted,
+        ))
+    );
+    catalog.retain_reachable_indexes_observed(
+        &[(identity, digest)],
+        &ReplayMeter::bounded(u64::MAX),
+    )?;
+    assert!(catalog.has_verified_block(identity, digest));
+    Ok(())
+}
+
+#[test]
 fn replay_apply_rejects_cross_tenant_and_invalid_or_duplicate_indexes() -> Result<(), Box<dyn Error>>
 {
     let tenant = tenant();

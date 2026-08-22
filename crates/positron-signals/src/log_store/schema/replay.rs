@@ -1,6 +1,7 @@
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
 use super::index::TextIndexFraming;
+use super::session::{SchemaReplayCandidate, SchemaSessionStore};
 use crate::log_store::ScanObserver;
 
 impl SchemaCatalog {
@@ -98,6 +99,34 @@ impl SchemaCatalog {
             .ok_or(SchemaFailure::LimitExceeded)
     }
 
+    #[doc(hidden)]
+    pub fn replay_reconciliation_work_units(&self, blocks: usize) -> Result<u64, SchemaFailure> {
+        let block_len = self
+            .block_indexes
+            .len()
+            .checked_add(blocks)
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        let per_block = block_len
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        u64::try_from(per_block)
+            .ok()
+            .and_then(|value| value.checked_mul(u64::try_from(blocks).ok()?))
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
+    #[doc(hidden)]
+    pub fn replay_retention_work_units(&self) -> Result<u64, SchemaFailure> {
+        let operations = self
+            .block_indexes
+            .len()
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        u64::try_from(operations).map_err(|_| SchemaFailure::LimitExceeded)
+    }
+
     pub(crate) fn prepare_replay_mutation_observed(
         &mut self,
         observer: &dyn ScanObserver,
@@ -152,5 +181,102 @@ impl SchemaCatalog {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn reconcile_block_identity_observed(
+        &mut self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        let Ok(position) = self
+            .block_indexes
+            .binary_search_by_key(&identity, |known| known.identity)
+        else {
+            return Ok(());
+        };
+        if self
+            .block_indexes
+            .get(position)
+            .is_some_and(|known| known.digest == digest)
+        {
+            return Ok(());
+        }
+        // Reconciliation clones every surviving sidecar. Admit that copy
+        // before allocating; replacement accounting charges its own complete
+        // vector traversal below.
+        let work = self.block_indexes.len();
+        observer
+            .observe_work(u64::try_from(work).map_err(|_| SchemaFailure::LimitExceeded)?)
+            .map_err(SchemaFailure::Observed)?;
+        let mut next = Vec::new();
+        next.try_reserve_exact(self.block_indexes.len().saturating_sub(1))
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for (index, block) in self.block_indexes.iter().enumerate() {
+            if index != position {
+                next.push(block.try_clone()?);
+            }
+        }
+        self.replace_block_indexes_observed(next, 0, 0, 0, 0, observer)
+    }
+
+    pub(crate) fn retain_reachable_indexes_observed(
+        &mut self,
+        reachable: &[(positron_kernel::StoreBlockIdentity, [u8; 32])],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        let work = self.block_indexes.len();
+        observer
+            .observe_work(u64::try_from(work).map_err(|_| SchemaFailure::LimitExceeded)?)
+            .map_err(SchemaFailure::Observed)?;
+        let mut next = Vec::new();
+        next.try_reserve_exact(self.block_indexes.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for index in &self.block_indexes {
+            let keep = reachable
+                .binary_search(&(index.identity, index.digest))
+                .is_ok();
+            if keep {
+                next.push(index.try_clone()?);
+            }
+        }
+        self.replace_block_indexes_observed(next, 0, 0, 0, 0, observer)
+    }
+}
+
+impl SchemaSessionStore {
+    pub fn retain_reachable_indexes_work_units(&self) -> Result<u64, SchemaFailure> {
+        self.catalog().replay_retention_work_units()
+    }
+
+    pub fn retain_reachable_indexes_observed(
+        &mut self,
+        reachable: &[(positron_kernel::StoreBlockIdentity, [u8; 32])],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        self.catalog
+            .retain_reachable_indexes_observed(reachable, observer)
+    }
+
+    pub fn reconcile_block_identity_observed(
+        &mut self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        self.catalog
+            .reconcile_block_identity_observed(identity, digest, observer)
+    }
+}
+
+impl SchemaReplayCandidate<'_> {
+    pub fn reconcile_block_identity_observed(
+        &mut self,
+        identity: positron_kernel::StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        self.catalog
+            .reconcile_block_identity_observed(identity, digest, observer)
     }
 }

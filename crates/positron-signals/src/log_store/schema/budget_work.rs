@@ -32,6 +32,15 @@ impl SchemaBudget {
         .ok()
     }
 
+    /// Conservative replay work for projecting staged paths and their
+    /// bounded segments into optional text evidence. Every encoded path
+    /// segment consumes at least one payload byte, so payload length is a
+    /// lossless upper bound without decoding the block during admission.
+    #[must_use]
+    pub fn text_projection_work_units(payload_bytes: usize) -> Option<u64> {
+        u64::try_from(payload_bytes).ok()
+    }
+
     /// Small live-ingest admission slice for optional text sidecar setup.
     ///
     /// The runtime observer still charges the actual catalog walk and falls
@@ -46,7 +55,9 @@ impl SchemaBudget {
     /// Conservative replay bound including one optional catalog walk.
     #[must_use]
     pub fn text_replay_work_units(body_bytes: usize) -> Option<u64> {
-        Self::text_index_work_units(body_bytes)?.checked_add(Self::text_catalog_work_units()?)
+        Self::text_index_work_units(body_bytes)?
+            .checked_add(Self::text_catalog_work_units()?)?
+            .checked_add(Self::text_projection_work_units(body_bytes)?)
     }
 
     /// Conservative replay work bound for one authenticated payload.
@@ -94,5 +105,31 @@ impl SchemaBudget {
             .checked_mul(4)?
             .checked_add(Self::system_max_memory_bytes())
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaEntry>>()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SchemaBudget;
+
+    #[test]
+    fn replay_work_bounds_cover_projection_and_arithmetic_edges() {
+        let payload = 257_usize;
+        let index = SchemaBudget::text_index_work_units(payload).expect("text index bound");
+        let catalog = SchemaBudget::text_catalog_work_units().expect("catalog bound");
+        assert_eq!(SchemaBudget::text_projection_work_units(payload), Some(257));
+        assert_eq!(
+            SchemaBudget::text_replay_work_units(payload),
+            Some(index + catalog + 257)
+        );
+        assert!(
+            SchemaBudget::replay_schema_work_units(payload).expect("schema replay bound")
+                >= index + catalog + 257
+        );
+        assert_eq!(SchemaBudget::text_stage_optional_work_units(), 6);
+        assert!(SchemaBudget::index_path_memory_bytes(0, 0).is_some());
+        assert!(SchemaBudget::replay_working_memory_bytes(0).is_some());
+        assert!(SchemaBudget::replay_decode_work_units(0).is_some());
+        assert!(SchemaBudget::text_replay_work_units(usize::MAX).is_none());
     }
 }

@@ -249,6 +249,41 @@ impl SchemaCatalog {
         Ok(())
     }
 
+    pub(crate) fn replace_block_indexes_observed(
+        &mut self,
+        next: Vec<SchemaBlockIndex>,
+        entry_index_reduction: usize,
+        added_memory: usize,
+        added_persistent: usize,
+        added_index: usize,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        let old = self.block_indexes.len();
+        let new = next.len();
+        // Replacement accounting may inspect each old sidecar twice, each
+        // new sidecar up to seven times when optional text is dropped, and
+        // once more to normalize framing. Charge the conservative complete
+        // vector traversal before entering the fallible replacement path.
+        let work = old
+            .checked_mul(2)
+            .and_then(|value| {
+                new.checked_mul(7)
+                    .and_then(|extra| value.checked_add(extra))
+            })
+            .and_then(|value| value.checked_add(1))
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        observer
+            .observe_work(u64::try_from(work).map_err(|_| SchemaFailure::LimitExceeded)?)
+            .map_err(SchemaFailure::Observed)?;
+        self.replace_block_indexes(
+            next,
+            entry_index_reduction,
+            added_memory,
+            added_persistent,
+            added_index,
+        )
+    }
+
     fn block_indexes_wire(blocks: &[SchemaBlockIndex]) -> Result<usize, SchemaFailure> {
         if blocks.is_empty() {
             return Ok(0);

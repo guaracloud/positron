@@ -137,7 +137,16 @@ impl LogStore {
             )?;
             let block_records = decode.record_count();
             if block_records > remaining {
-                decode.validate(cancellation)?;
+                let decoded = decode.decode(snapshot, remaining, cancellation)?;
+                for (ordinal, record) in decoded.records.into_iter().enumerate() {
+                    let ordinal = u16::try_from(ordinal)
+                        .ok()
+                        .and_then(|ordinal| {
+                            positron_domain::routing::RecordOrdinal::new(ordinal).ok()
+                        })
+                        .ok_or_else(LogStoreFailure::malformed_block)?;
+                    records.push(ScannedLogRecord::new(record, block.position(), ordinal));
+                }
                 complete = false;
                 break;
             }

@@ -149,7 +149,7 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
         &ledger.snapshot()?,
         LogScan::all(ScanLimit::new(1)?),
     )?;
-    assert!(bounded.records().is_empty());
+    assert_eq!(bounded.records().len(), 1);
     assert!(!bounded.complete());
     drop(bounded);
 

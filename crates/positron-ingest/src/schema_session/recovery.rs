@@ -99,6 +99,11 @@ impl TenantSchemaSession {
             .catalog()
             .replay_mutation_setup_work_units()
             .map_err(SchemaSessionFailure::Schema)?;
+        let catalog_reconciliation_work = state
+            .catalog
+            .catalog()
+            .replay_reconciliation_work_units(block_count)
+            .map_err(SchemaSessionFailure::Schema)?;
         let bounds = ReplaySnapshotBounds::new(
             block_count,
             total_payload_bytes,
@@ -108,6 +113,7 @@ impl TenantSchemaSession {
             state.catalog.catalog().memory_bytes(),
             catalog_clone_work
                 .checked_add(catalog_mutation_work)
+                .and_then(|work| work.checked_add(catalog_reconciliation_work))
                 .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
         )?;
         debug_assert!(bounds.total_payload_bytes >= bounds.maximum_payload_bytes);
@@ -189,7 +195,7 @@ impl TenantSchemaSession {
                 digest,
             )?;
             candidate_catalog
-                .reconcile_block_identity(block.identity(), digest)
+                .reconcile_block_identity_observed(block.identity(), digest, &mandatory_observer)
                 .map_err(SchemaSessionFailure::Schema)?;
             candidate_catalog
                 .commit_observed(delta, block.identity(), digest, &mandatory_observer)
@@ -254,7 +260,12 @@ impl TenantSchemaSession {
             let digest = block
                 .content_digest()
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-            resize_replay_work(recovery, block.payload().len())?;
+            let reconciliation_work = state
+                .catalog
+                .catalog()
+                .replay_reconciliation_work_units(1)
+                .map_err(SchemaSessionFailure::Schema)?;
+            resize_replay_work(recovery, block.payload().len(), reconciliation_work)?;
             ensure_replay_capacity(recovery, block.payload().len())?;
             let observer = SchemaBuildObserver::new_scan(
                 recovery.granted().get(ResourceDimension::CpuWorkUnits),
@@ -283,7 +294,7 @@ impl TenantSchemaSession {
             )?;
             state
                 .catalog
-                .reconcile_block_identity(block.identity(), digest)
+                .reconcile_block_identity_observed(block.identity(), digest, &observer)
                 .map_err(SchemaSessionFailure::Schema)?;
             state
                 .catalog

@@ -204,4 +204,8 @@ impl<'a> Input<'a> {
     pub(super) const fn is_empty(&self) -> bool {
         self.remaining.is_empty()
     }
+
+    pub(super) const fn remaining(&self) -> &'a [u8] {
+        self.remaining
+    }
 }

@@ -17,6 +17,8 @@ mod metadata;
 mod primitives;
 mod record;
 mod size;
+#[cfg(test)]
+mod tests;
 mod value;
 #[cfg(fuzzing)]
 pub(super) use fuzz::fuzz_decode_block;
@@ -219,23 +221,6 @@ impl<'input> BlockDecode<'input> {
         self.count
     }
 
-    pub(super) fn validate(
-        mut self,
-        cancellation: &dyn super::ScanCancellation,
-    ) -> Result<(), LogStoreFailure> {
-        for _ in 0..self.count {
-            check_decode_cancellation(cancellation)?;
-            record::validate(&mut self.input, self.limits, self.version)?;
-        }
-        self.input.finish_component_observation()?;
-        check_decode_cancellation(cancellation)?;
-        if self.input.is_empty() {
-            Ok(())
-        } else {
-            Err(LogStoreFailure::malformed_block())
-        }
-    }
-
     pub(super) fn decode(
         mut self,
         snapshot: &LedgerSnapshot<'_>,
@@ -252,14 +237,22 @@ impl<'input> BlockDecode<'input> {
             self.count,
         )
     }
-}
 
-fn check_decode_cancellation(
-    cancellation: &dyn super::ScanCancellation,
-) -> Result<(), LogStoreFailure> {
-    if cancellation.is_cancelled() {
-        Err(LogStoreFailure::cancelled())
-    } else {
+    #[cfg(fuzzing)]
+    pub(super) fn validate(
+        mut self,
+        cancellation: &dyn super::ScanCancellation,
+    ) -> Result<(), LogStoreFailure> {
+        for _ in 0..self.count {
+            if cancellation.is_cancelled() {
+                return Err(LogStoreFailure::cancelled());
+            }
+            record::validate_structure(&mut self.input, self.limits, self.version)?;
+        }
+        self.input.finish_component_observation()?;
+        if !self.input.is_empty() {
+            return Err(LogStoreFailure::malformed_block());
+        }
         Ok(())
     }
 }
@@ -275,17 +268,27 @@ fn decode_block_records(
 ) -> Result<DecodedBlock, LogStoreFailure> {
     let retained_count = count.min(limit);
     let mut records = bounded_vec(retained_count)?;
-    for index in 0..count {
+    for _ in 0..retained_count {
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
         }
         let decoded = record::decode(input, limits, version)?;
-        if index < retained_count {
-            records.push(decoded.into_stored(snapshot));
-        }
+        records.push(decoded.into_stored(snapshot));
     }
+    // The hard decoded-record bound applies to semantic record construction,
+    // not to authenticated framing. Consume the unretained tail with a
+    // detached structural cursor so malformed bytes still fail closed while
+    // no tail record is built or charged as decoded work.
     input.finish_component_observation()?;
-    if !input.is_empty() {
+    let mut tail = Input::new(input.remaining());
+    for _ in retained_count..count {
+        if cancellation.is_cancelled() {
+            return Err(LogStoreFailure::cancelled());
+        }
+        record::validate_structure(&mut tail, limits, version)?;
+    }
+    tail.finish_component_observation()?;
+    if !tail.is_empty() {
         return Err(LogStoreFailure::malformed_block());
     }
     if cancellation.is_cancelled() {

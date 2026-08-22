@@ -40,6 +40,10 @@ impl SchemaCatalog {
             .index_bytes
             .checked_sub(delta.physical_index_bytes())
             .ok_or(SchemaFailure::InvalidValue)?;
+        let preflight_work = 1_usize.max(delta.entries.len());
+        observer
+            .observe_work(u64::try_from(preflight_work).map_err(|_| SchemaFailure::LimitExceeded)?)
+            .map_err(SchemaFailure::Observed)?;
         let new_entries = delta
             .entries
             .iter()
@@ -113,13 +117,16 @@ impl SchemaCatalog {
                     .ok_or(SchemaFailure::LimitExceeded)
             },
         )?;
-        let mutation_work = 1_usize
-            .checked_add(block_shifts)
-            .and_then(|work| work.checked_add(entry_shifts))
+        let mutation_work = block_shifts
+            .checked_add(entry_shifts)
             .ok_or(SchemaFailure::LimitExceeded)?;
-        observer
-            .observe_work(u64::try_from(mutation_work).map_err(|_| SchemaFailure::LimitExceeded)?)
-            .map_err(SchemaFailure::Observed)?;
+        if mutation_work > 0 {
+            observer
+                .observe_work(
+                    u64::try_from(mutation_work).map_err(|_| SchemaFailure::LimitExceeded)?,
+                )
+                .map_err(SchemaFailure::Observed)?;
+        }
         if let Some(index) = block_index {
             let insertion = insertion
                 .and_then(Result::err)
