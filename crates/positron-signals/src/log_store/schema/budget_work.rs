@@ -19,24 +19,26 @@ impl SchemaBudget {
     /// Conservative bounded work units for constructing one text summary.
     #[must_use]
     pub fn text_index_work_units(body_bytes: usize) -> Option<u64> {
-        Some(
-            super::text_builder::work_units(body_bytes)?
-                .min(super::text_builder::MAX_ADMITTED_WORK_UNITS),
-        )
+        super::text_builder::work_units(body_bytes)
     }
 
     /// Conservative replay work bound for one authenticated payload.
     #[must_use]
     pub fn replay_schema_work_units(payload_bytes: usize) -> Option<u64> {
+        // The codec observer accounts structural components in bounded
+        // payload quanta; raw bytes remain separately accounted as scanned
+        // storage. A 64 KiB quantum is the fixed replay work unit.
+        let decode = u64::try_from(payload_bytes)
+            .ok()?
+            .checked_add(65_535)?
+            .checked_div(65_536)?;
         let discovery = Self::system_max_discovery_nodes()
             .checked_add(63)?
             .checked_div(64)
             .and_then(|value| u64::try_from(value).ok())?;
-        Some(
-            discovery
-                .max(Self::text_index_work_units(payload_bytes)?)
-                .min(super::text_builder::MAX_ADMITTED_WORK_UNITS),
-        )
+        decode
+            .checked_add(discovery)?
+            .checked_add(Self::text_index_work_units(payload_bytes)?)
     }
 
     /// Conservative retained-memory cost of one indexed path copy.

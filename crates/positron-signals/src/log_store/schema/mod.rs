@@ -4,6 +4,7 @@ mod checkpoint;
 mod codec;
 pub(crate) mod delta;
 mod discovery;
+mod discovery_meter;
 mod failure;
 mod index;
 mod index_path;

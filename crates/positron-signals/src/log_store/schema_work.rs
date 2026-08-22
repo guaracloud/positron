@@ -1,8 +1,8 @@
 use super::schema::{self, SchemaCatalog, SchemaDelta, SchemaRepresentation};
 use super::types::AttributeRepresentation;
 use super::{
-    LogRecord, LogStoreFailure, LogStoreFailureCode, ScanObservationFailureCode, ScanObserver,
-    codec, map_schema_failure,
+    LogRecord, LogStoreFailure, LogStoreFailureCode, ScanCancellation, ScanObservationFailureCode,
+    ScanObserver, codec, map_schema_failure,
 };
 use positron_kernel::{CommittedBlock, LedgerSnapshot};
 
@@ -32,7 +32,10 @@ impl super::LogStore {
         observer: Option<&dyn ScanObserver>,
     ) -> Result<SchemaDelta, LogStoreFailure> {
         let mut delta = SchemaDelta::empty(schema.tenant(), true);
-        let mut meter = schema::delta::DiscoveryMeter::new();
+        let mut meter = observer.map_or_else(
+            schema::delta::DiscoveryMeter::new,
+            schema::delta::DiscoveryMeter::observed,
+        );
         for record in records.iter_mut() {
             let mut attributes = Vec::new();
             attributes
@@ -114,9 +117,10 @@ impl super::LogStore {
         block: &CommittedBlock,
         schema: &SchemaCatalog,
     ) -> Result<SchemaDelta, LogStoreFailure> {
-        self.replay_schema_block_inner(tenant, snapshot, block, schema, None)
+        self.replay_schema_block_inner(tenant, snapshot, block, schema, None, None)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn replay_schema_block_observed(
         &self,
         tenant: positron_domain::identity::TenantId,
@@ -125,7 +129,33 @@ impl super::LogStore {
         schema: &SchemaCatalog,
         observer: &dyn ScanObserver,
     ) -> Result<SchemaDelta, LogStoreFailure> {
-        self.replay_schema_block_inner(tenant, snapshot, block, schema, Some(observer))
+        self.replay_schema_block_observed_cancellable(
+            tenant,
+            snapshot,
+            block,
+            schema,
+            &super::scan::NeverCancelled,
+            observer,
+        )
+    }
+
+    pub(crate) fn replay_schema_block_observed_cancellable(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        schema: &SchemaCatalog,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        self.replay_schema_block_inner(
+            tenant,
+            snapshot,
+            block,
+            schema,
+            Some(cancellation),
+            Some(observer),
+        )
     }
 
     fn replay_schema_block_inner(
@@ -134,9 +164,16 @@ impl super::LogStore {
         snapshot: &LedgerSnapshot<'_>,
         block: &CommittedBlock,
         schema: &SchemaCatalog,
+        cancellation: Option<&dyn ScanCancellation>,
         observer: Option<&dyn ScanObserver>,
     ) -> Result<SchemaDelta, LogStoreFailure> {
-        let decoded = codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?;
+        let decoded = match (cancellation, observer) {
+            (Some(cancellation), Some(observer)) => {
+                codec::BlockDecode::observed(tenant, block.payload(), cancellation, observer)?
+                    .decode(snapshot, usize::MAX, cancellation)?
+            },
+            _ => codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?,
+        };
         if schema.tenant() != tenant {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
@@ -172,7 +209,10 @@ impl super::LogStore {
             None
         };
         let mut delta = SchemaDelta::empty(tenant, true);
-        let mut meter = schema::delta::DiscoveryMeter::new();
+        let mut meter = observer.map_or_else(
+            schema::delta::DiscoveryMeter::new,
+            schema::delta::DiscoveryMeter::observed,
+        );
         for record in decoded.records {
             schema
                 .stage_replayed_record(record.attributes(), &mut delta, &mut meter)

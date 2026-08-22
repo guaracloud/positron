@@ -5,7 +5,7 @@ use positron_kernel::{
 };
 
 use super::{SchemaBudget, SchemaCatalog, SchemaDelta, SchemaFailure};
-use crate::log_store::{LogRecord, LogStore, LogStoreFailure, ScanObserver};
+use crate::log_store::{LogRecord, LogStore, LogStoreFailure, ScanCancellation, ScanObserver};
 
 /// Opaque tenant-bound schema store owned by the governed ingest session.
 ///
@@ -134,11 +134,29 @@ impl SchemaSessionStore {
         block: &CommittedBlock,
         observer: &dyn ScanObserver,
     ) -> Result<SchemaDelta, LogStoreFailure> {
-        LogStore::new().replay_schema_block_observed(
+        self.replay_observed_cancellable(
+            tenant,
+            snapshot,
+            block,
+            &super::super::scan::NeverCancelled,
+            observer,
+        )
+    }
+
+    pub fn replay_observed_cancellable(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().replay_schema_block_observed_cancellable(
             tenant,
             snapshot,
             block,
             &self.catalog,
+            cancellation,
             observer,
         )
     }

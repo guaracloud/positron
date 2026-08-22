@@ -21,4 +21,4 @@ pub use log_store::{
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
-pub use log_store::fuzz_log_store_block;
+pub use log_store::{fuzz_log_store_block, fuzz_text_search_pruning};

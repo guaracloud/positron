@@ -2,9 +2,10 @@ use positron_domain::identity::TenantId;
 use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
 
 use super::catalog::SchemaCatalog;
+pub(crate) use super::discovery_meter::DiscoveryMeter;
 use super::failure::SchemaFailure;
 use super::index::{SchemaBlockIndex, SchemaIndexPath};
-use super::model::{MAX_DISCOVERY_NODES, SchemaEntry, SchemaPath, promoted_index_bytes};
+use super::model::{SchemaEntry, SchemaPath, promoted_index_bytes};
 use super::observation::{ObservedAttribute, SchemaObservation};
 use super::representation::SchemaRepresentation;
 use super::text_index::TextBlockSummary;
@@ -148,24 +149,6 @@ impl SchemaDelta {
             .nth(position)
             .ok_or(SchemaFailure::InvalidValue)?;
         SchemaBlockIndex::one(identity, digest, indexed).map(Some)
-    }
-}
-
-pub(crate) struct DiscoveryMeter {
-    used: usize,
-}
-
-impl DiscoveryMeter {
-    pub(crate) const fn new() -> Self {
-        Self { used: 0 }
-    }
-
-    fn consume(&mut self) -> Result<bool, SchemaFailure> {
-        if self.used == MAX_DISCOVERY_NODES {
-            return Ok(false);
-        }
-        self.used += 1;
-        Ok(true)
     }
 }
 

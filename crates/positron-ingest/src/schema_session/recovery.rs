@@ -4,10 +4,18 @@ use positron_kernel::{
     LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation,
     StoreBlockIdentity,
 };
-use positron_signals::{SchemaBudget, SchemaCheckpointFrontier};
+use positron_signals::{ScanCancellation, SchemaBudget, SchemaCheckpointFrontier};
 
 use super::SchemaBuildObserver;
 use super::{MAX_REPLAY_SHARDS, SchemaSessionFailure, SessionState, TenantSchemaSession};
+
+struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
 
 impl TenantSchemaSession {
     pub fn replay_snapshot(
@@ -15,6 +23,16 @@ impl TenantSchemaSession {
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
         governor: ResourceGovernor<'_>,
+    ) -> Result<(), SchemaSessionFailure> {
+        self.replay_snapshot_cancellable(tenant, snapshot, governor, &NeverCancelled)
+    }
+
+    pub fn replay_snapshot_cancellable(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        governor: ResourceGovernor<'_>,
+        cancellation: &dyn ScanCancellation,
     ) -> Result<(), SchemaSessionFailure> {
         let mut state = self
             .state
@@ -42,15 +60,15 @@ impl TenantSchemaSession {
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
             let decode_capacity =
                 reserve_replay_decode_capacity(tenant, block.payload().len(), governor)?;
-            let observer = SchemaBuildObserver::new(
+            let observer = SchemaBuildObserver::new_scan(
                 decode_capacity
                     .granted()
                     .get(ResourceDimension::CpuWorkUnits),
-                None,
+                cancellation,
             );
             let delta = state
                 .catalog
-                .replay_observed(tenant, snapshot, block, &observer)
+                .replay_observed_cancellable(tenant, snapshot, block, cancellation, &observer)
                 .map_err(map_replay_observed_failure)?;
             let retained_bytes = u64::try_from(delta.retained_memory_bytes())
                 .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
@@ -85,11 +103,22 @@ impl TenantSchemaSession {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn replay_snapshot_for_bootstrap(
         &self,
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
         recovery: &mut ResourceReservation<'_>,
+    ) -> Result<(), SchemaSessionFailure> {
+        self.replay_snapshot_for_bootstrap_cancellable(tenant, snapshot, recovery, &NeverCancelled)
+    }
+
+    pub(crate) fn replay_snapshot_for_bootstrap_cancellable(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        recovery: &mut ResourceReservation<'_>,
+        cancellation: &dyn ScanCancellation,
     ) -> Result<(), SchemaSessionFailure> {
         let mut state = self
             .state
@@ -113,13 +142,13 @@ impl TenantSchemaSession {
                 .content_digest()
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
             ensure_replay_capacity(recovery, block.payload().len())?;
-            let observer = SchemaBuildObserver::new(
+            let observer = SchemaBuildObserver::new_scan(
                 recovery.granted().get(ResourceDimension::CpuWorkUnits),
-                None,
+                cancellation,
             );
             let delta = state
                 .catalog
-                .replay_observed(tenant, snapshot, block, &observer)
+                .replay_observed_cancellable(tenant, snapshot, block, cancellation, &observer)
                 .map_err(map_replay_observed_failure)?;
             ensure_frontier_slot(&state, snapshot.scope().shard_id())?;
             let frontier = validated_frontier(

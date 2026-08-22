@@ -5,9 +5,6 @@ use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 const TRIGRAM_BYTES: usize = 3;
 pub(crate) const WORK_QUANTUM_OPERATIONS: usize = 64;
 const MAX_BINARY_COMPARISONS: usize = 13;
-// Recovery reserves a 12-unit CPU slice for this optional
-// sidecar. Larger summaries conservatively fall back to authenticated scans.
-pub(crate) const MAX_ADMITTED_WORK_UNITS: u64 = 12;
 
 /// Failure returned when observed physical text evidence cannot finish.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,24 +21,22 @@ impl From<SchemaFailure> for TextSummaryFailure {
 
 /// Conservative CPU work bound for building one text summary from body bytes.
 ///
-/// One unit covers at most `WORK_QUANTUM_OPERATIONS` byte, comparison, or
-/// insertion-movement operations. The bound deliberately reserves the worst
-/// sorted insertion movement for the capped summary, while the builder charges
-/// only the movement it actually performs.
+/// One unit covers at most `WORK_QUANTUM_OPERATIONS` body-window, sort, or
+/// canonicalization operations. Collection is capped before canonicalization;
+/// a cap hit returns an incomplete summary and therefore cannot prune.
 pub(crate) fn work_units(body_bytes: usize) -> Option<u64> {
     let windows = body_bytes.saturating_sub(TRIGRAM_BYTES - 1);
-    let insertions = windows.min(MAX_TEXT_TRIGRAMS);
+    if windows > MAX_TEXT_TRIGRAMS {
+        return u64::try_from(ceil_units(MAX_TEXT_TRIGRAMS + 1)?).ok();
+    }
     let traversal = ceil_units(windows)?;
-    let comparisons = ceil_units(windows.checked_mul(MAX_BINARY_COMPARISONS)?)?;
-    let insertion_operations = insertions
-        .checked_mul(insertions.saturating_sub(1))?
-        .checked_div(2)?;
-    let insertion_movement = ceil_units(insertion_operations)?;
+    let collected = windows.min(MAX_TEXT_TRIGRAMS);
+    let canonical_operations = collected.checked_mul(MAX_BINARY_COMPARISONS + 1)?;
+    let canonicalization = ceil_units(canonical_operations)?;
     let encoding = ceil_units(MAX_TEXT_TRIGRAMS)?;
     u64::try_from(
         traversal
-            .checked_add(comparisons)?
-            .checked_add(insertion_movement)?
+            .checked_add(canonicalization)?
             .checked_add(encoding)?,
     )
     .ok()
@@ -53,62 +48,47 @@ pub(crate) fn from_bodies<'a>(
 ) -> Result<TextBlockSummary, TextSummaryFailure> {
     let mut trigrams = Vec::new();
     let mut complete = true;
+    let mut traversed = 0_usize;
     'bodies: for body in bodies {
         let Some(body) = body else { continue };
         let windows = body.len().saturating_sub(TRIGRAM_BYTES - 1);
-        observe(
-            observer,
-            ceil_units(windows).ok_or(SchemaFailure::LimitExceeded)?,
-        )?;
+        let additional = MAX_TEXT_TRIGRAMS
+            .saturating_sub(trigrams.len())
+            .min(windows);
+        if additional > 0 {
+            trigrams
+                .try_reserve_exact(additional)
+                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        }
         for window in body.as_bytes().windows(TRIGRAM_BYTES) {
-            let trigram = [window[0], window[1], window[2]];
-            let position = observed_search(&trigrams, trigram, observer)?;
-            let Err(position) = position else { continue };
-            let movement = trigrams.len().saturating_sub(position);
-            observe(
-                observer,
-                ceil_units(movement).ok_or(SchemaFailure::LimitExceeded)?,
-            )?;
-            if trigrams.len() >= MAX_TEXT_TRIGRAMS {
+            if traversed.is_multiple_of(WORK_QUANTUM_OPERATIONS) {
+                observe(observer, 1)?;
+            }
+            traversed += 1;
+            if trigrams.len() == MAX_TEXT_TRIGRAMS {
                 complete = false;
                 break 'bodies;
             }
-            trigrams
-                .try_reserve_exact(1)
-                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-            trigrams.insert(position, trigram);
+            trigrams.push([window[0], window[1], window[2]]);
         }
     }
+    if !complete {
+        trigrams.clear();
+        trigrams.shrink_to_fit();
+        return Ok(TextBlockSummary { complete, trigrams });
+    }
+    let canonical_operations = trigrams
+        .len()
+        .checked_mul(MAX_BINARY_COMPARISONS + 1)
+        .ok_or(SchemaFailure::LimitExceeded)?;
     observe(
         observer,
-        ceil_units(trigrams.len()).ok_or(SchemaFailure::LimitExceeded)?,
+        ceil_units(canonical_operations).ok_or(SchemaFailure::LimitExceeded)?,
     )?;
+    trigrams.sort_unstable();
+    trigrams.dedup();
     trigrams.shrink_to_fit();
     Ok(TextBlockSummary { complete, trigrams })
-}
-
-fn observed_search(
-    trigrams: &[[u8; TRIGRAM_BYTES]],
-    needle: [u8; TRIGRAM_BYTES],
-    observer: Option<&dyn ScanObserver>,
-) -> Result<Result<usize, usize>, TextSummaryFailure> {
-    let mut low = 0;
-    let mut high = trigrams.len();
-    let mut comparisons = 0_usize;
-    while low < high {
-        if comparisons.is_multiple_of(WORK_QUANTUM_OPERATIONS) {
-            observe(observer, 1)?;
-        }
-        comparisons += 1;
-        let middle = low + (high - low) / 2;
-        let value = trigrams.get(middle).ok_or(SchemaFailure::InvalidValue)?;
-        match value.cmp(&needle) {
-            std::cmp::Ordering::Less => low = middle + 1,
-            std::cmp::Ordering::Equal => return Ok(Ok(middle)),
-            std::cmp::Ordering::Greater => high = middle,
-        }
-    }
-    Ok(Err(low))
 }
 
 fn observe(observer: Option<&dyn ScanObserver>, units: usize) -> Result<(), TextSummaryFailure> {

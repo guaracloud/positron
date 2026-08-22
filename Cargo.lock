@@ -1178,6 +1178,7 @@ dependencies = [
  "positron-ingest",
  "positron-kernel",
  "positron-query",
+ "positron-signals",
  "prost 0.14.3",
  "serde_json",
  "tokio",

@@ -6,6 +6,10 @@ use positron_signals::{SchemaBudget, SchemaEntry};
 // steps remain byte-exact and are rounded up to one 64 Ki-step work quantum.
 const POLICY_EVALUATION_STEPS_PER_CPU_WORK_UNIT: u64 = 65_536;
 const SCHEMA_DISCOVERY_NODES_PER_CPU_WORK_UNIT: u64 = 64;
+// A text sidecar is optional physical evidence. Requests whose conservative
+// construction bound exceeds this admission slice intentionally fall back to
+// authenticated body scans instead of making ordinary ingest unavailable.
+const MAX_ADMITTED_TEXT_WORK_UNITS: u64 = 256;
 
 #[derive(Clone, Copy)]
 pub(super) struct SchemaAdmissionEstimate {
@@ -69,13 +73,16 @@ pub(super) fn schema_admission_estimate(
         }
     }
     if has_text_body {
-        schema_bytes = schema_bytes.checked_add(
-            u64::try_from(SchemaBudget::text_index_block_memory_bound(
-                text_body_bytes,
-            )?)
-            .ok()?,
-        )?;
-        text_work_units = SchemaBudget::text_index_work_units(text_body_bytes)?;
+        let estimated_work = SchemaBudget::text_index_work_units(text_body_bytes)?;
+        if estimated_work <= MAX_ADMITTED_TEXT_WORK_UNITS {
+            schema_bytes = schema_bytes.checked_add(
+                u64::try_from(SchemaBudget::text_index_block_memory_bound(
+                    text_body_bytes,
+                )?)
+                .ok()?,
+            )?;
+            text_work_units = estimated_work;
+        }
     }
     if discovery_nodes > 0 {
         schema_bytes = schema_bytes
@@ -92,7 +99,8 @@ pub(super) fn schema_admission_estimate(
         retained_memory_bytes,
         discovery_nodes,
         text_work_units,
-        schema_work_units: schema_discovery_cpu_work_units(discovery_nodes)?.max(text_work_units),
+        schema_work_units: schema_discovery_cpu_work_units(discovery_nodes)?
+            .checked_add(text_work_units)?,
     })
 }
 

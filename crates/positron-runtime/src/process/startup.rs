@@ -134,7 +134,10 @@ impl ApplicationRuntime {
             instance.admission_group_planner = planner;
         }
         let instance = Arc::new(instance);
-        let services = match ServiceHandle::new(Arc::clone(&instance)) {
+        let services = match ServiceHandle::new_with_cancellation(
+            Arc::clone(&instance),
+            Some(&cancellation),
+        ) {
             Ok(services) => services,
             Err(failure) => {
                 return Err(cleanup_startup(

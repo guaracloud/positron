@@ -72,5 +72,10 @@ pub fn fuzz_query_search_matcher(data: &[u8]) {
     let mut observer = search::UnobservedSearch;
     let _ = regex.is_match_observed(body, &mut observer);
     let _ = search::contains_observed(body, pattern, &mut observer);
-    let _ = positron_signals::TextSearchCandidate::any_of_bytes(regex.pruning_literals());
+    let literals = regex
+        .pruning_literals()
+        .iter()
+        .map(|literal| literal.to_vec())
+        .collect::<Vec<_>>();
+    positron_signals::fuzz_text_search_pruning(body, &literals);
 }

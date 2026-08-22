@@ -42,6 +42,35 @@ pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
 };
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_text_search_pruning(body: &str, literals: &[Vec<u8>]) {
+    let Ok(Some(candidate)) = schema::TextSearchCandidate::any_of_bytes(literals) else {
+        return;
+    };
+    let Ok(summary) = schema::TextBlockSummary::from_bodies([Some(body)]) else {
+        return;
+    };
+    struct Observer;
+    impl ScanObserver for Observer {
+        fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+            Ok(())
+        }
+    }
+    let Ok(Some(might_contain)) = summary.might_contain_observed(&candidate, &Observer) else {
+        return;
+    };
+    if !might_contain
+        && candidate.literals().iter().any(|literal| {
+            body.as_bytes()
+                .windows(literal.len())
+                .any(|window| window == literal)
+        })
+    {
+        panic!("text pruning produced a false negative");
+    }
+}
+
 /// The concrete Release 1 Log Signal Store adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LogStore;
@@ -228,6 +257,7 @@ fn map_schema_failure(failure: SchemaFailure) -> LogStoreFailure {
             LogStoreFailure::invalid_input()
         },
         SchemaFailure::MalformedCatalog => LogStoreFailure::invalid_input(),
+        SchemaFailure::Observed(failure) => LogStoreFailure::observation(failure),
     }
 }
 

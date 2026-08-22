@@ -40,6 +40,12 @@ impl TaskCancellation {
     }
 }
 
+impl positron_signals::ScanCancellation for TaskCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskJoinOutcome {
     Joined,

@@ -4,7 +4,7 @@ use positron_kernel::{
     LedgerSnapshot, RecoveryAuthority, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
     ResourceReservation,
 };
-use positron_signals::SchemaBudget;
+use positron_signals::{ScanCancellation, SchemaBudget};
 
 use crate::{SchemaSessionFailure, TenantSchemaCheckpoint, TenantSchemaSession};
 
@@ -15,6 +15,14 @@ pub struct SchemaReplayBuilder<'authority> {
     source_bytes: u64,
     recovery: ResourceReservation<'authority>,
     reachable_indexes: Vec<(StoreBlockIdentity, [u8; 32])>,
+}
+
+struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 impl<'authority> SchemaReplayBuilder<'authority> {
@@ -85,11 +93,23 @@ impl<'authority> SchemaReplayBuilder<'authority> {
         &mut self,
         snapshot: &LedgerSnapshot<'_>,
     ) -> Result<(), SchemaSessionFailure> {
+        self.replay_snapshot_cancellable(snapshot, &NeverCancelled)
+    }
+
+    pub fn replay_snapshot_cancellable(
+        &mut self,
+        snapshot: &LedgerSnapshot<'_>,
+        cancellation: &dyn ScanCancellation,
+    ) -> Result<(), SchemaSessionFailure> {
         self.recovery
             .try_resize(peak_resources(self.source_bytes)?)
             .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-        self.session
-            .replay_snapshot_for_bootstrap(self.tenant, snapshot, &mut self.recovery)?;
+        self.session.replay_snapshot_for_bootstrap_cancellable(
+            self.tenant,
+            snapshot,
+            &mut self.recovery,
+            cancellation,
+        )?;
         self.session
             .append_reachable_indexes(snapshot, &mut self.reachable_indexes)?;
         Ok(())

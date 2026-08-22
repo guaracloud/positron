@@ -82,9 +82,7 @@ impl SchemaDelta {
             .memory_bytes()
             .map_err(TextSummaryAttachFailure::Schema)?;
         let summary_wire = summary
-            .encoded_bytes()?
-            .checked_add(1)
-            .ok_or(SchemaFailure::LimitExceeded)
+            .encoded_bytes()
             .map_err(TextSummaryAttachFailure::Schema)?;
         if let Some(observer) = observer {
             let units = summary

@@ -245,7 +245,7 @@ impl SchemaCatalog {
             {
                 candidate.paths.remove(position);
             }
-            if !candidate.paths.is_empty() {
+            if !candidate.paths.is_empty() || candidate.text_summary.is_some() {
                 next.push(candidate);
             }
         }

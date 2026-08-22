@@ -213,7 +213,8 @@ impl LogicalPlan {
         };
         candidate.map_err(|failure| match failure {
             positron_signals::SchemaFailure::AllocationUnavailable
-            | positron_signals::SchemaFailure::LimitExceeded => {
+            | positron_signals::SchemaFailure::LimitExceeded
+            | positron_signals::SchemaFailure::Observed(_) => {
                 crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted)
             },
             positron_signals::SchemaFailure::InvalidBudget

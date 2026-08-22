@@ -13,6 +13,7 @@ pub(super) struct RecoveredSchema {
 
 pub(super) fn recover(
     instance: &crate::InitializedInstance,
+    cancellation: &crate::TaskCancellation,
 ) -> Result<RecoveredSchema, ServiceFailure> {
     let catalog = Catalog::open(
         &instance._authority,
@@ -63,7 +64,7 @@ pub(super) fn recover(
             .snapshot()
             .map_err(|_| ServiceFailure::LedgerUnavailable)?;
         replay
-            .replay_snapshot(&snapshot)
+            .replay_snapshot_cancellable(&snapshot, cancellation)
             .map_err(|failure| match failure {
                 positron_ingest::SchemaSessionFailure::ReplayIntegrity
                 | positron_ingest::SchemaSessionFailure::TenantConflict

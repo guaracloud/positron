@@ -142,6 +142,7 @@ pub(super) fn map_schema_session_failure(failure: SchemaSessionFailure) -> Inges
             IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
         },
         SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
+        | SchemaSessionFailure::Schema(SchemaFailure::Observed(_))
         | SchemaSessionFailure::StateUnavailable => {
             IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
         },
