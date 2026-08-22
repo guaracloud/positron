@@ -1,10 +1,68 @@
 use positron_domain::identity::TenantId;
 use positron_kernel::{
-    ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation, WorkClaim, WorkKind,
+    ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation, StoreBlockIdentity,
+    TransferredResourceReservation, WorkClaim, WorkKind,
 };
 use positron_signals::SchemaBudget;
+use std::mem::size_of;
 
 use super::SchemaSessionFailure;
+
+/// Allocation-free bounds collected during the immutable replay preflight.
+///
+/// The serving replay allocates its candidate catalog, frontier copy, retained
+/// reservation slots, and reachable-index scratch only after this full peak is
+/// admitted.  The block stream is immutable, so the second pass can revisit
+/// it without retaining per-block vectors before admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReplaySnapshotBounds {
+    pub(super) block_count: usize,
+    pub(super) total_payload_bytes: usize,
+    pub(super) maximum_payload_bytes: usize,
+    pub(super) mandatory_work: u64,
+    pub(super) optional_work: u64,
+    pub(super) scratch_memory_bytes: usize,
+}
+
+impl ReplaySnapshotBounds {
+    pub(super) fn new(
+        block_count: usize,
+        total_payload_bytes: usize,
+        maximum_payload_bytes: usize,
+        mandatory_work: u64,
+        optional_work: u64,
+        catalog_memory_bytes: usize,
+    ) -> Result<Self, SchemaSessionFailure> {
+        if total_payload_bytes < maximum_payload_bytes {
+            return Err(SchemaSessionFailure::ReplayLimitExceeded);
+        }
+        let candidate_frontiers = super::MAX_REPLAY_SHARDS
+            .checked_mul(size_of::<positron_signals::SchemaCheckpointFrontier>())
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        let retained_slots = block_count
+            .checked_mul(size_of::<TransferredResourceReservation>())
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        let reachable_indexes = SchemaBudget::system_max_entries()
+            .checked_mul(size_of::<(StoreBlockIdentity, [u8; 32])>())
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        let per_block = SchemaBudget::replay_working_memory_bytes(maximum_payload_bytes)
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        let scratch_memory_bytes = catalog_memory_bytes
+            .checked_add(candidate_frontiers)
+            .and_then(|bytes| bytes.checked_add(retained_slots))
+            .and_then(|bytes| bytes.checked_add(reachable_indexes))
+            .and_then(|bytes| bytes.checked_add(per_block))
+            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+        Ok(Self {
+            block_count,
+            total_payload_bytes,
+            maximum_payload_bytes,
+            mandatory_work,
+            optional_work,
+            scratch_memory_bytes,
+        })
+    }
+}
 
 pub(super) fn reserve_replay_decode_capacity(
     tenant: TenantId,
@@ -31,48 +89,32 @@ pub(super) fn reserve_replay_decode_capacity(
 /// reservation for its full cumulative bound.
 pub(super) fn reserve_replay_snapshot_capacity<'authority>(
     tenant: TenantId,
-    payload_bytes: &[usize],
+    bounds: ReplaySnapshotBounds,
     governor: ResourceGovernor<'authority>,
 ) -> Result<(ResourceReservation<'authority>, bool), SchemaSessionFailure> {
-    let maximum_payload = payload_bytes.iter().copied().max().unwrap_or(0);
-    let memory = u64::try_from(
-        SchemaBudget::replay_working_memory_bytes(maximum_payload)
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
-    )
-    .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-    let (mandatory_work, optional_work) = replay_snapshot_work_bounds(payload_bytes)?;
-    match mandatory_work.checked_add(optional_work) {
+    let memory = u64::try_from(bounds.scratch_memory_bytes)
+        .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+    match bounds.mandatory_work.checked_add(bounds.optional_work) {
         Some(complete_work) => reserve_with_work(tenant, memory, complete_work, governor)
             .map(|reservation| (reservation, true))
             .or_else(|_| {
-                reserve_with_work(tenant, memory, mandatory_work, governor)
+                reserve_with_work(tenant, memory, bounds.mandatory_work, governor)
                     .map(|reservation| (reservation, false))
             }),
-        None => reserve_with_work(tenant, memory, mandatory_work, governor)
+        None => reserve_with_work(tenant, memory, bounds.mandatory_work, governor)
             .map(|reservation| (reservation, false)),
     }
 }
 
-pub(super) fn replay_snapshot_work_bounds(
-    payload_bytes: &[usize],
+pub(super) fn replay_snapshot_block_work(
+    payload_bytes: usize,
 ) -> Result<(u64, u64), SchemaSessionFailure> {
-    let mut mandatory_work = 0_u64;
-    let mut optional_work = 0_u64;
-    for payload in payload_bytes {
-        mandatory_work = mandatory_work
-            .checked_add(
-                SchemaBudget::replay_decode_work_units(*payload)
-                    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
-            )
-            .and_then(|work| work.checked_add(1))
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-        optional_work = optional_work
-            .checked_add(
-                SchemaBudget::text_index_work_units(*payload)
-                    .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?,
-            )
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-    }
+    let mandatory_work = SchemaBudget::replay_decode_work_units(payload_bytes)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?
+        .checked_add(1)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let optional_work = SchemaBudget::text_index_work_units(payload_bytes)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
     Ok((mandatory_work, optional_work))
 }
 
@@ -130,4 +172,48 @@ pub(super) fn resize_replay_work(
         .try_resize(reduced)
         .map(|_| ())
         .map_err(|_| SchemaSessionFailure::StateUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReplaySnapshotBounds, reserve_replay_snapshot_capacity};
+    use positron_kernel::ResourceDimension;
+
+    #[test]
+    fn replay_snapshot_memory_admission_counts_tiny_block_slots_exactly() {
+        let bounds = ReplaySnapshotBounds::new(64, 64, 1, 64, 128, 0).expect("bounds");
+        let exact_memory = u64::try_from(bounds.scratch_memory_bytes).expect("bound");
+        let exact_fixture = crate::tests::support::fixture_with_ordinary_memory(
+            exact_memory.checked_add(20).expect("protected headroom"),
+        )
+        .expect("exact replay-capable fixture");
+        let exact = reserve_replay_snapshot_capacity(
+            exact_fixture.tenant,
+            bounds,
+            exact_fixture.authority.governor(),
+        )
+        .expect("exact scratch bound is admitted");
+        assert_eq!(
+            exact.0.granted().get(ResourceDimension::MemoryBytes),
+            exact_memory
+        );
+        drop(exact);
+
+        // The fixture keeps seven bytes of the fixed ordinary class headroom
+        // available for a request that spills out of the shared pool. Leave
+        // less than that headroom so the admitted scratch bound itself is the
+        // limiting resource, rather than relying on an oversized fixture.
+        let under_fixture = crate::tests::support::fixture_with_ordinary_memory(
+            exact_memory.checked_add(13).expect("protected headroom"),
+        )
+        .expect("under-bound replay fixture");
+        assert!(
+            reserve_replay_snapshot_capacity(
+                under_fixture.tenant,
+                bounds,
+                under_fixture.authority.governor(),
+            )
+            .is_err()
+        );
+    }
 }

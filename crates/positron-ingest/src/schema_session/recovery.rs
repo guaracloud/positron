@@ -9,8 +9,8 @@ pub(super) use super::recovery_support::{
     reserve_schema_memory, validated_frontier, verify_frontier,
 };
 use super::replay_capacity::{
-    ensure_replay_capacity, replay_snapshot_work_bounds, reserve_replay_snapshot_capacity,
-    resize_replay_work,
+    ReplaySnapshotBounds, ensure_replay_capacity, replay_snapshot_block_work,
+    reserve_replay_snapshot_capacity, resize_replay_work,
 };
 use super::{MAX_REPLAY_SHARDS, SchemaFailure, SchemaSessionFailure, TenantSchemaSession};
 
@@ -57,10 +57,11 @@ impl TenantSchemaSession {
             .find(|frontier| frontier.shard() == snapshot.scope().shard_id())
             .copied();
         verify_frontier(snapshot, frontier)?;
-        let mut blocks = Vec::new();
-        blocks
-            .try_reserve_exact(snapshot.blocks().len())
-            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
+        let mut block_count = 0_usize;
+        let mut total_payload_bytes = 0_usize;
+        let mut maximum_payload_bytes = 0_usize;
+        let mut mandatory_work = 0_u64;
+        let mut optional_work = 0_u64;
         for block in snapshot
             .blocks()
             .iter()
@@ -69,42 +70,45 @@ impl TenantSchemaSession {
             if cancellation.is_cancelled() {
                 return Err(SchemaSessionFailure::Cancelled);
             }
-            blocks.push(block);
+            block_count = block_count
+                .checked_add(1)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+            let payload_bytes = block.payload().len();
+            total_payload_bytes = total_payload_bytes
+                .checked_add(payload_bytes)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+            maximum_payload_bytes = maximum_payload_bytes.max(payload_bytes);
+            let (block_mandatory, block_optional) = replay_snapshot_block_work(payload_bytes)?;
+            mandatory_work = mandatory_work
+                .checked_add(block_mandatory)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+            optional_work = optional_work
+                .checked_add(block_optional)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
         }
-        if blocks.is_empty() {
+        if block_count == 0 {
             return Ok(());
         }
-        let mut payload_bytes = Vec::new();
-        payload_bytes
-            .try_reserve_exact(blocks.len())
-            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-        let mut digests = Vec::new();
-        digests
-            .try_reserve_exact(blocks.len())
-            .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
-        for block in &blocks {
-            if cancellation.is_cancelled() {
-                return Err(SchemaSessionFailure::Cancelled);
-            }
-            payload_bytes.push(block.payload().len());
-            digests.push(
-                block
-                    .content_digest()
-                    .map_err(|_| SchemaSessionFailure::StateUnavailable)?,
-            );
-        }
+        let bounds = ReplaySnapshotBounds::new(
+            block_count,
+            total_payload_bytes,
+            maximum_payload_bytes,
+            mandatory_work,
+            optional_work,
+            state.catalog.catalog().memory_bytes(),
+        )?;
+        debug_assert!(bounds.total_payload_bytes >= bounds.maximum_payload_bytes);
         let (replay_capacity, complete_text) =
-            reserve_replay_snapshot_capacity(tenant, &payload_bytes, governor)?;
+            reserve_replay_snapshot_capacity(tenant, bounds, governor)?;
         let replay_work = replay_capacity
             .granted()
             .get(ResourceDimension::CpuWorkUnits);
-        let (mandatory_work, optional_work) = replay_snapshot_work_bounds(&payload_bytes)?;
-        if replay_work < mandatory_work {
+        if replay_work < bounds.mandatory_work {
             return Err(SchemaSessionFailure::StateUnavailable);
         }
-        let mandatory_observer = SchemaBuildObserver::new_scan(mandatory_work, cancellation);
-        let optional_observer =
-            complete_text.then(|| SchemaBuildObserver::new_scan(optional_work, cancellation));
+        let mandatory_observer = SchemaBuildObserver::new_scan(bounds.mandatory_work, cancellation);
+        let optional_observer = complete_text
+            .then(|| SchemaBuildObserver::new_scan(bounds.optional_work, cancellation));
         let mut candidate_catalog = state
             .catalog
             .try_clone_for_replay(&replay_capacity)
@@ -116,13 +120,24 @@ impl TenantSchemaSession {
         candidate_frontiers.extend_from_slice(&state.frontiers);
         let mut new_retained_capacity = Vec::new();
         new_retained_capacity
-            .try_reserve_exact(blocks.len())
+            .try_reserve_exact(bounds.block_count)
             .map_err(|_| SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable))?;
         let mut candidate_retained_charge = state.retained_charge_bytes;
-        for (block, digest) in blocks.iter().zip(&digests) {
+        let mut processed_blocks = 0_usize;
+        for block in snapshot
+            .blocks()
+            .iter()
+            .filter(|block| frontier.is_none_or(|known| block.position() > known.position()))
+        {
             if cancellation.is_cancelled() {
                 return Err(SchemaSessionFailure::Cancelled);
             }
+            processed_blocks = processed_blocks
+                .checked_add(1)
+                .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+            let digest = block
+                .content_digest()
+                .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
             mandatory_observer
                 .observe_work(1)
                 .map_err(map_observation_failure)?;
@@ -155,19 +170,22 @@ impl TenantSchemaSession {
                 snapshot.scope().shard_id(),
                 block.position(),
                 block.identity(),
-                *digest,
+                digest,
             )?;
             candidate_catalog
-                .reconcile_block_identity(block.identity(), *digest)
+                .reconcile_block_identity(block.identity(), digest)
                 .map_err(SchemaSessionFailure::Schema)?;
             candidate_catalog
-                .commit(delta, block.identity(), *digest)
+                .commit(delta, block.identity(), digest)
                 .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
             if let Some(capacity) = capacity {
                 new_retained_capacity.push(capacity.transfer());
             }
             candidate_retained_charge = next_retained;
             publish_frontier_values(&mut candidate_frontiers, frontier);
+        }
+        if processed_blocks != bounds.block_count {
+            return Err(SchemaSessionFailure::ReplayLimitExceeded);
         }
         if cancellation.is_cancelled() {
             return Err(SchemaSessionFailure::Cancelled);

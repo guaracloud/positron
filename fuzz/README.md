@@ -36,8 +36,12 @@ cargo +nightly fuzz run query_search_matcher
 ```
 
 The physical query-search target builds bounded authenticated Store Blocks and
-schema text coverage, then exercises identity/digest validation, pruning,
-fallback, decoding, and the actual matcher through the production scan path:
+schema text coverage, then exercises identity/digest validation, conservative
+candidate pruning, fallback, and decoding through the production scan path.
+It asserts that a matching body is never pruned.  A nonmatching body may still
+decode because trigrams are only pruning evidence; exact substring and regex
+verification is covered by `query_search_matcher` and the query execution
+post-filter:
 
 ```console
 cargo +nightly fuzz run query_search_physical --sanitizer none -- -runs=1000

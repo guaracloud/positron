@@ -113,9 +113,14 @@ fn run_once(
         &NeverCancelled,
         &Unobserved,
     )?;
-    assert_eq!(result.decoded_records() == 1, has_match);
+    // The physical scan exposes the conservative candidate stage.  A summary
+    // can prove absence, but a present trigram is only evidence: unrelated
+    // text may decode as a false positive and is verified by query execution.
+    assert_eq!(result.decoded_records(), result.records().len() as u64);
     if has_match {
-        assert_eq!(result.records().len(), 1);
+        assert_eq!(result.decoded_records(), 1);
+    } else {
+        assert!(result.decoded_records() <= 1);
     }
     Ok(())
 }

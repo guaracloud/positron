@@ -356,6 +356,46 @@ fn replay_cancellation_on_later_block_is_atomic_for_catalog_frontier_and_capacit
 }
 
 #[test]
+fn replay_preflight_admits_many_tiny_blocks_before_allocating_transaction_scratch() {
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xb1; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(306).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xb4);
+    let live_registry = TenantSchemaRegistry::new(1).expect("registry");
+    let live = live_registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("session");
+    for marker in 0xc0..0xc3 {
+        ingest(&fixture, &ledger, shard, live.clone(), marker);
+    }
+    let snapshot = ledger.snapshot().expect("snapshot");
+    assert_eq!(snapshot.blocks().len(), 3);
+    drop(live);
+    drop(live_registry);
+
+    let registry = TenantSchemaRegistry::new(1).expect("replay registry");
+    let session = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("replay session");
+    session
+        .replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor())
+        .expect("many tiny blocks replay");
+    assert!(
+        !session
+            .checkpoint()
+            .expect("replay checkpoint")
+            .catalog_bytes()
+            .is_empty()
+    );
+}
+
+#[test]
 fn reachable_index_collection_honors_cancellation_before_publication() {
     let fixture = crate::tests::support::fixture().expect("fixture");
     let catalog = Catalog::open(
