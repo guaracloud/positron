@@ -3388,7 +3388,7 @@ fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
     )?;
     let events = service
         .execute_with_schema(query, schema.catalog())?
@@ -3403,14 +3403,14 @@ fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<
         matches!(
             events.last(),
             Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-                if stats.cpu_work_units() == 15 && stats.decoded_records() == 1
+                if stats.cpu_work_units() == 16 && stats.decoded_records() == 1
         ),
         "events: {events:?}"
     );
     let exhausted = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(14)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
     )?;
     let exhausted_events = service
         .execute_with_schema(exhausted, schema.catalog())?
@@ -3419,7 +3419,7 @@ fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 15
+                && incomplete.stats().cpu_work_units() == 16
     ));
     Ok(())
 }

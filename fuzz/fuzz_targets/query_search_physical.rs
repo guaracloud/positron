@@ -16,6 +16,7 @@ use positron_signals::{
     LogScan, LogStore, ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver,
     SchemaBudget, SchemaCatalog, TextSearchCandidate,
 };
+use positron_fuzz::truncate_utf8;
 
 #[path = "schema_discovery_query/authority.rs"]
 mod authority;
@@ -74,7 +75,7 @@ fn run_once(
         SegmentProtectionKey::from_owned(Box::new([0x64; 32])),
     )?;
     let mut body = String::from_utf8_lossy(data).into_owned();
-    body.truncate(512);
+    truncate_utf8(&mut body, 512);
     if data.first().is_none_or(|byte| byte & 1 == 0) {
         body.push_str(" needle ");
     }
@@ -117,6 +118,13 @@ fn run_once(
     // can prove absence, but a present trigram is only evidence: unrelated
     // text may decode as a false positive and is verified by query execution.
     assert_eq!(result.decoded_records(), result.records().len() as u64);
+    let decoded_match = result.records().iter().any(|record| {
+        record
+            .body()
+            .and_then(positron_domain::value::ValidatedAttributeValue::as_str)
+            .is_some_and(|text| text.contains("needle"))
+    });
+    assert_eq!(decoded_match, has_match);
     if has_match {
         assert_eq!(result.decoded_records(), 1);
     } else {

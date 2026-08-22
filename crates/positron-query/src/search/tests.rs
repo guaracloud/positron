@@ -1,5 +1,5 @@
 use super::{
-    BoundedRegex, MAX_SEARCH_LITERAL_BYTES, SearchObserver, UnobservedSearch, contains_observed,
+    BoundedRegex, BoundedSubstring, MAX_SEARCH_LITERAL_BYTES, SearchObserver, UnobservedSearch,
     search_text,
 };
 use crate::QueryFailureCode;
@@ -123,10 +123,37 @@ fn extracted_literals_remain_conservative_pruning_proofs() {
 fn substring_matching_preserves_state_across_payload_chunks() {
     let chunk = positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES;
     let body = format!("{}needle", "x".repeat(chunk - 2));
+    let mut substring = BoundedSubstring::from_source("needle".to_owned()).expect("substring");
+    substring.compile().expect("substring compiles");
     let mut observer = UnobservedSearch;
-    assert!(contains_observed(&body, "needle", &mut observer).expect("substring succeeds"));
-    assert!(!contains_observed(&body, "needles", &mut observer).expect("substring succeeds"));
-    assert!(contains_observed(&body, "", &mut observer).expect("empty substring succeeds"));
+    assert!(
+        substring
+            .is_match_observed(&body, &mut observer)
+            .expect("substring succeeds")
+    );
+    let mut other = BoundedSubstring::from_source("needles".to_owned()).expect("substring");
+    other.compile().expect("substring compiles");
+    assert!(
+        !other
+            .is_match_observed(&body, &mut observer)
+            .expect("substring succeeds")
+    );
+}
+
+#[test]
+fn bounded_substring_compiles_prefix_once_and_reuses_it_across_records() {
+    let mut substring = BoundedSubstring::from_source("ababaca".to_owned()).expect("substring");
+    assert_eq!(substring.compile_work_units(), 1);
+    substring.compile().expect("substring compiles");
+    let mut observer = UnobservedSearch;
+    for body in ["zzababacax", "ababaca"] {
+        assert!(
+            substring
+                .is_match_observed(body, &mut observer)
+                .expect("substring succeeds")
+        );
+    }
+    assert_eq!(substring.prefix_len(), 7);
 }
 
 #[test]
@@ -142,8 +169,11 @@ fn matching_polls_cancellation_between_body_chunks() {
     );
 
     let mut substring_observer = CancellingObserver { chunks_left: 1 };
+    let mut substring = BoundedSubstring::from_source("needle".to_owned()).expect("substring");
+    substring.compile().expect("substring compiles");
     assert_eq!(
-        contains_observed(&body, "needle", &mut substring_observer)
+        substring
+            .is_match_observed(&body, &mut substring_observer)
             .expect_err("substring should observe cancellation"),
         crate::QueryFailure::new(QueryFailureCode::Cancelled)
     );

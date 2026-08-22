@@ -71,7 +71,13 @@ pub fn fuzz_query_search_matcher(data: &[u8]) {
     }
     let mut observer = search::UnobservedSearch;
     let _ = regex.is_match_observed(body, &mut observer);
-    let _ = search::contains_observed(body, pattern, &mut observer);
+    let Ok(mut substring) = search::BoundedSubstring::from_source(pattern.to_owned()) else {
+        return;
+    };
+    if substring.compile().is_err() {
+        return;
+    }
+    let _ = substring.is_match_observed(body, &mut observer);
     let literals = regex
         .pruning_literals()
         .iter()

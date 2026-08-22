@@ -46,7 +46,7 @@ impl TemporalRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FilterPredicate {
     BodyEquals(positron_domain::value::ValidatedAttributeValue),
-    BodyContains(String),
+    BodyContains(crate::search::BoundedSubstring),
     BodyRegex(crate::search::BoundedRegex),
     AttributeEquals(positron_signals::SchemaQuery),
 }
@@ -191,17 +191,20 @@ impl LogicalPlan {
     }
 
     pub(crate) fn compile_search(&mut self) -> Result<(), crate::QueryFailure> {
-        if let Some(FilterPredicate::BodyRegex(regex)) = self.filter.as_mut() {
-            regex.compile()?;
+        match self.filter.as_mut() {
+            Some(FilterPredicate::BodyContains(substring)) => substring.compile(),
+            Some(FilterPredicate::BodyRegex(regex)) => regex.compile(),
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => Ok(()),
         }
-        Ok(())
     }
 
     pub(crate) fn search_compile_work_units(&self) -> u64 {
         match self.filter.as_ref() {
+            Some(FilterPredicate::BodyContains(substring)) => substring.compile_work_units(),
             Some(FilterPredicate::BodyRegex(regex)) => regex.compile_work_units(),
             Some(FilterPredicate::BodyEquals(_))
-            | Some(FilterPredicate::BodyContains(_))
             | Some(FilterPredicate::AttributeEquals(_))
             | None => 0,
         }
@@ -212,7 +215,7 @@ impl LogicalPlan {
     ) -> Result<Option<positron_signals::TextSearchCandidate>, crate::QueryFailure> {
         let candidate = match self.filter.as_ref() {
             Some(FilterPredicate::BodyContains(value)) => {
-                positron_signals::TextSearchCandidate::literal(value)
+                positron_signals::TextSearchCandidate::literal(value.source())
             },
             Some(FilterPredicate::BodyRegex(regex)) => {
                 positron_signals::TextSearchCandidate::any_of_bytes(regex.pruning_literals())

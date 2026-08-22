@@ -1,6 +1,6 @@
 use positron_domain::identity::TenantId;
 use positron_kernel::{
-    ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation, StoreBlockIdentity,
+    ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation,
     TransferredResourceReservation, WorkClaim, WorkKind,
 };
 use positron_signals::SchemaBudget;
@@ -10,10 +10,11 @@ use super::SchemaSessionFailure;
 
 /// Allocation-free bounds collected during the immutable replay preflight.
 ///
-/// The serving replay allocates its candidate catalog, frontier copy, retained
-/// reservation slots, and reachable-index scratch only after this full peak is
-/// admitted.  The block stream is immutable, so the second pass can revisit
-/// it without retaining per-block vectors before admission.
+/// The serving replay allocates its candidate catalog, frontier copy, and
+/// retained reservation slots only after this full peak is admitted.  The
+/// block stream is immutable, so the second pass can revisit it without
+/// retaining per-block vectors before admission. Bootstrap's separate
+/// reachable-index allocation is admitted by `SchemaReplayBuilder`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ReplaySnapshotBounds {
     pub(super) block_count: usize,
@@ -42,15 +43,11 @@ impl ReplaySnapshotBounds {
         let retained_slots = block_count
             .checked_mul(size_of::<TransferredResourceReservation>())
             .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
-        let reachable_indexes = SchemaBudget::system_max_entries()
-            .checked_mul(size_of::<(StoreBlockIdentity, [u8; 32])>())
-            .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
         let per_block = SchemaBudget::replay_working_memory_bytes(maximum_payload_bytes)
             .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
         let scratch_memory_bytes = catalog_memory_bytes
             .checked_add(candidate_frontiers)
             .and_then(|bytes| bytes.checked_add(retained_slots))
-            .and_then(|bytes| bytes.checked_add(reachable_indexes))
             .and_then(|bytes| bytes.checked_add(per_block))
             .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
         Ok(Self {
