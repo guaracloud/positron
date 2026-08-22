@@ -333,12 +333,9 @@ impl TextBlockSummary {
         for literal in candidate.literals() {
             let mut present = true;
             for window in literal.windows(TRIGRAM_BYTES) {
-                let (Some(&first), Some(&second), Some(&third)) =
-                    (window.first(), window.get(1), window.get(2))
-                else {
-                    return Err(ScanObservationFailureCode::Internal);
-                };
-                let trigram = [first, second, third];
+                let trigram = window
+                    .try_into()
+                    .map_err(|_| ScanObservationFailureCode::Internal)?;
                 if !observed_binary_search(&self.trigrams, trigram, observer)? {
                     present = false;
                     break;

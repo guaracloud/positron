@@ -221,3 +221,62 @@ impl From<SchemaFailure> for TextSummaryAttachFailure {
         Self::Schema(failure)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use positron_domain::identity::TenantId;
+    use positron_domain::value::AttributeNamespace;
+
+    use super::super::super::model::SchemaPath;
+    use super::super::SchemaDelta;
+    use super::{ScanObservationFailureCode, ScanObserver, TextSummaryAttachFailure};
+
+    struct BoundedObserver {
+        consumed: Cell<u64>,
+        limit: u64,
+    }
+
+    impl BoundedObserver {
+        const fn new(limit: u64) -> Self {
+            Self {
+                consumed: Cell::new(0),
+                limit,
+            }
+        }
+    }
+
+    impl ScanObserver for BoundedObserver {
+        fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+            let consumed = self.consumed.get().saturating_add(units);
+            self.consumed.set(consumed);
+            if consumed > self.limit {
+                Err(ScanObservationFailureCode::BudgetExhausted)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn observed_projection_work_accounts_unverified_path_segments() {
+        let tenant = TenantId::from_bytes([0x42; 16]).expect("tenant");
+        let mut delta = SchemaDelta::empty(tenant, true);
+        delta.unverified_paths.push(
+            SchemaPath::new(AttributeNamespace::Record, "parent.child".to_owned()).expect("path"),
+        );
+        let observer = BoundedObserver::new(3);
+
+        assert!(super::observe_projection_work(&delta, &observer).is_ok());
+        assert_eq!(observer.consumed.get(), 3);
+
+        let cancelled = BoundedObserver::new(2);
+        assert!(matches!(
+            super::observe_projection_work(&delta, &cancelled),
+            Err(TextSummaryAttachFailure::Observation(
+                ScanObservationFailureCode::BudgetExhausted,
+            ))
+        ));
+    }
+}

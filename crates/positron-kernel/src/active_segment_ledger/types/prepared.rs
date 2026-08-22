@@ -33,13 +33,7 @@ impl<'capacity> PreparedStoreBlock<'capacity> {
         }
         let digest = DataProtection::hash(&self.payload)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-        match self.content_digest.set(digest) {
-            Ok(()) => Ok(digest),
-            Err(existing) => match self.content_digest.get() {
-                Some(stored) => Ok(*stored),
-                None => Ok(existing),
-            },
-        }
+        Ok(publish_digest(&self.content_digest, digest))
     }
 
     pub fn new_with_preparation_capacity(
@@ -67,5 +61,29 @@ impl<'capacity> PreparedStoreBlock<'capacity> {
             content_digest: OnceLock::new(),
             preparation_capacity,
         })
+    }
+}
+
+fn publish_digest(content_digest: &OnceLock<[u8; 32]>, digest: [u8; 32]) -> [u8; 32] {
+    match content_digest.set(digest) {
+        Ok(()) => digest,
+        Err(existing) => content_digest
+            .get()
+            .copied()
+            .map_or(existing, |stored| stored),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use super::publish_digest;
+
+    #[test]
+    fn competing_digest_publication_keeps_the_first_value() {
+        let content_digest = OnceLock::new();
+        assert_eq!(publish_digest(&content_digest, [0x11; 32]), [0x11; 32]);
+        assert_eq!(publish_digest(&content_digest, [0x22; 32]), [0x11; 32]);
     }
 }

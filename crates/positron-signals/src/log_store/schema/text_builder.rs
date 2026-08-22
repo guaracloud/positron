@@ -69,12 +69,8 @@ pub(crate) fn from_bodies<'a>(
                 complete = false;
                 break 'bodies;
             }
-            let (Some(&first), Some(&second), Some(&third)) =
-                (window.first(), window.get(1), window.get(2))
-            else {
-                return Err(SchemaFailure::InvalidValue.into());
-            };
-            trigrams.push([first, second, third]);
+            let trigram = window.try_into().map_err(|_| SchemaFailure::InvalidValue)?;
+            trigrams.push(trigram);
         }
     }
     if !complete {
