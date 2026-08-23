@@ -384,6 +384,28 @@ fn sql_unquoted_attribute_namespaces_are_case_insensitive_and_quoted_namespaces_
         failure.code(),
         positron_query::QueryFailureCode::UnsupportedQuery
     );
+    service.plan_sql(
+        fixture.context,
+        "SELECT BODY FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        budget,
+    )?;
+    service.plan_sql(
+        fixture.context,
+        "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY query_time LIMIT 1",
+        budget,
+    )?;
+    let pipeline = service
+        .plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | project BODY | limit 1",
+            budget,
+        )
+        .err()
+        .ok_or("pipeline intrinsic case unexpectedly became insensitive")?;
+    assert_eq!(
+        pipeline.code(),
+        positron_query::QueryFailureCode::UnsupportedQuery
+    );
     Ok(())
 }
 

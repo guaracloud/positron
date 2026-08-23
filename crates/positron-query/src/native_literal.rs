@@ -6,45 +6,63 @@ const HEX_PREFIX: &str = "0x";
 
 pub(crate) fn parse_body(
     source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
+    let scratch = value_scratch_reservation(memory, source)?;
     let candidate = if source.starts_with('"') {
-        CandidateAttributeValue::string(Cursor::new(source)?.parse_legacy_string()?)
+        CandidateAttributeValue::string(Cursor::new(source, memory)?.parse_legacy_string()?)
     } else {
-        Cursor::new(source)?.parse_complete()?
+        Cursor::new(source, memory)?.parse_complete()?
     };
-    candidate
+    let value = candidate
         .validate_log_body(ValueLimitProfile::release_1_system_maximum())
-        .map_err(map_domain_failure)
+        .map_err(map_domain_failure)?;
+    drop(scratch);
+    Ok(value)
 }
 
 pub(crate) fn parse_attribute(
     source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
-    Cursor::new(source)?
+    let scratch = value_scratch_reservation(memory, source)?;
+    let value = Cursor::new(source, memory)?
         .parse_complete()?
         .validate_attribute(ValueLimitProfile::release_1_system_maximum())
-        .map_err(map_domain_failure)
+        .map_err(map_domain_failure)?;
+    drop(scratch);
+    Ok(value)
 }
 
 pub(crate) fn parse_search_string(
     source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
-    CandidateAttributeValue::string(Cursor::new(source)?.parse_legacy_string()?)
-        .validate_log_body(ValueLimitProfile::release_1_system_maximum())
-        .map_err(map_domain_failure)
+    let scratch = value_scratch_reservation(memory, source)?;
+    let value =
+        CandidateAttributeValue::string(Cursor::new(source, memory)?.parse_legacy_string()?)
+            .validate_log_body(ValueLimitProfile::release_1_system_maximum())
+            .map_err(map_domain_failure)?;
+    drop(scratch);
+    Ok(value)
 }
 
 struct Cursor<'source> {
     remaining: &'source str,
     maximum_depth: u16,
+    memory: crate::planning_memory::PlanningMemory,
 }
 
 impl<'source> Cursor<'source> {
-    fn new(source: &'source str) -> Result<Self, QueryFailure> {
+    fn new(
+        source: &'source str,
+        memory: &crate::planning_memory::PlanningMemory,
+    ) -> Result<Self, QueryFailure> {
         let limits = ValueLimitProfile::release_1_system_maximum().system_limits();
         Ok(Self {
             remaining: source,
             maximum_depth: limits.dynamic_value().nesting_depth().value(),
+            memory: memory.clone(),
         })
     }
 
@@ -106,7 +124,7 @@ impl<'source> Cursor<'source> {
         }
         if self.take_prefix("bytes(") {
             let source = self.take_until(')')?;
-            let value = parse_bytes(source)?;
+            let value = parse_bytes(source, &self.memory)?;
             self.expect(')')?;
             return Ok(CandidateAttributeValue::bytes(value));
         }
@@ -124,37 +142,31 @@ impl<'source> Cursor<'source> {
     }
 
     fn parse_array(&mut self, depth: u16) -> Result<Vec<CandidateAttributeValue>, QueryFailure> {
-        let mut values = Vec::new();
+        let mut values = crate::planning_memory::PlanningVec::with_capacity(&self.memory, 0)?;
         if self.take_prefix(")") {
-            return Ok(values);
+            return Ok(values.into_vec());
         }
         loop {
-            values
-                .try_reserve(1)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-            values.push(self.parse_value(depth)?);
+            values.push(self.parse_value(depth)?)?;
             if self.take_prefix(")") {
-                return Ok(values);
+                return Ok(values.into_vec());
             }
             self.expect(',')?;
         }
     }
 
     fn parse_key_values(&mut self, depth: u16) -> Result<Vec<CandidateKeyValue>, QueryFailure> {
-        let mut values = Vec::new();
+        let mut values = crate::planning_memory::PlanningVec::with_capacity(&self.memory, 0)?;
         if self.take_prefix(")") {
-            return Ok(values);
+            return Ok(values.into_vec());
         }
         loop {
             let key = self.parse_quoted()?;
             self.expect('=')?;
             let value = self.parse_value(depth)?;
-            values
-                .try_reserve(1)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-            values.push(CandidateKeyValue::new(key, value));
+            values.push(CandidateKeyValue::new(key, value))?;
             if self.take_prefix(")") {
-                return Ok(values);
+                return Ok(values.into_vec());
             }
             self.expect(',')?;
         }
@@ -163,13 +175,23 @@ impl<'source> Cursor<'source> {
     fn parse_quoted(&mut self) -> Result<String, QueryFailure> {
         self.expect('"')?;
         let mut decoded = String::new();
-        decoded
+        let reservation = self.memory.reserve(
+            u64::try_from(self.remaining.len().min(4_096))
+                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+        )?;
+        if decoded
             .try_reserve_exact(self.remaining.len().min(4_096))
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            .is_err()
+        {
+            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+        }
         loop {
             let character = self.next_character().ok_or_else(unsupported)?;
             match character {
-                '"' => return Ok(decoded),
+                '"' => {
+                    drop(reservation);
+                    return Ok(decoded);
+                },
                 '\\' => {
                     let escaped = self.next_character().ok_or_else(unsupported)?;
                     if !matches!(escaped, '"' | '\\' | '|') {
@@ -231,7 +253,10 @@ fn parse_fixed_hex(source: &str, digits: usize) -> Result<u64, QueryFailure> {
     u64::from_str_radix(hex, 16).map_err(|_| unsupported())
 }
 
-fn parse_bytes(source: &str) -> Result<Vec<u8>, QueryFailure> {
+fn parse_bytes(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<Vec<u8>, QueryFailure> {
     let hex = source.strip_prefix(HEX_PREFIX).ok_or_else(unsupported)?;
     if hex.len() % 2 != 0
         || !hex
@@ -241,6 +266,9 @@ fn parse_bytes(source: &str) -> Result<Vec<u8>, QueryFailure> {
         return Err(unsupported());
     }
     let mut bytes = Vec::new();
+    let reservation = memory.reserve(
+        u64::try_from(hex.len() / 2).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+    )?;
     bytes
         .try_reserve_exact(hex.len() / 2)
         .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
@@ -251,7 +279,19 @@ fn parse_bytes(source: &str) -> Result<Vec<u8>, QueryFailure> {
         let low = low.to_digit(16).ok_or_else(unsupported)?;
         bytes.push(u8::try_from((high << 4) | low).map_err(|_| unsupported())?);
     }
+    drop(reservation);
     Ok(bytes)
+}
+
+fn value_scratch_reservation(
+    memory: &crate::planning_memory::PlanningMemory,
+    source: &str,
+) -> Result<crate::planning_memory::PlanningReservation, QueryFailure> {
+    let bytes = u64::try_from(source.len())
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
+        .checked_mul(64)
+        .ok_or_else(|| QueryFailure::budget_exhausted(crate::QueryBudgetDimension::MemoryBytes))?;
+    memory.reserve(bytes)
 }
 
 fn map_domain_failure(failure: positron_domain::outcome::DomainFailure) -> QueryFailure {

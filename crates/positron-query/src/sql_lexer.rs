@@ -3,11 +3,12 @@ use crate::{QueryFailure, QueryFailureCode};
 const MAX_SQL_TOKENS: usize = 128;
 const MAX_SQL_NESTING: usize = 16;
 
-pub(crate) fn tokenize(source: &str) -> Result<Vec<&str>, QueryFailure> {
-    let mut tokens = Vec::new();
-    tokens
-        .try_reserve_exact(source.len().min(MAX_SQL_TOKENS))
-        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+pub(crate) fn tokenize<'source>(
+    source: &'source str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<crate::planning_memory::PlanningVec<&'source str>, QueryFailure> {
+    let capacity = source.len().min(MAX_SQL_TOKENS);
+    let mut tokens = crate::planning_memory::PlanningVec::with_capacity(memory, capacity)?;
     let mut start = None;
     let mut quoted = false;
     let mut escaped = false;
@@ -104,7 +105,7 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<&str>, QueryFailure> {
 }
 
 fn push_token<'source>(
-    tokens: &mut Vec<&'source str>,
+    tokens: &mut crate::planning_memory::PlanningVec<&'source str>,
     token: &'source str,
 ) -> Result<(), QueryFailure> {
     if token.is_empty() {
@@ -113,8 +114,7 @@ fn push_token<'source>(
     if tokens.len() >= MAX_SQL_TOKENS {
         return Err(unsupported());
     }
-    tokens.push(token);
-    Ok(())
+    tokens.push(token)
 }
 
 fn unsupported() -> QueryFailure {

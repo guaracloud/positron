@@ -482,6 +482,27 @@ fn planning_memory_is_admitted_before_sql_and_pipeline_allocations() -> Result<(
     Ok(())
 }
 
+#[test]
+fn pipeline_token_scratch_is_charged_before_collecting_bounded_input() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("pipeline-token-memory")?;
+    let service = fixture.service(16)?;
+    let noisy_stage = "x ".repeat(1_900);
+    let source = format!("pipeline:v1 logs | range {noisy_stage}| limit 1");
+    assert!(source.len() <= 4_096);
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4_096, 60)?;
+    let failure = match service.plan_pipeline(fixture.context, &source, budget) {
+        Ok(_) => return Err("oversized pipeline token scratch unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(QueryBudgetDimension::MemoryBytes)
+    );
+    Ok(())
+}
+
 pub(crate) struct QueryFixture {
     _roots: TemporaryRoots,
     pub(crate) kernel: KernelFixture,

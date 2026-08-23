@@ -3,9 +3,12 @@ use positron_signals::{OccurrenceSelector, SchemaFailure, SchemaPath, SchemaQuer
 
 use crate::{QueryFailure, QueryFailureCode};
 
-pub(crate) fn parse_predicate(source: &str) -> Result<SchemaQuery, QueryFailure> {
+pub(crate) fn parse_predicate(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<SchemaQuery, QueryFailure> {
     let (path_source, remainder) = split_path(source)?;
-    let path = parse_path(path_source)?;
+    let path = parse_path(path_source, memory)?;
     let (selector, literal) = if let Some(literal) = remainder.strip_prefix(" any == ") {
         (OccurrenceSelector::Any, literal)
     } else if let Some(literal) = remainder.strip_prefix(" all == ") {
@@ -20,11 +23,17 @@ pub(crate) fn parse_predicate(source: &str) -> Result<SchemaQuery, QueryFailure>
     } else {
         return Err(unsupported());
     };
-    let value = crate::native_literal::parse_attribute(literal)?;
+    let value = crate::native_literal::parse_attribute(literal, memory)?;
     SchemaQuery::exact_native_value(path, selector, value).map_err(map_schema_failure)
 }
 
-pub(crate) fn parse_path(source: &str) -> Result<SchemaPath, QueryFailure> {
+pub(crate) fn parse_path(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<SchemaPath, QueryFailure> {
+    let scratch = memory.reserve(
+        u64::try_from(source.len()).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+    )?;
     let (namespace, mut remaining) = if let Some(value) = strip_namespace(source, "resource") {
         (AttributeNamespace::Resource, value)
     } else if let Some(value) = strip_namespace(source, "scope") {
@@ -34,22 +43,22 @@ pub(crate) fn parse_path(source: &str) -> Result<SchemaPath, QueryFailure> {
     } else {
         return Err(unsupported());
     };
-    let mut segments = Vec::new();
+    let mut segments = crate::planning_memory::PlanningVec::with_capacity(memory, 0)?;
     while !remaining.is_empty() {
         let Some(after_open) = remaining.strip_prefix("[\"") else {
             return Err(unsupported());
         };
-        let (segment, after_segment) = parse_segment(after_open)?;
+        let (segment, after_segment) = parse_segment(after_open, memory)?;
         if segments.len() == SchemaPath::system_max_segments() {
             return Err(unsupported());
         }
-        segments
-            .try_reserve(1)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        segments.push(segment);
+        segments.push(segment)?;
         remaining = after_segment;
     }
-    SchemaPath::from_segments(namespace, segments).map_err(map_schema_failure)
+    let path =
+        SchemaPath::from_segments(namespace, segments.into_vec()).map_err(map_schema_failure)?;
+    drop(scratch);
+    Ok(path)
 }
 
 fn strip_namespace<'source>(source: &'source str, namespace: &str) -> Option<&'source str> {
@@ -118,8 +127,15 @@ fn split_path(source: &str) -> Result<(&str, &str), QueryFailure> {
     Err(unsupported())
 }
 
-fn parse_segment(source: &str) -> Result<(String, &str), QueryFailure> {
+fn parse_segment<'source>(
+    source: &'source str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<(String, &'source str), QueryFailure> {
     let mut segment = String::new();
+    let reservation = memory.reserve(
+        u64::try_from(source.len().min(4_096))
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+    )?;
     segment
         .try_reserve_exact(source.len().min(4_096))
         .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
@@ -132,6 +148,7 @@ fn parse_segment(source: &str) -> Result<(String, &str), QueryFailure> {
         match character {
             '"' => {
                 remaining = remaining.strip_prefix(']').ok_or_else(unsupported)?;
+                drop(reservation);
                 return Ok((segment, remaining));
             },
             '\\' => {

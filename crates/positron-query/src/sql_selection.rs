@@ -1,41 +1,55 @@
-use crate::plan::ProjectionColumn;
+use crate::plan::{FilterPredicate, ProjectionColumn};
 use crate::transform::{BodyTransform, CastTarget};
 use crate::{QueryFailure, QueryFailureCode};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Selection {
     Projection {
-        projection: Vec<ProjectionColumn>,
+        projection: crate::planning_memory::PlanningVec<ProjectionColumn>,
         transform: Option<BodyTransform>,
     },
     Count,
-    CountBy(Vec<ProjectionColumn>),
+    CountBy(crate::planning_memory::PlanningVec<ProjectionColumn>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum IdentifierCase {
+    Exact,
+    Insensitive,
 }
 
 pub(crate) fn push_column(
-    columns: &mut Vec<ProjectionColumn>,
+    columns: &mut crate::planning_memory::PlanningVec<ProjectionColumn>,
     token: &str,
+    case: IdentifierCase,
 ) -> Result<(), QueryFailure> {
     if token.is_empty() || columns.len() >= 5 {
         return Err(unsupported());
     }
-    let column = if token.eq_ignore_ascii_case("body") {
+    let matches = |expected: &str| match case {
+        IdentifierCase::Exact => token == expected,
+        IdentifierCase::Insensitive => token.eq_ignore_ascii_case(expected),
+    };
+    let column = if matches("body") {
         ProjectionColumn::Body
-    } else if token.eq_ignore_ascii_case("query_time") {
+    } else if matches("query_time") {
         ProjectionColumn::QueryTime
-    } else if token.eq_ignore_ascii_case("event_time") {
+    } else if matches("event_time") {
         ProjectionColumn::EventTime
-    } else if token.eq_ignore_ascii_case("ingest_time") {
+    } else if matches("ingest_time") {
         ProjectionColumn::IngestTime
-    } else if token.eq_ignore_ascii_case("commit_position") {
+    } else if matches("commit_position") {
         ProjectionColumn::CommitPosition
     } else {
-        ProjectionColumn::Attribute(crate::attribute_syntax::parse_path(token)?)
+        ProjectionColumn::Attribute(crate::attribute_syntax::parse_path(
+            token,
+            &columns.memory(),
+        )?)
     };
     if columns.contains(&column) {
         return Err(unsupported());
     }
-    columns.push(column);
+    columns.push(column)?;
     Ok(())
 }
 
@@ -80,6 +94,39 @@ pub(crate) fn parse_transform(token: &str) -> Result<Option<BodyTransform>, Quer
         _ => return Err(unsupported()),
     };
     Ok(Some(BodyTransform::Cast(target)))
+}
+
+pub(crate) fn parse_body_predicate(
+    operator: &str,
+    literal: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<FilterPredicate, QueryFailure> {
+    if operator.eq_ignore_ascii_case("=") || operator == "==" {
+        return Ok(FilterPredicate::BodyEquals(
+            crate::native_literal::parse_body(literal, memory)?,
+        ));
+    }
+    let value = crate::native_literal::parse_search_string(literal, memory)?;
+    let text_source = value.as_str().ok_or_else(unsupported)?;
+    let text_memory = memory.reserve(
+        u64::try_from(text_source.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+    )?;
+    let text = text_source.to_owned();
+    if operator.eq_ignore_ascii_case("contains") {
+        let search = crate::search::search_text(text)?;
+        drop(text_memory);
+        return Ok(FilterPredicate::BodyContains(search));
+    }
+    if operator.eq_ignore_ascii_case("regexp")
+        || operator.eq_ignore_ascii_case("regex")
+        || operator == "~"
+    {
+        let regex = crate::search::BoundedRegex::from_source(text)?;
+        drop(text_memory);
+        return Ok(FilterPredicate::BodyRegex(regex));
+    }
+    Err(unsupported())
 }
 
 fn unsupported() -> QueryFailure {

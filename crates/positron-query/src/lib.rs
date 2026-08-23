@@ -48,8 +48,10 @@ pub fn fuzz_query_inputs(data: &[u8]) {
         return;
     }
     if let Ok(source) = std::str::from_utf8(data) {
-        let _ = service::parse_pipeline(source);
-        let _ = service::parse_sql(source);
+        let memory = planning_memory::PlanningMemory::new(4_096);
+        let _ = service::parse_pipeline(source, &memory);
+        let memory = planning_memory::PlanningMemory::new(4_096);
+        let _ = service::parse_sql(source, &memory);
     }
     let _ = QueryCursor::from_bytes(data);
 }
@@ -60,8 +62,8 @@ pub fn fuzz_query_sql(data: &[u8]) {
     const MAX_RAW_BYTES: usize = 4_096;
     const MAX_PARITY_LITERAL_BYTES: usize = 512;
     let raw = bounded_lossy_query(data, MAX_RAW_BYTES);
-    let first = service::parse_sql(&raw);
-    let second = service::parse_sql(&raw);
+    let first = service::parse_sql(&raw, &planning_memory::PlanningMemory::new(4_096));
+    let second = service::parse_sql(&raw, &planning_memory::PlanningMemory::new(4_096));
     assert_eq!(query_classification(&first), query_classification(&second));
     if let (Ok(first), Ok(second)) = (&first, &second) {
         assert_eq!(first, second, "SQL plans must be deterministic");
@@ -74,8 +76,9 @@ pub fn fuzz_query_sql(data: &[u8]) {
     let Some((sql, pipeline)) = parity_queries(&literal) else {
         return;
     };
-    let sql_result = service::parse_sql(&sql);
-    let pipeline_result = service::parse_pipeline(&pipeline);
+    let sql_result = service::parse_sql(&sql, &planning_memory::PlanningMemory::new(4_096));
+    let pipeline_result =
+        service::parse_pipeline(&pipeline, &planning_memory::PlanningMemory::new(4_096));
     assert_eq!(
         query_classification(&sql_result),
         query_classification(&pipeline_result),

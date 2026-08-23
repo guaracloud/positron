@@ -1,20 +1,25 @@
 use crate::plan::{AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn};
 use crate::sql_lexer::tokenize;
-use crate::sql_selection::{Selection, parse_transform, push_column};
+use crate::sql_selection::{Selection, parse_body_predicate, parse_transform, push_column};
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange};
 use std::borrow::Cow;
 
-pub(crate) fn parse(source: &str) -> Result<LogicalPlan, QueryFailure> {
+pub(crate) fn parse(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<LogicalPlan, QueryFailure> {
     let mut parser = Parser {
-        tokens: tokenize(source)?,
+        tokens: tokenize(source, memory)?,
         index: 0,
+        memory: memory.clone(),
     };
     parser.query()
 }
 
 struct Parser<'source> {
-    tokens: Vec<&'source str>,
+    tokens: crate::planning_memory::PlanningVec<&'source str>,
     index: usize,
+    memory: crate::planning_memory::PlanningMemory,
 }
 
 impl<'source> Parser<'source> {
@@ -53,7 +58,7 @@ impl<'source> Parser<'source> {
             return Err(unsupported());
         }
 
-        let mut plan = plan(axis, start, end, limit)?;
+        let mut plan = plan(axis, start, end, limit, &self.memory)?;
         if let Some(filter) = filter {
             plan = plan.with_filter(filter);
         }
@@ -68,21 +73,21 @@ impl<'source> Parser<'source> {
                 if groups.is_some() {
                     return Err(unsupported());
                 }
-                plan = plan.with_projection(projection);
+                plan = plan.with_projection(projection.into_vec());
                 if let Some(transform) = transform {
                     plan = plan.with_transform(transform);
                 }
             },
             Selection::Count => {
-                plan = plan.with_aggregate(
-                    groups.map_or_else(AggregateSpec::count, AggregateSpec::count_by),
-                );
+                plan = plan.with_aggregate(groups.map_or_else(AggregateSpec::count, |columns| {
+                    AggregateSpec::count_by(columns.into_vec())
+                }));
             },
             Selection::CountBy(columns) => {
                 if groups.as_ref() != Some(&columns) {
                     return Err(unsupported());
                 }
-                plan = plan.with_aggregate(AggregateSpec::count_by(columns));
+                plan = plan.with_aggregate(AggregateSpec::count_by(columns.into_vec()));
             },
         }
         let default_ordering = OrderSpec::ascending(plan.temporal_axis());
@@ -90,10 +95,7 @@ impl<'source> Parser<'source> {
     }
 
     fn selection(&mut self) -> Result<Selection, QueryFailure> {
-        let mut columns = Vec::new();
-        columns
-            .try_reserve_exact(5)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        let mut columns = crate::planning_memory::PlanningVec::with_capacity(&self.memory, 5)?;
         let mut count = false;
         let mut transform = None;
         loop {
@@ -111,9 +113,17 @@ impl<'source> Parser<'source> {
                     if transform.replace(value).is_some() {
                         return Err(unsupported());
                     }
-                    push_column(&mut columns, "body")?;
+                    push_column(
+                        &mut columns,
+                        "body",
+                        crate::sql_selection::IdentifierCase::Insensitive,
+                    )?;
                 } else {
-                    push_column(&mut columns, token)?;
+                    push_column(
+                        &mut columns,
+                        token,
+                        crate::sql_selection::IdentifierCase::Insensitive,
+                    )?;
                 }
             }
             if !self.comma() {
@@ -136,18 +146,26 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn columns(&mut self) -> Result<Vec<ProjectionColumn>, QueryFailure> {
-        let mut columns = Vec::new();
-        columns
-            .try_reserve_exact(5)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    fn columns(
+        &mut self,
+    ) -> Result<crate::planning_memory::PlanningVec<ProjectionColumn>, QueryFailure> {
+        let mut columns = crate::planning_memory::PlanningVec::with_capacity(&self.memory, 5)?;
         let first = self.take()?;
         if first == "*" {
             return Err(unsupported());
         }
-        push_column(&mut columns, first)?;
+        push_column(
+            &mut columns,
+            first,
+            crate::sql_selection::IdentifierCase::Insensitive,
+        )?;
         while self.comma() {
-            push_column(&mut columns, self.take()?)?;
+            let token = self.take()?;
+            push_column(
+                &mut columns,
+                token,
+                crate::sql_selection::IdentifierCase::Insensitive,
+            )?;
         }
         Ok(columns)
     }
@@ -160,7 +178,7 @@ impl<'source> Parser<'source> {
             if self.peek().is_some_and(|token| !clause(token)) {
                 return Err(unsupported());
             }
-            return body_predicate(operator, literal);
+            return parse_body_predicate(operator, literal, &self.memory);
         }
 
         let value = self.take()?;
@@ -178,11 +196,16 @@ impl<'source> Parser<'source> {
         {
             let suffix = operator.get(6..).ok_or_else(unsupported)?;
             let mut selector = String::new();
+            let selector_reservation = self.memory.reserve(
+                u64::try_from(6_usize.checked_add(suffix.len()).ok_or_else(unsupported)?)
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+            )?;
             selector
                 .try_reserve_exact(6 + suffix.len())
                 .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
             selector.push_str("index(");
             selector.push_str(suffix);
+            drop(selector_reservation);
             Cow::Owned(selector)
         } else {
             return Err(unsupported());
@@ -191,6 +214,16 @@ impl<'source> Parser<'source> {
             return Err(unsupported());
         }
         let mut source = String::new();
+        let source_reservation = self.memory.reserve(
+            u64::try_from(
+                left.len()
+                    .checked_add(selector.len())
+                    .and_then(|length| length.checked_add(value.len()))
+                    .and_then(|length| length.checked_add(8))
+                    .ok_or_else(unsupported)?,
+            )
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+        )?;
         source
             .try_reserve_exact(left.len() + selector.len() + value.len() + 8)
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
@@ -199,9 +232,9 @@ impl<'source> Parser<'source> {
         source.push_str(&selector);
         source.push_str(" == ");
         source.push_str(value);
-        Ok(FilterPredicate::AttributeEquals(
-            crate::attribute_syntax::parse_predicate(&source)?,
-        ))
+        let predicate = crate::attribute_syntax::parse_predicate(&source, &self.memory)?;
+        drop(source_reservation);
+        Ok(FilterPredicate::AttributeEquals(predicate))
     }
 
     fn ordering(&mut self, axis: &str) -> Result<OrderSpec, QueryFailure> {
@@ -316,34 +349,12 @@ impl<'source> Parser<'source> {
     }
 }
 
-fn body_predicate(operator: &str, literal: &str) -> Result<FilterPredicate, QueryFailure> {
-    if operator.eq_ignore_ascii_case("=") || operator == "==" {
-        return Ok(FilterPredicate::BodyEquals(
-            crate::native_literal::parse_body(literal)?,
-        ));
-    }
-    let value = crate::native_literal::parse_search_string(literal)?;
-    let text = value.as_str().ok_or_else(unsupported)?.to_owned();
-    if operator.eq_ignore_ascii_case("contains") {
-        let search = crate::search::search_text(text)?;
-        return Ok(FilterPredicate::BodyContains(search));
-    }
-    if operator.eq_ignore_ascii_case("regexp")
-        || operator.eq_ignore_ascii_case("regex")
-        || operator == "~"
-    {
-        return Ok(FilterPredicate::BodyRegex(
-            crate::search::BoundedRegex::from_source(text)?,
-        ));
-    }
-    Err(unsupported())
-}
-
 pub(crate) fn plan(
     axis: &str,
     start: &str,
     end: &str,
     limit: u16,
+    memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<LogicalPlan, QueryFailure> {
     let axis = if axis.eq_ignore_ascii_case("query_time") {
         TemporalAxis::QueryTime
@@ -356,7 +367,7 @@ pub(crate) fn plan(
     };
     let range = TemporalRange::new(parse_timestamp(start)?, parse_timestamp(end)?)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
-    Ok(LogicalPlan::logs(axis, range, limit))
+    LogicalPlan::logs_with_memory(axis, range, limit, memory)
 }
 
 pub(crate) fn parse_limit(source: &str) -> Result<u16, QueryFailure> {

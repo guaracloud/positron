@@ -89,7 +89,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
         source: &str,
         budget: QueryBudget,
-        parser: fn(&str) -> Result<LogicalPlan, QueryFailure>,
+        parser: fn(
+            &str,
+            &crate::planning_memory::PlanningMemory,
+        ) -> Result<LogicalPlan, QueryFailure>,
     ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
         let tenant = context
             .tenant_attribution()
@@ -101,9 +104,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
-        crate::planning_memory::preflight(budget.memory_bytes(), source)?;
+        let planning_memory = crate::planning_memory::PlanningMemory::new(budget.memory_bytes());
         let parse_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
-        let mut plan = parser(source)?;
+        let mut plan = parser(source, &planning_memory)?;
         let compile_work_units = plan.search_compile_work_units();
         let cpu_work_units = if compile_work_units == 0 {
             parse_work_units
@@ -146,6 +149,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::MemoryBytes,
             ));
         }
+        let planning_memory = planning_memory.reserve(retained_plan_memory)?;
         plan.compile_search()?;
         if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
@@ -171,6 +175,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             plan: Arc::new(plan),
             budget,
             _reservation: reservation,
+            _planning_memory: planning_memory,
             started_at,
             last_observed_at,
             cpu_work_units,

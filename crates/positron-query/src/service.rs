@@ -4,19 +4,22 @@ use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis};
 
 use crate::sql::plan;
 
-pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
-    let stages = pipeline_stages(source)?;
-    if let Some((&"pipeline:v1 logs", remaining)) = stages.split_first() {
-        return parse_versioned_pipeline(remaining);
+pub(crate) fn parse_pipeline(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<LogicalPlan, QueryFailure> {
+    let stages = pipeline_stages(source, memory)?;
+    if let Some((&"pipeline:v1 logs", remaining)) = stages.as_slice().split_first() {
+        return parse_versioned_pipeline(remaining, memory);
     }
     match stages.as_slice() {
         ["logs", range, limit] => {
-            let range = range.split_ascii_whitespace().collect::<Vec<_>>();
-            let limit = limit.split_ascii_whitespace().collect::<Vec<_>>();
+            let range = crate::planning_memory::split_ascii_whitespace(range, memory)?;
+            let limit = crate::planning_memory::split_ascii_whitespace(limit, memory)?;
             match (range.as_slice(), limit.as_slice()) {
                 (["range", axis, start, end], ["limit", limit]) => {
                     let limit = crate::sql::parse_limit(limit)?;
-                    plan(axis, start, end, limit)
+                    plan(axis, start, end, limit, memory)
                 },
                 _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
             }
@@ -25,17 +28,17 @@ pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> 
     }
 }
 
-fn pipeline_stages(source: &str) -> Result<Vec<&str>, QueryFailure> {
+fn pipeline_stages<'source>(
+    source: &'source str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<crate::planning_memory::PlanningVec<&'source str>, QueryFailure> {
     let capacity = source
         .bytes()
         .filter(|byte| *byte == b'|')
         .count()
         .checked_add(1)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-    let mut stages = Vec::new();
-    stages
-        .try_reserve_exact(capacity)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    let mut stages = crate::planning_memory::PlanningVec::with_capacity(memory, capacity)?;
     let mut start = 0;
     let mut quoted = false;
     let mut escaped = false;
@@ -54,7 +57,7 @@ fn pipeline_stages(source: &str) -> Result<Vec<&str>, QueryFailure> {
                     let stage = source
                         .get(start..index)
                         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-                    stages.push(stage.trim());
+                    stages.push(stage.trim())?;
                     start = index
                         .checked_add(character.len_utf8())
                         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
@@ -69,11 +72,14 @@ fn pipeline_stages(source: &str) -> Result<Vec<&str>, QueryFailure> {
     let stage = source
         .get(start..)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-    stages.push(stage.trim());
+    stages.push(stage.trim())?;
     Ok(stages)
 }
 
-fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, QueryFailure> {
+fn parse_versioned_pipeline(
+    remaining_stages: &[&str],
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<LogicalPlan, QueryFailure> {
     let mut range = None;
     let mut filter = None;
     let mut projection = None;
@@ -87,7 +93,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         if let Some(arguments) = stage.strip_prefix("range ") {
-            let tokens = arguments.split_ascii_whitespace().collect::<Vec<_>>();
+            let tokens = crate::planning_memory::split_ascii_whitespace(arguments, memory)?;
             let &[axis, start, end] = tokens.as_slice() else {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             };
@@ -101,7 +107,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(FilterPredicate::BodyEquals(
-                crate::native_literal::parse_body(literal)?,
+                crate::native_literal::parse_body(literal, memory)?,
             ));
             stage_order = 2;
         } else if let Some(predicate) = stage.strip_prefix("filter ") {
@@ -109,7 +115,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(FilterPredicate::AttributeEquals(
-                crate::attribute_syntax::parse_predicate(predicate)?,
+                crate::attribute_syntax::parse_predicate(predicate, memory)?,
             ));
             stage_order = 2;
         } else if let Some(literal) = stage.strip_prefix("search body == ") {
@@ -117,21 +123,26 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(FilterPredicate::BodyEquals(
-                crate::native_literal::parse_search_string(literal)?,
+                crate::native_literal::parse_search_string(literal, memory)?,
             ));
             stage_order = 2;
         } else if let Some(literal) = stage.strip_prefix("search body contains ") {
             if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            let value = crate::native_literal::parse_search_string(literal)?;
-            let text = value
+            let value = crate::native_literal::parse_search_string(literal, memory)?;
+            let text_source = value
                 .as_str()
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?
-                .to_owned();
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+            let text_memory = memory.reserve(
+                u64::try_from(text_source.len())
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+            )?;
+            let text = text_source.to_owned();
             filter = Some(FilterPredicate::BodyContains(crate::search::search_text(
                 text,
             )?));
+            drop(text_memory);
             stage_order = 2;
         } else if let Some(literal) = stage
             .strip_prefix("search body =~ ")
@@ -140,26 +151,31 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            let value = crate::native_literal::parse_search_string(literal)?;
-            let text = value
+            let value = crate::native_literal::parse_search_string(literal, memory)?;
+            let text_source = value
                 .as_str()
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?
-                .to_owned();
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+            let text_memory = memory.reserve(
+                u64::try_from(text_source.len())
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+            )?;
+            let text = text_source.to_owned();
             filter = Some(FilterPredicate::BodyRegex(
                 crate::search::BoundedRegex::from_source(text)?,
             ));
+            drop(text_memory);
             stage_order = 2;
         } else if let Some(columns) = stage.strip_prefix("project ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            projection = Some(parse_projection(columns)?);
+            projection = Some(parse_projection(columns, memory)?);
             stage_order = 3;
         } else if stage == "aggregate count" || stage.starts_with("aggregate count by ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            aggregate = Some(parse_aggregate(stage)?);
+            aggregate = Some(parse_aggregate(stage, memory)?);
             stage_order = 3;
         } else if stage == "json" {
             if transform.is_some() || filter.is_some() || stage_order > 2 {
@@ -183,7 +199,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             if ordering.is_some() || aggregate.is_some() || stage_order > 3 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            ordering = Some(specification.to_owned());
+            ordering = Some(specification);
             stage_order = 4;
         } else if let Some(value) = stage.strip_prefix("limit ") {
             limit = Some(value);
@@ -200,6 +216,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
         crate::sql::parse_limit(
             limit.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
         )?,
+        memory,
     )?;
     if let Some(filter) = filter {
         plan = plan.with_filter(filter);
@@ -208,13 +225,13 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
         plan = plan.with_transform(transform);
     }
     if let Some(projection) = projection {
-        plan = plan.with_projection(projection);
+        plan = plan.with_projection(projection.into_vec());
     }
     if let Some(aggregate) = aggregate {
         plan = plan.with_aggregate(aggregate);
     }
     if let Some(ordering) = ordering {
-        let parsed = parse_ordering(plan.temporal_axis(), &ordering)?;
+        let parsed = parse_ordering(plan.temporal_axis(), ordering, memory)?;
         plan = plan.with_ordering(parsed);
     }
     Ok(plan)
@@ -230,15 +247,18 @@ fn parse_cast_target(source: &str) -> Result<CastTarget, QueryFailure> {
     }
 }
 
-pub(crate) fn parse_sql(source: &str) -> Result<LogicalPlan, QueryFailure> {
-    crate::sql::parse(source)
+pub(crate) fn parse_sql(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<LogicalPlan, QueryFailure> {
+    crate::sql::parse(source, memory)
 }
 
-fn parse_projection(source: &str) -> Result<Vec<ProjectionColumn>, QueryFailure> {
-    let mut projection = Vec::new();
-    projection
-        .try_reserve_exact(5)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+fn parse_projection(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<crate::planning_memory::PlanningVec<ProjectionColumn>, QueryFailure> {
+    let mut projection = crate::planning_memory::PlanningVec::with_capacity(memory, 5)?;
     let mut start = 0;
     let mut quoted = false;
     let mut escaped = false;
@@ -253,7 +273,11 @@ fn parse_projection(source: &str) -> Result<Vec<ProjectionColumn>, QueryFailure>
                     let column = source
                         .get(start..index)
                         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-                    push_projection_column(&mut projection, column.trim())?;
+                    crate::sql_selection::push_column(
+                        &mut projection,
+                        column.trim(),
+                        crate::sql_selection::IdentifierCase::Exact,
+                    )?;
                     start = index
                         .checked_add(character.len_utf8())
                         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
@@ -265,44 +289,33 @@ fn parse_projection(source: &str) -> Result<Vec<ProjectionColumn>, QueryFailure>
     let column = source
         .get(start..)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-    push_projection_column(&mut projection, column.trim())?;
+    crate::sql_selection::push_column(
+        &mut projection,
+        column.trim(),
+        crate::sql_selection::IdentifierCase::Exact,
+    )?;
     Ok(projection)
 }
 
-fn push_projection_column(
-    projection: &mut Vec<ProjectionColumn>,
-    column: &str,
-) -> Result<(), QueryFailure> {
-    if column.is_empty() || projection.len() == 5 {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
-    let column = match column {
-        "body" => ProjectionColumn::Body,
-        "query_time" => ProjectionColumn::QueryTime,
-        "event_time" => ProjectionColumn::EventTime,
-        "ingest_time" => ProjectionColumn::IngestTime,
-        "commit_position" => ProjectionColumn::CommitPosition,
-        _ => ProjectionColumn::Attribute(crate::attribute_syntax::parse_path(column)?),
-    };
-    if projection.contains(&column) {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
-    projection.push(column);
-    Ok(())
-}
-
-fn parse_aggregate(stage: &str) -> Result<AggregateSpec, QueryFailure> {
+fn parse_aggregate(
+    stage: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<AggregateSpec, QueryFailure> {
     if stage == "aggregate count" {
         return Ok(AggregateSpec::count());
     }
     let columns = stage
         .strip_prefix("aggregate count by ")
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
-    parse_projection(columns).map(AggregateSpec::count_by)
+    parse_projection(columns, memory).map(|columns| AggregateSpec::count_by(columns.into_vec()))
 }
 
-fn parse_ordering(axis: TemporalAxis, specification: &str) -> Result<OrderSpec, QueryFailure> {
-    let tokens = specification.split_ascii_whitespace().collect::<Vec<_>>();
+fn parse_ordering(
+    axis: TemporalAxis,
+    specification: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<OrderSpec, QueryFailure> {
+    let tokens = crate::planning_memory::split_ascii_whitespace(specification, memory)?;
     let &[primary, primary_direction, commit, commit_direction] = tokens.as_slice() else {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     };
