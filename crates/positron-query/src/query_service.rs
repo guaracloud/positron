@@ -107,6 +107,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let planning_memory = crate::planning_memory::PlanningMemory::new(budget.memory_bytes());
         let parse_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
         let mut plan = parser(source, &planning_memory)?;
+        let parser_retained = planning_memory.take_retained();
         let compile_work_units = plan.search_compile_work_units();
         let cpu_work_units = if compile_work_units == 0 {
             parse_work_units
@@ -134,11 +135,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ));
         }
         let retained_plan_memory = plan.retained_memory_bytes()?;
-        if retained_plan_memory > budget.memory_bytes() {
-            return Err(QueryFailure::budget_exhausted(
-                QueryBudgetDimension::MemoryBytes,
-            ));
-        }
+        (retained_plan_memory <= budget.memory_bytes())
+            .then_some(())
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
         if retained_plan_memory
             .checked_add(plan.search_memory_bytes())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
@@ -149,7 +148,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::MemoryBytes,
             ));
         }
-        let planning_memory = planning_memory.reserve(retained_plan_memory)?;
+        let parser_retained_bytes = parser_retained.bytes();
+        let plan_retained_bytes = retained_plan_memory
+            .checked_sub(parser_retained_bytes)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let planning_memory = planning_memory.reserve(plan_retained_bytes)?;
+        drop(parser_retained);
         plan.compile_search()?;
         if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));

@@ -3,23 +3,20 @@ use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
 struct PlanningMemoryState {
     limit: u64,
     current: AtomicU64,
     peak: AtomicU64,
+    retained: AtomicU64,
 }
-
 #[derive(Clone)]
 pub(crate) struct PlanningMemory {
     state: Arc<PlanningMemoryState>,
 }
-
 pub(crate) struct PlanningReservation {
     state: Arc<PlanningMemoryState>,
     bytes: u64,
 }
-
 impl PlanningMemory {
     pub(crate) fn new(limit: u64) -> Self {
         Self {
@@ -27,6 +24,7 @@ impl PlanningMemory {
                 limit,
                 current: AtomicU64::new(0),
                 peak: AtomicU64::new(0),
+                retained: AtomicU64::new(0),
             }),
         }
     }
@@ -71,9 +69,106 @@ impl PlanningMemory {
             .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
         self.reserve(bytes)
     }
+
+    #[allow(deprecated)]
+    pub(crate) fn retain_reservation(
+        &self,
+        mut reservation: PlanningReservation,
+        bytes: u64,
+    ) -> Result<(), QueryFailure> {
+        reservation.reconcile(bytes)?;
+        self.state
+            .retained
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+                retained.checked_add(bytes)
+            })
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        reservation.disarm();
+        Ok(())
+    }
+
+    pub(crate) fn take_retained(&self) -> PlanningReservation {
+        PlanningReservation {
+            state: Arc::clone(&self.state),
+            bytes: self.state.retained.swap(0, Ordering::AcqRel),
+        }
+    }
+
+    pub(crate) fn release_retained(&self, bytes: u64) -> Result<(), QueryFailure> {
+        let mut retained = self.state.retained.load(Ordering::Acquire);
+        loop {
+            let remaining = retained
+                .checked_sub(bytes)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            match self.state.retained.compare_exchange_weak(
+                retained,
+                remaining,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.state.current.fetch_sub(bytes, Ordering::AcqRel);
+                    return Ok(());
+                },
+                Err(observed) => retained = observed,
+            }
+        }
+    }
 }
 
 impl PlanningReservation {
+    fn disarm(&mut self) {
+        self.bytes = 0;
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(crate) fn reconcile(&mut self, bytes: u64) -> Result<(), QueryFailure> {
+        if bytes > self.bytes {
+            let additional = bytes - self.bytes;
+            let reservation = Arc::clone(&self.state);
+            let mut current = reservation.current.load(Ordering::Acquire);
+            loop {
+                let next = current.checked_add(additional).ok_or_else(|| {
+                    QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes)
+                })?;
+                if next > reservation.limit {
+                    return Err(QueryFailure::budget_exhausted(
+                        QueryBudgetDimension::MemoryBytes,
+                    ));
+                }
+                match reservation.current.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        reservation.peak.fetch_max(next, Ordering::AcqRel);
+                        break;
+                    },
+                    Err(observed) => current = observed,
+                }
+            }
+        } else {
+            self.state
+                .current
+                .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub(crate) fn release_bytes(&mut self, bytes: u64) -> Result<(), QueryFailure> {
+        let remaining = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        self.reconcile(remaining)
+    }
+
     pub(crate) fn merge(&mut self, other: Self) -> Result<(), QueryFailure> {
         let bytes = self
             .bytes
@@ -107,6 +202,12 @@ impl<T> PlanningVec<T> {
         if values.try_reserve_exact(capacity).is_err() {
             return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
         }
+        let actual = u64::try_from(values.capacity())
+            .ok()
+            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<T>() as u64))
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let mut reservation = reservation;
+        reservation.reconcile(actual)?;
         Ok(Self {
             values,
             memory: memory.clone(),
@@ -122,6 +223,11 @@ impl<T> PlanningVec<T> {
                 return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
             }
             self.reservation.merge(reservation)?;
+            let actual = u64::try_from(self.values.capacity())
+                .ok()
+                .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<T>() as u64))
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            self.reservation.reconcile(actual)?;
         }
         self.values.push(value);
         Ok(())
@@ -145,6 +251,10 @@ impl<T> PlanningVec<T> {
 
     pub(crate) fn into_vec(self) -> Vec<T> {
         self.values
+    }
+
+    pub(crate) fn into_vec_with_reservation(self) -> (Vec<T>, PlanningReservation) {
+        (self.values, self.reservation)
     }
 }
 
@@ -262,7 +372,10 @@ fn projection_memory(mut bytes: u64, columns: &[ProjectionColumn]) -> Result<u64
     Ok(bytes)
 }
 
-fn path_memory(mut bytes: u64, path: &positron_signals::SchemaPath) -> Result<u64, QueryFailure> {
+pub(crate) fn path_memory(
+    mut bytes: u64,
+    path: &positron_signals::SchemaPath,
+) -> Result<u64, QueryFailure> {
     bytes = add_capacity(
         bytes,
         positron_signals::SchemaPath::system_max_segments(),
@@ -280,55 +393,5 @@ fn path_memory(mut bytes: u64, path: &positron_signals::SchemaPath) -> Result<u6
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn checked_planning_arithmetic_rejects_capacity_overflow() {
-        assert!(add_capacity(u64::MAX, 1, 1).is_err());
-        assert!(add_capacity(0, usize::MAX, usize::MAX).is_err());
-        let path = positron_signals::SchemaPath::root(
-            positron_domain::value::AttributeNamespace::Record,
-            "key".to_owned(),
-        )
-        .expect("bounded test path");
-        assert!(path_memory(u64::MAX, &path).is_err());
-    }
-
-    #[test]
-    fn planning_reservations_are_bounded_and_release_on_drop() {
-        let memory = PlanningMemory::new(8);
-        let reservation = memory.reserve(8).expect("initial reservation");
-        assert!(memory.reserve(1).is_err());
-        drop(reservation);
-        assert!(memory.reserve(8).is_ok());
-
-        let unbounded = PlanningMemory::new(u64::MAX);
-        let reservation = unbounded.reserve(u64::MAX).expect("maximum reservation");
-        assert!(unbounded.reserve(1).is_err());
-        drop(reservation);
-    }
-
-    #[test]
-    fn planning_vec_borrows_debug_and_transfers_its_bounded_storage() {
-        let memory = PlanningMemory::new(64);
-        let mut values: PlanningVec<u8> =
-            PlanningVec::with_capacity(&memory, 1).expect("vector reserve");
-        values.push(7).expect("vector push");
-        assert_eq!(&*values, &[7]);
-        values[0] = 9;
-        assert_eq!(format!("{values:?}"), "[9]");
-        assert!(values.memory().reserve(1).is_ok());
-        assert_eq!(values.into_vec(), vec![9]);
-    }
-
-    #[test]
-    fn retained_plan_accounting_includes_group_columns() {
-        let range = crate::plan::TemporalRange::new(0, 1).expect("valid range");
-        let plan = LogicalPlan::logs(crate::plan::TemporalAxis::QueryTime, range, 1)
-            .with_aggregate(crate::plan::AggregateSpec::count_by(vec![
-                ProjectionColumn::QueryTime,
-            ]));
-        assert!(retained_plan_bytes(&plan).is_ok());
-    }
-}
+#[path = "planning_memory_tests.rs"]
+mod tests;

@@ -31,9 +31,6 @@ pub(crate) fn parse_path(
     source: &str,
     memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<SchemaPath, QueryFailure> {
-    let scratch = memory.reserve(
-        u64::try_from(source.len()).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-    )?;
     let (namespace, mut remaining) = if let Some(value) = strip_namespace(source, "resource") {
         (AttributeNamespace::Resource, value)
     } else if let Some(value) = strip_namespace(source, "scope") {
@@ -43,21 +40,24 @@ pub(crate) fn parse_path(
     } else {
         return Err(unsupported());
     };
+    let mut reservation = memory.reserve(0)?;
     let mut segments = crate::planning_memory::PlanningVec::with_capacity(memory, 0)?;
     while !remaining.is_empty() {
         let Some(after_open) = remaining.strip_prefix("[\"") else {
             return Err(unsupported());
         };
-        let (segment, after_segment) = parse_segment(after_open, memory)?;
+        let (segment, after_segment, segment_reservation) = parse_segment(after_open, memory)?;
         if segments.len() == SchemaPath::system_max_segments() {
             return Err(unsupported());
         }
+        reservation.merge(segment_reservation)?;
         segments.push(segment)?;
         remaining = after_segment;
     }
-    let path =
-        SchemaPath::from_segments(namespace, segments.into_vec()).map_err(map_schema_failure)?;
-    drop(scratch);
+    let (segments, segments_reservation) = segments.into_vec_with_reservation();
+    reservation.merge(segments_reservation)?;
+    let path = SchemaPath::from_segments(namespace, segments).map_err(map_schema_failure)?;
+    memory.retain_reservation(reservation, crate::planning_memory::path_memory(0, &path)?)?;
     Ok(path)
 }
 
@@ -130,40 +130,17 @@ fn split_path(source: &str) -> Result<(&str, &str), QueryFailure> {
 fn parse_segment<'source>(
     source: &'source str,
     memory: &crate::planning_memory::PlanningMemory,
-) -> Result<(String, &'source str), QueryFailure> {
-    let mut segment = String::new();
-    let reservation = memory.reserve(
-        u64::try_from(source.len().min(4_096))
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-    )?;
-    segment
-        .try_reserve_exact(source.len().min(4_096))
-        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-    let mut remaining = source;
-    loop {
-        let character = remaining.chars().next().ok_or_else(unsupported)?;
-        remaining = remaining
-            .get(character.len_utf8()..)
-            .ok_or_else(unsupported)?;
-        match character {
-            '"' => {
-                remaining = remaining.strip_prefix(']').ok_or_else(unsupported)?;
-                drop(reservation);
-                return Ok((segment, remaining));
-            },
-            '\\' => {
-                let escaped = remaining.chars().next().ok_or_else(unsupported)?;
-                if !matches!(escaped, '"' | '\\' | '|') {
-                    return Err(unsupported());
-                }
-                remaining = remaining
-                    .get(escaped.len_utf8()..)
-                    .ok_or_else(unsupported)?;
-                segment.push(escaped);
-            },
-            _ => segment.push(character),
-        }
-    }
+) -> Result<
+    (
+        String,
+        &'source str,
+        crate::planning_memory::PlanningReservation,
+    ),
+    QueryFailure,
+> {
+    let (segment, remaining, reservation) = crate::quoted::parse_after_open(source, memory)?;
+    let remaining = remaining.strip_prefix(']').ok_or_else(unsupported)?;
+    Ok((segment, remaining, reservation))
 }
 
 fn map_schema_failure(failure: SchemaFailure) -> QueryFailure {

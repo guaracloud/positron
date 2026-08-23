@@ -7,8 +7,7 @@ pub(crate) fn tokenize<'source>(
     source: &'source str,
     memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<crate::planning_memory::PlanningVec<&'source str>, QueryFailure> {
-    let capacity = source.len().min(MAX_SQL_TOKENS);
-    let mut tokens = crate::planning_memory::PlanningVec::with_capacity(memory, capacity)?;
+    let mut tokens = crate::planning_memory::PlanningVec::with_capacity(memory, 0)?;
     let mut start = None;
     let mut quoted = false;
     let mut escaped = false;

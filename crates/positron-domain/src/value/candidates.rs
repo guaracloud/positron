@@ -158,4 +158,20 @@ impl CandidateAttributeValue {
             observer,
         )
     }
+
+    /// Validates an attribute value while exposing every bounded output allocation.
+    pub fn validate_attribute_observed_with_facts<O: NativeValueObserver>(
+        self,
+        profile: ValueLimitProfile,
+        observer: &mut O,
+    ) -> Result<ObservedValueTransfer, ObservedValueFailure<O::Error>> {
+        let limits = profile.effective_limits();
+        validate_attribute_value_observed_with_facts(
+            self,
+            limits,
+            limits.dynamic_value().individual_value_bytes(),
+            limits.dynamic_value().nesting_depth().value(),
+            observer,
+        )
+    }
 }

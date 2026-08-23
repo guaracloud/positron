@@ -1042,7 +1042,7 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
     use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
     use positron_policy::NativeLogAttribute;
 
-    const EXACT_PEAK_BYTES: u64 = 69_893;
+    const EXACT_PEAK_BYTES: u64 = 69_891;
 
     let fixture = QueryFixture::new("attribute-projection-memory")?;
     fixture.kernel.append_attribute_logs(

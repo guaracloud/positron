@@ -107,28 +107,58 @@ pub(crate) fn parse_body_predicate(
         ));
     }
     let value = crate::native_literal::parse_search_string(literal, memory)?;
-    let text_source = value.as_str().ok_or_else(unsupported)?;
-    let text_memory = memory.reserve(
-        u64::try_from(text_source.len())
+    let retained = u64::try_from(
+        value
+            .retained_heap_bytes()
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-    )?;
+    )
+    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    let Some(text_source) = value.as_str() else {
+        memory.release_retained(retained)?;
+        return Err(unsupported());
+    };
+    let text_bytes = u64::try_from(text_source.len())
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    let text_memory = memory.reserve(text_bytes)?;
     let text = text_source.to_owned();
     if operator.eq_ignore_ascii_case("contains") {
-        let search = crate::search::search_text(text)?;
+        let search = crate::search::search_text(text);
+        drop(value);
         drop(text_memory);
+        memory.release_retained(retained)?;
+        let search = search?;
         return Ok(FilterPredicate::BodyContains(search));
     }
     if operator.eq_ignore_ascii_case("regexp")
         || operator.eq_ignore_ascii_case("regex")
         || operator == "~"
     {
-        let regex = crate::search::BoundedRegex::from_source(text)?;
+        let regex = crate::search::BoundedRegex::from_source(text);
+        drop(value);
         drop(text_memory);
+        memory.release_retained(retained)?;
+        let regex = regex?;
         return Ok(FilterPredicate::BodyRegex(regex));
     }
+    drop(value);
+    drop(text_memory);
+    memory.release_retained(retained)?;
     Err(unsupported())
 }
 
 fn unsupported() -> QueryFailure {
     QueryFailure::new(QueryFailureCode::UnsupportedQuery)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_body_search_operator_releases_its_temporary_value() {
+        let memory = crate::planning_memory::PlanningMemory::new(1_024);
+        let failure =
+            parse_body_predicate("like", "\"needle\"", &memory).expect_err("unknown operator");
+        assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    }
 }
