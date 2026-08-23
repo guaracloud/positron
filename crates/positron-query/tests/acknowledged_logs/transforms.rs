@@ -93,7 +93,7 @@ fn parser_scratch_and_retained_output_have_exact_memory_boundaries() -> Result<(
     let json_fixture = QueryFixture::new("query-json-transform-memory-boundary")?;
     let json_source = format!(
         "{{{}}}",
-        (0..100)
+        (0..1_024)
             .map(|index| format!(r#""k{index}":"{}""#, "value".repeat(8)))
             .collect::<Vec<_>>()
             .join(",")
@@ -211,6 +211,42 @@ fn nested_json_parser_allocations_are_admitted_before_the_final_value() -> Resul
     let events = service.execute(query)?.collect::<Vec<_>>();
     assert!(matches!(
         events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    ));
+
+    let permissive = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 4_194_304, 60)?
+            .with_cpu_work_units(1_024)?,
+    )?;
+    let permissive_events = service.execute(permissive)?.collect::<Vec<_>>();
+    let peak = permissive_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats.memory_peak_bytes()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("nested JSON peak query did not complete")?;
+    let exact_boundary = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
+        QueryBudget::new(
+            1_048_576,
+            16,
+            16,
+            1_048_576,
+            peak.checked_sub(1).ok_or("nested JSON peak was zero")?,
+            60,
+        )?
+        .with_cpu_work_units(1_024)?,
+    )?;
+    let exact_events = service.execute(exact_boundary)?.collect::<Vec<_>>();
+    assert!(matches!(
+        exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().limiting_budget()

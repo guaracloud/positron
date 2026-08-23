@@ -15,6 +15,17 @@ pub trait NativeValueObserver {
 
     fn observe_structure(&mut self) -> Result<(), Self::Error>;
     fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error>;
+
+    /// Admits canonical output capacity before a validated collection is
+    /// allocated while its candidate values remain live.
+    fn observe_allocation(&mut self, _bytes: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Releases an output-capacity admission when validation cannot finish.
+    fn release_allocation(&mut self, _bytes: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 pub(super) struct UnobservedNativeValue;
@@ -56,6 +67,7 @@ pub struct ObservedValueTransfer {
     pub(super) value: ValidatedAttributeValue,
     pub(super) value_size_bytes: usize,
     pub(super) retained_heap_bytes: usize,
+    pub(super) allocation_bytes: usize,
 }
 
 impl ObservedValueTransfer {
@@ -63,11 +75,13 @@ impl ObservedValueTransfer {
         value: ValidatedAttributeValue,
         value_size_bytes: usize,
         retained_heap_bytes: usize,
+        allocation_bytes: usize,
     ) -> Self {
         Self {
             value,
             value_size_bytes,
             retained_heap_bytes,
+            allocation_bytes,
         }
     }
 
@@ -87,6 +101,10 @@ impl ObservedValueTransfer {
     #[must_use]
     pub const fn retained_heap_bytes(&self) -> usize {
         self.retained_heap_bytes
+    }
+
+    pub(super) const fn allocation_bytes(&self) -> usize {
+        self.allocation_bytes
     }
 
     /// Borrows the validated value without starting another traversal.

@@ -124,7 +124,7 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
         let bytes = u64::try_from(character.len_utf8())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         self.observer.reserve_memory(bytes)?;
-        if value.try_reserve(character.len_utf8()).is_err() {
+        if value.try_reserve_exact(character.len_utf8()).is_err() {
             self.observer.release_memory(bytes)?;
             return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
         }

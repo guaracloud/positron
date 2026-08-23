@@ -6,8 +6,13 @@ use crate::value::{
 #[derive(Default)]
 struct CountingObserver {
     fail_at_structure: Option<usize>,
+    fail_at_allocation: Option<usize>,
     structures: usize,
     payloads: usize,
+    allocation_calls: usize,
+    allocations: Vec<usize>,
+    releases: Vec<usize>,
+    live_bytes: usize,
 }
 
 impl NativeValueObserver for CountingObserver {
@@ -23,6 +28,22 @@ impl NativeValueObserver for CountingObserver {
 
     fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
         self.payloads = self.payloads.saturating_add(1);
+        Ok(())
+    }
+
+    fn observe_allocation(&mut self, bytes: usize) -> Result<(), Self::Error> {
+        self.allocation_calls = self.allocation_calls.saturating_add(1);
+        if self.fail_at_allocation == Some(self.allocation_calls) {
+            return Err("allocation admission failed");
+        }
+        self.live_bytes = self.live_bytes.saturating_add(bytes);
+        self.allocations.push(bytes);
+        Ok(())
+    }
+
+    fn release_allocation(&mut self, bytes: usize) -> Result<(), Self::Error> {
+        self.live_bytes = self.live_bytes.saturating_sub(bytes);
+        self.releases.push(bytes);
         Ok(())
     }
 }
@@ -74,4 +95,69 @@ fn observed_log_body_validation_returns_profile_transfer_facts_from_one_traversa
     );
     assert_eq!(observer.structures, 7);
     assert_eq!(observer.payloads, 4);
+    assert_eq!(observer.allocations, vec![96, 128, 96]);
+    assert_eq!(observer.live_bytes, 320);
+}
+
+#[test]
+fn observed_validation_releases_output_capacity_on_cancellation() {
+    let candidate = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+        "nested".to_owned(),
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::string("payload".to_owned())]),
+    )]);
+    let mut observer = CountingObserver {
+        fail_at_structure: Some(4),
+        ..CountingObserver::default()
+    };
+    assert_eq!(
+        candidate.validate_log_body_observed(
+            ValueLimitProfile::release_1_system_maximum(),
+            &mut observer,
+        ),
+        Err(ObservedValueFailure::Observer("cancelled traversal"))
+    );
+    assert_eq!(observer.allocations, vec![96, 64]);
+    assert_eq!(observer.releases, vec![64, 96]);
+    assert_eq!(observer.live_bytes, 0);
+}
+
+#[test]
+fn observed_validation_propagates_allocation_admission_failure() {
+    let candidate = CandidateAttributeValue::array(vec![CandidateAttributeValue::null()]);
+    let mut observer = CountingObserver {
+        fail_at_allocation: Some(1),
+        ..CountingObserver::default()
+    };
+    assert_eq!(
+        candidate.validate_log_body_observed(
+            ValueLimitProfile::release_1_system_maximum(),
+            &mut observer,
+        ),
+        Err(ObservedValueFailure::Observer(
+            "allocation admission failed"
+        ))
+    );
+    assert!(observer.allocations.is_empty());
+    assert!(observer.releases.is_empty());
+    assert_eq!(observer.live_bytes, 0);
+}
+
+#[test]
+fn observed_validation_releases_capacity_when_collection_value_limit_is_exceeded() {
+    let candidate = CandidateAttributeValue::array(vec![
+        CandidateAttributeValue::string("a".to_owned()),
+        CandidateAttributeValue::string("b".to_owned()),
+    ]);
+    let mut observer = CountingObserver::default();
+    assert!(
+        candidate
+            .validate_log_body_observed(
+                super::profile_with_value_and_body_bytes(64, 1),
+                &mut observer
+            )
+            .is_err()
+    );
+    assert_eq!(observer.allocations, vec![128]);
+    assert_eq!(observer.releases, vec![128]);
+    assert_eq!(observer.live_bytes, 0);
 }
