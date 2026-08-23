@@ -211,6 +211,29 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
         drop(service);
         drop(ledger);
         drop(catalog);
+        let durable_identity = initialized.durable_identity()?;
+        let durable_ingest = durable_identity.attribute(
+            &initialized.key,
+            PresentedCredential::parse(&ingest)?,
+            RequestedIntent::Ingest,
+            CompatibilityHints::none(),
+        );
+        let durable_query = durable_identity.attribute(
+            &initialized.key,
+            PresentedCredential::parse(&query_secret)?,
+            RequestedIntent::Query,
+            CompatibilityHints::none(),
+        );
+        assert_eq!(
+            durable_ingest.is_ok(),
+            code == 1,
+            "{state} ingest identity state"
+        );
+        assert_eq!(
+            durable_query.is_ok(),
+            code <= 2,
+            "{state} query identity state"
+        );
 
         let reopened_catalog = open_catalog(&initialized)?;
         let reopened_protection = initialized.key.segment_key(initialized.instance, scope)?;

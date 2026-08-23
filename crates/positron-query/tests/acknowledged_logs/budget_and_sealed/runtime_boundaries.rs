@@ -37,6 +37,37 @@ fn clock_only_runtime_override_preserves_normal_query_execution() -> Result<(), 
 }
 
 #[test]
+fn output_wall_budget_is_checked_after_page_materialization() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("output-wall-boundary")?;
+    fixture.kernel.append_log("materialized", 20, 1)?;
+    let service = super::super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        SequenceClock::shared([100, 100, 100, 100, 100, 160]),
+    );
+    let planned = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service.execute(planned)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::BudgetExhausted
+                && failure.stats().limiting_budget() == Some(QueryBudgetDimension::WallSeconds)
+    ));
+    Ok(())
+}
+
+#[test]
 fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         positron_query::QueryClockFailure.to_string(),

@@ -319,6 +319,124 @@ fn resumable_reconnect_survives_query_service_and_ledger_reopen() -> Result<(), 
 }
 
 #[test]
+fn resume_rejects_cumulative_counter_underflow_before_additional_work() -> Result<(), Box<dyn Error>>
+{
+    let fixture = CursorFixture::new()?;
+    let decoded_underflow = rewritten_cursor(
+        &fixture,
+        |bytes| {
+            bytes[229..237].copy_from_slice(&1_u64.to_be_bytes());
+            bytes[293..301].copy_from_slice(&2_u64.to_be_bytes());
+        },
+        b"query-cursor-v4",
+    )?;
+    let decoded_events = fixture
+        .service()
+        .resume(fixture.context, &decoded_underflow)?
+        .collect::<Vec<_>>();
+    assert!(
+        decoded_events
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        decoded_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::BudgetExhausted
+                && failure.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::DecodedRecords)
+    ));
+
+    let fixture = CursorFixture::new()?;
+    let output_underflow = rewritten_cursor(
+        &fixture,
+        |bytes| {
+            bytes[301..309].copy_from_slice(&3_u64.to_be_bytes());
+            bytes[237..245].copy_from_slice(&2_u64.to_be_bytes());
+        },
+        b"query-cursor-v4",
+    )?;
+    let output_events = fixture
+        .service()
+        .resume(fixture.context, &output_underflow)?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        output_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::BudgetExhausted
+                && failure.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::OutputRows)
+    ));
+    Ok(())
+}
+
+#[test]
+fn legacy_cursor_preserves_event_and_ingest_axis_plan_digests() -> Result<(), Box<dyn Error>> {
+    for axis in [2_u8, 3_u8] {
+        let fixture = CursorFixture::new()?;
+        let mut encoding = Vec::with_capacity(19);
+        encoding.push(axis);
+        encoding.extend_from_slice(&(-100_i64).to_be_bytes());
+        encoding.extend_from_slice(&100_i64.to_be_bytes());
+        encoding.extend_from_slice(&2_u16.to_be_bytes());
+        let digest = fixture
+            .kernel
+            .ledger()?
+            .control_tokens()
+            .digest(b"query-plan-v1", &encoding)?;
+        let legacy = rewritten_cursor(
+            &fixture,
+            |bytes| {
+                bytes[..8].copy_from_slice(b"POSQCR01");
+                bytes[104] = axis;
+                bytes.drain(317..4449);
+                bytes.drain(261..269);
+                bytes[123..155].copy_from_slice(&digest);
+            },
+            b"query-cursor-v1",
+        )?;
+        let events = fixture
+            .service()
+            .resume(fixture.context, &legacy)
+            .expect("legacy axis digest must authenticate before execution")
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn resume_rejects_a_reconstructed_plan_that_cannot_fit_its_memory_budget()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = CursorFixture::new()?;
+    let plan = fixture.service().plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "s.*" | limit 2"#,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = fixture.service().execute_page(plan)?.collect::<Vec<_>>();
+    fixture.cursor = continuation(&first)?.clone();
+    let constrained = rewritten_cursor(
+        &fixture,
+        |bytes| bytes[253..261].copy_from_slice(&100_000_u64.to_be_bytes()),
+        b"query-cursor-v4",
+    )?;
+    let failure = fixture
+        .service()
+        .resume(fixture.context, &constrained)
+        .expect_err("reconstruction must enforce the authenticated memory ceiling");
+    assert_eq!(failure.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    );
+    Ok(())
+}
+
+#[test]
 fn advanced_resume_preserves_peak_and_pruning_stats_after_ledger_reopen()
 -> Result<(), Box<dyn Error>> {
     let mut fixture = CursorFixture::new()?;
@@ -770,6 +888,24 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
     )
     .map_err(|error| format!("legacy construction failed: {error:?}"))?;
     assert_eq!(legacy.as_bytes().len(), 341);
+    let invalid_legacy = rewritten_cursor(
+        &fixture,
+        |bytes| {
+            bytes[..8].copy_from_slice(b"POSQCR01");
+            bytes.drain(317..4449);
+            bytes.drain(261..269);
+            bytes[123..155].fill(0);
+        },
+        b"query-cursor-v1",
+    )?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &invalid_legacy)
+            .expect_err("legacy plan digest is authenticated")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
     let events = fixture
         .service()
         .resume(fixture.context, &legacy)

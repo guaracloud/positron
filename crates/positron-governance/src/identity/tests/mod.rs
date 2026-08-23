@@ -93,6 +93,7 @@ fn durable_lifecycle_states_are_decoded_and_query_readability_is_fail_closed() {
             generation: identity.generation,
             lifecycle: expected,
         };
+        assert_eq!(context.tenant_lifecycle(), expected);
         assert_eq!(identity.validate_query_context(context).is_ok(), readable);
     }
 }

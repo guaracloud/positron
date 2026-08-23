@@ -519,7 +519,10 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlTokenFailure, QueryFailureCode, map_protection_failure};
+    use super::{
+        CURSOR_BYTES, ControlTokenFailure, QueryCursor, QueryFailureCode, V3_PAYLOAD_BYTES,
+        map_protection_failure, source_length,
+    };
 
     #[test]
     fn protection_failures_keep_the_cursor_failure_boundary_closed() {
@@ -538,6 +541,28 @@ mod tests {
         assert_eq!(
             map_protection_failure(ControlTokenFailure::Custody).code(),
             QueryFailureCode::Internal
+        );
+    }
+
+    #[test]
+    fn source_length_rejects_unknown_language_and_checked_overflow() {
+        let mut bytes = vec![0_u8; CURSOR_BYTES];
+        bytes[V3_PAYLOAD_BYTES + 9] = 3;
+        assert_eq!(
+            source_length(&QueryCursor(bytes.clone()))
+                .expect_err("unknown language must fail closed")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+
+        bytes[V3_PAYLOAD_BYTES + 9] = 1;
+        bytes[V3_PAYLOAD_BYTES + 10..V3_PAYLOAD_BYTES + 12]
+            .copy_from_slice(&4_097_u16.to_be_bytes());
+        assert_eq!(
+            source_length(&QueryCursor(bytes))
+                .expect_err("source length above the checked cap must fail closed")
+                .code(),
+            QueryFailureCode::InvalidCursor
         );
     }
 }
