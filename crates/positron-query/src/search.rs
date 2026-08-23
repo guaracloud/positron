@@ -107,6 +107,11 @@ impl BoundedSubstring {
         &self.source
     }
 
+    pub(crate) fn source_memory_bytes(&self) -> Result<u64, QueryFailure> {
+        u64::try_from(self.source.capacity())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+    }
+
     #[cfg(test)]
     pub(crate) fn prefix_len(&self) -> usize {
         self.prefix.as_ref().map_or(0, |prefix| prefix.len())
@@ -249,6 +254,11 @@ impl BoundedRegex {
         self.pruning_literals.as_deref().unwrap_or_default()
     }
 
+    pub(crate) fn source_memory_bytes(&self) -> Result<u64, QueryFailure> {
+        u64::try_from(self.source.capacity())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+    }
+
     pub(crate) fn memory_bytes(&self) -> u64 {
         let automaton = self
             .compiled
@@ -280,6 +290,7 @@ impl PartialEq for BoundedRegex {
 
 impl Eq for BoundedRegex {}
 
+#[cfg(test)]
 pub(crate) fn search_text(source: String) -> Result<BoundedSubstring, QueryFailure> {
     BoundedSubstring::from_source(source)
 }

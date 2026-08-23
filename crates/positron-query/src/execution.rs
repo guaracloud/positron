@@ -96,7 +96,18 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_limit = framed!(
             ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
         );
-        let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
+        let plan_memory = framed!(state.plan.retained_memory_bytes());
+        let execution_memory = framed!(
+            state
+                .budget
+                .memory_bytes()
+                .checked_sub(plan_memory)
+                .ok_or_else(|| QueryFailure::budget_exhausted(
+                    crate::QueryBudgetDimension::MemoryBytes
+                ))
+        );
+        state.memory_peak_bytes = state.memory_peak_bytes.max(plan_memory);
+        let mut memory = crate::memory::QueryMemory::new(execution_memory);
         framed!(memory.acquire(state.plan.search_memory_bytes()));
         state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let mut observer = QueryScanObserver::new(

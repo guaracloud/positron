@@ -247,7 +247,7 @@ fn planning_failures_identify_the_effective_budget_limit() -> Result<(), Box<dyn
         Ok(_) => return Err("regex compilation exceeded its admitted memory budget".into()),
         Err(failure) => failure,
     };
-    assert_eq!(regex_memory.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(regex_memory.code(), QueryFailureCode::BudgetExhausted);
     assert_eq!(
         regex_memory.limiting_budget(),
         Some(QueryBudgetDimension::MemoryBytes)

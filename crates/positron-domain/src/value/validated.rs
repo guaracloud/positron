@@ -44,6 +44,26 @@ enum ValidatedAttributeValueInner {
     KeyValueList(Vec<ValidatedKeyValue>),
 }
 
+/// An owned scalar extracted from a validated native value.
+///
+/// This transfer preserves the validated allocation rather than cloning it
+/// into another scalar representation.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ValidatedScalar {
+    /// The explicit null value.
+    Null,
+    /// A boolean value.
+    Boolean(bool),
+    /// A signed integer value.
+    SignedInteger(i64),
+    /// An IEEE 754 floating-point bit pattern.
+    FloatingPointBits(u64),
+    /// A UTF-8 string value.
+    String(String),
+    /// An opaque byte value.
+    Bytes(Vec<u8>),
+}
+
 /// A profile-bounded ordered key/value entry.
 ///
 /// It retains the original key and typed value without last-write-wins
@@ -69,6 +89,21 @@ impl ValidatedKeyValue {
 }
 
 impl ValidatedAttributeValue {
+    /// Moves a scalar out of this validated value without cloning its heap data.
+    pub fn into_scalar(self) -> Option<ValidatedScalar> {
+        let scalar = match self.inner {
+            ValidatedAttributeValueInner::Null => ValidatedScalar::Null,
+            ValidatedAttributeValueInner::Boolean(value) => ValidatedScalar::Boolean(value),
+            ValidatedAttributeValueInner::SignedInteger(value) => ValidatedScalar::SignedInteger(value),
+            ValidatedAttributeValueInner::FloatingPointBits(value) => ValidatedScalar::FloatingPointBits(value),
+            ValidatedAttributeValueInner::String(value) => ValidatedScalar::String(value),
+            ValidatedAttributeValueInner::Bytes(value) => ValidatedScalar::Bytes(value),
+            ValidatedAttributeValueInner::Array(_)
+            | ValidatedAttributeValueInner::KeyValueList(_) => return None,
+        };
+        Some(scalar)
+    }
+
     /// Fallibly clones a previously bounded value without an unchecked heap allocation.
     pub fn try_clone(&self) -> Result<Self, DomainFailure> {
         let inner = match &self.inner {

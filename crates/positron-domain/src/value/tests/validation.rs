@@ -40,6 +40,14 @@ fn key_value_lists_are_never_coerced_into_arrays() {
 }
 
 #[test]
+fn owned_scalar_transfer_leaves_structural_values_structural() {
+    let value = CandidateAttributeValue::array(vec![])
+        .validate_attribute(profile())
+        .expect("empty array is a valid typed collection");
+    assert!(value.into_scalar().is_none());
+}
+
+#[test]
 fn configured_system_limits_cannot_raise_the_release_one_safe_maximum() {
     let maximum = ValueLimitProfile::release_1_system_maximum().system_limits();
     let raised_request = RequestLimits::new(

@@ -151,6 +151,33 @@ impl LogicalPlan {
         }
     }
 
+    pub(crate) fn logs_with_memory(
+        axis: TemporalAxis,
+        range: TemporalRange,
+        limit: u16,
+        memory: &crate::planning_memory::PlanningMemory,
+    ) -> Result<Self, crate::QueryFailure> {
+        let plan_memory = memory.reserve(
+            u64::try_from(std::mem::size_of::<Self>())
+                .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::Internal))?,
+        )?;
+        let mut projection = crate::planning_memory::PlanningVec::with_capacity(memory, 1)?;
+        projection.push(ProjectionColumn::Body)?;
+        let plan = Self {
+            version: 1,
+            axis,
+            range,
+            limit,
+            filter: None,
+            projection: projection.into_vec(),
+            aggregate: None,
+            ordering: OrderSpec::ascending(axis),
+            transform: None,
+        };
+        drop(plan_memory);
+        Ok(plan)
+    }
+
     #[must_use]
     pub const fn version(&self) -> u8 {
         self.version
@@ -202,6 +229,10 @@ impl LogicalPlan {
             | Some(FilterPredicate::AttributeEquals(_))
             | None => 0,
         }
+    }
+
+    pub(crate) fn retained_memory_bytes(&self) -> Result<u64, crate::QueryFailure> {
+        crate::planning_memory::retained_plan_bytes(self)
     }
 
     pub(crate) fn compile_search(&mut self) -> Result<(), crate::QueryFailure> {
@@ -312,6 +343,7 @@ pub struct PlannedQuery<'kernel> {
     pub(crate) plan: Arc<LogicalPlan>,
     pub(crate) budget: QueryBudget,
     pub(crate) _reservation: ResourceReservation<'kernel>,
+    pub(crate) _planning_memory: crate::planning_memory::PlanningReservation,
     pub(crate) started_at: u64,
     pub(crate) last_observed_at: u64,
     pub(crate) cpu_work_units: u64,

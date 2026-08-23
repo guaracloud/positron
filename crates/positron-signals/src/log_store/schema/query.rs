@@ -216,10 +216,14 @@ impl SchemaQuery {
         selector: OccurrenceSelector,
         value: ValidatedAttributeValue,
     ) -> Result<Self, SchemaFailure> {
-        match SchemaValue::try_from_validated(&value)? {
-            Some(value) => Ok(Self::value(path, selector, value)),
-            None => Ok(Self::native_value(path, selector, value)),
+        if matches!(
+            value.kind(),
+            AttributeValueKind::Array | AttributeValueKind::KeyValueList
+        ) {
+            return Ok(Self::native_value(path, selector, value));
         }
+        let value = SchemaValue::try_from_validated_owned(value)?;
+        Ok(Self::value(path, selector, value))
     }
     #[must_use]
     pub const fn path(&self) -> &SchemaPath {
@@ -229,6 +233,32 @@ impl SchemaQuery {
     pub const fn selector(&self) -> OccurrenceSelector {
         self.selector
     }
+
+    /// Returns a conservative charge for the query path and retained value.
+    pub fn retained_memory_bytes(&self) -> Result<usize, SchemaFailure> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(
+                SchemaPath::system_max_segments()
+                    .checked_mul(std::mem::size_of::<String>())
+                    .ok_or(SchemaFailure::LimitExceeded)?,
+            )
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        for segment in self.path.segments() {
+            bytes = bytes
+                .checked_add(segment.capacity())
+                .ok_or(SchemaFailure::LimitExceeded)?;
+        }
+        let value_bytes = match &self.value {
+            QueryValue::Scalar(value) => value.memory_bytes()?,
+            QueryValue::Native(value) => value
+                .retained_heap_bytes()
+                .map_err(|_| SchemaFailure::LimitExceeded)?,
+        };
+        bytes
+            .checked_add(value_bytes)
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
     pub(crate) const fn expected_kind(&self) -> AttributeValueKind {
         match &self.value {
             QueryValue::Scalar(SchemaValue::Null) => AttributeValueKind::Null,

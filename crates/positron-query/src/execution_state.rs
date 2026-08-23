@@ -61,6 +61,7 @@ pub(crate) fn initial_state<'kernel>(
         last_observed_at,
         cpu_work_units,
         cancellation,
+        ..
     } = query;
     (
         CursorState {
