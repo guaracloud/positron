@@ -106,6 +106,8 @@ fn json_malformed_and_structural_limits_are_stable() -> Result<(), Box<dyn Error
         "\"\\uD834x\"",
         "\"\\uD834\\u0041\"",
         "\"\\u12x4\"",
+        "\u{000b}1\u{000b}",
+        "\u{000c}1\u{000c}",
     ];
     for (index, source) in malformed.into_iter().enumerate() {
         let fixture = QueryFixture::new(&format!("query-json-malformed-{index}"))?;

@@ -107,7 +107,15 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         );
         let schema_query = state.plan.schema_query();
         let schema_filter_used = schema.zip(schema_query).is_some();
-        let text_candidate = framed!(state.plan.text_search_candidate());
+        // A body transform changes the value on which a textual predicate is
+        // evaluated. Raw text summaries can only prove absence for the stored
+        // bytes, so transformed predicates must use the exact post-transform
+        // path and retain reduced-pruning evidence.
+        let text_candidate = if state.plan.transform().is_some() {
+            None
+        } else {
+            framed!(state.plan.text_search_candidate())
+        };
         let text_filter_used = schema.zip(text_candidate.as_ref()).is_some();
         let scan_result = match (schema, schema_query, text_candidate.as_ref()) {
             (Some(schema), None, Some(candidate)) => LogStore::new().scan_text_observed(

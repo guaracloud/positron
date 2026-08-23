@@ -109,6 +109,7 @@ fn logfmt_malformed_and_input_limits_are_stable() -> Result<(), Box<dyn Error>> 
         "key=\"unterminated",
         "key=\"bad\\q\"",
         "key=\"\u{0001}\"",
+        "key=\"v\"next=x",
     ]
     .into_iter()
     .enumerate()

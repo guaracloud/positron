@@ -193,3 +193,106 @@ fn transforms_read_active_sealed_and_reopened_records_without_source_mutation()
     );
     Ok(())
 }
+
+#[test]
+fn transformed_text_predicates_use_the_transformed_value_not_raw_sidecar_evidence()
+-> Result<(), Box<dyn Error>> {
+    let escaped = QueryFixture::new("query-transform-escaped-search")?;
+    let escaped_schema = escaped
+        .kernel
+        .append_indexed_text_logs(vec![r#""\u0066oo""#], 1)?;
+    let service = escaped.service(16)?;
+    let query = service.plan_pipeline(
+        escaped.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | json | search body contains "foo" | limit 1"#,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service
+        .execute_with_schema(query, escaped_schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.reduced_pruning() && stats.decoded_records() == 1
+    ));
+    assert_eq!(first_record(&events)?.body_text(), Some("foo"));
+
+    let object = QueryFixture::new("query-transform-object-search")?;
+    let object_schema = object
+        .kernel
+        .append_indexed_text_logs(vec![r#"{"value":"foo"}"#], 1)?;
+    let service = object.service(16)?;
+    let query = service.plan_pipeline(
+        object.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | json | search body contains "foo" | limit 1"#,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service
+        .execute_with_schema(query, object_schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.reduced_pruning() && stats.decoded_records() == 1
+    ));
+    Ok(())
+}
+
+#[test]
+fn textual_predicates_must_follow_body_transform() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("query-transform-stage-order")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    assert_eq!(
+        service
+            .plan_pipeline(
+                fixture.context,
+                r#"pipeline:v1 logs | range query_time -100 100 | search body contains "foo" | json | limit 1"#,
+                budget,
+            )
+            .err()
+            .ok_or("predicate-before-transform was accepted")?
+            .code(),
+        QueryFailureCode::UnsupportedQuery
+    );
+    service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | json | search body contains "foo" | limit 1"#,
+        budget,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn temporal_exclusion_precedes_transform_parsing() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("query-transform-temporal-order")?;
+    fixture.kernel.append_log("{malformed", 200, 1)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.decoded_records() == 1
+    ));
+    Ok(())
+}

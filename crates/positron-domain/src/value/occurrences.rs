@@ -233,6 +233,24 @@ fn validate_attribute_value(
     value_bytes: ByteLimit,
     remaining_depth: u16,
 ) -> Result<ValidatedAttributeValue, DomainFailure> {
+    let mut observer = observed::UnobservedNativeValue;
+    observed::remove_observation(validate_attribute_value_observed(
+        candidate,
+        limits,
+        value_bytes,
+        remaining_depth,
+        &mut observer,
+    ))
+}
+
+fn validate_attribute_value_observed<O: NativeValueObserver>(
+    candidate: CandidateAttributeValue,
+    limits: ValueLimitSet,
+    value_bytes: ByteLimit,
+    remaining_depth: u16,
+    observer: &mut O,
+) -> Result<ValidatedAttributeValue, ObservedValueFailure<O::Error>> {
+    observed::observe_structure(observer)?;
     let inner = match candidate {
         CandidateAttributeValue::Null => ValidatedAttributeValueInner::Null,
         CandidateAttributeValue::Boolean(value) => ValidatedAttributeValueInner::Boolean(value),
@@ -243,90 +261,110 @@ fn validate_attribute_value(
             ValidatedAttributeValueInner::FloatingPointBits(value)
         },
         CandidateAttributeValue::String(value) => {
+            observed::observe_payload(value.as_bytes(), observer)?;
             if exceeds_byte_limit(value.len(), value_bytes) {
-                return Err(DomainFailure::value_limit_exceeded());
+                return Err(DomainFailure::value_limit_exceeded().into());
             }
             ValidatedAttributeValueInner::String(value)
         },
         CandidateAttributeValue::Bytes(value) => {
+            observed::observe_payload(&value, observer)?;
             if exceeds_byte_limit(value.len(), value_bytes) {
-                return Err(DomainFailure::value_limit_exceeded());
+                return Err(DomainFailure::value_limit_exceeded().into());
             }
             ValidatedAttributeValueInner::Bytes(value)
         },
         CandidateAttributeValue::Array(values) => ValidatedAttributeValueInner::Array(
-            validate_attribute_array(values, limits, value_bytes, remaining_depth)?,
-        ),
-        CandidateAttributeValue::KeyValueList(values) => {
-            ValidatedAttributeValueInner::KeyValueList(validate_key_value_list(
+            validate_attribute_array_observed(
                 values,
                 limits,
                 value_bytes,
                 remaining_depth,
+                observer,
+            )?,
+        ),
+        CandidateAttributeValue::KeyValueList(values) => {
+            ValidatedAttributeValueInner::KeyValueList(validate_key_value_list_observed(
+                values,
+                limits,
+                value_bytes,
+                remaining_depth,
+                observer,
             )?)
         },
     };
     let validated = ValidatedAttributeValue { inner };
     if exceeds_byte_limit(validated.value_size_bytes()?, value_bytes) {
-        return Err(DomainFailure::value_limit_exceeded());
+        return Err(DomainFailure::value_limit_exceeded().into());
     }
     Ok(validated)
 }
 
-fn validate_attribute_array(
+fn validate_attribute_array_observed<O: NativeValueObserver>(
     values: Vec<CandidateAttributeValue>,
     limits: ValueLimitSet,
     value_bytes: ByteLimit,
     remaining_depth: u16,
-) -> Result<Vec<ValidatedAttributeValue>, DomainFailure> {
+    observer: &mut O,
+) -> Result<Vec<ValidatedAttributeValue>, ObservedValueFailure<O::Error>> {
     let Some(child_depth) = remaining_depth.checked_sub(1) else {
-        return Err(DomainFailure::value_limit_exceeded());
+        return Err(DomainFailure::value_limit_exceeded().into());
     };
     if exceeds_collection_limit(values.len(), limits.dynamic_value().array_entries()) {
-        return Err(DomainFailure::value_limit_exceeded());
+        return Err(DomainFailure::value_limit_exceeded().into());
     }
     let mut validated = Vec::new();
     validated
         .try_reserve_exact(values.len())
         .map_err(|_| DomainFailure::allocation_unavailable())?;
     for value in values {
-        validated.push(validate_attribute_value(
+        validated.push(validate_attribute_value_observed(
             value,
             limits,
             value_bytes,
             child_depth,
+            observer,
         )?);
     }
     Ok(validated)
 }
 
-fn validate_key_value_list(
+fn validate_key_value_list_observed<O: NativeValueObserver>(
     values: Vec<CandidateKeyValue>,
     limits: ValueLimitSet,
     value_bytes: ByteLimit,
     remaining_depth: u16,
-) -> Result<Vec<ValidatedKeyValue>, DomainFailure> {
+    observer: &mut O,
+) -> Result<Vec<ValidatedKeyValue>, ObservedValueFailure<O::Error>> {
     let Some(child_depth) = remaining_depth.checked_sub(1) else {
-        return Err(DomainFailure::value_limit_exceeded());
+        return Err(DomainFailure::value_limit_exceeded().into());
     };
     if exceeds_collection_limit(
         values.len(),
         limits.dynamic_value().key_value_list_entries(),
     ) {
-        return Err(DomainFailure::value_limit_exceeded());
+        return Err(DomainFailure::value_limit_exceeded().into());
     }
     let mut validated = Vec::new();
     validated
         .try_reserve_exact(values.len())
         .map_err(|_| DomainFailure::allocation_unavailable())?;
     for CandidateKeyValue { key, value } in values {
+        observed::observe_structure(observer)?;
+        observed::observe_payload(key.as_bytes(), observer)?;
         if key.is_empty() || exceeds_byte_limit(key.len(), limits.dynamic_value().key_path_bytes())
         {
-            return Err(DomainFailure::value_limit_exceeded());
+            return Err(DomainFailure::value_limit_exceeded().into());
         }
         validated.push(ValidatedKeyValue {
             key,
-            value: validate_attribute_value(value, limits, value_bytes, child_depth)?,
+            value: validate_attribute_value_observed(
+                value,
+                limits,
+                value_bytes,
+                child_depth,
+                observer,
+            )?,
         });
     }
     Ok(validated)

@@ -172,28 +172,20 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
     fn string(&mut self) -> Result<String, QueryFailure> {
         self.expect(b'"')?;
         let mut value = String::new();
-        value
-            .try_reserve(
-                self.source
-                    .len()
-                    .saturating_sub(self.offset)
-                    .min(MAX_TRANSFORM_INPUT_BYTES),
-            )
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         loop {
             self.observer.step()?;
             let byte = self.next()?.ok_or_else(unsupported)?;
             match byte {
                 b'"' => return Ok(value),
                 b'\\' => match self.next()?.ok_or_else(unsupported)? {
-                    b'"' => value.push('"'),
-                    b'\\' => value.push('\\'),
-                    b'/' => value.push('/'),
-                    b'b' => value.push('\u{0008}'),
-                    b'f' => value.push('\u{000c}'),
-                    b'n' => value.push('\n'),
-                    b'r' => value.push('\r'),
-                    b't' => value.push('\t'),
+                    b'"' => self.push_character(&mut value, '"')?,
+                    b'\\' => self.push_character(&mut value, '\\')?,
+                    b'/' => self.push_character(&mut value, '/')?,
+                    b'b' => self.push_character(&mut value, '\u{0008}')?,
+                    b'f' => self.push_character(&mut value, '\u{000c}')?,
+                    b'n' => self.push_character(&mut value, '\n')?,
+                    b'r' => self.push_character(&mut value, '\r')?,
+                    b't' => self.push_character(&mut value, '\t')?,
                     b'u' => self.unicode_escape(&mut value)?,
                     _ => return Err(unsupported()),
                 },
@@ -209,10 +201,18 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
                         return Err(unsupported());
                     }
                     self.offset = end;
-                    value.push(character);
+                    self.push_character(&mut value, character)?;
                 },
             }
         }
+    }
+
+    fn push_character(&mut self, value: &mut String, character: char) -> Result<(), QueryFailure> {
+        value
+            .try_reserve(character.len_utf8())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        value.push(character);
+        Ok(())
     }
 
     fn unicode_escape(&mut self, value: &mut String) -> Result<(), QueryFailure> {
@@ -228,7 +228,7 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
             let codepoint =
                 0x1_0000 + (u32::from(first) - 0xD800) * 0x400 + (u32::from(second) - 0xDC00);
             let character = char::from_u32(codepoint).ok_or_else(unsupported)?;
-            value.push(character);
+            self.push_character(value, character)?;
         } else {
             if (0xDC00..=0xDFFF).contains(&first) {
                 return Err(unsupported());
@@ -271,7 +271,10 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
     }
 
     fn skip_whitespace(&mut self) -> Result<(), QueryFailure> {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        {
             self.observer.step()?;
             self.offset = self.offset.checked_add(1).ok_or_else(unsupported)?;
         }

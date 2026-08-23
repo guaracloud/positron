@@ -53,7 +53,8 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
                     .ok_or_else(unsupported)?,
             )?;
             self.expect(b'=')?;
-            let value = if self.peek() == Some(b'"') {
+            let quoted = self.peek() == Some(b'"');
+            let value = if quoted {
                 CandidateAttributeValue::string(self.quoted()?)
             } else {
                 let value_start = self.offset;
@@ -67,6 +68,9 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
                     .ok_or_else(unsupported)?;
                 parse_bare(source)?
             };
+            if quoted && self.peek().is_some_and(|byte| !byte.is_ascii_whitespace()) {
+                return Err(unsupported());
+            }
             values
                 .try_reserve(1)
                 .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
@@ -78,24 +82,16 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
     fn quoted(&mut self) -> Result<String, QueryFailure> {
         self.expect(b'"')?;
         let mut value = String::new();
-        value
-            .try_reserve(
-                self.source
-                    .len()
-                    .saturating_sub(self.offset)
-                    .min(MAX_TRANSFORM_INPUT_BYTES),
-            )
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         loop {
             let byte = self.next()?.ok_or_else(unsupported)?;
             match byte {
                 b'"' => return Ok(value),
                 b'\\' => match self.next()?.ok_or_else(unsupported)? {
-                    b'"' => value.push('"'),
-                    b'\\' => value.push('\\'),
-                    b'n' => value.push('\n'),
-                    b'r' => value.push('\r'),
-                    b't' => value.push('\t'),
+                    b'"' => self.push_character(&mut value, '"')?,
+                    b'\\' => self.push_character(&mut value, '\\')?,
+                    b'n' => self.push_character(&mut value, '\n')?,
+                    b'r' => self.push_character(&mut value, '\r')?,
+                    b't' => self.push_character(&mut value, '\t')?,
                     _ => return Err(unsupported()),
                 },
                 byte if byte.is_ascii() && byte < 0x20 => return Err(unsupported()),
@@ -110,10 +106,18 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
                         return Err(unsupported());
                     }
                     self.offset = end;
-                    value.push(character);
+                    self.push_character(&mut value, character)?;
                 },
             }
         }
+    }
+
+    fn push_character(&mut self, value: &mut String, character: char) -> Result<(), QueryFailure> {
+        value
+            .try_reserve(character.len_utf8())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        value.push(character);
+        Ok(())
     }
 
     fn skip_whitespace(&mut self) -> Result<bool, QueryFailure> {

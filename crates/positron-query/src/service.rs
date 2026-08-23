@@ -157,19 +157,19 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             aggregate = Some(parse_aggregate(stage)?);
             stage_order = 3;
         } else if stage == "json" {
-            if transform.is_some() || stage_order > 2 {
+            if transform.is_some() || filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             transform = Some(BodyTransform::Json);
             stage_order = 2;
         } else if stage == "logfmt" {
-            if transform.is_some() || stage_order > 2 {
+            if transform.is_some() || filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             transform = Some(BodyTransform::Logfmt);
             stage_order = 2;
         } else if let Some(target) = stage.strip_prefix("cast body as ") {
-            if transform.is_some() || stage_order > 2 {
+            if transform.is_some() || filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             transform = Some(BodyTransform::Cast(parse_cast_target(target)?));

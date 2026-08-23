@@ -132,4 +132,20 @@ impl CandidateAttributeValue {
             limits.dynamic_value().nesting_depth().value(),
         )
     }
+
+    /// Validates one log body while observing every recursive validation pass.
+    pub fn validate_log_body_observed<O: NativeValueObserver>(
+        self,
+        profile: ValueLimitProfile,
+        observer: &mut O,
+    ) -> Result<ValidatedAttributeValue, ObservedValueFailure<O::Error>> {
+        let limits = profile.effective_limits();
+        validate_attribute_value_observed(
+            self,
+            limits,
+            limits.record().log_body_bytes(),
+            limits.dynamic_value().nesting_depth().value(),
+            observer,
+        )
+    }
 }

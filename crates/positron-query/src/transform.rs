@@ -28,7 +28,46 @@ pub(crate) trait TransformObserver {
     fn step(&mut self) -> Result<(), QueryFailure>;
 }
 
+struct NativeValidationObserver<'a, O> {
+    observer: &'a mut O,
+}
+
+impl<O: TransformObserver> positron_domain::value::NativeValueObserver
+    for NativeValidationObserver<'_, O>
+{
+    type Error = QueryFailure;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        self.observer.step()
+    }
+
+    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        for _chunk in payload.chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
+            self.observer.step()?;
+        }
+        Ok(())
+    }
+}
+
 impl BodyTransform {
+    pub(crate) fn scratch_memory_bytes(
+        self,
+        value: &ValidatedAttributeValue,
+    ) -> Result<u64, QueryFailure> {
+        let source_bytes = value.as_str().map(str::len).unwrap_or(0).max(128);
+        let parser_slots = match self {
+            Self::Json | Self::Logfmt => MAX_TRANSFORM_ENTRIES
+                .checked_mul(96)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?,
+            Self::Cast(_) => 0,
+        };
+        let bytes = source_bytes
+            .checked_add(parser_slots)
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        u64::try_from(bytes).map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))
+    }
+
     pub(crate) fn apply(
         self,
         value: &ValidatedAttributeValue,
@@ -45,9 +84,13 @@ impl BodyTransform {
             },
             Self::Cast(target) => cast_value(value, target, observer)?,
         };
+        let mut validation_observer = NativeValidationObserver { observer };
         candidate
-            .validate_log_body(ValueLimitProfile::release_1_system_maximum())
-            .map_err(map_domain_failure)
+            .validate_log_body_observed(
+                ValueLimitProfile::release_1_system_maximum(),
+                &mut validation_observer,
+            )
+            .map_err(map_observed_failure)
     }
 }
 
@@ -198,6 +241,17 @@ fn map_domain_failure(failure: positron_domain::outcome::DomainFailure) -> Query
         QueryFailure::new(QueryFailureCode::ResourceExhausted)
     } else {
         unsupported()
+    }
+}
+
+fn map_observed_failure(
+    failure: positron_domain::value::ObservedValueFailure<QueryFailure>,
+) -> QueryFailure {
+    match failure {
+        positron_domain::value::ObservedValueFailure::Domain(failure) => {
+            map_domain_failure(failure)
+        },
+        positron_domain::value::ObservedValueFailure::Observer(failure) => failure,
     }
 }
 

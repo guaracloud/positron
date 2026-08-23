@@ -1,8 +1,6 @@
 use positron_domain::time::{IngestTimeCandidate, QueryTime};
 
-use crate::{
-    LogicalPlan, QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis,
-};
+use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
 
 struct TransformWorkObserver<'a, 'kernel, 'catalog, 'ledger> {
     service: &'a crate::QueryService<'kernel, 'catalog, 'ledger>,
@@ -25,6 +23,21 @@ impl crate::transform::TransformObserver for TransformWorkObserver<'_, '_, '_, '
     }
 }
 
+impl positron_domain::value::NativeValueObserver for TransformWorkObserver<'_, '_, '_, '_> {
+    type Error = QueryFailure;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        crate::transform::TransformObserver::step(self)
+    }
+
+    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        for _chunk in payload.chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
+            crate::transform::TransformObserver::step(self)?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn query_record(
     service: &crate::QueryService<'_, '_, '_>,
     state: &mut crate::cursor::CursorState,
@@ -32,12 +45,34 @@ pub(crate) fn query_record(
     predicate_applied: bool,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<Option<QueryRecord>, QueryFailure> {
+    let observed = record.observed_time();
+    let ingest_time = record.ingest_time();
+    let query_time = QueryTime::for_log(
+        &record.event_time(),
+        observed.as_ref(),
+        IngestTimeCandidate::new(ingest_time.instant()),
+    );
+    let event_time = record.event_time();
+    let temporal_axis = state.plan.temporal_axis();
+    let temporal_range = state.plan.temporal_range();
+    let Some(ordering_time) = (match temporal_axis {
+        TemporalAxis::QueryTime => Some(query_time.instant()),
+        TemporalAxis::EventTime => event_time.instant(),
+        TemporalAxis::IngestTime => Some(ingest_time.instant()),
+    }) else {
+        return Ok(None);
+    };
+    if !temporal_range.contains(ordering_time) {
+        return Ok(None);
+    }
+    let mut transformed_retained_bytes = None;
     let transformed_body = match state.plan.transform() {
         Some(transform) => record
             .body()
             .map(|body| {
-                let mut observer = TransformWorkObserver { service, state };
-                transform.apply(body, &mut observer)
+                let (value, bytes) = apply_transform(transform, body, service, state, memory)?;
+                transformed_retained_bytes = Some(bytes);
+                Ok(value)
             })
             .transpose()?,
         None => None,
@@ -106,32 +141,18 @@ pub(crate) fn query_record(
             },
         };
         if !matched {
+            if let Some(bytes) = transformed_retained_bytes {
+                memory.release(bytes)?;
+            }
             return Ok(None);
         }
     }
-    let observed = record.observed_time();
-    let ingest_time = record.ingest_time();
-    let query_time = QueryTime::for_log(
-        &record.event_time(),
-        observed.as_ref(),
-        IngestTimeCandidate::new(ingest_time.instant()),
-    );
-    let event_time = record.event_time();
-    let plan: &LogicalPlan = &state.plan;
-    let Some(ordering_time) = (match plan.temporal_axis() {
-        TemporalAxis::QueryTime => Some(query_time.instant()),
-        TemporalAxis::EventTime => event_time.instant(),
-        TemporalAxis::IngestTime => Some(ingest_time.instant()),
-    }) else {
-        return Ok(None);
-    };
-    if !plan.temporal_range().contains(ordering_time) {
-        return Ok(None);
-    }
-    let selected_columns = plan
+    let selected_columns = state
+        .plan
         .aggregate()
         .map(crate::plan::AggregateSpec::group_by)
-        .unwrap_or_else(|| plan.projection());
+        .unwrap_or_else(|| state.plan.projection())
+        .to_vec();
     let body_selected = selected_columns.contains(&crate::plan::ProjectionColumn::Body);
     let query_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime);
     let event_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::EventTime);
@@ -141,15 +162,9 @@ pub(crate) fn query_record(
         selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition);
     let cancellation = state.cancellation.clone();
     let cpu_limit = state.budget.cpu_work_units();
-    let transformed_retained_bytes = transformed_body
-        .as_ref()
-        .map(transformed_body_retained_bytes)
-        .transpose()?
-        .map(|bytes| memory.acquire(bytes).map(|()| bytes))
-        .transpose()?;
     let (attributes, attribute_retained_bytes) = match project_attributes(
         record.stored(),
-        selected_columns,
+        &selected_columns,
         service,
         &mut state.cpu_work_units,
         cpu_limit,
@@ -200,12 +215,55 @@ pub(crate) fn query_record(
     )))
 }
 
+fn apply_transform(
+    transform: crate::transform::BodyTransform,
+    body: &positron_domain::value::ValidatedAttributeValue,
+    service: &crate::QueryService<'_, '_, '_>,
+    state: &mut crate::cursor::CursorState,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<(positron_domain::value::ValidatedAttributeValue, u64), QueryFailure> {
+    let scratch = transform.scratch_memory_bytes(body)?;
+    memory.acquire(scratch)?;
+    let transformed = {
+        let mut observer = TransformWorkObserver { service, state };
+        transform.apply(body, &mut observer)
+    };
+    let value = match transformed {
+        Ok(value) => value,
+        Err(failure) => {
+            memory.release(scratch)?;
+            return Err(failure);
+        },
+    };
+    let retained = {
+        let mut observer = TransformWorkObserver { service, state };
+        transformed_body_retained_bytes(&value, &mut observer)
+    };
+    let bytes = match retained {
+        Ok(bytes) => bytes,
+        Err(failure) => {
+            memory.release(scratch)?;
+            return Err(failure);
+        },
+    };
+    if bytes >= scratch {
+        if let Err(failure) = memory.acquire(bytes - scratch) {
+            memory.release(scratch)?;
+            return Err(failure);
+        }
+    } else {
+        memory.release(scratch - bytes)?;
+    }
+    Ok((value, bytes))
+}
+
 fn transformed_body_retained_bytes(
     value: &positron_domain::value::ValidatedAttributeValue,
+    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
 ) -> Result<u64, QueryFailure> {
     value
-        .retained_heap_bytes()
-        .map_err(super::map_domain_value_failure)
+        .retained_heap_bytes_observed(observer)
+        .map_err(super::map_observed_failure)
         .and_then(|bytes| {
             u64::try_from(bytes)
                 .ok()
