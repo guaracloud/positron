@@ -28,7 +28,12 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "cursor-kernel")?;
+    let governance = instance.governance_object_for_test()?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "cursor-kernel",
+        &governance,
+    )?;
     fixture.append_log("first", 20, 1)?;
     fixture.append_log("second", 21, 2)?;
     let clock = TestClock::shared(100);
@@ -110,6 +115,85 @@ fn result_envelope_identifies_snapshot_schema_budget_order_lease_and_digest_chai
         QueryEvent::Terminal(QueryTerminal::Complete(stats))
             if stats.result_digest() == batch.digest()
     ));
+    Ok(())
+}
+
+#[test]
+fn equivalent_pipeline_and_sql_pages_share_one_authenticated_plan_digest()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    let pipeline = fixture.service().plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let sql = fixture.service().plan_sql(
+        fixture.context,
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
+        budget,
+    )?;
+    let pipeline_events = fixture
+        .service()
+        .execute_page(pipeline)?
+        .collect::<Vec<_>>();
+    let sql_events = fixture.service().execute_page(sql)?.collect::<Vec<_>>();
+    let pipeline_cursor = continuation(&pipeline_events)?;
+    let sql_cursor = continuation(&sql_events)?;
+    assert_eq!(
+        pipeline_cursor.as_bytes().get(123..155),
+        sql_cursor.as_bytes().get(123..155)
+    );
+    Ok(())
+}
+
+#[test]
+fn resume_admits_before_reconstructing_the_authenticated_plan() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let held = fixture
+        .kernel
+        .authority
+        .governor()
+        .reserve(positron_kernel::WorkClaim::tenant(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("query tenant missing")?
+                .tenant_id(),
+            positron_kernel::WorkKind::InteractiveQueryTail,
+            positron_kernel::ResourceAmounts::only(
+                positron_kernel::ResourceDimension::MemoryBytes,
+                7_500_000,
+            )?,
+        )?)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        fixture.clock.clone(),
+        std::sync::Arc::new(super::support::FailingStageWorkMeter(
+            positron_query::QueryWorkStage::Parse,
+        )),
+    );
+    let failure = match service.resume(fixture.context, &fixture.cursor) {
+        Err(failure) => failure,
+        Ok(_) => return Err("admission unexpectedly succeeded".into()),
+    };
+    assert_eq!(failure.code(), QueryFailureCode::ResourceAdmissionRefused);
+    let before_drop = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
+    drop(held);
+    let after_drop = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
+    assert_eq!(after_drop + 1, before_drop);
     Ok(())
 }
 
@@ -416,13 +500,15 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
             .code(),
         QueryFailureCode::Unauthorized
     );
-    let empty = KernelFixture::new(
+    let governance = fixture.governance.clone();
+    let empty = KernelFixture::new_with_identity(
         fixture
             .context
             .tenant_attribution()
             .ok_or("query attribution missing")?
             .tenant_id(),
         "cursor-frontier-regression",
+        &governance,
     )?;
     let behind = super::support::zero_work_service(empty.authority.governor(), empty.ledger()?, 1);
     assert_eq!(
@@ -433,7 +519,7 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
         QueryFailureCode::SnapshotExpired
     );
 
-    let catalog_mismatch = rewritten_cursor(&fixture, |bytes| bytes[88] ^= 1, b"query-cursor-v1")?;
+    let catalog_mismatch = rewritten_cursor(&fixture, |bytes| bytes[88] ^= 1, b"query-cursor-v4")?;
     assert_eq!(
         fixture
             .service()
@@ -520,7 +606,11 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
             bytes[351..353].copy_from_slice(&4_097_u16.to_be_bytes());
         }),
     ] {
-        let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v1")?;
+        if label == "magic" {
+            assert!(rewritten_cursor(&fixture, rewrite, b"query-cursor-v4").is_err());
+            continue;
+        }
+        let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v4")?;
         assert_eq!(
             fixture
                 .service()
@@ -536,7 +626,7 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
             bytes[350] = 0;
             bytes[351..353].fill(0);
         },
-        b"query-cursor-v1",
+        b"query-cursor-v4",
     )?;
     assert_eq!(
         fixture
@@ -546,7 +636,8 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
             .code(),
         QueryFailureCode::InvalidCursor
     );
-    let source_fixture = CursorFixture::new()?;
+    let source_fixture =
+        CursorFixture::new().map_err(|error| format!("source fixture failed: {error:?}"))?;
     let mut basic_encoding = Vec::with_capacity(19);
     basic_encoding.push(1);
     basic_encoding.extend_from_slice(&(-100_i64).to_be_bytes());
@@ -565,16 +656,20 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
             bytes[351..353].fill(0);
             bytes[353..4449].fill(0);
         },
-        b"query-cursor-v1",
+        b"query-cursor-v4",
     )?;
-    let source_free_events = source_fixture
-        .service()
-        .resume(source_fixture.context, &source_free_basic)?
-        .collect::<Vec<_>>();
-    assert_eq!(bodies(&source_free_events), ["second"]);
+    assert_eq!(
+        source_fixture
+            .service()
+            .resume(source_fixture.context, &source_free_basic)
+            .expect_err("source-free current cursors must be rejected")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
 
     for axis in [2_u8, 3_u8] {
-        let axis_fixture = CursorFixture::new()?;
+        let axis_fixture =
+            CursorFixture::new().map_err(|error| format!("axis fixture failed: {error:?}"))?;
         let mut axis_encoding = Vec::with_capacity(19);
         axis_encoding.push(axis);
         axis_encoding.extend_from_slice(&(-100_i64).to_be_bytes());
@@ -594,13 +689,16 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
                 bytes[351..353].fill(0);
                 bytes[353..4449].fill(0);
             },
-            b"query-cursor-v1",
+            b"query-cursor-v4",
         )?;
-        let axis_events = axis_fixture
-            .service()
-            .resume(axis_fixture.context, &axis_cursor)?
-            .collect::<Vec<_>>();
-        assert_eq!(bodies(&axis_events), ["second"]);
+        assert_eq!(
+            axis_fixture
+                .service()
+                .resume(axis_fixture.context, &axis_cursor)
+                .expect_err("source-free current cursors must be rejected")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
     }
     let wrong_domain = rewritten_cursor(&fixture, |_| {}, b"query-result-batch-v1")?;
     assert_eq!(
@@ -632,7 +730,7 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
             }) as fn(&mut Vec<u8>),
         ),
     ] {
-        let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v1")?;
+        let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v4")?;
         let expected = if label == "memory budget" {
             QueryFailureCode::BudgetExhausted
         } else {
@@ -663,16 +761,19 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
     let legacy = rewritten_cursor(
         &fixture,
         |bytes| {
+            bytes[..8].copy_from_slice(b"POSQCR01");
             bytes.drain(317..4449);
             bytes.drain(261..269);
             bytes[123..155].copy_from_slice(&legacy_plan_digest);
         },
         b"query-cursor-v1",
-    )?;
+    )
+    .map_err(|error| format!("legacy construction failed: {error:?}"))?;
     assert_eq!(legacy.as_bytes().len(), 341);
     let events = fixture
         .service()
-        .resume(fixture.context, &legacy)?
+        .resume(fixture.context, &legacy)
+        .map_err(|failure| format!("legacy resume failed: {failure:?}"))?
         .collect::<Vec<_>>();
     assert_eq!(bodies(&events), ["second"]);
     let truncated = fixture
@@ -734,9 +835,9 @@ fn rewritten_source_cursor(
         .digest_query_cursor(b"query-plan-source-v1", &encoding)?;
     payload[123..155].copy_from_slice(&digest);
     let protector = fixture.kernel.ledger()?.control_tokens();
-    let initial = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v4", &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
-    let authentication = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v4", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
 }
@@ -748,6 +849,7 @@ struct CursorFixture {
     administrator: positron_governance::AuthorizedContext,
     cursor: positron_query::QueryCursor,
     clock: std::sync::Arc<TestClock>,
+    governance: Vec<u8>,
 }
 
 impl CursorFixture {
@@ -771,7 +873,12 @@ impl CursorFixture {
             RequestedIntent::SystemAdministration,
             CompatibilityHints::none(),
         )?;
-        let kernel = KernelFixture::new(instance.default_tenant_id(), "cursor-failure-kernel")?;
+        let governance = instance.governance_object_for_test()?;
+        let kernel = KernelFixture::new_with_identity(
+            instance.default_tenant_id(),
+            "cursor-failure-kernel",
+            &governance,
+        )?;
         kernel.append_log("first", 20, 1)?;
         kernel.append_log("second", 21, 2)?;
         let clock = TestClock::shared(100);
@@ -797,6 +904,7 @@ impl CursorFixture {
             administrator,
             cursor,
             clock,
+            governance,
         })
     }
 

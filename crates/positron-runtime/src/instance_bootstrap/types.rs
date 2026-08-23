@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
-    BootstrapKeyCustody, InstanceBootstrapStorage, InstanceId, MountQualification,
+    BootstrapKeyCustody, Catalog, InstanceBootstrapStorage, InstanceId, MountQualification,
     OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
@@ -175,6 +175,58 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
+    pub(crate) fn durable_identity(
+        &self,
+    ) -> Result<positron_governance::Identity, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::Identity::open(&snapshot)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+
+    /// Returns the authenticated governance object for an external durable
+    /// Catalog test fixture. The object remains opaque to runtime callers; the
+    /// canonical Identity decoder remains the only reader of its fields.
+    #[doc(hidden)]
+    pub fn governance_object_for_test(&self) -> Result<Vec<u8>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        for object_id in snapshot.object_identities() {
+            let object = snapshot
+                .object(object_id)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            if let Some(object) = object
+                && (object.starts_with(b"POSGOV01")
+                    || object.starts_with(b"POSGOV02")
+                    || object.starts_with(b"POSGOV03"))
+            {
+                let mut owned = Vec::new();
+                owned.try_reserve_exact(object.len()).map_err(|_| {
+                    BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
+                })?;
+                owned.extend_from_slice(object);
+                return Ok(owned);
+            }
+        }
+        Err(BootstrapFailure::new(
+            BootstrapFailureCode::CatalogUnavailable,
+        ))
+    }
+
     pub(crate) fn begin_shutdown(&self) -> Result<(), BootstrapFailure> {
         self._authority
             .begin_shutdown()

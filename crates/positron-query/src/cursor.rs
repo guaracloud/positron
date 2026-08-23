@@ -6,8 +6,10 @@ use crate::{
     LogicalPlan, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange,
 };
 
-const MAGIC: [u8; 8] = *b"POSQCR01";
-const CURSOR_PURPOSE: &[u8] = b"query-cursor-v1";
+const MAGIC: [u8; 8] = *b"POSQCR04";
+const LEGACY_MAGIC: [u8; 8] = *b"POSQCR01";
+const CURSOR_PURPOSE: &[u8] = b"query-cursor-v4";
+const LEGACY_CURSOR_PURPOSE: &[u8] = b"query-cursor-v1";
 const V1_PAYLOAD_BYTES: usize = 309;
 const V3_PAYLOAD_BYTES: usize = 341;
 const MAX_PLAN_SOURCE_BYTES: usize = 4_096;
@@ -28,6 +30,9 @@ impl QueryCursor {
             bytes.len(),
             V1_CURSOR_BYTES | V3_CURSOR_BYTES | CURSOR_BYTES
         ) {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        if bytes.len() == CURSOR_BYTES && bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
         let mut owned = Vec::new();
@@ -114,13 +119,8 @@ pub(crate) fn encode(
     );
     bytes.extend_from_slice(&state.plan.temporal_range().end_nanoseconds().to_be_bytes());
     bytes.extend_from_slice(&state.plan.limit().to_be_bytes());
-    let plan_digest = plan_digest(
-        protector,
-        &state.plan,
-        state.language,
-        state.source.as_deref(),
-    )?;
-    bytes.extend_from_slice(&plan_digest);
+    let _ = protector;
+    bytes.extend_from_slice(&state.plan_digest);
     bytes.extend_from_slice(&state.offset.to_be_bytes());
     bytes.extend_from_slice(&state.sequence.to_be_bytes());
     bytes.extend_from_slice(&state.prior_digest);
@@ -181,6 +181,21 @@ pub(crate) fn decode(
     protector: &ControlTokenProtector<'_>,
     cursor: &QueryCursor,
 ) -> Result<CursorState, QueryFailure> {
+    decode_internal(protector, cursor, true)
+}
+
+pub(crate) fn decode_for_admission(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &QueryCursor,
+) -> Result<CursorState, QueryFailure> {
+    decode_internal(protector, cursor, false)
+}
+
+fn decode_internal(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &QueryCursor,
+    retain_source: bool,
+) -> Result<CursorState, QueryFailure> {
     let payload_bytes = cursor.as_bytes().len().saturating_sub(32);
     let (payload, authentication) = cursor
         .as_bytes()
@@ -196,11 +211,18 @@ pub(crate) fn decode(
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let authentication = ControlTokenAuthentication::new(epoch, tag)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let legacy = payload_bytes != PAYLOAD_BYTES;
+    let purpose = if legacy {
+        LEGACY_CURSOR_PURPOSE
+    } else {
+        CURSOR_PURPOSE
+    };
     protector
-        .verify_query_cursor(CURSOR_PURPOSE, payload, authentication)
+        .verify_query_cursor(purpose, payload, authentication)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let mut reader = Reader::new(payload);
-    if reader.array::<8>()? != MAGIC || reader.u64()? != epoch {
+    let magic = reader.array::<8>()?;
+    if (legacy && magic != LEGACY_MAGIC) || (!legacy && magic != MAGIC) || reader.u64()? != epoch {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let principal = PrincipalId::from_bytes(reader.array()?)
@@ -287,21 +309,26 @@ pub(crate) fn decode(
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
         let source_bytes = reader.bytes(MAX_PLAN_SOURCE_BYTES)?;
-        if source_bytes[length..].iter().any(|byte| *byte != 0) {
+        if source_bytes
+            .get(length..)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
-        let source = std::str::from_utf8(
+        let source_bytes = std::str::from_utf8(
             source_bytes
                 .get(..length)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?,
         )
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(source.len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        owned.extend_from_slice(source.as_bytes());
-        let source = if language.is_some() {
+        let source = if retain_source && language.is_some() {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(source_bytes.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            owned.extend_from_slice(source_bytes.as_bytes());
             Some(Arc::from(owned.into_boxed_slice()))
         } else {
             None
@@ -310,7 +337,11 @@ pub(crate) fn decode(
     } else {
         (None, None)
     };
-    if encoded_plan_digest != plan_digest(protector, &plan, language, source.as_deref())? {
+    if legacy && encoded_plan_digest != plan_digest(protector, &plan, language, source.as_deref())?
+    {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
+    if !legacy && (language.is_none() || (retain_source && source.is_none())) {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let state = CursorState {
@@ -434,6 +465,33 @@ fn map_protection_failure(failure: ControlTokenFailure) -> QueryFailure {
             QueryFailure::new(QueryFailureCode::Internal)
         },
     }
+}
+
+pub(crate) fn source_length(cursor: &QueryCursor) -> Result<u64, QueryFailure> {
+    if cursor.as_bytes().len() != CURSOR_BYTES {
+        return Ok(0);
+    }
+    let payload = cursor
+        .as_bytes()
+        .get(..PAYLOAD_BYTES)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let language = payload
+        .get(V3_PAYLOAD_BYTES + 9)
+        .copied()
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    if !matches!(language, 1 | 2) {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
+    let length = payload
+        .get(V3_PAYLOAD_BYTES + 10..V3_PAYLOAD_BYTES + 12)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u16::from_be_bytes)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let length = usize::from(length);
+    if length > MAX_PLAN_SOURCE_BYTES {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
+    u64::try_from(length).map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))
 }
 
 struct Reader<'a> {

@@ -189,7 +189,7 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             RequestedIntent::Query,
             CompatibilityHints::none(),
         )?;
-        let service = QueryService::new_checked(initialized.resource_governor(), &ledger, 1);
+        let service = QueryService::new(initialized.resource_governor(), &ledger, 1);
         let query = service.plan_pipeline(
             context,
             "logs | range query_time 0 100 | limit 2",
@@ -202,6 +202,12 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             _ => return Err(format!("{state} query did not produce a cursor").into()),
         };
         publish_lifecycle(&catalog, code, code)?;
+        if code != 1 {
+            assert!(
+                services.authorize_logs(&ingest).is_err(),
+                "{state} ingest authorization must fail closed"
+            );
+        }
         drop(service);
         drop(ledger);
         drop(catalog);
@@ -215,7 +221,7 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             reopened_protection,
         )?;
         let resumed_service =
-            QueryService::new_checked(initialized.resource_governor(), &reopened_ledger, 1);
+            QueryService::new(initialized.resource_governor(), &reopened_ledger, 1);
         let before = initialized
             .resource_governor()
             .inspect()?

@@ -87,8 +87,25 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 }
             };
         }
+        let decoded_remaining = state
+            .budget
+            .decoded_records()
+            .checked_sub(state.decoded_records)
+            .ok_or_else(|| {
+                QueryFailure::budget_exhausted(crate::QueryBudgetDimension::DecodedRecords)
+            });
+        let decoded_remaining = framed!(decoded_remaining);
+        if decoded_remaining == 0 {
+            return self.failed_page(
+                Some(header),
+                QueryFailure::budget_exhausted(crate::QueryBudgetDimension::DecodedRecords),
+                &state,
+                delivered_before,
+                resources,
+            );
+        }
         let scan_limit = framed!(
-            usize::try_from(state.budget.decoded_records())
+            usize::try_from(decoded_remaining)
                 .ok()
                 .map(|limit| limit.min(MAX_SCAN_RECORDS))
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))
@@ -219,7 +236,15 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
 
-        let wanted = usize::from(state.plan.limit()).min(records.len());
+        let output_rows_remaining = state
+            .budget
+            .output_rows()
+            .checked_sub(state.output_rows)
+            .ok_or_else(|| QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows));
+        let output_rows_remaining = framed!(output_rows_remaining);
+        let wanted = usize::from(state.plan.limit())
+            .min(records.len())
+            .min(usize::try_from(output_rows_remaining).unwrap_or(usize::MAX));
         let start = usize::from(state.offset);
         let end = framed!(
             start
@@ -315,6 +340,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         output_state.last_observed_at = state.last_observed_at;
         output_state.elapsed_wall_seconds = state.elapsed_wall_seconds;
         output_state.cpu_work_units = state.cpu_work_units;
+        output_state.memory_peak_bytes =
+            output_state.memory_peak_bytes.max(state.memory_peak_bytes);
         state = output_state;
         let batch = QueryEvent::Batch(QueryBatch::new(
             state.sequence,

@@ -1,9 +1,12 @@
 use positron_governance::AuthorizedContext;
-use positron_kernel::ResourceReservation;
+use positron_kernel::{ControlTokenProtector, ResourceReservation};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::QueryBudget;
 use crate::transform::BodyTransform;
+
+const MAX_CANONICAL_PLAN_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemporalAxis {
@@ -336,6 +339,95 @@ impl LogicalPlan {
     pub const fn temporal_range(&self) -> TemporalRange {
         self.range
     }
+
+    /// Computes the authenticated semantic plan identity shared by every
+    /// frontend. Source spelling and frontend language are deliberately absent;
+    /// only the parsed LogicalPlan's bounded operators and parameters enter
+    /// this visitor.
+    pub(crate) fn canonical_digest(
+        &self,
+        protector: &ControlTokenProtector<'_>,
+        _memory: &crate::planning_memory::PlanningMemory,
+    ) -> Result<[u8; 32], crate::QueryFailure> {
+        let mut canonical = CanonicalBuffer::new();
+        write!(
+            canonical,
+            "plan:v4;version={};axis={:?};range={}..{};limit={};filter=",
+            self.version,
+            self.axis,
+            self.range.start_nanoseconds,
+            self.range.end_nanoseconds,
+            self.limit,
+        )
+        .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
+        match self.filter.as_ref() {
+            Some(FilterPredicate::BodyEquals(value)) => write!(canonical, "body_equals:{value:?}"),
+            Some(FilterPredicate::BodyContains(value)) => {
+                write!(
+                    canonical,
+                    "body_contains:{}:{}",
+                    value.source().len(),
+                    value.source()
+                )
+            },
+            Some(FilterPredicate::BodyRegex(value)) => {
+                write!(
+                    canonical,
+                    "body_regex:{}:{}",
+                    value.source().len(),
+                    value.source()
+                )
+            },
+            Some(FilterPredicate::AttributeEquals(query)) => {
+                write!(canonical, "attribute_equals:{query:?}")
+            },
+            None => Ok(()),
+        }
+        .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
+        write!(
+            canonical,
+            ";projection={:?};aggregate={:?};ordering={:?};transform={:?}",
+            self.projection, self.aggregate, self.ordering, self.transform,
+        )
+        .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
+        protector
+            .digest_query_plan(b"query-plan-canonical-v1", canonical.as_slice())
+            .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::Internal))
+    }
+}
+
+struct CanonicalBuffer {
+    bytes: [u8; MAX_CANONICAL_PLAN_BYTES],
+    length: usize,
+}
+
+impl CanonicalBuffer {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; MAX_CANONICAL_PLAN_BYTES],
+            length: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.bytes.get(..self.length).unwrap_or(&[])
+    }
+}
+
+impl std::fmt::Write for CanonicalBuffer {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let end = self
+            .length
+            .checked_add(value.len())
+            .ok_or(std::fmt::Error)?;
+        let target = self
+            .bytes
+            .get_mut(self.length..end)
+            .ok_or(std::fmt::Error)?;
+        target.copy_from_slice(value.as_bytes());
+        self.length = end;
+        Ok(())
+    }
 }
 
 pub struct PlannedQuery<'kernel> {
@@ -344,6 +436,7 @@ pub struct PlannedQuery<'kernel> {
     pub(crate) source: Arc<[u8]>,
     pub(crate) language: crate::query_service::QueryLanguage,
     pub(crate) budget: QueryBudget,
+    pub(crate) plan_digest: [u8; 32],
     pub(crate) _reservation: ResourceReservation<'kernel>,
     pub(crate) _planning_memory: crate::planning_memory::PlanningReservation,
     pub(crate) started_at: u64,

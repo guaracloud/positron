@@ -127,6 +127,9 @@ impl Identity {
                 })
             },
             RequestedIntent::Ingest => {
+                if self.lifecycle != TenantLifecycleState::Active {
+                    return Err(AttributionFailure);
+                }
                 let ingest = self.ingest.as_ref().ok_or(AttributionFailure)?;
                 if !keys
                     .verify_salted_secret_hash(&ingest.salt, credential.secret(), &ingest.hash)

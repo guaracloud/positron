@@ -11,13 +11,14 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureThresholds,
-    FixedLifecycleClockSource, GovernorFailure, GovernorPolicy, InstanceId,
-    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
-    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, DiskObservation,
+    DiskPressureThresholds, FixedLifecycleClockSource, FormatEpoch, GovernorFailure,
+    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
+    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
     ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
-    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, WorkClaim, WorkKind,
+    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim,
+    WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
@@ -516,6 +517,37 @@ impl KernelFixture {
             shard,
             _root: root,
         })
+    }
+
+    pub fn new_with_identity(
+        tenant: TenantId,
+        label: &str,
+        identity_object: &[u8],
+    ) -> Result<Self, Box<dyn Error>> {
+        let fixture = Self::new(tenant, label)?;
+        let basis = fixture.catalog.pin()?;
+        let mut objects = Vec::new();
+        objects.try_reserve_exact(
+            usize::try_from(basis.number())
+                .ok()
+                .and_then(|number| number.checked_add(1))
+                .ok_or("Catalog object count overflow")?,
+        )?;
+        for object_id in basis.object_identities() {
+            let object = basis.object(object_id)?.ok_or("Catalog object missing")?;
+            objects.push(CatalogObject::new(object.to_vec())?);
+        }
+        objects.push(CatalogObject::new(identity_object.to_vec())?);
+        fixture.catalog.commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([0x41; 16])?,
+                FormatEpoch::CATALOG_V1,
+                objects,
+            )?,
+            None,
+        )?;
+        Ok(fixture)
     }
 
     pub fn ledger(&self) -> Result<&ActiveSegmentLedger<'static, 'static>, Box<dyn Error>> {

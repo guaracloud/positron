@@ -64,7 +64,8 @@ pub fn fuzz_query_inputs(data: &[u8]) {
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub fn fuzz_query_cursor(data: &[u8]) {
-    if data.len() > 4_096 {
+    const MAX_FUZZ_INPUT_BYTES: usize = 65_536;
+    if data.len() > MAX_FUZZ_INPUT_BYTES {
         return;
     }
     let parsed = QueryCursor::from_bytes(data);
@@ -90,6 +91,17 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         .expect("fuzz budget is valid")
         .with_cpu_work_units(1_024)
         .expect("fuzz CPU budget is valid");
+    let parsed_plan = service::parse_pipeline(
+        std::str::from_utf8(source).expect("fixture source is UTF-8"),
+        &planning_memory::PlanningMemory::new(budget.memory_bytes()),
+    )
+    .expect("fixture source parses");
+    let plan_digest = parsed_plan
+        .canonical_digest(
+            &protector,
+            &planning_memory::PlanningMemory::new(budget.memory_bytes()),
+        )
+        .expect("fixture plan digest is bounded");
     let state = cursor::CursorState {
         principal,
         tenant,
@@ -100,7 +112,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         plan: std::sync::Arc::new(plan),
         source: Some(std::sync::Arc::from(source.to_vec().into_boxed_slice())),
         language: Some(query_service::QueryLanguage::Pipeline),
-        plan_digest: [0; 32],
+        plan_digest,
         offset: 0,
         sequence: 0,
         prior_digest: [0; 32],
@@ -154,18 +166,36 @@ pub fn fuzz_query_cursor(data: &[u8]) {
     )
     .expect("fixture source parses");
     assert_eq!(parsed.limit(), decoded.plan.limit());
+    let decoded_digest = parsed
+        .canonical_digest(
+            &protector,
+            &planning_memory::PlanningMemory::new(decoded.budget.memory_bytes()),
+        )
+        .expect("decoded plan digest is bounded");
+    assert_eq!(decoded_digest, decoded.plan_digest);
 
-    if let Some(selector) = data.first().copied() {
+    if !data.is_empty() {
         let mut variant = canonical.as_bytes().to_vec();
-        match selector % 8 {
-            0 => variant[32] ^= 1,
-            1 => variant[48] ^= 1,
-            2 => variant[96] ^= 1,
-            3 => variant[213] ^= 1,
-            4 => variant[353] ^= 1,
-            5 => variant[0] ^= 1,
-            6 => variant[157] ^= 1,
-            _ => variant[4480] ^= 1,
+        const MUTATION_OFFSETS: [usize; 24] = [
+            16, 32, 48, 64, 80, 96, 104, 112, 123, 157, 165, 197, 213, 221, 237, 253, 261, 269,
+            277, 285, 317, 349, 350, 351,
+        ];
+        for (index, byte) in data.iter().take(MUTATION_OFFSETS.len()).enumerate() {
+            if let Some(slot) = variant.get_mut(MUTATION_OFFSETS[index]) {
+                *slot ^= *byte;
+            }
+        }
+        for (index, byte) in data.iter().take(32).enumerate() {
+            if let Some(slot) = variant.get_mut(353 + index) {
+                *slot ^= *byte;
+            }
+        }
+        if data.len() >= 4_481 {
+            for (index, byte) in data.iter().skip(4_449).take(32).enumerate() {
+                if let Some(slot) = variant.get_mut(4_449 + index) {
+                    *slot ^= *byte;
+                }
+            }
         }
         let _ = cursor::fuzz_reauthenticate(&protector, &mut variant);
         if let Ok(cursor) = QueryCursor::from_bytes(&variant) {

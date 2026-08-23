@@ -106,7 +106,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         cursor: &QueryCursor,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let tenant = self.validate_current_query_context(context)?;
-        let mut state = cursor::decode(&self.ledger.control_tokens(), cursor)?;
+        let mut state = cursor::decode_for_admission(&self.ledger.control_tokens(), cursor)?;
         validate_authorization(
             state.principal,
             state.tenant,
@@ -122,8 +122,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now_seconds >= state.expiry {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
-        self.reconstruct_plan(&mut state)?;
         let reservation = self.reserve_query(tenant, state.budget)?;
+        let planning_memory =
+            crate::planning_memory::PlanningMemory::new(state.budget.memory_bytes());
+        let source_length = cursor::source_length(cursor)?;
+        let source_reservation = planning_memory.reserve(source_length)?;
+        let decoded = cursor::decode(&self.ledger.control_tokens(), cursor)?;
+        state.source = decoded.source;
+        state.language = decoded.language;
+        self.reconstruct_plan(&mut state, &planning_memory)?;
+        drop(source_reservation);
         let lease_id = SnapshotLeaseId::new(state.lease_identity)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
         // The resumed page reservation is live before snapshot reconstruction.
@@ -162,19 +170,23 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         )
     }
 
-    fn reconstruct_plan(&self, state: &mut cursor::CursorState) -> Result<(), QueryFailure> {
+    fn reconstruct_plan(
+        &self,
+        state: &mut cursor::CursorState,
+        memory: &crate::planning_memory::PlanningMemory,
+    ) -> Result<(), QueryFailure> {
         let (Some(source), Some(language)) = (state.source.clone(), state.language) else {
             return Ok(());
         };
         let source = std::str::from_utf8(&source)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        let memory = crate::planning_memory::PlanningMemory::new(state.budget.memory_bytes());
         let mut plan = match language {
             crate::query_service::QueryLanguage::Pipeline => {
-                crate::service::parse_pipeline(source, &memory)?
+                crate::service::parse_pipeline(source, memory)?
             },
-            crate::query_service::QueryLanguage::Sql => crate::service::parse_sql(source, &memory)?,
+            crate::query_service::QueryLanguage::Sql => crate::service::parse_sql(source, memory)?,
         };
+        let parser_retained = memory.take_retained();
         charge_work(state, self.work_units(crate::QueryWorkStage::Parse)?)?;
         let compile_work = plan.search_compile_work_units();
         if compile_work > 0 {
@@ -217,15 +229,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 crate::QueryBudgetDimension::MemoryBytes,
             ));
         }
-        let digest = cursor::plan_digest(
-            &self.ledger.control_tokens(),
-            &plan,
-            Some(language),
-            Some(source.as_bytes()),
-        )?;
+        let retained_plan_bytes = retained
+            .checked_sub(parser_retained.bytes())
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let plan_reservation = memory.reserve(retained_plan_bytes)?;
+        drop(parser_retained);
+        plan.compile_search()?;
+        let digest = plan.canonical_digest(&self.ledger.control_tokens(), memory)?;
+        if state.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
         if digest != state.plan_digest {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
+        drop(plan_reservation);
         state.plan = Arc::new(plan);
         Ok(())
     }

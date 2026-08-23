@@ -55,7 +55,11 @@ fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<d
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "runtime-failure-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "runtime-failure-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     let service = QueryService::with_runtime(
         fixture.authority.governor(),
         fixture.ledger()?,

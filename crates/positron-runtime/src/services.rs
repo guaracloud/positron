@@ -150,8 +150,12 @@ impl ServiceHandle {
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, ServiceFailure> {
         let instance = &self.instance;
-        instance
+        let identity = instance
+            .durable_identity()
+            .map_err(|_| ServiceFailure::Unauthorized)?;
+        identity
             .attribute(
+                &instance.key,
                 PresentedCredential::parse(bearer).map_err(|_| ServiceFailure::Unauthorized)?,
                 RequestedIntent::Ingest,
                 hints,
@@ -299,7 +303,7 @@ impl ServiceHandle {
             .map_err(|_| ServiceFailure::KeyUnavailable)?;
         let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
             .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        let service = QueryService::new_checked(instance._authority.governor(), &ledger, 100);
+        let service = QueryService::new(instance._authority.governor(), &ledger, 100);
         let query = service
             .plan_pipeline(context, source, budget)
             .map_err(|_| ServiceFailure::InvalidRequest)?;

@@ -28,7 +28,11 @@ fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dy
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "default-fitting-cpu-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "default-fitting-cpu-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     fixture.append_log("normal", 20, 1)?;
     let meter = StageCountingWorkMeter::shared();
     let service = QueryService::with_runtime(
@@ -70,7 +74,11 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "budget-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "budget-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     fixture.append_log("larger-than-the-scan-budget", 20, 1)?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
@@ -113,7 +121,11 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "atomic-decoded-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "atomic-decoded-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     fixture.append_logs(
         vec![
             (
@@ -239,7 +251,11 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "runtime-budget-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "runtime-budget-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     fixture.append_log("bounded", 20, 1)?;
     let cpu_budget =
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1)?;
@@ -307,7 +323,11 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "cumulative-budget-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "cumulative-budget-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     fixture.append_log("one", 20, 1)?;
     fixture.append_log("two", 21, 2)?;
     let clock = TestClock::shared(100);
@@ -351,6 +371,53 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
 }
 
 #[test]
+fn resume_uses_the_remaining_decoded_record_budget_before_scanning() -> Result<(), Box<dyn Error>> {
+    let (_roots, paths) = bootstrap_paths("cumulative-decoded-budget")?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "cumulative-decoded-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
+    fixture.append_log("one", 20, 1)?;
+    fixture.append_log("two", 21, 2)?;
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 1);
+    let planned = service.plan_pipeline(
+        context,
+        "logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 2, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = service.execute_page(planned)?.collect::<Vec<_>>();
+    let cursor = match first.last() {
+        Some(QueryEvent::Terminal(QueryTerminal::Continued(cursor))) => cursor,
+        _ => return Err("continuation missing".into()),
+    };
+    let resumed = service.resume(context, cursor)?.collect::<Vec<_>>();
+    assert!(
+        resumed
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        resumed.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::DecodedRecords)
+                && incomplete.stats().decoded_records() == 2
+    ));
+    Ok(())
+}
+
+#[test]
 fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(), Box<dyn Error>> {
     let (_roots, paths) = bootstrap_paths("sealed")?;
     InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
@@ -361,7 +428,11 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let mut fixture = KernelFixture::new(instance.default_tenant_id(), "sealed-kernel")?;
+    let mut fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "sealed-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     fixture.append_log("sealed", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active", 21, 2)?;
@@ -427,7 +498,11 @@ fn full_text_search_keeps_active_and_sealed_results_equivalent() -> Result<(), B
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let mut fixture = KernelFixture::new(instance.default_tenant_id(), "sealed-search-kernel")?;
+    let mut fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "sealed-search-kernel",
+        &instance.governance_object_for_test()?,
+    )?;
     fixture.append_log("sealed timeout", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active timeout", 21, 2)?;

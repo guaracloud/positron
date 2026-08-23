@@ -13,6 +13,7 @@ const CONTROL_TOKEN_DOMAIN: &[u8] = b"positron-authenticated-control-token-v1\0"
 const MAX_PURPOSE_BYTES: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 4_096;
 pub const QUERY_CURSOR_MAX_PAYLOAD_BYTES: usize = 8_192;
+const QUERY_PLAN_DIGEST_MAX_PAYLOAD_BYTES: usize = 65_536;
 const QUERY_RESULT_DIGEST_PURPOSE: &[u8] = b"query-result-batch-v1";
 
 /// Data Protection-owned authentication attached to one bounded control payload.
@@ -142,6 +143,18 @@ impl<'key> ControlTokenProtector<'key> {
         payload: &[u8],
     ) -> Result<[u8; 32], ControlTokenFailure> {
         let input = control_input(purpose, payload, QUERY_CURSOR_MAX_PAYLOAD_BYTES)?;
+        DataProtection::hash(&input).map_err(|_| ControlTokenFailure::Authentication)
+    }
+
+    /// Hashes one bounded canonical LogicalPlan without changing the
+    /// authenticated cursor wire-payload ceiling. This purpose-specific
+    /// opening is used only for the semantic plan digest.
+    pub fn digest_query_plan(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+    ) -> Result<[u8; 32], ControlTokenFailure> {
+        let input = control_input(purpose, payload, QUERY_PLAN_DIGEST_MAX_PAYLOAD_BYTES)?;
         DataProtection::hash(&input).map_err(|_| ControlTokenFailure::Authentication)
     }
 
