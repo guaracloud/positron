@@ -113,6 +113,35 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
                 crate::native_literal::parse_search_string(literal)?,
             ));
             stage_order = 2;
+        } else if let Some(literal) = stage.strip_prefix("search body contains ") {
+            if filter.is_some() || stage_order > 1 {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            let value = crate::native_literal::parse_search_string(literal)?;
+            let text = value
+                .as_str()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?
+                .to_owned();
+            filter = Some(FilterPredicate::BodyContains(crate::search::search_text(
+                text,
+            )?));
+            stage_order = 2;
+        } else if let Some(literal) = stage
+            .strip_prefix("search body =~ ")
+            .or_else(|| stage.strip_prefix("search body ~= "))
+        {
+            if filter.is_some() || stage_order > 1 {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            let value = crate::native_literal::parse_search_string(literal)?;
+            let text = value
+                .as_str()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?
+                .to_owned();
+            filter = Some(FilterPredicate::BodyRegex(
+                crate::search::BoundedRegex::from_source(text)?,
+            ));
+            stage_order = 2;
         } else if let Some(columns) = stage.strip_prefix("project ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));

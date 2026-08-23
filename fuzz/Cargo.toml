@@ -126,6 +126,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "query_search_matcher"
+path = "fuzz_targets/query_search_matcher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_search_physical"
+path = "fuzz_targets/query_search_physical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "process_inputs"
 path = "fuzz_targets/process_inputs.rs"
 test = false

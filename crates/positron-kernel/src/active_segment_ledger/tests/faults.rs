@@ -10,6 +10,7 @@ use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
     InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
     PrimaryDataVolume, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, TransactionId,
+    WorkClaim, WorkKind,
 };
 
 mod admission_faults;
@@ -73,6 +74,34 @@ fn failed_frame_synchronization_never_acknowledges_and_recovery_discards_its_tai
     assert_eq!(reopened.snapshot()?.blocks().len(), 1);
     assert_eq!(reopened.snapshot()?.blocks()[0].payload(), b"acknowledged");
     Ok(())
+}
+
+#[test]
+fn preparation_capacity_is_consumed_by_the_admitted_append() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x74; 32])),
+        )?;
+        let payload = b"pre-admitted preparation";
+        let amounts = super::super::capacity::append_claim(payload.len())?;
+        let capacity = authority.governor().reserve(
+            WorkClaim::tenant(scope.tenant, WorkKind::Ingest, amounts).expect("valid ingest claim"),
+        )?;
+        let block = PreparedStoreBlock::new_with_preparation_capacity(
+            scope,
+            StoreBlockIdentity::new([0x74; 16])?,
+            payload.to_vec(),
+            capacity,
+        )?;
+
+        let receipt = ledger.append(block)?;
+        assert_eq!(receipt.position().value(), 1);
+        assert_eq!(ledger.snapshot()?.blocks()[0].payload(), payload);
+        Ok(())
+    })
 }
 
 #[test]

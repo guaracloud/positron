@@ -705,6 +705,62 @@ impl KernelFixture {
         Ok(schema)
     }
 
+    pub fn append_indexed_text_logs(
+        &self,
+        bodies: Vec<&str>,
+        identity: u8,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let schema_budget = positron_signals::SchemaBudget::new(8, 200_000, 8_000, 8_000)?;
+        let schema_capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 200_000)?,
+        )?)?;
+        let mut schema =
+            positron_signals::SchemaSessionStore::new(schema_capacity, self.tenant, schema_budget)?;
+        let mut records = Vec::new();
+        records.try_reserve_exact(bodies.len())?;
+        for (event_time, body) in bodies.into_iter().enumerate() {
+            let event_time = i64::try_from(event_time + 20)?;
+            let candidate = NativeLogCandidate::new(
+                Some(event_time),
+                None,
+                Some(CandidateAttributeValue::string(body.to_owned())),
+                vec![],
+                LogMetadata::empty(),
+            );
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the text query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
+        let delta = schema.stage_group(&mut records)?;
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let block = LogStore::new()
+            .prepare(
+                capacity,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
+                self.tenant,
+                self.shard,
+                StoreBlockIdentity::new([identity; 16])?,
+                records,
+            )?
+            .into_store_block();
+        let digest = block.content_digest()?;
+        self.ledger()?.append(block)?;
+        schema.commit(delta, StoreBlockIdentity::new([identity; 16])?, digest)?;
+        Ok(schema)
+    }
+
     pub fn append_malformed_log_block(&self, identity: u8) -> Result<(), Box<dyn Error>> {
         let block = PreparedStoreBlock::new(
             SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),

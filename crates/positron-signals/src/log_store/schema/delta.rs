@@ -2,16 +2,19 @@ use positron_domain::identity::TenantId;
 use positron_domain::value::{AttributeOccurrenceSet, ValidatedAttributeValue};
 
 use super::catalog::SchemaCatalog;
+pub(crate) use super::discovery_meter::DiscoveryMeter;
 use super::failure::SchemaFailure;
-use super::index::{ScalarIndexFraming, SchemaBlockIndex, SchemaIndexPath};
-use super::model::{MAX_DISCOVERY_NODES, SchemaEntry, SchemaPath, promoted_index_bytes};
+use super::index::{SchemaBlockIndex, SchemaIndexPath};
+use super::model::{SchemaEntry, SchemaPath, promoted_index_bytes};
 use super::observation::{ObservedAttribute, SchemaObservation};
 use super::representation::SchemaRepresentation;
+use super::text_index::TextBlockSummary;
 use crate::log_store::{AttributeRepresentation, StoredLogAttribute};
 
 mod accounting;
 mod apply;
 mod indexing;
+mod text;
 mod unverified;
 use accounting::{attribute_bytes, projected_cost, root_fits, staged_memory_bytes};
 pub(super) use indexing::additional_physical_cost;
@@ -33,6 +36,7 @@ pub struct SchemaDelta {
     physical_index_bytes: usize,
     physical_memory_bytes: usize,
     build_physical_index: bool,
+    text_summary: Option<TextBlockSummary>,
 }
 
 impl SchemaDelta {
@@ -52,6 +56,7 @@ impl SchemaDelta {
             physical_index_bytes: 0,
             physical_memory_bytes: 0,
             build_physical_index,
+            text_summary: None,
         }
     }
 
@@ -75,6 +80,14 @@ impl SchemaDelta {
 
     pub(crate) const fn physical_memory_bytes(&self) -> usize {
         self.physical_memory_bytes
+    }
+
+    pub(crate) const fn has_index_paths(&self) -> bool {
+        !self.index_paths.is_empty()
+    }
+
+    pub(crate) const fn has_block_index(&self) -> bool {
+        !self.index_paths.is_empty() || self.text_summary.is_some()
     }
 
     pub fn try_clone(&self) -> Result<Self, SchemaFailure> {
@@ -114,28 +127,12 @@ impl SchemaDelta {
             physical_index_bytes: self.physical_index_bytes,
             physical_memory_bytes: self.physical_memory_bytes,
             build_physical_index: self.build_physical_index,
+            text_summary: self
+                .text_summary
+                .as_ref()
+                .map(TextBlockSummary::try_clone)
+                .transpose()?,
         })
-    }
-
-    pub(crate) fn into_block_index(
-        self,
-        identity: positron_kernel::StoreBlockIdentity,
-        digest: [u8; 32],
-    ) -> (Self, Option<SchemaBlockIndex>) {
-        if self.index_paths.is_empty() {
-            return (self, None);
-        }
-        let mut delta = self;
-        let paths = std::mem::take(&mut delta.index_paths);
-        (
-            delta,
-            Some(SchemaBlockIndex {
-                identity,
-                digest,
-                paths,
-                scalar_framing: ScalarIndexFraming::V2,
-            }),
-        )
     }
 
     pub(super) fn into_query_index(
@@ -156,24 +153,6 @@ impl SchemaDelta {
             .nth(position)
             .ok_or(SchemaFailure::InvalidValue)?;
         SchemaBlockIndex::one(identity, digest, indexed).map(Some)
-    }
-}
-
-pub(crate) struct DiscoveryMeter {
-    used: usize,
-}
-
-impl DiscoveryMeter {
-    pub(crate) const fn new() -> Self {
-        Self { used: 0 }
-    }
-
-    fn consume(&mut self) -> Result<bool, SchemaFailure> {
-        if self.used == MAX_DISCOVERY_NODES {
-            return Ok(false);
-        }
-        self.used += 1;
-        Ok(true)
     }
 }
 

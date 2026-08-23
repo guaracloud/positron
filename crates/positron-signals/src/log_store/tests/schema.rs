@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::error::Error;
 
 use positron_domain::identity::TenantId;
@@ -5,6 +6,7 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue,
+    NativeValueObserver,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
@@ -21,8 +23,9 @@ use crate::log_store::tests::support::{
     TemporaryRoot, establish_kernel_authority, preparation_capacity,
 };
 use crate::{
-    LogStoreFailureCode, OccurrenceSelector, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery,
-    SchemaSessionStore, SchemaValue,
+    LogStoreFailureCode, OccurrenceSelector, ScanCancellation, ScanObservationFailureCode,
+    ScanObserver, SchemaBudget, SchemaCatalog, SchemaPath, SchemaQuery, SchemaSessionStore,
+    SchemaValue,
 };
 
 #[test]
@@ -85,7 +88,15 @@ fn schema_overflow_survives_preparation_and_kernel_scan_losslessly() -> Result<(
     let replay_budget = SchemaBudget::new(1, 8_192, 512, 256)?;
     let permit_capacity = preparation_capacity(&authority, tenant)?;
     let mut replayed = SchemaSessionStore::new(permit_capacity, tenant, replay_budget)?;
-    let replay_delta = replayed.replay(tenant, &snapshot, block)?;
+    let replay_observer = ObservationMeter::bounded(u64::MAX);
+    let replay_delta = replayed.replay_observed_cancellable_with_text_observer(
+        tenant,
+        &snapshot,
+        block,
+        &NeverCancelled,
+        &replay_observer,
+        None,
+    )?;
     replayed.commit(replay_delta, block.identity(), block.content_digest()?)?;
     assert_eq!(replayed.catalog(), &schema);
 
@@ -130,6 +141,284 @@ fn discovery_work_overflow_is_cumulative_across_the_whole_group() -> Result<(), 
     )?;
     assert_eq!(applied.overflow_record_count(), 1);
     Ok(())
+}
+
+#[test]
+fn observed_text_staging_has_an_exact_work_boundary_and_is_atomic() -> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x42; 16])?;
+    let schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let mut records = vec![make_text_record("prefix needle suffix")?];
+    let unlimited = ObservationMeter::bounded(u64::MAX);
+    let delta = LogStore::new().stage_schema_group_observed(&mut records, &schema, &unlimited)?;
+    let consumed = unlimited.consumed.get();
+    assert!(consumed > 0);
+    assert!(delta.physical_memory_bytes() > 0);
+
+    let mut records = vec![make_text_record("prefix needle suffix")?];
+    let exact_minus_one = ObservationMeter::bounded(consumed - 1);
+    let fallback = match LogStore::new().stage_schema_group_observed(
+        &mut records,
+        &schema,
+        &exact_minus_one,
+    ) {
+        Ok(delta) => delta,
+        Err(_) => return Err("unexpected staging failure".into()),
+    };
+    assert_eq!(fallback.physical_memory_bytes(), 0);
+    let empty = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    assert_eq!(schema.memory_bytes(), empty.memory_bytes());
+    Ok(())
+}
+
+#[test]
+fn observed_text_staging_polls_cancellation_before_publication() -> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x43; 16])?;
+    let schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let before = schema.memory_bytes();
+    let mut records = vec![make_text_record(&"x".repeat(2_048))?];
+    let cancelling = ObservationMeter::cancelling(0);
+    let failure =
+        match LogStore::new().stage_schema_group_observed(&mut records, &schema, &cancelling) {
+            Ok(_) => return Err("cancellation unexpectedly succeeded".into()),
+            Err(failure) => failure,
+        };
+    assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
+    assert_eq!(schema.memory_bytes(), before);
+    Ok(())
+}
+
+#[test]
+fn observed_text_staging_maps_attach_cancellation_without_publication() -> Result<(), Box<dyn Error>>
+{
+    let tenant = TenantId::from_bytes([0x44; 16])?;
+    let schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let mut records = vec![make_text_record("abc")?];
+    let observer = CancelOnCall::new(3);
+    let failure =
+        match LogStore::new().stage_schema_group_observed(&mut records, &schema, &observer) {
+            Ok(_) => return Err("attach cancellation unexpectedly succeeded".into()),
+            Err(failure) => failure,
+        };
+    assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
+    assert_eq!(
+        schema.memory_bytes(),
+        SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?.memory_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_text_replay_has_an_exact_work_boundary_and_falls_back_atomically()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x54; 16])?,
+        CatalogSecret::from_owned(Box::new([0x64; 32]), Box::new([0x74; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(24)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x84; 32])),
+    )?;
+    let store = LogStore::new();
+    let identity = StoreBlockIdentity::new([0x94; 16])?;
+    let block = store
+        .prepare(
+            preparation_capacity(&authority, tenant)?,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(120))),
+            tenant,
+            shard,
+            identity,
+            (0..32)
+                .map(|_| make_text_record("abc"))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?
+        .into_store_block();
+    ledger.append(block)?;
+    let snapshot = ledger.snapshot()?;
+    let block = snapshot.blocks().first().ok_or("committed block")?;
+    let schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let unlimited = ObservationMeter::bounded(u64::MAX);
+    let delta =
+        store.replay_schema_block_observed(tenant, &snapshot, block, &schema, &unlimited)?;
+    let consumed = unlimited.consumed.get();
+    assert!(consumed > 0);
+    assert!(delta.physical_memory_bytes() > 0);
+
+    let exact_minus_one = ObservationMeter::bounded(consumed - 1);
+    let fallback =
+        store.replay_schema_block_observed(tenant, &snapshot, block, &schema, &exact_minus_one)?;
+    assert_eq!(fallback.physical_memory_bytes(), 0);
+
+    let mandatory = ObservationMeter::bounded(u64::MAX);
+    let text_budget = ObservationMeter::bounded(0);
+    let reduced_with_text_budget = store
+        .replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            &snapshot,
+            block,
+            &schema,
+            &NeverCancelled,
+            &mandatory,
+            Some(&text_budget),
+        )?;
+    assert_eq!(reduced_with_text_budget.physical_memory_bytes(), 0);
+    let mandatory_work = mandatory.consumed.get();
+    let mandatory_only = ObservationMeter::bounded(mandatory_work);
+    let reduced_without_text_budget = store
+        .replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            &snapshot,
+            block,
+            &schema,
+            &NeverCancelled,
+            &mandatory_only,
+            None,
+        )?;
+    assert_eq!(reduced_without_text_budget.physical_memory_bytes(), 0);
+    assert_eq!(mandatory_only.consumed.get(), mandatory_work);
+
+    let unobserved = store.replay_schema_block(tenant, &snapshot, block, &schema)?;
+    assert!(unobserved.physical_memory_bytes() > 0);
+    let foreign = SchemaCatalog::new(
+        TenantId::from_bytes([0x45; 16])?,
+        SchemaBudget::release_1()?,
+    )?;
+    let foreign_result = store.replay_schema_block(tenant, &snapshot, block, &foreign);
+    let foreign_failure = match foreign_result {
+        Ok(_) => return Err("replay accepted a foreign schema tenant".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        foreign_failure.code(),
+        LogStoreFailureCode::PhysicalScopeMismatch
+    );
+
+    let cancelled_during_summary = CancelOnCall::new(1);
+    let failure = match store.replay_schema_block_observed(
+        tenant,
+        &snapshot,
+        block,
+        &schema,
+        &cancelled_during_summary,
+    ) {
+        Ok(_) => return Err("summary cancellation unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
+
+    let cancelled_during_attach = CancelOnCall::new(3);
+    let failure = match store.replay_schema_block_observed(
+        tenant,
+        &snapshot,
+        block,
+        &schema,
+        &cancelled_during_attach,
+    ) {
+        Ok(_) => return Err("attach cancellation unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
+    Ok(())
+}
+
+struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct AlwaysCancelled;
+
+impl ScanCancellation for AlwaysCancelled {
+    fn is_cancelled(&self) -> bool {
+        true
+    }
+}
+
+struct ObservationMeter {
+    consumed: Cell<u64>,
+    limit: u64,
+    cancel_after: Option<u64>,
+}
+
+impl ObservationMeter {
+    const fn bounded(limit: u64) -> Self {
+        Self {
+            consumed: Cell::new(0),
+            limit,
+            cancel_after: None,
+        }
+    }
+
+    const fn cancelling(after: u64) -> Self {
+        Self {
+            consumed: Cell::new(0),
+            limit: u64::MAX,
+            cancel_after: Some(after),
+        }
+    }
+}
+
+impl ScanObserver for ObservationMeter {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let consumed = self.consumed.get().saturating_add(units);
+        self.consumed.set(consumed);
+        if self.cancel_after.is_some_and(|after| consumed > after) {
+            return Err(ScanObservationFailureCode::Cancelled);
+        }
+        if consumed > self.limit {
+            Err(ScanObservationFailureCode::BudgetExhausted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl NativeValueObserver for ObservationMeter {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        self.observe_work(1)
+    }
+
+    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        self.observe_work(u64::try_from(payload.len()).unwrap_or(u64::MAX))
+    }
+}
+
+struct CancelOnCall {
+    calls: Cell<u64>,
+    fail_at: u64,
+}
+
+impl CancelOnCall {
+    const fn new(fail_at: u64) -> Self {
+        Self {
+            calls: Cell::new(0),
+            fail_at,
+        }
+    }
+}
+
+impl ScanObserver for CancelOnCall {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        let calls = self.calls.get().saturating_add(1);
+        self.calls.set(calls);
+        if calls == self.fail_at {
+            Err(ScanObservationFailureCode::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[test]
@@ -259,6 +548,42 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
     assert_eq!(result.records().len(), 1);
     assert!(result.reduced_pruning());
 
+    let mut observed = ObservationMeter::bounded(u64::MAX);
+    let bounded = store.scan_schema_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &SchemaQuery::value(
+            path.clone(),
+            OccurrenceSelector::Any,
+            SchemaValue::signed_integer(42),
+        ),
+        &NeverCancelled,
+        &mut observed,
+    )?;
+    assert_eq!(bounded.decoded_records(), 1);
+    assert!(!bounded.complete());
+
+    let cancelled = store
+        .scan_schema_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            LogScan::all(ScanLimit::new(1)?),
+            &schema,
+            &SchemaQuery::value(
+                path.clone(),
+                OccurrenceSelector::Any,
+                SchemaValue::signed_integer(42),
+            ),
+            &AlwaysCancelled,
+            &mut observed,
+        )
+        .expect_err("schema scan cancellation must be checked before admission");
+    assert_eq!(cancelled.code(), LogStoreFailureCode::Cancelled);
+
     let snapshot = ledger.snapshot()?;
     let replay_capacity = preparation_capacity(&authority, tenant)?;
     let mut replayed = SchemaSessionStore::new(
@@ -307,6 +632,26 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
 
 fn make_record(key: &str, value: &str) -> Result<LogRecord, Box<dyn Error>> {
     make_record_with_occurrences(key, &[value])
+}
+
+fn make_text_record(body: &str) -> Result<LogRecord, Box<dyn Error>> {
+    let policy = IngestPolicy::preserving(1)?;
+    let candidate = NativeLogCandidate::new(
+        None,
+        None,
+        Some(CandidateAttributeValue::string(body.to_owned())),
+        Vec::new(),
+        LogMetadata::empty(),
+    );
+    let PolicyEvaluation::Accepted(evaluated) =
+        policy.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+    else {
+        return Err("preserving policy rejected fixture".into());
+    };
+    Ok(LogRecord::checked_evaluated(
+        LogStore::value_limit_profile(),
+        *evaluated,
+    )?)
 }
 
 fn make_record_with_occurrences(key: &str, values: &[&str]) -> Result<LogRecord, Box<dyn Error>> {

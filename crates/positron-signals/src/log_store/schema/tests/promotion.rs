@@ -1,4 +1,5 @@
 use super::*;
+use positron_kernel::StoreBlockIdentity;
 
 #[test]
 fn scalar_discovery_consumes_exact_dictionary_index_bytes() -> Result<(), Box<dyn Error>> {
@@ -121,5 +122,47 @@ fn repeated_and_conflicting_occurrences_update_one_exact_dictionary() -> Result<
     assert_eq!(entry.variants().len(), 2);
     assert_eq!(entry.conflicts(), 1);
     assert_eq!(catalog.index_bytes(), 4);
+    Ok(())
+}
+
+#[test]
+fn removing_scalar_evidence_retains_unrelated_text_only_block() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let text_identity = StoreBlockIdentity::new(1_u128.to_be_bytes())?;
+    let mut text_delta = super::super::SchemaDelta::empty(tenant, true);
+    text_delta.attach_text_summary(
+        &catalog,
+        super::super::TextBlockSummary::from_bodies([Some("text-only block")])?,
+    )?;
+    let (text_delta, text_index) = text_delta.into_block_index(text_identity, [0x21; 32]);
+    catalog.apply_delta(text_delta, text_index)?;
+
+    let scalar = occurrence(
+        AttributeNamespace::Record,
+        "scalar",
+        CandidateAttributeValue::signed_integer(7),
+    )?;
+    catalog.observe(std::slice::from_ref(&scalar))?;
+    catalog.observe(std::slice::from_ref(&scalar))?;
+    let scalar_path = path(AttributeNamespace::Record, "scalar");
+    catalog.record_query_use(&scalar_path)?;
+    let mut scalar_delta = super::super::SchemaDelta::empty(tenant, true);
+    catalog.stage_record(
+        std::slice::from_ref(&scalar),
+        &mut scalar_delta,
+        &mut super::super::delta::DiscoveryMeter::new(),
+    )?;
+    let (scalar_delta, scalar_index) =
+        scalar_delta.into_block_index(StoreBlockIdentity::new(2_u128.to_be_bytes())?, [0x22; 32]);
+    catalog.apply_delta(scalar_delta, scalar_index)?;
+
+    catalog.remove_query_evidence(&scalar_path)?;
+    assert!(
+        catalog
+            .block_indexes
+            .iter()
+            .any(|block| block.identity == text_identity && block.text_summary.is_some())
+    );
     Ok(())
 }

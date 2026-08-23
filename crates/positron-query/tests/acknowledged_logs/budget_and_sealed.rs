@@ -151,7 +151,7 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().decoded_records() == 0
+                && incomplete.stats().decoded_records() == 1
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::DecodedRecords)
     ));
@@ -399,6 +399,64 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     )?;
     let after_restart = restarted
         .execute(query)?
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(
+                batch
+                    .records()
+                    .iter()
+                    .filter_map(|record| record.body_text())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            ),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(after_restart, first);
+    Ok(())
+}
+
+#[test]
+fn full_text_search_keeps_active_and_sealed_results_equivalent() -> Result<(), Box<dyn Error>> {
+    let (_roots, paths) = bootstrap_paths("sealed-search")?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let mut fixture = KernelFixture::new(instance.default_tenant_id(), "sealed-search-kernel")?;
+    fixture.append_log("sealed timeout", 20, 1)?;
+    fixture.seal_and_reopen()?;
+    fixture.append_log("active timeout", 21, 2)?;
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let source = "pipeline:v1 logs | range query_time -100 100 | search body contains \"timeout\" | limit 16";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    let first = service
+        .execute(service.plan_pipeline(context, source, budget)?)?
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(
+                batch
+                    .records()
+                    .iter()
+                    .filter_map(|record| record.body_text())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            ),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(first, ["sealed timeout", "active timeout"]);
+
+    fixture.seal_and_reopen()?;
+    let restarted =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let after_restart = restarted
+        .execute(restarted.plan_pipeline(context, source, budget)?)?
         .filter_map(|event| match event {
             QueryEvent::Batch(batch) => Some(
                 batch

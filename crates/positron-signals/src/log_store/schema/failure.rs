@@ -1,3 +1,5 @@
+use crate::log_store::ScanObservationFailureCode;
+
 /// Failures returned by bounded schema discovery and catalog operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchemaFailure {
@@ -8,6 +10,7 @@ pub enum SchemaFailure {
     LimitExceeded,
     AllocationUnavailable,
     MalformedCatalog,
+    Observed(ScanObservationFailureCode),
 }
 
 impl std::fmt::Display for SchemaFailure {
@@ -20,6 +23,7 @@ impl std::fmt::Display for SchemaFailure {
             Self::LimitExceeded => "schema limit exceeded",
             Self::AllocationUnavailable => "schema allocation unavailable",
             Self::MalformedCatalog => "malformed schema catalog",
+            Self::Observed(_) => "schema work observation failed",
         })
     }
 }

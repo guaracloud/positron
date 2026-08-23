@@ -1,12 +1,13 @@
 use positron_kernel::StoreBlockIdentity;
 
+use super::value::{decode_value, preflight_value, put_value};
 use super::{Input, decode_namespace, namespace_tag, put_bytes, put_len, put_u16};
 use crate::log_store::schema::index::{
     BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, INDEX_MAGIC, MAX_BLOCK_INDEXES, MAX_INDEX_VALUES,
-    SCALAR_VALUES_MAGIC, ScalarIndexFraming, SchemaBlockIndex, SchemaIndexPath,
+    SCALAR_VALUES_MAGIC, ScalarIndexFraming, SchemaBlockIndex, SchemaIndexPath, TextIndexFraming,
 };
-use crate::log_store::schema::model::MAX_SCALAR_VALUE_BYTES;
 use crate::log_store::schema::query::SchemaValue;
+use crate::log_store::schema::text_index::{MAX_TEXT_TRIGRAMS, TextBlockSummary};
 use crate::log_store::{SchemaBudget, SchemaCatalog, SchemaFailure, SchemaPath};
 
 pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(), SchemaFailure> {
@@ -38,6 +39,16 @@ pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(),
                 }
             }
         }
+        if block.text_framing == TextIndexFraming::V1 {
+            bytes.push(u8::from(block.text_summary.is_some()));
+            if let Some(summary) = &block.text_summary {
+                bytes.push(u8::from(summary.complete()));
+                put_len(bytes, summary.trigrams().len())?;
+                for trigram in summary.trigrams() {
+                    bytes.extend_from_slice(trigram);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -45,17 +56,20 @@ pub(super) fn append(catalog: &SchemaCatalog, bytes: &mut Vec<u8>) -> Result<(),
 pub(super) struct IndexPreflight {
     pub(super) encoded_bytes: usize,
     pub(super) memory_bound: usize,
+    pub(super) sidecar_memory_bound: usize,
 }
 
 pub(super) fn preflight(
     input: &mut Input<'_>,
     budget: SchemaBudget,
     legacy: bool,
+    text: bool,
 ) -> Result<IndexPreflight, SchemaFailure> {
     if !input.starts_with(INDEX_MAGIC) {
         return Ok(IndexPreflight {
             encoded_bytes: 0,
             memory_bound: 0,
+            sidecar_memory_bound: 0,
         });
     }
     let before = input.remaining_len();
@@ -68,6 +82,7 @@ pub(super) fn preflight(
     let mut memory = count
         .checked_mul(SchemaBudget::block_index_memory_bytes())
         .ok_or(SchemaFailure::MalformedCatalog)?;
+    let mut sidecar_memory = memory;
     for _ in 0..count {
         let identity: [u8; 16] = input.array()?;
         let digest: [u8; 32] = input.array()?;
@@ -79,7 +94,7 @@ pub(super) fn preflight(
         }
         previous_identity = Some(identity);
         let paths = input.usize()?;
-        if paths == 0 || paths > budget.max_entries() {
+        if paths > budget.max_entries() {
             return Err(SchemaFailure::MalformedCatalog);
         }
         let mut previous_path: Option<&[u8]> = None;
@@ -116,12 +131,16 @@ pub(super) fn preflight(
                 return Err(SchemaFailure::MalformedCatalog);
             }
             previous_path = Some(current);
+            let path_memory = SchemaBudget::index_path_memory_bytes(path_bytes, segments)
+                .ok_or(SchemaFailure::MalformedCatalog)?
+                .checked_add(std::mem::size_of::<Vec<SchemaValue>>())
+                .ok_or(SchemaFailure::MalformedCatalog)?;
             memory = memory
-                .checked_add(
-                    SchemaBudget::index_path_memory_bytes(path_bytes, segments)
-                        .ok_or(SchemaFailure::MalformedCatalog)?,
-                )
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<SchemaValue>>()))
+                .checked_add(path_memory)
+                .filter(|bytes| *bytes <= budget.max_memory_bytes())
+                .ok_or(SchemaFailure::MalformedCatalog)?;
+            sidecar_memory = sidecar_memory
+                .checked_add(path_memory)
                 .filter(|bytes| *bytes <= budget.max_memory_bytes())
                 .ok_or(SchemaFailure::MalformedCatalog)?;
         }
@@ -144,8 +163,13 @@ pub(super) fn preflight(
                 }
                 any_values |= values > 0;
                 for _ in 0..values {
+                    let value_memory = preflight_value(&mut *input)?;
                     memory = memory
-                        .checked_add(preflight_value(&mut *input)?)
+                        .checked_add(value_memory)
+                        .filter(|bytes| *bytes <= budget.max_memory_bytes())
+                        .ok_or(SchemaFailure::MalformedCatalog)?;
+                    sidecar_memory = sidecar_memory
+                        .checked_add(value_memory)
                         .filter(|bytes| *bytes <= budget.max_memory_bytes())
                         .ok_or(SchemaFailure::MalformedCatalog)?;
                 }
@@ -153,6 +177,51 @@ pub(super) fn preflight(
             if !legacy && !any_values {
                 return Err(SchemaFailure::MalformedCatalog);
             }
+        }
+        let has_text = if text {
+            match input.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(SchemaFailure::MalformedCatalog),
+            }
+        } else {
+            false
+        };
+        if paths == 0 && !has_text {
+            return Err(SchemaFailure::MalformedCatalog);
+        }
+        if has_text {
+            match input.u8()? {
+                0 | 1 => {},
+                _ => return Err(SchemaFailure::MalformedCatalog),
+            }
+            let trigrams = input.usize()?;
+            if trigrams > MAX_TEXT_TRIGRAMS {
+                return Err(SchemaFailure::MalformedCatalog);
+            }
+            let mut previous = None;
+            for _ in 0..trigrams {
+                let trigram: [u8; 3] = input.array()?;
+                if previous.is_some_and(|known| known >= trigram) {
+                    return Err(SchemaFailure::MalformedCatalog);
+                }
+                previous = Some(trigram);
+            }
+            let text_memory = std::mem::size_of::<TextBlockSummary>()
+                .checked_add(
+                    trigrams
+                        .checked_mul(std::mem::size_of::<[u8; 3]>())
+                        .ok_or(SchemaFailure::MalformedCatalog)?,
+                )
+                .ok_or(SchemaFailure::MalformedCatalog)?;
+            memory = memory
+                .checked_add(text_memory)
+                .filter(|bytes| *bytes <= budget.max_memory_bytes())
+                .ok_or(SchemaFailure::MalformedCatalog)?;
+            sidecar_memory = sidecar_memory
+                .checked_add(text_memory)
+                .filter(|bytes| *bytes <= budget.max_memory_bytes())
+                .ok_or(SchemaFailure::MalformedCatalog)?;
         }
     }
     let encoded_bytes = before
@@ -163,6 +232,7 @@ pub(super) fn preflight(
     Ok(IndexPreflight {
         encoded_bytes,
         memory_bound: memory,
+        sidecar_memory_bound: sidecar_memory,
     })
 }
 
@@ -170,6 +240,7 @@ pub(super) fn decode(
     input: &mut Input<'_>,
     budget: SchemaBudget,
     legacy: bool,
+    text: bool,
 ) -> Result<(Vec<SchemaBlockIndex>, usize, usize), SchemaFailure> {
     // `decode_checkpoint` performs the complete bounded and canonical preflight
     // immediately before this pass; this pass retains checked allocation and
@@ -251,6 +322,51 @@ pub(super) fn decode(
                 })?)
                 .ok_or(SchemaFailure::MalformedCatalog)?;
         }
+        let (text_framing, text_summary) = if text {
+            let has_text = match input.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(SchemaFailure::MalformedCatalog),
+            };
+            if !has_text {
+                (TextIndexFraming::V1, None)
+            } else {
+                let complete = match input.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(SchemaFailure::MalformedCatalog),
+                };
+                let count = input.usize()?;
+                if count > MAX_TEXT_TRIGRAMS {
+                    return Err(SchemaFailure::MalformedCatalog);
+                }
+                let mut trigrams = Vec::new();
+                trigrams
+                    .try_reserve_exact(count)
+                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+                for _ in 0..count {
+                    trigrams.push(input.array()?);
+                }
+                if trigrams.windows(2).any(|pair| pair.first() >= pair.get(1)) {
+                    return Err(SchemaFailure::MalformedCatalog);
+                }
+                memory = memory
+                    .checked_add(std::mem::size_of::<TextBlockSummary>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(count.checked_mul(std::mem::size_of::<[u8; 3]>())?)
+                    })
+                    .ok_or(SchemaFailure::MalformedCatalog)?;
+                (
+                    TextIndexFraming::V1,
+                    Some(TextBlockSummary::from_wire_parts(complete, trigrams)),
+                )
+            }
+        } else {
+            (TextIndexFraming::LegacyV2, None)
+        };
+        if paths.is_empty() && text_summary.is_none() {
+            return Err(SchemaFailure::MalformedCatalog);
+        }
         blocks.push(SchemaBlockIndex {
             identity,
             digest,
@@ -260,6 +376,8 @@ pub(super) fn decode(
             } else {
                 ScalarIndexFraming::V2
             },
+            text_framing,
+            text_summary,
         });
     }
     let physical = before
@@ -267,153 +385,4 @@ pub(super) fn decode(
         .filter(|bytes| *bytes <= budget.max_index_bytes())
         .ok_or(SchemaFailure::MalformedCatalog)?;
     Ok((blocks, physical, memory))
-}
-
-#[derive(Clone, Copy)]
-enum ScalarTag {
-    Null,
-    Boolean,
-    SignedInteger,
-    FloatingPointBits,
-    String,
-    Bytes,
-}
-
-impl ScalarTag {
-    fn from_byte(byte: u8) -> Result<Self, SchemaFailure> {
-        match byte {
-            0 => Ok(Self::Null),
-            1 => Ok(Self::Boolean),
-            2 => Ok(Self::SignedInteger),
-            3 => Ok(Self::FloatingPointBits),
-            4 => Ok(Self::String),
-            5 => Ok(Self::Bytes),
-            _ => Err(SchemaFailure::MalformedCatalog),
-        }
-    }
-
-    const fn byte(self) -> u8 {
-        match self {
-            Self::Null => 0,
-            Self::Boolean => 1,
-            Self::SignedInteger => 2,
-            Self::FloatingPointBits => 3,
-            Self::String => 4,
-            Self::Bytes => 5,
-        }
-    }
-}
-
-fn value_tag(value: &SchemaValue) -> Result<ScalarTag, SchemaFailure> {
-    match value {
-        SchemaValue::Null => Ok(ScalarTag::Null),
-        SchemaValue::Boolean(_) => Ok(ScalarTag::Boolean),
-        SchemaValue::SignedInteger(_) => Ok(ScalarTag::SignedInteger),
-        SchemaValue::FloatingPointBits(_) => Ok(ScalarTag::FloatingPointBits),
-        SchemaValue::String(_) => Ok(ScalarTag::String),
-        SchemaValue::Bytes(_) => Ok(ScalarTag::Bytes),
-        SchemaValue::Kind(_) => Err(SchemaFailure::InvalidValue),
-    }
-}
-
-fn put_value(bytes: &mut Vec<u8>, value: &SchemaValue) -> Result<(), SchemaFailure> {
-    let tag = value_tag(value)?;
-    bytes.push(tag.byte());
-    match value {
-        SchemaValue::Null => {},
-        SchemaValue::Boolean(value) => {
-            bytes.push(u8::from(*value));
-        },
-        SchemaValue::SignedInteger(value) => {
-            bytes.extend_from_slice(&value.to_be_bytes());
-        },
-        SchemaValue::FloatingPointBits(value) => {
-            bytes.extend_from_slice(&value.to_be_bytes());
-        },
-        SchemaValue::String(value) => {
-            if value.len() > MAX_SCALAR_VALUE_BYTES {
-                return Err(SchemaFailure::LimitExceeded);
-            }
-            put_bytes(bytes, value.as_bytes())?;
-        },
-        SchemaValue::Bytes(value) => {
-            if value.len() > MAX_SCALAR_VALUE_BYTES {
-                return Err(SchemaFailure::LimitExceeded);
-            }
-            put_bytes(bytes, value)?;
-        },
-        SchemaValue::Kind(_) => return Err(SchemaFailure::InvalidValue),
-    }
-    Ok(())
-}
-
-fn preflight_value(input: &mut Input<'_>) -> Result<usize, SchemaFailure> {
-    let tag = ScalarTag::from_byte(input.u8()?)?;
-    let payload = match tag {
-        ScalarTag::Null => 0,
-        ScalarTag::Boolean => {
-            if input.u8()? > 1 {
-                return Err(SchemaFailure::MalformedCatalog);
-            }
-            1
-        },
-        ScalarTag::SignedInteger | ScalarTag::FloatingPointBits => {
-            input.take(8)?;
-            8
-        },
-        ScalarTag::String | ScalarTag::Bytes => {
-            let length = input.usize()?;
-            if length > MAX_SCALAR_VALUE_BYTES {
-                return Err(SchemaFailure::MalformedCatalog);
-            }
-            let bytes = input.take(length)?;
-            if matches!(tag, ScalarTag::String) && std::str::from_utf8(bytes).is_err() {
-                return Err(SchemaFailure::MalformedCatalog);
-            }
-            length
-        },
-    };
-    std::mem::size_of::<SchemaValue>()
-        .checked_add(payload)
-        .ok_or(SchemaFailure::MalformedCatalog)
-}
-
-fn decode_value(input: &mut Input<'_>) -> Result<SchemaValue, SchemaFailure> {
-    match ScalarTag::from_byte(input.u8()?)? {
-        ScalarTag::Null => Ok(SchemaValue::Null),
-        ScalarTag::Boolean => Ok(SchemaValue::Boolean(input.u8()? == 1)),
-        ScalarTag::SignedInteger => Ok(SchemaValue::SignedInteger(i64::from_be_bytes(
-            input.array()?,
-        ))),
-        ScalarTag::FloatingPointBits => Ok(SchemaValue::FloatingPointBits(u64::from_be_bytes(
-            input.array()?,
-        ))),
-        ScalarTag::String => {
-            let length = input.usize()?;
-            if length > MAX_SCALAR_VALUE_BYTES {
-                return Err(SchemaFailure::MalformedCatalog);
-            }
-            let bytes = input.take(length)?;
-            let value = std::str::from_utf8(bytes).map_err(|_| SchemaFailure::MalformedCatalog)?;
-            let mut decoded = String::new();
-            decoded
-                .try_reserve_exact(length)
-                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-            decoded.push_str(value);
-            Ok(SchemaValue::String(decoded))
-        },
-        ScalarTag::Bytes => {
-            let length = input.usize()?;
-            if length > MAX_SCALAR_VALUE_BYTES {
-                return Err(SchemaFailure::MalformedCatalog);
-            }
-            let source = input.take(length)?;
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(length)
-                .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-            bytes.extend_from_slice(source);
-            Ok(SchemaValue::Bytes(bytes))
-        },
-    }
 }

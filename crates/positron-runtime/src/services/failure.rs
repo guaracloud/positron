@@ -15,6 +15,7 @@ pub enum ServiceFailure {
     StorageUnavailable,
     CorruptState,
     Internal,
+    Cancelled,
 }
 
 pub(super) fn map_admission_group_plan_failure(
@@ -53,6 +54,7 @@ impl ServiceFailure {
                 crate::BootstrapFailureCode::CatalogUnavailable
             },
             Self::LedgerUnavailable => crate::BootstrapFailureCode::LedgerUnavailable,
+            Self::Cancelled => crate::BootstrapFailureCode::ResourceUnavailable,
             Self::CapacityUnavailable => crate::BootstrapFailureCode::ResourceUnavailable,
             Self::Unauthorized | Self::RequestTooLarge | Self::InvalidRequest | Self::Internal => {
                 crate::BootstrapFailureCode::ResourceUnavailable

@@ -18,6 +18,14 @@ positron-domain = { path = "../positron-domain" }
 positron-governance = { path = "../positron-governance" }
 positron-kernel = { path = "../positron-kernel" }
 positron-signals = { path = "../positron-signals" }
+regex-automata = { version = "=0.4.18", default-features = false, features = [
+    "dfa-build",
+    "dfa-search",
+    "std",
+    "syntax",
+    "unicode",
+] }
+regex-syntax = "=0.8.11"
 
 [dev-dependencies]
 positron-kernel = { path = "../positron-kernel", features = ["test-support"] }

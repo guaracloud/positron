@@ -5,7 +5,7 @@ use positron_kernel::{
 };
 
 use super::{SchemaBudget, SchemaCatalog, SchemaDelta, SchemaFailure};
-use crate::log_store::{LogRecord, LogStore, LogStoreFailure};
+use crate::log_store::{LogRecord, LogStore, LogStoreFailure, ScanCancellation, ScanObserver};
 
 /// Opaque tenant-bound schema store owned by the governed ingest session.
 ///
@@ -13,15 +13,23 @@ use crate::log_store::{LogRecord, LogStore, LogStoreFailure};
 /// outlive or be copied independently from its capacity.
 #[doc(hidden)]
 pub struct SchemaSessionStore {
-    catalog: SchemaCatalog,
+    pub(super) catalog: SchemaCatalog,
     _capacity: TransferredResourceReservation,
     capacity_bytes: u64,
 }
 
-/// Fallibly constructed, unpublished query-evidence replacement.
+/// Fallibly constructed, unpublished catalog replacement.
 #[doc(hidden)]
 pub struct SchemaQueryUpdate {
     catalog: SchemaCatalog,
+}
+
+/// Unpublished replay state whose lifetime is tied to the temporary replay
+/// reservation. It cannot be published after that reservation is dropped.
+#[doc(hidden)]
+pub struct SchemaReplayCandidate<'reservation> {
+    pub(super) catalog: SchemaCatalog,
+    pub(super) reservation: ResourceReservation<'reservation>,
 }
 
 impl SchemaSessionStore {
@@ -97,8 +105,54 @@ impl SchemaSessionStore {
         self._capacity.can_reclaim_with(governor)
     }
 
+    /// Builds an unpublished catalog copy under the caller's already-admitted
+    /// replay reservation. The candidate owns that temporary capacity and
+    /// therefore cannot transfer the live session's base grant at publication
+    /// time.
+    pub fn try_clone_for_replay<'reservation>(
+        &self,
+        reservation: ResourceReservation<'reservation>,
+    ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
+        self.try_clone_for_replay_inner(reservation, None)
+    }
+
+    pub fn try_clone_for_replay_observed<'reservation>(
+        &self,
+        reservation: ResourceReservation<'reservation>,
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
+        self.try_clone_for_replay_inner(reservation, Some(observer))
+    }
+
+    fn try_clone_for_replay_inner<'reservation>(
+        &self,
+        reservation: ResourceReservation<'reservation>,
+        observer: Option<&dyn ScanObserver>,
+    ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
+        let required =
+            u64::try_from(self.catalog.memory_bytes()).map_err(|_| SchemaFailure::LimitExceeded)?;
+        if !reservation.authorizes_tenant_schema_session(self.tenant(), required) {
+            return Err(SchemaFailure::AllocationUnavailable);
+        }
+        Ok(SchemaReplayCandidate {
+            catalog: match observer {
+                Some(observer) => self.catalog.try_clone_observed(observer)?,
+                None => self.catalog.try_clone()?,
+            },
+            reservation,
+        })
+    }
+
     pub fn stage_group(&self, records: &mut [LogRecord]) -> Result<SchemaDelta, LogStoreFailure> {
         LogStore::new().stage_schema_group(records, &self.catalog)
+    }
+
+    pub fn stage_group_observed(
+        &self,
+        records: &mut [LogRecord],
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().stage_schema_group_observed(records, &self.catalog, observer)
     }
 
     pub fn commit(
@@ -110,6 +164,22 @@ impl SchemaSessionStore {
         LogStore::new().apply_schema_delta(&mut self.catalog, delta, identity, digest)
     }
 
+    pub fn commit_observed(
+        &mut self,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), LogStoreFailure> {
+        LogStore::new().apply_schema_delta_replay_observed(
+            &mut self.catalog,
+            delta,
+            identity,
+            digest,
+            observer,
+        )
+    }
+
     pub fn replay(
         &self,
         tenant: TenantId,
@@ -117,6 +187,60 @@ impl SchemaSessionStore {
         block: &CommittedBlock,
     ) -> Result<SchemaDelta, LogStoreFailure> {
         LogStore::new().replay_schema_block(tenant, snapshot, block, &self.catalog)
+    }
+
+    pub fn replay_observed(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        self.replay_observed_cancellable(
+            tenant,
+            snapshot,
+            block,
+            &super::super::scan::NeverCancelled,
+            observer,
+        )
+    }
+
+    pub fn replay_observed_cancellable(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().replay_schema_block_observed_cancellable(
+            tenant,
+            snapshot,
+            block,
+            &self.catalog,
+            cancellation,
+            observer,
+        )
+    }
+
+    pub fn replay_observed_cancellable_with_text_observer(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        text_observer: Option<&dyn ScanObserver>,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            snapshot,
+            block,
+            &self.catalog,
+            cancellation,
+            observer,
+            text_observer,
+        )
     }
 
     pub fn stage_query_update(&self) -> Result<SchemaQueryUpdate, SchemaFailure> {
@@ -130,6 +254,17 @@ impl SchemaSessionStore {
             return Err(SchemaFailure::InvalidValue);
         }
         self.catalog = update.catalog;
+        Ok(())
+    }
+
+    pub fn commit_replay_candidate<'reservation>(
+        &mut self,
+        candidate: SchemaReplayCandidate<'reservation>,
+    ) -> Result<(), SchemaFailure> {
+        if self.catalog.tenant() != candidate.catalog.tenant() {
+            return Err(SchemaFailure::InvalidValue);
+        }
+        self.catalog = candidate.catalog;
         Ok(())
     }
 
@@ -176,33 +311,65 @@ impl SchemaQueryUpdate {
     }
 }
 
-impl SchemaCatalog {
-    fn try_clone(&self) -> Result<Self, SchemaFailure> {
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.entries.capacity())
-            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-        for entry in &self.entries {
-            entries.push(entry.try_clone()?);
-        }
-        let mut block_indexes = Vec::new();
-        block_indexes
-            .try_reserve_exact(self.block_indexes.len())
-            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-        for block in &self.block_indexes {
-            block_indexes.push(block.try_clone()?);
-        }
-        Ok(Self {
-            tenant: self.tenant,
-            budget: self.budget,
-            entries,
-            memory_bytes: self.memory_bytes,
-            persistent_bytes: self.persistent_bytes,
-            index_bytes: self.index_bytes,
-            overflow_records: self.overflow_records,
-            overflow_bytes: self.overflow_bytes,
-            block_indexes,
-        })
+impl<'reservation> SchemaReplayCandidate<'reservation> {
+    pub fn prepare_replay_mutation_observed(
+        &mut self,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaFailure> {
+        self.catalog.prepare_replay_mutation_observed(observer)
+    }
+
+    pub fn commit(
+        &mut self,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> Result<(), LogStoreFailure> {
+        LogStore::new().apply_schema_delta(&mut self.catalog, delta, identity, digest)
+    }
+
+    pub fn commit_observed(
+        &mut self,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), LogStoreFailure> {
+        LogStore::new().apply_schema_delta_replay_observed(
+            &mut self.catalog,
+            delta,
+            identity,
+            digest,
+            observer,
+        )
+    }
+
+    pub fn replay_observed_cancellable_with_text_observer(
+        &self,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        text_observer: Option<&dyn ScanObserver>,
+    ) -> Result<SchemaDelta, LogStoreFailure> {
+        LogStore::new().replay_schema_block_observed_cancellable_with_text_observer(
+            tenant,
+            snapshot,
+            block,
+            &self.catalog,
+            cancellation,
+            observer,
+            text_observer,
+        )
+    }
+
+    pub fn reconcile_block_identity(
+        &mut self,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+    ) -> Result<(), SchemaFailure> {
+        self.catalog.reconcile_block_identity(identity, digest)
     }
 }
 

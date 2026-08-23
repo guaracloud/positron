@@ -5,6 +5,35 @@ use super::{SchemaCatalog, SchemaPath, SchemaQuery, SchemaValue};
 use crate::log_store::{ScanObservationFailureCode, ScanObserver};
 
 impl SchemaCatalog {
+    pub(crate) fn verified_text_coverage_observed(
+        &self,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        candidate: &super::TextSearchCandidate,
+        observer: &dyn ScanObserver,
+    ) -> Result<Option<bool>, ScanObservationFailureCode> {
+        for index in &self.block_indexes {
+            observer.observe_work(1)?;
+            if index.identity != identity {
+                continue;
+            }
+            if index.digest != digest || !index.semantically_valid(&self.entries) {
+                return Ok(None);
+            }
+            let Some(summary) = index.text_summary.as_ref() else {
+                return Ok(None);
+            };
+            // The summary is a sorted, bounded set. Charge the physical
+            // lookup once, then poll cancellation while doing its bounded
+            // binary searches. Charging every stored trigram would make the
+            // cost depend on the index representation rather than the
+            // caller's one candidate lookup.
+            observer.observe_work(1)?;
+            return summary.might_contain_observed(candidate, observer);
+        }
+        Ok(None)
+    }
+
     pub(crate) fn verified_query_coverage_observed(
         &self,
         identity: StoreBlockIdentity,
@@ -77,7 +106,146 @@ fn poll_payload(
     observer: &dyn ScanObserver,
 ) -> Result<(), ScanObservationFailureCode> {
     for _ in payload.chunks(NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
-        observer.observe_work(0)?;
+        observer.observe_work(1)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, error::Error};
+
+    use positron_domain::identity::TenantId;
+    use positron_kernel::StoreBlockIdentity;
+
+    use super::super::index::{ScalarIndexFraming, SchemaBlockIndex, TextIndexFraming};
+    use super::super::text_index::TextBlockSummary;
+    use super::super::{SchemaBudget, TextSearchCandidate};
+    use super::SchemaCatalog;
+    use crate::log_store::{ScanObservationFailureCode, ScanObserver};
+
+    struct Unobserved;
+
+    impl ScanObserver for Unobserved {
+        fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+            Ok(())
+        }
+    }
+
+    struct BoundedObserver {
+        consumed: Cell<u64>,
+        limit: u64,
+    }
+
+    impl BoundedObserver {
+        const fn new(limit: u64) -> Self {
+            Self {
+                consumed: Cell::new(0),
+                limit,
+            }
+        }
+    }
+
+    impl ScanObserver for BoundedObserver {
+        fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+            let next = self
+                .consumed
+                .get()
+                .checked_add(units)
+                .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+            self.consumed.set(next);
+            if next > self.limit {
+                Err(ScanObservationFailureCode::BudgetExhausted)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn text_coverage_falls_back_for_missing_and_skips_other_block_indexes()
+    -> Result<(), Box<dyn Error>> {
+        let tenant = TenantId::from_bytes([0x41; 16])?;
+        let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+        let first = StoreBlockIdentity::new([0x01; 16])?;
+        let second = StoreBlockIdentity::new([0x02; 16])?;
+        catalog.block_indexes = vec![
+            SchemaBlockIndex {
+                identity: first,
+                digest: [0x11; 32],
+                paths: Vec::new(),
+                scalar_framing: ScalarIndexFraming::V2,
+                text_framing: TextIndexFraming::V1,
+                text_summary: Some(TextBlockSummary::from_bodies([Some("alpha")])?),
+            },
+            SchemaBlockIndex {
+                identity: second,
+                digest: [0x22; 32],
+                paths: Vec::new(),
+                scalar_framing: ScalarIndexFraming::V2,
+                text_framing: TextIndexFraming::V1,
+                text_summary: Some(TextBlockSummary::from_bodies([Some("beta")])?),
+            },
+        ];
+        let candidate = TextSearchCandidate::literal("eta")?.ok_or("candidate was generic")?;
+        let observer = Unobserved;
+
+        assert_eq!(
+            catalog.verified_text_coverage_observed(second, [0x22; 32], &candidate, &observer),
+            Ok(Some(true))
+        );
+        let missing = StoreBlockIdentity::new([0x03; 16])?;
+        assert_eq!(
+            catalog.verified_text_coverage_observed(missing, [0x33; 32], &candidate, &observer),
+            Ok(None)
+        );
+        let partial = StoreBlockIdentity::new([0x04; 16])?;
+        catalog.block_indexes.push(SchemaBlockIndex {
+            identity: partial,
+            digest: [0x44; 32],
+            paths: Vec::new(),
+            scalar_framing: ScalarIndexFraming::V2,
+            text_framing: TextIndexFraming::V1,
+            text_summary: Some(TextBlockSummary::from_wire_parts(
+                false,
+                vec![[b'z', b'z', b'z']],
+            )),
+        });
+        assert_eq!(
+            catalog.verified_text_coverage_observed(partial, [0x44; 32], &candidate, &observer),
+            Ok(None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_text_capacity_is_bounded_before_optional_work() -> Result<(), Box<dyn Error>> {
+        let tenant = TenantId::from_bytes([0x42; 16])?;
+        let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+        for marker in 1_u16..=193 {
+            let mut identity_bytes = [0_u8; 16];
+            identity_bytes[..2].copy_from_slice(&marker.to_be_bytes());
+            catalog.block_indexes.push(SchemaBlockIndex {
+                identity: StoreBlockIdentity::new(identity_bytes)?,
+                digest: [u8::try_from(marker % 251)?; 32],
+                paths: Vec::new(),
+                scalar_framing: ScalarIndexFraming::V2,
+                text_framing: TextIndexFraming::V1,
+                text_summary: (marker % 64 == 1)
+                    .then(|| TextBlockSummary::from_bodies([Some("body")]))
+                    .transpose()?,
+            });
+        }
+
+        let observer = BoundedObserver::new(4);
+        assert_eq!(catalog.may_add_text_summary_observed(&observer), Ok(false));
+        assert_eq!(observer.consumed.get(), 4);
+
+        let cancelled = BoundedObserver::new(0);
+        assert_eq!(
+            catalog.may_add_text_summary_observed(&cancelled),
+            Err(ScanObservationFailureCode::BudgetExhausted)
+        );
+        Ok(())
+    }
 }

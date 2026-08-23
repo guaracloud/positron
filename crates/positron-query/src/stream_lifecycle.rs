@@ -331,6 +331,7 @@ mod tests {
                 scanned_bytes: 0,
                 decoded_records: 0,
                 output_bytes: 0,
+                memory_peak_bytes: 0,
                 cpu_work_units: 0,
                 wall_seconds: 0,
             },
@@ -344,7 +345,7 @@ mod tests {
         let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
         let budget = QueryBudget::new(1, 1, 1, 1, 1, 1).expect("test budget is valid");
         QueryHeader::new(
-            plan,
+            &plan,
             budget,
             ResultSnapshot::new([1; 32], 1, 1),
             ResultLease::new([2; 16], 1),

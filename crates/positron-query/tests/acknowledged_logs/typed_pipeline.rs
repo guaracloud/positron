@@ -2335,7 +2335,7 @@ fn deep_native_output_and_digest_share_the_cumulative_cpu_budget() -> Result<(),
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(9)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(10)?,
     )?;
 
     let events = service.execute(query)?.collect::<Vec<_>>();
@@ -2778,23 +2778,26 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
     let exhausted = metered_service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(7)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(10)?,
     )?;
     let exhausted_events = metered_service
         .execute_with_schema(exhausted, schema.catalog())?
         .collect::<Vec<_>>();
-    assert!(matches!(
-        exhausted_events.last(),
-        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
-            if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().cpu_work_units() == 8
-                && incomplete.stats().limiting_budget()
-                    == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
-    ));
+    assert!(
+        matches!(
+            exhausted_events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                if incomplete.code() == QueryFailureCode::BudgetExhausted
+                    && incomplete.stats().cpu_work_units() == 11
+                    && incomplete.stats().limiting_budget()
+                        == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+        ),
+        "events: {exhausted_events:?}"
+    );
     let exact = metered_service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(8)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(11)?,
     )?;
     let exact_events = metered_service
         .execute_with_schema(exact, schema.catalog())?
@@ -2802,7 +2805,7 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
     assert!(matches!(
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
-            if stats.cpu_work_units() == 8
+            if stats.cpu_work_units() == 11
                 && stats.scanned_bytes() == 0
                 && stats.decoded_records() == 0
     ));
@@ -3228,5 +3231,355 @@ fn post_digest_wall_expiry_never_claims_an_unqueued_batch() -> Result<(), Box<dy
                 && incomplete.stats().output_bytes() == 0
                 && incomplete.stats().result_digest() == [0; 32]
     ));
+    Ok(())
+}
+
+#[test]
+fn versioned_pipeline_searches_body_text_without_matching_other_records()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-full-text-search")?;
+    fixture.kernel.append_log("request timed out", 20, 1)?;
+    fixture.kernel.append_log("request accepted", 21, 2)?;
+    fixture.kernel.append_log("timeout disabled", 22, 3)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"timed out\" | limit 16",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let bodies = events
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+
+    assert_eq!(bodies, ["request timed out"]);
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn body_search_memory_peak_includes_matcher_and_retained_rows() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-search-memory-peak")?;
+    fixture.kernel.append_log("request timed out", 20, 1)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source = "pipeline:v1 logs | range query_time -100 100 | search body contains \"timed out\" | limit 1";
+
+    let high = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let high_events = service.execute(high)?.collect::<Vec<_>>();
+    let peak = high_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats.memory_peak_bytes()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("search did not complete")?;
+    assert!(peak > 40_000, "matcher memory was not retained: {peak}");
+
+    for (memory_bytes, expected_complete) in [(peak, true), (peak - 1, false)] {
+        let query = service.plan_pipeline(
+            fixture.context,
+            source,
+            QueryBudget::new(1_048_576, 1, 1, 1_048_576, memory_bytes, 60)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert_eq!(
+            matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+            ),
+            expected_complete,
+            "events: {events:?}"
+        );
+        if !expected_complete {
+            assert!(matches!(
+                events.last(),
+                Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                    if incomplete.code() == QueryFailureCode::BudgetExhausted
+                        && incomplete.stats().limiting_budget()
+                            == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn body_regex_memory_peak_includes_automaton_and_retained_rows() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-regex-memory-peak")?;
+    fixture.kernel.append_log("request timed out", 20, 1)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source =
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "timed.*out" | limit 1"#;
+
+    let high = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let high_events = service.execute(high)?.collect::<Vec<_>>();
+    let peak = high_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats.memory_peak_bytes()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("regex search did not complete")?;
+    assert!(
+        peak > 100_000,
+        "regex automaton memory was not retained: {peak}"
+    );
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, peak - 1, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    ));
+    Ok(())
+}
+
+#[test]
+fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("schema-text-budget")?;
+    let schema = fixture
+        .kernel
+        .append_indexed_text_logs(vec!["prefix needle suffix"], 1)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(1)),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let events = service
+        .execute_with_schema(query, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "events: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if stats.cpu_work_units() == 16 && stats.decoded_records() == 1
+        ),
+        "events: {events:?}"
+    );
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(15)?,
+    )?;
+    let exhausted_events = service
+        .execute_with_schema(exhausted, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 16
+    ));
+    Ok(())
+}
+
+#[test]
+fn schema_backed_regex_search_keeps_index_and_dfa_work_bounded() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("schema-regex-budget")?;
+    let schema = fixture
+        .kernel
+        .append_indexed_text_logs(vec!["prefix needle suffix"], 1)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(ConstantWorkMeter(1)),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "needle" | limit 1"#,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(19)?,
+    )?;
+    let events = service
+        .execute_with_schema(query, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "events: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+                if stats.cpu_work_units() == 19 && stats.decoded_records() == 1
+        ),
+        "events: {events:?}"
+    );
+    let exhausted = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "needle" | limit 1"#,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(18)?,
+    )?;
+    let exhausted_events = service
+        .execute_with_schema(exhausted, schema.catalog())?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().cpu_work_units() == 19
+    ));
+    Ok(())
+}
+
+#[test]
+fn versioned_pipeline_regex_search_is_anchored_and_rejects_unbounded_patterns()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-regex-search")?;
+    fixture.kernel.append_log("error-42", 20, 1)?;
+    fixture.kernel.append_log("error-x", 21, 2)?;
+    fixture.kernel.append_log("prefix-error-42", 22, 3)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "^error-[0-9]+$" | limit 16"#,
+        budget,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let bodies = events
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["error-42"]);
+
+    for pattern in [
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "[" | limit 16"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "" | limit 16"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "" | limit 16"#,
+    ] {
+        assert_eq!(
+            service
+                .plan_pipeline(fixture.context, pattern, budget)
+                .err()
+                .ok_or("invalid regex was accepted")?
+                .code(),
+            QueryFailureCode::UnsupportedQuery
+        );
+    }
+
+    let oversized = format!(
+        "pipeline:v1 logs | range query_time -100 100 | search body =~ \"{}\" | limit 16",
+        "a".repeat(1_025)
+    );
+    assert_eq!(
+        service
+            .plan_pipeline(fixture.context, &oversized, budget)
+            .err()
+            .ok_or("oversized regex was accepted")?
+            .code(),
+        QueryFailureCode::UnsupportedQuery
+    );
+
+    let insufficient_memory = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1, 60)?;
+    let failure = service
+        .plan_pipeline(
+            fixture.context,
+            r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "error" | limit 16"#,
+            insufficient_memory,
+        )
+        .err()
+        .ok_or("regex memory reservation was not enforced")?;
+    assert_eq!(failure.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    );
+    Ok(())
+}
+
+#[test]
+fn body_search_polls_cancellation_during_matching() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("pipeline-search-cancellation")?;
+    fixture.kernel.append_log(&"x".repeat(2_048), 20, 1)?;
+    let meter = CancellingOperatorCallMeter::shared(3);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"timeout\" | limit 16",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
     Ok(())
 }

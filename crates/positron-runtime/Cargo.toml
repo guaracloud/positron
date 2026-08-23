@@ -19,6 +19,7 @@ positron-governance = { path = "../positron-governance" }
 positron-ingest = { path = "../positron-ingest" }
 positron-kernel = { path = "../positron-kernel" }
 positron-query = { path = "../positron-query" }
+positron-signals = { path = "../positron-signals" }
 prost = "=0.14.3"
 serde_json = "=1.0.149"
 tokio = { version = "=1.53.1", default-features = false, features = ["net", "rt", "time"] }

@@ -1,9 +1,10 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use positron_ingest::load_schema_checkpoint;
+use positron_ingest::{SchemaReplayBuilder, load_schema_checkpoint};
 use positron_kernel::{
-    CatalogObject, CatalogProposal, FormatEpoch, StoreBlockIdentity, TransactionId,
+    CatalogObject, CatalogProposal, FormatEpoch, RecoveryWorkClaim, RecoveryWorkKind,
+    ResourceAmounts, ResourceDimension, StoreBlockIdentity, TransactionId,
 };
 use prost::Message;
 
@@ -74,5 +75,122 @@ fn bootstrap_rejects_a_structurally_valid_mismatched_replay_frontier() -> Result
         ServiceHandle::new(Arc::clone(&initialized)),
         Err(ServiceFailure::CorruptState)
     ));
+    Ok(())
+}
+
+#[test]
+fn bootstrap_cancellation_is_typed_and_releases_replay_resources() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("cancelled-replay").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    drop(services);
+
+    let before = initialized._authority.governor().inspect()?;
+    let cancellation = crate::TaskCancellation::new();
+    cancellation.cancel();
+    assert!(matches!(
+        ServiceHandle::new_with_cancellation(Arc::clone(&initialized), Some(&cancellation)),
+        Err(ServiceFailure::Cancelled)
+    ));
+    let after = initialized._authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), before.outstanding_total());
+    assert_eq!(after.outstanding_ordinary(), before.outstanding_ordinary());
+    assert_eq!(after.outstanding_recovery(), before.outstanding_recovery());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), before.usage(dimension));
+    }
+    Ok(())
+}
+
+#[test]
+fn bootstrap_cancellation_during_finalization_is_typed() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _) = fixture.initialized()?;
+    let cancellation = crate::TaskCancellation::new();
+    cancellation.cancel();
+
+    assert!(matches!(
+        ServiceHandle::new_with_cancellation(Arc::clone(&initialized), Some(&cancellation)),
+        Err(ServiceFailure::Cancelled)
+    ));
+    Ok(())
+}
+
+#[test]
+fn bootstrap_resource_refusal_is_capacity_not_corrupt_state() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _) = fixture.initialized()?;
+    let mut held = Vec::new();
+    while let Ok(grant) = initialized
+        ._authority
+        .recovery()
+        .reserve(RecoveryWorkClaim::tenant(
+            initialized.tenant,
+            RecoveryWorkKind::Repair,
+            ResourceAmounts::only(ResourceDimension::CpuWorkUnits, 1)?,
+        )?)
+    {
+        held.push(grant);
+    }
+    assert!(!held.is_empty());
+    let failure =
+        match SchemaReplayBuilder::new(initialized.tenant, None, initialized._authority.recovery())
+        {
+            Ok(_) => return Err("resource refusal unexpectedly succeeded".into()),
+            Err(failure) => failure,
+        };
+    assert_eq!(
+        super::super::schema_bootstrap::classify_replay_failure(failure),
+        ServiceFailure::CapacityUnavailable
+    );
+    Ok(())
+}
+
+#[test]
+fn bootstrap_cancellation_after_finalization_does_not_publish_checkpoint()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("finalized-cancel").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    drop(services);
+
+    let probe = crate::TaskCancellation::new();
+    let recovered = super::super::schema_bootstrap::recover(&initialized, &probe)?;
+    assert!(recovered.dirty_checkpoint.is_some());
+    let polls = probe.poll_count();
+    drop(recovered);
+
+    let catalog = open_catalog(&initialized)?;
+    let basis = catalog.pin()?;
+    let before =
+        load_schema_checkpoint(&basis, initialized.tenant, initialized.resource_governor())
+            .map_err(|_| "checkpoint load")?;
+    drop((basis, catalog));
+
+    let cancellation = crate::TaskCancellation::new();
+    cancellation.cancel_after_polls(polls);
+    assert!(matches!(
+        super::super::schema_bootstrap::recover(&initialized, &cancellation),
+        Err(ServiceFailure::Cancelled)
+    ));
+    let catalog = open_catalog(&initialized)?;
+    let basis = catalog.pin()?;
+    assert!(
+        load_schema_checkpoint(&basis, initialized.tenant, initialized.resource_governor())
+            .map_err(|_| "checkpoint load")?
+            == before
+    );
     Ok(())
 }

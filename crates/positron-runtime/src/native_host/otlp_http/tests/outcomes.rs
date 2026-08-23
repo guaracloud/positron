@@ -92,6 +92,13 @@ fn service_failures_have_stable_protocol_statuses() {
                 "OTLP Logs ingest failed",
                 None,
             ),
+            (
+                ServiceFailure::Cancelled,
+                500,
+                13,
+                "OTLP Logs ingest failed",
+                None,
+            ),
         ] {
             let response = ingest_response(Err(failure), encoding);
             assert_eq!(response.status(), http_status);

@@ -9,6 +9,8 @@ mod policy_provenance;
 mod scan;
 mod schema;
 mod schema_scan;
+mod schema_work;
+mod text_scan;
 mod types;
 
 #[cfg(fuzzing)]
@@ -17,9 +19,8 @@ pub use fuzzing::fuzz_log_store_block;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
-    CommittedBlock, LedgerSnapshot, LifecycleClock, LifecycleClockSource, PreparedStoreBlock,
-    ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation, SegmentScope,
-    StoreBlockIdentity, WorkClaim, WorkKind,
+    LedgerSnapshot, LifecycleClock, LifecycleClockSource, PreparedStoreBlock, ResourceGovernor,
+    ResourceReservation, SegmentScope, StoreBlockIdentity,
 };
 
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
@@ -35,11 +36,40 @@ pub use schema::{
     SchemaFailure, SchemaObservation, SchemaPath, SchemaPathDigest, SchemaPathSummary,
     SchemaPromotionDecision, SchemaPromotionReason, SchemaQuery, SchemaQueryResult,
     SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore, SchemaTraversalFailure,
-    SchemaValue,
+    SchemaValue, TextSearchCandidate,
 };
 pub use types::{
     AttributeRepresentation, LogRecord, PreparedLogBlock, StoredLogAttribute, StoredLogRecord,
 };
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_text_search_pruning(body: &str, literals: &[Vec<u8>]) {
+    let Ok(Some(candidate)) = schema::TextSearchCandidate::any_of_bytes(literals) else {
+        return;
+    };
+    let Ok(summary) = schema::TextBlockSummary::from_bodies([Some(body)]) else {
+        return;
+    };
+    struct Observer;
+    impl ScanObserver for Observer {
+        fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+            Ok(())
+        }
+    }
+    let Ok(Some(might_contain)) = summary.might_contain_observed(&candidate, &Observer) else {
+        return;
+    };
+    if !might_contain
+        && candidate.literals().iter().any(|literal| {
+            body.as_bytes()
+                .windows(literal.len())
+                .any(|window| window == literal)
+        })
+    {
+        panic!("text pruning produced a false negative");
+    }
+}
 
 /// The concrete Release 1 Log Signal Store adapter.
 #[derive(Clone, Copy, Debug, Default)]
@@ -71,9 +101,10 @@ impl LogStore {
     }
 
     /// Prepares a block and its bounded schema delta without mutating live schema state.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_with_schema_delta<'capacity, S: LifecycleClockSource>(
+    pub fn prepare_with_schema_delta<'capacity, S: LifecycleClockSource>(
         &self,
         capacity: ResourceReservation<'capacity>,
         clock: &LifecycleClock<S>,
@@ -88,46 +119,9 @@ impl LogStore {
             .map(|prepared| (prepared, delta))
     }
 
-    /// Stages one complete group's root-atomic schema decisions against an immutable view.
-    pub(crate) fn stage_schema_group(
-        &self,
-        records: &mut [LogRecord],
-        schema: &SchemaCatalog,
-    ) -> Result<SchemaDelta, LogStoreFailure> {
-        let mut delta = SchemaDelta::empty(schema.tenant(), true);
-        let mut meter = schema::delta::DiscoveryMeter::new();
-        for record in records.iter_mut() {
-            let mut attributes = Vec::new();
-            attributes
-                .try_reserve_exact(record.attributes().len())
-                .map_err(|_| LogStoreFailure::resource_exhausted())?;
-            for attribute in record.attributes() {
-                attributes.push(
-                    attribute
-                        .occurrences()
-                        .try_clone()
-                        .map_err(LogStoreFailure::domain)?,
-                );
-            }
-            let observation = schema
-                .stage_record(&attributes, &mut delta, &mut meter)
-                .map_err(map_schema_failure)?;
-            for (attribute, (_, representation)) in record
-                .attributes_mut()
-                .iter_mut()
-                .zip(observation.attributes())
-            {
-                attribute.set_representation(match representation {
-                    SchemaRepresentation::Cataloged => AttributeRepresentation::Generic,
-                    SchemaRepresentation::Overflow => AttributeRepresentation::SchemaOverflow,
-                });
-            }
-        }
-        Ok(delta)
-    }
-
     /// Applies a previously staged delta after its v2 block is durably resolved.
-    pub(crate) fn apply_schema_delta(
+    #[doc(hidden)]
+    pub fn apply_schema_delta(
         &self,
         schema: &mut SchemaCatalog,
         delta: SchemaDelta,
@@ -143,26 +137,22 @@ impl LogStore {
             .map_err(map_schema_failure)
     }
 
-    /// Reconstructs one committed v2 block's schema delta without changing Store Block grammar.
-    pub(crate) fn replay_schema_block(
+    #[doc(hidden)]
+    pub fn apply_schema_delta_replay_observed(
         &self,
-        tenant: TenantId,
-        snapshot: &LedgerSnapshot<'_>,
-        block: &CommittedBlock,
-        schema: &SchemaCatalog,
-    ) -> Result<SchemaDelta, LogStoreFailure> {
-        let decoded = codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?;
-        if schema.tenant() != tenant {
+        schema: &mut SchemaCatalog,
+        delta: SchemaDelta,
+        identity: StoreBlockIdentity,
+        digest: [u8; 32],
+        observer: &dyn ScanObserver,
+    ) -> Result<(), LogStoreFailure> {
+        if schema.tenant() != delta.tenant() {
             return Err(LogStoreFailure::physical_scope_mismatch());
         }
-        let mut delta = SchemaDelta::empty(tenant, true);
-        let mut meter = schema::delta::DiscoveryMeter::new();
-        for record in decoded.records {
-            schema
-                .stage_replayed_record(record.attributes(), &mut delta, &mut meter)
-                .map_err(map_schema_failure)?;
-        }
-        Ok(delta)
+        let (delta, block_index) = delta.into_block_index(identity, digest);
+        schema
+            .apply_replay_delta(delta, block_index, observer)
+            .map_err(map_schema_failure)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -236,109 +226,15 @@ impl LogStore {
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
-        let scope = snapshot.scope();
-        if scope.tenant_id() != tenant || scope.signal_kind() != SignalKind::Logs {
-            return Err(LogStoreFailure::physical_scope_mismatch());
-        }
-        check_scan_cancellation(cancellation)?;
-        let mut encoded_bytes = 0_u64;
-        for block in snapshot.blocks() {
-            check_scan_cancellation(cancellation)?;
-            if scan
-                .frontier()
-                .is_some_and(|frontier| block.position() > frontier)
-            {
-                continue;
-            }
-            encoded_bytes = encoded_bytes
-                .checked_add(
-                    u64::try_from(block.payload().len())
-                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
-                )
-                .ok_or_else(LogStoreFailure::limit_exceeded)?;
-        }
-        let memory = encoded_bytes
-            .checked_add(
-                u64::try_from(scan.limit().value())
-                    .map_err(|_| LogStoreFailure::limit_exceeded())?
-                    .saturating_mul(512),
-            )
-            .ok_or_else(LogStoreFailure::limit_exceeded)?
-            .max(1);
-        let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
-            .map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
-            .map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let capacity = governor
-            .reserve(claim)
-            .map_err(|_| LogStoreFailure::resource_admission_refused())?;
-        check_scan_cancellation(cancellation)?;
-        let mut records = Vec::new();
-        records
-            .try_reserve_exact(scan.limit().value())
-            .map_err(|_| LogStoreFailure::resource_exhausted())?;
-        let mut scanned_bytes = 0_u64;
-        let limit = scan.limit().value();
-        let mut complete = true;
-        for block in snapshot.blocks() {
-            check_scan_cancellation(cancellation)?;
-            if scan
-                .frontier()
-                .is_some_and(|frontier| block.position() > frontier)
-            {
-                continue;
-            }
-            let remaining = limit.saturating_sub(records.len());
-            if remaining == 0 {
-                complete = false;
-                break;
-            }
-            scanned_bytes = scanned_bytes
-                .checked_add(
-                    u64::try_from(block.payload().len())
-                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
-                )
-                .ok_or_else(LogStoreFailure::limit_exceeded)?;
-            let decode =
-                codec::BlockDecode::observed(tenant, block.payload(), cancellation, observer)?;
-            let block_records = decode.record_count();
-            if block_records > remaining {
-                decode.validate(cancellation)?;
-                complete = false;
-                break;
-            }
-            let decoded = decode.decode(snapshot, remaining, cancellation)?;
-            if decoded.truncated {
-                complete = false;
-            }
-            for (ordinal, record) in decoded.records.into_iter().enumerate() {
-                if records.len() == limit {
-                    complete = false;
-                    break;
-                }
-                let ordinal = u16::try_from(ordinal)
-                    .ok()
-                    .and_then(|ordinal| positron_domain::routing::RecordOrdinal::new(ordinal).ok())
-                    .ok_or_else(LogStoreFailure::malformed_block)?;
-                records.push(ScannedLogRecord::new(record, block.position(), ordinal));
-            }
-            if !complete {
-                break;
-            }
-        }
-        check_scan_cancellation(cancellation)?;
-        let decoded_records =
-            u64::try_from(records.len()).map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let retained_size_bytes = retained_scan_bytes(scan.limit(), &mut records)?;
-        Ok(LogScanResult::new(
-            records,
-            decoded_records,
-            complete,
-            scanned_bytes,
-            retained_size_bytes,
-            false,
-            capacity,
-        ))
+        self.scan_observed_inner(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            None,
+        )
     }
 }
 
@@ -361,7 +257,9 @@ pub(super) fn retained_scan_bytes(
     })
 }
 
-fn check_scan_cancellation(cancellation: &dyn ScanCancellation) -> Result<(), LogStoreFailure> {
+pub(super) fn check_scan_cancellation(
+    cancellation: &dyn ScanCancellation,
+) -> Result<(), LogStoreFailure> {
     if cancellation.is_cancelled() {
         Err(LogStoreFailure::cancelled())
     } else {
@@ -379,6 +277,7 @@ fn map_schema_failure(failure: SchemaFailure) -> LogStoreFailure {
             LogStoreFailure::invalid_input()
         },
         SchemaFailure::MalformedCatalog => LogStoreFailure::invalid_input(),
+        SchemaFailure::Observed(failure) => LogStoreFailure::observation(failure),
     }
 }
 

@@ -1,7 +1,10 @@
 use super::{
-    MAGIC, VERSION, namespace_tag, put_bytes, put_len, put_u8, put_u16, put_u64, value_tag,
+    MAGIC, PREVIOUS_VERSION, VERSION, namespace_tag, put_bytes, put_len, put_u8, put_u16, put_u64,
+    value_tag,
 };
-use crate::log_store::schema::index::{BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES};
+use crate::log_store::schema::index::{
+    BLOCK_INDEX_HEADER_BYTES, INDEX_HEADER_BYTES, ScalarIndexFraming,
+};
 use crate::log_store::schema::model::{
     CATALOG_HEADER_BYTES, MAX_SCALAR_VALUE_BYTES, entry_persistent_bytes,
 };
@@ -21,7 +24,7 @@ pub(super) fn catalog(catalog: &SchemaCatalog) -> Result<Vec<u8>, SchemaFailure>
         .try_reserve_exact(expected_len)
         .map_err(|_| SchemaFailure::AllocationUnavailable)?;
     bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes.extend_from_slice(&catalog_version(catalog).to_be_bytes());
     bytes.extend_from_slice(&catalog.tenant.to_bytes());
     for value in [
         catalog.budget.max_entries(),
@@ -73,6 +76,7 @@ fn preflight_length(catalog: &SchemaCatalog) -> Result<usize, SchemaFailure> {
             )
             .ok_or(SchemaFailure::LimitExceeded)
     })?;
+    let version = catalog_version(catalog);
     let indexes = if catalog.block_indexes.is_empty() {
         0
     } else {
@@ -85,14 +89,18 @@ fn preflight_length(catalog: &SchemaCatalog) -> Result<usize, SchemaFailure> {
                         validate_value(value)?;
                     }
                 }
-                let path_bytes =
+                let block_bytes = if version == VERSION {
+                    block.encoded_bytes()?
+                } else {
                     super::super::index::SchemaBlockIndex::paths_encoded_bytes_with_framing(
                         &block.paths,
-                        super::super::index::ScalarIndexFraming::V2,
-                    )?;
-                total
+                        ScalarIndexFraming::V2,
+                    )?
                     .checked_add(BLOCK_INDEX_HEADER_BYTES)
-                    .and_then(|bytes| bytes.checked_add(path_bytes))
+                    .ok_or(SchemaFailure::LimitExceeded)?
+                };
+                total
+                    .checked_add(block_bytes)
                     .ok_or(SchemaFailure::LimitExceeded)
             })?
     };
@@ -100,6 +108,18 @@ fn preflight_length(catalog: &SchemaCatalog) -> Result<usize, SchemaFailure> {
         .checked_add(entries)
         .and_then(|bytes| bytes.checked_add(indexes))
         .ok_or(SchemaFailure::LimitExceeded)
+}
+
+fn catalog_version(catalog: &SchemaCatalog) -> u16 {
+    if catalog
+        .block_indexes
+        .iter()
+        .any(|block| block.text_framing == super::super::index::TextIndexFraming::V1)
+    {
+        VERSION
+    } else {
+        PREVIOUS_VERSION
+    }
 }
 
 fn validate_value(value: &SchemaValue) -> Result<(), SchemaFailure> {

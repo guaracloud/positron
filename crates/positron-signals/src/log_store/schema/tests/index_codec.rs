@@ -33,6 +33,39 @@ fn checkpoint_preflight_includes_physical_index_and_frontier_memory() -> Result<
 }
 
 #[test]
+fn text_version_upgrades_legacy_survivors_before_checkpoint_publication()
+-> Result<(), Box<dyn Error>> {
+    let (mut catalog, _) = indexed_checkpoint(false)?;
+    let summary = super::super::text_index::TextBlockSummary::from_bodies([Some("alpha")])?;
+    let text_index = super::super::index::SchemaBlockIndex {
+        identity: StoreBlockIdentity::new([0x6a; 16])?,
+        digest: [0x6b; 32],
+        paths: Vec::new(),
+        scalar_framing: super::super::index::ScalarIndexFraming::V2,
+        text_framing: super::super::index::TextIndexFraming::V1,
+        text_summary: Some(summary),
+    };
+    catalog.apply_delta(
+        super::super::delta::SchemaDelta::empty(catalog.tenant(), true),
+        Some(text_index),
+    )?;
+    assert!(
+        catalog
+            .block_indexes
+            .iter()
+            .all(|block| block.text_framing == super::super::index::TextIndexFraming::V1)
+    );
+    let encoded = catalog.encode_catalog_object()?;
+    let reopened = SchemaCatalog::decode_catalog_object(&encoded)?;
+    assert_eq!(reopened.tenant(), catalog.tenant());
+    assert_eq!(reopened.entries, catalog.entries);
+    assert_eq!(reopened.persistent_bytes(), encoded.len());
+    assert_eq!(reopened.index_bytes(), catalog.index_bytes());
+    assert_eq!(reopened.block_indexes, catalog.block_indexes);
+    Ok(())
+}
+
+#[test]
 fn physical_index_must_match_catalog_path_and_complete_kind_set() -> Result<(), Box<dyn Error>> {
     let (_, valid) = indexed_checkpoint(false)?;
     let sidecar = valid
@@ -451,6 +484,27 @@ fn governed_v1_exact_budget_reconciliation_removes_stale_block() -> Result<(), B
         assert_eq!(session.catalog().index_bytes(), reopened.index_bytes());
         assert_eq!(reopened.persistent_bytes(), encoded.len());
         assert_eq!(reopened.entry_count(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn governed_session_commit_and_reconcile_preserve_empty_replay_state() -> Result<(), Box<dyn Error>>
+{
+    let (legacy, index_bytes) = exact_legacy_budget_checkpoint(1)?;
+    let mut bounded = legacy.clone();
+    let persistent_bytes = u64::from_be_bytes(legacy[42..50].try_into()?) + 16;
+    let index_bytes = u64::try_from(index_bytes)? + 16;
+    bounded[42..50].copy_from_slice(&persistent_bytes.to_be_bytes());
+    bounded[50..58].copy_from_slice(&index_bytes.to_be_bytes());
+    with_governed_legacy_session(&bounded, |session| {
+        let identity = StoreBlockIdentity::new([0x91; 16])?;
+        session.commit(
+            super::super::SchemaDelta::empty(session.tenant(), true),
+            identity,
+            [0x91; 32],
+        )?;
+        session.reconcile_block_identity(identity, [0x91; 32])?;
         Ok(())
     })
 }

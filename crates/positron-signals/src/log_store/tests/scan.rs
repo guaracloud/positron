@@ -18,6 +18,26 @@ impl super::super::ScanCancellation for CancelDuringPreflight {
     }
 }
 
+struct CancelAfterPolls {
+    polls: AtomicU64,
+    threshold: u64,
+}
+
+impl CancelAfterPolls {
+    const fn new(threshold: u64) -> Self {
+        Self {
+            polls: AtomicU64::new(0),
+            threshold,
+        }
+    }
+}
+
+impl super::super::ScanCancellation for CancelAfterPolls {
+    fn is_cancelled(&self) -> bool {
+        self.polls.fetch_add(1, Ordering::SeqCst) >= self.threshold
+    }
+}
+
 struct NeverCancelled;
 
 impl super::super::ScanCancellation for NeverCancelled {
@@ -87,7 +107,7 @@ fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Er
         &snapshot,
         LogScan::all(ScanLimit::new(1)?),
     )?;
-    assert!(bounded.records().is_empty());
+    assert_eq!(bounded.records().len(), 1);
     assert!(!bounded.complete());
     let wrong_tenant = store
         .scan(
@@ -230,8 +250,9 @@ fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn
         &snapshot,
         LogScan::all(ScanLimit::new(1)?),
     )?;
-    assert!(result.records().is_empty());
+    assert_eq!(result.records().len(), 1);
     assert!(!result.complete());
+    assert_eq!(result.decoded_records(), 1);
     assert_eq!(
         authority
             .governor()
@@ -247,6 +268,59 @@ fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn
             .outstanding_for(WorkClass::InteractiveQueryTail),
         before
     );
+
+    let recording = RecordingScanObserver(AtomicU64::new(0));
+    let observed = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &recording,
+    )?;
+    assert!(
+        recording.0.load(Ordering::SeqCst) >= 1_024,
+        "every structurally validated tail record must be observed"
+    );
+    let exact_work = recording.0.load(Ordering::SeqCst);
+    drop(observed);
+    let exact = BudgetedScanObserver(AtomicU64::new(exact_work));
+    let exact_result = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &exact,
+    )?;
+    assert_eq!(exact.0.load(Ordering::SeqCst), 0);
+    drop(exact_result);
+    let below = BudgetedScanObserver(AtomicU64::new(exact_work - 1));
+    let failure = LogStore::new()
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &NeverCancelled,
+            &below,
+        )
+        .expect_err("one less tail-validation work unit must fail closed");
+    assert_eq!(failure.code(), LogStoreFailureCode::BudgetExhausted);
+
+    for threshold in 1..=256 {
+        let cancellation = CancelAfterPolls::new(threshold);
+        let failure = LogStore::new()
+            .scan_cancellable(
+                authority.governor(),
+                tenant,
+                &snapshot,
+                LogScan::all(ScanLimit::new(1)?),
+                &cancellation,
+            )
+            .expect_err("every cancellation boundary must stop the oversized block");
+        assert_eq!(failure.code(), LogStoreFailureCode::Cancelled);
+    }
 
     let exact = LogStore::new().scan(
         authority.governor(),
@@ -301,7 +375,7 @@ fn oversized_block_preflight_has_an_exact_observed_work_boundary() -> Result<(),
         &NeverCancelled,
         &recording,
     )?;
-    assert!(result.records().is_empty());
+    assert_eq!(result.records().len(), 1);
     assert!(!result.complete());
     drop(result);
     let exact_work = recording.0.load(Ordering::SeqCst);
@@ -316,10 +390,39 @@ fn oversized_block_preflight_has_an_exact_observed_work_boundary() -> Result<(),
         &NeverCancelled,
         &exact,
     )?;
-    assert!(exact_result.records().is_empty());
+    assert_eq!(exact_result.records().len(), 1);
     assert!(!exact_result.complete());
     assert_eq!(exact.0.load(Ordering::SeqCst), 0);
     drop(exact_result);
+
+    let malformed_scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(800)?);
+    let malformed_ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        malformed_scope,
+        SegmentProtectionKey::from_owned(Box::new([0x62; 32])),
+    )?;
+    let mut malformed_payload = snapshot
+        .blocks()
+        .first()
+        .ok_or("committed block missing")?
+        .payload()
+        .to_vec();
+    malformed_payload.pop();
+    malformed_ledger.append(PreparedStoreBlock::new(
+        malformed_scope,
+        StoreBlockIdentity::new([0x7e; 16])?,
+        malformed_payload,
+    )?)?;
+    let malformed = LogStore::new()
+        .scan(
+            authority.governor(),
+            tenant,
+            &malformed_ledger.snapshot()?,
+            scan,
+        )
+        .expect_err("structurally malformed unretained tail must fail closed");
+    assert_eq!(malformed.code(), LogStoreFailureCode::MalformedBlock);
 
     let before = authority
         .governor()

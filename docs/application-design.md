@@ -577,6 +577,11 @@ Scalar String and Bytes sidecar payloads use the canonical 65,536-byte native
 value limit. Any mutation of a version 1 physical index upgrades its framing to
 version 2 and reserves the one-byte presence field atomically before publication;
 the governed mutation fails closed when that additional budget is unavailable.
+The same governed checkpoint may carry a bounded UTF-8 byte-trigram summary for
+string bodies. It is an optional version 3 per-block sidecar bound to the exact
+Store Block identity and authenticated payload digest; complete summaries can
+only prove candidate absence, while partial, stale, or missing summaries force
+the authenticated generic scan and set reduced pruning.
 Discovery returns tenant-bound bounded top
 paths, typed conflicts and variants, promotion decisions, budget pressure,
 overflow counts, and sampled path digests without exposing mutation authority.
@@ -638,6 +643,13 @@ making it configurable is outside the Release 1 surface.
 Signal Stores receive typed plan fragments, never query strings. The Storage
 Kernel returns snapshot-scoped verified block readers, never filesystem paths
 or key material.
+
+The Query module's typed search fragment distinguishes exact native-body
+predicates, case-sensitive string-substring search, and bounded regular
+expressions. Regex compilation uses a finite-automaton implementation with
+explicit pattern, nesting, and compiled-program limits; query execution
+charges search work through the same cumulative operator and cancellation
+authority as other native-value traversal.
 
 A Query Snapshot pins each involved Signal Store's committed high-water mark.
 It does not claim one transactionally atomic cross-signal instant. Cursor

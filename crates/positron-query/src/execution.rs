@@ -58,7 +58,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
         };
         let header = match QueryHeader::new(
-            state.plan.clone(),
+            &state.plan,
             state.budget,
             ResultSnapshot::new(
                 state.catalog_identity,
@@ -96,6 +96,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_limit = framed!(
             ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
         );
+        let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
+        framed!(memory.acquire(state.plan.search_memory_bytes()));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let mut observer = QueryScanObserver::new(
             self.work_meter.as_ref(),
             state.cancellation.clone(),
@@ -104,8 +107,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         );
         let schema_query = state.plan.schema_query();
         let schema_filter_used = schema.zip(schema_query).is_some();
-        let scan_result = match schema.zip(schema_query) {
-            Some((schema, query)) => LogStore::new().scan_schema_observed(
+        let text_candidate = framed!(state.plan.text_search_candidate());
+        let text_filter_used = schema.zip(text_candidate.as_ref()).is_some();
+        let scan_result = match (schema, schema_query, text_candidate.as_ref()) {
+            (Some(schema), None, Some(candidate)) => LogStore::new().scan_text_observed(
+                self.governor,
+                state.tenant,
+                snapshot,
+                LogScan::through(scan_limit, frontier),
+                schema,
+                candidate,
+                &state.cancellation,
+                &observer,
+            ),
+            (Some(schema), Some(query), _) => LogStore::new().scan_schema_observed(
                 self.governor,
                 state.tenant,
                 snapshot,
@@ -115,7 +130,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 &state.cancellation,
                 &mut observer,
             ),
-            None => LogStore::new().scan_observed(
+            _ => LogStore::new().scan_observed(
                 self.governor,
                 state.tenant,
                 snapshot,
@@ -128,8 +143,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let result = framed!(scan_result.map_err(map_store_failure));
         state.reduced_pruning |= result.reduced_pruning();
         framed!(charge_scan(&mut state, &result));
-        let mut memory = crate::memory::QueryMemory::new(state.budget.memory_bytes());
         framed!(memory.acquire(result.retained_size_bytes()));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         if state.cancellation.is_cancelled() {
             return self.failed_page(
                 Some(header),
@@ -153,8 +168,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
 
         let has_operator_work = state.plan.has_advanced_operators();
-        state.reduced_pruning |=
-            state.plan.requires_post_decode_predicate_fallback() && !schema_filter_used;
+        state.reduced_pruning |= state.plan.requires_post_decode_predicate_fallback()
+            && !schema_filter_used
+            && !text_filter_used;
         let records = framed!(crate::operators::execute(
             self,
             &mut state,
@@ -162,6 +178,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             schema_filter_used,
             &mut memory,
         ));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let operator_wall_exhausted = if has_operator_work {
             framed!(self.observe_state(&mut state))
         } else {
@@ -186,6 +203,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
         );
         let page = framed!(materialize_page(records, start, end, &mut memory));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let before_batch = stats_before_current(&state);
         if state.cancellation.is_cancelled() {
             return self.failed_page_with_stats(
@@ -258,6 +276,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             },
             &mut memory,
         ));
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let post_digest_expired = framed!(self.observe_state(&mut state));
         if post_digest_expired {
             return self.failed_page(

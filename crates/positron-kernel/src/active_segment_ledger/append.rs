@@ -119,6 +119,7 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             .frontier
             .next()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let content_digest = block.content_digest()?;
         let context = self
             .key
             .object
@@ -165,6 +166,7 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             identity: block.identity,
             position,
             payload: block.payload,
+            content_digest,
             segment: self.storage.segment_id()?,
             frontier_authenticator: authenticator,
         });

@@ -101,8 +101,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
-        let cpu_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
-        let plan = parser(source)?;
+        let parse_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
+        let mut plan = parser(source)?;
+        let compile_work_units = plan.search_compile_work_units();
+        let cpu_work_units = if compile_work_units == 0 {
+            parse_work_units
+        } else {
+            let compile_unit_cost = self.work_units(crate::QueryWorkStage::Parse)?;
+            let compile_work = compile_unit_cost
+                .checked_mul(compile_work_units)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            parse_work_units
+                .checked_add(compile_work)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+        };
         let last_observed_at = self.now()?;
         if last_observed_at < started_at {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
@@ -117,6 +129,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::CpuWorkUnits,
             ));
         }
+        if plan.search_memory_bytes() > budget.memory_bytes() {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                QueryBudgetDimension::MemoryBytes,
+            ));
+        }
+        plan.compile_search()?;
         if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
@@ -138,7 +157,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         Ok(PlannedQuery {
             context,
-            plan,
+            plan: Arc::new(plan),
             budget,
             _reservation: reservation,
             started_at,

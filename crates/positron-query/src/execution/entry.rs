@@ -51,9 +51,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .create_snapshot_lease(now, expiry)
             .map_err(map_ledger_failure)?;
         let tenant = query_tenant(query.context)?;
-        let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
-        let limit = query.plan.limit();
-        let resources = ExecutionResources::new(query._reservation, lease.identity());
+        let (state, reservation) =
+            initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
+        let limit = state.plan.limit();
+        let resources = ExecutionResources::new(reservation, lease.identity());
         self.run_page(state, lease.snapshot(), limit, false, schema, resources)
     }
 
@@ -87,8 +88,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .create_snapshot_lease(now_seconds, expiry)
             .map_err(map_ledger_failure)?;
         let tenant = query_tenant(query.context)?;
-        let state = initial_state(&query, lease.snapshot(), tenant, expiry, lease.identity());
-        let resources = ExecutionResources::new(query._reservation, lease.identity());
+        let (state, reservation) =
+            initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
+        let resources = ExecutionResources::new(reservation, lease.identity());
         self.run_page(
             state,
             lease.snapshot(),

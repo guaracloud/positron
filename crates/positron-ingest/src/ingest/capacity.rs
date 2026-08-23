@@ -6,12 +6,20 @@ use positron_signals::{SchemaBudget, SchemaEntry};
 // steps remain byte-exact and are rounded up to one 64 Ki-step work quantum.
 const POLICY_EVALUATION_STEPS_PER_CPU_WORK_UNIT: u64 = 65_536;
 const SCHEMA_DISCOVERY_NODES_PER_CPU_WORK_UNIT: u64 = 64;
+// A text sidecar is optional physical evidence. Requests whose conservative
+// construction bound exceeds this admission slice intentionally fall back to
+// authenticated body scans instead of making ordinary ingest unavailable.
+const MAX_ADMITTED_TEXT_WORK_UNITS: u64 = 31;
 
 #[derive(Clone, Copy)]
 pub(super) struct SchemaAdmissionEstimate {
     staging_memory_bytes: u64,
     retained_memory_bytes: u64,
+    #[allow(dead_code)]
     discovery_nodes: u64,
+    #[allow(dead_code)]
+    text_work_units: u64,
+    schema_work_units: u64,
 }
 
 impl SchemaAdmissionEstimate {
@@ -23,8 +31,18 @@ impl SchemaAdmissionEstimate {
         self.retained_memory_bytes
     }
 
+    #[allow(dead_code)]
     pub(super) const fn discovery_nodes(self) -> u64 {
         self.discovery_nodes
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn text_work_units(self) -> u64 {
+        self.text_work_units
+    }
+
+    pub(super) const fn schema_work_units(self) -> u64 {
+        self.schema_work_units
     }
 }
 
@@ -34,8 +52,15 @@ pub(super) fn schema_admission_estimate(
     let mut clone_bytes = 0_u64;
     let mut schema_bytes = u64::try_from(std::mem::size_of::<Vec<SchemaEntry>>()).ok()?;
     let mut discovery_nodes = 0_u64;
+    let mut text_body_bytes = 0_usize;
+    let mut text_work_units = 0_u64;
+    let mut has_text_body = false;
     let discovery_limit = u64::try_from(SchemaBudget::system_max_discovery_nodes()).ok()?;
     for record in records {
+        if let Some(positron_domain::value::CandidateAttributeValue::String(body)) = record.body() {
+            has_text_body = true;
+            text_body_bytes = text_body_bytes.checked_add(body.len())?;
+        }
         for attribute in record.attributes() {
             clone_bytes = clone_bytes
                 .checked_add(u64::try_from(attribute.key().len()).ok()?)?
@@ -45,6 +70,18 @@ pub(super) fn schema_admission_estimate(
                 accumulate_schema_bytes(value, attribute.key().len(), 1, &mut schema_bytes)?;
                 accumulate_discovery_nodes(value, &mut discovery_nodes, discovery_limit)?;
             }
+        }
+    }
+    if has_text_body {
+        let estimated_work = SchemaBudget::text_index_work_units(text_body_bytes)?;
+        if estimated_work <= MAX_ADMITTED_TEXT_WORK_UNITS {
+            schema_bytes = schema_bytes.checked_add(
+                u64::try_from(SchemaBudget::text_index_block_memory_bound(
+                    text_body_bytes,
+                )?)
+                .ok()?,
+            )?;
+            text_work_units = estimated_work;
         }
     }
     if discovery_nodes > 0 {
@@ -57,10 +94,19 @@ pub(super) fn schema_admission_estimate(
         .checked_mul(2)?
         .checked_add(schema_bytes.min(schema_stage_ceiling_bytes()?))?
         .max(1);
+    let text_optional_work = if has_text_body {
+        SchemaBudget::text_stage_optional_work_units()
+    } else {
+        0
+    };
     Some(SchemaAdmissionEstimate {
         staging_memory_bytes,
         retained_memory_bytes,
         discovery_nodes,
+        text_work_units,
+        schema_work_units: schema_discovery_cpu_work_units(discovery_nodes)?
+            .checked_add(text_work_units)?
+            .checked_add(text_optional_work)?,
     })
 }
 
@@ -76,8 +122,7 @@ pub(super) fn group_work_amounts(
     let policy_and_store_work = evaluation_work.checked_mul(record_count)?.checked_add(1)?;
     // Policy and discovery execute sequentially within the admission group;
     // reserve their conservative peak rather than fabricating concurrency.
-    let cpu_work =
-        policy_and_store_work.max(schema_discovery_cpu_work_units(schema.discovery_nodes())?);
+    let cpu_work = policy_and_store_work.max(schema.schema_work_units());
     let per_record = policy.reserved_memory_bytes()?;
     let policy_memory = per_record.checked_mul(record_count)?;
     let memory = 1_048_576_u64

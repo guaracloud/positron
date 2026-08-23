@@ -1,5 +1,6 @@
 use positron_domain::identity::TenantId;
 use positron_kernel::{LedgerSnapshot, ResourceGovernor, ResourceReservation, StoreBlockIdentity};
+use positron_signals::{ScanCancellation, ScanObservationFailureCode, ScanObserver};
 
 use super::{SchemaSessionFailure, TenantSchemaSession, recovery};
 
@@ -21,6 +22,7 @@ impl TenantSchemaSession {
         Ok(operation(state.catalog.catalog()))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn append_reachable_indexes(
         &self,
         snapshot: &LedgerSnapshot<'_>,
@@ -51,6 +53,45 @@ impl TenantSchemaSession {
         Ok(())
     }
 
+    pub(crate) fn append_reachable_indexes_observed(
+        &self,
+        snapshot: &LedgerSnapshot<'_>,
+        reachable: &mut Vec<(StoreBlockIdentity, [u8; 32])>,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaSessionFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        for block in snapshot.blocks() {
+            if cancellation.is_cancelled() {
+                return Err(SchemaSessionFailure::Cancelled);
+            }
+            observer.observe_work(1).map_err(|failure| match failure {
+                ScanObservationFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
+                ScanObservationFailureCode::BudgetExhausted
+                | ScanObservationFailureCode::ResourceExhausted
+                | ScanObservationFailureCode::Internal => SchemaSessionFailure::StateUnavailable,
+            })?;
+            let digest = block
+                .content_digest()
+                .map_err(|_| SchemaSessionFailure::ReplayIntegrity)?;
+            if !state.catalog.has_verified_block(block.identity(), digest) {
+                continue;
+            }
+            let Err(position) = reachable.binary_search(&(block.identity(), digest)) else {
+                continue;
+            };
+            if reachable.len() == positron_signals::SchemaBudget::system_max_entries() {
+                return Err(SchemaSessionFailure::ReplayLimitExceeded);
+            }
+            reachable.insert(position, (block.identity(), digest));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn retain_reachable_indexes(
         &self,
         reachable: &[(StoreBlockIdentity, [u8; 32])],
@@ -63,6 +104,50 @@ impl TenantSchemaSession {
             .catalog
             .retain_reachable_indexes(reachable)
             .map_err(SchemaSessionFailure::Schema)
+    }
+
+    pub(crate) fn retain_reachable_indexes_work_units(&self) -> Result<u64, SchemaSessionFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        state
+            .catalog
+            .retain_reachable_indexes_work_units()
+            .map_err(SchemaSessionFailure::Schema)
+    }
+
+    pub(crate) fn retain_reachable_indexes_observed(
+        &self,
+        reachable: &[(StoreBlockIdentity, [u8; 32])],
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), SchemaSessionFailure> {
+        if cancellation.is_cancelled() {
+            return Err(SchemaSessionFailure::Cancelled);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        state
+            .catalog
+            .retain_reachable_indexes_observed(reachable, observer)
+            .map_err(|failure| match failure {
+                positron_signals::SchemaFailure::Observed(
+                    ScanObservationFailureCode::Cancelled,
+                ) => SchemaSessionFailure::Cancelled,
+                positron_signals::SchemaFailure::Observed(_)
+                | positron_signals::SchemaFailure::AllocationUnavailable
+                | positron_signals::SchemaFailure::LimitExceeded
+                | positron_signals::SchemaFailure::InvalidBudget
+                | positron_signals::SchemaFailure::InvalidPath
+                | positron_signals::SchemaFailure::InvalidValue
+                | positron_signals::SchemaFailure::PathTooLong
+                | positron_signals::SchemaFailure::MalformedCatalog => {
+                    SchemaSessionFailure::Schema(failure)
+                },
+            })
     }
 
     pub fn discover(

@@ -134,11 +134,14 @@ impl ApplicationRuntime {
             instance.admission_group_planner = planner;
         }
         let instance = Arc::new(instance);
-        let services = match ServiceHandle::new(Arc::clone(&instance)) {
+        let services = match ServiceHandle::new_with_cancellation(
+            Arc::clone(&instance),
+            Some(&cancellation),
+        ) {
             Ok(services) => services,
             Err(failure) => {
                 return Err(cleanup_startup(
-                    ExitOutcome::StartupUnavailable(failure.bootstrap_code()),
+                    service_failure_outcome(failure),
                     &cancellation,
                     &mut listeners,
                     &mut tasks,
@@ -320,4 +323,29 @@ const fn recoverable(code: BootstrapFailureCode) -> bool {
             | BootstrapFailureCode::CatalogUnavailable
             | BootstrapFailureCode::LedgerUnavailable
     )
+}
+
+const fn service_failure_outcome(failure: crate::ServiceFailure) -> ExitOutcome {
+    match failure {
+        crate::ServiceFailure::Cancelled => ExitOutcome::Graceful,
+        failure => ExitOutcome::StartupUnavailable(failure.bootstrap_code()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_failure_outcome;
+    use crate::{BootstrapFailureCode, ExitOutcome, ServiceFailure};
+
+    #[test]
+    fn service_cancellation_stops_startup_without_a_retryable_outcome() {
+        assert_eq!(
+            service_failure_outcome(ServiceFailure::Cancelled),
+            ExitOutcome::Graceful
+        );
+        assert_eq!(
+            service_failure_outcome(ServiceFailure::Internal),
+            ExitOutcome::StartupUnavailable(BootstrapFailureCode::ResourceUnavailable)
+        );
+    }
 }

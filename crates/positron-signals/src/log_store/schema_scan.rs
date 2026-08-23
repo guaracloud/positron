@@ -141,15 +141,6 @@ impl LogStore {
             {
                 continue;
             }
-            let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
-            let coverage = schema
-                .verified_query_coverage_observed(block.identity(), digest, query, observer)
-                .map_err(LogStoreFailure::observation)?;
-            match coverage {
-                Some(false) => continue,
-                Some(true) => {},
-                None => reduced_pruning = true,
-            }
             let remaining = match limit_kind {
                 SchemaScanLimit::DecodedRecords => {
                     scan.limit().value().saturating_sub(decoded_records)
@@ -160,6 +151,15 @@ impl LogStore {
                 complete = false;
                 break;
             }
+            let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
+            let coverage = schema
+                .verified_query_coverage_observed(block.identity(), digest, query, observer)
+                .map_err(LogStoreFailure::observation)?;
+            match coverage {
+                Some(false) => continue,
+                Some(true) => {},
+                None => reduced_pruning = true,
+            }
             scanned_bytes = scanned_bytes
                 .checked_add(
                     u64::try_from(block.payload().len())
@@ -168,11 +168,7 @@ impl LogStore {
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;
             let decode =
                 codec::BlockDecode::observed(tenant, block.payload(), cancellation, &*observer)?;
-            if decode.record_count() > remaining {
-                decode.validate(cancellation)?;
-                complete = false;
-                break;
-            }
+            let oversized = decode.record_count() > remaining;
             let decoded = decode.decode(snapshot, remaining, cancellation)?;
             decoded_records = decoded_records
                 .checked_add(decoded.records.len())
@@ -197,6 +193,10 @@ impl LogStore {
                         .ok_or_else(LogStoreFailure::malformed_block)?;
                     records.push(ScannedLogRecord::new(record, block.position(), ordinal));
                 }
+            }
+            if oversized {
+                complete = false;
+                break;
             }
         }
         check_cancellation(cancellation)?;
@@ -233,5 +233,30 @@ fn map_traversal_failure(
     match failure {
         ObservedValueFailure::Domain(failure) => LogStoreFailure::domain(failure),
         ObservedValueFailure::Observer(failure) => LogStoreFailure::observation(failure),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use positron_domain::identity::TenantId;
+
+    use super::{ScanObservationFailureCode, map_traversal_failure};
+    use crate::log_store::LogStoreFailureCode;
+    use positron_domain::value::ObservedValueFailure;
+
+    #[test]
+    fn traversal_failures_preserve_domain_and_observer_public_classes() {
+        let domain = TenantId::from_bytes([0; 16]).expect_err("zero tenant must be rejected");
+        assert_eq!(
+            map_traversal_failure(ObservedValueFailure::Domain(domain)).code(),
+            LogStoreFailureCode::InvalidInput
+        );
+        assert_eq!(
+            map_traversal_failure(ObservedValueFailure::Observer(
+                ScanObservationFailureCode::BudgetExhausted,
+            ))
+            .code(),
+            LogStoreFailureCode::BudgetExhausted
+        );
     }
 }

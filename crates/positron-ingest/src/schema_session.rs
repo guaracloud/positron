@@ -3,19 +3,23 @@ use std::sync::{Arc, Mutex};
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, VirtualShardId};
 use positron_kernel::{
-    LedgerSnapshot, ResourceGovernor, ResourceReservation, StoreBlockIdentity,
-    TransferredResourceReservation,
+    ResourceGovernor, ResourceReservation, StoreBlockIdentity, TransferredResourceReservation,
 };
 use positron_signals::{
-    LogRecord, SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta, SchemaFailure,
+    SchemaBudget, SchemaCatalog, SchemaCheckpointFrontier, SchemaDelta, SchemaFailure,
     SchemaSessionStore,
 };
 
 mod checkpoint;
 mod inspection;
+mod observer;
 mod recovery;
+mod recovery_support;
 mod registry;
+mod replay_capacity;
+mod stage;
 pub use checkpoint::TenantSchemaCheckpoint;
+pub(crate) use observer::SchemaBuildObserver;
 use recovery::{
     ensure_frontier_slot, reconcile_pending, reserve_schema_memory, validated_frontier,
 };
@@ -55,6 +59,7 @@ pub enum SchemaSessionFailure {
     TenantConflict,
     Schema(SchemaFailure),
     StateUnavailable,
+    Cancelled,
     ReplayLimitExceeded,
     RegistryLimitExceeded,
     InFlight,
@@ -184,60 +189,6 @@ impl TenantSchemaSession {
                 in_flight: None,
             })),
         })
-    }
-
-    pub(crate) fn stage_group(
-        &self,
-        tenant: TenantId,
-        shard: VirtualShardId,
-        identity: StoreBlockIdentity,
-        snapshot: &LedgerSnapshot<'_>,
-        records: &mut [LogRecord],
-        governor: ResourceGovernor<'_>,
-    ) -> Result<SchemaDelta, SchemaSessionFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
-        if tenant != state.tenant || snapshot.scope().tenant_id() != state.tenant {
-            return Err(SchemaSessionFailure::TenantConflict);
-        }
-        if !state.catalog.governed_by(governor) {
-            return Err(SchemaSessionFailure::StateUnavailable);
-        }
-        if state.pending.is_some() {
-            reconcile_pending(&mut state, snapshot, governor)?;
-        }
-        if state.in_flight.is_some() {
-            return Err(SchemaSessionFailure::InFlight);
-        }
-        ensure_frontier_slot(&state, shard)?;
-        let delta = state
-            .catalog
-            .stage_group(records)
-            .map_err(|failure| match failure.code() {
-                positron_signals::LogStoreFailureCode::InvalidInput
-                | positron_signals::LogStoreFailureCode::MalformedBlock
-                | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch => {
-                    SchemaSessionFailure::Schema(SchemaFailure::InvalidValue)
-                },
-                positron_signals::LogStoreFailureCode::LimitExceeded => {
-                    SchemaSessionFailure::Schema(SchemaFailure::LimitExceeded)
-                },
-                positron_signals::LogStoreFailureCode::ResourceExhausted
-                | positron_signals::LogStoreFailureCode::BudgetExhausted
-                | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused
-                | positron_signals::LogStoreFailureCode::ClockUnavailable
-                | positron_signals::LogStoreFailureCode::Kernel
-                | positron_signals::LogStoreFailureCode::Internal => {
-                    SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
-                },
-                positron_signals::LogStoreFailureCode::Cancelled => {
-                    SchemaSessionFailure::StateUnavailable
-                },
-            })?;
-        state.in_flight = Some(identity);
-        Ok(delta)
     }
 
     pub(crate) fn resolve_durable_outcome(

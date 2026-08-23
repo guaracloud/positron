@@ -94,6 +94,11 @@ fn runtime_service_failures_keep_one_stable_public_taxonomy() {
             Code::Internal,
             "OTLP Logs ingest failed",
         ),
+        (
+            ServiceFailure::Cancelled,
+            Code::Internal,
+            "OTLP Logs ingest failed",
+        ),
     ] {
         let status = service_status(failure);
         assert_eq!(status.code(), code);

@@ -52,6 +52,7 @@ fn push_service_failures_do_not_claim_durable_success() {
         (ServiceFailure::KeyUnavailable, 503),
         (ServiceFailure::StorageUnavailable, 503),
         (ServiceFailure::Internal, 500),
+        (ServiceFailure::Cancelled, 500),
     ] {
         assert_eq!(ingest_response(Err(failure)).status(), status);
     }

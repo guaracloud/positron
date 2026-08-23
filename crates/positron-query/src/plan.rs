@@ -1,5 +1,6 @@
 use positron_governance::AuthorizedContext;
 use positron_kernel::ResourceReservation;
+use std::sync::Arc;
 
 use crate::QueryBudget;
 
@@ -46,6 +47,8 @@ impl TemporalRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FilterPredicate {
     BodyEquals(positron_domain::value::ValidatedAttributeValue),
+    BodyContains(crate::search::BoundedSubstring),
+    BodyRegex(crate::search::BoundedRegex),
     AttributeEquals(positron_signals::SchemaQuery),
 }
 
@@ -169,8 +172,73 @@ impl LogicalPlan {
     pub(crate) fn schema_query(&self) -> Option<&positron_signals::SchemaQuery> {
         match self.filter.as_ref() {
             Some(FilterPredicate::AttributeEquals(query)) => Some(query),
-            Some(FilterPredicate::BodyEquals(_)) | None => None,
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::BodyContains(_))
+            | Some(FilterPredicate::BodyRegex(_))
+            | None => None,
         }
+    }
+
+    pub(crate) fn search_memory_bytes(&self) -> u64 {
+        match self.filter.as_ref() {
+            Some(FilterPredicate::BodyContains(_)) => crate::search::text_memory_bytes(),
+            Some(FilterPredicate::BodyRegex(regex)) => regex
+                .memory_bytes()
+                .max(crate::search::regex_peak_memory_bytes()),
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => 0,
+        }
+    }
+
+    pub(crate) fn compile_search(&mut self) -> Result<(), crate::QueryFailure> {
+        match self.filter.as_mut() {
+            Some(FilterPredicate::BodyContains(substring)) => substring.compile(),
+            Some(FilterPredicate::BodyRegex(regex)) => regex.compile(),
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => Ok(()),
+        }
+    }
+
+    pub(crate) fn search_compile_work_units(&self) -> u64 {
+        match self.filter.as_ref() {
+            Some(FilterPredicate::BodyContains(substring)) => substring.compile_work_units(),
+            Some(FilterPredicate::BodyRegex(regex)) => regex.compile_work_units(),
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => 0,
+        }
+    }
+
+    pub(crate) fn text_search_candidate(
+        &self,
+    ) -> Result<Option<positron_signals::TextSearchCandidate>, crate::QueryFailure> {
+        let candidate = match self.filter.as_ref() {
+            Some(FilterPredicate::BodyContains(value)) => {
+                positron_signals::TextSearchCandidate::literal(value.source())
+            },
+            Some(FilterPredicate::BodyRegex(regex)) => {
+                positron_signals::TextSearchCandidate::any_of_bytes(regex.pruning_literals())
+            },
+            Some(FilterPredicate::BodyEquals(_))
+            | Some(FilterPredicate::AttributeEquals(_))
+            | None => return Ok(None),
+        };
+        candidate.map_err(|failure| match failure {
+            positron_signals::SchemaFailure::AllocationUnavailable
+            | positron_signals::SchemaFailure::LimitExceeded
+            | positron_signals::SchemaFailure::Observed(_) => {
+                crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted)
+            },
+            positron_signals::SchemaFailure::InvalidBudget
+            | positron_signals::SchemaFailure::PathTooLong
+            | positron_signals::SchemaFailure::InvalidPath
+            | positron_signals::SchemaFailure::InvalidValue
+            | positron_signals::SchemaFailure::MalformedCatalog => {
+                crate::QueryFailure::new(crate::QueryFailureCode::UnsupportedQuery)
+            },
+        })
     }
 
     pub(crate) const fn requires_post_decode_predicate_fallback(&self) -> bool {
@@ -227,7 +295,7 @@ impl LogicalPlan {
 
 pub struct PlannedQuery<'kernel> {
     pub(crate) context: AuthorizedContext,
-    pub(crate) plan: LogicalPlan,
+    pub(crate) plan: Arc<LogicalPlan>,
     pub(crate) budget: QueryBudget,
     pub(crate) _reservation: ResourceReservation<'kernel>,
     pub(crate) started_at: u64,
@@ -238,8 +306,8 @@ pub struct PlannedQuery<'kernel> {
 
 impl PlannedQuery<'_> {
     #[must_use]
-    pub fn logical_plan(&self) -> LogicalPlan {
-        self.plan.clone()
+    pub fn logical_plan(&self) -> &LogicalPlan {
+        self.plan.as_ref()
     }
 
     /// Returns the query-scoped handle used to propagate disconnects and deadlines.

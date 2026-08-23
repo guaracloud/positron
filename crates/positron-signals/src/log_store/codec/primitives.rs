@@ -1,4 +1,5 @@
 use crate::log_store::LogStoreFailure;
+use std::cell::Cell;
 
 const CANCELLATION_POLL_BYTES: usize = 1_024;
 
@@ -36,6 +37,8 @@ pub(super) struct Input<'a> {
     remaining: &'a [u8],
     observer: Option<&'a dyn crate::log_store::ScanObserver>,
     cancellation: Option<&'a dyn crate::log_store::ScanCancellation>,
+    quantized_components: bool,
+    pending_components: Cell<u8>,
 }
 
 impl<'a> Input<'a> {
@@ -44,6 +47,8 @@ impl<'a> Input<'a> {
             remaining: bytes,
             observer: None,
             cancellation: None,
+            quantized_components: false,
+            pending_components: Cell::new(0),
         }
     }
 
@@ -56,6 +61,22 @@ impl<'a> Input<'a> {
             remaining: bytes,
             observer: Some(observer),
             cancellation: Some(cancellation),
+            quantized_components: false,
+            pending_components: Cell::new(0),
+        }
+    }
+
+    pub(super) const fn observed_quantized(
+        bytes: &'a [u8],
+        cancellation: &'a dyn crate::log_store::ScanCancellation,
+        observer: &'a dyn crate::log_store::ScanObserver,
+    ) -> Self {
+        Self {
+            remaining: bytes,
+            observer: Some(observer),
+            cancellation: Some(cancellation),
+            quantized_components: true,
+            pending_components: Cell::new(0),
         }
     }
 
@@ -74,9 +95,34 @@ impl<'a> Input<'a> {
     pub(super) fn observe_component(&self) -> Result<(), LogStoreFailure> {
         self.poll_cancellation()?;
         if let Some(observer) = self.observer {
+            if self.quantized_components {
+                let pending = self.pending_components.get().saturating_add(1);
+                if pending == 64 {
+                    observer
+                        .observe_work(1)
+                        .map_err(LogStoreFailure::observation)?;
+                    self.pending_components.set(0);
+                } else {
+                    self.pending_components.set(pending);
+                }
+            } else {
+                observer
+                    .observe_work(1)
+                    .map_err(LogStoreFailure::observation)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_component_observation(&self) -> Result<(), LogStoreFailure> {
+        if self.quantized_components
+            && self.pending_components.get() != 0
+            && let Some(observer) = self.observer
+        {
             observer
                 .observe_work(1)
                 .map_err(LogStoreFailure::observation)?;
+            self.pending_components.set(0);
         }
         Ok(())
     }
@@ -157,5 +203,15 @@ impl<'a> Input<'a> {
 
     pub(super) const fn is_empty(&self) -> bool {
         self.remaining.is_empty()
+    }
+
+    pub(super) const fn remaining_input(&self) -> Self {
+        Self {
+            remaining: self.remaining,
+            observer: self.observer,
+            cancellation: self.cancellation,
+            quantized_components: self.quantized_components,
+            pending_components: Cell::new(0),
+        }
     }
 }

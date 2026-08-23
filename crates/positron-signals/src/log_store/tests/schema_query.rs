@@ -1,7 +1,8 @@
 use std::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_domain::identity::TenantId;
-use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, AttributeOccurrenceSetCandidate, AttributeValueKind,
@@ -21,8 +22,431 @@ use crate::log_store::tests::support::{
 use crate::{
     LogScanResult, LogStoreFailure, LogStoreFailureCode, OccurrenceSelector, ScanCancellation,
     ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaCatalog, SchemaDiscoveryRequest,
-    SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue,
+    SchemaFailure, SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue, TextSearchCandidate,
 };
+
+struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct Unobserved;
+
+impl ScanObserver for Unobserved {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+}
+
+struct RejectObservedWork;
+
+#[test]
+fn short_text_candidates_use_the_generic_fallback() {
+    assert!(
+        TextSearchCandidate::literal("ab")
+            .expect("candidate construction")
+            .is_none()
+    );
+}
+
+impl ScanObserver for RejectObservedWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        if units > 0 {
+            Err(ScanObservationFailureCode::BudgetExhausted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct BudgetedTextWork(AtomicU64);
+
+impl ScanObserver for BudgetedTextWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.0
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(units),
+            )
+            .map(|_| ())
+            .map_err(|_| ScanObservationFailureCode::BudgetExhausted)
+    }
+}
+
+struct RecordingTextWork(AtomicU64);
+
+impl ScanObserver for RecordingTextWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.0.fetch_add(units, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct RecordingSchemaWork(AtomicU64);
+
+impl ScanObserver for RecordingSchemaWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.0.fetch_add(units, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl NativeValueObserver for RecordingSchemaWork {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct BudgetedSchemaWork(AtomicU64);
+
+impl ScanObserver for BudgetedSchemaWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(units)
+            })
+            .map(|_| ())
+            .map_err(|_| ScanObservationFailureCode::BudgetExhausted)
+    }
+}
+
+impl NativeValueObserver for BudgetedSchemaWork {
+    type Error = ScanObservationFailureCode;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct CancelAtSchemaPoll(AtomicU64);
+
+impl ScanCancellation for CancelAtSchemaPoll {
+    fn is_cancelled(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst) >= 5
+    }
+}
+
+#[test]
+fn text_candidate_rejects_duplicate_input_over_limit() {
+    const MAX_SEARCH_LITERALS: usize = 32;
+    let at_limit = vec![b"alpha".to_vec(); MAX_SEARCH_LITERALS];
+    assert!(
+        TextSearchCandidate::any_of_bytes(&at_limit)
+            .expect("duplicate boundary is valid")
+            .is_some()
+    );
+    let over_limit = vec![b"alpha".to_vec(); MAX_SEARCH_LITERALS + 1];
+    assert_eq!(
+        TextSearchCandidate::any_of_bytes(&over_limit),
+        Err(SchemaFailure::LimitExceeded)
+    );
+    let oversized_literals = vec![vec![b'a'; 1_025]; MAX_SEARCH_LITERALS];
+    assert_eq!(
+        TextSearchCandidate::any_of_bytes(&oversized_literals),
+        Err(SchemaFailure::LimitExceeded)
+    );
+}
+
+#[test]
+fn text_summary_prunes_absent_blocks_and_survives_reopen() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let kernel_catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x91; 16])?,
+        CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(91)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &kernel_catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x94; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let identity = StoreBlockIdentity::new([0x95; 16])?;
+    let (prepared, delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        identity,
+        vec![super::minimal_record("alpha βeta", 100)?],
+        &schema,
+    )?;
+    let block = prepared.into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    store.apply_schema_delta(&mut schema, delta, identity, digest)?;
+    let snapshot = ledger.snapshot()?;
+    let cancellation = NeverCancelled;
+    let observer = Unobserved;
+
+    let before_frontier = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::through(ScanLimit::new(1)?, CommitPosition::origin()),
+        &schema,
+        &TextSearchCandidate::literal("pha")?.ok_or("frontier candidate was generic")?,
+        &cancellation,
+        &observer,
+    )?;
+    assert!(before_frontier.records().is_empty());
+    assert_eq!(before_frontier.scanned_bytes(), 0);
+
+    let absent = TextSearchCandidate::literal("zzz")?
+        .ok_or("absent literal candidate was unexpectedly generic")?;
+    let other_schema = SchemaCatalog::new(
+        TenantId::from_bytes([0x42; 16])?,
+        SchemaBudget::release_1()?,
+    )?;
+    let scope_failure = store
+        .scan_text_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &other_schema,
+            &absent,
+            &cancellation,
+            &observer,
+        )
+        .expect_err("a tenant-mismatched schema must be refused before scanning");
+    assert_eq!(
+        scope_failure.code(),
+        LogStoreFailureCode::PhysicalScopeMismatch
+    );
+    let pruned = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &absent,
+        &cancellation,
+        &observer,
+    )?;
+    assert!(pruned.records().is_empty());
+    assert_eq!(pruned.decoded_records(), 0);
+    assert_eq!(pruned.scanned_bytes(), 0);
+    assert!(!pruned.reduced_pruning());
+
+    let present = TextSearchCandidate::literal("pha")?
+        .ok_or("present literal candidate was unexpectedly generic")?;
+    let decoded = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &present,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(decoded.records().len(), 1);
+    assert_eq!(decoded.decoded_records(), 1);
+    assert!(decoded.scanned_bytes() > 0);
+    assert!(!decoded.reduced_pruning());
+
+    // The ordinary catalog publication path and the checkpoint path must
+    // account for the same version-3 text framing bytes.
+    let catalog_object = schema.encode_catalog_object()?;
+    let reopened_catalog = SchemaCatalog::decode_catalog_object(&catalog_object)?;
+    assert_eq!(reopened_catalog.block_indexes, schema.block_indexes);
+
+    let checkpoint = schema.encode_checkpoint_object(&[])?;
+    let index_marker = checkpoint
+        .windows(8)
+        .position(|window| window == b"PINDEX1\0")
+        .ok_or("text index marker missing")?;
+    let text_presence = index_marker
+        .checked_add(73)
+        .ok_or("text presence offset overflow")?;
+    let mut invalid_presence = checkpoint.clone();
+    *invalid_presence
+        .get_mut(text_presence)
+        .ok_or("text presence missing")? = 2;
+    assert!(SchemaCatalog::decode_checkpoint_object(&invalid_presence).is_err());
+    let text_count = text_presence
+        .checked_add(2)
+        .ok_or("text count offset overflow")?;
+    let mut oversized_summary = checkpoint.clone();
+    oversized_summary
+        .get_mut(text_count..text_count + 8)
+        .ok_or("text count missing")?
+        .copy_from_slice(&u64::MAX.to_be_bytes());
+    assert!(SchemaCatalog::decode_checkpoint_object(&oversized_summary).is_err());
+    let reopened = SchemaCatalog::decode_checkpoint_object(&checkpoint)?.0;
+    let reopened_pruned = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &reopened,
+        &absent,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(reopened_pruned.records(), pruned.records());
+    assert_eq!(reopened_pruned.scanned_bytes(), 0);
+    assert!(!reopened_pruned.reduced_pruning());
+
+    let budget_failure = store
+        .scan_text_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &reopened,
+            &present,
+            &cancellation,
+            &RejectObservedWork,
+        )
+        .expect_err("text coverage work must be charged before digest/decode");
+    assert_eq!(budget_failure.code(), LogStoreFailureCode::BudgetExhausted);
+
+    let mut missing_summary = reopened;
+    missing_summary
+        .block_indexes
+        .first_mut()
+        .ok_or("text block index missing after reopen")?
+        .text_summary = None;
+    let fallback = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &missing_summary,
+        &present,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(fallback.records(), decoded.records());
+    assert!(fallback.scanned_bytes() > 0);
+    assert!(fallback.reduced_pruning());
+
+    let mut stale = SchemaCatalog::decode_checkpoint_object(&checkpoint)?.0;
+    stale
+        .block_indexes
+        .first_mut()
+        .ok_or("text block index missing for stale test")?
+        .digest[0] ^= 1;
+    let stale_result = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &stale,
+        &present,
+        &cancellation,
+        &observer,
+    )?;
+    assert_eq!(stale_result.records(), decoded.records());
+    assert!(stale_result.reduced_pruning());
+    Ok(())
+}
+
+#[test]
+fn text_scan_limit_stops_before_next_block_candidate_work() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let kernel_catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x96; 16])?,
+        CatalogSecret::from_owned(Box::new([0x97; 32]), Box::new([0x98; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(92)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &kernel_catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x99; 32])),
+    )?;
+    let store = LogStore::new();
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let candidate = TextSearchCandidate::literal("target")?.ok_or("candidate became generic")?;
+    let first_identity = StoreBlockIdentity::new([0x9a; 16])?;
+    let (first, first_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        tenant,
+        shard,
+        first_identity,
+        vec![super::minimal_record("target", 100)?],
+        &schema,
+    )?;
+    let first = first.into_store_block();
+    let first_digest = first.content_digest()?;
+    ledger.append(first)?;
+    store.apply_schema_delta(&mut schema, first_delta, first_identity, first_digest)?;
+    let first_snapshot = ledger.snapshot()?;
+    let first_observer = RecordingTextWork(AtomicU64::new(0));
+    let first_result = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &first_snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &candidate,
+        &NeverCancelled,
+        &first_observer,
+    )?;
+    assert_eq!(first_result.records().len(), 1);
+    drop(first_result);
+    let first_work = first_observer.0.load(Ordering::SeqCst);
+
+    let second_identity = StoreBlockIdentity::new([0x9b; 16])?;
+    let (second, second_delta) = store.prepare_with_schema_delta(
+        preparation_capacity(&authority, tenant)?,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+        tenant,
+        shard,
+        second_identity,
+        vec![super::minimal_record("target", 101)?],
+        &schema,
+    )?;
+    let second = second.into_store_block();
+    let second_digest = second.content_digest()?;
+    ledger.append(second)?;
+    store.apply_schema_delta(&mut schema, second_delta, second_identity, second_digest)?;
+
+    let budget = BudgetedTextWork(AtomicU64::new(first_work));
+    let result = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &candidate,
+        &NeverCancelled,
+        &budget,
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert!(!result.complete());
+    assert_eq!(budget.0.load(Ordering::SeqCst), 0);
+    Ok(())
+}
 
 #[test]
 fn stored_projection_compatibility_preserves_nested_occurrences_and_exact_matching()
@@ -1500,8 +1924,17 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
         SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
     )?;
     let store = LogStore::new();
-    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(8, 8_192, 8_192, 64)?)?;
+    let mut schema = SchemaCatalog::new(tenant, SchemaBudget::new(8, 8_192, 8_192, 8_192)?)?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100)));
+    let match_path = SchemaPath::new(AttributeNamespace::Record, "match".to_owned())?;
+    let seed = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "match".to_owned(),
+        vec![CandidateAttributeValue::string("seed".to_owned())],
+    )
+    .validate(LogStore::value_limit_profile())?;
+    schema.observe(std::slice::from_ref(&seed))?;
+    schema.record_query_use(&match_path)?;
 
     let first_identity = StoreBlockIdentity::new([0x6a; 16])?;
     let (first, first_delta) = store.prepare_with_schema_delta(
@@ -1556,6 +1989,68 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
     assert_eq!(bounded.records().len(), 1);
     assert!(!bounded.complete());
     drop(bounded);
+
+    let observed = observed_schema_scan(
+        &store,
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &schema,
+        &query("match", "value")?,
+    )?;
+    assert_eq!(observed.records().len(), 1);
+    assert!(!observed.complete());
+    drop(observed);
+
+    let mut first_observer = RecordingSchemaWork(AtomicU64::new(0));
+    let first_only = store.scan_schema_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::through(ScanLimit::new(1)?, first_receipt.position()),
+        &schema,
+        &query("match", "value")?,
+        &NeverCancelledSchemaScan,
+        &mut first_observer,
+    )?;
+    assert_eq!(first_only.records().len(), 1);
+    let first_block_work = first_observer.0.load(Ordering::SeqCst);
+    assert!(first_block_work > 0);
+    drop(first_only);
+
+    let mut exact_observer = BudgetedSchemaWork(AtomicU64::new(first_block_work));
+    let exact = store
+        .scan_schema_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &schema,
+            &query("match", "value")?,
+            &NeverCancelledSchemaScan,
+            &mut exact_observer,
+        )
+        .expect("decoded-record limit must guard before the second block");
+    assert_eq!(exact.records().len(), 1);
+    assert!(!exact.complete());
+    assert_eq!(exact_observer.0.load(Ordering::SeqCst), 0);
+    drop(exact);
+
+    let mut cancellation_observer = RecordingSchemaWork(AtomicU64::new(0));
+    let cancelled = store
+        .scan_schema_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            LogScan::all(ScanLimit::new(1)?),
+            &schema,
+            &query("match", "value")?,
+            &CancelAtSchemaPoll(AtomicU64::new(0)),
+            &mut cancellation_observer,
+        )
+        .expect_err("cancellation before the next block must stop the scan");
+    assert_eq!(cancelled.code(), LogStoreFailureCode::Cancelled);
 
     let foreign = TenantId::from_bytes([0x42; 16])?;
     let failure = store

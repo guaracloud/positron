@@ -83,6 +83,20 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    #[cfg(fuzzing)]
+    #[doc(hidden)]
+    pub fn fuzz_text_body(body: String) -> Result<Self, LogStoreFailure> {
+        Self::checked_receiver_candidate_with_metadata(
+            value_profile(),
+            None,
+            None,
+            Some(CandidateAttributeValue::string(body)),
+            Vec::new(),
+            LogMetadata::empty(),
+            PolicyProvenance::new(1, [0x71; 32], Vec::new())?,
+        )
+    }
+
     pub(in crate::log_store) fn take_body(&mut self) -> Option<ValidatedAttributeValue> {
         self.body.take()
     }

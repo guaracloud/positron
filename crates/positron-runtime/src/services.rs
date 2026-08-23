@@ -54,10 +54,26 @@ impl std::fmt::Debug for ServiceHandle {
 }
 
 impl ServiceHandle {
+    #[allow(dead_code)]
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Result<Self, ServiceFailure> {
+        Self::new_with_cancellation(instance, None)
+    }
+
+    pub(crate) fn new_with_cancellation(
+        instance: Arc<InitializedInstance>,
+        cancellation: Option<&crate::TaskCancellation>,
+    ) -> Result<Self, ServiceFailure> {
         let ingest_policy = instance.ingest_policy.serving();
-        let recovered = schema_bootstrap::recover(&instance)?;
+        let fallback = crate::TaskCancellation::new();
+        let cancellation = cancellation.unwrap_or(&fallback);
+        let recovered = schema_bootstrap::recover(&instance, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(ServiceFailure::Cancelled);
+        }
         if let Some(checkpoint) = recovered.dirty_checkpoint {
+            if cancellation.is_cancelled() {
+                return Err(ServiceFailure::Cancelled);
+            }
             schema_maintenance::publish_quiescent_checkpoint(&instance, checkpoint)?;
         }
         Ok(Self {

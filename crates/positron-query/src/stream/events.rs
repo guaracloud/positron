@@ -52,6 +52,7 @@ pub struct QueryStats {
     scanned_bytes: u64,
     decoded_records: u64,
     output_bytes: u64,
+    memory_peak_bytes: u64,
     cpu_work_units: u64,
     wall_seconds: u64,
     last_sequence: Option<u64>,
@@ -65,6 +66,7 @@ pub(crate) struct QueryCounters {
     pub(crate) scanned_bytes: u64,
     pub(crate) decoded_records: u64,
     pub(crate) output_bytes: u64,
+    pub(crate) memory_peak_bytes: u64,
     pub(crate) cpu_work_units: u64,
     pub(crate) wall_seconds: u64,
 }
@@ -80,6 +82,7 @@ impl QueryStats {
             scanned_bytes: counters.scanned_bytes,
             decoded_records: counters.decoded_records,
             output_bytes: counters.output_bytes,
+            memory_peak_bytes: counters.memory_peak_bytes,
             cpu_work_units: counters.cpu_work_units,
             wall_seconds: counters.wall_seconds,
             last_sequence,
@@ -116,6 +119,10 @@ impl QueryStats {
     #[must_use]
     pub const fn output_bytes(self) -> u64 {
         self.output_bytes
+    }
+    #[must_use]
+    pub const fn memory_peak_bytes(self) -> u64 {
+        self.memory_peak_bytes
     }
     #[must_use]
     pub const fn cpu_work_units(self) -> u64 {

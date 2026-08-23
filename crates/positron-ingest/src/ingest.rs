@@ -1,3 +1,4 @@
+use crate::schema_session::SchemaBuildObserver;
 use crate::schema_session::{DurableSchemaOutcome, DurableSchemaResolution};
 use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation, TenantSchemaSession};
 use positron_domain::identity::{Scope, TenantId};
@@ -54,6 +55,9 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         if records.is_empty() {
             return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord);
         }
+        if cancellation.is_some_and(AppendCancellation::is_cancelled) {
+            return IngestOutcome::Retryable(IngestFailureCode::Cancelled);
+        }
         let input_record_count = match u64::try_from(records.len()) {
             Ok(count) => count,
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
@@ -100,7 +104,9 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         };
         let schema_capacity = match self.authority.governor().reserve(schema_claim) {
             Ok(capacity) => capacity,
-            Err(_) => return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable),
+            Err(_) => {
+                return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
+            },
         };
         let mut accepted = Vec::new();
         let mut accepted_attributes = 0_usize;
@@ -195,16 +201,21 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             Ok(snapshot) => snapshot,
             Err(failure) => return map_ledger_failure(&failure),
         };
-        let staged_schema = match self.schema.stage_group(
+        let schema_observer =
+            SchemaBuildObserver::new(schema_estimate.schema_work_units(), cancellation);
+        let staged_schema = match self.schema.stage_group_observed(
             self.tenant,
             self.shard,
             identity,
             &snapshot,
             &mut accepted,
             self.authority.governor(),
+            &schema_observer,
         ) {
             Ok(staged) => staged,
-            Err(failure) => return map_schema_session_failure(failure),
+            Err(failure) => {
+                return map_schema_session_failure(failure);
+            },
         };
         let staged_bytes = match u64::try_from(staged_schema.staged_memory_bytes()) {
             Ok(bytes) if bytes <= schema_estimate.staging_memory_bytes() => bytes,

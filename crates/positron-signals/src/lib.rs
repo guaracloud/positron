@@ -16,8 +16,9 @@ pub use log_store::{
     SchemaPath, SchemaPathDigest, SchemaPathSummary, SchemaPromotionDecision,
     SchemaPromotionReason, SchemaQuery, SchemaQueryResult, SchemaQueryUpdate, SchemaRepresentation,
     SchemaSessionStore, SchemaTraversalFailure, SchemaValue, StoredLogAttribute, StoredLogRecord,
+    TextSearchCandidate,
 };
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
-pub use log_store::fuzz_log_store_block;
+pub use log_store::{fuzz_log_store_block, fuzz_text_search_pruning};

@@ -32,23 +32,28 @@ pub(super) fn root_fits(
         .len()
         .checked_add(new_entries)
         .ok_or(SchemaFailure::LimitExceeded)?;
-    Ok(entries <= catalog.budget.max_entries()
-        && catalog
-            .memory_bytes
+    if entries > catalog.budget.max_entries() || catalog.persistent_bytes < CATALOG_HEADER_BYTES {
+        return Ok(false);
+    }
+    let fits = |base_memory: usize, base_persistent: usize, base_index: usize| {
+        base_memory
             .checked_add(memory)
             .and_then(|value| value.checked_add(physical_memory))
             .is_some_and(|value| value <= catalog.budget.max_memory_bytes())
-        && catalog
-            .persistent_bytes
-            .checked_add(persistent)
-            .and_then(|value| value.checked_add(physical_bytes))
-            .is_some_and(|value| value <= catalog.budget.max_persistent_bytes())
-        && catalog
-            .index_bytes
-            .checked_add(index)
-            .and_then(|value| value.checked_add(physical_bytes))
-            .is_some_and(|value| value <= catalog.budget.max_index_bytes())
-        && catalog.persistent_bytes >= CATALOG_HEADER_BYTES)
+            && base_persistent
+                .checked_add(persistent)
+                .and_then(|value| value.checked_add(physical_bytes))
+                .is_some_and(|value| value <= catalog.budget.max_persistent_bytes())
+            && base_index
+                .checked_add(index)
+                .and_then(|value| value.checked_add(physical_bytes))
+                .is_some_and(|value| value <= catalog.budget.max_index_bytes())
+    };
+    Ok(fits(
+        catalog.memory_bytes,
+        catalog.persistent_bytes,
+        catalog.index_bytes,
+    ))
 }
 
 pub(super) fn projected_cost(
