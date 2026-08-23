@@ -45,6 +45,15 @@ produce the same typed plan or stable failure class:
 cargo +nightly fuzz run query_sql
 ```
 
+The authenticated cursor boundary target checks bounded cursor ownership,
+lossless round trips, and truncation rejection. The current 373-byte cursor
+encoding remains readable alongside the legacy 341-byte encoding; all other
+lengths are rejected before any resume state is constructed:
+
+```console
+cargo +nightly fuzz run query_cursor --sanitizer none -- -runs=1000
+```
+
 The physical query-search target builds bounded authenticated Store Blocks and
 schema text coverage, then exercises identity/digest validation, conservative
 candidate pruning, fallback, and decoding through the production scan path.

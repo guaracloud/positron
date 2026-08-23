@@ -137,20 +137,9 @@ fn validate_attribute_array_observed<O: NativeValueObserver>(
     if exceeds_collection_limit(values.len(), limits.dynamic_value().array_entries()) {
         return Err(DomainFailure::value_limit_exceeded().into());
     }
-    let allocation_bytes = reserve_output_capacity(
+    let (mut validated, allocation_bytes) = reserve_validated_capacity(
         values.len(),
         ARRAY_VALUE_SLOT_BYTES,
-        observer,
-    )?;
-    let mut validated = Vec::new();
-    if validated.try_reserve_exact(values.len()).is_err() {
-        release_output_capacity(allocation_bytes, observer)?;
-        return Err(DomainFailure::allocation_unavailable().into());
-    }
-    let allocation_bytes = reconcile_output_capacity(
-        &validated,
-        ARRAY_VALUE_SLOT_BYTES,
-        allocation_bytes,
         observer,
     )?;
     let mut value_size_bytes = 0_usize;
@@ -214,20 +203,9 @@ fn validate_key_value_list_observed<O: NativeValueObserver>(
     ) {
         return Err(DomainFailure::value_limit_exceeded().into());
     }
-    let allocation_bytes = reserve_output_capacity(
+    let (mut validated, allocation_bytes) = reserve_validated_capacity(
         values.len(),
         KEY_VALUE_ENTRY_SLOT_BYTES,
-        observer,
-    )?;
-    let mut validated = Vec::new();
-    if validated.try_reserve_exact(values.len()).is_err() {
-        release_output_capacity(allocation_bytes, observer)?;
-        return Err(DomainFailure::allocation_unavailable().into());
-    }
-    let allocation_bytes = reconcile_output_capacity(
-        &validated,
-        KEY_VALUE_ENTRY_SLOT_BYTES,
-        allocation_bytes,
         observer,
     )?;
     let mut value_size_bytes = 0_usize;
@@ -306,20 +284,54 @@ fn reserve_output_capacity<O: NativeValueObserver>(
     Ok(bytes)
 }
 
+fn reserve_validated_capacity<T, O: NativeValueObserver>(
+    count: usize,
+    slot_bytes: usize,
+    observer: &mut O,
+) -> Result<(Vec<T>, usize), ObservedValueFailure<O::Error>> {
+    // The candidate collection is still live here. Admit canonical output
+    // slots before allocating the replacement so QueryMemory observes the
+    // complete simultaneous peak through the same observer authority.
+    let admitted_bytes = reserve_output_capacity(count, slot_bytes, observer)?;
+    let mut values = Vec::new();
+    if values.try_reserve_exact(count).is_err() {
+        release_output_capacity(admitted_bytes, observer)?;
+        return Err(DomainFailure::allocation_unavailable().into());
+    }
+    let actual_bytes = reconcile_output_capacity(
+        &values,
+        slot_bytes,
+        admitted_bytes,
+        observer,
+    )?;
+    Ok((values, actual_bytes))
+}
+
 fn reconcile_output_capacity<T, O: NativeValueObserver>(
     values: &Vec<T>,
     slot_bytes: usize,
     admitted_bytes: usize,
     observer: &mut O,
 ) -> Result<usize, ObservedValueFailure<O::Error>> {
-    let actual_bytes = checked_capacity_bytes(values.capacity(), slot_bytes)?;
+    let actual_bytes = match checked_capacity_bytes(values.capacity(), slot_bytes) {
+        Ok(bytes) => bytes,
+        Err(failure) => {
+            return match release_output_capacity(admitted_bytes, observer) {
+                Ok(()) => Err(failure.into()),
+                Err(release_failure) => Err(release_failure),
+            };
+        },
+    };
     if actual_bytes > admitted_bytes {
         let additional = actual_bytes
             .checked_sub(admitted_bytes)
             .ok_or_else(DomainFailure::value_limit_exceeded)?;
-        observer
-            .observe_allocation(additional)
-            .map_err(ObservedValueFailure::Observer)?;
+        if let Err(failure) = observer.observe_allocation(additional) {
+            return match release_output_capacity(admitted_bytes, observer) {
+                Ok(()) => Err(ObservedValueFailure::Observer(failure)),
+                Err(release_failure) => Err(release_failure),
+            };
+        }
         return Ok(actual_bytes);
     }
     let slack = admitted_bytes - actual_bytes;

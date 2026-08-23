@@ -99,6 +99,91 @@ fn parser_scratch_and_retained_output_have_exact_memory_boundaries() -> Result<(
 }
 
 #[test]
+fn json_validation_charges_candidate_and_canonical_capacity_at_exact_boundary()
+-> Result<(), Box<dyn Error>> {
+    const ENTRIES: u64 = 1_024;
+    const PARSER_ENTRY_BYTES: u64 = 96;
+    const ARRAY_VALUE_SLOT_BYTES: u64 = 64;
+    // The query's fixed page/digest working set is retained by both runs; the
+    // transform adds the source scratch and its transfer bookkeeping.
+    const TRANSFORM_WORKING_BYTES: u64 = 320;
+
+    let fixture = QueryFixture::new("query-json-array-simultaneous-capacity")?;
+    let source = format!("[{}]", vec!["0"; usize::try_from(ENTRIES)?].join(","));
+    fixture.kernel.append_log(&source, 20, 1)?;
+    let service = zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = |memory| {
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, memory, 60)
+            .and_then(|budget| budget.with_cpu_work_units(1_024))
+    };
+    let baseline = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget(4_194_304)?,
+    )?;
+    let baseline_peak = service
+        .execute(baseline)?
+        .collect::<Vec<_>>()
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats.memory_peak_bytes()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("JSON array baseline did not complete")?;
+    let parser_bytes = ENTRIES
+        .checked_mul(PARSER_ENTRY_BYTES)
+        .ok_or("parser capacity overflowed")?;
+    let output_bytes = ENTRIES
+        .checked_mul(ARRAY_VALUE_SLOT_BYTES)
+        .ok_or("validated capacity overflowed")?;
+    let expected_peak = baseline_peak
+        .checked_add(parser_bytes)
+        .and_then(|bytes| bytes.checked_add(output_bytes))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(source.len()).ok()?))
+        .and_then(|bytes| bytes.checked_add(TRANSFORM_WORKING_BYTES))
+        .ok_or("transform capacity floor overflowed")?;
+
+    let under = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
+        budget(expected_peak.checked_sub(1).ok_or("boundary underflowed")?)?,
+    )?;
+    let under_events = service.execute(under)?.collect::<Vec<_>>();
+    assert!(matches!(
+        under_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    ));
+
+    let exact = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
+        budget(expected_peak)?,
+    )?;
+    let exact_events = service.execute(exact)?.collect::<Vec<_>>();
+    assert!(matches!(
+        exact_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    let exact_stats = exact_events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("JSON array exact query did not complete")?;
+    assert!(exact_stats.memory_peak_bytes() <= expected_peak);
+    assert_eq!(exact_stats.records(), 1);
+    Ok(())
+}
+
+#[test]
 fn nested_json_parser_allocations_are_admitted_before_the_final_value() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("query-json-nested-parser-memory-boundary")?;

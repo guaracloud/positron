@@ -80,7 +80,18 @@ impl Identity {
                 return Err(IdentityFailure);
             }
             let mut decoded = decode_initial_identity(object)?;
-            decoded.generation = snapshot.number();
+            // Lease, query-marker, and other catalog objects may advance the
+            // catalog generation without changing authorization. Bind query
+            // revalidation to this immutable governance object instead, so a
+            // reconnect after ordinary catalog churn remains authorized while
+            // replacing the identity object still changes the binding.
+            let object_bytes = object_id.to_bytes();
+            decoded.generation = object_bytes
+                .get(..8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(1)
+                .max(1);
             identity = Some(decoded);
         }
         identity.ok_or(IdentityFailure)

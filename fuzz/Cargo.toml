@@ -126,6 +126,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "query_cursor"
+path = "fuzz_targets/query_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "query_sql"
 path = "fuzz_targets/query_sql.rs"
 test = false

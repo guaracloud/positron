@@ -116,7 +116,12 @@ fn result_envelope_identifies_snapshot_schema_budget_order_lease_and_digest_chai
 #[test]
 fn terminal_stats_report_cumulative_resume_and_repeat_state() -> Result<(), Box<dyn Error>> {
     let fixture = CursorFixture::new()?;
-    let service = fixture.service();
+    let service = super::support::stage_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        fixture.clock.clone(),
+    );
     let mut first = service.resume(fixture.context, &fixture.cursor)?;
     assert!(matches!(first.next(), Some(QueryEvent::Header(_))));
     assert!(matches!(first.next(), Some(QueryEvent::Batch(_))));
@@ -148,6 +153,95 @@ fn terminal_stats_report_cumulative_resume_and_repeat_state() -> Result<(), Box<
     );
     assert_eq!(repeated_stats.cumulative_budget().decoded_records(), 16);
     assert_eq!(repeated_stats.budget(), repeated_stats.cumulative_budget());
+    Ok(())
+}
+
+#[test]
+fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let service = fixture.service();
+    let plan = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?.with_cpu_work_units(16)?,
+    )?;
+    let first = service.execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+
+    let mut first_retry = super::support::stage_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        fixture.clock.clone(),
+    )
+    .resume(fixture.context, &cursor)?;
+    let first_retry_header = first_retry.next().ok_or("retry header missing")?;
+    let first_retry_batch = first_retry.next().ok_or("retry batch missing")?;
+    let first_retry_identity = match &first_retry_batch {
+        QueryEvent::Batch(batch) => (batch.sequence(), batch.digest()),
+        _ => return Err("retry batch has the wrong event type".into()),
+    };
+    drop(first_retry);
+    let mut second_retry = super::support::stage_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        fixture.clock.clone(),
+    )
+    .resume(fixture.context, &cursor)?;
+    assert_eq!(second_retry.next(), Some(first_retry_header));
+    assert_eq!(second_retry.next(), Some(first_retry_batch));
+    drop(second_retry);
+
+    let terminal = super::support::stage_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        fixture.clock.clone(),
+    )
+    .resume(fixture.context, &cursor)?
+    .collect::<Vec<_>>();
+    let stats = match terminal.last() {
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats))) => *stats,
+        _ => return Err("final retry terminal missing".into()),
+    };
+    assert_eq!(batch_identity(&terminal)?, first_retry_identity);
+    assert_eq!(bodies(&terminal), ["second"]);
+    assert_eq!(stats.records(), 2);
+    assert_eq!(stats.emitted_records(), 2);
+    assert!(stats.scanned_bytes() > 0);
+    assert!(stats.scanned_records() >= 2);
+    assert!(stats.output_bytes() > 0);
+    assert!(stats.memory_peak_bytes() > 0);
+    assert!(stats.cpu_work_units() > 0);
+    assert_eq!(stats.cumulative_budget().scanned_bytes(), 1_048_576);
+    assert_eq!(stats.cumulative_budget().decoded_records(), 16);
+    assert_eq!(stats.cumulative_budget().output_rows(), 16);
+    assert_eq!(stats.cumulative_budget().output_bytes(), 1_048_576);
+    assert_eq!(stats.resume_count(), 3);
+    assert_eq!(stats.repeated_batch_count(), 2);
+    Ok(())
+}
+
+#[test]
+fn resumable_reconnect_survives_query_service_and_ledger_reopen() -> Result<(), Box<dyn Error>> {
+    let mut fixture = CursorFixture::new()?;
+    let cursor = fixture.cursor.clone();
+    let mut first = fixture.service().resume(fixture.context, &cursor)?;
+    assert!(matches!(first.next(), Some(QueryEvent::Header(_))));
+    assert!(matches!(first.next(), Some(QueryEvent::Batch(_))));
+    drop(first);
+    fixture.kernel.reopen_ledger()?;
+    let resumed = fixture
+        .service()
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert_eq!(bodies(&resumed), ["second"]);
+    assert!(matches!(
+        resumed.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
     Ok(())
 }
 
@@ -259,6 +353,25 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         .resume(fixture.context, &legacy)?
         .collect::<Vec<_>>();
     assert_eq!(bodies(&events), ["second"]);
+    let truncated = fixture
+        .cursor
+        .as_bytes()
+        .get(..372)
+        .ok_or("cursor too short")?;
+    assert_eq!(
+        QueryCursor::from_bytes(truncated)
+            .expect_err("truncated cursor must be rejected")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    let mut unknown_version = fixture.cursor.as_bytes().to_vec();
+    unknown_version.extend_from_slice(&[0; 32]);
+    assert_eq!(
+        QueryCursor::from_bytes(&unknown_version)
+            .expect_err("unknown cursor wire length must be rejected")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
     Ok(())
 }
 

@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use positron_domain::identity::{PrincipalId, Scope};
+use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_governance::{
     CatalogRootRotationStage, CompatibilityHints, InitialAuditContext, InitialGovernanceIntent,
     InitialTenantIntent, PresentedCredential, RequestedIntent,
 };
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogSecret, CatalogWrappingKey,
-    FormatEpoch, MountQualification, PrimaryDataVolume, TransactionId,
+    ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogSecret,
+    CatalogWrappingKey, FormatEpoch, MountQualification, PrimaryDataVolume, SegmentScope,
+    TransactionId,
 };
 
 use super::super::InitializationPlan;
@@ -139,6 +142,67 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
         CompatibilityHints::none(),
     )?;
     assert_eq!(retried.inspect_governance(context)?.audit_records(), audit);
+    Ok(())
+}
+
+#[test]
+fn query_authorization_generation_ignores_non_security_catalog_churn()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
+        .map_err(|error| format!("initialize: {error:?}"))?;
+    drop(initialized);
+    let claim = InstanceBootstrap::claim(&paths).map_err(|error| format!("claim: {error:?}"))?;
+    let initialized =
+        InstanceBootstrap::reopen(&paths).map_err(|error| format!("reopen: {error:?}"))?;
+    let credential = PresentedCredential::parse(claim.query_secret().ok_or("query secret")?)?;
+    let before = initialized
+        .attribute(
+            credential,
+            RequestedIntent::Query,
+            CompatibilityHints::none(),
+        )
+        .map_err(|error| format!("before attribute: {error:?}"))?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )
+    .map_err(|error| format!("catalog open: {error:?}"))?;
+    let scope = SegmentScope::new(
+        initialized.tenant,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)
+        .map_err(|error| format!("ledger open: {error:?}"))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let expiry = now.checked_add(100).ok_or("lease expiry overflow")?;
+    drop(
+        ledger
+            .create_snapshot_lease(now, expiry)
+            .map_err(|error| format!("lease create: {error:?}"))?,
+    );
+    drop(ledger);
+    let pinned = catalog
+        .pin()
+        .map_err(|error| format!("catalog pin: {error:?}"))?;
+    let after = positron_governance::Identity::open(&pinned)
+        .map_err(|error| format!("identity open: {error:?}"))?
+        .attribute(
+            &initialized.key,
+            PresentedCredential::parse(claim.query_secret().ok_or("query secret")?)?,
+            RequestedIntent::Query,
+            CompatibilityHints::none(),
+        )?;
+    drop(catalog);
+    drop(initialized);
+    assert_eq!(
+        before.authorization_generation(),
+        after.authorization_generation()
+    );
     Ok(())
 }
 

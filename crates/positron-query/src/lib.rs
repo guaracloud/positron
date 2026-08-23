@@ -58,7 +58,25 @@ pub fn fuzz_query_inputs(data: &[u8]) {
         let memory = planning_memory::PlanningMemory::new(4_096);
         let _ = service::parse_sql(source, &memory);
     }
-    let _ = QueryCursor::from_bytes(data);
+    fuzz_query_cursor(data);
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_query_cursor(data: &[u8]) {
+    if data.len() > 4_096 {
+        return;
+    }
+    let parsed = QueryCursor::from_bytes(data);
+    if let Ok(cursor) = parsed {
+        assert_eq!(cursor.as_bytes(), data);
+        let reparsed = QueryCursor::from_bytes(cursor.as_bytes())
+            .expect("a bounded cursor must remain decodable after a lossless copy");
+        assert_eq!(reparsed, cursor);
+    }
+    if matches!(data.len(), 341 | 373) {
+        assert!(QueryCursor::from_bytes(&data[..data.len() - 1]).is_err());
+    }
 }
 
 #[cfg(fuzzing)]

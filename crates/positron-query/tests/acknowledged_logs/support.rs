@@ -536,6 +536,22 @@ impl KernelFixture {
         Ok(())
     }
 
+    pub fn reopen_ledger(&mut self) -> Result<(), Box<dyn Error>> {
+        let ledger = self.ledger.take().ok_or("ledger unavailable")?;
+        drop(ledger);
+        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+            101_000_000_000,
+        )));
+        self.ledger = Some(ActiveSegmentLedger::open_with_clock(
+            self.authority,
+            self.catalog,
+            SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+            &clock,
+        )?);
+        Ok(())
+    }
+
     pub fn append_log(
         &self,
         body: &str,
