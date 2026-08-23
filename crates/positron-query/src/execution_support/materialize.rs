@@ -31,23 +31,70 @@ pub(crate) fn query_record(
         return Ok(None);
     }
     let mut transformed = RetainedBytesGuard::new(memory);
-    let transformed_body = match state.plan.transform() {
-        Some(transform) => record
-            .body()
-            .map(|body| {
-                let (value, bytes) =
-                    apply_transform(transform, body, service, state, transformed.memory())?;
-                transformed.set(bytes);
-                Ok(value)
-            })
-            .transpose()?,
-        None => None,
-    };
-    let body = transformed_body.as_ref().or_else(|| record.body());
-    if !predicate_applied && let Some(filter) = state.plan.filter() {
-        let matched = match filter {
-            crate::plan::FilterPredicate::BodyEquals(expected) => match body {
-                Some(value) => {
+    let result = (|| {
+        let transformed_body = match state.plan.transform() {
+            Some(transform) => record
+                .body()
+                .map(|body| {
+                    let (value, bytes) =
+                        apply_transform(transform, body, service, state, transformed.memory())?;
+                    transformed.set(bytes);
+                    Ok(value)
+                })
+                .transpose()?,
+            None => None,
+        };
+        let body = transformed_body.as_ref().or_else(|| record.body());
+        if !predicate_applied && let Some(filter) = state.plan.filter() {
+            let matched = match filter {
+                crate::plan::FilterPredicate::BodyEquals(expected) => match body {
+                    Some(value) => {
+                        let mut observer = super::QueryValueObserver::new(
+                            service,
+                            &mut state.cpu_work_units,
+                            state.budget.cpu_work_units(),
+                            state.cancellation.clone(),
+                            crate::QueryWorkStage::Operators,
+                        );
+                        value
+                            .equals_observed(expected, &mut observer)
+                            .map_err(super::map_observed_failure)?
+                    },
+                    None => false,
+                },
+                crate::plan::FilterPredicate::BodyContains(expected) => match body {
+                    Some(value) => {
+                        let mut observer = super::QueryValueObserver::new(
+                            service,
+                            &mut state.cpu_work_units,
+                            state.budget.cpu_work_units(),
+                            state.cancellation.clone(),
+                            crate::QueryWorkStage::Operators,
+                        );
+                        match value.as_str() {
+                            Some(text) => expected.is_match_observed(text, &mut observer)?,
+                            None => false,
+                        }
+                    },
+                    None => false,
+                },
+                crate::plan::FilterPredicate::BodyRegex(expected) => match body {
+                    Some(value) => {
+                        let mut observer = super::QueryValueObserver::new(
+                            service,
+                            &mut state.cpu_work_units,
+                            state.budget.cpu_work_units(),
+                            state.cancellation.clone(),
+                            crate::QueryWorkStage::Operators,
+                        );
+                        match value.as_str() {
+                            Some(text) => expected.is_match_observed(text, &mut observer)?,
+                            None => false,
+                        }
+                    },
+                    None => false,
+                },
+                crate::plan::FilterPredicate::AttributeEquals(query) => {
                     let mut observer = super::QueryValueObserver::new(
                         service,
                         &mut state.cpu_work_units,
@@ -55,118 +102,82 @@ pub(crate) fn query_record(
                         state.cancellation.clone(),
                         crate::QueryWorkStage::Operators,
                     );
-                    value
-                        .equals_observed(expected, &mut observer)
+                    query
+                        .matches_stored_record_observed(record.stored(), &mut observer)
                         .map_err(super::map_observed_failure)?
                 },
-                None => false,
-            },
-            crate::plan::FilterPredicate::BodyContains(expected) => match body {
-                Some(value) => {
-                    let mut observer = super::QueryValueObserver::new(
-                        service,
-                        &mut state.cpu_work_units,
-                        state.budget.cpu_work_units(),
-                        state.cancellation.clone(),
-                        crate::QueryWorkStage::Operators,
-                    );
-                    match value.as_str() {
-                        Some(text) => expected.is_match_observed(text, &mut observer)?,
-                        None => false,
-                    }
-                },
-                None => false,
-            },
-            crate::plan::FilterPredicate::BodyRegex(expected) => match body {
-                Some(value) => {
-                    let mut observer = super::QueryValueObserver::new(
-                        service,
-                        &mut state.cpu_work_units,
-                        state.budget.cpu_work_units(),
-                        state.cancellation.clone(),
-                        crate::QueryWorkStage::Operators,
-                    );
-                    match value.as_str() {
-                        Some(text) => expected.is_match_observed(text, &mut observer)?,
-                        None => false,
-                    }
-                },
-                None => false,
-            },
-            crate::plan::FilterPredicate::AttributeEquals(query) => {
-                let mut observer = super::QueryValueObserver::new(
-                    service,
-                    &mut state.cpu_work_units,
-                    state.budget.cpu_work_units(),
-                    state.cancellation.clone(),
-                    crate::QueryWorkStage::Operators,
-                );
-                query
-                    .matches_stored_record_observed(record.stored(), &mut observer)
-                    .map_err(super::map_observed_failure)?
-            },
-        };
-        if !matched {
-            transformed.release()?;
-            return Ok(None);
+            };
+            if !matched {
+                transformed.release()?;
+                return Ok(None);
+            }
         }
-    }
-    let selected_columns = state
-        .plan
-        .aggregate()
-        .map(crate::plan::AggregateSpec::group_by)
-        .unwrap_or_else(|| state.plan.projection());
-    let body_selected = selected_columns.contains(&crate::plan::ProjectionColumn::Body);
-    let query_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime);
-    let event_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::EventTime);
-    let ingest_time_selected =
-        selected_columns.contains(&crate::plan::ProjectionColumn::IngestTime);
-    let commit_position_selected =
-        selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition);
-    let cancellation = state.cancellation.clone();
-    let cpu_limit = state.budget.cpu_work_units();
-    let (attributes, attribute_retained_bytes) = project_attributes(
-        record.stored(),
-        selected_columns,
-        service,
-        &mut state.cpu_work_units,
-        cpu_limit,
-        cancellation.clone(),
-        transformed.memory(),
-    )?;
-    let (body, body_retained_bytes) = if body_selected {
-        if let Some(value) = transformed_body {
-            let retained = transformed.disarm();
-            (Some(value), retained)
+        let selected_columns = state
+            .plan
+            .aggregate()
+            .map(crate::plan::AggregateSpec::group_by)
+            .unwrap_or_else(|| state.plan.projection());
+        let body_selected = selected_columns.contains(&crate::plan::ProjectionColumn::Body);
+        let query_time_selected =
+            selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime);
+        let event_time_selected =
+            selected_columns.contains(&crate::plan::ProjectionColumn::EventTime);
+        let ingest_time_selected =
+            selected_columns.contains(&crate::plan::ProjectionColumn::IngestTime);
+        let commit_position_selected =
+            selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition);
+        let cancellation = state.cancellation.clone();
+        let cpu_limit = state.budget.cpu_work_units();
+        let (attributes, attribute_retained_bytes) = project_attributes(
+            record.stored(),
+            selected_columns,
+            service,
+            &mut state.cpu_work_units,
+            cpu_limit,
+            cancellation.clone(),
+            transformed.memory(),
+        )?;
+        let (body, body_retained_bytes) = if body_selected {
+            if let Some(value) = transformed_body {
+                let retained = transformed.disarm();
+                (Some(value), retained)
+            } else {
+                let retained = record.body_retained_bytes();
+                (record.take_body(), retained)
+            }
         } else {
-            let retained = record.body_retained_bytes();
-            (record.take_body(), retained)
-        }
-    } else {
-        transformed.release()?;
-        (None, 0)
-    };
-    Ok(Some(QueryRecord::new(
-        body,
-        body_retained_bytes,
-        crate::stream::QueryRecordTimes {
-            query: query_time,
-            event: event_time,
-            ingest: ingest_time,
-            ordering: ordering_time,
+            transformed.release()?;
+            (None, 0)
+        };
+        Ok(Some(QueryRecord::new(
+            body,
+            body_retained_bytes,
+            crate::stream::QueryRecordTimes {
+                query: query_time,
+                event: event_time,
+                ingest: ingest_time,
+                ordering: ordering_time,
+            },
+            record.commit_position(),
+            record.record_ordinal(),
+            crate::stream::QueryRecordSelection {
+                body: body_selected,
+                query_time: query_time_selected,
+                event_time: event_time_selected,
+                ingest_time: ingest_time_selected,
+                commit_position: commit_position_selected,
+                attributes,
+                attribute_retained_bytes,
+            },
+        )))
+    })();
+    match result {
+        Ok(result) => Ok(result),
+        Err(failure) => match transformed.release() {
+            Ok(()) => Err(failure),
+            Err(cleanup) => Err(cleanup),
         },
-        record.commit_position(),
-        record.record_ordinal(),
-        crate::stream::QueryRecordSelection {
-            body: body_selected,
-            query_time: query_time_selected,
-            event_time: event_time_selected,
-            ingest_time: ingest_time_selected,
-            commit_position: commit_position_selected,
-            attributes,
-            attribute_retained_bytes,
-        },
-    )))
+    }
 }
 
 struct RetainedBytesGuard<'a> {
@@ -197,15 +208,6 @@ impl<'a> RetainedBytesGuard<'a> {
 
     fn disarm(&mut self) -> u64 {
         std::mem::take(&mut self.bytes)
-    }
-}
-
-impl Drop for RetainedBytesGuard<'_> {
-    fn drop(&mut self) {
-        let bytes = std::mem::take(&mut self.bytes);
-        if bytes != 0 {
-            debug_assert!(self.memory.release(bytes).is_ok());
-        }
     }
 }
 
@@ -346,6 +348,26 @@ mod tests {
             guard.set(32);
         }
         assert_eq!(memory.release(0), Ok(()));
+    }
+
+    #[test]
+    fn retained_bytes_cleanup_failure_is_reported_without_drop_panic() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut memory = QueryMemory::new(0);
+            {
+                let mut guard = RetainedBytesGuard::new(&mut memory);
+                guard.set(32);
+            }
+        }));
+        assert!(result.is_ok());
+
+        let mut memory = QueryMemory::new(0);
+        let mut guard = RetainedBytesGuard::new(&mut memory);
+        guard.set(32);
+        assert_eq!(
+            guard.release().expect_err("the debit is absent").code(),
+            QueryFailureCode::Internal
+        );
     }
 
     #[test]
