@@ -1,6 +1,8 @@
 use crate::plan::{AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn};
 use crate::transform::{BodyTransform, CastTarget};
-use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange};
+use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis};
+
+use crate::sql::plan;
 
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
     let stages = pipeline_stages(source)?;
@@ -12,7 +14,10 @@ pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> 
             let range = range.split_ascii_whitespace().collect::<Vec<_>>();
             let limit = limit.split_ascii_whitespace().collect::<Vec<_>>();
             match (range.as_slice(), limit.as_slice()) {
-                (["range", axis, start, end], ["limit", limit]) => plan(axis, start, end, limit),
+                (["range", axis, start, end], ["limit", limit]) => {
+                    let limit = crate::sql::parse_limit(limit)?;
+                    plan(axis, start, end, limit)
+                },
                 _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
             }
         },
@@ -192,7 +197,9 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
         axis,
         start,
         end,
-        limit.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
+        crate::sql::parse_limit(
+            limit.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
+        )?,
     )?;
     if let Some(filter) = filter {
         plan = plan.with_filter(filter);
@@ -224,68 +231,7 @@ fn parse_cast_target(source: &str) -> Result<CastTarget, QueryFailure> {
 }
 
 pub(crate) fn parse_sql(source: &str) -> Result<LogicalPlan, QueryFailure> {
-    let normalized = source.trim().to_ascii_lowercase();
-    let tokens = normalized.split_ascii_whitespace().collect::<Vec<_>>();
-    match tokens.as_slice() {
-        [
-            "select",
-            "body",
-            "from",
-            "logs",
-            "where",
-            axis,
-            ">=",
-            start,
-            "and",
-            upper_axis,
-            "<",
-            end,
-            "order",
-            "by",
-            ordered_axis,
-            "commit_position",
-            "limit",
-            limit,
-        ] if *upper_axis == *axis && ordered_axis.strip_suffix(',') == Some(axis) => {
-            plan(axis, start, end, limit)
-        },
-        _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
-    }
-}
-
-fn plan(axis: &str, start: &str, end: &str, limit: &str) -> Result<LogicalPlan, QueryFailure> {
-    let axis = match axis {
-        "query_time" => TemporalAxis::QueryTime,
-        "event_time" => TemporalAxis::EventTime,
-        "ingest_time" => TemporalAxis::IngestTime,
-        _ => return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
-    };
-    let start = parse_timestamp(start)?;
-    let end = parse_timestamp(end)?;
-    let range = TemporalRange::new(start, end)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
-    Ok(LogicalPlan::logs(axis, range, parse_limit(limit)?))
-}
-
-fn parse_timestamp(source: &str) -> Result<i64, QueryFailure> {
-    if source.starts_with('+')
-        || (source.starts_with('0') && source.len() > 1)
-        || (source.starts_with("-0") && source.len() > 2)
-    {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
-    source
-        .parse()
-        .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
-}
-
-fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
-    if source.starts_with('0') && source.len() > 1 {
-        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-    }
-    source
-        .parse()
-        .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
+    crate::sql::parse(source)
 }
 
 fn parse_projection(source: &str) -> Result<Vec<ProjectionColumn>, QueryFailure> {

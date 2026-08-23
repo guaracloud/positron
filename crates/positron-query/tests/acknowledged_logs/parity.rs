@@ -156,6 +156,278 @@ fn pipeline_and_sql_require_the_same_explicit_bounded_temporal_range() -> Result
 }
 
 #[test]
+fn sql_compiles_typed_projection_and_body_filter_to_the_pipeline_plan() -> Result<(), Box<dyn Error>>
+{
+    let roots = TemporaryRoots::new("sql-typed-parity")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-typed-parity-kernel")?;
+    fixture.append_log("keep", 20, 1)?;
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+
+    let pipeline = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | project query_time, commit_position | limit 16",
+        budget,
+    )?;
+    let sql = service.plan_sql(
+        context,
+        "SELECT query_time, commit_position FROM logs WHERE query_time >= -100 AND query_time < 100 AND body = \"keep\" ORDER BY query_time ASC, commit_position ASC LIMIT 16",
+        budget,
+    )?;
+    assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+
+    let pipeline = service.plan_pipeline(
+        context,
+        r#"pipeline:v1 logs | range query_time -100 100 | filter record["service"] any == string("api") | project record["service"], query_time | limit 16"#,
+        budget,
+    )?;
+    let sql = service.plan_sql(
+        context,
+        r#"SELECT record["service"], query_time FROM logs WHERE query_time >= -100 AND query_time < 100 AND record["service"] any = string("api") ORDER BY query_time, commit_position LIMIT 16"#,
+        budget,
+    )?;
+    assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+    Ok(())
+}
+
+#[test]
+fn sql_compiles_search_and_grouped_count_to_the_same_typed_plan() -> Result<(), Box<dyn Error>> {
+    let roots = TemporaryRoots::new("sql-operators-parity")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-operators-parity-kernel")?;
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+
+    let pipeline = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"Keep\" | limit 16",
+        budget,
+    )?;
+    let sql = service.plan_sql(
+        context,
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body CONTAINS \"Keep\" ORDER BY query_time, commit_position LIMIT 16",
+        budget,
+    )?;
+    assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+
+    let pipeline = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 16",
+        budget,
+    )?;
+    let sql = service.plan_sql(
+        context,
+        "SELECT body, COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY body ORDER BY query_time, commit_position LIMIT 16",
+        budget,
+    )?;
+    assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+
+    let pipeline = service.plan_pipeline(
+        context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count | limit 1",
+        budget,
+    )?;
+    let sql = service.plan_sql(
+        context,
+        "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        budget,
+    )?;
+    assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+    Ok(())
+}
+
+#[test]
+fn sql_rejects_mutation_joins_and_unbounded_or_ambiguous_forms() -> Result<(), Box<dyn Error>> {
+    let roots = TemporaryRoots::new("sql-rejections")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-rejections-kernel")?;
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    for source in [
+        "SELECT * FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        "SELECT body FROM logs LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position",
+        "SELECT body FROM logs JOIN spans ON logs.trace_id = spans.trace_id WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "UPDATE logs SET body = \"x\"",
+        "DELETE FROM logs",
+        "CREATE TABLE logs (body string)",
+        "BEGIN; SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body = \"unterminated ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 01",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body CONTAINS \"Keep\" ORDER BY query_time, commit_position LIMIT 1 trailing",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body = \"Keep\" extra ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"service\"] none = string(\"api\") ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"service\"] any != string(\"api\") ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"service\"] index(01) = string(\"api\") ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY event_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, body LIMIT 1",
+        "SELECT body, body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body, query_time, event_time, ingest_time, commit_position, record[\"x\"] FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT COUNT(*), COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT JSON(body), LOGFMT(body) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT CAST(body AS bytes) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT CAST(body) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT JSON(record[\"body\"]) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY * ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY body, query_time ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body, COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY query_time ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position DESC extra LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1;",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body = \"bad\\n\" ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body = \"bad\\\" ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND (((((((((((((((((body = \"x\")))))))))))))))))) ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time = -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND event_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY 123, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body LIKE \"x\" ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1)",
+        "SELECT foo(body) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "",
+    ] {
+        let failure = match service.plan_sql(context, source, budget) {
+            Ok(_) => return Err(format!("unsupported SQL form was accepted: {source}").into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.code(),
+            positron_query::QueryFailureCode::UnsupportedQuery
+        );
+    }
+    let many_tokens = (0..129).map(|_| "body").collect::<Vec<_>>().join(" ");
+    let source = format!(
+        "SELECT {many_tokens} FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1"
+    );
+    let failure = match service.plan_sql(context, &source, budget) {
+        Ok(_) => return Err("token bound must reject before parsing".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        failure.code(),
+        positron_query::QueryFailureCode::UnsupportedQuery
+    );
+    Ok(())
+}
+
+#[test]
+fn sql_body_expressions_preserve_bounded_transform_parity() -> Result<(), Box<dyn Error>> {
+    let roots = TemporaryRoots::new("sql-transform-parity")?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-transform-parity-kernel")?;
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60);
+    let budget = budget?;
+    for (pipeline, sql) in [
+        (
+            "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
+            "SELECT JSON(body) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        ),
+        (
+            "pipeline:v1 logs | range query_time -100 100 | logfmt | limit 1",
+            "SELECT LOGFMT(body) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        ),
+        (
+            "pipeline:v1 logs | range query_time -100 100 | cast body as int | limit 1",
+            "SELECT CAST(body AS int) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        ),
+    ] {
+        let pipeline = service
+            .plan_pipeline(context, pipeline, budget)
+            .map_err(|error| format!("pipeline {pipeline}: {error:?}"))?;
+        let sql = service
+            .plan_sql(context, sql, budget)
+            .map_err(|error| format!("sql {sql}: {error:?}"))?;
+        assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+    }
+
+    for (pipeline, sql) in [
+        (
+            r#"pipeline:v1 logs | range event_time -100 100 | filter record["service"] all == string("api") | project event_time, ingest_time | order by event_time desc, commit_position desc | limit 1"#,
+            r#"SELECT EVENT_TIME, INGEST_TIME FROM logs WHERE EVENT_TIME >= -100 AND event_time < 100 AND record["service"] ALL = string("api") ORDER BY EVENT_TIME DESC, COMMIT_POSITION DESC LIMIT 1"#,
+        ),
+        (
+            r#"pipeline:v1 logs | range ingest_time -100 100 | filter record["service"] index(0) == string("api") | project body | order by ingest_time desc, commit_position asc | limit 1"#,
+            r#"SELECT body FROM logs WHERE ingest_time >= -100 AND INGEST_TIME < 100 AND record["service"] INDEX(0) = string("api") ORDER BY ingest_time DESC, commit_position ASC LIMIT 1"#,
+        ),
+        (
+            "pipeline:v1 logs | range query_time -100 100 | search body =~ \"Keep\" | order by query_time desc, commit_position desc | limit 1",
+            "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body REGEXP \"Keep\" ORDER BY query_time DESC, commit_position DESC LIMIT 1",
+        ),
+        (
+            "pipeline:v1 logs | range query_time -100 100 | cast body as float | limit 1",
+            "SELECT CAST(body AS float) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        ),
+        (
+            "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
+            "SELECT CAST(body AS bool) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        ),
+    ] {
+        let pipeline = service
+            .plan_pipeline(context, pipeline, budget)
+            .map_err(|error| format!("pipeline {pipeline}: {error:?}"))?;
+        let sql = service
+            .plan_sql(context, sql, budget)
+            .map_err(|error| format!("sql {sql}: {error:?}"))?;
+        assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+    }
+    Ok(())
+}
+
+#[test]
 fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box<dyn Error>> {
     let roots = TemporaryRoots::new("versioned-pipeline")?;
     let paths = BootstrapPaths::new(
