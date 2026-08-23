@@ -24,7 +24,6 @@ pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) batch_limit: u16,
     pub(crate) clock: Arc<dyn crate::QueryClock>,
     pub(crate) work_meter: Arc<dyn crate::QueryWorkMeter>,
-    pub(crate) require_catalog_identity: bool,
 }
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
@@ -34,22 +33,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         batch_limit: u16,
     ) -> Self {
         Self::with_runtime(
-            governor,
-            ledger,
-            batch_limit,
-            Arc::new(crate::runtime::SystemQueryClock),
-            Arc::new(crate::runtime::FixedQueryWorkMeter),
-        )
-    }
-
-    /// Constructs the application service with durable Identity/Catalog
-    /// revalidation enabled for every admission and resume boundary.
-    pub fn new_checked(
-        governor: ResourceGovernor<'kernel>,
-        ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-        batch_limit: u16,
-    ) -> Self {
-        Self::with_runtime_checked(
             governor,
             ledger,
             batch_limit,
@@ -80,34 +63,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         clock: Arc<dyn crate::QueryClock>,
         work_meter: Arc<dyn crate::QueryWorkMeter>,
     ) -> Self {
-        Self::with_runtime_mode(governor, ledger, batch_limit, clock, work_meter, false)
-    }
-
-    pub fn with_runtime_checked(
-        governor: ResourceGovernor<'kernel>,
-        ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-        batch_limit: u16,
-        clock: Arc<dyn crate::QueryClock>,
-        work_meter: Arc<dyn crate::QueryWorkMeter>,
-    ) -> Self {
-        Self::with_runtime_mode(governor, ledger, batch_limit, clock, work_meter, true)
-    }
-
-    fn with_runtime_mode(
-        governor: ResourceGovernor<'kernel>,
-        ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
-        batch_limit: u16,
-        clock: Arc<dyn crate::QueryClock>,
-        work_meter: Arc<dyn crate::QueryWorkMeter>,
-        require_catalog_identity: bool,
-    ) -> Self {
         Self {
             governor,
             ledger,
             batch_limit,
             clock,
             work_meter,
-            require_catalog_identity,
         }
     }
 
@@ -164,6 +125,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
         let planning_memory = crate::planning_memory::PlanningMemory::new(budget.memory_bytes());
+        let source_memory = planning_memory.reserve(
+            u64::try_from(source.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?,
+        )?;
         let parse_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
         let mut plan = parser(source, &planning_memory)?;
         let parser_retained = planning_memory.take_retained();
@@ -216,9 +181,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let plan_retained_bytes = retained_plan_memory
             .checked_sub(parser_retained_bytes)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        let planning_memory = planning_memory.reserve(plan_retained_bytes)?;
+        let planning_memory_reservation = planning_memory.reserve(plan_retained_bytes)?;
         drop(parser_retained);
         plan.compile_search()?;
+        let plan_digest = plan.canonical_digest(&self.ledger.control_tokens(), &planning_memory)?;
+        drop(source_memory);
         if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
@@ -244,8 +211,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             source: Arc::from(source_bytes.into_boxed_slice()),
             language,
             budget,
+            plan_digest,
             _reservation: reservation,
-            _planning_memory: planning_memory,
+            _planning_memory: planning_memory_reservation,
             started_at,
             last_observed_at,
             cpu_work_units,
@@ -283,23 +251,15 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
     ) -> Result<positron_domain::identity::TenantId, QueryFailure> {
         let tenant = crate::execution_state::query_tenant(context)?;
-        if self.require_catalog_identity {
-            let snapshot = self
-                .ledger
-                .catalog_snapshot()
-                .map_err(crate::execution_support::map_ledger_failure)?;
-            let identity = Identity::open(&snapshot)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Unauthorized))?;
-            identity
-                .validate_query_context(context)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Unauthorized))?;
-        } else if !matches!(
-            context.tenant_lifecycle(),
-            positron_domain::lifecycle::TenantLifecycleState::Active
-                | positron_domain::lifecycle::TenantLifecycleState::ReadOnly
-        ) {
-            return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
-        }
+        let snapshot = self
+            .ledger
+            .catalog_snapshot()
+            .map_err(crate::execution_support::map_ledger_failure)?;
+        let identity = Identity::open(&snapshot)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Unauthorized))?;
+        identity
+            .validate_query_context(context)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Unauthorized))?;
         Ok(tenant)
     }
 
