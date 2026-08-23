@@ -5,6 +5,7 @@ mod grouping;
 mod materialize;
 mod ordering;
 mod scan_observer;
+mod transform;
 mod traversal;
 mod vocabulary;
 

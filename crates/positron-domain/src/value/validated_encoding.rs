@@ -149,18 +149,24 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::Boolean(_)
             | ValidatedAttributeValueInner::SignedInteger(_)
             | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(0),
-            ValidatedAttributeValueInner::String(value) => Ok(value.len()),
-            ValidatedAttributeValueInner::Bytes(value) => Ok(value.len()),
+            ValidatedAttributeValueInner::String(value) => Ok(value.capacity()),
+            ValidatedAttributeValueInner::Bytes(value) => Ok(value.capacity()),
             ValidatedAttributeValueInner::Array(values) => {
-                values.iter().try_fold(0_usize, |total, value| {
-                    let total = checked_decoded_add(total, ARRAY_VALUE_SLOT_BYTES)?;
+                let retained = values
+                    .capacity()
+                    .checked_mul(ARRAY_VALUE_SLOT_BYTES)
+                    .ok_or_else(DomainFailure::value_limit_exceeded)?;
+                values.iter().try_fold(retained, |total, value| {
                     checked_decoded_add(total, value.retained_heap_bytes()?)
                 })
             },
             ValidatedAttributeValueInner::KeyValueList(values) => {
-                values.iter().try_fold(0_usize, |total, entry| {
-                    let total = checked_decoded_add(total, KEY_VALUE_ENTRY_SLOT_BYTES)?;
-                    let total = checked_decoded_add(total, entry.key.len())?;
+                let retained = values
+                    .capacity()
+                    .checked_mul(KEY_VALUE_ENTRY_SLOT_BYTES)
+                    .ok_or_else(DomainFailure::value_limit_exceeded)?;
+                values.iter().try_fold(retained, |total, entry| {
+                    let total = checked_decoded_add(total, entry.key.capacity())?;
                     checked_decoded_add(total, entry.value.retained_heap_bytes()?)
                 })
             },

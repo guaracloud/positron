@@ -10,5 +10,17 @@ mod parity;
 mod support;
 #[path = "acknowledged_logs/terminal_and_bounds.rs"]
 mod terminal_and_bounds;
+#[path = "acknowledged_logs/transform_capacity.rs"]
+mod transform_capacity;
+#[path = "acknowledged_logs/transform_edges.rs"]
+mod transform_edges;
+#[path = "acknowledged_logs/transform_json_edges.rs"]
+mod transform_json_edges;
+#[path = "acknowledged_logs/transform_limits.rs"]
+mod transform_limits;
+#[path = "acknowledged_logs/transform_logfmt_edges.rs"]
+mod transform_logfmt_edges;
+#[path = "acknowledged_logs/transforms.rs"]
+mod transforms;
 #[path = "acknowledged_logs/typed_pipeline.rs"]
 mod typed_pipeline;

@@ -3,6 +3,7 @@ use positron_kernel::ResourceReservation;
 use std::sync::Arc;
 
 use crate::QueryBudget;
+use crate::transform::BodyTransform;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemporalAxis {
@@ -132,6 +133,7 @@ pub struct LogicalPlan {
     projection: Vec<ProjectionColumn>,
     aggregate: Option<AggregateSpec>,
     ordering: OrderSpec,
+    transform: Option<BodyTransform>,
 }
 
 impl LogicalPlan {
@@ -145,6 +147,7 @@ impl LogicalPlan {
             projection: vec![ProjectionColumn::Body],
             aggregate: None,
             ordering: OrderSpec::ascending(axis),
+            transform: None,
         }
     }
 
@@ -158,11 +161,21 @@ impl LogicalPlan {
         self
     }
 
+    pub(crate) fn with_transform(mut self, transform: BodyTransform) -> Self {
+        self.transform = Some(transform);
+        self
+    }
+
+    pub(crate) const fn transform(&self) -> Option<BodyTransform> {
+        self.transform
+    }
+
     pub(crate) fn has_advanced_operators(&self) -> bool {
         self.filter.is_some()
             || self.projection != [ProjectionColumn::Body]
             || self.aggregate.is_some()
             || self.ordering != OrderSpec::ascending(self.axis)
+            || self.transform.is_some()
     }
 
     pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
@@ -276,6 +289,7 @@ impl LogicalPlan {
         u64::from(self.projection != [ProjectionColumn::Body])
             + u64::from(self.aggregate.is_some())
             + u64::from(self.ordering != OrderSpec::ascending(self.axis))
+            + u64::from(self.transform.is_some())
     }
 
     pub(crate) const fn limit(&self) -> u16 {

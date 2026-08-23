@@ -1,4 +1,5 @@
 use crate::plan::{AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn};
+use crate::transform::{BodyTransform, CastTarget};
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange};
 
 pub(crate) fn parse_pipeline(source: &str) -> Result<LogicalPlan, QueryFailure> {
@@ -73,6 +74,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
     let mut projection = None;
     let mut aggregate = None;
     let mut ordering = None;
+    let mut transform = None;
     let mut limit = None;
     let mut stage_order = 0_u8;
     for &stage in remaining_stages {
@@ -90,7 +92,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             range = Some((axis, start, end));
             stage_order = 1;
         } else if let Some(literal) = stage.strip_prefix("filter body == ") {
-            if filter.is_some() || stage_order > 1 {
+            if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(FilterPredicate::BodyEquals(
@@ -98,7 +100,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             ));
             stage_order = 2;
         } else if let Some(predicate) = stage.strip_prefix("filter ") {
-            if filter.is_some() || stage_order > 1 {
+            if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(FilterPredicate::AttributeEquals(
@@ -106,7 +108,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             ));
             stage_order = 2;
         } else if let Some(literal) = stage.strip_prefix("search body == ") {
-            if filter.is_some() || stage_order > 1 {
+            if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             filter = Some(FilterPredicate::BodyEquals(
@@ -114,7 +116,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             ));
             stage_order = 2;
         } else if let Some(literal) = stage.strip_prefix("search body contains ") {
-            if filter.is_some() || stage_order > 1 {
+            if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             let value = crate::native_literal::parse_search_string(literal)?;
@@ -130,7 +132,7 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             .strip_prefix("search body =~ ")
             .or_else(|| stage.strip_prefix("search body ~= "))
         {
-            if filter.is_some() || stage_order > 1 {
+            if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
             let value = crate::native_literal::parse_search_string(literal)?;
@@ -154,6 +156,24 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
             }
             aggregate = Some(parse_aggregate(stage)?);
             stage_order = 3;
+        } else if stage == "json" {
+            if transform.is_some() || filter.is_some() || stage_order > 2 {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            transform = Some(BodyTransform::Json);
+            stage_order = 2;
+        } else if stage == "logfmt" {
+            if transform.is_some() || filter.is_some() || stage_order > 2 {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            transform = Some(BodyTransform::Logfmt);
+            stage_order = 2;
+        } else if let Some(target) = stage.strip_prefix("cast body as ") {
+            if transform.is_some() || filter.is_some() || stage_order > 2 {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            transform = Some(BodyTransform::Cast(parse_cast_target(target)?));
+            stage_order = 2;
         } else if let Some(specification) = stage.strip_prefix("order by ") {
             if ordering.is_some() || aggregate.is_some() || stage_order > 3 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
@@ -177,6 +197,9 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
     if let Some(filter) = filter {
         plan = plan.with_filter(filter);
     }
+    if let Some(transform) = transform {
+        plan = plan.with_transform(transform);
+    }
     if let Some(projection) = projection {
         plan = plan.with_projection(projection);
     }
@@ -188,6 +211,16 @@ fn parse_versioned_pipeline(remaining_stages: &[&str]) -> Result<LogicalPlan, Qu
         plan = plan.with_ordering(parsed);
     }
     Ok(plan)
+}
+
+fn parse_cast_target(source: &str) -> Result<CastTarget, QueryFailure> {
+    match source {
+        "string" => Ok(CastTarget::String),
+        "int" => Ok(CastTarget::Integer),
+        "float" => Ok(CastTarget::Float),
+        "bool" => Ok(CastTarget::Boolean),
+        _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
+    }
 }
 
 pub(crate) fn parse_sql(source: &str) -> Result<LogicalPlan, QueryFailure> {

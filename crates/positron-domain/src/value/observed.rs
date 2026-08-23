@@ -15,6 +15,17 @@ pub trait NativeValueObserver {
 
     fn observe_structure(&mut self) -> Result<(), Self::Error>;
     fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error>;
+
+    /// Admits canonical output capacity before a validated collection is
+    /// allocated while its candidate values remain live.
+    fn observe_allocation(&mut self, _bytes: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Releases an output-capacity admission when validation cannot finish.
+    fn release_allocation(&mut self, _bytes: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 pub(super) struct UnobservedNativeValue;
@@ -46,6 +57,61 @@ pub(super) fn remove_observation<T>(
 pub enum ObservedValueFailure<E> {
     Domain(DomainFailure),
     Observer(E),
+}
+
+/// Validated value plus the bounded facts needed to transfer it between
+/// domain and query ownership. The facts are produced during validation so a
+/// caller does not need to traverse the value again merely to size it.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ObservedValueTransfer {
+    pub(super) value: ValidatedAttributeValue,
+    pub(super) value_size_bytes: usize,
+    pub(super) retained_heap_bytes: usize,
+    pub(super) allocation_bytes: usize,
+}
+
+impl ObservedValueTransfer {
+    pub(super) const fn new(
+        value: ValidatedAttributeValue,
+        value_size_bytes: usize,
+        retained_heap_bytes: usize,
+        allocation_bytes: usize,
+    ) -> Self {
+        Self {
+            value,
+            value_size_bytes,
+            retained_heap_bytes,
+            allocation_bytes,
+        }
+    }
+
+    /// Returns the validated value while transferring ownership to the caller.
+    #[must_use]
+    pub fn into_value(self) -> ValidatedAttributeValue {
+        self.value
+    }
+
+    /// Returns the profile-transfer value size measured during validation.
+    #[must_use]
+    pub const fn value_size_bytes(&self) -> usize {
+        self.value_size_bytes
+    }
+
+    /// Returns retained heap bytes measured during validation.
+    #[must_use]
+    pub const fn retained_heap_bytes(&self) -> usize {
+        self.retained_heap_bytes
+    }
+
+    pub(super) const fn allocation_bytes(&self) -> usize {
+        self.allocation_bytes
+    }
+
+    /// Borrows the validated value without starting another traversal.
+    #[must_use]
+    pub const fn value(&self) -> &ValidatedAttributeValue {
+        &self.value
+    }
 }
 
 impl<E> From<DomainFailure> for ObservedValueFailure<E> {
@@ -112,25 +178,35 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(0),
             ValidatedAttributeValueInner::String(value) => {
                 observe_payload(value.as_bytes(), observer)?;
-                Ok(value.len())
+                Ok(value.capacity())
             },
             ValidatedAttributeValueInner::Bytes(value) => {
                 observe_payload(value, observer)?;
-                Ok(value.len())
+                Ok(value.capacity())
             },
             ValidatedAttributeValueInner::Array(values) => {
-                values.iter().try_fold(0_usize, |total, value| {
+                let retained = values
+                    .capacity()
+                    .checked_mul(ARRAY_VALUE_SLOT_BYTES)
+                    .ok_or_else(|| {
+                        ObservedValueFailure::Domain(DomainFailure::value_limit_exceeded())
+                    })?;
+                values.iter().try_fold(retained, |total, value| {
                     observe_structure(observer)?;
-                    let total = checked_add(total, ARRAY_VALUE_SLOT_BYTES)?;
                     checked_add(total, value.retained_heap_bytes_observed(observer)?)
                 })
             },
             ValidatedAttributeValueInner::KeyValueList(values) => {
-                values.iter().try_fold(0_usize, |total, entry| {
+                let retained = values
+                    .capacity()
+                    .checked_mul(KEY_VALUE_ENTRY_SLOT_BYTES)
+                    .ok_or_else(|| {
+                        ObservedValueFailure::Domain(DomainFailure::value_limit_exceeded())
+                    })?;
+                values.iter().try_fold(retained, |total, entry| {
                     observe_structure(observer)?;
                     observe_payload(entry.key.as_bytes(), observer)?;
-                    let total = checked_add(total, KEY_VALUE_ENTRY_SLOT_BYTES)?;
-                    let total = checked_add(total, entry.key.len())?;
+                    let total = checked_add(total, entry.key.capacity())?;
                     checked_add(total, entry.value.retained_heap_bytes_observed(observer)?)
                 })
             },

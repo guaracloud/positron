@@ -132,4 +132,30 @@ impl CandidateAttributeValue {
             limits.dynamic_value().nesting_depth().value(),
         )
     }
+
+    /// Validates one log body while observing every recursive validation pass.
+    pub fn validate_log_body_observed<O: NativeValueObserver>(
+        self,
+        profile: ValueLimitProfile,
+        observer: &mut O,
+    ) -> Result<ValidatedAttributeValue, ObservedValueFailure<O::Error>> {
+        self.validate_log_body_observed_with_facts(profile, observer)
+            .map(ObservedValueTransfer::into_value)
+    }
+
+    /// Validates a log body and returns its transfer facts from the same pass.
+    pub fn validate_log_body_observed_with_facts<O: NativeValueObserver>(
+        self,
+        profile: ValueLimitProfile,
+        observer: &mut O,
+    ) -> Result<ObservedValueTransfer, ObservedValueFailure<O::Error>> {
+        let limits = profile.effective_limits();
+        validate_attribute_value_observed_with_facts(
+            self,
+            limits,
+            limits.record().log_body_bytes(),
+            limits.dynamic_value().nesting_depth().value(),
+            observer,
+        )
+    }
 }
