@@ -10,6 +10,8 @@ mod parity;
 mod support;
 #[path = "acknowledged_logs/terminal_and_bounds.rs"]
 mod terminal_and_bounds;
+#[path = "acknowledged_logs/transform_capacity.rs"]
+mod transform_capacity;
 #[path = "acknowledged_logs/transform_edges.rs"]
 mod transform_edges;
 #[path = "acknowledged_logs/transform_json_edges.rs"]
