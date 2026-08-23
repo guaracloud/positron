@@ -22,7 +22,12 @@ impl QueryCursor {
         if !matches!(bytes.len(), V1_CURSOR_BYTES | CURSOR_BYTES) {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
-        Ok(Self(bytes.to_vec()))
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        owned.extend_from_slice(bytes);
+        Ok(Self(owned))
     }
 
     #[must_use]
@@ -62,6 +67,8 @@ pub(crate) struct CursorState {
     pub(crate) cpu_work_units: u64,
     pub(crate) elapsed_wall_seconds: u64,
     pub(crate) reduced_pruning: bool,
+    pub(crate) resume_count: u64,
+    pub(crate) repeated_batch_count: u64,
     pub(crate) cancellation: crate::QueryCancellation,
 }
 
@@ -69,7 +76,10 @@ pub(crate) fn encode(
     protector: &ControlTokenProtector<'_>,
     state: CursorState,
 ) -> Result<QueryCursor, QueryFailure> {
-    let mut bytes = Vec::with_capacity(CURSOR_BYTES);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(CURSOR_BYTES)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
     bytes.extend_from_slice(&MAGIC);
     let epoch_offset = bytes.len();
     bytes.extend_from_slice(&0_u64.to_be_bytes());
@@ -242,6 +252,8 @@ pub(crate) fn decode(
         cpu_work_units: actual_cpu_work_units,
         elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
         reduced_pruning: false,
+        resume_count: 0,
+        repeated_batch_count: 0,
         cancellation: crate::QueryCancellation::new(),
     };
     if !reader.empty()

@@ -114,6 +114,34 @@ fn result_envelope_identifies_snapshot_schema_budget_order_lease_and_digest_chai
 }
 
 #[test]
+fn terminal_stats_report_cumulative_resume_and_repeat_state() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let service = fixture.service();
+    let mut first = service.resume(fixture.context, &fixture.cursor)?;
+    assert!(matches!(first.next(), Some(QueryEvent::Header(_))));
+    assert!(matches!(first.next(), Some(QueryEvent::Batch(_))));
+    drop(first);
+
+    let mut repeated = service.resume(fixture.context, &fixture.cursor)?;
+    assert!(matches!(repeated.next(), Some(QueryEvent::Header(_))));
+    assert!(matches!(repeated.next(), Some(QueryEvent::Batch(_))));
+    drop(repeated);
+
+    let completed = service
+        .resume(fixture.context, &fixture.cursor)?
+        .collect::<Vec<_>>();
+    let repeated_stats = match completed.last() {
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats))) => *stats,
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete))) => incomplete.stats(),
+        _ => return Err("repeated resumed terminal missing".into()),
+    };
+    assert_eq!(repeated_stats.resume_count(), 3);
+    assert_eq!(repeated_stats.repeated_batch_count(), 2);
+    assert_eq!(repeated_stats.cumulative_budget().decoded_records(), 16);
+    Ok(())
+}
+
+#[test]
 fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
 -> Result<(), Box<dyn Error>> {
     let fixture = CursorFixture::new()?;

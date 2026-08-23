@@ -246,6 +246,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 next_sequence: 0,
                 poisoned: false,
                 lease_reservations: recovered_leases.reservations,
+                lease_resume_markers: recovered_leases.resume_markers,
                 pending_lease_releases: snapshot_lease_pending::PendingLeaseReleases::new(),
                 last_snapshot_lease_time: recovered_leases.last_observed,
             }),

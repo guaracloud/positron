@@ -20,6 +20,8 @@ pub(super) const MAX_SNAPSHOT_LEASES: usize = 64;
 pub struct SnapshotLeaseGrant<'kernel> {
     identity: SnapshotLeaseId,
     expiry: u64,
+    resume_count: u64,
+    repeated_batch_count: u64,
     snapshot: LedgerSnapshot<'kernel>,
 }
 
@@ -43,6 +45,16 @@ impl<'kernel> SnapshotLeaseGrant<'kernel> {
     #[must_use]
     pub const fn expiry(&self) -> u64 {
         self.expiry
+    }
+
+    #[must_use]
+    pub const fn resume_count(&self) -> u64 {
+        self.resume_count
+    }
+
+    #[must_use]
+    pub const fn repeated_batch_count(&self) -> u64 {
+        self.repeated_batch_count
     }
 
     #[must_use]
@@ -99,6 +111,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             frontier: state.frontier,
             observed_at: now,
             expiry,
+            resume_count: 0,
+            repeated_batch_count: 0,
+            last_resume_sequence: None,
+            last_resume_prior_digest: [0; 32],
             blocks: state.blocks.iter().map(LeaseBlock::from).collect(),
         };
         // Admit every capacity needed by the returned grant before publishing its
@@ -124,6 +140,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         Ok(SnapshotLeaseGrant {
             identity,
             expiry,
+            resume_count: 0,
+            repeated_batch_count: 0,
             snapshot,
         })
     }
@@ -135,6 +153,28 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         &self,
         identity: SnapshotLeaseId,
         now: u64,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.resume_snapshot_lease_marked(identity, now, None)
+    }
+
+    /// Resumes a lease while recording the immutable cursor boundary being
+    /// attempted. Reusing the same boundary is an at-least-once batch retry;
+    /// advancing to a different boundary is a normal page transition.
+    pub fn resume_snapshot_lease_with_marker(
+        &self,
+        identity: SnapshotLeaseId,
+        now: u64,
+        sequence: u64,
+        prior_digest: [u8; 32],
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.resume_snapshot_lease_marked(identity, now, Some((sequence, prior_digest)))
+    }
+
+    fn resume_snapshot_lease_marked(
+        &self,
+        identity: SnapshotLeaseId,
+        now: u64,
+        marker: Option<(u64, [u8; 32])>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
         let mut state = self
             .state
@@ -166,9 +206,54 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             self.normalize_legacy_lease(&mut state, &mut record, now)?;
         }
         let snapshot = snapshot_from_record(self, &state, &record)?;
+        let (resume_count, repeated_batch_count) = if let Some((sequence, prior_digest)) = marker {
+            let previous = state
+                .lease_resume_markers
+                .get(&identity)
+                .copied()
+                .unwrap_or_default();
+            let repeated = previous.attempts > 0
+                && previous.sequence == sequence
+                && previous.prior_digest == prior_digest;
+            let resume_count = previous
+                .attempts
+                .checked_add(1)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+            let repeated_batch_count = previous
+                .repeats
+                .checked_add(u64::from(repeated))
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+            let mut updated = record.clone();
+            updated.resume_count = resume_count;
+            updated.repeated_batch_count = repeated_batch_count;
+            updated.last_resume_sequence = Some(sequence);
+            updated.last_resume_prior_digest = prior_digest;
+            let encoded = encode(&updated)?;
+            let marker_basis = self.catalog.pin()?;
+            publish_many(
+                self.catalog,
+                &marker_basis,
+                &BTreeSet::from([identity]),
+                vec![encoded],
+            )?;
+            state.lease_resume_markers.insert(
+                identity,
+                super::snapshot_lease_record::LeaseResumeMarker {
+                    sequence,
+                    prior_digest,
+                    attempts: resume_count,
+                    repeats: repeated_batch_count,
+                },
+            );
+            (resume_count, repeated_batch_count)
+        } else {
+            (record.resume_count, record.repeated_batch_count)
+        };
         Ok(SnapshotLeaseGrant {
             identity,
             expiry: record.expiry,
+            resume_count,
+            repeated_batch_count,
             snapshot,
         })
     }
@@ -204,6 +289,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         }
         for identity in pending {
             state.lease_reservations.remove(&identity);
+            state.lease_resume_markers.remove(&identity);
         }
         state.pending_lease_releases.clear();
         Ok(())

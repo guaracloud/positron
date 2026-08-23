@@ -24,6 +24,9 @@ pub(crate) fn stats_before_current(state: &CursorState) -> QueryStats {
             .then(|| state.sequence.checked_sub(1))
             .flatten(),
         state.prior_digest,
+        state.budget,
+        state.resume_count,
+        state.repeated_batch_count,
     )
     .with_reduced_pruning(state.reduced_pruning)
 }
@@ -41,6 +44,9 @@ pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
         },
         Some(state.sequence),
         state.prior_digest,
+        state.budget,
+        state.resume_count,
+        state.repeated_batch_count,
     )
     .with_reduced_pruning(state.reduced_pruning)
 }
@@ -88,6 +94,8 @@ pub(crate) fn initial_state<'kernel>(
             cpu_work_units,
             elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
             reduced_pruning: false,
+            resume_count: 0,
+            repeated_batch_count: 0,
             cancellation,
         },
         _reservation,

@@ -11,8 +11,10 @@ use super::{
 
 const LEASE_MAGIC: [u8; 8] = *b"PSLEASE1";
 const LEASE_VERSION: u16 = 2;
+const LEASE_MARKER_VERSION: u16 = 3;
 const LEASE_V1_HEADER_BYTES: usize = 105;
-const LEASE_HEADER_BYTES: usize = 113;
+const LEASE_V2_HEADER_BYTES: usize = 113;
+const LEASE_HEADER_BYTES: usize = 169;
 const LEASE_BLOCK_BYTES: usize = 40;
 
 pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
@@ -24,7 +26,12 @@ pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
     let mut bytes =
         Vec::with_capacity(LEASE_HEADER_BYTES + record.blocks.len() * LEASE_BLOCK_BYTES);
     bytes.extend_from_slice(&LEASE_MAGIC);
-    bytes.extend_from_slice(&LEASE_VERSION.to_be_bytes());
+    let version = if record.resume_count > 0 || record.last_resume_sequence.is_some() {
+        LEASE_MARKER_VERSION
+    } else {
+        LEASE_VERSION
+    };
+    bytes.extend_from_slice(&version.to_be_bytes());
     bytes.extend_from_slice(&record.identity.to_bytes());
     bytes.extend_from_slice(&record.scope.tenant.to_bytes());
     bytes.push(signal_tag(record.scope.signal));
@@ -34,6 +41,17 @@ pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
     bytes.extend_from_slice(&record.frontier.value().to_be_bytes());
     bytes.extend_from_slice(&record.observed_at.to_be_bytes());
     bytes.extend_from_slice(&record.expiry.to_be_bytes());
+    if version == LEASE_MARKER_VERSION {
+        bytes.extend_from_slice(&record.resume_count.to_be_bytes());
+        bytes.extend_from_slice(&record.repeated_batch_count.to_be_bytes());
+        bytes.extend_from_slice(
+            &record
+                .last_resume_sequence
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(&record.last_resume_prior_digest);
+    }
     bytes.extend_from_slice(
         &u16::try_from(record.blocks.len())
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?
@@ -54,7 +72,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
     let version = u16::from_be_bytes(exact(bytes, 8)?);
     let (header_bytes, count_offset) = match version {
         1 => (LEASE_V1_HEADER_BYTES, 103),
-        LEASE_VERSION => (LEASE_HEADER_BYTES, 111),
+        2 => (LEASE_V2_HEADER_BYTES, 111),
+        LEASE_MARKER_VERSION => (LEASE_HEADER_BYTES, 167),
         _ => return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
     };
     let count = usize::from(u16::from_be_bytes(exact(bytes, count_offset)?));
@@ -97,6 +116,26 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
     if version != 1 && !valid_lease_interval(observed_at, expiry) {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
+    let (resume_count, repeated_batch_count, last_resume_sequence, last_resume_prior_digest) =
+        if version == LEASE_MARKER_VERSION {
+            let resume_count = u64::from_be_bytes(exact(bytes, 111)?);
+            let repeated_batch_count = u64::from_be_bytes(exact(bytes, 119)?);
+            let sequence = u64::from_be_bytes(exact(bytes, 127)?);
+            if repeated_batch_count > resume_count
+                || (resume_count == 0 && sequence != u64::MAX)
+                || (resume_count > 0 && sequence == u64::MAX)
+            {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            }
+            (
+                resume_count,
+                repeated_batch_count,
+                (sequence != u64::MAX).then_some(sequence),
+                exact(bytes, 135)?,
+            )
+        } else {
+            (0, 0, None, [0; 32])
+        };
     Ok(Some(LeaseRecord {
         identity: SnapshotLeaseId::new(exact(bytes, 10)?)?,
         scope,
@@ -105,6 +144,10 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
         frontier: position_from_value(u64::from_be_bytes(exact(bytes, 87)?))?,
         observed_at,
         expiry,
+        resume_count,
+        repeated_batch_count,
+        last_resume_sequence,
+        last_resume_prior_digest,
         blocks,
     }))
 }

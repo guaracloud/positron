@@ -488,6 +488,35 @@ fn maximum_v2_snapshot_lease_remains_restart_resumable() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn marked_snapshot_lease_persists_ambiguous_resume_counts_across_restart()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let first = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        assert_eq!(first.resume_count(), 1);
+        assert_eq!(first.repeated_batch_count(), 0);
+        let second = ledger.resume_snapshot_lease_with_marker(identity, 102, 1, [9; 32])?;
+        assert_eq!(second.resume_count(), 2);
+        assert_eq!(second.repeated_batch_count(), 1);
+        drop(ledger);
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(103),
+        )?;
+        let third = reopened.resume_snapshot_lease_with_marker(identity, 103, 1, [9; 32])?;
+        assert_eq!(third.resume_count(), 3);
+        assert_eq!(third.repeated_batch_count(), 2);
+        Ok(())
+    })
+}
+
+#[test]
 fn malformed_snapshot_lease_catalog_records_fail_closed() -> Result<(), Box<dyn Error>> {
     for (transaction, rewrite) in [
         (0xd1, corrupt_lease_version as fn(&mut Vec<u8>)),

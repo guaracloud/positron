@@ -129,7 +129,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         // The resumed page reservation is live before snapshot reconstruction.
         let lease = self
             .ledger
-            .resume_snapshot_lease(lease_id, now_seconds)
+            .resume_snapshot_lease_with_marker(
+                lease_id,
+                now_seconds,
+                state.sequence,
+                state.prior_digest,
+            )
             .map_err(map_ledger_failure)?;
         let resources = ExecutionResources::new(reservation, lease.identity());
         if lease.snapshot().catalog_identity().to_bytes() != state.catalog_identity
@@ -143,6 +148,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ));
         }
         let mut state = state;
+        state.resume_count = lease.resume_count();
+        state.repeated_batch_count = lease.repeated_batch_count();
         state.last_observed_at = now_seconds;
         state.elapsed_wall_seconds = now_seconds.saturating_sub(state.started_at);
         self.run_page(

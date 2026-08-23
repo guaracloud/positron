@@ -25,6 +25,21 @@ impl SnapshotLeaseId {
     }
 }
 
+/// Bounded delivery marker owned by the Snapshot Lease authority.
+///
+/// Query cursors are opaque immutable values, so the lease is the one place
+/// that can distinguish a first resume of a cursor from a retry after an
+/// ambiguous batch delivery. This state is deliberately bounded to one
+/// marker per active lease and is not a second query scheduler or cursor
+/// authority.
+#[derive(Clone, Copy, Default)]
+pub(super) struct LeaseResumeMarker {
+    pub(super) sequence: u64,
+    pub(super) prior_digest: [u8; 32],
+    pub(super) attempts: u64,
+    pub(super) repeats: u64,
+}
+
 #[derive(Clone)]
 pub(super) struct LeaseRecord {
     pub(super) identity: SnapshotLeaseId,
@@ -34,6 +49,10 @@ pub(super) struct LeaseRecord {
     pub(super) frontier: CommitPosition,
     pub(super) observed_at: u64,
     pub(super) expiry: u64,
+    pub(super) resume_count: u64,
+    pub(super) repeated_batch_count: u64,
+    pub(super) last_resume_sequence: Option<u64>,
+    pub(super) last_resume_prior_digest: [u8; 32],
     pub(super) blocks: Vec<LeaseBlock>,
 }
 
