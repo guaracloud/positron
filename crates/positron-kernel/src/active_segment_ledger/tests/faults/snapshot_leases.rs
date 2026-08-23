@@ -1,5 +1,5 @@
 use super::*;
-use crate::ResourceDimension;
+use crate::{OrdinaryPool, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 
 #[test]
 fn snapshot_lease_pins_exact_visibility_across_append_restart_release_and_expiry()
@@ -531,6 +531,61 @@ fn marked_snapshot_lease_reserves_its_added_persistent_metadata() -> Result<(), 
             after.usage(ResourceDimension::MemoryBytes)
                 - before.usage(ResourceDimension::MemoryBytes),
             56
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_snapshot_lease_refuses_when_added_metadata_cannot_be_admitted()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let before = authority.governor().inspect()?;
+        let remaining = before
+            .pool_capacity(OrdinaryPool::Shared, ResourceDimension::MemoryBytes)
+            .checked_sub(before.pool_usage(OrdinaryPool::Shared, ResourceDimension::MemoryBytes))
+            .and_then(|value| value.checked_sub(1))
+            .ok_or("fixture has no memory headroom for the blocker")?;
+        let blocker = authority.governor().reserve(WorkClaim::tenant(
+            scope.tenant,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, remaining)?,
+        )?)?;
+        let failure = ledger
+            .resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])
+            .expect_err("marker metadata must be admitted before publication");
+        assert_eq!(failure.code(), LedgerFailureCode::ResourceAdmissionRefused);
+        drop(blocker);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_snapshot_lease_publication_failure_rolls_back_capacity_resize()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let before = authority.governor().inspect()?;
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])
+        })
+        .expect_err("marker publication fault must not acknowledge the marker");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        let after = authority.governor().inspect()?;
+        assert_eq!(
+            after.usage(ResourceDimension::MemoryBytes),
+            before.usage(ResourceDimension::MemoryBytes)
+        );
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease_with_marker(identity, 102, 1, [9; 32])?
+                .resume_count(),
+            1
         );
         Ok(())
     })

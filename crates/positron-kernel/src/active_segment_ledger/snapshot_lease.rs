@@ -6,6 +6,7 @@ use crate::catalog::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId}
 use crate::data_protection::DataProtection;
 use crate::{WorkClaim, WorkKind};
 
+use super::LedgerFailureCode::ResourceAdmissionRefused;
 use super::capacity::{lease_claim, snapshot_retained_claim};
 use super::snapshot_lease_codec::{decode, encode};
 use super::snapshot_lease_record::{
@@ -237,9 +238,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
                 let previous = reservation.granted();
                 if previous != amounts {
-                    reservation.try_resize(amounts).map_err(|_| {
-                        LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused)
-                    })?;
+                    reservation
+                        .try_resize(amounts)
+                        .map_err(|_| LedgerFailure::new(ResourceAdmissionRefused))?;
                 }
                 previous
             };
@@ -250,15 +251,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 &BTreeSet::from([identity]),
                 vec![encoded],
             ) {
-                let rollback =
-                    state
-                        .lease_reservations
-                        .get_mut(&identity)
-                        .and_then(|reservation| {
-                            (reservation.granted() != previous_amounts)
-                                .then(|| reservation.try_resize(previous_amounts))
-                        });
-                if rollback.is_some_and(|result| result.is_err()) {
+                if let Some(reservation) = state.lease_reservations.get_mut(&identity)
+                    && reservation.granted() != previous_amounts
+                    && reservation.try_resize(previous_amounts).is_err()
+                {
                     return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
                 }
                 return Err(failure);
