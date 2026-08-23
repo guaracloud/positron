@@ -337,8 +337,7 @@ fn decode_internal(
     } else {
         (None, None)
     };
-    if legacy && encoded_plan_digest != plan_digest(protector, &plan, language, source.as_deref())?
-    {
+    if legacy && encoded_plan_digest != plan_digest(protector, &plan)? {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     if !legacy && (language.is_none() || (retain_source && source.is_none())) {
@@ -387,29 +386,7 @@ fn decode_internal(
 pub(crate) fn plan_digest(
     protector: &ControlTokenProtector<'_>,
     plan: &LogicalPlan,
-    language: Option<crate::query_service::QueryLanguage>,
-    source: Option<&[u8]>,
 ) -> Result<[u8; 32], QueryFailure> {
-    if let Some(source) = source {
-        let mut encoding = Vec::new();
-        encoding
-            .try_reserve_exact(1 + 2 + source.len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        encoding.push(match language {
-            Some(crate::query_service::QueryLanguage::Pipeline) => 1,
-            Some(crate::query_service::QueryLanguage::Sql) => 2,
-            None => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
-        });
-        encoding.extend_from_slice(
-            &u16::try_from(source.len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?
-                .to_be_bytes(),
-        );
-        encoding.extend_from_slice(source);
-        return protector
-            .digest_query_cursor(b"query-plan-source-v1", &encoding)
-            .map_err(map_protection_failure);
-    }
     let mut encoding = Vec::with_capacity(19);
     encoding.push(match plan.temporal_axis() {
         TemporalAxis::QueryTime => 1,
