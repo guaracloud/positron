@@ -445,6 +445,30 @@ fn text_scan_limit_stops_before_next_block_candidate_work() -> Result<(), Box<dy
     assert_eq!(result.records().len(), 1);
     assert!(!result.complete());
     assert_eq!(budget.0.load(Ordering::SeqCst), 0);
+
+    let first_block_bytes = u64::try_from(
+        ledger
+            .snapshot()?
+            .blocks()
+            .first()
+            .ok_or("first text block missing")?
+            .payload()
+            .len(),
+    )?;
+    let limited = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?).with_scanned_bytes(first_block_bytes - 1),
+        &schema,
+        &candidate,
+        &NeverCancelled,
+        &RecordingTextWork(AtomicU64::new(0)),
+    )?;
+    assert!(limited.records().is_empty());
+    assert!(!limited.complete());
+    assert_eq!(limited.scanned_bytes(), 0);
+    assert!(limited.scanned_bytes_limited());
     Ok(())
 }
 
@@ -1989,6 +2013,28 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
     assert_eq!(bounded.records().len(), 1);
     assert!(!bounded.complete());
     drop(bounded);
+
+    let first_block_bytes = u64::try_from(
+        snapshot
+            .blocks()
+            .first()
+            .ok_or("first schema block missing")?
+            .payload()
+            .len(),
+    )?;
+    let limited = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?).with_scanned_bytes(first_block_bytes - 1),
+        &schema,
+        &query("match", "value")?,
+    )?;
+    assert!(limited.records().is_empty());
+    assert!(!limited.complete());
+    assert_eq!(limited.scanned_bytes(), 0);
+    assert!(limited.scanned_bytes_limited());
+    drop(limited);
 
     let observed = observed_schema_scan(
         &store,
