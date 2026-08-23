@@ -9,8 +9,13 @@ use crate::{
 const MAGIC: [u8; 8] = *b"POSQCR01";
 const CURSOR_PURPOSE: &[u8] = b"query-cursor-v1";
 const V1_PAYLOAD_BYTES: usize = 309;
-const PAYLOAD_BYTES: usize = 341;
+const V3_PAYLOAD_BYTES: usize = 341;
+const MAX_PLAN_SOURCE_BYTES: usize = 4_096;
+const PLAN_SOURCE_HEADER_BYTES: usize = 1 + 2;
+const PAYLOAD_BYTES: usize =
+    V3_PAYLOAD_BYTES + 9 + PLAN_SOURCE_HEADER_BYTES + MAX_PLAN_SOURCE_BYTES;
 const V1_CURSOR_BYTES: usize = V1_PAYLOAD_BYTES + 32;
+const V3_CURSOR_BYTES: usize = V3_PAYLOAD_BYTES + 32;
 const CURSOR_BYTES: usize = PAYLOAD_BYTES + 32;
 
 /// Opaque authenticated continuation with one fixed bounded representation.
@@ -19,7 +24,10 @@ pub struct QueryCursor(Vec<u8>);
 
 impl QueryCursor {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueryFailure> {
-        if !matches!(bytes.len(), V1_CURSOR_BYTES | CURSOR_BYTES) {
+        if !matches!(
+            bytes.len(),
+            V1_CURSOR_BYTES | V3_CURSOR_BYTES | CURSOR_BYTES
+        ) {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
         let mut owned = Vec::new();
@@ -51,6 +59,9 @@ pub(crate) struct CursorState {
     pub(crate) catalog_generation: u64,
     pub(crate) frontier: u64,
     pub(crate) plan: Arc<LogicalPlan>,
+    pub(crate) source: Option<Arc<[u8]>>,
+    pub(crate) language: Option<crate::query_service::QueryLanguage>,
+    pub(crate) plan_digest: [u8; 32],
     pub(crate) offset: u16,
     pub(crate) sequence: u64,
     pub(crate) prior_digest: [u8; 32],
@@ -103,7 +114,13 @@ pub(crate) fn encode(
     );
     bytes.extend_from_slice(&state.plan.temporal_range().end_nanoseconds().to_be_bytes());
     bytes.extend_from_slice(&state.plan.limit().to_be_bytes());
-    bytes.extend_from_slice(&plan_digest(protector, &state.plan)?);
+    let plan_digest = plan_digest(
+        protector,
+        &state.plan,
+        state.language,
+        state.source.as_deref(),
+    )?;
+    bytes.extend_from_slice(&plan_digest);
     bytes.extend_from_slice(&state.offset.to_be_bytes());
     bytes.extend_from_slice(&state.sequence.to_be_bytes());
     bytes.extend_from_slice(&state.prior_digest);
@@ -128,15 +145,33 @@ pub(crate) fn encode(
     ] {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
+    bytes.extend_from_slice(&state.memory_peak_bytes.to_be_bytes());
+    bytes.push(u8::from(state.reduced_pruning));
+    let source = state.source.as_deref().unwrap_or_default();
+    if source.len() > MAX_PLAN_SOURCE_BYTES {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
+    bytes.push(match state.language {
+        Some(crate::query_service::QueryLanguage::Pipeline) => 1,
+        Some(crate::query_service::QueryLanguage::Sql) => 2,
+        None => 0,
+    });
+    bytes.extend_from_slice(
+        &u16::try_from(source.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(source);
+    bytes.resize(CURSOR_BYTES - 32, 0);
     let authentication = protector
-        .authenticate(CURSOR_PURPOSE, &bytes)
+        .authenticate_query_cursor(CURSOR_PURPOSE, &bytes)
         .map_err(map_protection_failure)?;
     bytes
         .get_mut(epoch_offset..epoch_offset + 8)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
         .copy_from_slice(&authentication.epoch().to_be_bytes());
     let authentication = protector
-        .authenticate(CURSOR_PURPOSE, &bytes)
+        .authenticate_query_cursor(CURSOR_PURPOSE, &bytes)
         .map_err(map_protection_failure)?;
     bytes.extend_from_slice(&authentication.tag());
     Ok(QueryCursor(bytes))
@@ -162,7 +197,7 @@ pub(crate) fn decode(
     let authentication = ControlTokenAuthentication::new(epoch, tag)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     protector
-        .verify(CURSOR_PURPOSE, payload, authentication)
+        .verify_query_cursor(CURSOR_PURPOSE, payload, authentication)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let mut reader = Reader::new(payload);
     if reader.array::<8>()? != MAGIC || reader.u64()? != epoch {
@@ -185,9 +220,7 @@ pub(crate) fn decode(
     let range = TemporalRange::new(reader.i64()?, reader.i64()?)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let plan = LogicalPlan::logs(axis, range, reader.u16()?);
-    if reader.array::<32>()? != plan_digest(protector, &plan)? {
-        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-    }
+    let encoded_plan_digest = reader.array::<32>()?;
     let offset = reader.u16()?;
     let sequence = reader.u64()?;
     let prior_digest = reader.array()?;
@@ -228,6 +261,58 @@ pub(crate) fn decode(
     } else {
         (reader.u64()?, reader.u64()?, reader.u64()?)
     };
+    let (memory_peak_bytes, reduced_pruning) = if payload_bytes == PAYLOAD_BYTES {
+        let memory_peak_bytes = reader.u64()?;
+        let reduced_pruning = match reader.array::<1>()?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
+        };
+        (memory_peak_bytes, reduced_pruning)
+    } else {
+        (0, false)
+    };
+    let (source, language) = if payload_bytes == PAYLOAD_BYTES {
+        let language = match reader.array::<1>()?[0] {
+            0 => None,
+            1 => Some(crate::query_service::QueryLanguage::Pipeline),
+            2 => Some(crate::query_service::QueryLanguage::Sql),
+            _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
+        };
+        let length = usize::from(reader.u16()?);
+        if language.is_none() && length != 0 {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        if length > MAX_PLAN_SOURCE_BYTES {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        let source_bytes = reader.bytes(MAX_PLAN_SOURCE_BYTES)?;
+        if source_bytes[length..].iter().any(|byte| *byte != 0) {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        let source = std::str::from_utf8(
+            source_bytes
+                .get(..length)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?,
+        )
+        .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(source.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        owned.extend_from_slice(source.as_bytes());
+        let source = if language.is_some() {
+            Some(Arc::from(owned.into_boxed_slice()))
+        } else {
+            None
+        };
+        (source, language)
+    } else {
+        (None, None)
+    };
+    if encoded_plan_digest != plan_digest(protector, &plan, language, source.as_deref())? {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
     let state = CursorState {
         principal,
         tenant,
@@ -236,6 +321,9 @@ pub(crate) fn decode(
         catalog_generation,
         frontier,
         plan: Arc::new(plan),
+        source,
+        language,
+        plan_digest: encoded_plan_digest,
         offset,
         sequence,
         prior_digest,
@@ -246,12 +334,12 @@ pub(crate) fn decode(
         decoded_records,
         output_rows,
         output_bytes,
-        memory_peak_bytes: 0,
+        memory_peak_bytes,
         started_at,
         last_observed_at,
         cpu_work_units: actual_cpu_work_units,
         elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
-        reduced_pruning: false,
+        reduced_pruning,
         resume_count: 0,
         repeated_batch_count: 0,
         cancellation: crate::QueryCancellation::new(),
@@ -265,10 +353,32 @@ pub(crate) fn decode(
     Ok(state)
 }
 
-fn plan_digest(
+pub(crate) fn plan_digest(
     protector: &ControlTokenProtector<'_>,
     plan: &LogicalPlan,
+    language: Option<crate::query_service::QueryLanguage>,
+    source: Option<&[u8]>,
 ) -> Result<[u8; 32], QueryFailure> {
+    if let Some(source) = source {
+        let mut encoding = Vec::new();
+        encoding
+            .try_reserve_exact(1 + 2 + source.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        encoding.push(match language {
+            Some(crate::query_service::QueryLanguage::Pipeline) => 1,
+            Some(crate::query_service::QueryLanguage::Sql) => 2,
+            None => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
+        });
+        encoding.extend_from_slice(
+            &u16::try_from(source.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?
+                .to_be_bytes(),
+        );
+        encoding.extend_from_slice(source);
+        return protector
+            .digest_query_cursor(b"query-plan-source-v1", &encoding)
+            .map_err(map_protection_failure);
+    }
     let mut encoding = Vec::with_capacity(19);
     encoding.push(match plan.temporal_axis() {
         TemporalAxis::QueryTime => 1,
@@ -281,6 +391,38 @@ fn plan_digest(
     protector
         .digest(b"query-plan-v1", &encoding)
         .map_err(map_protection_failure)
+}
+
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_reauthenticate(
+    protector: &ControlTokenProtector<'_>,
+    bytes: &mut [u8],
+) -> Result<(), QueryFailure> {
+    let payload_bytes = bytes
+        .len()
+        .checked_sub(32)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let payload = bytes
+        .get(..payload_bytes)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let authentication = protector
+        .authenticate_query_cursor(CURSOR_PURPOSE, payload)
+        .map_err(map_protection_failure)?;
+    bytes
+        .get_mut(8..16)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
+        .copy_from_slice(&authentication.epoch().to_be_bytes());
+    let payload = bytes
+        .get(..payload_bytes)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    let authentication = protector
+        .authenticate_query_cursor(CURSOR_PURPOSE, payload)
+        .map_err(map_protection_failure)?;
+    bytes
+        .get_mut(payload_bytes..)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
+        .copy_from_slice(&authentication.tag());
+    Ok(())
 }
 
 fn map_protection_failure(failure: ControlTokenFailure) -> QueryFailure {
@@ -314,6 +456,15 @@ impl<'a> Reader<'a> {
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))
     }
 
+    fn bytes(&mut self, length: usize) -> Result<&'a [u8], QueryFailure> {
+        let (value, rest) = self
+            .bytes
+            .split_at_checked(length)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        self.bytes = rest;
+        Ok(value)
+    }
+
     fn u16(&mut self) -> Result<u16, QueryFailure> {
         self.array().map(u16::from_be_bytes)
     }
@@ -328,5 +479,30 @@ impl<'a> Reader<'a> {
 
     const fn empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlTokenFailure, QueryFailureCode, map_protection_failure};
+
+    #[test]
+    fn protection_failures_keep_the_cursor_failure_boundary_closed() {
+        assert_eq!(
+            map_protection_failure(ControlTokenFailure::InvalidInput).code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(
+            map_protection_failure(ControlTokenFailure::LimitExceeded).code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(
+            map_protection_failure(ControlTokenFailure::Authentication).code(),
+            QueryFailureCode::Internal
+        );
+        assert_eq!(
+            map_protection_failure(ControlTokenFailure::Custody).code(),
+            QueryFailureCode::Internal
+        );
     }
 }

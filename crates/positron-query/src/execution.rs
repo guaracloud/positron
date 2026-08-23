@@ -96,7 +96,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_limit = framed!(
             ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
         );
-        let plan_memory = framed!(state.plan.retained_memory_bytes());
+        let plan_memory = framed!(state.plan.retained_memory_bytes().and_then(|retained| {
+            let source = u64::try_from(state.source.as_ref().map_or(0, |source| source.len()))
+                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+            retained
+                .checked_add(source)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
+        }));
         let execution_memory = framed!(
             state
                 .budget

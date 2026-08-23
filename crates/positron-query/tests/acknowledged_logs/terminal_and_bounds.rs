@@ -307,6 +307,10 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
     assert!(QueryCursor::from_bytes(&[0; 340]).is_err());
     assert!(QueryCursor::from_bytes(&[0; 341]).is_ok());
     assert!(QueryCursor::from_bytes(&[0; 342]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 373]).is_ok());
+    assert!(QueryCursor::from_bytes(&[0; 382]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 4481]).is_ok());
+    assert!(QueryCursor::from_bytes(&[0; 4482]).is_err());
     assert_eq!(
         format!("{:?}", QueryCursor::from_bytes(&[0; 341])?),
         "QueryCursor { <opaque> }"

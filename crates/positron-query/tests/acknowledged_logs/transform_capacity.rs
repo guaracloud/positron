@@ -104,10 +104,9 @@ fn json_validation_charges_candidate_and_canonical_capacity_at_exact_boundary()
     const ENTRIES: u64 = 1_024;
     const PARSER_ENTRY_BYTES: u64 = 96;
     const ARRAY_VALUE_SLOT_BYTES: u64 = 64;
-    // The query's fixed page/digest working set is retained by both runs; the
-    // transform adds the source scratch and its transfer bookkeeping.
-    const TRANSFORM_WORKING_BYTES: u64 = 320;
-
+    // Fixed transform/materialization bookkeeping retained alongside the
+    // parser and canonical value vectors for one result row.
+    const TRANSFORM_FIXED_WORKING_BYTES: u64 = 381;
     let fixture = QueryFixture::new("query-json-array-simultaneous-capacity")?;
     let source = format!("[{}]", vec!["0"; usize::try_from(ENTRIES)?].join(","));
     fixture.kernel.append_log(&source, 20, 1)?;
@@ -144,7 +143,7 @@ fn json_validation_charges_candidate_and_canonical_capacity_at_exact_boundary()
         .checked_add(parser_bytes)
         .and_then(|bytes| bytes.checked_add(output_bytes))
         .and_then(|bytes| bytes.checked_add(u64::try_from(source.len()).ok()?))
-        .and_then(|bytes| bytes.checked_add(TRANSFORM_WORKING_BYTES))
+        .and_then(|bytes| bytes.checked_add(TRANSFORM_FIXED_WORKING_BYTES))
         .ok_or("transform capacity floor overflowed")?;
 
     let under = service.plan_pipeline(

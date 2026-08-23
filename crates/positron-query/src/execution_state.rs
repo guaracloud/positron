@@ -61,6 +61,8 @@ pub(crate) fn initial_state<'kernel>(
     let PlannedQuery {
         context,
         plan,
+        source,
+        language,
         budget,
         _reservation,
         started_at,
@@ -78,6 +80,9 @@ pub(crate) fn initial_state<'kernel>(
             catalog_generation: snapshot.catalog_generation(),
             frontier: snapshot.frontier().value(),
             plan,
+            source: Some(source),
+            language: Some(language),
+            plan_digest: [0; 32],
             offset: 0,
             sequence: 0,
             prior_digest: [0; 32],

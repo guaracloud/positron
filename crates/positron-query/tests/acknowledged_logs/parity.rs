@@ -901,21 +901,26 @@ fn advanced_native_page_execution_stays_with_the_pagination_authority() -> Resul
         instance.default_tenant_id(),
         "pipeline-page-authority-kernel",
     )?;
+    fixture.append_log("bounded", 20, 1)?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
-        "pipeline:v1 logs | range query_time 0 1 | filter body == \"bounded\" | limit 1",
+        "pipeline:v1 logs | range query_time 0 100 | filter body == \"bounded\" | limit 1",
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
-    let failure = service
-        .execute_page(query)
-        .err()
-        .ok_or("advanced native page execution was accepted")?;
-    assert_eq!(
-        failure.code(),
-        positron_query::QueryFailureCode::UnsupportedQuery
-    );
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    let body = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch
+                .records()
+                .first()
+                .and_then(|record| record.body_text()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("advanced native page did not emit a record")?;
+    assert_eq!(body, "bounded");
     Ok(())
 }
 

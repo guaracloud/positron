@@ -1,8 +1,10 @@
 use positron_governance::AuthorizedContext;
 use positron_kernel::SnapshotLeaseId;
+use std::sync::Arc;
 
 use crate::cursor;
-use crate::execution_state::{initial_state, query_tenant, validate_authorization};
+use crate::execution_state::{initial_state, validate_authorization};
+use crate::execution_support::charge_work;
 use crate::execution_support::map_ledger_failure;
 use crate::{PlannedQuery, QueryCursor, QueryFailure, QueryFailureCode, QueryService, QueryStream};
 
@@ -31,6 +33,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         schema: Option<&positron_signals::SchemaCatalog>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        let tenant = self.validate_current_query_context(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
@@ -50,7 +53,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .ledger
             .create_snapshot_lease(now, expiry)
             .map_err(map_ledger_failure)?;
-        let tenant = query_tenant(query.context)?;
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
         let limit = state.plan.limit();
@@ -62,14 +64,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        let tenant = self.validate_current_query_context(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
         if self.batch_limit == 0 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
-        }
-        if query.plan.has_advanced_operators() {
-            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         let now_seconds = self.observe_planned(&query)?;
         let expiry = query
@@ -87,7 +87,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .ledger
             .create_snapshot_lease(now_seconds, expiry)
             .map_err(map_ledger_failure)?;
-        let tenant = query_tenant(query.context)?;
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
         let resources = ExecutionResources::new(reservation, lease.identity());
@@ -106,8 +105,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
         cursor: &QueryCursor,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let tenant = query_tenant(context)?;
-        let state = cursor::decode(&self.ledger.control_tokens(), cursor)?;
+        let tenant = self.validate_current_query_context(context)?;
+        let mut state = cursor::decode(&self.ledger.control_tokens(), cursor)?;
         validate_authorization(
             state.principal,
             state.tenant,
@@ -123,6 +122,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now_seconds >= state.expiry {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
+        self.reconstruct_plan(&mut state)?;
         let reservation = self.reserve_query(tenant, state.budget)?;
         let lease_id = SnapshotLeaseId::new(state.lease_identity)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
@@ -160,6 +160,74 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             None,
             resources,
         )
+    }
+
+    fn reconstruct_plan(&self, state: &mut cursor::CursorState) -> Result<(), QueryFailure> {
+        let (Some(source), Some(language)) = (state.source.clone(), state.language) else {
+            return Ok(());
+        };
+        let source = std::str::from_utf8(&source)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        let memory = crate::planning_memory::PlanningMemory::new(state.budget.memory_bytes());
+        let mut plan = match language {
+            crate::query_service::QueryLanguage::Pipeline => {
+                crate::service::parse_pipeline(source, &memory)?
+            },
+            crate::query_service::QueryLanguage::Sql => crate::service::parse_sql(source, &memory)?,
+        };
+        charge_work(state, self.work_units(crate::QueryWorkStage::Parse)?)?;
+        let compile_work = plan.search_compile_work_units();
+        if compile_work > 0 {
+            let unit = self.work_units(crate::QueryWorkStage::Parse)?;
+            charge_work(
+                state,
+                unit.checked_mul(compile_work).ok_or_else(|| {
+                    QueryFailure::budget_exhausted(crate::QueryBudgetDimension::CpuWorkUnits)
+                })?,
+            )?;
+        }
+        plan.compile_search()?;
+        if plan.limit() == 0 || plan.limit() > 1_024 {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
+        }
+        if u64::from(plan.limit()) > state.budget.output_rows() {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                crate::QueryBudgetDimension::OutputRows,
+            ));
+        }
+        if plan
+            .temporal_range()
+            .duration()
+            .is_none_or(|duration| duration > state.budget.maximum_time_range_nanoseconds())
+        {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds,
+            ));
+        }
+        let retained = plan.retained_memory_bytes()?;
+        if retained
+            .checked_add(plan.search_memory_bytes())
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+            > state.budget.memory_bytes()
+        {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                crate::QueryBudgetDimension::MemoryBytes,
+            ));
+        }
+        let digest = cursor::plan_digest(
+            &self.ledger.control_tokens(),
+            &plan,
+            Some(language),
+            Some(source.as_bytes()),
+        )?;
+        if digest != state.plan_digest {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        state.plan = Arc::new(plan);
+        Ok(())
     }
 
     fn observe_planned(&self, query: &PlannedQuery<'_>) -> Result<u64, QueryFailure> {

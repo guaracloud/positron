@@ -341,6 +341,8 @@ impl LogicalPlan {
 pub struct PlannedQuery<'kernel> {
     pub(crate) context: AuthorizedContext,
     pub(crate) plan: Arc<LogicalPlan>,
+    pub(crate) source: Arc<[u8]>,
+    pub(crate) language: crate::query_service::QueryLanguage,
     pub(crate) budget: QueryBudget,
     pub(crate) _reservation: ResourceReservation<'kernel>,
     pub(crate) _planning_memory: crate::planning_memory::PlanningReservation,

@@ -10,6 +10,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug};
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot};
 use zeroize::Zeroizing;
 
@@ -43,6 +44,7 @@ pub struct Identity {
     hash: [u8; 32],
     ingest: Option<IngestIdentity>,
     query: Option<QueryIdentity>,
+    lifecycle: TenantLifecycleState,
 }
 
 impl Identity {
@@ -121,6 +123,7 @@ impl Identity {
                     tenant: None,
                     authority: self.instance,
                     generation: self.generation,
+                    lifecycle: self.lifecycle,
                 })
             },
             RequestedIntent::Ingest => {
@@ -140,9 +143,13 @@ impl Identity {
                     ),
                     authority: self.instance,
                     generation: self.generation,
+                    lifecycle: self.lifecycle,
                 })
             },
             RequestedIntent::Query => {
+                if !is_query_readable(self.lifecycle) {
+                    return Err(AttributionFailure);
+                }
                 let query = self.query.as_ref().ok_or(AttributionFailure)?;
                 if !keys
                     .verify_salted_secret_hash(&query.salt, credential.secret(), &query.hash)
@@ -159,12 +166,42 @@ impl Identity {
                     ),
                     authority: self.instance,
                     generation: self.generation,
+                    lifecycle: self.lifecycle,
                 })
             },
             RequestedIntent::TenantAdministration | RequestedIntent::SystemAdministration => {
                 Err(AttributionFailure)
             },
         }
+    }
+
+    /// Revalidates a previously attributed query context against this
+    /// generation-pinned identity and its current durable lifecycle state.
+    ///
+    /// This is intentionally the same constant-shape failure as attribution:
+    /// a caller cannot learn whether a tenant was suspended, purged, or merely
+    /// presented with a stale context.
+    pub fn validate_query_context(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<(), AttributionFailure> {
+        let tenant = context.tenant.ok_or(AttributionFailure)?;
+        if self
+            .query
+            .as_ref()
+            .is_none_or(|query| context.principal != query.principal)
+            || context.scope != Scope::Query
+            || tenant.principal_id() != context.principal
+            || tenant.scope() != Scope::Query
+            || tenant.tenant_id() != self.tenant
+            || context.authority != self.instance
+            || context.generation != self.generation
+            || context.lifecycle != self.lifecycle
+            || !is_query_readable(self.lifecycle)
+        {
+            return Err(AttributionFailure);
+        }
+        Ok(())
     }
 
     /// Authorizes the narrow read-only governance view without introducing a
@@ -334,6 +371,7 @@ pub struct AuthorizedContext {
     tenant: Option<TenantAttribution>,
     authority: [u8; 16],
     generation: u64,
+    lifecycle: TenantLifecycleState,
 }
 
 impl AuthorizedContext {
@@ -356,6 +394,18 @@ impl AuthorizedContext {
     pub const fn authorization_generation(self) -> u64 {
         self.generation
     }
+
+    #[must_use]
+    pub const fn tenant_lifecycle(self) -> TenantLifecycleState {
+        self.lifecycle
+    }
+}
+
+const fn is_query_readable(state: TenantLifecycleState) -> bool {
+    matches!(
+        state,
+        TenantLifecycleState::Active | TenantLifecycleState::ReadOnly
+    )
 }
 
 /// Constant-shape authentication and authorization rejection.

@@ -46,9 +46,10 @@ cargo +nightly fuzz run query_sql
 ```
 
 The authenticated cursor boundary target checks bounded cursor ownership,
-lossless round trips, and truncation rejection. The current 373-byte cursor
-encoding remains readable alongside the legacy 341-byte encoding; all other
-lengths are rejected before any resume state is constructed:
+lossless round trips, and truncation rejection. The current 4481-byte cursor
+encoding remains readable alongside the legacy 341-byte and v3 373-byte
+encodings; all other lengths are rejected before any resume state is
+constructed:
 
 ```console
 cargo +nightly fuzz run query_cursor --sanitizer none -- -runs=1000

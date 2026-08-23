@@ -12,6 +12,7 @@ use super::DataProtection;
 const CONTROL_TOKEN_DOMAIN: &[u8] = b"positron-authenticated-control-token-v1\0";
 const MAX_PURPOSE_BYTES: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 4_096;
+pub const QUERY_CURSOR_MAX_PAYLOAD_BYTES: usize = 8_192;
 const QUERY_RESULT_DIGEST_PURPOSE: &[u8] = b"query-result-batch-v1";
 
 /// Data Protection-owned authentication attached to one bounded control payload.
@@ -55,7 +56,27 @@ impl<'key> ControlTokenProtector<'key> {
         purpose: &[u8],
         payload: &[u8],
     ) -> Result<ControlTokenAuthentication, ControlTokenFailure> {
-        let input = control_input(purpose, payload)?;
+        self.authenticate_bounded(purpose, payload, MAX_PAYLOAD_BYTES)
+    }
+
+    /// Authenticates a bounded Query Cursor payload under its dedicated wire
+    /// limit. Other control-token purposes remain governed by the 4 KiB
+    /// generic limit.
+    pub fn authenticate_query_cursor(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+    ) -> Result<ControlTokenAuthentication, ControlTokenFailure> {
+        self.authenticate_bounded(purpose, payload, QUERY_CURSOR_MAX_PAYLOAD_BYTES)
+    }
+
+    fn authenticate_bounded(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+        maximum_payload_bytes: usize,
+    ) -> Result<ControlTokenAuthentication, ControlTokenFailure> {
+        let input = control_input(purpose, payload, maximum_payload_bytes)?;
         let secret = self
             .secret
             .lock()
@@ -72,7 +93,32 @@ impl<'key> ControlTokenProtector<'key> {
         payload: &[u8],
         authentication: ControlTokenAuthentication,
     ) -> Result<(), ControlTokenFailure> {
-        let input = control_input(purpose, payload)?;
+        self.verify_bounded(purpose, payload, authentication, MAX_PAYLOAD_BYTES)
+    }
+
+    /// Verifies a Query Cursor payload under its dedicated wire limit.
+    pub fn verify_query_cursor(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+        authentication: ControlTokenAuthentication,
+    ) -> Result<(), ControlTokenFailure> {
+        self.verify_bounded(
+            purpose,
+            payload,
+            authentication,
+            QUERY_CURSOR_MAX_PAYLOAD_BYTES,
+        )
+    }
+
+    fn verify_bounded(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+        authentication: ControlTokenAuthentication,
+        maximum_payload_bytes: usize,
+    ) -> Result<(), ControlTokenFailure> {
+        let input = control_input(purpose, payload, maximum_payload_bytes)?;
         let secret = self
             .secret
             .lock()
@@ -85,7 +131,17 @@ impl<'key> ControlTokenProtector<'key> {
     }
 
     pub fn digest(&self, purpose: &[u8], payload: &[u8]) -> Result<[u8; 32], ControlTokenFailure> {
-        let input = control_input(purpose, payload)?;
+        let input = control_input(purpose, payload, MAX_PAYLOAD_BYTES)?;
+        DataProtection::hash(&input).map_err(|_| ControlTokenFailure::Authentication)
+    }
+
+    /// Hashes a Query Cursor plan payload under the dedicated cursor bound.
+    pub fn digest_query_cursor(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+    ) -> Result<[u8; 32], ControlTokenFailure> {
+        let input = control_input(purpose, payload, QUERY_CURSOR_MAX_PAYLOAD_BYTES)?;
         DataProtection::hash(&input).map_err(|_| ControlTokenFailure::Authentication)
     }
 
@@ -112,6 +168,24 @@ impl<'key> ControlTokenProtector<'key> {
     }
 }
 
+/// Returns a deterministic authenticator for the bounded fuzz adapters.
+///
+/// The key is process-local fuzz fixture data and is only compiled into fuzz
+/// builds; production callers can obtain a protector only through Catalog
+/// custody.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_control_token_protector() -> ControlTokenProtector<'static> {
+    static SECRET: std::sync::OnceLock<Mutex<CatalogSecret>> = std::sync::OnceLock::new();
+    let secret = SECRET.get_or_init(|| {
+        Mutex::new(CatalogSecret::from_owned(
+            Box::new([0x21; 32]),
+            Box::new([0x31; 32]),
+        ))
+    });
+    ControlTokenProtector::new(secret)
+}
+
 /// Non-cloneable, non-debug streaming state for one authenticated Query Result Batch digest.
 pub struct QueryResultDigest {
     state: Hmac<Sha256>,
@@ -132,8 +206,11 @@ impl QueryResultDigest {
 fn control_input(
     purpose: &[u8],
     payload: &[u8],
+    maximum_payload_bytes: usize,
 ) -> Result<Zeroizing<Vec<u8>>, ControlTokenFailure> {
-    if purpose.is_empty() || purpose.len() > MAX_PURPOSE_BYTES || payload.len() > MAX_PAYLOAD_BYTES
+    if purpose.is_empty()
+        || purpose.len() > MAX_PURPOSE_BYTES
+        || payload.len() > maximum_payload_bytes
     {
         return Err(ControlTokenFailure::LimitExceeded);
     }
@@ -171,7 +248,7 @@ impl std::error::Error for ControlTokenFailure {}
 mod tests {
     use std::sync::Mutex;
 
-    use super::ControlTokenProtector;
+    use super::{ControlTokenAuthentication, ControlTokenProtector, MAX_PAYLOAD_BYTES};
     use crate::catalog::CatalogSecret;
 
     #[test]
@@ -198,6 +275,78 @@ mod tests {
                 0x79, 0x16, 0x8a, 0x50, 0xb2, 0x7b, 0xf5, 0x58, 0x37, 0x3f, 0xae, 0x01, 0xcc, 0x84,
                 0xb0, 0xbc, 0x4e, 0x1c,
             ]
+        );
+    }
+
+    #[test]
+    fn query_cursor_payload_has_a_dedicated_limit_without_widening_generic_tokens() {
+        assert_eq!(
+            ControlTokenAuthentication::new(0, [0; 32]).expect_err("zero epochs are invalid"),
+            super::ControlTokenFailure::InvalidInput
+        );
+        let secret = Mutex::new(CatalogSecret::from_owned(
+            Box::new([0x41; 32]),
+            Box::new([0x51; 32]),
+        ));
+        let protector = ControlTokenProtector::new(&secret);
+        assert!(
+            protector
+                .authenticate(b"generic", &vec![0; MAX_PAYLOAD_BYTES])
+                .is_ok()
+        );
+        let authentication = protector
+            .authenticate(b"generic", b"stable")
+            .expect("generic authentication must produce a token");
+        assert!(
+            protector
+                .verify(b"generic", b"stable", authentication)
+                .is_ok()
+        );
+        let stale =
+            ControlTokenAuthentication::new(authentication.epoch() + 1, authentication.tag())
+                .expect("non-zero epoch is a valid authentication shape");
+        assert_eq!(
+            protector
+                .verify(b"generic", b"stable", stale)
+                .expect_err("stale epochs must fail closed"),
+            super::ControlTokenFailure::Authentication
+        );
+        let mut wrong_tag = authentication.tag();
+        wrong_tag[0] ^= 1;
+        let wrong_tag = ControlTokenAuthentication::new(authentication.epoch(), wrong_tag)
+            .expect("non-zero epoch is a valid authentication shape");
+        assert_eq!(
+            protector
+                .verify(b"generic", b"stable", wrong_tag)
+                .expect_err("tampered tags must fail closed"),
+            super::ControlTokenFailure::Authentication
+        );
+        assert_eq!(
+            protector
+                .authenticate(b"generic", &vec![0; MAX_PAYLOAD_BYTES + 1])
+                .expect_err("generic payload growth must remain bounded"),
+            super::ControlTokenFailure::LimitExceeded
+        );
+        assert!(
+            protector
+                .authenticate_query_cursor(
+                    b"query-cursor-v1",
+                    &vec![0; super::QUERY_CURSOR_MAX_PAYLOAD_BYTES]
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            protector
+                .authenticate_query_cursor(
+                    b"query-cursor-v1",
+                    &vec![0; super::QUERY_CURSOR_MAX_PAYLOAD_BYTES + 1]
+                )
+                .expect_err("query cursor payload growth must remain bounded"),
+            super::ControlTokenFailure::LimitExceeded
+        );
+        assert_eq!(
+            super::ControlTokenFailure::Authentication.to_string(),
+            "authenticated control token operation failed"
         );
     }
 }

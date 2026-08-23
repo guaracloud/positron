@@ -161,6 +161,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     /// Resumes a lease while recording the immutable cursor boundary being
     /// attempted. Reusing the same boundary is an at-least-once batch retry;
     /// advancing to a different boundary is a normal page transition.
+    ///
+    /// `LeaseResumeMarker` remains private to this lease authority: exposing
+    /// the durable marker as a cross-crate public wire type would duplicate
+    /// cursor protocol ownership. The scalar arguments are therefore the
+    /// deliberate narrow boundary into the kernel-owned typed marker.
     pub fn resume_snapshot_lease_with_marker(
         &self,
         identity: SnapshotLeaseId,

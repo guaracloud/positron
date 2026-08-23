@@ -142,17 +142,7 @@ fn terminal_stats_report_cumulative_resume_and_repeat_state() -> Result<(), Box<
     };
     assert_eq!(repeated_stats.resume_count(), 3);
     assert_eq!(repeated_stats.repeated_batch_count(), 2);
-    assert_eq!(repeated_stats.emitted_records(), repeated_stats.records());
-    assert_eq!(
-        repeated_stats.scanned_records(),
-        repeated_stats.decoded_records()
-    );
-    assert_eq!(
-        repeated_stats.emitted_bytes(),
-        repeated_stats.output_bytes()
-    );
     assert_eq!(repeated_stats.cumulative_budget().decoded_records(), 16);
-    assert_eq!(repeated_stats.budget(), repeated_stats.cumulative_budget());
     Ok(())
 }
 
@@ -209,9 +199,8 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
     assert_eq!(batch_identity(&terminal)?, first_retry_identity);
     assert_eq!(bodies(&terminal), ["second"]);
     assert_eq!(stats.records(), 2);
-    assert_eq!(stats.emitted_records(), 2);
     assert!(stats.scanned_bytes() > 0);
-    assert!(stats.scanned_records() >= 2);
+    assert!(stats.decoded_records() >= 2);
     assert!(stats.output_bytes() > 0);
     assert!(stats.memory_peak_bytes() > 0);
     assert!(stats.cpu_work_units() > 0);
@@ -246,6 +235,152 @@ fn resumable_reconnect_survives_query_service_and_ledger_reopen() -> Result<(), 
 }
 
 #[test]
+fn advanced_resume_preserves_peak_and_pruning_stats_after_ledger_reopen()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = CursorFixture::new()?;
+    let plan = fixture
+        .service()
+        .plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | search body contains \"s\" | limit 2",
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+        )
+        .map_err(|failure| format!("plan: {failure:?}"))?;
+    let first = fixture
+        .service()
+        .execute_page(plan)
+        .map_err(|failure| format!("first: {failure:?}"))?
+        .collect::<Vec<_>>();
+    let cursor = continuation(&first)
+        .map_err(|failure| format!("continuation: {failure}"))?
+        .clone();
+    fixture.kernel.reopen_ledger()?;
+    let resumed = fixture
+        .service()
+        .resume(fixture.context, &cursor)
+        .map_err(|failure| format!("resume: {failure:?}"))?
+        .collect::<Vec<_>>();
+    let stats = match resumed.last() {
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats))) => *stats,
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete))) => incomplete.stats(),
+        _ => return Err("resumed terminal missing".into()),
+    };
+    assert!(stats.memory_peak_bytes() > 0);
+    assert!(stats.reduced_pruning());
+    Ok(())
+}
+
+#[test]
+fn sql_resume_reconstructs_filter_and_projection_from_the_authenticated_source()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let plan = fixture.service().plan_sql(
+        fixture.context,
+        "SELECT body, query_time FROM logs WHERE query_time >= -100 AND query_time < 100 AND body CONTAINS \"s\" ORDER BY query_time, commit_position LIMIT 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = fixture.service().execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+    let resumed = fixture
+        .service()
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert_eq!(bodies(&resumed), ["second"]);
+    let header = resumed
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("resumed SQL header missing")?;
+    assert_eq!(header.schema().columns(), ["body", "query_time"]);
+    Ok(())
+}
+
+#[test]
+fn aggregate_resume_reconstructs_grouping_from_the_authenticated_source()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let plan = fixture.service().plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = fixture.service().execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+    let resumed = fixture
+        .service()
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        resumed.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn regex_resume_reconstructs_compilation_and_repeats_the_bounded_page() -> Result<(), Box<dyn Error>>
+{
+    let fixture = CursorFixture::new()?;
+    fixture.kernel.append_log("start", 22, 3)?;
+    let plan = fixture.service().plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "s.*" | limit 2"#,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = fixture.service().execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+    let resumed = fixture
+        .service()
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert_eq!(bodies(&resumed), ["second"]);
+    assert!(matches!(
+        resumed.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn advanced_resume_revalidates_authenticated_source_limits() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let plan = fixture.service().plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"s\" | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = fixture.service().execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+    let rewritten = rewritten_source_cursor(
+        &fixture,
+        &cursor,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"s\" | limit 1025",
+    )?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &rewritten)
+            .expect_err("reconstructed limit must remain bounded")
+            .code(),
+        QueryFailureCode::InvalidBudget
+    );
+
+    let malformed =
+        rewritten_source_cursor(&fixture, &cursor, "pipeline:v1 logs | definitely_not_valid")?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &malformed)
+            .expect_err("reconstructed parser failures must be preserved")
+            .code(),
+        QueryFailureCode::UnsupportedQuery
+    );
+    Ok(())
+}
+
+#[test]
 fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
 -> Result<(), Box<dyn Error>> {
     let fixture = CursorFixture::new()?;
@@ -272,6 +407,7 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
             .code(),
         QueryFailureCode::SnapshotExpired
     );
+    fixture.clock.set(101);
     assert_eq!(
         fixture
             .service()
@@ -296,6 +432,55 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
             .code(),
         QueryFailureCode::SnapshotExpired
     );
+
+    let catalog_mismatch = rewritten_cursor(&fixture, |bytes| bytes[88] ^= 1, b"query-cursor-v1")?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &catalog_mismatch)
+            .expect_err("cursor catalog binding must be checked after lease admission")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    Ok(())
+}
+
+#[test]
+fn cancelled_planned_query_is_rejected_before_snapshot_admission() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let plan = fixture.service().plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    plan.cancellation().cancel();
+    assert_eq!(
+        fixture
+            .service()
+            .execute_page(plan)
+            .expect_err("cancelled query must not admit a snapshot")
+            .code(),
+        QueryFailureCode::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn resume_clock_failure_is_reported_before_lease_reacquisition() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let service = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        std::sync::Arc::new(super::support::FailingClock),
+    );
+    assert_eq!(
+        service
+            .resume(fixture.context, &fixture.cursor)
+            .expect_err("clock failures must not admit a resumed lease")
+            .code(),
+        QueryFailureCode::Internal
+    );
     Ok(())
 }
 
@@ -303,7 +488,7 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
 fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Result<(), Box<dyn Error>>
 {
     let fixture = CursorFixture::new()?;
-    assert_eq!(fixture.cursor.as_bytes().len(), 373);
+    assert_eq!(fixture.cursor.as_bytes().len(), 4481);
     for (label, rewrite) in [
         (
             "magic",
@@ -318,6 +503,22 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         ("overlong wall budget", |bytes: &mut Vec<u8>| {
             bytes[269..277].copy_from_slice(&3_601_u64.to_be_bytes())
         }),
+        ("invalid pruning flag", |bytes: &mut Vec<u8>| {
+            bytes[349] = 2;
+        }),
+        ("invalid plan language", |bytes: &mut Vec<u8>| {
+            bytes[350] = 3;
+        }),
+        ("legacy source length", |bytes: &mut Vec<u8>| {
+            bytes[350] = 0;
+            bytes[351..353].copy_from_slice(&1_u16.to_be_bytes());
+        }),
+        ("source padding", |bytes: &mut Vec<u8>| {
+            bytes[4448] = 1;
+        }),
+        ("overlong source length", |bytes: &mut Vec<u8>| {
+            bytes[351..353].copy_from_slice(&4_097_u16.to_be_bytes());
+        }),
     ] {
         let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v1")?;
         assert_eq!(
@@ -329,6 +530,78 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
             QueryFailureCode::InvalidCursor
         );
     }
+    let source_free = rewritten_cursor(
+        &fixture,
+        |bytes| {
+            bytes[350] = 0;
+            bytes[351..353].fill(0);
+        },
+        b"query-cursor-v1",
+    )?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &source_free)
+            .expect_err("source-free v4 cursor must not reuse an advanced digest")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    let source_fixture = CursorFixture::new()?;
+    let mut basic_encoding = Vec::with_capacity(19);
+    basic_encoding.push(1);
+    basic_encoding.extend_from_slice(&(-100_i64).to_be_bytes());
+    basic_encoding.extend_from_slice(&100_i64.to_be_bytes());
+    basic_encoding.extend_from_slice(&2_u16.to_be_bytes());
+    let basic_digest = source_fixture
+        .kernel
+        .ledger()?
+        .control_tokens()
+        .digest(b"query-plan-v1", &basic_encoding)?;
+    let source_free_basic = rewritten_cursor(
+        &source_fixture,
+        |bytes| {
+            bytes[123..155].copy_from_slice(&basic_digest);
+            bytes[350] = 0;
+            bytes[351..353].fill(0);
+            bytes[353..4449].fill(0);
+        },
+        b"query-cursor-v1",
+    )?;
+    let source_free_events = source_fixture
+        .service()
+        .resume(source_fixture.context, &source_free_basic)?
+        .collect::<Vec<_>>();
+    assert_eq!(bodies(&source_free_events), ["second"]);
+
+    for axis in [2_u8, 3_u8] {
+        let axis_fixture = CursorFixture::new()?;
+        let mut axis_encoding = Vec::with_capacity(19);
+        axis_encoding.push(axis);
+        axis_encoding.extend_from_slice(&(-100_i64).to_be_bytes());
+        axis_encoding.extend_from_slice(&100_i64.to_be_bytes());
+        axis_encoding.extend_from_slice(&2_u16.to_be_bytes());
+        let axis_digest = axis_fixture
+            .kernel
+            .ledger()?
+            .control_tokens()
+            .digest(b"query-plan-v1", &axis_encoding)?;
+        let axis_cursor = rewritten_cursor(
+            &axis_fixture,
+            |bytes| {
+                bytes[104] = axis;
+                bytes[123..155].copy_from_slice(&axis_digest);
+                bytes[350] = 0;
+                bytes[351..353].fill(0);
+                bytes[353..4449].fill(0);
+            },
+            b"query-cursor-v1",
+        )?;
+        let axis_events = axis_fixture
+            .service()
+            .resume(axis_fixture.context, &axis_cursor)?
+            .collect::<Vec<_>>();
+        assert_eq!(bodies(&axis_events), ["second"]);
+    }
     let wrong_domain = rewritten_cursor(&fixture, |_| {}, b"query-result-batch-v1")?;
     assert_eq!(
         fixture
@@ -339,11 +612,60 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         QueryFailureCode::InvalidCursor
     );
 
+    for (label, rewrite) in [
+        (
+            "output rows budget",
+            (|bytes: &mut Vec<u8>| {
+                bytes[237..245].copy_from_slice(&1_u64.to_be_bytes());
+            }) as fn(&mut Vec<u8>),
+        ),
+        (
+            "maximum range budget",
+            (|bytes: &mut Vec<u8>| {
+                bytes[277..285].copy_from_slice(&1_u64.to_be_bytes());
+            }) as fn(&mut Vec<u8>),
+        ),
+        (
+            "memory budget",
+            (|bytes: &mut Vec<u8>| {
+                bytes[253..261].copy_from_slice(&1_u64.to_be_bytes());
+            }) as fn(&mut Vec<u8>),
+        ),
+    ] {
+        let cursor = rewritten_cursor(&fixture, rewrite, b"query-cursor-v1")?;
+        let expected = if label == "memory budget" {
+            QueryFailureCode::BudgetExhausted
+        } else {
+            QueryFailureCode::InvalidBudget
+        };
+        assert_eq!(
+            fixture
+                .service()
+                .resume(fixture.context, &cursor)
+                .expect_err(label)
+                .code(),
+            expected
+        );
+    }
+
+    let legacy_plan_digest = {
+        let mut encoding = Vec::with_capacity(19);
+        encoding.push(1);
+        encoding.extend_from_slice(&(-100_i64).to_be_bytes());
+        encoding.extend_from_slice(&100_i64.to_be_bytes());
+        encoding.extend_from_slice(&2_u16.to_be_bytes());
+        fixture
+            .kernel
+            .ledger()?
+            .control_tokens()
+            .digest(b"query-plan-v1", &encoding)?
+    };
     let legacy = rewritten_cursor(
         &fixture,
         |bytes| {
-            bytes.drain(317..341);
+            bytes.drain(317..4449);
             bytes.drain(261..269);
+            bytes[123..155].copy_from_slice(&legacy_plan_digest);
         },
         b"query-cursor-v1",
     )?;
@@ -356,7 +678,7 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
     let truncated = fixture
         .cursor
         .as_bytes()
-        .get(..372)
+        .get(..4480)
         .ok_or("cursor too short")?;
     assert_eq!(
         QueryCursor::from_bytes(truncated)
@@ -383,9 +705,38 @@ fn rewritten_cursor(
     let mut payload = fixture.cursor.as_bytes()[..fixture.cursor.as_bytes().len() - 32].to_vec();
     rewrite(&mut payload);
     let protector = fixture.kernel.ledger()?.control_tokens();
-    let initial = protector.authenticate(purpose, &payload)?;
+    let initial = protector.authenticate_query_cursor(purpose, &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
-    let authentication = protector.authenticate(purpose, &payload)?;
+    let authentication = protector.authenticate_query_cursor(purpose, &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(QueryCursor::from_bytes(&payload)?)
+}
+
+fn rewritten_source_cursor(
+    fixture: &CursorFixture,
+    cursor: &QueryCursor,
+    source: &str,
+) -> Result<QueryCursor, Box<dyn Error>> {
+    let mut payload = cursor.as_bytes()[..cursor.as_bytes().len() - 32].to_vec();
+    let source_bytes = source.as_bytes();
+    let source_length = u16::try_from(source_bytes.len())?;
+    payload[351..353].copy_from_slice(&source_length.to_be_bytes());
+    payload[353..4449].fill(0);
+    payload[353..353 + source_bytes.len()].copy_from_slice(source_bytes);
+    let mut encoding = Vec::with_capacity(1 + 2 + source_bytes.len());
+    encoding.push(1);
+    encoding.extend_from_slice(&source_length.to_be_bytes());
+    encoding.extend_from_slice(source_bytes);
+    let digest = fixture
+        .kernel
+        .ledger()?
+        .control_tokens()
+        .digest_query_cursor(b"query-plan-source-v1", &encoding)?;
+    payload[123..155].copy_from_slice(&digest);
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
+    payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
 }

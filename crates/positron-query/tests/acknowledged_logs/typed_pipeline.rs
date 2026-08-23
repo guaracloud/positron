@@ -1042,8 +1042,6 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
     use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
     use positron_policy::NativeLogAttribute;
 
-    const EXACT_PEAK_BYTES: u64 = 69_891;
-
     let fixture = QueryFixture::new("attribute-projection-memory")?;
     fixture.kernel.append_attribute_logs(
         vec![(
@@ -1067,12 +1065,14 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
         Arc::new(ConstantWorkMeter(0)),
     );
     let source = r#"pipeline:v1 logs | range query_time 0 100 | project record["x"] | limit 1"#;
+    let exact_peak = 69_891_u64
+        .checked_add(u64::try_from(source.len())?)
+        .ok_or("attribute projection peak overflowed")?;
 
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, EXACT_PEAK_BYTES, 60)?
-            .with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, exact_peak, 60)?.with_cpu_work_units(16)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(
@@ -1088,7 +1088,7 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, EXACT_PEAK_BYTES - 1, 60)?
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, exact_peak - 1, 60)?
             .with_cpu_work_units(16)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
@@ -1750,7 +1750,10 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_996, true), (1_995, false)] {
+    let ordinary_peak = 1_996_u64
+        .checked_add(u64::try_from(ordinary.len())?)
+        .ok_or("ordinary peak overflowed")?;
+    for (memory_bytes, expected_complete) in [(ordinary_peak, true), (ordinary_peak - 1, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -1777,7 +1780,10 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(3_831, true), (3_830, false)] {
+    let grouped_peak = 3_831_u64
+        .checked_add(u64::try_from(grouped.len())?)
+        .ok_or("grouped peak overflowed")?;
+    for (memory_bytes, expected_complete) in [(grouped_peak, true), (grouped_peak - 1, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
@@ -3298,6 +3304,7 @@ fn body_search_memory_peak_includes_matcher_and_retained_rows() -> Result<(), Bo
     assert!(peak > 40_000, "matcher memory was not retained: {peak}");
     let peak = peak
         .checked_add(457)
+        .and_then(|bytes| bytes.checked_add(u64::try_from(source.len()).ok()?))
         .ok_or("plan memory boundary overflowed")?;
 
     for (memory_bytes, expected_complete) in [(peak, true), (peak - 1, false)] {

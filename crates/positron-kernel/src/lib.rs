@@ -135,6 +135,10 @@ pub use data_protection::fuzz_local_root_key_file;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
+pub use data_protection::fuzz_control_token_protector;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
 pub use catalog::fuzz_catalog_stateful;
 
 #[cfg(fuzzing)]

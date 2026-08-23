@@ -115,21 +115,11 @@ impl QueryStats {
         self.records
     }
 
-    /// Alias for the number of records emitted in the logical result.
-    #[must_use]
-    pub const fn emitted_records(self) -> u64 {
-        self.records
-    }
     #[must_use]
     pub const fn scanned_bytes(self) -> u64 {
         self.scanned_bytes
     }
 
-    /// Alias for the physical records decoded while evaluating the snapshot.
-    #[must_use]
-    pub const fn scanned_records(self) -> u64 {
-        self.decoded_records
-    }
     #[must_use]
     pub const fn decoded_records(self) -> u64 {
         self.decoded_records
@@ -139,11 +129,6 @@ impl QueryStats {
         self.output_bytes
     }
 
-    /// Alias for the bytes emitted in typed Result Batches.
-    #[must_use]
-    pub const fn emitted_bytes(self) -> u64 {
-        self.output_bytes
-    }
     #[must_use]
     pub const fn memory_peak_bytes(self) -> u64 {
         self.memory_peak_bytes
@@ -169,13 +154,6 @@ impl QueryStats {
     /// reconnect of this query snapshot.
     #[must_use]
     pub const fn cumulative_budget(self) -> crate::QueryBudget {
-        self.cumulative_budget
-    }
-
-    /// Returns the same cumulative budget under the concise public name used
-    /// by query consumers.
-    #[must_use]
-    pub const fn budget(self) -> crate::QueryBudget {
         self.cumulative_budget
     }
 

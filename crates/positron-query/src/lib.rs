@@ -74,8 +74,114 @@ pub fn fuzz_query_cursor(data: &[u8]) {
             .expect("a bounded cursor must remain decodable after a lossless copy");
         assert_eq!(reparsed, cursor);
     }
-    if matches!(data.len(), 341 | 373) {
+    if matches!(data.len(), 341 | 373 | 4_481) {
         assert!(QueryCursor::from_bytes(&data[..data.len() - 1]).is_err());
+    }
+
+    let protector = positron_kernel::fuzz_control_token_protector();
+    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
+        .expect("fuzz principal fixture is valid");
+    let tenant = positron_domain::identity::TenantId::from_bytes([2; 16])
+        .expect("fuzz tenant fixture is valid");
+    let range = TemporalRange::new(-100, 100).expect("fuzz range is ordered");
+    let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
+    let source = b"pipeline:v1 logs | range query_time -100 100 | limit 1";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)
+        .expect("fuzz budget is valid")
+        .with_cpu_work_units(1_024)
+        .expect("fuzz CPU budget is valid");
+    let state = cursor::CursorState {
+        principal,
+        tenant,
+        authorization_generation: 7,
+        catalog_identity: [3; 32],
+        catalog_generation: 8,
+        frontier: 1,
+        plan: std::sync::Arc::new(plan),
+        source: Some(std::sync::Arc::from(source.to_vec().into_boxed_slice())),
+        language: Some(query_service::QueryLanguage::Pipeline),
+        plan_digest: [0; 32],
+        offset: 0,
+        sequence: 0,
+        prior_digest: [0; 32],
+        lease_identity: [4; 16],
+        expiry: 60,
+        budget,
+        scanned_bytes: 0,
+        decoded_records: 0,
+        output_rows: 0,
+        output_bytes: 0,
+        memory_peak_bytes: 512,
+        started_at: 0,
+        last_observed_at: 0,
+        cpu_work_units: 0,
+        elapsed_wall_seconds: 0,
+        reduced_pruning: true,
+        resume_count: 0,
+        repeated_batch_count: 0,
+        cancellation: QueryCancellation::new(),
+    };
+    let canonical = cursor::encode(&protector, state).expect("fuzz cursor fixture is valid");
+    let decoded = cursor::decode(&protector, &canonical).expect("fixture must authenticate");
+    assert_eq!(decoded.principal, principal);
+    assert_eq!(decoded.tenant, tenant);
+    assert_eq!(decoded.authorization_generation, 7);
+    assert_eq!(decoded.frontier, 1);
+    assert_eq!(decoded.expiry, 60);
+    assert_eq!(decoded.plan.limit(), 1);
+    assert_eq!(decoded.memory_peak_bytes, 512);
+    assert!(decoded.reduced_pruning);
+    execution_state::validate_authorization(
+        principal,
+        tenant,
+        7,
+        decoded.principal,
+        decoded.tenant,
+        decoded.authorization_generation,
+    )
+    .expect("fixture authorization is valid");
+    let _ = execution_state::commit_position(decoded.frontier);
+    let source = std::str::from_utf8(
+        decoded
+            .source
+            .as_deref()
+            .expect("fixture source is retained"),
+    )
+    .expect("fixture source is UTF-8");
+    let parsed = service::parse_pipeline(
+        source,
+        &planning_memory::PlanningMemory::new(decoded.budget.memory_bytes()),
+    )
+    .expect("fixture source parses");
+    assert_eq!(parsed.limit(), decoded.plan.limit());
+
+    if let Some(selector) = data.first().copied() {
+        let mut variant = canonical.as_bytes().to_vec();
+        match selector % 8 {
+            0 => variant[32] ^= 1,
+            1 => variant[48] ^= 1,
+            2 => variant[96] ^= 1,
+            3 => variant[213] ^= 1,
+            4 => variant[353] ^= 1,
+            5 => variant[0] ^= 1,
+            6 => variant[157] ^= 1,
+            _ => variant[4480] ^= 1,
+        }
+        let _ = cursor::fuzz_reauthenticate(&protector, &mut variant);
+        if let Ok(cursor) = QueryCursor::from_bytes(&variant) {
+            if let Ok(state) = cursor::decode(&protector, &cursor) {
+                let _ = execution_state::validate_authorization(
+                    principal,
+                    tenant,
+                    7,
+                    state.principal,
+                    state.tenant,
+                    state.authorization_generation,
+                );
+                let _ = execution_state::commit_position(state.frontier);
+                let _ = state.expiry.checked_sub(state.started_at);
+            }
+        }
     }
 }
 

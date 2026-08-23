@@ -299,7 +299,7 @@ impl ServiceHandle {
             .map_err(|_| ServiceFailure::KeyUnavailable)?;
         let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
             .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        let service = QueryService::new(instance._authority.governor(), &ledger, 100);
+        let service = QueryService::new_checked(instance._authority.governor(), &ledger, 100);
         let query = service
             .plan_pipeline(context, source, budget)
             .map_err(|_| ServiceFailure::InvalidRequest)?;
