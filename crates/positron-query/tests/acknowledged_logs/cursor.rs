@@ -137,7 +137,17 @@ fn terminal_stats_report_cumulative_resume_and_repeat_state() -> Result<(), Box<
     };
     assert_eq!(repeated_stats.resume_count(), 3);
     assert_eq!(repeated_stats.repeated_batch_count(), 2);
+    assert_eq!(repeated_stats.emitted_records(), repeated_stats.records());
+    assert_eq!(
+        repeated_stats.scanned_records(),
+        repeated_stats.decoded_records()
+    );
+    assert_eq!(
+        repeated_stats.emitted_bytes(),
+        repeated_stats.output_bytes()
+    );
     assert_eq!(repeated_stats.cumulative_budget().decoded_records(), 16);
+    assert_eq!(repeated_stats.budget(), repeated_stats.cumulative_budget());
     Ok(())
 }
 
