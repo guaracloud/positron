@@ -11,19 +11,19 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, DiskObservation,
-    DiskPressureThresholds, FixedLifecycleClockSource, FormatEpoch, GovernorFailure,
-    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
-    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureThresholds,
+    FixedLifecycleClockSource, GovernorFailure, GovernorPolicy, InstanceId,
+    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
+    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
+    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
     ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
-    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim,
-    WorkKind,
+    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, WorkClaim, WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
     PolicyReceiver,
 };
+use positron_runtime::GovernanceTestFixture;
 use positron_signals::{LogRecord, LogStore};
 
 pub struct TestClock(AtomicU64);
@@ -195,6 +195,7 @@ pub fn zero_work_service<'kernel, 'catalog, 'ledger>(
     governor: positron_kernel::ResourceGovernor<'kernel>,
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
+    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -202,6 +203,7 @@ pub fn zero_work_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(0)),
+        identity,
     )
 }
 
@@ -210,6 +212,7 @@ pub fn zero_work_clock_service<'kernel, 'catalog, 'ledger>(
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
     clock: Arc<dyn positron_query::QueryClock>,
+    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -217,6 +220,7 @@ pub fn zero_work_clock_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         clock,
         Arc::new(ConstantWorkMeter(0)),
+        identity,
     )
 }
 
@@ -224,6 +228,7 @@ pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
     governor: positron_kernel::ResourceGovernor<'kernel>,
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
+    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -231,6 +236,7 @@ pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         TestClock::shared(100),
         Arc::new(ZeroScanWorkMeter),
+        identity,
     )
 }
 
@@ -239,6 +245,7 @@ pub fn stage_work_clock_service<'kernel, 'catalog, 'ledger>(
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
     clock: Arc<dyn positron_query::QueryClock>,
+    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -246,6 +253,7 @@ pub fn stage_work_clock_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         clock,
         Arc::new(ZeroScanWorkMeter),
+        identity,
     )
 }
 
@@ -522,31 +530,10 @@ impl KernelFixture {
     pub fn new_with_identity(
         tenant: TenantId,
         label: &str,
-        identity_object: &[u8],
+        identity: &GovernanceTestFixture,
     ) -> Result<Self, Box<dyn Error>> {
         let fixture = Self::new(tenant, label)?;
-        let basis = fixture.catalog.pin()?;
-        let mut objects = Vec::new();
-        objects.try_reserve_exact(
-            usize::try_from(basis.number())
-                .ok()
-                .and_then(|number| number.checked_add(1))
-                .ok_or("Catalog object count overflow")?,
-        )?;
-        for object_id in basis.object_identities() {
-            let object = basis.object(object_id)?.ok_or("Catalog object missing")?;
-            objects.push(CatalogObject::new(object.to_vec())?);
-        }
-        objects.push(CatalogObject::new(identity_object.to_vec())?);
-        fixture.catalog.commit(
-            basis.identity(),
-            CatalogProposal::new(
-                TransactionId::new([0x41; 16])?,
-                FormatEpoch::CATALOG_V1,
-                objects,
-            )?,
-            None,
-        )?;
+        identity.install_into(fixture.catalog)?;
         Ok(fixture)
     }
 
@@ -554,6 +541,12 @@ impl KernelFixture {
         self.ledger
             .as_ref()
             .ok_or_else(|| "ledger unavailable".into())
+    }
+
+    pub fn identity(&self) -> Result<positron_governance::Identity, Box<dyn Error>> {
+        let snapshot = self.catalog.pin()?;
+        positron_governance::Identity::open(&snapshot)
+            .map_err(|_| "governance identity missing from fixture catalog".into())
     }
 
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {

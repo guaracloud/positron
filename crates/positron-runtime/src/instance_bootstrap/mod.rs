@@ -7,6 +7,8 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "test-support")]
+pub use types::GovernanceTestFixture;
 pub use types::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
     InitializationPlan, InitializedInstance,

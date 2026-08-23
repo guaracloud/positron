@@ -610,6 +610,16 @@ fn exact_result_limit_stops_before_decoding_a_later_committed_block() -> Result<
     assert_eq!(result.records().len(), 1);
     assert!(!result.complete());
     assert_eq!(result.scanned_bytes(), first_block_bytes);
+
+    let one_byte_short = LogStore::new().scan(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?).with_scanned_bytes(first_block_bytes - 1),
+    )?;
+    assert!(one_byte_short.records().is_empty());
+    assert!(!one_byte_short.complete());
+    assert_eq!(one_byte_short.scanned_bytes(), 0);
     Ok(())
 }
 

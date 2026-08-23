@@ -75,7 +75,7 @@ impl QueryFixtureForAxis {
             RequestedIntent::Query,
             CompatibilityHints::none(),
         )?;
-        let governance = instance.governance_object_for_test()?;
+        let governance = instance.governance_fixture_for_test()?;
         let kernel = Box::leak(Box::new(KernelFixture::new_with_identity(
             instance.default_tenant_id(),
             "event-time-cursor-kernel",
@@ -88,6 +88,7 @@ impl QueryFixtureForAxis {
             kernel.ledger()?,
             1,
             TestClock::shared(100),
+            kernel.identity()?,
         );
         let source = format!("logs | range {axis} -100 100 | limit 2");
         let plan = service.plan_pipeline(

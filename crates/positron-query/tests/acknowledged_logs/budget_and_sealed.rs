@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_query::{
-    QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+    QueryBudget, QueryBudgetDimension, QueryCursor, QueryEvent, QueryFailureCode, QueryService,
+    QueryTerminal,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
@@ -16,6 +17,206 @@ use super::support::{
 
 #[path = "budget_and_sealed/runtime_boundaries.rs"]
 mod runtime_boundaries;
+
+#[test]
+fn scanned_bytes_are_atomic_across_normal_page_resume_and_exact_minus_one()
+-> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("scan-budget-normal")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    fixture.kernel.append_log("two", 21, 2)?;
+    let snapshot = fixture.kernel.ledger()?.snapshot()?;
+    let first_block_bytes = u64::try_from(
+        snapshot
+            .blocks()
+            .first()
+            .ok_or("first block missing")?
+            .payload()
+            .len(),
+    )?;
+    let block_bytes = snapshot
+        .blocks()
+        .iter()
+        .try_fold(0_u64, |total, block| {
+            total.checked_add(u64::try_from(block.payload().len()).ok()?)
+        })
+        .ok_or("scan byte fixture overflowed")?;
+    let budget = QueryBudget::new(block_bytes, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let service = fixture.service(1)?;
+    let first = service
+        .execute_page(service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 2",
+            budget,
+        )?)?
+        .collect::<Vec<_>>();
+    let cursor = continued_cursor(&first)?;
+    let resumed = service.resume(fixture.context, cursor)?.collect::<Vec<_>>();
+    assert!(
+        !resumed
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        resumed.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.stats().scanned_bytes() == block_bytes
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::ScannedBytes)
+    ));
+
+    let short_budget = QueryBudget::new(block_bytes - 1, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let short = service
+        .execute(service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 2",
+            short_budget,
+        )?)?
+        .collect::<Vec<_>>();
+    assert!(
+        !short
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        short.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.stats().scanned_bytes() == first_block_bytes
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::ScannedBytes)
+    ));
+    Ok(())
+}
+
+#[test]
+fn scanned_bytes_are_atomic_across_schema_text() -> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("scan-budget-text")?;
+    let schema = fixture
+        .kernel
+        .append_indexed_text_logs(vec!["needle one", "needle two"], 1)?;
+    let block_bytes = u64::try_from(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot()?
+            .blocks()
+            .first()
+            .ok_or("text block missing")?
+            .payload()
+            .len(),
+    )?;
+    let budget = QueryBudget::new(block_bytes, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let service = fixture.service(1)?;
+    let source =
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"needle\" | limit 2";
+    let first = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        first.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.scanned_bytes() == block_bytes
+    ));
+    let short_budget = QueryBudget::new(block_bytes - 1, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let short = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, short_budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(
+        !short
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        short.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.stats().scanned_bytes() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::ScannedBytes)
+    ));
+    Ok(())
+}
+
+#[test]
+fn scanned_bytes_are_atomic_across_schema_attribute() -> Result<(), Box<dyn Error>> {
+    use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
+    use positron_policy::NativeLogAttribute;
+    use positron_signals::SchemaPath;
+
+    let fixture = super::terminal_and_bounds::QueryFixture::new("scan-budget-schema")?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "indexed".to_owned())?;
+    let schema = fixture.kernel.append_indexed_attribute_logs(
+        vec![
+            (
+                Some(20),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Record,
+                    "indexed".to_owned(),
+                    vec![CandidateAttributeValue::string("one".to_owned())],
+                )],
+            ),
+            (
+                Some(21),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Record,
+                    "indexed".to_owned(),
+                    vec![CandidateAttributeValue::string("one".to_owned())],
+                )],
+            ),
+        ],
+        1,
+        &path,
+    )?;
+    let block_bytes = u64::try_from(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot()?
+            .blocks()
+            .first()
+            .ok_or("schema block missing")?
+            .payload()
+            .len(),
+    )?;
+    let budget = QueryBudget::new(block_bytes, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let service = fixture.service(1)?;
+    let source = r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("one") | limit 2"#;
+    let first = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        first.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
+            if stats.scanned_bytes() == block_bytes
+    ));
+    let short_budget = QueryBudget::new(block_bytes - 1, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let short = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, short_budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(
+        !short
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        short.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.stats().scanned_bytes() == 0
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::ScannedBytes)
+    ));
+    Ok(())
+}
 
 #[test]
 fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dyn Error>> {
@@ -31,7 +232,7 @@ fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dy
     let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "default-fitting-cpu-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("normal", 20, 1)?;
     let meter = StageCountingWorkMeter::shared();
@@ -41,6 +242,7 @@ fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dy
         1,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+        fixture.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
     let query = service.plan_pipeline(
@@ -77,11 +279,15 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
     let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "budget-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("larger-than-the-scan-budget", 20, 1)?;
-    let service =
-        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
+    let service = super::support::zero_work_service(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        100,
+        fixture.identity()?,
+    );
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 1",
@@ -124,7 +330,7 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
     let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "atomic-decoded-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_logs(
         vec![
@@ -145,6 +351,7 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         16,
         TestClock::shared(100),
         std::sync::Arc::new(super::support::ConstantWorkMeter(1)),
+        fixture.identity()?,
     );
     let query = service.plan_pipeline(
         context,
@@ -214,6 +421,7 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         16,
         TestClock::shared(2_000_000_000),
         std::sync::Arc::clone(&meter) as std::sync::Arc<dyn positron_query::QueryWorkMeter>,
+        fixture.identity()?,
     );
     let cancelling = cancelling_service.plan_pipeline(
         context,
@@ -254,7 +462,7 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
     let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "runtime-budget-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("bounded", 20, 1)?;
     let cpu_budget =
@@ -266,6 +474,7 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
         16,
         clock,
         std::sync::Arc::new(TestWorkMeter),
+        fixture.identity()?,
     );
     let before = fixture.authority.governor().inspect()?;
     let planned = service.plan_pipeline(
@@ -294,6 +503,7 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
         fixture.ledger()?,
         16,
         StepClock::shared(200),
+        fixture.identity()?,
     );
     let planned = wall_service.plan_pipeline(
         context,
@@ -326,7 +536,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
     let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "cumulative-budget-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("one", 20, 1)?;
     fixture.append_log("two", 21, 2)?;
@@ -336,6 +546,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
         fixture.ledger()?,
         1,
         clock.clone(),
+        fixture.identity()?,
     );
     let planned = service.plan_pipeline(
         context,
@@ -384,12 +595,16 @@ fn resume_uses_the_remaining_decoded_record_budget_before_scanning() -> Result<(
     let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "cumulative-decoded-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("one", 20, 1)?;
     fixture.append_log("two", 21, 2)?;
-    let service =
-        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 1);
+    let service = super::support::zero_work_service(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        1,
+        fixture.identity()?,
+    );
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
@@ -431,13 +646,17 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     let mut fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "sealed-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("sealed", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active", 21, 2)?;
-    let service =
-        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
+    let service = super::support::zero_work_service(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        100,
+        fixture.identity()?,
+    );
     let query = service.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
@@ -461,8 +680,12 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     assert_eq!(first, ["sealed", "active"]);
 
     fixture.seal_and_reopen()?;
-    let restarted =
-        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
+    let restarted = super::support::zero_work_service(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        100,
+        fixture.identity()?,
+    );
     let query = restarted.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
@@ -501,13 +724,17 @@ fn full_text_search_keeps_active_and_sealed_results_equivalent() -> Result<(), B
     let mut fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "sealed-search-kernel",
-        &instance.governance_object_for_test()?,
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("sealed timeout", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active timeout", 21, 2)?;
-    let service =
-        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let service = super::support::zero_work_service(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        16,
+        fixture.identity()?,
+    );
     let source = "pipeline:v1 logs | range query_time -100 100 | search body contains \"timeout\" | limit 16";
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     let first = service
@@ -528,8 +755,12 @@ fn full_text_search_keeps_active_and_sealed_results_equivalent() -> Result<(), B
     assert_eq!(first, ["sealed timeout", "active timeout"]);
 
     fixture.seal_and_reopen()?;
-    let restarted =
-        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
+    let restarted = super::support::zero_work_service(
+        fixture.authority.governor(),
+        fixture.ledger()?,
+        16,
+        fixture.identity()?,
+    );
     let after_restart = restarted
         .execute(restarted.plan_pipeline(context, source, budget)?)?
         .filter_map(|event| match event {
@@ -557,4 +788,14 @@ fn bootstrap_paths(label: &str) -> Result<(TemporaryRoots, BootstrapPaths), Box<
         positron_kernel::MountQualification::LocalHost,
     )?;
     Ok((roots, paths))
+}
+
+fn continued_cursor(events: &[QueryEvent]) -> Result<&QueryCursor, Box<dyn Error>> {
+    events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or_else(|| format!("continued cursor missing: {events:?}").into())
 }

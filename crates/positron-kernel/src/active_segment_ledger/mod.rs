@@ -82,13 +82,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.catalog.control_tokens()
     }
 
-    /// Pins the current immutable governance Catalog for authorization
-    /// revalidation. The ledger does not retain or interpret this view.
-    pub fn catalog_snapshot(&self) -> Result<crate::CatalogSnapshot, LedgerFailure> {
-        self.catalog
-            .pin()
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))
-    }
     pub fn open(
         authority: &'kernel StorageKernelResourceAuthority,
         catalog: &'catalog Catalog<'kernel>,

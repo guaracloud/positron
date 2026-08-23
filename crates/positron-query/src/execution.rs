@@ -104,6 +104,15 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
+        let scanned_remaining = framed!(
+            state
+                .budget
+                .scanned_bytes()
+                .checked_sub(state.scanned_bytes)
+                .ok_or_else(|| {
+                    QueryFailure::budget_exhausted(crate::QueryBudgetDimension::ScannedBytes)
+                })
+        );
         let scan_limit = framed!(
             usize::try_from(decoded_remaining)
                 .ok()
@@ -156,7 +165,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 self.governor,
                 state.tenant,
                 snapshot,
-                LogScan::through(scan_limit, frontier),
+                LogScan::through(scan_limit, frontier).with_scanned_bytes(scanned_remaining),
                 schema,
                 candidate,
                 &state.cancellation,
@@ -166,7 +175,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 self.governor,
                 state.tenant,
                 snapshot,
-                LogScan::through(scan_limit, frontier),
+                LogScan::through(scan_limit, frontier).with_scanned_bytes(scanned_remaining),
                 schema,
                 query,
                 &state.cancellation,
@@ -176,7 +185,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 self.governor,
                 state.tenant,
                 snapshot,
-                LogScan::through(scan_limit, frontier),
+                LogScan::through(scan_limit, frontier).with_scanned_bytes(scanned_remaining),
                 &state.cancellation,
                 &observer,
             ),
@@ -198,8 +207,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let wall_exhausted = framed!(self.observe_state(&mut state));
         if wall_exhausted || limiting_budget(&state).is_some() || !result.complete() {
-            let dimension =
-                limiting_budget(&state).unwrap_or(crate::QueryBudgetDimension::DecodedRecords);
+            let dimension = limiting_budget(&state).unwrap_or_else(|| {
+                if result.scanned_bytes_limited() {
+                    crate::QueryBudgetDimension::ScannedBytes
+                } else {
+                    crate::QueryBudgetDimension::DecodedRecords
+                }
+            });
             return self.failed_page(
                 Some(header),
                 QueryFailure::budget_exhausted(dimension),

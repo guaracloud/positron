@@ -8,6 +8,8 @@ use positron_kernel::{
     BootstrapKeyCustody, Catalog, InstanceBootstrapStorage, InstanceId, MountQualification,
     OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
+#[cfg(feature = "test-support")]
+use positron_kernel::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +164,71 @@ pub struct InitializedInstance {
     pub(super) claim_available: bool,
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct GovernanceTestFixture {
+    object: Vec<u8>,
+}
+
+#[cfg(feature = "test-support")]
+impl GovernanceTestFixture {
+    fn new(object: &[u8]) -> Result<Self, BootstrapFailure> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(object.len())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        owned.extend_from_slice(object);
+        Ok(Self { object: owned })
+    }
+
+    pub fn install_into(&self, catalog: &Catalog<'_>) -> Result<(), BootstrapFailure> {
+        let basis = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(
+                usize::try_from(basis.number())
+                    .ok()
+                    .and_then(|number| number.checked_add(1))
+                    .ok_or_else(|| {
+                        BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
+                    })?,
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        for object_id in basis.object_identities() {
+            let object = basis
+                .object(object_id)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+                .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            objects.push(
+                CatalogObject::new(object.to_vec()).map_err(|_| {
+                    BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
+                })?,
+            );
+        }
+        objects.push(
+            CatalogObject::new(self.object.clone())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?,
+        );
+        catalog
+            .commit(
+                basis.identity(),
+                CatalogProposal::new(
+                    TransactionId::new([0x41; 16]).map_err(|_| {
+                        BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable)
+                    })?,
+                    FormatEpoch::CATALOG_V1,
+                    objects,
+                )
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+}
+
 impl std::fmt::Debug for InitializedInstance {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -191,11 +258,11 @@ impl InitializedInstance {
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
     }
 
-    /// Returns the authenticated governance object for an external durable
-    /// Catalog test fixture. The object remains opaque to runtime callers; the
-    /// canonical Identity decoder remains the only reader of its fields.
+    /// Returns a typed governed fixture capability for external integration
+    /// tests. The authenticated Catalog object never crosses this boundary.
     #[doc(hidden)]
-    pub fn governance_object_for_test(&self) -> Result<Vec<u8>, BootstrapFailure> {
+    #[cfg(feature = "test-support")]
+    pub fn governance_fixture_for_test(&self) -> Result<GovernanceTestFixture, BootstrapFailure> {
         let secret = self
             .key
             .catalog_secret(self.instance)
@@ -214,12 +281,7 @@ impl InitializedInstance {
                     || object.starts_with(b"POSGOV02")
                     || object.starts_with(b"POSGOV03"))
             {
-                let mut owned = Vec::new();
-                owned.try_reserve_exact(object.len()).map_err(|_| {
-                    BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
-                })?;
-                owned.extend_from_slice(object);
-                return Ok(owned);
+                return GovernanceTestFixture::new(object);
             }
         }
         Err(BootstrapFailure::new(

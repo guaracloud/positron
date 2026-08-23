@@ -21,12 +21,14 @@ use codec::{
     decode_initial_identity,
 };
 
+#[derive(Clone)]
 struct IngestIdentity {
     principal: PrincipalId,
     salt: [u8; 32],
     hash: [u8; 32],
 }
 
+#[derive(Clone)]
 struct QueryIdentity {
     principal: PrincipalId,
     salt: [u8; 32],
@@ -34,6 +36,7 @@ struct QueryIdentity {
 }
 
 /// The sole immutable identity view reconstructed from one Catalog Generation.
+#[derive(Clone)]
 pub struct Identity {
     instance: [u8; 16],
     generation: u64,
@@ -205,6 +208,15 @@ impl Identity {
             return Err(AttributionFailure);
         }
         Ok(())
+    }
+
+    /// Revalidates a previously attributed query context against the current
+    /// durable identity and lifecycle authority.
+    pub fn revalidate_query_context(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<(), AttributionFailure> {
+        self.validate_query_context(context)
     }
 
     /// Authorizes the narrow read-only governance view without introducing a

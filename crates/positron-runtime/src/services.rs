@@ -296,6 +296,12 @@ impl ServiceHandle {
                 .map_err(|_| ServiceFailure::KeyUnavailable)?,
         )
         .map_err(|_| ServiceFailure::StorageUnavailable)?;
+        let identity = positron_governance::Identity::open(
+            &catalog
+                .pin()
+                .map_err(|_| ServiceFailure::StorageUnavailable)?,
+        )
+        .map_err(|_| ServiceFailure::StorageUnavailable)?;
         let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
         let protection = instance
             .key
@@ -303,7 +309,7 @@ impl ServiceHandle {
             .map_err(|_| ServiceFailure::KeyUnavailable)?;
         let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
             .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        let service = QueryService::new(instance._authority.governor(), &ledger, 100);
+        let service = QueryService::new(instance._authority.governor(), &ledger, 100, identity);
         let query = service
             .plan_pipeline(context, source, budget)
             .map_err(|_| ServiceFailure::InvalidRequest)?;

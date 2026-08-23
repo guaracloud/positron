@@ -77,6 +77,7 @@ fn malformed_and_over_limit_transforms_fail_closed_with_stable_query_errors()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        fixture.kernel.identity()?,
     );
     for source in [
         "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
@@ -97,6 +98,7 @@ fn malformed_and_over_limit_transforms_fail_closed_with_stable_query_errors()
         oversized_fixture.kernel.authority.governor(),
         oversized_fixture.kernel.ledger()?,
         16,
+        oversized_fixture.kernel.identity()?,
     );
     let query = oversized_service.plan_pipeline(
         oversized_fixture.context,
@@ -115,6 +117,7 @@ fn malformed_and_over_limit_transforms_fail_closed_with_stable_query_errors()
         entries_fixture.kernel.authority.governor(),
         entries_fixture.kernel.ledger()?,
         16,
+        entries_fixture.kernel.identity()?,
     );
     let query = entries_service.plan_pipeline(
         entries_fixture.context,
@@ -135,6 +138,7 @@ fn transform_work_is_cumulative_and_cancellation_is_prompt() -> Result<(), Box<d
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        fixture.kernel.identity()?,
     );
     let budget =
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(8)?;
@@ -163,6 +167,7 @@ fn transform_work_is_cumulative_and_cancellation_is_prompt() -> Result<(), Box<d
         16,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+        cancelling.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         cancelling.context,
@@ -343,6 +348,7 @@ fn transformed_predicate_cancellation_releases_transformed_memory() -> Result<()
         16,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,

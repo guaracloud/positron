@@ -249,19 +249,20 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 }
                 previous
             };
-            let marker_basis = self.catalog.pin()?;
+            let marker_basis = match self.catalog.pin() {
+                Ok(basis) => basis,
+                Err(_) => {
+                    rollback_marker_resize(&mut state, identity, previous_amounts)?;
+                    return Err(LedgerFailure::new(LedgerFailureCode::StorageUnavailable));
+                },
+            };
             if let Err(failure) = publish_many(
                 self.catalog,
                 &marker_basis,
                 &BTreeSet::from([identity]),
                 vec![encoded],
             ) {
-                if let Some(reservation) = state.lease_reservations.get_mut(&identity)
-                    && reservation.granted() != previous_amounts
-                    && reservation.try_resize(previous_amounts).is_err()
-                {
-                    return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
-                }
+                rollback_marker_resize(&mut state, identity, previous_amounts)?;
                 return Err(failure);
             }
             state.lease_resume_markers.insert(
@@ -358,6 +359,23 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         *record = normalized;
         Ok(())
     }
+}
+
+fn rollback_marker_resize(
+    state: &mut super::state::LedgerState<'_>,
+    identity: SnapshotLeaseId,
+    previous_amounts: crate::ResourceAmounts,
+) -> Result<(), LedgerFailure> {
+    let reservation = state
+        .lease_reservations
+        .get_mut(&identity)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+    if reservation.granted() != previous_amounts {
+        reservation
+            .try_resize(previous_amounts)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+    }
+    Ok(())
 }
 
 fn snapshot_from_record<'kernel>(

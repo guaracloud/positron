@@ -180,15 +180,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         };
         let source = std::str::from_utf8(&source)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        let mut plan = match language {
-            crate::query_service::QueryLanguage::Pipeline => {
-                crate::service::parse_pipeline(source, memory)?
-            },
-            crate::query_service::QueryLanguage::Sql => crate::service::parse_sql(source, memory)?,
-        };
-        let parser_retained = memory.take_retained();
+        let (plan, plan_reservation, compile_work) =
+            self.compile_plan(source, language, memory, state.budget)?;
         charge_work(state, self.work_units(crate::QueryWorkStage::Parse)?)?;
-        let compile_work = plan.search_compile_work_units();
         if compile_work > 0 {
             let unit = self.work_units(crate::QueryWorkStage::Parse)?;
             charge_work(
@@ -198,44 +192,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 })?,
             )?;
         }
-        plan.compile_search()?;
-        if plan.limit() == 0 || plan.limit() > 1_024 {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
-        }
-        if u64::from(plan.limit()) > state.budget.output_rows() {
-            return Err(QueryFailure::for_budget(
-                QueryFailureCode::InvalidBudget,
-                crate::QueryBudgetDimension::OutputRows,
-            ));
-        }
-        if plan
-            .temporal_range()
-            .duration()
-            .is_none_or(|duration| duration > state.budget.maximum_time_range_nanoseconds())
-        {
-            return Err(QueryFailure::for_budget(
-                QueryFailureCode::InvalidBudget,
-                crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds,
-            ));
-        }
-        let retained = plan.retained_memory_bytes()?;
-        if retained
-            .checked_add(plan.search_memory_bytes())
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
-            > state.budget.memory_bytes()
-        {
-            return Err(QueryFailure::for_budget(
-                QueryFailureCode::InvalidBudget,
-                crate::QueryBudgetDimension::MemoryBytes,
-            ));
-        }
-        let retained_plan_bytes = retained
-            .checked_sub(parser_retained.bytes())
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        let plan_reservation = memory.reserve(retained_plan_bytes)?;
-        drop(parser_retained);
-        plan.compile_search()?;
-        let digest = plan.canonical_digest(&self.ledger.control_tokens(), memory)?;
+        let digest = plan.canonical_digest(&self.ledger.control_tokens())?;
         if state.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }

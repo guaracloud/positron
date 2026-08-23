@@ -4,6 +4,7 @@ use positron_governance::{CompatibilityHints, PresentedCredential, RequestedInte
 use positron_query::{
     QueryBudget, QueryCursor, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
 };
+use positron_runtime::GovernanceTestFixture;
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
 use super::support::{KernelFixture, TemporaryRoots, TestClock};
@@ -28,7 +29,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let governance = instance.governance_object_for_test()?;
+    let governance = instance.governance_fixture_for_test()?;
     let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "cursor-kernel",
@@ -42,6 +43,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
         fixture.ledger()?,
         1,
         clock.clone(),
+        fixture.identity()?,
     );
     let plan = service.plan_pipeline(
         context,
@@ -59,6 +61,7 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
         fixture.ledger()?,
         1,
         clock.clone(),
+        fixture.identity()?,
     )
     .resume(context, &cursor)?;
     let resumed_events = resumed.by_ref().take(2).collect::<Vec<_>>();
@@ -174,6 +177,7 @@ fn resume_admits_before_reconstructing_the_authenticated_plan() -> Result<(), Bo
         std::sync::Arc::new(super::support::FailingStageWorkMeter(
             positron_query::QueryWorkStage::Parse,
         )),
+        fixture.kernel.identity()?,
     );
     let failure = match service.resume(fixture.context, &fixture.cursor) {
         Err(failure) => failure,
@@ -205,6 +209,7 @@ fn terminal_stats_report_cumulative_resume_and_repeat_state() -> Result<(), Box<
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
+        fixture.kernel.identity()?,
     );
     let mut first = service.resume(fixture.context, &fixture.cursor)?;
     assert!(matches!(first.next(), Some(QueryEvent::Header(_))));
@@ -248,6 +253,7 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
+        fixture.kernel.identity()?,
     )
     .resume(fixture.context, &cursor)?;
     let first_retry_header = first_retry.next().ok_or("retry header missing")?;
@@ -262,6 +268,7 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
+        fixture.kernel.identity()?,
     )
     .resume(fixture.context, &cursor)?;
     assert_eq!(second_retry.next(), Some(first_retry_header));
@@ -273,6 +280,7 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
+        fixture.kernel.identity()?,
     )
     .resume(fixture.context, &cursor)?
     .collect::<Vec<_>>();
@@ -628,7 +636,12 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
         "cursor-frontier-regression",
         &governance,
     )?;
-    let behind = super::support::zero_work_service(empty.authority.governor(), empty.ledger()?, 1);
+    let behind = super::support::zero_work_service(
+        empty.authority.governor(),
+        empty.ledger()?,
+        1,
+        empty.identity()?,
+    );
     assert_eq!(
         behind
             .resume(fixture.context, &fixture.cursor)
@@ -677,6 +690,7 @@ fn resume_clock_failure_is_reported_before_lease_reacquisition() -> Result<(), B
         fixture.kernel.ledger()?,
         1,
         std::sync::Arc::new(super::support::FailingClock),
+        fixture.kernel.identity()?,
     );
     assert_eq!(
         service
@@ -985,7 +999,7 @@ struct CursorFixture {
     administrator: positron_governance::AuthorizedContext,
     cursor: positron_query::QueryCursor,
     clock: std::sync::Arc<TestClock>,
-    governance: Vec<u8>,
+    governance: GovernanceTestFixture,
 }
 
 impl CursorFixture {
@@ -1009,7 +1023,7 @@ impl CursorFixture {
             RequestedIntent::SystemAdministration,
             CompatibilityHints::none(),
         )?;
-        let governance = instance.governance_object_for_test()?;
+        let governance = instance.governance_fixture_for_test()?;
         let kernel = KernelFixture::new_with_identity(
             instance.default_tenant_id(),
             "cursor-failure-kernel",
@@ -1023,6 +1037,7 @@ impl CursorFixture {
             kernel.ledger()?,
             1,
             clock.clone(),
+            kernel.identity()?,
         );
         let plan = service.plan_pipeline(
             context,
@@ -1050,6 +1065,7 @@ impl CursorFixture {
             self.kernel.ledger().expect("fixture ledger"),
             1,
             self.clock.clone(),
+            self.kernel.identity().expect("fixture identity"),
         )
     }
 }

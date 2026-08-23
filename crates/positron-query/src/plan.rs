@@ -347,7 +347,6 @@ impl LogicalPlan {
     pub(crate) fn canonical_digest(
         &self,
         protector: &ControlTokenProtector<'_>,
-        _memory: &crate::planning_memory::PlanningMemory,
     ) -> Result<[u8; 32], crate::QueryFailure> {
         let mut canonical = CanonicalBuffer::new();
         write!(

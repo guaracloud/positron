@@ -20,6 +20,7 @@ fn parser_scratch_and_retained_output_have_exact_memory_boundaries() -> Result<(
         json_fixture.kernel.authority.governor(),
         json_fixture.kernel.ledger()?,
         16,
+        json_fixture.kernel.identity()?,
     );
     let json_query = |memory| {
         let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, memory, 60)
@@ -63,6 +64,7 @@ fn parser_scratch_and_retained_output_have_exact_memory_boundaries() -> Result<(
         logfmt_fixture.kernel.authority.governor(),
         logfmt_fixture.kernel.ledger()?,
         16,
+        logfmt_fixture.kernel.identity()?,
     );
     let logfmt_query = |memory| {
         let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, memory, 60)
@@ -114,6 +116,7 @@ fn json_validation_charges_candidate_and_canonical_capacity_at_exact_boundary()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        fixture.kernel.identity()?,
     );
     let budget = |memory| {
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, memory, 60)
@@ -201,6 +204,7 @@ fn nested_json_parser_allocations_are_admitted_before_the_final_value() -> Resul
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
+        fixture.kernel.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, parser_memory, 60)?
         .with_cpu_work_units(1_024)?;
@@ -270,6 +274,7 @@ fn cast_string_peak_uses_retained_capacity_for_1024_records() -> Result<(), Box<
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1_024,
+        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,

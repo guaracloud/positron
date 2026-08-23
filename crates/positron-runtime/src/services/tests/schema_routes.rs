@@ -92,7 +92,12 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
     let scope = SegmentScope::new(initialized.tenant, SignalKind::Logs, initialized.logs_shard);
     let protection = initialized.key.segment_key(initialized.instance, scope)?;
     let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)?;
-    let query_service = QueryService::new(initialized.resource_governor(), &ledger, 100);
+    let query_service = QueryService::new(
+        initialized.resource_governor(),
+        &ledger,
+        100,
+        initialized.identity.clone(),
+    );
     let context = initialized.attribute(
         PresentedCredential::parse(&query_secret)?,
         RequestedIntent::Query,
@@ -189,7 +194,12 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             RequestedIntent::Query,
             CompatibilityHints::none(),
         )?;
-        let service = QueryService::new(initialized.resource_governor(), &ledger, 1);
+        let service = QueryService::new(
+            initialized.resource_governor(),
+            &ledger,
+            1,
+            initialized.identity.clone(),
+        );
         let query = service.plan_pipeline(
             context,
             "logs | range query_time 0 100 | limit 2",
@@ -236,6 +246,7 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
         );
 
         let reopened_catalog = open_catalog(&initialized)?;
+        let reopened_identity = positron_governance::Identity::open(&reopened_catalog.pin()?)?;
         let reopened_protection = initialized.key.segment_key(initialized.instance, scope)?;
         let reopened_ledger = ActiveSegmentLedger::open(
             &initialized._authority,
@@ -243,8 +254,12 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             scope,
             reopened_protection,
         )?;
-        let resumed_service =
-            QueryService::new(initialized.resource_governor(), &reopened_ledger, 1);
+        let resumed_service = QueryService::new(
+            initialized.resource_governor(),
+            &reopened_ledger,
+            1,
+            reopened_identity,
+        );
         let before = initialized
             .resource_governor()
             .inspect()?

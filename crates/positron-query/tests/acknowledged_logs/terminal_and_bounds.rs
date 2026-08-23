@@ -142,6 +142,7 @@ fn paged_execution_rejects_zero_batch_and_expiry_overflow_before_work() -> Resul
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(u64::MAX),
+        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -168,6 +169,7 @@ fn paged_execution_classifies_elapsed_deadlines_before_snapshot_mutation()
             fixture.kernel.ledger()?,
             1,
             SequenceClock::shared([100, 100, execute_at]),
+            fixture.kernel.identity()?,
         );
         let before_resources = fixture.kernel.authority.governor().inspect()?;
         let before_snapshot = fixture.kernel.ledger()?.snapshot()?;
@@ -210,6 +212,7 @@ fn paged_execution_classifies_elapsed_deadlines_before_snapshot_mutation()
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
+        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -868,7 +871,7 @@ impl QueryFixture {
             RequestedIntent::SystemAdministration,
             CompatibilityHints::none(),
         )?;
-        let governance = instance.governance_object_for_test()?;
+        let governance = instance.governance_fixture_for_test()?;
         let kernel =
             KernelFixture::new_with_identity(instance.default_tenant_id(), label, &governance)?;
         Ok(Self {
@@ -887,6 +890,7 @@ impl QueryFixture {
             self.kernel.authority.governor(),
             self.kernel.ledger()?,
             batch_limit,
+            self.kernel.identity()?,
         ))
     }
 }

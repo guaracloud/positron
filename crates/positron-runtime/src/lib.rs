@@ -13,6 +13,8 @@ mod services;
 mod task;
 
 pub use health::{HealthState, Liveness, ProcessPhase, Readiness};
+#[cfg(feature = "test-support")]
+pub use instance_bootstrap::GovernanceTestFixture;
 pub use instance_bootstrap::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
     InitializationPlan, InitializedInstance, InstanceBootstrap,

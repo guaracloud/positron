@@ -97,10 +97,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
     )
     .expect("fixture source parses");
     let plan_digest = parsed_plan
-        .canonical_digest(
-            &protector,
-            &planning_memory::PlanningMemory::new(budget.memory_bytes()),
-        )
+        .canonical_digest(&protector)
         .expect("fixture plan digest is bounded");
     let state = cursor::CursorState {
         principal,
@@ -167,10 +164,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
     .expect("fixture source parses");
     assert_eq!(parsed.limit(), decoded.plan.limit());
     let decoded_digest = parsed
-        .canonical_digest(
-            &protector,
-            &planning_memory::PlanningMemory::new(decoded.budget.memory_bytes()),
-        )
+        .canonical_digest(&protector)
         .expect("decoded plan digest is bounded");
     assert_eq!(decoded_digest, decoded.plan_digest);
 
