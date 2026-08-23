@@ -1,4 +1,5 @@
 use super::*;
+use crate::ResourceDimension;
 
 #[test]
 fn snapshot_lease_pins_exact_visibility_across_append_restart_release_and_expiry()
@@ -512,6 +513,25 @@ fn marked_snapshot_lease_persists_ambiguous_resume_counts_across_restart()
         let third = reopened.resume_snapshot_lease_with_marker(identity, 103, 1, [9; 32])?;
         assert_eq!(third.resume_count(), 3);
         assert_eq!(third.repeated_batch_count(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_snapshot_lease_reserves_its_added_persistent_metadata() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let before = authority.governor().inspect()?;
+        let marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        drop(marked);
+        let after = authority.governor().inspect()?;
+        assert_eq!(
+            after.usage(ResourceDimension::MemoryBytes)
+                - before.usage(ResourceDimension::MemoryBytes),
+            56
+        );
         Ok(())
     })
 }

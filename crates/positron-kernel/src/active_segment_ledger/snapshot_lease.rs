@@ -229,13 +229,40 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             updated.last_resume_sequence = Some(sequence);
             updated.last_resume_prior_digest = prior_digest;
             let encoded = encode(&updated)?;
+            let amounts = lease_claim(encoded.len())?;
+            let previous_amounts = {
+                let reservation = state
+                    .lease_reservations
+                    .get_mut(&identity)
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+                let previous = reservation.granted();
+                if previous != amounts {
+                    reservation.try_resize(amounts).map_err(|_| {
+                        LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused)
+                    })?;
+                }
+                previous
+            };
             let marker_basis = self.catalog.pin()?;
-            publish_many(
+            if let Err(failure) = publish_many(
                 self.catalog,
                 &marker_basis,
                 &BTreeSet::from([identity]),
                 vec![encoded],
-            )?;
+            ) {
+                let rollback =
+                    state
+                        .lease_reservations
+                        .get_mut(&identity)
+                        .and_then(|reservation| {
+                            (reservation.granted() != previous_amounts)
+                                .then(|| reservation.try_resize(previous_amounts))
+                        });
+                if rollback.is_some_and(|result| result.is_err()) {
+                    return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
+                }
+                return Err(failure);
+            }
             state.lease_resume_markers.insert(
                 identity,
                 super::snapshot_lease_record::LeaseResumeMarker {
