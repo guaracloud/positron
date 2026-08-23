@@ -48,6 +48,54 @@ pub enum ObservedValueFailure<E> {
     Observer(E),
 }
 
+/// Validated value plus the bounded facts needed to transfer it between
+/// domain and query ownership. The facts are produced during validation so a
+/// caller does not need to traverse the value again merely to size it.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ObservedValueTransfer {
+    pub(super) value: ValidatedAttributeValue,
+    pub(super) value_size_bytes: usize,
+    pub(super) retained_heap_bytes: usize,
+}
+
+impl ObservedValueTransfer {
+    pub(super) const fn new(
+        value: ValidatedAttributeValue,
+        value_size_bytes: usize,
+        retained_heap_bytes: usize,
+    ) -> Self {
+        Self {
+            value,
+            value_size_bytes,
+            retained_heap_bytes,
+        }
+    }
+
+    /// Returns the validated value while transferring ownership to the caller.
+    #[must_use]
+    pub fn into_value(self) -> ValidatedAttributeValue {
+        self.value
+    }
+
+    /// Returns the profile-transfer value size measured during validation.
+    #[must_use]
+    pub const fn value_size_bytes(&self) -> usize {
+        self.value_size_bytes
+    }
+
+    /// Returns retained heap bytes measured during validation.
+    #[must_use]
+    pub const fn retained_heap_bytes(&self) -> usize {
+        self.retained_heap_bytes
+    }
+
+    /// Borrows the validated value without starting another traversal.
+    #[must_use]
+    pub const fn value(&self) -> &ValidatedAttributeValue {
+        &self.value
+    }
+}
+
 impl<E> From<DomainFailure> for ObservedValueFailure<E> {
     fn from(failure: DomainFailure) -> Self {
         Self::Domain(failure)

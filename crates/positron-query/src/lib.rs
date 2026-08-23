@@ -102,13 +102,32 @@ pub fn fuzz_query_transforms(data: &[u8]) {
     let profile = positron_domain::value::ValueLimitProfile::release_1_system_maximum();
     if data.len() > transform::MAX_TRANSFORM_INPUT_BYTES {
         let candidate = positron_domain::value::CandidateAttributeValue::string(source.to_owned());
-        let failure = candidate
-            .validate_log_body(profile)
-            .expect_err("oversized transform input must be rejected by the value limit");
-        assert_eq!(
-            failure.code(),
-            positron_domain::outcome::DomainFailureCode::ValueLimitExceeded
-        );
+        let value = match candidate.validate_log_body(profile) {
+            Ok(value) => value,
+            Err(failure) => {
+                assert_eq!(
+                    failure.code(),
+                    positron_domain::outcome::DomainFailureCode::ValueLimitExceeded
+                );
+                return;
+            },
+        };
+        for transform in [
+            transform::BodyTransform::Json,
+            transform::BodyTransform::Logfmt,
+            transform::BodyTransform::Cast(transform::CastTarget::String),
+            transform::BodyTransform::Cast(transform::CastTarget::Integer),
+            transform::BodyTransform::Cast(transform::CastTarget::Float),
+            transform::BodyTransform::Cast(transform::CastTarget::Boolean),
+        ] {
+            let mut observer = Unobserved;
+            let result = transform.apply_with_facts(&value, &mut observer);
+            assert!(matches!(
+                result,
+                Err(failure)
+                    if failure.code() == QueryFailureCode::UnsupportedQuery
+            ));
+        }
         return;
     }
     let mut bits = [0_u8; 8];

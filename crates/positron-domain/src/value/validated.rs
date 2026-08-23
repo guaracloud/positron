@@ -299,26 +299,6 @@ impl ValidatedAttributeValue {
         }
     }
 
-    pub(crate) fn value_size_bytes(&self) -> Result<usize, DomainFailure> {
-        match &self.inner {
-            ValidatedAttributeValueInner::Null => Ok(0),
-            ValidatedAttributeValueInner::Boolean(_) => Ok(1),
-            ValidatedAttributeValueInner::SignedInteger(_)
-            | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(8),
-            ValidatedAttributeValueInner::String(value) => Ok(value.len()),
-            ValidatedAttributeValueInner::Bytes(value) => Ok(value.len()),
-            ValidatedAttributeValueInner::Array(values) => {
-                values.iter().try_fold(0_usize, |total, value| {
-                    checked_decoded_add(total, value.value_size_bytes()?)
-                })
-            },
-            ValidatedAttributeValueInner::KeyValueList(values) => {
-                values.iter().try_fold(0_usize, |total, entry| {
-                    checked_decoded_add(total, entry.value.value_size_bytes()?)
-                })
-            },
-        }
-    }
 }
 
 fn try_string(value: &str) -> Result<String, DomainFailure> {

@@ -182,6 +182,44 @@ fn parser_scratch_and_retained_output_have_exact_memory_boundaries() -> Result<(
 }
 
 #[test]
+fn nested_json_parser_allocations_are_admitted_before_the_final_value() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("query-json-nested-parser-memory-boundary")?;
+    let leaf = format!("[{}]", vec!["0"; 256].join(","));
+    let source = format!("[{}]", vec![leaf; 32].join(","));
+    let parser_entries = 32_usize
+        .checked_mul(256)
+        .and_then(|entries| entries.checked_add(32))
+        .ok_or("parser entry fixture overflowed")?;
+    let parser_memory = u64::try_from(parser_entries)
+        .ok()
+        .and_then(|entries| entries.checked_mul(96))
+        .ok_or("parser memory fixture overflowed")?;
+    fixture.kernel.append_log(&source, 20, 1)?;
+    let service = zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, parser_memory, 60)?
+        .with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | json | limit 1",
+        budget,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    ));
+    Ok(())
+}
+
+#[test]
 fn logfmt_query_transform_decodes_quoted_and_typed_fields() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("query-logfmt-transform")?;
     fixture

@@ -1,7 +1,8 @@
 use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue};
 
 use super::{
-    MAX_TRANSFORM_ENTRIES, MAX_TRANSFORM_INPUT_BYTES, TransformObserver, copy_text, unsupported,
+    MAX_TRANSFORM_ENTRIES, MAX_TRANSFORM_INPUT_BYTES, PARSER_ENTRY_BYTES, TransformObserver,
+    copy_text, unsupported,
 };
 use crate::{QueryFailure, QueryFailureCode};
 
@@ -51,6 +52,7 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
                 self.source
                     .get(key_start..self.offset)
                     .ok_or_else(unsupported)?,
+                self.observer,
             )?;
             self.expect(b'=')?;
             let quoted = self.peek() == Some(b'"');
@@ -66,14 +68,20 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
                     .source
                     .get(value_start..self.offset)
                     .ok_or_else(unsupported)?;
-                parse_bare(source)?
+                if source.contains('=') {
+                    return Err(unsupported());
+                }
+                parse_bare(source, self.observer)?
             };
             if quoted && self.peek().is_some_and(|byte| !byte.is_ascii_whitespace()) {
                 return Err(unsupported());
             }
-            values
-                .try_reserve(1)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            self.observer.step()?;
+            self.observer.reserve_memory(PARSER_ENTRY_BYTES)?;
+            if values.try_reserve_exact(1).is_err() {
+                self.observer.release_memory(PARSER_ENTRY_BYTES)?;
+                return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+            }
             values.push(CandidateKeyValue::new(key, value));
         }
         Ok(CandidateAttributeValue::key_value_list(values))
@@ -113,9 +121,13 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
     }
 
     fn push_character(&mut self, value: &mut String, character: char) -> Result<(), QueryFailure> {
-        value
-            .try_reserve(character.len_utf8())
+        let bytes = u64::try_from(character.len_utf8())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        self.observer.reserve_memory(bytes)?;
+        if value.try_reserve(character.len_utf8()).is_err() {
+            self.observer.release_memory(bytes)?;
+            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+        }
         value.push(character);
         Ok(())
     }
@@ -154,7 +166,10 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
     }
 }
 
-fn parse_bare(source: &str) -> Result<CandidateAttributeValue, QueryFailure> {
+fn parse_bare(
+    source: &str,
+    observer: &mut impl TransformObserver,
+) -> Result<CandidateAttributeValue, QueryFailure> {
     match source {
         "null" => Ok(CandidateAttributeValue::null()),
         "true" => Ok(CandidateAttributeValue::boolean(true)),
@@ -173,7 +188,9 @@ fn parse_bare(source: &str) -> Result<CandidateAttributeValue, QueryFailure> {
             if source.is_empty() {
                 Ok(CandidateAttributeValue::string(String::new()))
             } else {
-                Ok(CandidateAttributeValue::string(copy_text(source)?))
+                Ok(CandidateAttributeValue::string(copy_text(
+                    source, observer,
+                )?))
             }
         },
     }

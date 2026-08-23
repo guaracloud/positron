@@ -1,42 +1,7 @@
 use positron_domain::time::{IngestTimeCandidate, QueryTime};
 
+use super::transform::apply_transform;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
-
-struct TransformWorkObserver<'a, 'kernel, 'catalog, 'ledger> {
-    service: &'a crate::QueryService<'kernel, 'catalog, 'ledger>,
-    state: &'a mut crate::cursor::CursorState,
-}
-
-impl crate::transform::TransformObserver for TransformWorkObserver<'_, '_, '_, '_> {
-    fn step(&mut self) -> Result<(), QueryFailure> {
-        if self.state.cancellation.is_cancelled() {
-            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
-        }
-        let units = self.service.work_units(crate::QueryWorkStage::Operators)?;
-        super::charge_work(self.state, units)?;
-        if super::exhausted(self.state) {
-            return Err(QueryFailure::budget_exhausted(
-                QueryBudgetDimension::CpuWorkUnits,
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl positron_domain::value::NativeValueObserver for TransformWorkObserver<'_, '_, '_, '_> {
-    type Error = QueryFailure;
-
-    fn observe_structure(&mut self) -> Result<(), Self::Error> {
-        crate::transform::TransformObserver::step(self)
-    }
-
-    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
-        for _chunk in payload.chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
-            crate::transform::TransformObserver::step(self)?;
-        }
-        Ok(())
-    }
-}
 
 pub(crate) fn query_record(
     service: &crate::QueryService<'_, '_, '_>,
@@ -213,63 +178,6 @@ pub(crate) fn query_record(
             attribute_retained_bytes,
         },
     )))
-}
-
-fn apply_transform(
-    transform: crate::transform::BodyTransform,
-    body: &positron_domain::value::ValidatedAttributeValue,
-    service: &crate::QueryService<'_, '_, '_>,
-    state: &mut crate::cursor::CursorState,
-    memory: &mut crate::memory::QueryMemory,
-) -> Result<(positron_domain::value::ValidatedAttributeValue, u64), QueryFailure> {
-    let scratch = transform.scratch_memory_bytes(body)?;
-    memory.acquire(scratch)?;
-    let transformed = {
-        let mut observer = TransformWorkObserver { service, state };
-        transform.apply(body, &mut observer)
-    };
-    let value = match transformed {
-        Ok(value) => value,
-        Err(failure) => {
-            memory.release(scratch)?;
-            return Err(failure);
-        },
-    };
-    let retained = {
-        let mut observer = TransformWorkObserver { service, state };
-        transformed_body_retained_bytes(&value, &mut observer)
-    };
-    let bytes = match retained {
-        Ok(bytes) => bytes,
-        Err(failure) => {
-            memory.release(scratch)?;
-            return Err(failure);
-        },
-    };
-    if bytes >= scratch {
-        if let Err(failure) = memory.acquire(bytes - scratch) {
-            memory.release(scratch)?;
-            return Err(failure);
-        }
-    } else {
-        memory.release(scratch - bytes)?;
-    }
-    Ok((value, bytes))
-}
-
-fn transformed_body_retained_bytes(
-    value: &positron_domain::value::ValidatedAttributeValue,
-    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
-) -> Result<u64, QueryFailure> {
-    value
-        .retained_heap_bytes_observed(observer)
-        .map_err(super::map_observed_failure)
-        .and_then(|bytes| {
-            u64::try_from(bytes)
-                .ok()
-                .and_then(|bytes| bytes.checked_add(64))
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))
-        })
 }
 
 fn project_attributes(

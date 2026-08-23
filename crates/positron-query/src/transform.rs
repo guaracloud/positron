@@ -26,6 +26,14 @@ pub(crate) enum CastTarget {
 
 pub(crate) trait TransformObserver {
     fn step(&mut self) -> Result<(), QueryFailure>;
+
+    fn reserve_memory(&mut self, _bytes: u64) -> Result<(), QueryFailure> {
+        Ok(())
+    }
+
+    fn release_memory(&mut self, _bytes: u64) -> Result<(), QueryFailure> {
+        Ok(())
+    }
 }
 
 struct NativeValidationObserver<'a, O> {
@@ -55,24 +63,27 @@ impl BodyTransform {
         value: &ValidatedAttributeValue,
     ) -> Result<u64, QueryFailure> {
         let source_bytes = value.as_str().map(str::len).unwrap_or(0).max(128);
-        let parser_slots = match self {
-            Self::Json | Self::Logfmt => MAX_TRANSFORM_ENTRIES
-                .checked_mul(96)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?,
-            Self::Cast(_) => 0,
-        };
         let bytes = source_bytes
-            .checked_add(parser_slots)
-            .and_then(|bytes| bytes.checked_add(64))
+            .checked_add(64)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         u64::try_from(bytes).map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))
     }
 
+    #[cfg(fuzzing)]
     pub(crate) fn apply(
         self,
         value: &ValidatedAttributeValue,
         observer: &mut impl TransformObserver,
     ) -> Result<ValidatedAttributeValue, QueryFailure> {
+        self.apply_with_facts(value, observer)
+            .map(positron_domain::value::ObservedValueTransfer::into_value)
+    }
+
+    pub(crate) fn apply_with_facts(
+        self,
+        value: &ValidatedAttributeValue,
+        observer: &mut impl TransformObserver,
+    ) -> Result<positron_domain::value::ObservedValueTransfer, QueryFailure> {
         let candidate = match self {
             Self::Json => {
                 let source = value.as_str().ok_or_else(unsupported)?;
@@ -86,7 +97,7 @@ impl BodyTransform {
         };
         let mut validation_observer = NativeValidationObserver { observer };
         candidate
-            .validate_log_body_observed(
+            .validate_log_body_observed_with_facts(
                 ValueLimitProfile::release_1_system_maximum(),
                 &mut validation_observer,
             )
@@ -97,6 +108,7 @@ impl BodyTransform {
 pub(super) const MAX_TRANSFORM_INPUT_BYTES: usize = 65_536;
 pub(super) const MAX_TRANSFORM_DEPTH: u16 = 32;
 pub(super) const MAX_TRANSFORM_ENTRIES: usize = 1_024;
+pub(super) const PARSER_ENTRY_BYTES: u64 = 96;
 
 fn cast_value(
     value: &ValidatedAttributeValue,
@@ -115,7 +127,7 @@ fn cast_value(
     observer.step()?;
     match target {
         CastTarget::String => {
-            let text = scalar_string(value)?;
+            let text = scalar_string(value, observer)?;
             Ok(CandidateAttributeValue::string(text))
         },
         CastTarget::Integer => {
@@ -193,51 +205,71 @@ fn observe_length(
     Ok(())
 }
 
-fn scalar_string(value: &ValidatedAttributeValue) -> Result<String, QueryFailure> {
+fn scalar_string(
+    value: &ValidatedAttributeValue,
+    observer: &mut impl TransformObserver,
+) -> Result<String, QueryFailure> {
     if let Some(value) = value.as_str() {
-        return copy_text(value);
+        return copy_text(value, observer);
     }
     if let Some(value) = value.as_signed_integer() {
-        return format_scalar(|output| write!(output, "{value}"));
+        return format_scalar(|output| write!(output, "{value}"), observer);
     }
     if let Some(value) = value.as_boolean() {
-        return format_scalar(|output| write!(output, "{value}"));
+        return format_scalar(|output| write!(output, "{value}"), observer);
     }
     if let Some(bits) = value.as_floating_point_bits() {
         let value = f64::from_bits(bits);
         if !value.is_finite() {
             return Err(unsupported());
         }
-        return format_scalar(|output| write!(output, "{value}"));
+        return format_scalar(|output| write!(output, "{value}"), observer);
     }
     if value.is_null() {
-        return copy_text("null");
+        return copy_text("null", observer);
     }
     Err(unsupported())
 }
 
-pub(super) fn copy_text(source: &str) -> Result<String, QueryFailure> {
-    let mut value = String::new();
-    value
-        .try_reserve_exact(source.len())
+pub(super) fn copy_text(
+    source: &str,
+    observer: &mut impl TransformObserver,
+) -> Result<String, QueryFailure> {
+    let bytes = u64::try_from(source.len())
         .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    observer.reserve_memory(bytes)?;
+    let mut value = String::new();
+    if value.try_reserve_exact(source.len()).is_err() {
+        observer.release_memory(bytes)?;
+        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+    }
     value.push_str(source);
     Ok(value)
 }
 
 fn format_scalar(
     formatter: impl FnOnce(&mut String) -> std::fmt::Result,
+    observer: &mut impl TransformObserver,
 ) -> Result<String, QueryFailure> {
+    observer.reserve_memory(128)?;
     let mut value = String::new();
-    value
-        .try_reserve_exact(128)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-    formatter(&mut value).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    if value.try_reserve_exact(128).is_err() {
+        observer.release_memory(128)?;
+        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+    }
+    if formatter(&mut value).is_err() {
+        observer.release_memory(128)?;
+        return Err(QueryFailure::new(QueryFailureCode::Internal));
+    }
     Ok(value)
 }
 
 fn map_domain_failure(failure: positron_domain::outcome::DomainFailure) -> QueryFailure {
-    if failure.code() == positron_domain::outcome::DomainFailureCode::AllocationUnavailable {
+    map_domain_failure_code(failure.code())
+}
+
+fn map_domain_failure_code(code: positron_domain::outcome::DomainFailureCode) -> QueryFailure {
+    if code == positron_domain::outcome::DomainFailureCode::AllocationUnavailable {
         QueryFailure::new(QueryFailureCode::ResourceExhausted)
     } else {
         unsupported()
@@ -257,4 +289,84 @@ fn map_observed_failure(
 
 pub(super) const fn unsupported() -> QueryFailure {
     QueryFailure::new(QueryFailureCode::UnsupportedQuery)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Unobserved;
+
+    impl TransformObserver for Unobserved {
+        fn step(&mut self) -> Result<(), QueryFailure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn direct_transforms_use_default_memory_hooks_and_return_transfer_facts() {
+        let source = CandidateAttributeValue::string("{\"field\":\"value\"}".to_owned())
+            .validate_log_body(ValueLimitProfile::release_1_system_maximum())
+            .expect("bounded JSON source");
+        let mut observer = Unobserved;
+        let facts = BodyTransform::Json
+            .apply_with_facts(&source, &mut observer)
+            .expect("JSON transform succeeds");
+        assert_eq!(facts.value_size_bytes(), 5);
+        assert_eq!(
+            facts.value().kind(),
+            positron_domain::value::AttributeValueKind::KeyValueList
+        );
+
+        observer
+            .reserve_memory(4)
+            .expect("default memory admission");
+        observer.release_memory(4).expect("default memory release");
+        let cast = BodyTransform::Cast(CastTarget::String)
+            .apply_with_facts(
+                &CandidateAttributeValue::signed_integer(7)
+                    .validate_attribute(ValueLimitProfile::release_1_system_maximum())
+                    .expect("bounded integer"),
+                &mut observer,
+            )
+            .expect("scalar cast succeeds");
+        assert_eq!(cast.value().as_str(), Some("7"));
+    }
+
+    #[test]
+    fn observed_transform_failures_keep_stable_domain_and_observer_classes() {
+        assert_eq!(
+            map_domain_failure_code(
+                positron_domain::outcome::DomainFailureCode::ValueLimitExceeded
+            )
+            .code(),
+            QueryFailureCode::UnsupportedQuery
+        );
+        assert_eq!(
+            map_domain_failure_code(
+                positron_domain::outcome::DomainFailureCode::AllocationUnavailable,
+            )
+            .code(),
+            QueryFailureCode::ResourceExhausted
+        );
+
+        let domain_failure = CandidateAttributeValue::key_value_list(vec![
+            positron_domain::value::CandidateKeyValue::new(
+                String::new(),
+                CandidateAttributeValue::null(),
+            ),
+        ])
+        .validate_attribute(ValueLimitProfile::release_1_system_maximum())
+        .expect_err("empty key is a domain value-limit failure");
+        let mapped = map_observed_failure(positron_domain::value::ObservedValueFailure::Domain(
+            domain_failure,
+        ));
+        assert_eq!(mapped.code(), QueryFailureCode::UnsupportedQuery);
+
+        let cancelled =
+            map_observed_failure(positron_domain::value::ObservedValueFailure::Observer(
+                QueryFailure::new(QueryFailureCode::Cancelled),
+            ));
+        assert_eq!(cancelled.code(), QueryFailureCode::Cancelled);
+    }
 }

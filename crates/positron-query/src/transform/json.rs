@@ -1,8 +1,8 @@
 use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue};
 
 use super::{
-    MAX_TRANSFORM_DEPTH, MAX_TRANSFORM_ENTRIES, MAX_TRANSFORM_INPUT_BYTES, TransformObserver,
-    unsupported,
+    MAX_TRANSFORM_DEPTH, MAX_TRANSFORM_ENTRIES, MAX_TRANSFORM_INPUT_BYTES, PARSER_ENTRY_BYTES,
+    TransformObserver, unsupported,
 };
 use crate::{QueryFailure, QueryFailureCode};
 
@@ -79,9 +79,7 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
             if values.len() >= MAX_TRANSFORM_ENTRIES {
                 return Err(unsupported());
             }
-            values
-                .try_reserve(1)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            self.reserve_entry(&mut values)?;
             values.push(self.value(depth.checked_add(1).ok_or_else(unsupported)?)?);
             self.skip_whitespace()?;
             if self.take(b']')? {
@@ -108,9 +106,7 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
             self.expect(b':')?;
             self.skip_whitespace()?;
             let value = self.value(depth.checked_add(1).ok_or_else(unsupported)?)?;
-            values
-                .try_reserve(1)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            self.reserve_entry(&mut values)?;
             values.push(CandidateKeyValue::new(key, value));
             self.skip_whitespace()?;
             if self.take(b'}')? {
@@ -208,9 +204,13 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
     }
 
     fn push_character(&mut self, value: &mut String, character: char) -> Result<(), QueryFailure> {
-        value
-            .try_reserve(character.len_utf8())
+        let bytes = u64::try_from(character.len_utf8())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        self.observer.reserve_memory(bytes)?;
+        if value.try_reserve(character.len_utf8()).is_err() {
+            self.observer.release_memory(bytes)?;
+            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+        }
         value.push(character);
         Ok(())
     }
@@ -234,7 +234,7 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
                 return Err(unsupported());
             }
             let character = char::from_u32(u32::from(first)).ok_or_else(unsupported)?;
-            value.push(character);
+            self.push_character(value, character)?;
         }
         Ok(())
     }
@@ -308,5 +308,15 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
 
     fn peek(&self) -> Option<u8> {
         self.source.as_bytes().get(self.offset).copied()
+    }
+
+    fn reserve_entry<T>(&mut self, values: &mut Vec<T>) -> Result<(), QueryFailure> {
+        self.observer.step()?;
+        self.observer.reserve_memory(PARSER_ENTRY_BYTES)?;
+        if values.try_reserve_exact(1).is_err() {
+            self.observer.release_memory(PARSER_ENTRY_BYTES)?;
+            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+        }
+        Ok(())
     }
 }
