@@ -14,6 +14,7 @@ mod memory;
 mod native_literal;
 mod operators;
 mod plan;
+mod planning_memory;
 mod query_service;
 mod runtime;
 mod search;

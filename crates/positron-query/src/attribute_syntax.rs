@@ -25,11 +25,11 @@ pub(crate) fn parse_predicate(source: &str) -> Result<SchemaQuery, QueryFailure>
 }
 
 pub(crate) fn parse_path(source: &str) -> Result<SchemaPath, QueryFailure> {
-    let (namespace, mut remaining) = if let Some(value) = source.strip_prefix("resource") {
+    let (namespace, mut remaining) = if let Some(value) = strip_namespace(source, "resource") {
         (AttributeNamespace::Resource, value)
-    } else if let Some(value) = source.strip_prefix("scope") {
+    } else if let Some(value) = strip_namespace(source, "scope") {
         (AttributeNamespace::InstrumentationScope, value)
-    } else if let Some(value) = source.strip_prefix("record") {
+    } else if let Some(value) = strip_namespace(source, "record") {
         (AttributeNamespace::Record, value)
     } else {
         return Err(unsupported());
@@ -50,6 +50,13 @@ pub(crate) fn parse_path(source: &str) -> Result<SchemaPath, QueryFailure> {
         remaining = after_segment;
     }
     SchemaPath::from_segments(namespace, segments).map_err(map_schema_failure)
+}
+
+fn strip_namespace<'source>(source: &'source str, namespace: &str) -> Option<&'source str> {
+    source
+        .get(..namespace.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(namespace))
+        .map(|_| &source[namespace.len()..])
 }
 
 pub(crate) fn render_path(path: &SchemaPath) -> Result<String, QueryFailure> {

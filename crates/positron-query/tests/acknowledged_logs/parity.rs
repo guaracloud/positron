@@ -244,7 +244,7 @@ fn sql_compiles_search_and_grouped_count_to_the_same_typed_plan() -> Result<(), 
     )?;
     let sql = service.plan_sql(
         context,
-        "SELECT body, COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY body ORDER BY query_time, commit_position LIMIT 16",
+        "SELECT body, COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY body LIMIT 16",
         budget,
     )?;
     assert_eq!(pipeline.logical_plan(), sql.logical_plan());
@@ -256,10 +256,83 @@ fn sql_compiles_search_and_grouped_count_to_the_same_typed_plan() -> Result<(), 
     )?;
     let sql = service.plan_sql(
         context,
-        "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
         budget,
     )?;
     assert_eq!(pipeline.logical_plan(), sql.logical_plan());
+    Ok(())
+}
+
+#[test]
+fn aggregate_ordering_is_rejected_by_both_frontends() -> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("aggregate-order-parity")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    for ordering in [
+        "ORDER BY query_time, commit_position",
+        "ORDER BY query_time DESC, commit_position DESC",
+    ] {
+        let sql = format!(
+            "SELECT body, COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY body {ordering} LIMIT 16"
+        );
+        let sql_failure = match service.plan_sql(fixture.context, &sql, budget) {
+            Ok(_) => return Err("SQL aggregate ordering unexpectedly succeeded".into()),
+            Err(failure) => failure,
+        };
+        let pipeline = format!(
+            "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | order by {} | limit 16",
+            ordering
+                .strip_prefix("ORDER BY ")
+                .ok_or("ordering prefix")?
+        );
+        let pipeline_failure = match service.plan_pipeline(fixture.context, &pipeline, budget) {
+            Ok(_) => return Err("pipeline aggregate ordering unexpectedly succeeded".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            sql_failure.code(),
+            positron_query::QueryFailureCode::UnsupportedQuery
+        );
+        assert_eq!(pipeline_failure.code(), sql_failure.code());
+    }
+    Ok(())
+}
+
+#[test]
+fn sql_unquoted_attribute_namespaces_are_case_insensitive_and_quoted_namespaces_reject()
+-> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("namespace-parity")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    for (sql_namespace, pipeline_namespace) in [
+        ("RESOURCE", "resource"),
+        ("SCOPE", "scope"),
+        ("RECORD", "record"),
+    ] {
+        let sql = format!(
+            "SELECT {sql_namespace}[\"service\"] FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1"
+        );
+        let pipeline = format!(
+            "pipeline:v1 logs | range query_time -100 100 | project {pipeline_namespace}[\"service\"] | limit 1"
+        );
+        assert_eq!(
+            service
+                .plan_sql(fixture.context, &sql, budget)?
+                .logical_plan(),
+            service
+                .plan_pipeline(fixture.context, &pipeline, budget)?
+                .logical_plan()
+        );
+    }
+    let quoted = "SELECT \"record\"[\"service\"] FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1";
+    let failure = match service.plan_sql(fixture.context, quoted, budget) {
+        Ok(_) => return Err("quoted namespace unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        failure.code(),
+        positron_query::QueryFailureCode::UnsupportedQuery
+    );
     Ok(())
 }
 

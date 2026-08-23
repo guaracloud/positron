@@ -94,7 +94,7 @@ fn empty_snapshot_completes_once_without_a_batch_and_terminal_cancel_is_idempote
 fn response_header_exposes_every_effective_query_budget_limit() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("header-budget")?;
     let service = fixture.service(1)?;
-    let expected = QueryBudget::new(101, 7, 5, 103, 107, 109)?
+    let expected = QueryBudget::new(101, 7, 5, 103, 512, 109)?
         .with_cpu_work_units(11)?
         .with_maximum_time_range_nanoseconds(113)?;
     let query = service.plan_pipeline(
@@ -112,7 +112,7 @@ fn response_header_exposes_every_effective_query_budget_limit() -> Result<(), Bo
     assert_eq!(actual.decoded_records(), 7);
     assert_eq!(actual.output_rows(), 5);
     assert_eq!(actual.output_bytes(), 103);
-    assert_eq!(actual.memory_bytes(), 107);
+    assert_eq!(actual.memory_bytes(), 512);
     assert_eq!(actual.cpu_work_units(), 11);
     assert_eq!(actual.wall_seconds(), 109);
     assert_eq!(actual.maximum_time_range_nanoseconds(), 113);
@@ -412,6 +412,73 @@ fn every_query_frontend_rejects_source_bytes_beyond_the_public_bound_before_pars
         failure_code(service.plan_sql(fixture.context, &format!("{sql} "), budget()))?,
         QueryFailureCode::UnsupportedQuery
     );
+    Ok(())
+}
+
+#[test]
+fn planning_memory_is_admitted_before_sql_and_pipeline_allocations() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("planning-memory-admission")?;
+    let service = fixture.service(16)?;
+    let too_small = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1, 60)?;
+    for source in [
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body, query_time, event_time, ingest_time, commit_position FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"items\"] any = array(string(\"a\"), string(\"b\")) ORDER BY query_time, commit_position LIMIT 1",
+    ] {
+        let failure = match service.plan_sql(fixture.context, source, too_small) {
+            Ok(_) => return Err("SQL planning unexpectedly succeeded".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+        assert_eq!(
+            failure.limiting_budget(),
+            Some(QueryBudgetDimension::MemoryBytes)
+        );
+    }
+    let pipeline_failure = match service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        too_small,
+    ) {
+        Ok(_) => return Err("pipeline planning unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(pipeline_failure.code(), QueryFailureCode::BudgetExhausted);
+    assert_eq!(
+        pipeline_failure.limiting_budget(),
+        Some(QueryBudgetDimension::MemoryBytes)
+    );
+    let retained_failure = match service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 100, 60)?,
+    ) {
+        Ok(_) => return Err("retained plan allocation unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(retained_failure.code(), QueryFailureCode::BudgetExhausted);
+
+    let search_failure = match service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "needle" | limit 1"#,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 43_000, 60)?,
+    ) {
+        Ok(_) => return Err("search plan unexpectedly succeeded below its memory charge".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(search_failure.code(), QueryFailureCode::InvalidBudget);
+
+    let normal = budget();
+    service.plan_sql(
+        fixture.context,
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        normal,
+    )?;
+    service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        normal,
+    )?;
     Ok(())
 }
 

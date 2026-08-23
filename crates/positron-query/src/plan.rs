@@ -204,6 +204,10 @@ impl LogicalPlan {
         }
     }
 
+    pub(crate) fn retained_memory_bytes(&self) -> Result<u64, crate::QueryFailure> {
+        crate::planning_memory::retained_plan_bytes(self)
+    }
+
     pub(crate) fn compile_search(&mut self) -> Result<(), crate::QueryFailure> {
         match self.filter.as_mut() {
             Some(FilterPredicate::BodyContains(substring)) => substring.compile(),

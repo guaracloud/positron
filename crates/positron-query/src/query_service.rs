@@ -101,6 +101,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
+        crate::planning_memory::preflight(budget.memory_bytes(), source)?;
         let parse_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
         let mut plan = parser(source)?;
         let compile_work_units = plan.search_compile_work_units();
@@ -129,7 +130,17 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::CpuWorkUnits,
             ));
         }
-        if plan.search_memory_bytes() > budget.memory_bytes() {
+        let retained_plan_memory = plan.retained_memory_bytes()?;
+        if retained_plan_memory > budget.memory_bytes() {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::MemoryBytes,
+            ));
+        }
+        if retained_plan_memory
+            .checked_add(plan.search_memory_bytes())
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+            > budget.memory_bytes()
+        {
             return Err(QueryFailure::for_budget(
                 QueryFailureCode::InvalidBudget,
                 QueryBudgetDimension::MemoryBytes,

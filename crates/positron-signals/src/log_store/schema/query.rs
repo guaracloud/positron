@@ -229,6 +229,32 @@ impl SchemaQuery {
     pub const fn selector(&self) -> OccurrenceSelector {
         self.selector
     }
+
+    /// Returns a conservative charge for the query path and retained value.
+    pub fn retained_memory_bytes(&self) -> Result<usize, SchemaFailure> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(
+                SchemaPath::system_max_segments()
+                    .checked_mul(std::mem::size_of::<String>())
+                    .ok_or(SchemaFailure::LimitExceeded)?,
+            )
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        for segment in self.path.segments() {
+            bytes = bytes
+                .checked_add(segment.capacity())
+                .ok_or(SchemaFailure::LimitExceeded)?;
+        }
+        let value_bytes = match &self.value {
+            QueryValue::Scalar(value) => value.memory_bytes()?,
+            QueryValue::Native(value) => value
+                .retained_heap_bytes()
+                .map_err(|_| SchemaFailure::LimitExceeded)?,
+        };
+        bytes
+            .checked_add(value_bytes)
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
     pub(crate) const fn expected_kind(&self) -> AttributeValueKind {
         match &self.value {
             QueryValue::Scalar(SchemaValue::Null) => AttributeValueKind::Null,

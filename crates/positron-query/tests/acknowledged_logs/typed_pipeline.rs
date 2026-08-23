@@ -1042,7 +1042,7 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
     use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
     use positron_policy::NativeLogAttribute;
 
-    const EXACT_PEAK_BYTES: u64 = 66_498;
+    const EXACT_PEAK_BYTES: u64 = 69_893;
 
     let fixture = QueryFixture::new("attribute-projection-memory")?;
     fixture.kernel.append_attribute_logs(
@@ -1750,7 +1750,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_676, true), (1_675, false)] {
+    for (memory_bytes, expected_complete) in [(1_996, true), (1_995, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -1777,7 +1777,7 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(3_351, true), (3_350, false)] {
+    for (memory_bytes, expected_complete) in [(3_831, true), (3_830, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
@@ -3296,6 +3296,9 @@ fn body_search_memory_peak_includes_matcher_and_retained_rows() -> Result<(), Bo
         })
         .ok_or("search did not complete")?;
     assert!(peak > 40_000, "matcher memory was not retained: {peak}");
+    let peak = peak
+        .checked_add(448)
+        .ok_or("plan memory boundary overflowed")?;
 
     for (memory_bytes, expected_complete) in [(peak, true), (peak - 1, false)] {
         let query = service.plan_pipeline(
@@ -3544,7 +3547,7 @@ fn versioned_pipeline_regex_search_is_anchored_and_rejects_unbounded_patterns()
         )
         .err()
         .ok_or("regex memory reservation was not enforced")?;
-    assert_eq!(failure.code(), QueryFailureCode::InvalidBudget);
+    assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
     assert_eq!(
         failure.limiting_budget(),
         Some(positron_query::QueryBudgetDimension::MemoryBytes)

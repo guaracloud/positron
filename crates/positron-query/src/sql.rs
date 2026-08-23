@@ -39,9 +39,14 @@ impl<'source> Parser<'source> {
             parser.keyword("by")?;
             parser.columns()
         })?;
-        self.keyword("order")?;
-        self.keyword("by")?;
-        let ordering = self.ordering(axis)?;
+        let ordering = self.when("order", |parser| {
+            parser.keyword("by")?;
+            parser.ordering(axis)
+        })?;
+        let aggregate_selection = matches!(&selection, Selection::Count | Selection::CountBy(_));
+        if ordering.is_none() && !aggregate_selection {
+            return Err(unsupported());
+        }
         self.keyword("limit")?;
         let limit = parse_limit(self.take()?)?;
         if self.index != self.tokens.len() {
@@ -51,6 +56,9 @@ impl<'source> Parser<'source> {
         let mut plan = plan(axis, start, end, limit)?;
         if let Some(filter) = filter {
             plan = plan.with_filter(filter);
+        }
+        if aggregate_selection && ordering.is_some() {
+            return Err(unsupported());
         }
         match selection {
             Selection::Projection {
@@ -77,7 +85,8 @@ impl<'source> Parser<'source> {
                 plan = plan.with_aggregate(AggregateSpec::count_by(columns));
             },
         }
-        Ok(plan.with_ordering(ordering))
+        let default_ordering = OrderSpec::ascending(plan.temporal_axis());
+        Ok(plan.with_ordering(ordering.unwrap_or(default_ordering)))
     }
 
     fn selection(&mut self) -> Result<Selection, QueryFailure> {
