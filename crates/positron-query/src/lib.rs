@@ -22,6 +22,7 @@ mod runtime;
 mod search;
 mod service;
 mod sql;
+mod sql_helpers;
 mod sql_lexer;
 mod sql_selection;
 mod stream;

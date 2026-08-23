@@ -66,8 +66,36 @@ pub(crate) fn parse_transform(token: &str) -> Result<Option<BodyTransform>, Quer
     }
     let arguments = token.get(open + 1..).ok_or_else(unsupported)?;
     let arguments = arguments.strip_suffix(')').ok_or_else(unsupported)?;
+    parse_transform_arguments(arguments, is_json, is_logfmt)
+}
+
+pub(crate) fn parse_transform_group(
+    name: &str,
+    group: &str,
+) -> Result<Option<BodyTransform>, QueryFailure> {
+    let is_json = name.eq_ignore_ascii_case("json");
+    let is_logfmt = name.eq_ignore_ascii_case("logfmt");
+    let is_cast = name.eq_ignore_ascii_case("cast");
+    if !is_json && !is_logfmt && !is_cast {
+        return Ok(None);
+    }
+    let arguments = group
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .ok_or_else(unsupported)?;
+    parse_transform_arguments(arguments, is_json, is_logfmt)
+}
+
+fn parse_transform_arguments(
+    arguments: &str,
+    is_json: bool,
+    is_logfmt: bool,
+) -> Result<Option<BodyTransform>, QueryFailure> {
     if is_json || is_logfmt {
-        if !arguments.eq_ignore_ascii_case("body") {
+        if !arguments
+            .trim_matches(|character: char| character.is_ascii_whitespace())
+            .eq_ignore_ascii_case("body")
+        {
             return Err(unsupported());
         }
         return Ok(Some(if is_json {

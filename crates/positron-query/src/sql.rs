@@ -1,6 +1,9 @@
 use crate::plan::{AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn};
+use crate::sql_helpers::{clause, is_count_group, parse_timestamp, unsupported};
 use crate::sql_lexer::tokenize;
-use crate::sql_selection::{Selection, parse_body_predicate, parse_transform, push_column};
+use crate::sql_selection::{
+    Selection, parse_body_predicate, parse_transform, parse_transform_group, push_column,
+};
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange};
 use std::borrow::Cow;
 
@@ -109,7 +112,18 @@ impl<'source> Parser<'source> {
                 if token == "*" {
                     return Err(unsupported());
                 }
-                if let Some(value) = parse_transform(token)? {
+                let parsed_transform = if let Some(value) = parse_transform(token)? {
+                    Some(value)
+                } else if let Some(group) = self.tokens.get(self.index).copied() {
+                    let value = parse_transform_group(token, group)?;
+                    if value.is_some() {
+                        self.index += 1;
+                    }
+                    value
+                } else {
+                    None
+                };
+                if let Some(value) = parsed_transform {
                     if transform.replace(value).is_some() {
                         return Err(unsupported());
                     }
@@ -281,7 +295,7 @@ impl<'source> Parser<'source> {
             && self
                 .tokens
                 .get(self.index + 1)
-                .is_some_and(|value| *value == "( * )")
+                .is_some_and(|value| is_count_group(value))
         {
             self.index += 2;
             return true;
@@ -371,28 +385,5 @@ pub(crate) fn plan(
 }
 
 pub(crate) fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
-    if source.starts_with('0') && source.len() > 1 {
-        return Err(unsupported());
-    }
-    source.parse().map_err(|_| unsupported())
-}
-
-fn parse_timestamp(source: &str) -> Result<i64, QueryFailure> {
-    if source.starts_with('+')
-        || (source.starts_with('0') && source.len() > 1)
-        || (source.starts_with("-0") && source.len() > 2)
-    {
-        return Err(unsupported());
-    }
-    source.parse().map_err(|_| unsupported())
-}
-
-fn clause(token: &str) -> bool {
-    ["group", "order", "limit"]
-        .iter()
-        .any(|value| token.eq_ignore_ascii_case(value))
-}
-
-fn unsupported() -> QueryFailure {
-    QueryFailure::new(QueryFailureCode::UnsupportedQuery)
+    crate::sql_helpers::parse_limit(source)
 }

@@ -216,10 +216,14 @@ impl SchemaQuery {
         selector: OccurrenceSelector,
         value: ValidatedAttributeValue,
     ) -> Result<Self, SchemaFailure> {
-        match SchemaValue::try_from_validated(&value)? {
-            Some(value) => Ok(Self::value(path, selector, value)),
-            None => Ok(Self::native_value(path, selector, value)),
+        if matches!(
+            value.kind(),
+            AttributeValueKind::Array | AttributeValueKind::KeyValueList
+        ) {
+            return Ok(Self::native_value(path, selector, value));
         }
+        let value = SchemaValue::try_from_validated_owned(value)?;
+        Ok(Self::value(path, selector, value))
     }
     #[must_use]
     pub const fn path(&self) -> &SchemaPath {

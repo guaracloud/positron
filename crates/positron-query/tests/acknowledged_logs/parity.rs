@@ -323,12 +323,57 @@ fn sql_and_pipeline_edge_rejections_keep_their_public_classes() -> Result<(), Bo
         "SELECT COUNT ( * ) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
         budget,
     )?;
+    let separated_count = service.plan_sql(
+        fixture.context,
+        "SELECT COUNT (*) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        budget,
+    )?;
     let canonical_count = service.plan_sql(
         fixture.context,
         "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
         budget,
     )?;
     assert_eq!(spaced_count.logical_plan(), canonical_count.logical_plan());
+    assert_eq!(
+        separated_count.logical_plan(),
+        canonical_count.logical_plan()
+    );
+
+    for (canonical, spaced) in [
+        ("JSON(body)", "JSON ( body )"),
+        ("LOGFMT(body)", "LOGFMT ( body )"),
+        ("CAST(body AS string)", "CAST ( body AS string )"),
+    ] {
+        let canonical = format!(
+            "SELECT {canonical} FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1"
+        );
+        let spaced = format!(
+            "SELECT {spaced} FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1"
+        );
+        assert_eq!(
+            service
+                .plan_sql(fixture.context, &canonical, budget)?
+                .logical_plan(),
+            service
+                .plan_sql(fixture.context, &spaced, budget)?
+                .logical_plan()
+        );
+    }
+    for source in [
+        "SELECT COUNT foo FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        "SELECT COUNT ( \" * \" ) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        "SELECT JSON ( \"body\" ) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT CAST ( \"body\" AS string ) FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+    ] {
+        let failure = match service.plan_sql(fixture.context, source, budget) {
+            Ok(_) => return Err("quoted transform argument unexpectedly succeeded".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.code(),
+            positron_query::QueryFailureCode::UnsupportedQuery
+        );
+    }
 
     for source in [
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"x\" | search body contains \"x\" | limit 1",

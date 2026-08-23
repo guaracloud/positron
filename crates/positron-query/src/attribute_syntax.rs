@@ -23,8 +23,12 @@ pub(crate) fn parse_predicate(
     } else {
         return Err(unsupported());
     };
-    let value = crate::native_literal::parse_attribute(literal, memory)?;
-    SchemaQuery::exact_native_value(path, selector, value).map_err(map_schema_failure)
+    let (value, reservation, retained) =
+        crate::native_literal::parse_attribute_with_reservation(literal, memory)?;
+    let query =
+        SchemaQuery::exact_native_value(path, selector, value).map_err(map_schema_failure)?;
+    memory.retain_reservation(reservation, retained)?;
+    Ok(query)
 }
 
 pub(crate) fn parse_path(

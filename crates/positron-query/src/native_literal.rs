@@ -17,10 +17,27 @@ pub(crate) fn parse_body(
     validate_body(candidate, reservation, memory)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_attribute(
     source: &str,
     memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
+    let (value, reservation, retained) = parse_attribute_with_reservation(source, memory)?;
+    memory.retain_reservation(reservation, retained)?;
+    Ok(value)
+}
+
+pub(crate) fn parse_attribute_with_reservation(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<
+    (
+        positron_domain::value::ValidatedAttributeValue,
+        crate::planning_memory::PlanningReservation,
+        u64,
+    ),
+    QueryFailure,
+> {
     let (candidate, reservation) = Cursor::new(source, memory)?.parse_complete()?;
     let mut observer = crate::planning_observer::PlanningValueObserver::new(reservation);
     let transfer = candidate
@@ -31,8 +48,7 @@ pub(crate) fn parse_attribute(
         .map_err(map_observed_failure)?;
     let retained = u64::try_from(transfer.retained_heap_bytes())
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    memory.retain_reservation(observer.into_reservation(), retained)?;
-    Ok(transfer.into_value())
+    Ok((transfer.into_value(), observer.into_reservation(), retained))
 }
 
 pub(crate) fn parse_search_string(
