@@ -171,3 +171,60 @@ fn nested_json_parser_allocations_are_admitted_before_the_final_value() -> Resul
     ));
     Ok(())
 }
+
+#[test]
+fn cast_string_peak_uses_retained_capacity_for_1024_records() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("query-cast-string-capacity-boundary")?;
+    fixture.kernel.append_log_bodies(
+        (0..1_024)
+            .map(|_| Some(positron_domain::value::CandidateAttributeValue::signed_integer(7)))
+            .collect(),
+        20,
+        1,
+    )?;
+    let service = zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1_024,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1024",
+        QueryBudget::new(1_048_576, 1_024, 1_024, 1_048_576, 4_194_304, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    let peak = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Complete(stats)) => Some(stats.memory_peak_bytes()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("cast capacity query did not complete")?;
+    let expected_capacity_floor = 1_024_u64
+        .checked_mul(192)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or("capacity floor overflowed")?;
+    assert!(peak >= expected_capacity_floor);
+
+    let under = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1024",
+        QueryBudget::new(
+            1_048_576,
+            1_024,
+            1_024,
+            1_048_576,
+            peak.checked_sub(1).ok_or("cast peak was zero")?,
+            60,
+        )?,
+    )?;
+    let under_events = service.execute(under)?.collect::<Vec<_>>();
+    assert!(matches!(
+        under_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    ));
+    Ok(())
+}

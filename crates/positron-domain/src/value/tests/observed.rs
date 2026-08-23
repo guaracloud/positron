@@ -100,6 +100,24 @@ fn observed_log_body_validation_returns_profile_transfer_facts_from_one_traversa
 }
 
 #[test]
+fn observed_validation_reports_string_capacity_not_only_length() {
+    let mut text = String::with_capacity(128);
+    text.push('7');
+    let retained_capacity = text.capacity();
+    let candidate = CandidateAttributeValue::string(text);
+    let mut observer = CountingObserver::default();
+    let facts = candidate
+        .validate_log_body_observed_with_facts(
+            ValueLimitProfile::release_1_system_maximum(),
+            &mut observer,
+        )
+        .expect("bounded scalar string validates");
+
+    assert_eq!(facts.value_size_bytes(), 1);
+    assert_eq!(facts.retained_heap_bytes(), retained_capacity);
+}
+
+#[test]
 fn observed_validation_releases_output_capacity_on_cancellation() {
     let candidate = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
         "nested".to_owned(),

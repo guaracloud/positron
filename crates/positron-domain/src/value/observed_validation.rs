@@ -62,7 +62,13 @@ fn validate_attribute_value_observed_with_facts<O: NativeValueObserver>(
                 return Err(DomainFailure::value_limit_exceeded().into());
             }
             let size = value.len();
-            (ValidatedAttributeValueInner::String(value), size, size, 0)
+            let retained = value.capacity();
+            (
+                ValidatedAttributeValueInner::String(value),
+                size,
+                retained,
+                0,
+            )
         },
         CandidateAttributeValue::Bytes(value) => {
             observed::observe_payload(&value, observer)?;
@@ -70,7 +76,13 @@ fn validate_attribute_value_observed_with_facts<O: NativeValueObserver>(
                 return Err(DomainFailure::value_limit_exceeded().into());
             }
             let size = value.len();
-            (ValidatedAttributeValueInner::Bytes(value), size, size, 0)
+            let retained = value.capacity();
+            (
+                ValidatedAttributeValueInner::Bytes(value),
+                size,
+                retained,
+                0,
+            )
         },
         CandidateAttributeValue::Array(values) => {
             let (values, value_size, retained, allocation_bytes) = validate_attribute_array_observed(
@@ -104,9 +116,6 @@ fn validate_attribute_value_observed_with_facts<O: NativeValueObserver>(
             )
         },
     };
-    if exceeds_byte_limit(value_size_bytes, value_bytes) {
-        return Err(DomainFailure::value_limit_exceeded().into());
-    }
     Ok(ObservedValueTransfer::new(
         ValidatedAttributeValue { inner },
         value_size_bytes,
@@ -138,8 +147,17 @@ fn validate_attribute_array_observed<O: NativeValueObserver>(
         release_output_capacity(allocation_bytes, observer)?;
         return Err(DomainFailure::allocation_unavailable().into());
     }
+    let allocation_bytes = reconcile_output_capacity(
+        &validated,
+        ARRAY_VALUE_SLOT_BYTES,
+        allocation_bytes,
+        observer,
+    )?;
     let mut value_size_bytes = 0_usize;
-    let mut retained_heap_bytes = 0_usize;
+    let mut retained_heap_bytes = checked_capacity_bytes(
+        validated.capacity(),
+        ARRAY_VALUE_SLOT_BYTES,
+    )?;
     let mut total_allocation_bytes = allocation_bytes;
     let result = (|| {
         for value in values {
@@ -164,9 +182,7 @@ fn validate_attribute_array_observed<O: NativeValueObserver>(
             if exceeds_byte_limit(value_size_bytes, value_bytes) {
                 return Err(DomainFailure::value_limit_exceeded().into());
             }
-            let child_retained =
-                checked_add(ARRAY_VALUE_SLOT_BYTES, transfer.retained_heap_bytes())?;
-            retained_heap_bytes = checked_add(retained_heap_bytes, child_retained)?;
+            retained_heap_bytes = checked_add(retained_heap_bytes, transfer.retained_heap_bytes())?;
             validated.push(transfer.into_value());
         }
         Ok((
@@ -208,8 +224,17 @@ fn validate_key_value_list_observed<O: NativeValueObserver>(
         release_output_capacity(allocation_bytes, observer)?;
         return Err(DomainFailure::allocation_unavailable().into());
     }
+    let allocation_bytes = reconcile_output_capacity(
+        &validated,
+        KEY_VALUE_ENTRY_SLOT_BYTES,
+        allocation_bytes,
+        observer,
+    )?;
     let mut value_size_bytes = 0_usize;
-    let mut retained_heap_bytes = 0_usize;
+    let mut retained_heap_bytes = checked_capacity_bytes(
+        validated.capacity(),
+        KEY_VALUE_ENTRY_SLOT_BYTES,
+    )?;
     let mut total_allocation_bytes = allocation_bytes;
     let result = (|| {
         for CandidateKeyValue { key, value } in values {
@@ -241,8 +266,7 @@ fn validate_key_value_list_observed<O: NativeValueObserver>(
             if exceeds_byte_limit(value_size_bytes, value_bytes) {
                 return Err(DomainFailure::value_limit_exceeded().into());
             }
-            let entry_retained = checked_add(KEY_VALUE_ENTRY_SLOT_BYTES, key.len())?;
-            let entry_retained = checked_add(entry_retained, transfer.retained_heap_bytes())?;
+            let entry_retained = checked_add(key.capacity(), transfer.retained_heap_bytes())?;
             retained_heap_bytes = checked_add(retained_heap_bytes, entry_retained)?;
             validated.push(ValidatedKeyValue {
                 key,
@@ -270,13 +294,45 @@ fn reserve_output_capacity<O: NativeValueObserver>(
     if count == 0 {
         return Ok(0);
     }
-    let bytes = count
+    let capacity = count
+        .checked_next_power_of_two()
+        .ok_or_else(DomainFailure::value_limit_exceeded)?;
+    let bytes = capacity
         .checked_mul(slot_bytes)
         .ok_or_else(DomainFailure::value_limit_exceeded)?;
     observer
         .observe_allocation(bytes)
         .map_err(ObservedValueFailure::Observer)?;
     Ok(bytes)
+}
+
+fn reconcile_output_capacity<T, O: NativeValueObserver>(
+    values: &Vec<T>,
+    slot_bytes: usize,
+    admitted_bytes: usize,
+    observer: &mut O,
+) -> Result<usize, ObservedValueFailure<O::Error>> {
+    let actual_bytes = checked_capacity_bytes(values.capacity(), slot_bytes)?;
+    if actual_bytes > admitted_bytes {
+        let additional = actual_bytes
+            .checked_sub(admitted_bytes)
+            .ok_or_else(DomainFailure::value_limit_exceeded)?;
+        observer
+            .observe_allocation(additional)
+            .map_err(ObservedValueFailure::Observer)?;
+        return Ok(actual_bytes);
+    }
+    let slack = admitted_bytes - actual_bytes;
+    if slack > 0 {
+        release_output_capacity(slack, observer)?;
+    }
+    Ok(actual_bytes)
+}
+
+fn checked_capacity_bytes(capacity: usize, slot_bytes: usize) -> Result<usize, DomainFailure> {
+    capacity
+        .checked_mul(slot_bytes)
+        .ok_or_else(DomainFailure::value_limit_exceeded)
 }
 
 fn release_output_capacity<O: NativeValueObserver>(

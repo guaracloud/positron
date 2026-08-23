@@ -2,9 +2,9 @@ use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue};
 
 use super::{
     MAX_TRANSFORM_DEPTH, MAX_TRANSFORM_ENTRIES, MAX_TRANSFORM_INPUT_BYTES, PARSER_ENTRY_BYTES,
-    TransformObserver, unsupported,
+    TransformObserver, reserve_string_capacity, reserve_vec_capacity, unsupported,
 };
-use crate::{QueryFailure, QueryFailureCode};
+use crate::QueryFailure;
 
 struct JsonParser<'source, 'observer, O> {
     source: &'source str,
@@ -204,13 +204,7 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
     }
 
     fn push_character(&mut self, value: &mut String, character: char) -> Result<(), QueryFailure> {
-        let bytes = u64::try_from(character.len_utf8())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        self.observer.reserve_memory(bytes)?;
-        if value.try_reserve_exact(character.len_utf8()).is_err() {
-            self.observer.release_memory(bytes)?;
-            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-        }
+        reserve_string_capacity(value, character.len_utf8(), self.observer)?;
         value.push(character);
         Ok(())
     }
@@ -312,11 +306,6 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
 
     fn reserve_entry<T>(&mut self, values: &mut Vec<T>) -> Result<(), QueryFailure> {
         self.observer.step()?;
-        self.observer.reserve_memory(PARSER_ENTRY_BYTES)?;
-        if values.try_reserve_exact(1).is_err() {
-            self.observer.release_memory(PARSER_ENTRY_BYTES)?;
-            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-        }
-        Ok(())
+        reserve_vec_capacity(values, 1, PARSER_ENTRY_BYTES, self.observer)
     }
 }

@@ -30,13 +30,14 @@ pub(crate) fn query_record(
     if !temporal_range.contains(ordering_time) {
         return Ok(None);
     }
-    let mut transformed_retained_bytes = None;
+    let mut transformed = RetainedBytesGuard::new(memory);
     let transformed_body = match state.plan.transform() {
         Some(transform) => record
             .body()
             .map(|body| {
-                let (value, bytes) = apply_transform(transform, body, service, state, memory)?;
-                transformed_retained_bytes = Some(bytes);
+                let (value, bytes) =
+                    apply_transform(transform, body, service, state, transformed.memory())?;
+                transformed.set(bytes);
                 Ok(value)
             })
             .transpose()?,
@@ -106,9 +107,7 @@ pub(crate) fn query_record(
             },
         };
         if !matched {
-            if let Some(bytes) = transformed_retained_bytes {
-                memory.release(bytes)?;
-            }
+            transformed.release()?;
             return Ok(None);
         }
     }
@@ -116,8 +115,7 @@ pub(crate) fn query_record(
         .plan
         .aggregate()
         .map(crate::plan::AggregateSpec::group_by)
-        .unwrap_or_else(|| state.plan.projection())
-        .to_vec();
+        .unwrap_or_else(|| state.plan.projection());
     let body_selected = selected_columns.contains(&crate::plan::ProjectionColumn::Body);
     let query_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::QueryTime);
     let event_time_selected = selected_columns.contains(&crate::plan::ProjectionColumn::EventTime);
@@ -127,34 +125,25 @@ pub(crate) fn query_record(
         selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition);
     let cancellation = state.cancellation.clone();
     let cpu_limit = state.budget.cpu_work_units();
-    let (attributes, attribute_retained_bytes) = match project_attributes(
+    let (attributes, attribute_retained_bytes) = project_attributes(
         record.stored(),
-        &selected_columns,
+        selected_columns,
         service,
         &mut state.cpu_work_units,
         cpu_limit,
         cancellation.clone(),
-        memory,
-    ) {
-        Ok(value) => value,
-        Err(failure) => {
-            if let Some(bytes) = transformed_retained_bytes {
-                memory.release(bytes)?;
-            }
-            return Err(failure);
-        },
-    };
+        transformed.memory(),
+    )?;
     let (body, body_retained_bytes) = if body_selected {
         if let Some(value) = transformed_body {
-            (Some(value), transformed_retained_bytes.unwrap_or(0))
+            let retained = transformed.disarm();
+            (Some(value), retained)
         } else {
             let retained = record.body_retained_bytes();
             (record.take_body(), retained)
         }
     } else {
-        if let Some(bytes) = transformed_retained_bytes {
-            memory.release(bytes)?;
-        }
+        transformed.release()?;
         (None, 0)
     };
     Ok(Some(QueryRecord::new(
@@ -178,6 +167,46 @@ pub(crate) fn query_record(
             attribute_retained_bytes,
         },
     )))
+}
+
+struct RetainedBytesGuard<'a> {
+    memory: &'a mut crate::memory::QueryMemory,
+    bytes: u64,
+}
+
+impl<'a> RetainedBytesGuard<'a> {
+    fn new(memory: &'a mut crate::memory::QueryMemory) -> Self {
+        Self { memory, bytes: 0 }
+    }
+
+    fn memory(&mut self) -> &mut crate::memory::QueryMemory {
+        self.memory
+    }
+
+    fn set(&mut self, bytes: u64) {
+        self.bytes = bytes;
+    }
+
+    fn release(&mut self) -> Result<(), QueryFailure> {
+        let bytes = std::mem::take(&mut self.bytes);
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.memory.release(bytes)
+    }
+
+    fn disarm(&mut self) -> u64 {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for RetainedBytesGuard<'_> {
+    fn drop(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        if bytes != 0 {
+            debug_assert!(self.memory.release(bytes).is_ok());
+        }
+    }
 }
 
 fn project_attributes(
@@ -286,5 +315,59 @@ fn map_schema_traversal_failure(
         positron_signals::SchemaTraversalFailure::Value(failure) => {
             super::map_observed_failure(failure)
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetainedBytesGuard, map_schema_failure, map_schema_traversal_failure};
+    use crate::QueryFailureCode;
+    use crate::memory::QueryMemory;
+    use positron_signals::{SchemaFailure, SchemaTraversalFailure};
+
+    #[test]
+    fn retained_bytes_guard_releases_explicitly_and_disarms_for_transfer() {
+        let mut memory = QueryMemory::new(128);
+        memory.acquire(32).expect("test admission fits");
+        let mut guard = RetainedBytesGuard::new(&mut memory);
+        guard.set(32);
+        guard.release().expect("explicit release succeeds");
+        guard.set(32);
+        assert_eq!(guard.disarm(), 32);
+        guard.release().expect("disarmed release is a no-op");
+    }
+
+    #[test]
+    fn retained_bytes_guard_drop_releases_unclaimed_transfer() {
+        let mut memory = QueryMemory::new(128);
+        memory.acquire(32).expect("test admission fits");
+        {
+            let mut guard = RetainedBytesGuard::new(&mut memory);
+            guard.set(32);
+        }
+        assert_eq!(memory.release(0), Ok(()));
+    }
+
+    #[test]
+    fn schema_failures_map_to_stable_query_classes() {
+        assert_eq!(
+            map_schema_failure(SchemaFailure::AllocationUnavailable).code(),
+            QueryFailureCode::ResourceExhausted
+        );
+        assert_eq!(
+            map_schema_failure(SchemaFailure::LimitExceeded).code(),
+            QueryFailureCode::ResourceExhausted
+        );
+        assert_eq!(
+            map_schema_failure(SchemaFailure::InvalidValue).code(),
+            QueryFailureCode::Internal
+        );
+        assert_eq!(
+            map_schema_traversal_failure(SchemaTraversalFailure::Schema(
+                SchemaFailure::InvalidPath,
+            ))
+            .code(),
+            QueryFailureCode::Internal
+        );
     }
 }

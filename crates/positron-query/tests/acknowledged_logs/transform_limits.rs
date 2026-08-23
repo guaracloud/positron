@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
+use positron_domain::value::CandidateAttributeValue;
 use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal};
 
 use super::support::{
@@ -24,6 +25,38 @@ fn assert_unsupported(events: &[QueryEvent]) {
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::UnsupportedQuery
     ));
+}
+
+#[test]
+fn text_predicates_skip_missing_and_non_text_bodies() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("query-text-predicate-body-kinds")?;
+    fixture.kernel.append_log_bodies(
+        vec![None, Some(CandidateAttributeValue::signed_integer(7))],
+        20,
+        1,
+    )?;
+    let service = fixture.service(16)?;
+    for predicate in [
+        r#"search body contains "seven""#,
+        r#"search body =~ "seven""#,
+    ] {
+        let query = service.plan_pipeline(
+            fixture.context,
+            &format!("pipeline:v1 logs | range query_time -100 100 | {predicate} | limit 2"),
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+        )?;
+        let events = service.execute(query)?.collect::<Vec<_>>();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, QueryEvent::Batch(_)))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+        ));
+    }
+    Ok(())
 }
 
 #[test]
@@ -293,6 +326,47 @@ fn temporal_exclusion_precedes_transform_parsing() -> Result<(), Box<dyn Error>>
         events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
             if stats.decoded_records() == 1
+    ));
+    Ok(())
+}
+
+#[test]
+fn transformed_predicate_cancellation_releases_transformed_memory() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("query-transform-predicate-cancellation")?;
+    fixture
+        .kernel
+        .append_log(r#""timeout timeout timeout timeout timeout""#, 20, 1)?;
+    let meter = CancellingOperatorCallMeter::shared(10);
+    let service = positron_query::QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | cast body as string | search body contains "timeout" | limit 1"#,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
+            .with_cpu_work_units(128)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+    ));
+
+    let follow_up = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | json | limit 1"#,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?,
+    )?;
+    let follow_up_events = service.execute(follow_up)?.collect::<Vec<_>>();
+    assert!(matches!(
+        follow_up_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
     ));
     Ok(())
 }

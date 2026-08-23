@@ -2,9 +2,9 @@ use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue};
 
 use super::{
     MAX_TRANSFORM_ENTRIES, MAX_TRANSFORM_INPUT_BYTES, PARSER_ENTRY_BYTES, TransformObserver,
-    copy_text, unsupported,
+    copy_text, reserve_string_capacity, reserve_vec_capacity, unsupported,
 };
-use crate::{QueryFailure, QueryFailureCode};
+use crate::QueryFailure;
 
 struct LogfmtParser<'source, 'observer, O> {
     source: &'source str,
@@ -77,11 +77,7 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
                 return Err(unsupported());
             }
             self.observer.step()?;
-            self.observer.reserve_memory(PARSER_ENTRY_BYTES)?;
-            if values.try_reserve_exact(1).is_err() {
-                self.observer.release_memory(PARSER_ENTRY_BYTES)?;
-                return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-            }
+            reserve_vec_capacity(&mut values, 1, PARSER_ENTRY_BYTES, self.observer)?;
             values.push(CandidateKeyValue::new(key, value));
         }
         Ok(CandidateAttributeValue::key_value_list(values))
@@ -121,13 +117,7 @@ impl<'source, 'observer, O: TransformObserver> LogfmtParser<'source, 'observer, 
     }
 
     fn push_character(&mut self, value: &mut String, character: char) -> Result<(), QueryFailure> {
-        let bytes = u64::try_from(character.len_utf8())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        self.observer.reserve_memory(bytes)?;
-        if value.try_reserve_exact(character.len_utf8()).is_err() {
-            self.observer.release_memory(bytes)?;
-            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-        }
+        reserve_string_capacity(value, character.len_utf8(), self.observer)?;
         value.push(character);
         Ok(())
     }

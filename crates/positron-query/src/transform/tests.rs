@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use super::*;
 
 struct Unobserved;
@@ -76,10 +78,71 @@ fn json_validation_admits_output_capacity_while_parser_candidates_are_live() {
         .apply_with_facts(&source, &mut observer)
         .expect("JSON transform succeeds");
 
-    // Three parser entries (288 bytes), one key byte, and the canonical
-    // root/array output slots (96 + 2 * 64 bytes) are simultaneous.
-    assert_eq!(observer.reserved, 513);
-    assert_eq!(observer.released, 0);
+    // Three parser entries (288 bytes), one key capacity (8 bytes), and the
+    // canonical root/array output slots (96 + 2 * 64 bytes) are simultaneous.
+    assert_eq!(observer.reserved, 520);
+    assert_eq!(observer.released, 7);
+}
+
+#[test]
+fn parser_reservations_cover_actual_string_capacity() {
+    let source = CandidateAttributeValue::string(r#""123456789""#.to_owned())
+        .validate_log_body(ValueLimitProfile::release_1_system_maximum())
+        .expect("bounded JSON source");
+    let mut observer = MemoryProbe::default();
+    let facts = BodyTransform::Json
+        .apply_with_facts(&source, &mut observer)
+        .expect("JSON scalar transform succeeds");
+
+    assert!(observer.reserved >= facts.retained_heap_bytes() as u64);
+}
+
+#[test]
+fn capacity_helpers_fail_closed_and_reconcile_formatter_failures() {
+    let mut observer = MemoryProbe::default();
+    let mut text = String::new();
+    reserve_string_capacity(&mut text, 0, &mut observer).expect("zero growth is a no-op");
+    assert_eq!(
+        reserve_string_capacity(&mut text, usize::MAX, &mut observer),
+        Err(QueryFailure::new(QueryFailureCode::ResourceExhausted))
+    );
+    assert_eq!(
+        reserve_string_capacity(&mut text, 1_usize << 62, &mut observer),
+        Err(QueryFailure::new(QueryFailureCode::ResourceExhausted))
+    );
+
+    let mut entries = Vec::<u8>::new();
+    reserve_vec_capacity(&mut entries, 0, 1, &mut observer).expect("zero growth is a no-op");
+    assert_eq!(
+        reserve_vec_capacity(&mut entries, usize::MAX, 1, &mut observer),
+        Err(QueryFailure::new(QueryFailureCode::ResourceExhausted))
+    );
+    assert_eq!(
+        reserve_vec_capacity(&mut entries, 1_usize << 62, 1, &mut observer),
+        Err(QueryFailure::new(QueryFailureCode::ResourceExhausted))
+    );
+    assert_eq!(
+        reserve_vec_capacity(&mut entries, 2, u64::MAX, &mut observer),
+        Err(QueryFailure::new(QueryFailureCode::ResourceExhausted))
+    );
+
+    let first_pass = Cell::new(true);
+    let result = capacity::format_scalar(
+        |output| {
+            if first_pass.replace(false) {
+                output.write_str("7")
+            } else {
+                output.write_str("77")
+            }
+        },
+        &mut observer,
+    );
+    assert_eq!(result, Err(QueryFailure::new(QueryFailureCode::Internal)));
+    assert!(observer.released > 0);
+
+    let mut sizing_error = MemoryProbe::default();
+    let result = capacity::format_scalar(|_| Err(std::fmt::Error), &mut sizing_error);
+    assert_eq!(result, Err(QueryFailure::new(QueryFailureCode::Internal)));
 }
 
 #[test]

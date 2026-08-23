@@ -1,11 +1,12 @@
-use std::fmt::Write;
-
 use positron_domain::value::{CandidateAttributeValue, ValidatedAttributeValue, ValueLimitProfile};
 
 use crate::{QueryFailure, QueryFailureCode};
 
+mod capacity;
 mod json;
 mod logfmt;
+
+use capacity::{format_scalar, reserve_string_capacity, reserve_vec_capacity};
 
 /// Query-time body transformations. They produce a new query value and never
 /// alter the authenticated value held by the Signal Store.
@@ -247,32 +248,9 @@ pub(super) fn copy_text(
     source: &str,
     observer: &mut impl TransformObserver,
 ) -> Result<String, QueryFailure> {
-    let bytes = u64::try_from(source.len())
-        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-    observer.reserve_memory(bytes)?;
     let mut value = String::new();
-    if value.try_reserve_exact(source.len()).is_err() {
-        observer.release_memory(bytes)?;
-        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-    }
+    reserve_string_capacity(&mut value, source.len(), observer)?;
     value.push_str(source);
-    Ok(value)
-}
-
-fn format_scalar(
-    formatter: impl FnOnce(&mut String) -> std::fmt::Result,
-    observer: &mut impl TransformObserver,
-) -> Result<String, QueryFailure> {
-    observer.reserve_memory(128)?;
-    let mut value = String::new();
-    if value.try_reserve_exact(128).is_err() {
-        observer.release_memory(128)?;
-        return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
-    }
-    if formatter(&mut value).is_err() {
-        observer.release_memory(128)?;
-        return Err(QueryFailure::new(QueryFailureCode::Internal));
-    }
     Ok(value)
 }
 

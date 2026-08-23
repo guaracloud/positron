@@ -178,25 +178,35 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(0),
             ValidatedAttributeValueInner::String(value) => {
                 observe_payload(value.as_bytes(), observer)?;
-                Ok(value.len())
+                Ok(value.capacity())
             },
             ValidatedAttributeValueInner::Bytes(value) => {
                 observe_payload(value, observer)?;
-                Ok(value.len())
+                Ok(value.capacity())
             },
             ValidatedAttributeValueInner::Array(values) => {
-                values.iter().try_fold(0_usize, |total, value| {
+                let retained = values
+                    .capacity()
+                    .checked_mul(ARRAY_VALUE_SLOT_BYTES)
+                    .ok_or_else(|| {
+                        ObservedValueFailure::Domain(DomainFailure::value_limit_exceeded())
+                    })?;
+                values.iter().try_fold(retained, |total, value| {
                     observe_structure(observer)?;
-                    let total = checked_add(total, ARRAY_VALUE_SLOT_BYTES)?;
                     checked_add(total, value.retained_heap_bytes_observed(observer)?)
                 })
             },
             ValidatedAttributeValueInner::KeyValueList(values) => {
-                values.iter().try_fold(0_usize, |total, entry| {
+                let retained = values
+                    .capacity()
+                    .checked_mul(KEY_VALUE_ENTRY_SLOT_BYTES)
+                    .ok_or_else(|| {
+                        ObservedValueFailure::Domain(DomainFailure::value_limit_exceeded())
+                    })?;
+                values.iter().try_fold(retained, |total, entry| {
                     observe_structure(observer)?;
                     observe_payload(entry.key.as_bytes(), observer)?;
-                    let total = checked_add(total, KEY_VALUE_ENTRY_SLOT_BYTES)?;
-                    let total = checked_add(total, entry.key.len())?;
+                    let total = checked_add(total, entry.key.capacity())?;
                     checked_add(total, entry.value.retained_heap_bytes_observed(observer)?)
                 })
             },
