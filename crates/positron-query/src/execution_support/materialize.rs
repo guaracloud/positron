@@ -4,6 +4,27 @@ use crate::{
     LogicalPlan, QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis,
 };
 
+struct TransformWorkObserver<'a, 'kernel, 'catalog, 'ledger> {
+    service: &'a crate::QueryService<'kernel, 'catalog, 'ledger>,
+    state: &'a mut crate::cursor::CursorState,
+}
+
+impl crate::transform::TransformObserver for TransformWorkObserver<'_, '_, '_, '_> {
+    fn step(&mut self) -> Result<(), QueryFailure> {
+        if self.state.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        let units = self.service.work_units(crate::QueryWorkStage::Operators)?;
+        super::charge_work(self.state, units)?;
+        if super::exhausted(self.state) {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::CpuWorkUnits,
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn query_record(
     service: &crate::QueryService<'_, '_, '_>,
     state: &mut crate::cursor::CursorState,
@@ -11,9 +32,20 @@ pub(crate) fn query_record(
     predicate_applied: bool,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<Option<QueryRecord>, QueryFailure> {
+    let transformed_body = match state.plan.transform() {
+        Some(transform) => record
+            .body()
+            .map(|body| {
+                let mut observer = TransformWorkObserver { service, state };
+                transform.apply(body, &mut observer)
+            })
+            .transpose()?,
+        None => None,
+    };
+    let body = transformed_body.as_ref().or_else(|| record.body());
     if !predicate_applied && let Some(filter) = state.plan.filter() {
         let matched = match filter {
-            crate::plan::FilterPredicate::BodyEquals(expected) => match record.body() {
+            crate::plan::FilterPredicate::BodyEquals(expected) => match body {
                 Some(value) => {
                     let mut observer = super::QueryValueObserver::new(
                         service,
@@ -28,7 +60,7 @@ pub(crate) fn query_record(
                 },
                 None => false,
             },
-            crate::plan::FilterPredicate::BodyContains(expected) => match record.body() {
+            crate::plan::FilterPredicate::BodyContains(expected) => match body {
                 Some(value) => {
                     let mut observer = super::QueryValueObserver::new(
                         service,
@@ -44,7 +76,7 @@ pub(crate) fn query_record(
                 },
                 None => false,
             },
-            crate::plan::FilterPredicate::BodyRegex(expected) => match record.body() {
+            crate::plan::FilterPredicate::BodyRegex(expected) => match body {
                 Some(value) => {
                     let mut observer = super::QueryValueObserver::new(
                         service,
@@ -109,7 +141,13 @@ pub(crate) fn query_record(
         selected_columns.contains(&crate::plan::ProjectionColumn::CommitPosition);
     let cancellation = state.cancellation.clone();
     let cpu_limit = state.budget.cpu_work_units();
-    let (attributes, attribute_retained_bytes) = project_attributes(
+    let transformed_retained_bytes = transformed_body
+        .as_ref()
+        .map(transformed_body_retained_bytes)
+        .transpose()?
+        .map(|bytes| memory.acquire(bytes).map(|()| bytes))
+        .transpose()?;
+    let (attributes, attribute_retained_bytes) = match project_attributes(
         record.stored(),
         selected_columns,
         service,
@@ -117,11 +155,26 @@ pub(crate) fn query_record(
         cpu_limit,
         cancellation.clone(),
         memory,
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(failure) => {
+            if let Some(bytes) = transformed_retained_bytes {
+                memory.release(bytes)?;
+            }
+            return Err(failure);
+        },
+    };
     let (body, body_retained_bytes) = if body_selected {
-        let retained = record.body_retained_bytes();
-        (record.take_body(), retained)
+        if let Some(value) = transformed_body {
+            (Some(value), transformed_retained_bytes.unwrap_or(0))
+        } else {
+            let retained = record.body_retained_bytes();
+            (record.take_body(), retained)
+        }
     } else {
+        if let Some(bytes) = transformed_retained_bytes {
+            memory.release(bytes)?;
+        }
         (None, 0)
     };
     Ok(Some(QueryRecord::new(
@@ -145,6 +198,20 @@ pub(crate) fn query_record(
             attribute_retained_bytes,
         },
     )))
+}
+
+fn transformed_body_retained_bytes(
+    value: &positron_domain::value::ValidatedAttributeValue,
+) -> Result<u64, QueryFailure> {
+    value
+        .retained_heap_bytes()
+        .map_err(super::map_domain_value_failure)
+        .and_then(|bytes| {
+            u64::try_from(bytes)
+                .ok()
+                .and_then(|bytes| bytes.checked_add(64))
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))
+        })
 }
 
 fn project_attributes(

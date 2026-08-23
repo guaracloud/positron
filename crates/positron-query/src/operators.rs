@@ -44,9 +44,16 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
             records.push_acquired(record, dynamic_bytes)?;
         }
     }
-    let released_scan_bytes = scanned_retained_bytes
-        .checked_sub(transferred_body_bytes)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+    let released_scan_bytes = if state.plan.transform().is_some() {
+        // A transform allocates a fresh query value. Its retained bytes are
+        // already charged by `query_record`, so no source body bytes can be
+        // transferred out of the scan buffer.
+        scanned_retained_bytes
+    } else {
+        scanned_retained_bytes
+            .checked_sub(transferred_body_bytes)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+    };
     memory.release(released_scan_bytes)?;
 
     if let Some(aggregate) = state.plan.aggregate().cloned() {

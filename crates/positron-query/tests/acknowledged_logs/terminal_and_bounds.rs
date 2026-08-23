@@ -452,7 +452,7 @@ impl QueryFixture {
         })
     }
 
-    fn service(
+    pub(crate) fn service(
         &self,
         batch_limit: u16,
     ) -> Result<QueryService<'static, 'static, '_>, Box<dyn Error>> {

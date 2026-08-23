@@ -10,5 +10,7 @@ mod parity;
 mod support;
 #[path = "acknowledged_logs/terminal_and_bounds.rs"]
 mod terminal_and_bounds;
+#[path = "acknowledged_logs/transforms.rs"]
+mod transforms;
 #[path = "acknowledged_logs/typed_pipeline.rs"]
 mod typed_pipeline;

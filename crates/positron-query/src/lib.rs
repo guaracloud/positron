@@ -20,6 +20,7 @@ mod search;
 mod service;
 mod stream;
 mod stream_lifecycle;
+mod transform;
 
 pub use budget::{QueryBudget, QueryBudgetDimension};
 pub use cancellation::QueryCancellation;
@@ -84,4 +85,37 @@ pub fn fuzz_query_search_matcher(data: &[u8]) {
         .map(|literal| literal.to_vec())
         .collect::<Vec<_>>();
     positron_signals::fuzz_text_search_pruning(body, &literals);
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_query_transforms(data: &[u8]) {
+    if data.len() > 65_536 {
+        return;
+    }
+    let Ok(source) = std::str::from_utf8(data) else {
+        return;
+    };
+    let Ok(value) = positron_domain::value::CandidateAttributeValue::string(source.to_owned())
+        .validate_log_body(positron_domain::value::ValueLimitProfile::release_1_system_maximum())
+    else {
+        return;
+    };
+    struct Unobserved;
+    impl transform::TransformObserver for Unobserved {
+        fn step(&mut self) -> Result<(), QueryFailure> {
+            Ok(())
+        }
+    }
+    for transform in [
+        transform::BodyTransform::Json,
+        transform::BodyTransform::Logfmt,
+        transform::BodyTransform::Cast(transform::CastTarget::String),
+        transform::BodyTransform::Cast(transform::CastTarget::Integer),
+        transform::BodyTransform::Cast(transform::CastTarget::Float),
+        transform::BodyTransform::Cast(transform::CastTarget::Boolean),
+    ] {
+        let mut observer = Unobserved;
+        let _ = transform.apply(&value, &mut observer);
+    }
 }
