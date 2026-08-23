@@ -3,7 +3,6 @@ use positron_kernel::{
     CommittedBlock, LedgerSnapshot, ResourceGovernor, ResourceReservation, StoreBlockIdentity,
     TransferredResourceReservation,
 };
-use std::marker::PhantomData;
 
 use super::{SchemaBudget, SchemaCatalog, SchemaDelta, SchemaFailure};
 use crate::log_store::{LogRecord, LogStore, LogStoreFailure, ScanCancellation, ScanObserver};
@@ -30,7 +29,7 @@ pub struct SchemaQueryUpdate {
 #[doc(hidden)]
 pub struct SchemaReplayCandidate<'reservation> {
     pub(super) catalog: SchemaCatalog,
-    _reservation: PhantomData<&'reservation ()>,
+    pub(super) reservation: ResourceReservation<'reservation>,
 }
 
 impl SchemaSessionStore {
@@ -107,18 +106,19 @@ impl SchemaSessionStore {
     }
 
     /// Builds an unpublished catalog copy under the caller's already-admitted
-    /// replay reservation. The candidate borrows no capacity and therefore
-    /// cannot transfer the live session's base grant at publication time.
+    /// replay reservation. The candidate owns that temporary capacity and
+    /// therefore cannot transfer the live session's base grant at publication
+    /// time.
     pub fn try_clone_for_replay<'reservation>(
         &self,
-        reservation: &'reservation ResourceReservation<'_>,
+        reservation: ResourceReservation<'reservation>,
     ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
         self.try_clone_for_replay_inner(reservation, None)
     }
 
     pub fn try_clone_for_replay_observed<'reservation>(
         &self,
-        reservation: &'reservation ResourceReservation<'_>,
+        reservation: ResourceReservation<'reservation>,
         observer: &dyn ScanObserver,
     ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
         self.try_clone_for_replay_inner(reservation, Some(observer))
@@ -126,7 +126,7 @@ impl SchemaSessionStore {
 
     fn try_clone_for_replay_inner<'reservation>(
         &self,
-        reservation: &'reservation ResourceReservation<'_>,
+        reservation: ResourceReservation<'reservation>,
         observer: Option<&dyn ScanObserver>,
     ) -> Result<SchemaReplayCandidate<'reservation>, SchemaFailure> {
         let required =
@@ -139,7 +139,7 @@ impl SchemaSessionStore {
                 Some(observer) => self.catalog.try_clone_observed(observer)?,
                 None => self.catalog.try_clone()?,
             },
-            _reservation: PhantomData,
+            reservation,
         })
     }
 
@@ -311,7 +311,7 @@ impl SchemaQueryUpdate {
     }
 }
 
-impl SchemaReplayCandidate<'_> {
+impl<'reservation> SchemaReplayCandidate<'reservation> {
     pub fn prepare_replay_mutation_observed(
         &mut self,
         observer: &dyn ScanObserver,

@@ -9,7 +9,7 @@ pub(super) use super::recovery_support::{
     reserve_schema_memory, validated_frontier, verify_frontier,
 };
 use super::replay_capacity::{
-    ReplaySnapshotBounds, ensure_replay_capacity, replay_snapshot_block_work,
+    ReplaySnapshotBounds, ensure_replay_capacity, extend_replay_work, replay_snapshot_block_work,
     reserve_replay_snapshot_capacity, resize_replay_work,
 };
 use super::{MAX_REPLAY_SHARDS, SchemaFailure, SchemaSessionFailure, TenantSchemaSession};
@@ -101,8 +101,7 @@ impl TenantSchemaSession {
             .map_err(SchemaSessionFailure::Schema)?;
         let catalog_reconciliation_work = state
             .catalog
-            .catalog()
-            .replay_reconciliation_work_units(block_count)
+            .replay_reconciliation_work_units_with_staged_entries(block_count, 1)
             .map_err(SchemaSessionFailure::Schema)?;
         let bounds = ReplaySnapshotBounds::new(
             block_count,
@@ -130,7 +129,7 @@ impl TenantSchemaSession {
             .then(|| SchemaBuildObserver::new_scan(bounds.optional_work, cancellation));
         let mut candidate_catalog = state
             .catalog
-            .try_clone_for_replay_observed(&replay_capacity, &mandatory_observer)
+            .try_clone_for_replay_observed(replay_capacity, &mandatory_observer)
             .map_err(SchemaSessionFailure::Schema)?;
         candidate_catalog
             .prepare_replay_mutation_observed(&mandatory_observer)
@@ -175,6 +174,19 @@ impl TenantSchemaSession {
                         .map(|observer| observer as &dyn positron_signals::ScanObserver),
                 )
                 .map_err(map_replay_observed_failure)?;
+            let baseline = candidate_catalog
+                .replay_reconciliation_work_units_with_staged_entries(1, 1)
+                .map_err(SchemaSessionFailure::Schema)?;
+            let actual = candidate_catalog
+                .replay_delta_work_units(&delta, block.identity())
+                .map_err(SchemaSessionFailure::Schema)?;
+            admit_replay_delta_work(
+                candidate_catalog.replay_reservation(),
+                &mandatory_observer,
+                baseline,
+                actual,
+                cancellation,
+            )?;
             let retained_bytes = u64::try_from(delta.retained_memory_bytes())
                 .map_err(|_| SchemaSessionFailure::ReplayLimitExceeded)?;
             let next_retained = candidate_retained_charge
@@ -262,8 +274,7 @@ impl TenantSchemaSession {
                 .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
             let reconciliation_work = state
                 .catalog
-                .catalog()
-                .replay_reconciliation_work_units(1)
+                .replay_reconciliation_work_units_with_staged_entries(1, 1)
                 .map_err(SchemaSessionFailure::Schema)?;
             resize_replay_work(recovery, block.payload().len(), reconciliation_work)?;
             ensure_replay_capacity(recovery, block.payload().len())?;
@@ -285,6 +296,15 @@ impl TenantSchemaSession {
                     None,
                 )
                 .map_err(map_replay_observed_failure)?;
+            let baseline = state
+                .catalog
+                .replay_reconciliation_work_units_with_staged_entries(1, 1)
+                .map_err(SchemaSessionFailure::Schema)?;
+            let actual = state
+                .catalog
+                .replay_delta_work_units(&delta, block.identity())
+                .map_err(SchemaSessionFailure::Schema)?;
+            admit_replay_delta_work(recovery, &observer, baseline, actual, cancellation)?;
             ensure_frontier_slot(&state, snapshot.scope().shard_id())?;
             let frontier = validated_frontier(
                 snapshot.scope().shard_id(),
@@ -304,4 +324,21 @@ impl TenantSchemaSession {
         }
         Ok(())
     }
+}
+
+fn admit_replay_delta_work(
+    reservation: &mut ResourceReservation<'_>,
+    observer: &SchemaBuildObserver<'_>,
+    baseline: u64,
+    actual: u64,
+    cancellation: &dyn ScanCancellation,
+) -> Result<(), SchemaSessionFailure> {
+    if cancellation.is_cancelled() {
+        return Err(SchemaSessionFailure::Cancelled);
+    }
+    let additional = actual.saturating_sub(baseline);
+    extend_replay_work(reservation, additional)?;
+    observer
+        .increase_limit(additional)
+        .map_err(map_observation_failure)
 }

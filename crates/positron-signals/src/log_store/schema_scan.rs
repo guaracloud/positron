@@ -141,15 +141,6 @@ impl LogStore {
             {
                 continue;
             }
-            let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
-            let coverage = schema
-                .verified_query_coverage_observed(block.identity(), digest, query, observer)
-                .map_err(LogStoreFailure::observation)?;
-            match coverage {
-                Some(false) => continue,
-                Some(true) => {},
-                None => reduced_pruning = true,
-            }
             let remaining = match limit_kind {
                 SchemaScanLimit::DecodedRecords => {
                     scan.limit().value().saturating_sub(decoded_records)
@@ -159,6 +150,15 @@ impl LogStore {
             if remaining == 0 {
                 complete = false;
                 break;
+            }
+            let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
+            let coverage = schema
+                .verified_query_coverage_observed(block.identity(), digest, query, observer)
+                .map_err(LogStoreFailure::observation)?;
+            match coverage {
+                Some(false) => continue,
+                Some(true) => {},
+                None => reduced_pruning = true,
             }
             scanned_bytes = scanned_bytes
                 .checked_add(

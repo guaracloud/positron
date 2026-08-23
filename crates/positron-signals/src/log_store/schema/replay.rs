@@ -1,6 +1,7 @@
 use super::catalog::SchemaCatalog;
 use super::failure::SchemaFailure;
 use super::index::TextIndexFraming;
+use super::model::MAX_DISCOVERY_NODES;
 use super::session::{SchemaReplayCandidate, SchemaSessionStore};
 use crate::log_store::ScanObserver;
 
@@ -101,6 +102,17 @@ impl SchemaCatalog {
 
     #[doc(hidden)]
     pub fn replay_reconciliation_work_units(&self, blocks: usize) -> Result<u64, SchemaFailure> {
+        self.replay_reconciliation_work_units_with_staged_entries(blocks, MAX_DISCOVERY_NODES)
+    }
+
+    pub(crate) fn replay_reconciliation_work_units_with_staged_entries(
+        &self,
+        blocks: usize,
+        staged_entries_per_block: usize,
+    ) -> Result<u64, SchemaFailure> {
+        if staged_entries_per_block > MAX_DISCOVERY_NODES {
+            return Err(SchemaFailure::LimitExceeded);
+        }
         let block_len = self
             .block_indexes
             .len()
@@ -110,22 +122,32 @@ impl SchemaCatalog {
             .checked_mul(10)
             .and_then(|value| value.checked_add(1))
             .ok_or(SchemaFailure::LimitExceeded)?;
-        // Replay applies entries through sorted Vec insertion.  A new path
-        // may shift every bounded catalog slot, so reserve that complete
-        // worst-case traversal before the candidate is mutated.  Each
-        // admitted block gets one new-entry slot here; the delta observer
-        // charges any additional staged entries before mutation and rejects
-        // the transaction atomically when the reservation cannot cover them.
-        let entry_shifts = self
+        // Replay applies entries through sorted Vec insertion. A new path may
+        // shift every bounded catalog slot, and staged paths shift one another
+        // across blocks. Reserve the complete checked bound before mutation.
+        let triangular_blocks = blocks
+            .checked_mul(blocks.checked_add(1).ok_or(SchemaFailure::LimitExceeded)?)
+            .and_then(|value| value.checked_div(2))
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        let existing_entry_shifts = self
             .entries
             .len()
-            .checked_add(blocks)
-            .and_then(|value| value.checked_mul(blocks))
+            .checked_mul(blocks)
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        let staged_entry_shifts = staged_entries_per_block
+            .checked_mul(triangular_blocks)
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        let entry_preflight = staged_entries_per_block
+            .checked_mul(blocks)
+            .ok_or(SchemaFailure::LimitExceeded)?;
+        let entry_work = existing_entry_shifts
+            .checked_add(staged_entry_shifts)
+            .and_then(|value| value.checked_add(entry_preflight))
             .ok_or(SchemaFailure::LimitExceeded)?;
         u64::try_from(per_block)
             .ok()
             .and_then(|value| value.checked_mul(u64::try_from(blocks).ok()?))
-            .and_then(|value| value.checked_add(u64::try_from(entry_shifts).ok()?))
+            .and_then(|value| value.checked_add(u64::try_from(entry_work).ok()?))
             .ok_or(SchemaFailure::LimitExceeded)
     }
 
@@ -291,5 +313,56 @@ impl SchemaReplayCandidate<'_> {
     ) -> Result<(), SchemaFailure> {
         self.catalog
             .reconcile_block_identity_observed(identity, digest, observer)
+    }
+}
+
+impl SchemaSessionStore {
+    #[doc(hidden)]
+    pub fn replay_delta_work_units(
+        &self,
+        delta: &super::SchemaDelta,
+        identity: positron_kernel::StoreBlockIdentity,
+    ) -> Result<u64, SchemaFailure> {
+        self.catalog
+            .replay_delta_work_units(delta, delta.has_block_index().then_some(identity))
+    }
+
+    #[doc(hidden)]
+    pub fn replay_reconciliation_work_units_with_staged_entries(
+        &self,
+        blocks: usize,
+        staged_entries_per_block: usize,
+    ) -> Result<u64, SchemaFailure> {
+        self.catalog
+            .replay_reconciliation_work_units_with_staged_entries(blocks, staged_entries_per_block)
+    }
+}
+
+impl<'reservation> SchemaReplayCandidate<'reservation> {
+    #[doc(hidden)]
+    pub fn replay_reservation(
+        &mut self,
+    ) -> &mut positron_kernel::ResourceReservation<'reservation> {
+        &mut self.reservation
+    }
+
+    #[doc(hidden)]
+    pub fn replay_delta_work_units(
+        &self,
+        delta: &super::SchemaDelta,
+        identity: positron_kernel::StoreBlockIdentity,
+    ) -> Result<u64, SchemaFailure> {
+        self.catalog
+            .replay_delta_work_units(delta, delta.has_block_index().then_some(identity))
+    }
+
+    #[doc(hidden)]
+    pub fn replay_reconciliation_work_units_with_staged_entries(
+        &self,
+        blocks: usize,
+        staged_entries_per_block: usize,
+    ) -> Result<u64, SchemaFailure> {
+        self.catalog
+            .replay_reconciliation_work_units_with_staged_entries(blocks, staged_entries_per_block)
     }
 }

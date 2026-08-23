@@ -78,15 +78,6 @@ mod tests {
     }
 
     #[test]
-    fn short_literals_use_generic_fallback() {
-        assert!(
-            TextSearchCandidate::literal("ab")
-                .expect("candidate construction")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn candidate_literals_are_bounded_deduplicated_and_fail_closed() {
         let duplicate = TextSearchCandidate::any_of_bytes(&[
             b"alpha".to_vec(),
@@ -97,15 +88,6 @@ mod tests {
         .expect("at least one literal remains");
         assert_eq!(duplicate.literals(), &[b"alpha".to_vec(), b"beta".to_vec()]);
 
-        let too_many = (0..=super::MAX_SEARCH_LITERALS)
-            .map(|index| format!("{index:03}").into_bytes())
-            .collect::<Vec<_>>();
-        assert!(
-            TextSearchCandidate::any_of_bytes(&too_many)
-                .expect("bounded input allocation")
-                .is_none()
-        );
-
         assert!(
             TextSearchCandidate::any_of_bytes(&[vec![0xff, 0xfe, 0xfd]])
                 .expect("invalid bytes are a supported fallback")
@@ -115,6 +97,18 @@ mod tests {
             TextSearchCandidate::any_of_bytes(&[])
                 .expect("empty candidate allocation")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn internal_literal_bound_fails_closed_before_retaining_the_extra_value() {
+        let values = (0..=super::MAX_SEARCH_LITERALS)
+            .map(|index| format!("{index:03}").into_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            TextSearchCandidate::from_literals(values.iter().map(Vec::as_slice))
+                .expect("bounded literals are valid"),
+            None
         );
     }
 
@@ -191,6 +185,7 @@ pub(crate) const MIN_TEXT_INDEX_BUDGET_BYTES: usize = 256;
 const TRIGRAM_BYTES: usize = 3;
 const MAX_SEARCH_LITERALS: usize = 32;
 const MAX_SEARCH_LITERAL_BYTES: usize = 1_024;
+const MAX_SEARCH_INPUT_BYTES: usize = MAX_SEARCH_LITERALS * MAX_SEARCH_LITERAL_BYTES;
 // A lookup unit covers at most 64 binary-search comparisons. Cancellation is
 // still polled at each unit boundary, but no comparison is free CPU work.
 const LOOKUP_COMPARISONS_PER_WORK_UNIT: usize = 64;
@@ -208,6 +203,21 @@ impl TextSearchCandidate {
     }
 
     pub fn any_of_bytes(values: &[Vec<u8>]) -> Result<Option<Self>, SchemaFailure> {
+        let total_bytes = values.iter().try_fold(0_usize, |total, value| {
+            total
+                .checked_add(value.len())
+                .ok_or(SchemaFailure::LimitExceeded)
+        })?;
+        if values.len() > MAX_SEARCH_LITERALS || total_bytes > MAX_SEARCH_INPUT_BYTES {
+            return Err(SchemaFailure::LimitExceeded);
+        }
+        if values.iter().any(|value| {
+            value.len() < TRIGRAM_BYTES
+                || value.len() > MAX_SEARCH_LITERAL_BYTES
+                || std::str::from_utf8(value).is_err()
+        }) {
+            return Ok(None);
+        }
         Self::from_literals(values.iter().map(Vec::as_slice))
     }
 

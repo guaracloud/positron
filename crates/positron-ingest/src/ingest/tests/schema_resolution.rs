@@ -90,6 +90,72 @@ fn production_observed_schema_stage_publishes_a_complete_text_summary() {
 }
 
 #[test]
+fn unobserved_replay_clone_keeps_its_admitted_reservation_bound() {
+    let fixture = crate::tests::support::fixture().expect("fixture");
+    let budget = SchemaBudget::new(1, 512, 512, 256).expect("bounded budget");
+    let memory = u64::try_from(SchemaCatalog::base_memory_bound(budget).expect("base bound"))
+        .expect("bounded memory");
+    let claim = || {
+        WorkClaim::tenant(
+            fixture.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, memory).expect("amounts"),
+        )
+        .expect("claim")
+    };
+    let session_capacity = fixture
+        .authority
+        .governor()
+        .reserve(claim())
+        .expect("session capacity");
+    let session =
+        SchemaSessionStore::new(session_capacity, fixture.tenant, budget).expect("schema session");
+    let mut records = Vec::new();
+    let delta = session
+        .stage_group(&mut records)
+        .expect("empty delta work bound");
+    let identity = StoreBlockIdentity::new([0xa1; 16]).expect("identity");
+    assert_eq!(
+        session
+            .replay_delta_work_units(&delta, identity)
+            .expect("delta work bound"),
+        1
+    );
+    assert!(
+        session
+            .replay_reconciliation_work_units_with_staged_entries(1, 0)
+            .expect("reconciliation work bound")
+            > 0
+    );
+    let replay_capacity = fixture
+        .authority
+        .governor()
+        .reserve(claim())
+        .expect("replay capacity");
+    let mut candidate = session
+        .try_clone_for_replay(replay_capacity)
+        .expect("unobserved replay clone");
+    assert!(candidate.replay_reservation().is_active());
+
+    let insufficient = fixture
+        .authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                fixture.tenant,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 1).expect("amounts"),
+            )
+            .expect("claim"),
+        )
+        .expect("insufficient reservation");
+    assert!(matches!(
+        session.try_clone_for_replay(insufficient),
+        Err(SchemaFailure::AllocationUnavailable)
+    ));
+}
+
+#[test]
 fn rejected_observed_work_does_not_poison_the_cumulative_budget() {
     let observer = SchemaBuildObserver::new(3, None);
     observer.observe_work(3).expect("exact work fits");

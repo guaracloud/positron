@@ -3,8 +3,63 @@ use crate::log_store::ScanObserver;
 use crate::log_store::schema::catalog::SchemaCatalog;
 use crate::log_store::schema::failure::SchemaFailure;
 use crate::log_store::schema::index::{MAX_BLOCK_INDEXES, SchemaBlockIndex};
+use positron_kernel::StoreBlockIdentity;
 
 impl SchemaCatalog {
+    pub(crate) fn replay_delta_work_units(
+        &self,
+        delta: &SchemaDelta,
+        identity: Option<StoreBlockIdentity>,
+    ) -> Result<u64, SchemaFailure> {
+        let preflight = u64::try_from(1_usize.max(delta.entries.len()))
+            .map_err(|_| SchemaFailure::LimitExceeded)?;
+        let mutation = self.replay_delta_mutation_work_units(delta, identity)?;
+        preflight
+            .checked_add(mutation)
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
+    fn replay_delta_mutation_work_units(
+        &self,
+        delta: &SchemaDelta,
+        identity: Option<StoreBlockIdentity>,
+    ) -> Result<u64, SchemaFailure> {
+        let block_shifts = if let Some(identity) = identity {
+            match self
+                .block_indexes
+                .binary_search_by_key(&identity, |known| known.identity)
+            {
+                Ok(_) => 0,
+                Err(position) => self.block_indexes.len() - position,
+            }
+        } else {
+            0
+        };
+        let entry_shifts = delta.entries.iter().enumerate().try_fold(
+            0_usize,
+            |total, (new_entry_count, staged)| {
+                let shifts = match self
+                    .entries
+                    .binary_search_by(|entry| entry.path.cmp(&staged.path))
+                {
+                    Ok(_) => 0,
+                    Err(position) => self
+                        .entries
+                        .len()
+                        .saturating_sub(position)
+                        .saturating_add(new_entry_count),
+                };
+                total
+                    .checked_add(shifts)
+                    .ok_or(SchemaFailure::LimitExceeded)
+            },
+        )?;
+        u64::try_from(block_shifts)
+            .ok()
+            .and_then(|value| value.checked_add(u64::try_from(entry_shifts).ok()?))
+            .ok_or(SchemaFailure::LimitExceeded)
+    }
+
     pub(crate) fn apply_replay_delta(
         &mut self,
         delta: SchemaDelta,
@@ -40,9 +95,10 @@ impl SchemaCatalog {
             .index_bytes
             .checked_sub(delta.physical_index_bytes())
             .ok_or(SchemaFailure::InvalidValue)?;
-        let preflight_work = 1_usize.max(delta.entries.len());
+        let preflight_work = u64::try_from(1_usize.max(delta.entries.len()))
+            .map_err(|_| SchemaFailure::LimitExceeded)?;
         observer
-            .observe_work(u64::try_from(preflight_work).map_err(|_| SchemaFailure::LimitExceeded)?)
+            .observe_work(preflight_work)
             .map_err(SchemaFailure::Observed)?;
         let new_entries = delta
             .entries
@@ -94,37 +150,13 @@ impl SchemaCatalog {
         // to the replay reservation. Preflight the complete shift charge
         // before mutating either vector so an observation failure remains
         // atomic.
-        let block_shifts = insertion
-            .as_ref()
-            .and_then(|result| result.as_ref().err().copied())
-            .map_or(0, |position| self.block_indexes.len() - position);
-        let entry_shifts = delta.entries.iter().enumerate().try_fold(
-            0_usize,
-            |total, (new_entry_count, staged)| {
-                let shifts = match self
-                    .entries
-                    .binary_search_by(|entry| entry.path.cmp(&staged.path))
-                {
-                    Ok(_) => 0,
-                    Err(position) => self
-                        .entries
-                        .len()
-                        .saturating_sub(position)
-                        .saturating_add(new_entry_count),
-                };
-                total
-                    .checked_add(shifts)
-                    .ok_or(SchemaFailure::LimitExceeded)
-            },
+        let mutation_work = self.replay_delta_mutation_work_units(
+            &delta,
+            block_index.as_ref().map(|index| index.identity),
         )?;
-        let mutation_work = block_shifts
-            .checked_add(entry_shifts)
-            .ok_or(SchemaFailure::LimitExceeded)?;
         if mutation_work > 0 {
             observer
-                .observe_work(
-                    u64::try_from(mutation_work).map_err(|_| SchemaFailure::LimitExceeded)?,
-                )
+                .observe_work(mutation_work)
                 .map_err(SchemaFailure::Observed)?;
         }
         if let Some(index) = block_index {

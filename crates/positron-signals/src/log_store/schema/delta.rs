@@ -86,6 +86,10 @@ impl SchemaDelta {
         !self.index_paths.is_empty()
     }
 
+    pub(crate) const fn has_block_index(&self) -> bool {
+        !self.index_paths.is_empty() || self.text_summary.is_some()
+    }
+
     pub fn try_clone(&self) -> Result<Self, SchemaFailure> {
         let mut entries = Vec::new();
         entries

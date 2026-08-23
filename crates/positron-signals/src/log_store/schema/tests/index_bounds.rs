@@ -119,6 +119,41 @@ fn replay_apply_charges_many_block_mutations_at_the_exact_boundary() -> Result<(
 }
 
 #[test]
+fn replay_mutation_rejects_framing_upgrade_at_the_persistent_boundary() -> Result<(), Box<dyn Error>>
+{
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
+    let (delta, index) = staged_index(&catalog, tenant, &attribute, 1)?;
+    catalog.apply_replay_delta(delta, index, &ReplayMeter::bounded(u64::MAX))?;
+    let block = catalog.block_indexes.first_mut().ok_or("replay block")?;
+    block.text_summary = Some(super::super::text_index::TextBlockSummary::from_bodies([
+        Some("abc"),
+    ])?);
+    block.text_framing = super::super::index::TextIndexFraming::LegacyV2;
+    let budget = catalog.budget();
+    catalog.budget = SchemaBudget::new(
+        budget.max_entries(),
+        budget.max_memory_bytes(),
+        catalog.persistent_bytes(),
+        catalog.index_bytes(),
+    )?;
+    let before = (catalog.persistent_bytes(), catalog.index_bytes());
+    assert_eq!(
+        catalog.prepare_replay_mutation_observed(&ReplayMeter::bounded(u64::MAX)),
+        Err(super::super::SchemaFailure::LimitExceeded)
+    );
+    assert_eq!((catalog.persistent_bytes(), catalog.index_bytes()), before);
+    Ok(())
+}
+
+#[test]
 fn replay_apply_accounts_sorted_block_index_shifts() -> Result<(), Box<dyn Error>> {
     let tenant = tenant();
     let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
@@ -170,9 +205,117 @@ fn replay_reconciliation_capacity_includes_catalog_entry_shifts() -> Result<(), 
 
     assert_eq!(
         catalog.replay_reconciliation_work_units(1)?,
-        4_107,
+        12_298,
         "replay admission must cover a first-path insertion across the catalog"
     );
+    Ok(())
+}
+
+#[test]
+fn replay_reconciliation_capacity_includes_all_staged_entry_shifts() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    for index in 2..4_096 {
+        let attribute = occurrence(
+            AttributeNamespace::Record,
+            &format!("key-{index:04}"),
+            CandidateAttributeValue::string("value".to_owned()),
+        )?;
+        catalog.observe(std::slice::from_ref(&attribute))?;
+    }
+
+    assert!(
+        catalog.replay_reconciliation_work_units(1)? >= 8_191,
+        "one block must admit two first-path staged entries"
+    );
+    assert!(
+        catalog.replay_reconciliation_work_units(2)? >= 16_386,
+        "multiple blocks must admit every staged entry shift"
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_reconciliation_rejects_an_unbounded_staged_entry_claim() {
+    let catalog =
+        SchemaCatalog::new(tenant(), SchemaBudget::release_1().expect("budget")).expect("catalog");
+    assert_eq!(
+        catalog.replay_reconciliation_work_units_with_staged_entries(
+            1,
+            super::super::model::MAX_DISCOVERY_NODES + 1,
+        ),
+        Err(super::super::SchemaFailure::LimitExceeded)
+    );
+}
+
+#[test]
+fn replay_delta_work_units_matches_existing_and_new_identity_paths() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "indexed",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    catalog.observe(std::slice::from_ref(&attribute))?;
+    catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
+    let identity = StoreBlockIdentity::new(1_u128.to_be_bytes())?;
+    let (delta, index) = staged_index(&catalog, tenant, &attribute, 1)?;
+    let unchanged = delta.try_clone()?;
+    assert!(catalog.replay_delta_work_units(&delta, Some(identity))? > 0);
+    catalog.apply_replay_delta(delta, index, &ReplayMeter::bounded(u64::MAX))?;
+    assert_eq!(
+        catalog.replay_delta_work_units(&unchanged, Some(identity))?,
+        catalog.replay_delta_work_units(&unchanged, None)?
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_apply_accounts_multiple_entry_shifts_atomically() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let mut catalog = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    for index in 2..4_096 {
+        let attribute = occurrence(
+            AttributeNamespace::Record,
+            &format!("key-{index:04}"),
+            CandidateAttributeValue::string("value".to_owned()),
+        )?;
+        catalog.observe(std::slice::from_ref(&attribute))?;
+    }
+    let first = occurrence(
+        AttributeNamespace::Record,
+        "key-0000",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    let second = occurrence(
+        AttributeNamespace::Record,
+        "key-0001",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    let mut delta = super::super::SchemaDelta::empty(tenant, true);
+    catalog.stage_record(
+        &[first, second],
+        &mut delta,
+        &mut super::super::delta::DiscoveryMeter::new(),
+    )?;
+    let (delta, index) =
+        delta.into_block_index(StoreBlockIdentity::new(1_u128.to_be_bytes())?, [0x61; 32]);
+    assert!(index.is_none());
+    let before = catalog.encode_catalog_object()?;
+    let under = ReplayMeter::bounded(8_190);
+    assert_eq!(
+        catalog.apply_replay_delta(delta.try_clone()?, None, &under),
+        Err(super::super::SchemaFailure::Observed(
+            ScanObservationFailureCode::BudgetExhausted,
+        ))
+    );
+    assert_eq!(catalog.encode_catalog_object()?, before);
+
+    let exact = ReplayMeter::bounded(8_191);
+    catalog.apply_replay_delta(delta, None, &exact)?;
+    assert_eq!(exact.consumed.get(), 8_191);
+    assert_ne!(catalog.encode_catalog_object()?, before);
     Ok(())
 }
 
@@ -227,13 +370,16 @@ fn observed_replay_noops_and_retains_only_admitted_indexes() -> Result<(), Box<d
     catalog.record_query_use(&path(AttributeNamespace::Record, "indexed"))?;
     let (delta, index) = staged_index(&catalog, tenant, &attribute, 1)?;
     catalog.apply_replay_delta(delta, index, &ReplayMeter::bounded(u64::MAX))?;
+    let (delta, index) = staged_index(&catalog, tenant, &attribute, 2)?;
+    catalog.apply_replay_delta(delta, index, &ReplayMeter::bounded(u64::MAX))?;
     let identity = StoreBlockIdentity::new(1_u128.to_be_bytes())?;
+    let second_identity = StoreBlockIdentity::new(2_u128.to_be_bytes())?;
     let digest = [0x61; 32];
 
     let meter = ReplayMeter::bounded(0);
     catalog.reconcile_block_identity_observed(identity, digest, &meter)?;
     catalog.reconcile_block_identity_observed(
-        StoreBlockIdentity::new(2_u128.to_be_bytes())?,
+        StoreBlockIdentity::new(3_u128.to_be_bytes())?,
         [0x62; 32],
         &meter,
     )?;
@@ -250,6 +396,7 @@ fn observed_replay_noops_and_retains_only_admitted_indexes() -> Result<(), Box<d
         &ReplayMeter::bounded(u64::MAX),
     )?;
     assert!(catalog.has_verified_block(identity, digest));
+    assert!(!catalog.has_verified_block(second_identity, digest));
     Ok(())
 }
 
@@ -294,6 +441,55 @@ fn replay_apply_rejects_cross_tenant_and_invalid_or_duplicate_indexes() -> Resul
     )?;
     assert_eq!(
         catalog.apply_replay_delta(invalid_delta, Some(invalid_index), &meter),
+        Err(super::super::SchemaFailure::InvalidValue)
+    );
+    Ok(())
+}
+
+#[test]
+fn ordinary_apply_rejects_capacity_budget_and_conflicting_identity() -> Result<(), Box<dyn Error>> {
+    let tenant = tenant();
+    let source_budget = SchemaBudget::new(2, 512, 512, 256)?;
+    let source = SchemaCatalog::new(tenant, source_budget)?;
+    let attribute = occurrence(
+        AttributeNamespace::Record,
+        "new",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    let mut delta = super::super::SchemaDelta::empty(tenant, true);
+    source.stage_record(
+        std::slice::from_ref(&attribute),
+        &mut delta,
+        &mut super::super::delta::DiscoveryMeter::new(),
+    )?;
+
+    let mut full = SchemaCatalog::new(tenant, SchemaBudget::new(1, 512, 512, 256)?)?;
+    let existing = occurrence(
+        AttributeNamespace::Record,
+        "existing",
+        CandidateAttributeValue::string("value".to_owned()),
+    )?;
+    full.observe(std::slice::from_ref(&existing))?;
+    assert_eq!(
+        full.apply_replay_delta(delta.try_clone()?, None, &ReplayMeter::bounded(u64::MAX)),
+        Err(super::super::SchemaFailure::AllocationUnavailable)
+    );
+
+    let mut tight = SchemaCatalog::new(tenant, SchemaBudget::new(2, 512, 82, 256)?)?;
+    assert_eq!(
+        tight.apply_replay_delta(delta.try_clone()?, None, &ReplayMeter::bounded(u64::MAX)),
+        Err(super::super::SchemaFailure::LimitExceeded)
+    );
+
+    let mut indexed = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
+    indexed.observe(std::slice::from_ref(&attribute))?;
+    indexed.record_query_use(&path(AttributeNamespace::Record, "new"))?;
+    let (delta, index) = staged_index(&indexed, tenant, &attribute, 1)?;
+    indexed.apply_delta(delta, index)?;
+    let (delta, mut conflicting) = staged_index(&indexed, tenant, &attribute, 1)?;
+    conflicting.as_mut().ok_or("conflicting index")?.digest = [0x62; 32];
+    assert_eq!(
+        indexed.apply_replay_delta(delta, conflicting, &ReplayMeter::bounded(u64::MAX)),
         Err(super::super::SchemaFailure::InvalidValue)
     );
     Ok(())

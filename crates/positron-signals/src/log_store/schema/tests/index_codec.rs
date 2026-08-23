@@ -489,6 +489,27 @@ fn governed_v1_exact_budget_reconciliation_removes_stale_block() -> Result<(), B
 }
 
 #[test]
+fn governed_session_commit_and_reconcile_preserve_empty_replay_state() -> Result<(), Box<dyn Error>>
+{
+    let (legacy, index_bytes) = exact_legacy_budget_checkpoint(1)?;
+    let mut bounded = legacy.clone();
+    let persistent_bytes = u64::from_be_bytes(legacy[42..50].try_into()?) + 16;
+    let index_bytes = u64::try_from(index_bytes)? + 16;
+    bounded[42..50].copy_from_slice(&persistent_bytes.to_be_bytes());
+    bounded[50..58].copy_from_slice(&index_bytes.to_be_bytes());
+    with_governed_legacy_session(&bounded, |session| {
+        let identity = StoreBlockIdentity::new([0x91; 16])?;
+        session.commit(
+            super::super::SchemaDelta::empty(session.tenant(), true),
+            identity,
+            [0x91; 32],
+        )?;
+        session.reconcile_block_identity(identity, [0x91; 32])?;
+        Ok(())
+    })
+}
+
+#[test]
 fn legacy_identity_starting_with_scalar_marker_is_not_consumed_as_sidecar()
 -> Result<(), Box<dyn Error>> {
     let tenant = positron_domain::identity::TenantId::from_bytes([0x41; 16])?;

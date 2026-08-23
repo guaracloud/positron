@@ -178,6 +178,37 @@ pub(super) fn resize_replay_work(
         .map_err(|_| SchemaSessionFailure::StateUnavailable)
 }
 
+pub(super) fn extend_replay_work(
+    reservation: &mut ResourceReservation<'_>,
+    additional_work: u64,
+) -> Result<(), SchemaSessionFailure> {
+    if additional_work == 0 {
+        return Ok(());
+    }
+    let current = reservation.granted();
+    let cpu = current
+        .get(ResourceDimension::CpuWorkUnits)
+        .checked_add(additional_work)
+        .ok_or(SchemaSessionFailure::ReplayLimitExceeded)?;
+    let amounts = ResourceAmounts::new([
+        current.get(ResourceDimension::MemoryBytes),
+        current.get(ResourceDimension::QueueSlots),
+        current.get(ResourceDimension::TaskSlots),
+        current.get(ResourceDimension::BufferCacheBytes),
+        current.get(ResourceDimension::BatchItems),
+        current.get(ResourceDimension::LeaseSlots),
+        current.get(ResourceDimension::RetrySlots),
+        current.get(ResourceDimension::IoPermits),
+        cpu,
+        current.get(ResourceDimension::FileDescriptors),
+        current.get(ResourceDimension::DiskHeadroomBytes),
+    ]);
+    reservation
+        .try_resize(amounts)
+        .map(|_| ())
+        .map_err(|_| SchemaSessionFailure::StateUnavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ReplaySnapshotBounds, reserve_replay_snapshot_capacity};
