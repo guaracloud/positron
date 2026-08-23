@@ -328,6 +328,11 @@ fn sql_and_pipeline_edge_rejections_keep_their_public_classes() -> Result<(), Bo
         "SELECT COUNT (*) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
         budget,
     )?;
+    let tokenized_count = service.plan_sql(
+        fixture.context,
+        "SELECT COUNT( * ) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        budget,
+    )?;
     let canonical_count = service.plan_sql(
         fixture.context,
         "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
@@ -336,6 +341,10 @@ fn sql_and_pipeline_edge_rejections_keep_their_public_classes() -> Result<(), Bo
     assert_eq!(spaced_count.logical_plan(), canonical_count.logical_plan());
     assert_eq!(
         separated_count.logical_plan(),
+        canonical_count.logical_plan()
+    );
+    assert_eq!(
+        tokenized_count.logical_plan(),
         canonical_count.logical_plan()
     );
 

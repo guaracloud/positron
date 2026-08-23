@@ -55,8 +55,33 @@ pub(crate) fn parse_search_string(
     source: &str,
     memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<positron_domain::value::ValidatedAttributeValue, QueryFailure> {
+    let (value, reservation, retained) = parse_search_string_with_reservation(source, memory)?;
+    memory.retain_reservation(reservation, retained)?;
+    Ok(value)
+}
+
+pub(crate) fn parse_search_string_with_reservation(
+    source: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<
+    (
+        positron_domain::value::ValidatedAttributeValue,
+        crate::planning_memory::PlanningReservation,
+        u64,
+    ),
+    QueryFailure,
+> {
     let (value, reservation) = Cursor::new(source, memory)?.parse_legacy_string()?;
-    validate_body(CandidateAttributeValue::string(value), reservation, memory)
+    let mut observer = crate::planning_observer::PlanningValueObserver::new(reservation);
+    let transfer = CandidateAttributeValue::string(value)
+        .validate_log_body_observed_with_facts(
+            ValueLimitProfile::release_1_system_maximum(),
+            &mut observer,
+        )
+        .map_err(map_observed_failure)?;
+    let retained = u64::try_from(transfer.retained_heap_bytes())
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+    Ok((transfer.into_value(), observer.into_reservation(), retained))
 }
 
 fn validate_body(

@@ -94,6 +94,7 @@ impl PlanningMemory {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn release_retained(&self, bytes: u64) -> Result<(), QueryFailure> {
         let mut retained = self.state.retained.load(Ordering::Acquire);
         loop {
@@ -297,7 +298,6 @@ pub(crate) fn split_ascii_whitespace<'source>(
     }
     Ok(tokens)
 }
-
 const MAX_PLAN_COLUMNS: usize = 5;
 
 pub(crate) fn retained_plan_bytes(plan: &LogicalPlan) -> Result<u64, QueryFailure> {
@@ -321,32 +321,32 @@ pub(crate) fn retained_plan_bytes(plan: &LogicalPlan) -> Result<u64, QueryFailur
         bytes = bytes
             .checked_add(128)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        if let FilterPredicate::BodyEquals(value) = filter {
-            bytes = bytes
-                .checked_add(
-                    u64::try_from(
-                        value
-                            .retained_heap_bytes()
-                            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-                    )
+        bytes = match filter {
+            FilterPredicate::BodyEquals(value) => add_usize(
+                bytes,
+                value
+                    .retained_heap_bytes()
                     .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-                )
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        }
-        if let FilterPredicate::AttributeEquals(query) = filter {
-            bytes = bytes
-                .checked_add(
-                    u64::try_from(
-                        query
-                            .retained_memory_bytes()
-                            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-                    )
+            )?,
+            FilterPredicate::BodyContains(value) => bytes
+                .checked_add(value.source_memory_bytes()?)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
+            FilterPredicate::BodyRegex(value) => bytes
+                .checked_add(value.source_memory_bytes()?)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
+            FilterPredicate::AttributeEquals(query) => add_usize(
+                bytes,
+                query
+                    .retained_memory_bytes()
                     .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-                )
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        }
+            )?,
+        };
     }
     Ok(bytes)
+}
+
+fn add_usize(bytes: u64, value: usize) -> Result<u64, QueryFailure> {
+    add_capacity(bytes, value, 1)
 }
 
 fn add_capacity(bytes: u64, capacity: usize, slot_bytes: usize) -> Result<u64, QueryFailure> {

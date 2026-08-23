@@ -554,6 +554,91 @@ fn bounded_path_segments_transfer_exact_capacity() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn sql_index_selector_transfers_both_owned_reservations() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("index-selector-capacity")?;
+    let service = fixture.service(16)?;
+    let before = fixture.kernel.authority.governor().inspect()?;
+    let source = "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"payload\"] INDEX(123) = string(\"x\") ORDER BY query_time, commit_position LIMIT 1";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 3_944, 60)?;
+    drop(service.plan_sql(fixture.context, source, budget)?);
+    let failure = match service.plan_sql(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 3_943, 60)?,
+    ) {
+        Ok(_) => {
+            return Err("one byte below index selector capacity unexpectedly succeeded".into());
+        },
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(QueryBudgetDimension::MemoryBytes)
+    );
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, before);
+    Ok(())
+}
+
+#[test]
+fn sql_parenthesis_bound_is_explicitly_shallower_than_native_values() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("sql-parenthesis-bound")?;
+    let service = fixture.service(16)?;
+    let literal = |depth| {
+        let mut value = String::from("null");
+        for _ in 0..depth {
+            value = format!("array({value})");
+        }
+        value
+    };
+    let source = |depth| {
+        format!(
+            "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"nested\"] any = {} ORDER BY query_time, commit_position LIMIT 1",
+            literal(depth)
+        )
+    };
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    drop(service.plan_sql(fixture.context, &source(16), budget)?);
+    let failure = match service.plan_sql(fixture.context, &source(17), budget) {
+        Ok(_) => return Err("SQL nesting beyond the documented lexer bound succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    Ok(())
+}
+
+#[test]
+fn rejected_search_transfer_releases_parser_and_copy_reservations() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("search-transfer-rollback")?;
+    let service = fixture.service(16)?;
+    let before = fixture.kernel.authority.governor().inspect()?;
+    let literal = "x".repeat(1_025);
+    let pipeline = format!(
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"{literal}\" | limit 1"
+    );
+    let sql = format!(
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body CONTAINS \"{literal}\" ORDER BY query_time, commit_position LIMIT 1"
+    );
+    for source in [pipeline, sql] {
+        let failure = if source.starts_with("pipeline:") {
+            match service.plan_pipeline(fixture.context, &source, budget()) {
+                Ok(_) => return Err("oversized search source unexpectedly succeeded".into()),
+                Err(failure) => failure,
+            }
+        } else {
+            match service.plan_sql(fixture.context, &source, budget()) {
+                Ok(_) => return Err("oversized search source unexpectedly succeeded".into()),
+                Err(failure) => failure,
+            }
+        };
+        assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    }
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, before);
+    Ok(())
+}
+
+#[test]
 fn native_quoted_and_bytes_boundaries_share_closed_parser_errors() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("native-parser-boundaries")?;
     let service = fixture.service(16)?;

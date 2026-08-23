@@ -1,11 +1,11 @@
 use crate::plan::{AggregateSpec, FilterPredicate, OrderDirection, OrderSpec, ProjectionColumn};
-use crate::sql_helpers::{clause, is_count_group, parse_timestamp, unsupported};
+use crate::planning_string::PlanningString;
+use crate::sql_helpers::{clause, is_count_group, is_count_token, parse_timestamp, unsupported};
 use crate::sql_lexer::tokenize;
 use crate::sql_selection::{
     Selection, parse_body_predicate, parse_transform, parse_transform_group, push_column,
 };
 use crate::{LogicalPlan, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange};
-use std::borrow::Cow;
 
 pub(crate) fn parse(
     source: &str,
@@ -199,56 +199,31 @@ impl<'source> Parser<'source> {
         if self.peek().is_some_and(|token| !clause(token)) {
             return Err(unsupported());
         }
+        if literal != "=" && literal != "==" {
+            return Err(unsupported());
+        }
         let selector = if operator.eq_ignore_ascii_case("any") {
-            Cow::Borrowed("any")
+            "any"
         } else if operator.eq_ignore_ascii_case("all") {
-            Cow::Borrowed("all")
+            "all"
         } else if operator
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("index("))
             && operator.ends_with(')')
         {
             let suffix = operator.get(6..).ok_or_else(unsupported)?;
-            let mut selector = String::new();
-            let selector_reservation = self.memory.reserve(
-                u64::try_from(6_usize.checked_add(suffix.len()).ok_or_else(unsupported)?)
-                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-            )?;
-            selector
-                .try_reserve_exact(6 + suffix.len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-            selector.push_str("index(");
-            selector.push_str(suffix);
-            drop(selector_reservation);
-            Cow::Owned(selector)
+            let capacity = 6_usize.checked_add(suffix.len()).ok_or_else(unsupported)?;
+            let mut selector = PlanningString::with_capacity(capacity, &self.memory)?;
+            selector.push_str("index(")?;
+            selector.push_str(suffix)?;
+            let result = parse_attribute_predicate(left, selector.as_str(), value, &self.memory);
+            drop(selector);
+            return result.map(FilterPredicate::AttributeEquals);
         } else {
             return Err(unsupported());
         };
-        if literal != "=" && literal != "==" {
-            return Err(unsupported());
-        }
-        let mut source = String::new();
-        let source_reservation = self.memory.reserve(
-            u64::try_from(
-                left.len()
-                    .checked_add(selector.len())
-                    .and_then(|length| length.checked_add(value.len()))
-                    .and_then(|length| length.checked_add(8))
-                    .ok_or_else(unsupported)?,
-            )
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-        )?;
-        source
-            .try_reserve_exact(left.len() + selector.len() + value.len() + 8)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        source.push_str(left);
-        source.push(' ');
-        source.push_str(&selector);
-        source.push_str(" == ");
-        source.push_str(value);
-        let predicate = crate::attribute_syntax::parse_predicate(&source, &self.memory)?;
-        drop(source_reservation);
-        Ok(FilterPredicate::AttributeEquals(predicate))
+        parse_attribute_predicate(left, selector, value, &self.memory)
+            .map(FilterPredicate::AttributeEquals)
     }
 
     fn ordering(&mut self, axis: &str) -> Result<OrderSpec, QueryFailure> {
@@ -282,10 +257,7 @@ impl<'source> Parser<'source> {
     }
 
     fn count_marker(&mut self) -> bool {
-        if self
-            .peek()
-            .is_some_and(|value| value.eq_ignore_ascii_case("count(*)"))
-        {
+        if self.peek().is_some_and(is_count_token) {
             self.index += 1;
             return true;
         }
@@ -386,4 +358,25 @@ pub(crate) fn plan(
 
 pub(crate) fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
     crate::sql_helpers::parse_limit(source)
+}
+
+fn parse_attribute_predicate(
+    left: &str,
+    selector: &str,
+    value: &str,
+    memory: &crate::planning_memory::PlanningMemory,
+) -> Result<positron_signals::SchemaQuery, QueryFailure> {
+    let capacity = left
+        .len()
+        .checked_add(selector.len())
+        .and_then(|length| length.checked_add(value.len()))
+        .and_then(|length| length.checked_add(8))
+        .ok_or_else(unsupported)?;
+    let mut source = PlanningString::with_capacity(capacity, memory)?;
+    source.push_str(left)?;
+    source.push_str(" ")?;
+    source.push_str(selector)?;
+    source.push_str(" == ")?;
+    source.push_str(value)?;
+    crate::attribute_syntax::parse_predicate(source.as_str(), memory)
 }

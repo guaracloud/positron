@@ -1,6 +1,9 @@
 use crate::{QueryFailure, QueryFailureCode};
 
 const MAX_SQL_TOKENS: usize = 128;
+// SQL parentheses are a lexer-only bound. Native literals keep their own
+// deeper profile bound, but the read-only SQL grammar deliberately rejects
+// nesting beyond this shallower tokenization limit before value parsing.
 const MAX_SQL_NESTING: usize = 16;
 
 pub(crate) fn tokenize<'source>(

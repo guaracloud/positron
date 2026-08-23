@@ -130,27 +130,11 @@ fn parse_versioned_pipeline(
             if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            let value = crate::native_literal::parse_search_string(literal, memory)?;
-            let retained = u64::try_from(
-                value
-                    .retained_heap_bytes()
-                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-            )
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-            let Some(text_source) = value.as_str() else {
-                memory.release_retained(retained)?;
-                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-            };
-            let text_memory = memory.reserve(
-                u64::try_from(text_source.len())
-                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-            )?;
-            let text = text_source.to_owned();
-            let search = crate::search::search_text(text);
-            drop(value);
-            drop(text_memory);
-            memory.release_retained(retained)?;
-            filter = Some(FilterPredicate::BodyContains(search?));
+            filter = Some(crate::search_transfer::parse_filter(
+                literal,
+                crate::search_transfer::SearchKind::Contains,
+                memory,
+            )?);
             stage_order = 2;
         } else if let Some(literal) = stage
             .strip_prefix("search body =~ ")
@@ -159,27 +143,11 @@ fn parse_versioned_pipeline(
             if filter.is_some() || stage_order > 2 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
             }
-            let value = crate::native_literal::parse_search_string(literal, memory)?;
-            let retained = u64::try_from(
-                value
-                    .retained_heap_bytes()
-                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-            )
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-            let Some(text_source) = value.as_str() else {
-                memory.release_retained(retained)?;
-                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-            };
-            let text_memory = memory.reserve(
-                u64::try_from(text_source.len())
-                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-            )?;
-            let text = text_source.to_owned();
-            let regex = crate::search::BoundedRegex::from_source(text);
-            drop(value);
-            drop(text_memory);
-            memory.release_retained(retained)?;
-            filter = Some(FilterPredicate::BodyRegex(regex?));
+            filter = Some(crate::search_transfer::parse_filter(
+                literal,
+                crate::search_transfer::SearchKind::Regex,
+                memory,
+            )?);
             stage_order = 2;
         } else if let Some(columns) = stage.strip_prefix("project ") {
             if projection.is_some() || aggregate.is_some() || stage_order > 2 {

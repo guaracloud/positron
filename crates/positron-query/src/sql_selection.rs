@@ -134,43 +134,23 @@ pub(crate) fn parse_body_predicate(
             crate::native_literal::parse_body(literal, memory)?,
         ));
     }
-    let value = crate::native_literal::parse_search_string(literal, memory)?;
-    let retained = u64::try_from(
-        value
-            .retained_heap_bytes()
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
-    )
-    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    let Some(text_source) = value.as_str() else {
-        memory.release_retained(retained)?;
-        return Err(unsupported());
-    };
-    let text_bytes = u64::try_from(text_source.len())
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-    let text_memory = memory.reserve(text_bytes)?;
-    let text = text_source.to_owned();
     if operator.eq_ignore_ascii_case("contains") {
-        let search = crate::search::search_text(text);
-        drop(value);
-        drop(text_memory);
-        memory.release_retained(retained)?;
-        let search = search?;
-        return Ok(FilterPredicate::BodyContains(search));
+        return crate::search_transfer::parse_filter(
+            literal,
+            crate::search_transfer::SearchKind::Contains,
+            memory,
+        );
     }
     if operator.eq_ignore_ascii_case("regexp")
         || operator.eq_ignore_ascii_case("regex")
         || operator == "~"
     {
-        let regex = crate::search::BoundedRegex::from_source(text);
-        drop(value);
-        drop(text_memory);
-        memory.release_retained(retained)?;
-        let regex = regex?;
-        return Ok(FilterPredicate::BodyRegex(regex));
+        return crate::search_transfer::parse_filter(
+            literal,
+            crate::search_transfer::SearchKind::Regex,
+            memory,
+        );
     }
-    drop(value);
-    drop(text_memory);
-    memory.release_retained(retained)?;
     Err(unsupported())
 }
 

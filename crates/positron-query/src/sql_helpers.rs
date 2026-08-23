@@ -33,6 +33,16 @@ pub(crate) fn is_count_group(value: &str) -> bool {
     value.trim_matches(|character: char| character.is_ascii_whitespace()) == "*"
 }
 
+pub(crate) fn is_count_token(value: &str) -> bool {
+    let Some(group) = value.get(5..) else {
+        return false;
+    };
+    value
+        .get(..5)
+        .is_some_and(|name| name.eq_ignore_ascii_case("count"))
+        && is_count_group(group)
+}
+
 pub(crate) const fn unsupported() -> QueryFailure {
     QueryFailure::new(QueryFailureCode::UnsupportedQuery)
 }

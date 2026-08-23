@@ -3297,7 +3297,7 @@ fn body_search_memory_peak_includes_matcher_and_retained_rows() -> Result<(), Bo
         .ok_or("search did not complete")?;
     assert!(peak > 40_000, "matcher memory was not retained: {peak}");
     let peak = peak
-        .checked_add(448)
+        .checked_add(457)
         .ok_or("plan memory boundary overflowed")?;
 
     for (memory_bytes, expected_complete) in [(peak, true), (peak - 1, false)] {
