@@ -35,6 +35,16 @@ regex automaton, and conservative text-pruning candidate extraction:
 cargo +nightly fuzz run query_search_matcher
 ```
 
+The bounded SQL target feeds arbitrary bytes through a bounded lossy UTF-8
+conversion, parses raw SQL candidates, and checks deterministic failure
+classification. It also generates equivalent bounded SQL and native-pipeline
+queries from the same escaped body literal and asserts that both frontends
+produce the same typed plan or stable failure class:
+
+```console
+cargo +nightly fuzz run query_sql
+```
+
 The physical query-search target builds bounded authenticated Store Blocks and
 schema text coverage, then exercises identity/digest validation, conservative
 candidate pruning, fallback, and decoding through the production scan path.

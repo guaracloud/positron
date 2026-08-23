@@ -55,6 +55,121 @@ pub fn fuzz_query_inputs(data: &[u8]) {
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
+pub fn fuzz_query_sql(data: &[u8]) {
+    const MAX_RAW_BYTES: usize = 4_096;
+    const MAX_PARITY_LITERAL_BYTES: usize = 512;
+    let raw = bounded_lossy_query(data, MAX_RAW_BYTES);
+    let first = service::parse_sql(&raw);
+    let second = service::parse_sql(&raw);
+    assert_eq!(query_classification(&first), query_classification(&second));
+    if let (Ok(first), Ok(second)) = (&first, &second) {
+        assert_eq!(first, second, "SQL plans must be deterministic");
+    }
+
+    let literal = bounded_lossy_query(data, MAX_PARITY_LITERAL_BYTES);
+    let Some(literal) = escaped_query_literal(&literal) else {
+        return;
+    };
+    let Some((sql, pipeline)) = parity_queries(&literal) else {
+        return;
+    };
+    let sql_result = service::parse_sql(&sql);
+    let pipeline_result = service::parse_pipeline(&pipeline);
+    assert_eq!(
+        query_classification(&sql_result),
+        query_classification(&pipeline_result),
+        "equivalent bounded frontends must classify identically"
+    );
+    if let (Ok(sql), Ok(pipeline)) = (&sql_result, &pipeline_result) {
+        assert_eq!(sql, pipeline, "equivalent frontends must share one plan");
+    }
+}
+
+#[cfg(fuzzing)]
+fn bounded_lossy_query(data: &[u8], maximum_bytes: usize) -> String {
+    let bounded = data.get(..data.len().min(maximum_bytes)).unwrap_or(data);
+    let lossy = String::from_utf8_lossy(bounded);
+    let mut output = String::new();
+    if output
+        .try_reserve_exact(lossy.len().min(maximum_bytes))
+        .is_err()
+    {
+        return String::new();
+    }
+    for character in lossy.chars() {
+        let Some(next_length) = output.len().checked_add(character.len_utf8()) else {
+            break;
+        };
+        if next_length > maximum_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+#[cfg(fuzzing)]
+fn escaped_query_literal(value: &str) -> Option<String> {
+    let required = value.bytes().try_fold(0_usize, |length, byte| {
+        length.checked_add(usize::from(matches!(byte, b'"' | b'\\' | b'|')))
+    })?;
+    let required = value.len().checked_add(required)?;
+    let mut escaped = String::new();
+    escaped.try_reserve_exact(required).ok()?;
+    for character in value.chars() {
+        if matches!(character, '"' | '\\' | '|') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Some(escaped)
+}
+
+#[cfg(fuzzing)]
+fn parity_queries(literal: &str) -> Option<(String, String)> {
+    let sql_prefix =
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND body = \"";
+    let sql_suffix = "\" ORDER BY query_time, commit_position LIMIT 1";
+    let pipeline_prefix = "pipeline:v1 logs | range query_time -100 100 | filter body == \"";
+    let pipeline_suffix = "\" | limit 1";
+    let mut sql = String::new();
+    sql.try_reserve_exact(
+        sql_prefix
+            .len()
+            .checked_add(literal.len())?
+            .checked_add(sql_suffix.len())?,
+    )
+    .ok()?;
+    sql.push_str(sql_prefix);
+    sql.push_str(literal);
+    sql.push_str(sql_suffix);
+    let mut pipeline = String::new();
+    pipeline
+        .try_reserve_exact(
+            pipeline_prefix
+                .len()
+                .checked_add(literal.len())?
+                .checked_add(pipeline_suffix.len())?,
+        )
+        .ok()?;
+    pipeline.push_str(pipeline_prefix);
+    pipeline.push_str(literal);
+    pipeline.push_str(pipeline_suffix);
+    Some((sql, pipeline))
+}
+
+#[cfg(fuzzing)]
+fn query_classification(
+    result: &Result<LogicalPlan, QueryFailure>,
+) -> (Option<QueryFailureCode>, Option<QueryBudgetDimension>) {
+    match result {
+        Ok(_) => (None, None),
+        Err(failure) => (Some(failure.code()), failure.limiting_budget()),
+    }
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
 pub fn fuzz_query_search_matcher(data: &[u8]) {
     if data.is_empty() || data.len() > 4_096 {
         return;

@@ -126,6 +126,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "query_sql"
+path = "fuzz_targets/query_sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "query_search_matcher"
 path = "fuzz_targets/query_search_matcher.rs"
 test = false
