@@ -230,10 +230,10 @@ impl<'source, 'observer, O: TransformObserver> JsonParser<'source, 'observer, O>
             let character = char::from_u32(codepoint).ok_or_else(unsupported)?;
             value.push(character);
         } else {
-            let character = char::from_u32(u32::from(first)).ok_or_else(unsupported)?;
             if (0xDC00..=0xDFFF).contains(&first) {
                 return Err(unsupported());
             }
+            let character = char::from_u32(u32::from(first)).ok_or_else(unsupported)?;
             value.push(character);
         }
         Ok(())
