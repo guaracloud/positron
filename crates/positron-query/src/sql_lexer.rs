@@ -7,7 +7,7 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<&str>, QueryFailure> {
     let mut tokens = Vec::new();
     tokens
         .try_reserve_exact(source.len().min(MAX_SQL_TOKENS))
-        .map_err(|_| resource_exhausted())?;
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
     let mut start = None;
     let mut quoted = false;
     let mut escaped = false;
@@ -119,8 +119,4 @@ fn push_token<'source>(
 
 fn unsupported() -> QueryFailure {
     QueryFailure::new(QueryFailureCode::UnsupportedQuery)
-}
-
-fn resource_exhausted() -> QueryFailure {
-    QueryFailure::new(QueryFailureCode::ResourceExhausted)
 }

@@ -93,7 +93,7 @@ impl<'source> Parser<'source> {
         let mut columns = Vec::new();
         columns
             .try_reserve_exact(5)
-            .map_err(|_| resource_exhausted())?;
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let mut count = false;
         let mut transform = None;
         loop {
@@ -140,7 +140,7 @@ impl<'source> Parser<'source> {
         let mut columns = Vec::new();
         columns
             .try_reserve_exact(5)
-            .map_err(|_| resource_exhausted())?;
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let first = self.take()?;
         if first == "*" {
             return Err(unsupported());
@@ -180,7 +180,7 @@ impl<'source> Parser<'source> {
             let mut selector = String::new();
             selector
                 .try_reserve_exact(6 + suffix.len())
-                .map_err(|_| resource_exhausted())?;
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
             selector.push_str("index(");
             selector.push_str(suffix);
             Cow::Owned(selector)
@@ -193,7 +193,7 @@ impl<'source> Parser<'source> {
         let mut source = String::new();
         source
             .try_reserve_exact(left.len() + selector.len() + value.len() + 8)
-            .map_err(|_| resource_exhausted())?;
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         source.push_str(left);
         source.push(' ');
         source.push_str(&selector);
@@ -325,9 +325,8 @@ fn body_predicate(operator: &str, literal: &str) -> Result<FilterPredicate, Quer
     let value = crate::native_literal::parse_search_string(literal)?;
     let text = value.as_str().ok_or_else(unsupported)?.to_owned();
     if operator.eq_ignore_ascii_case("contains") {
-        return Ok(FilterPredicate::BodyContains(crate::search::search_text(
-            text,
-        )?));
+        let search = crate::search::search_text(text)?;
+        return Ok(FilterPredicate::BodyContains(search));
     }
     if operator.eq_ignore_ascii_case("regexp")
         || operator.eq_ignore_ascii_case("regex")
@@ -385,8 +384,4 @@ fn clause(token: &str) -> bool {
 
 fn unsupported() -> QueryFailure {
     QueryFailure::new(QueryFailureCode::UnsupportedQuery)
-}
-
-fn resource_exhausted() -> QueryFailure {
-    QueryFailure::new(QueryFailureCode::ResourceExhausted)
 }

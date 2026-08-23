@@ -299,6 +299,57 @@ fn aggregate_ordering_is_rejected_by_both_frontends() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn sql_and_pipeline_edge_rejections_keep_their_public_classes() -> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("parser-edge-parity")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
+    for source in [
+        "SELECT body, COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 GROUP BY query_time LIMIT 1",
+        "SELECT COUNT(*), JSON(body) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"service\"] any ! ORDER BY query_time, commit_position LIMIT 1",
+        "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"service\"] any != string(\"api\") ORDER BY query_time, commit_position LIMIT 1",
+    ] {
+        let failure = match service.plan_sql(fixture.context, source, budget) {
+            Ok(_) => return Err("unsupported SQL edge was accepted".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.code(),
+            positron_query::QueryFailureCode::UnsupportedQuery
+        );
+    }
+    let spaced_count = service.plan_sql(
+        fixture.context,
+        "SELECT COUNT ( * ) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        budget,
+    )?;
+    let canonical_count = service.plan_sql(
+        fixture.context,
+        "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+        budget,
+    )?;
+    assert_eq!(spaced_count.logical_plan(), canonical_count.logical_plan());
+
+    for source in [
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"x\" | search body contains \"x\" | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time asc, commit_position asc | search body =~ \"x\" | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | cast body as int | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | aggregate count | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | cast body as decimal | limit 1",
+    ] {
+        let failure = match service.plan_pipeline(fixture.context, source, budget) {
+            Ok(_) => return Err("unsupported pipeline edge was accepted".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.code(),
+            positron_query::QueryFailureCode::UnsupportedQuery
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn sql_unquoted_attribute_namespaces_are_case_insensitive_and_quoted_namespaces_reject()
 -> Result<(), Box<dyn Error>> {
     let fixture = super::terminal_and_bounds::QueryFixture::new("namespace-parity")?;
