@@ -200,12 +200,14 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             1,
             initialized.identity.clone(),
         );
-        let query = service.plan_pipeline(
-            context,
-            "logs | range query_time 0 100 | limit 2",
-            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
-                .with_cpu_work_units(16)?,
-        )?;
+        let query = service
+            .plan_pipeline(
+                context,
+                "logs | range query_time 0 100 | limit 2",
+                QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
+                    .with_cpu_work_units(16)?,
+            )
+            .map_err(|failure| format!("{state} plan failed: {failure:?}"))?;
         let events = service
             .execute_page(query)
             .map_err(|failure| format!("{state} initial page failed: {failure:?}"))?
