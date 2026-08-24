@@ -134,7 +134,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         );
         let (schema_query, schema_filter_used, text_candidate, text_filter_used) =
             framed!(scan_predicates(&state.plan, schema));
-        let scan_result = framed!(scan::execute_scan(
+        let scan_result = match scan::execute_scan(
             self.governor,
             state.tenant,
             snapshot,
@@ -146,7 +146,19 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             text_candidate.as_ref(),
             &state.cancellation,
             &mut observer,
-        ));
+        ) {
+            Ok(result) => result,
+            Err(failure) => {
+                state.cpu_work_units = observer.consumed();
+                return self.failed_page(
+                    Some(header),
+                    failure,
+                    &state,
+                    delivered_before,
+                    resources,
+                );
+            },
+        };
         state.cpu_work_units = observer.consumed();
         let result = scan_result;
         state.reduced_pruning |= result.reduced_pruning();
