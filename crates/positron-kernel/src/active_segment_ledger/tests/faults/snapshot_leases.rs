@@ -705,7 +705,7 @@ fn marked_snapshot_lease_publication_failure_rolls_back_capacity_resize()
         let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
         let identity = ledger.create_snapshot_lease(100, 200)?.identity();
         let before = authority.governor().inspect()?;
-        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
             ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])
         })
         .expect_err("marker publication fault must not acknowledge the marker");
