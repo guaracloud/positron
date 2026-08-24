@@ -1,11 +1,17 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_kernel::{ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector};
+use positron_kernel::{ControlTokenAuthentication, ControlTokenProtector};
 use std::sync::Arc;
 
 use crate::result_key::{RESULT_RESUME_KEY_BYTES, ResultResumeKey};
 use crate::{
     LogicalPlan, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange,
 };
+
+mod validation;
+#[cfg(fuzzing)]
+pub(crate) use validation::fuzz_reauthenticate;
+pub(crate) use validation::source_length;
+use validation::{Reader, map_protection_failure};
 
 const MAGIC: [u8; 8] = *b"POSQCR04";
 const LEGACY_MAGIC: [u8; 8] = *b"POSQCR01";
@@ -347,10 +353,7 @@ fn decode_internal(
         (None, None)
     };
     let resume_key = ResultResumeKey::decode(reader.bytes(RESULT_RESUME_KEY_BYTES)?)?;
-    if legacy && encoded_plan_digest != plan_digest(protector, &plan)? {
-        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-    }
-    if !legacy && (language.is_none() || (retain_source && source.is_none())) {
+    if language.is_none() || (retain_source && source.is_none()) {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let state = CursorState {
@@ -391,188 +394,4 @@ fn decode_internal(
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     Ok(state)
-}
-
-pub(crate) fn plan_digest(
-    protector: &ControlTokenProtector<'_>,
-    plan: &LogicalPlan,
-) -> Result<[u8; 32], QueryFailure> {
-    let mut encoding = Vec::with_capacity(19);
-    encoding.push(match plan.temporal_axis() {
-        TemporalAxis::QueryTime => 1,
-        TemporalAxis::EventTime => 2,
-        TemporalAxis::IngestTime => 3,
-    });
-    encoding.extend_from_slice(&plan.temporal_range().start_nanoseconds().to_be_bytes());
-    encoding.extend_from_slice(&plan.temporal_range().end_nanoseconds().to_be_bytes());
-    encoding.extend_from_slice(&plan.limit().to_be_bytes());
-    protector
-        .digest(b"query-plan-v1", &encoding)
-        .map_err(map_protection_failure)
-}
-
-#[cfg(fuzzing)]
-pub(crate) fn fuzz_reauthenticate(
-    protector: &ControlTokenProtector<'_>,
-    bytes: &mut [u8],
-) -> Result<(), QueryFailure> {
-    let payload_bytes = bytes
-        .len()
-        .checked_sub(32)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    let payload = bytes
-        .get(..payload_bytes)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    let authentication = protector
-        .authenticate_query_cursor(CURSOR_PURPOSE, payload)
-        .map_err(map_protection_failure)?;
-    bytes
-        .get_mut(8..16)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
-        .copy_from_slice(&authentication.epoch().to_be_bytes());
-    let payload = bytes
-        .get(..payload_bytes)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    let authentication = protector
-        .authenticate_query_cursor(CURSOR_PURPOSE, payload)
-        .map_err(map_protection_failure)?;
-    bytes
-        .get_mut(payload_bytes..)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
-        .copy_from_slice(&authentication.tag());
-    Ok(())
-}
-
-fn map_protection_failure(failure: ControlTokenFailure) -> QueryFailure {
-    match failure {
-        ControlTokenFailure::InvalidInput | ControlTokenFailure::LimitExceeded => {
-            QueryFailure::new(QueryFailureCode::InvalidCursor)
-        },
-        ControlTokenFailure::Authentication | ControlTokenFailure::Custody => {
-            QueryFailure::new(QueryFailureCode::Internal)
-        },
-    }
-}
-
-pub(crate) fn source_length(cursor: &QueryCursor) -> Result<u64, QueryFailure> {
-    if cursor.as_bytes().len() != CURSOR_BYTES {
-        return Ok(0);
-    }
-    let payload = cursor
-        .as_bytes()
-        .get(..PAYLOAD_BYTES)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    let language = payload
-        .get(CURRENT_PREFIX_BYTES + 9)
-        .copied()
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    if !matches!(language, 1 | 2) {
-        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-    }
-    let length = payload
-        .get(CURRENT_PREFIX_BYTES + 10..CURRENT_PREFIX_BYTES + 12)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u16::from_be_bytes)
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    let length = usize::from(length);
-    if length > MAX_PLAN_SOURCE_BYTES {
-        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-    }
-    u64::try_from(length).map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> Reader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], QueryFailure> {
-        let (value, rest) = self
-            .bytes
-            .split_at_checked(N)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        self.bytes = rest;
-        value
-            .try_into()
-            .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))
-    }
-
-    fn bytes(&mut self, length: usize) -> Result<&'a [u8], QueryFailure> {
-        let (value, rest) = self
-            .bytes
-            .split_at_checked(length)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        self.bytes = rest;
-        Ok(value)
-    }
-
-    fn u16(&mut self) -> Result<u16, QueryFailure> {
-        self.array().map(u16::from_be_bytes)
-    }
-
-    fn u64(&mut self) -> Result<u64, QueryFailure> {
-        self.array().map(u64::from_be_bytes)
-    }
-
-    fn i64(&mut self) -> Result<i64, QueryFailure> {
-        self.array().map(i64::from_be_bytes)
-    }
-
-    const fn empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CURRENT_PREFIX_BYTES, CURSOR_BYTES, ControlTokenFailure, QueryCursor, QueryFailureCode,
-        map_protection_failure, source_length,
-    };
-
-    #[test]
-    fn protection_failures_keep_the_cursor_failure_boundary_closed() {
-        assert_eq!(
-            map_protection_failure(ControlTokenFailure::InvalidInput).code(),
-            QueryFailureCode::InvalidCursor
-        );
-        assert_eq!(
-            map_protection_failure(ControlTokenFailure::LimitExceeded).code(),
-            QueryFailureCode::InvalidCursor
-        );
-        assert_eq!(
-            map_protection_failure(ControlTokenFailure::Authentication).code(),
-            QueryFailureCode::Internal
-        );
-        assert_eq!(
-            map_protection_failure(ControlTokenFailure::Custody).code(),
-            QueryFailureCode::Internal
-        );
-    }
-
-    #[test]
-    fn source_length_rejects_unknown_language_and_checked_overflow() {
-        let mut bytes = vec![0_u8; CURSOR_BYTES];
-        bytes[CURRENT_PREFIX_BYTES + 9] = 3;
-        assert_eq!(
-            source_length(&QueryCursor(bytes.clone()))
-                .expect_err("unknown language must fail closed")
-                .code(),
-            QueryFailureCode::InvalidCursor
-        );
-
-        bytes[CURRENT_PREFIX_BYTES + 9] = 1;
-        bytes[CURRENT_PREFIX_BYTES + 10..CURRENT_PREFIX_BYTES + 12]
-            .copy_from_slice(&4_097_u16.to_be_bytes());
-        assert_eq!(
-            source_length(&QueryCursor(bytes))
-                .expect_err("source length above the checked cap must fail closed")
-                .code(),
-            QueryFailureCode::InvalidCursor
-        );
-    }
 }

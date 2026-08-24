@@ -1,7 +1,12 @@
 //! Immutable encrypted Catalog Generations and their single publication authority.
 
+mod budget;
 mod codec;
+#[cfg(feature = "test-support")]
+mod fixture;
 mod inspection;
+mod recovery;
+mod rotation;
 mod storage;
 mod types;
 
@@ -11,17 +16,23 @@ mod tests;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use codec::{
-    CommitRecord, decode_audit, decode_commit, encode_commit, generation_identity,
-    object_set_digest, prepare_audit, snapshot_from_record, transaction_digest,
+use budget::{
+    commit_resource_claim, recovery_resource_claim, reserve_history, retained_artifact_bytes,
 };
-use storage::{CatalogStorage, FRAME_OVERHEAD_BYTES, MAX_GENERATIONS};
+use codec::{
+    CommitRecord, encode_commit, generation_identity, object_set_digest, prepare_audit,
+    snapshot_from_record, transaction_digest,
+};
+use recovery::load_snapshot;
+use recovery::recover;
+use storage::CatalogStorage;
 
 use crate::data_protection::ControlTokenProtector;
-use crate::data_protection::DataProtection;
 use crate::resource_governor::CatalogWriterLease;
-use crate::{RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority};
+use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority};
 
+#[cfg(feature = "test-support")]
+pub use fixture::GovernanceFixtureTarget;
 use types::AuditFrontier;
 #[cfg(feature = "test-support")]
 pub use types::GovernanceFixtureObject;
@@ -39,11 +50,11 @@ pub(crate) use storage::with_catalog_fault;
 pub(crate) use storage::fault::CatalogFileEvent;
 
 const MAX_RECOVERED_AUDIT_BYTES: usize = 16_777_216;
+#[cfg(test)]
+const MAX_GENERATIONS: usize = storage::MAX_GENERATIONS;
 const MAX_RETAINED_HISTORY_BYTES: usize = 16_777_216;
 const MAX_RECOVERY_MEMORY_BYTES: u64 = 70_000_000;
 const MAX_RECOVERY_ITEMS: u64 = 65_540;
-const ROTATION_AUDIT_DOMAIN: &[u8] = b"catalog-root-rotation-v1\0";
-const ROTATION_TRANSACTION_DOMAIN: &[u8] = b"positron-catalog-root-rotation-transaction-v1";
 
 /// The only Release 1 authority that publishes Catalog Generations.
 pub struct Catalog<'authority> {
@@ -338,135 +349,6 @@ impl<'authority> Catalog<'authority> {
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
     }
 
-    /// Rewraps every reachable encrypted artifact under a successor root key.
-    ///
-    /// Marker authentication is a separate stable authority and is never changed. An
-    /// interrupted pass can be reopened with [`CatalogSecret::with_predecessor`] and retried.
-    /// Started, successor-verified, and completed states are deterministic audited Catalog
-    /// transactions. The predecessor route remains installed until completion is published.
-    pub fn rewrap(
-        &self,
-        transaction: TransactionId,
-        replacement: CatalogWrappingKey,
-        intent: AuditIntent,
-    ) -> Result<CatalogRotation, CatalogFailure> {
-        let transactions = rotation_transactions(transaction)?;
-        let audits = rotation_audits(&replacement, &intent)?;
-        let replacement_route = (replacement.provider_key_reference, replacement.key_epoch);
-        let claim = RecoveryWorkClaim::system(
-            RecoveryWorkKind::DurabilityCompletion,
-            rewrap_resource_claim(),
-        )
-        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-        let _reservation = self
-            .authority
-            .recovery()
-            .reserve(claim)
-            .map_err(CatalogFailure::admission)?;
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-
-        self.refresh_state()?;
-        let started_exists = self.has_transaction(transactions[0])?;
-        {
-            let secret = self
-                .secret
-                .lock()
-                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-            let valid_route = match secret.predecessor.as_ref() {
-                Some(_) => replacement.same_route(&secret.wrapping),
-                None => {
-                    (started_exists && replacement.same_route(&secret.wrapping))
-                        || (replacement.key_epoch > secret.wrapping.key_epoch
-                            && !replacement.same_route(&secret.wrapping))
-                },
-            };
-            if !valid_route {
-                return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
-            }
-        }
-
-        let expected = self.pin()?.identity();
-        let started = self.commit_unreserved(
-            expected,
-            self.rotation_proposal(transactions[0])?,
-            Some(audits[0].clone()),
-        )?;
-
-        if !self.has_transaction(transactions[1])? {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-            let mut secret = self
-                .secret
-                .lock()
-                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-            let current = match secret.predecessor.as_ref() {
-                Some(predecessor) => predecessor,
-                None => &secret.wrapping,
-            };
-            for outcome in state.transactions.values() {
-                for identity in &outcome.record.objects {
-                    self.storage.rewrap_object(
-                        current,
-                        &replacement,
-                        self.instance,
-                        *identity,
-                        outcome.record.format_epoch,
-                    )?;
-                }
-                if let Some(audit) = outcome.audit.as_ref() {
-                    self.storage.rewrap_audit(
-                        current,
-                        &replacement,
-                        self.instance,
-                        audit.position,
-                        audit.hash,
-                    )?;
-                }
-                self.storage.rewrap_commit(
-                    current,
-                    &replacement,
-                    self.instance,
-                    outcome.record.generation,
-                )?;
-            }
-            if secret.predecessor.is_none() {
-                let predecessor = std::mem::replace(&mut secret.wrapping, replacement);
-                secret.predecessor = Some(predecessor);
-            }
-        }
-
-        let verified = self.commit_unreserved(
-            self.pin()?.identity(),
-            self.rotation_proposal(transactions[1])?,
-            Some(audits[1].clone()),
-        )?;
-        let completed = self.commit_unreserved(
-            self.pin()?.identity(),
-            self.rotation_proposal(transactions[2])?,
-            Some(audits[2].clone()),
-        )?;
-        let mut secret = self
-            .secret
-            .lock()
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-        if secret.wrapping.provider_key_reference != replacement_route.0
-            || secret.wrapping.key_epoch != replacement_route.1
-        {
-            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
-        }
-        secret.predecessor = None;
-        Ok(CatalogRotation {
-            started,
-            verified,
-            completed,
-        })
-    }
-
     pub(crate) fn refresh_state(&self) -> Result<(), CatalogFailure> {
         let mut state = self
             .state
@@ -482,384 +364,9 @@ impl<'authority> Catalog<'authority> {
         }
         Ok(())
     }
-
-    fn has_transaction(&self, transaction: TransactionId) -> Result<bool, CatalogFailure> {
-        self.state
-            .lock()
-            .map(|state| state.transactions.contains_key(&transaction))
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
-    }
-
-    fn rotation_proposal(
-        &self,
-        transaction: TransactionId,
-    ) -> Result<CatalogProposal, CatalogFailure> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-        let epoch = state
-            .current
-            .format_epoch()
-            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
-        let objects = state
-            .current
-            .0
-            .objects
-            .values()
-            .map(|plaintext| CatalogObject::new(plaintext.to_vec()))
-            .collect::<Result<Vec<_>, _>>()?;
-        CatalogProposal::new(transaction, epoch, objects)
-    }
-}
-
-/// Destination for the opaque governance fixture capability.
-#[cfg(feature = "test-support")]
-pub trait GovernanceFixtureTarget {
-    fn install_governance_fixture(
-        &self,
-        fixture: &GovernanceFixtureObject,
-    ) -> Result<(), CatalogFailure>;
-}
-
-#[cfg(feature = "test-support")]
-impl GovernanceFixtureTarget for Catalog<'_> {
-    fn install_governance_fixture(
-        &self,
-        fixture: &GovernanceFixtureObject,
-    ) -> Result<(), CatalogFailure> {
-        let basis = self.pin()?;
-        let capacity = usize::try_from(basis.number())
-            .ok()
-            .and_then(|number| number.checked_add(1))
-            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-        let mut objects = Vec::new();
-        objects
-            .try_reserve_exact(capacity)
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-        for object_id in basis.object_identities() {
-            let object = basis
-                .object(object_id)?
-                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
-            objects.push(CatalogObject::new(object.to_vec())?);
-        }
-        objects.push(CatalogObject::new(fixture.plaintext.clone())?);
-        let transaction = TransactionId::new([0x41; 16])?;
-        let proposal = CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)?;
-        self.commit(basis.identity(), proposal, None).map(|_| ())
-    }
 }
 
 pub(crate) use inspection::inspect_read_only;
-
-fn rotation_transactions(base: TransactionId) -> Result<[TransactionId; 3], CatalogFailure> {
-    fn derive(base: TransactionId, stage: u8) -> Result<TransactionId, CatalogFailure> {
-        let mut encoded = Vec::with_capacity(ROTATION_TRANSACTION_DOMAIN.len() + 17);
-        encoded.extend_from_slice(ROTATION_TRANSACTION_DOMAIN);
-        encoded.extend_from_slice(&base.0);
-        encoded.push(stage);
-        let digest = DataProtection::hash(&encoded)
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
-        let mut identifier = [0_u8; 16];
-        identifier.copy_from_slice(&digest[..16]);
-        TransactionId::new(identifier)
-    }
-    Ok([derive(base, 0)?, derive(base, 1)?, derive(base, 2)?])
-}
-
-fn rotation_audits(
-    replacement: &CatalogWrappingKey,
-    intent: &AuditIntent,
-) -> Result<[AuditIntent; 3], CatalogFailure> {
-    fn prepare(
-        replacement: &CatalogWrappingKey,
-        intent: &AuditIntent,
-        stage: &[u8],
-    ) -> Result<AuditIntent, CatalogFailure> {
-        let mut encoded = Vec::with_capacity(
-            ROTATION_AUDIT_DOMAIN.len() + stage.len() + 1 + 16 + 8 + intent.0.len(),
-        );
-        encoded.extend_from_slice(ROTATION_AUDIT_DOMAIN);
-        encoded.extend_from_slice(stage);
-        encoded.push(0);
-        encoded.extend_from_slice(&replacement.provider_key_reference);
-        encoded.extend_from_slice(&replacement.key_epoch.to_be_bytes());
-        encoded.extend_from_slice(&intent.0);
-        AuditIntent::new(encoded)
-    }
-    Ok([
-        prepare(replacement, intent, b"started")?,
-        prepare(replacement, intent, b"verified")?,
-        prepare(replacement, intent, b"completed")?,
-    ])
-}
-
-fn retained_artifact_bytes(plaintext_bytes: usize) -> Result<usize, CatalogFailure> {
-    plaintext_bytes
-        .checked_add(FRAME_OVERHEAD_BYTES)
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
-}
-
-fn reserve_history(
-    retained: usize,
-    additional: usize,
-    generation_number: u64,
-) -> Result<usize, CatalogFailure> {
-    let generation_count = usize::try_from(generation_number)
-        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    if generation_count > MAX_GENERATIONS {
-        return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
-    }
-    retained
-        .checked_add(additional)
-        .filter(|total| *total <= MAX_RETAINED_HISTORY_BYTES)
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
-}
-
-fn recovery_resource_claim() -> ResourceAmounts {
-    ResourceAmounts::new([
-        MAX_RECOVERY_MEMORY_BYTES,
-        1,
-        1,
-        MAX_RECOVERY_MEMORY_BYTES,
-        MAX_RECOVERY_ITEMS,
-        0,
-        1,
-        1,
-        1,
-        8,
-        0,
-    ])
-}
-
-fn rewrap_resource_claim() -> ResourceAmounts {
-    recovery_resource_claim().maximum(ResourceAmounts::new([
-        MAX_RECOVERY_MEMORY_BYTES,
-        1,
-        1,
-        MAX_RECOVERY_MEMORY_BYTES,
-        MAX_RECOVERY_ITEMS,
-        0,
-        1,
-        1,
-        1,
-        8,
-        MAX_RETAINED_HISTORY_BYTES as u64,
-    ]))
-}
-
-fn commit_resource_claim(
-    proposal: &CatalogProposal,
-    audit: Option<&AuditIntent>,
-) -> Result<ResourceAmounts, CatalogFailure> {
-    let object_bytes = proposal
-        .objects
-        .iter()
-        .try_fold(0_usize, |total, object| {
-            total.checked_add(object.plaintext.len())
-        })
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    let artifact_count = proposal
-        .objects
-        .len()
-        .checked_add(2)
-        .and_then(|count| count.checked_add(usize::from(audit.is_some())))
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    let durable_bytes = object_bytes
-        .checked_add(audit.map_or(0, |intent| intent.0.len()))
-        .and_then(|bytes| bytes.checked_add(artifact_count.saturating_mul(512)))
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    let memory_bytes = durable_bytes
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(1_048_576))
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    let publication = ResourceAmounts::new([
-        u64::try_from(memory_bytes)
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
-        1,
-        1,
-        u64::try_from(memory_bytes)
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
-        u64::try_from(artifact_count)
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
-        0,
-        1,
-        1,
-        1,
-        8,
-        u64::try_from(durable_bytes)
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
-    ]);
-    Ok(publication.maximum(recovery_resource_claim()))
-}
-
-fn recover(
-    storage: &CatalogStorage,
-    secret: &CatalogSecret,
-    instance: InstanceId,
-) -> Result<CatalogState, CatalogFailure> {
-    let marker_scan = storage.markers(secret)?;
-    if marker_scan.authentication_failures != 0 {
-        return Err(CatalogFailure::new(
-            CatalogFailureCode::AuthenticationFailed,
-        ));
-    }
-    if marker_scan.verified.is_empty() {
-        return Ok(CatalogState {
-            current: CatalogSnapshot::origin(),
-            audit: Vec::new(),
-            transactions: BTreeMap::new(),
-            retained_history_bytes: 0,
-        });
-    }
-
-    let mut by_number = BTreeMap::new();
-    let mut highest_number = 0_u64;
-    let mut highest_generation = CatalogGenerationId::ORIGIN;
-    for (generation, number) in &marker_scan.verified {
-        if by_number.insert(*number, *generation).is_some() {
-            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-        }
-        if *number > highest_number {
-            highest_number = *number;
-            highest_generation = *generation;
-        }
-    }
-    let mut chain = Vec::new();
-    let mut retained_history_bytes = marker_scan
-        .verified
-        .len()
-        .checked_mul(storage::MARKER_BYTES)
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-    let mut generation = highest_generation;
-    let mut expected_number = highest_number;
-    loop {
-        let encoded = storage.read_commit(secret, instance, generation)?;
-        retained_history_bytes = reserve_history(
-            retained_history_bytes,
-            retained_artifact_bytes(encoded.len())?,
-            highest_number,
-        )?;
-        let record = decode_commit(generation, &encoded)?;
-        if !record.format_epoch.is_catalog_readable() {
-            return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
-        }
-        if record.instance != instance || record.number != expected_number {
-            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-        }
-        let predecessor = record.predecessor;
-        chain.push(record);
-        if expected_number == 1 {
-            if predecessor != CatalogGenerationId::ORIGIN {
-                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-            }
-            break;
-        }
-        expected_number -= 1;
-        if by_number.get(&expected_number) != Some(&predecessor) {
-            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-        }
-        generation = predecessor;
-    }
-    chain.reverse();
-    let mut predecessor_generation = CatalogGenerationId::ORIGIN;
-    let mut predecessor_number = 0_u64;
-    let mut predecessor_audit = AuditFrontier::ORIGIN;
-    let mut audit = Vec::new();
-    let mut audit_bytes = 0_usize;
-    let mut transactions: BTreeMap<TransactionId, TransactionOutcome> = BTreeMap::new();
-    for record in chain {
-        if record.predecessor != predecessor_generation || record.number != predecessor_number + 1 {
-            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-        }
-        let visible_audit = if record.audit_frontier == predecessor_audit {
-            None
-        } else {
-            if record.audit_frontier.position != predecessor_audit.position + 1 {
-                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-            }
-            let encoded = storage.read_audit(
-                secret,
-                instance,
-                record.audit_frontier.position,
-                record.audit_frontier.hash,
-            )?;
-            retained_history_bytes = reserve_history(
-                retained_history_bytes,
-                retained_artifact_bytes(encoded.len())?,
-                highest_number,
-            )?;
-            let decoded = decode_audit(&encoded)?;
-            if decoded.position != record.audit_frontier.position
-                || decoded.hash != record.audit_frontier.hash
-                || decoded.predecessor_hash != predecessor_audit.hash
-                || decoded.transaction != record.transaction
-            {
-                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-            }
-            // The prior iteration is bounded and one decoded intent is bounded,
-            // so this addition cannot overflow on a supported target.
-            audit_bytes += decoded.intent.len();
-            if audit_bytes > MAX_RECOVERED_AUDIT_BYTES {
-                return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
-            }
-            audit.push(decoded.clone());
-            Some(decoded)
-        };
-        if transaction_digest(
-            record.format_epoch,
-            &record.objects,
-            visible_audit.as_ref().map(|entry| entry.intent()),
-        )? != record.transaction_digest
-        {
-            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-        }
-        predecessor_generation = record.generation;
-        predecessor_number = record.number;
-        predecessor_audit = record.audit_frontier;
-        match transactions.get(&record.transaction) {
-            Some(outcome) if outcome.digest != record.transaction_digest => {
-                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-            },
-            Some(_) => return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption)),
-            None => {
-                transactions.insert(
-                    record.transaction,
-                    TransactionOutcome {
-                        digest: record.transaction_digest,
-                        record,
-                        audit: visible_audit,
-                    },
-                );
-            },
-        }
-    }
-    let latest = transactions
-        .values()
-        .find(|outcome| outcome.record.generation == highest_generation)
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
-    let current = load_snapshot(storage, secret, instance, &latest.record)?;
-    Ok(CatalogState {
-        current,
-        audit,
-        transactions,
-        retained_history_bytes,
-    })
-}
-
-fn load_snapshot(
-    storage: &CatalogStorage,
-    secret: &CatalogSecret,
-    instance: InstanceId,
-    record: &CommitRecord,
-) -> Result<CatalogSnapshot, CatalogFailure> {
-    let mut objects = BTreeMap::new();
-    for identity in &record.objects {
-        let object = storage.read_object(secret, instance, *identity, record.format_epoch)?;
-        objects.insert(*identity, object);
-    }
-    Ok(snapshot_from_record(record, objects))
-}
 
 #[cfg(fuzzing)]
 pub fn fuzz_catalog_stateful(data: &[u8]) {

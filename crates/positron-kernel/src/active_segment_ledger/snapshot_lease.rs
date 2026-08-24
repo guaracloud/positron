@@ -1,24 +1,28 @@
 use std::collections::BTreeSet;
 
-use positron_domain::routing::CommitPosition;
-
-use crate::catalog::{
-    CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
-};
-use crate::data_protection::DataProtection;
 use crate::{WorkClaim, WorkKind};
 
 use super::LedgerFailureCode::ResourceAdmissionRefused;
-use super::capacity::{lease_claim, snapshot_retained_claim};
-use super::snapshot_lease_codec::{decode, encode};
+use super::capacity::lease_claim;
+use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_record::{
     LeaseBlock, LeaseRecord, SnapshotLeaseId, valid_lease_interval, validate_active_lease,
 };
-use super::{
-    ActiveSegmentLedger, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
-    SegmentScope, map_frame_failure,
+#[path = "snapshot_lease_support.rs"]
+mod snapshot_lease_support;
+use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, LedgerSnapshot};
+#[cfg(test)]
+pub(super) use snapshot_lease_support::publication_visible;
+pub(super) use snapshot_lease_support::{expired_in_scope, publish_many, records};
+use snapshot_lease_support::{
+    fresh_identity, map_catalog_failure, publish, reject_time_regression, remove_reservations,
+    rollback_marker_resize, snapshot_from_record,
 };
 pub(super) const MAX_SNAPSHOT_LEASES: usize = 64;
+
+#[cfg(test)]
+#[path = "snapshot_lease_tests.rs"]
+mod tests;
 
 pub struct SnapshotLeaseGrant<'kernel> {
     identity: SnapshotLeaseId,
@@ -376,280 +380,5 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         drop(previous);
         *record = normalized;
         Ok(())
-    }
-}
-
-fn rollback_marker_resize(
-    state: &mut super::state::LedgerState<'_>,
-    identity: SnapshotLeaseId,
-    previous_amounts: crate::ResourceAmounts,
-) -> Result<(), LedgerFailure> {
-    let reservation = state
-        .lease_reservations
-        .get_mut(&identity)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
-    if reservation.granted() != previous_amounts {
-        reservation
-            .try_resize(previous_amounts)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
-    }
-    Ok(())
-}
-
-fn snapshot_from_record<'kernel>(
-    ledger: &ActiveSegmentLedger<'kernel, '_>,
-    state: &super::state::LedgerState<'kernel>,
-    record: &LeaseRecord,
-) -> Result<LedgerSnapshot<'kernel>, LedgerFailure> {
-    if record.blocks.len() > state.blocks.len() || record.frontier > state.frontier {
-        return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
-    }
-    let blocks = state
-        .blocks
-        .get(..record.blocks.len())
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
-    if !blocks.iter().zip(&record.blocks).all(|(actual, expected)| {
-        actual.identity == expected.identity
-            && actual.position == expected.position
-            && actual.segment == expected.segment
-    }) || blocks
-        .last()
-        .map_or(CommitPosition::origin(), |block| block.position)
-        != record.frontier
-    {
-        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-    }
-    let bytes = blocks
-        .iter()
-        .try_fold(0_usize, |total, block| {
-            total.checked_add(block.payload.len())
-        })
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let claim = WorkClaim::tenant(
-        record.scope.tenant,
-        WorkKind::InteractiveQueryTail,
-        snapshot_retained_claim(bytes, blocks.len())?,
-    )
-    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let capacity = ledger
-        .authority
-        .governor()
-        .reserve(claim)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-    Ok(LedgerSnapshot {
-        _capacity: capacity,
-        scope: record.scope,
-        frontier: record.frontier,
-        catalog_generation: record.catalog_generation,
-        catalog_identity: record.catalog_identity,
-        blocks: blocks.to_vec(),
-    })
-}
-
-fn publish(
-    catalog: &crate::Catalog<'_>,
-    basis: &crate::CatalogSnapshot,
-    remove: &BTreeSet<SnapshotLeaseId>,
-    add: Option<Vec<u8>>,
-) -> Result<(), LedgerFailure> {
-    publish_many(catalog, basis, remove, add.into_iter().collect())
-}
-
-pub(super) fn publish_many(
-    catalog: &crate::Catalog<'_>,
-    basis: &crate::CatalogSnapshot,
-    remove: &BTreeSet<SnapshotLeaseId>,
-    add: Vec<Vec<u8>>,
-) -> Result<(), LedgerFailure> {
-    let mut objects = basis
-        .plaintext_objects()
-        .filter(|bytes| {
-            decode(bytes)
-                .ok()
-                .flatten()
-                .is_none_or(|record| !remove.contains(&record.identity))
-        })
-        .map(|bytes| CatalogObject::new(bytes.to_vec()))
-        .collect::<Result<Vec<_>, _>>()?;
-    for encoded in &add {
-        objects.push(CatalogObject::new(encoded.clone())?);
-    }
-    let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
-    match catalog.commit(
-        basis.identity(),
-        CatalogProposal::new(transaction, FormatEpoch::new(FORMAT_EPOCH)?, objects)?,
-        None,
-    ) {
-        Ok(_) => Ok(()),
-        Err(failure) => {
-            let code = map_catalog_failure(failure.code());
-            if catalog.refresh_state().is_err() {
-                return Err(LedgerFailure::ambiguous(code));
-            }
-            let current = catalog.pin().map_err(|_| LedgerFailure::ambiguous(code))?;
-            if publication_visible(&current, remove, &add) {
-                Ok(())
-            } else {
-                Err(LedgerFailure::new(code))
-            }
-        },
-    }
-}
-
-pub(super) fn publication_visible(
-    snapshot: &crate::CatalogSnapshot,
-    remove: &BTreeSet<SnapshotLeaseId>,
-    additions: &[Vec<u8>],
-) -> bool {
-    // Reconcile against the immutable generation without materializing a
-    // second object set. The catalog is already bounded; each lookup is
-    // generation-pinned and therefore observes one coherent publication.
-    if snapshot
-        .plaintext_objects()
-        .any(|published| decode(published).is_err())
-    {
-        return false;
-    }
-    remove.iter().all(|identity| {
-        let replaced = additions.iter().any(|addition| {
-            decode(addition)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.identity == *identity)
-        });
-        replaced
-            || !snapshot.plaintext_objects().any(|published| {
-                decode(published)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.identity == *identity)
-            })
-    }) && additions.iter().all(|addition| {
-        snapshot
-            .plaintext_objects()
-            .any(|published| published == addition.as_slice())
-    })
-}
-
-fn map_catalog_failure(code: CatalogFailureCode) -> LedgerFailureCode {
-    match code {
-        CatalogFailureCode::InvalidInput => LedgerFailureCode::InvalidInput,
-        CatalogFailureCode::LimitExceeded => LedgerFailureCode::LimitExceeded,
-        CatalogFailureCode::StaleGeneration => LedgerFailureCode::StaleGeneration,
-        CatalogFailureCode::IdempotencyConflict => LedgerFailureCode::IdempotencyConflict,
-        CatalogFailureCode::StorageUnavailable => LedgerFailureCode::StorageUnavailable,
-        CatalogFailureCode::IntegrityCorruption => LedgerFailureCode::IntegrityCorruption,
-        CatalogFailureCode::AuthenticationFailed => LedgerFailureCode::AuthenticationFailed,
-        CatalogFailureCode::ConcurrentWriter => LedgerFailureCode::ConcurrentWriter,
-        CatalogFailureCode::ResourceAdmissionRefused => LedgerFailureCode::ResourceAdmissionRefused,
-        CatalogFailureCode::UnsupportedFormat => LedgerFailureCode::UnsupportedFormat,
-    }
-}
-
-pub(super) fn expired_in_scope(
-    records: &[LeaseRecord],
-    scope: SegmentScope,
-    now: u64,
-) -> BTreeSet<SnapshotLeaseId> {
-    records
-        .iter()
-        .filter(|record| record.scope == scope && now >= record.expiry)
-        .map(|record| record.identity)
-        .collect()
-}
-
-fn reject_time_regression(
-    state: &super::state::LedgerState<'_>,
-    now: u64,
-) -> Result<(), LedgerFailure> {
-    if now < state.last_snapshot_lease_time {
-        return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
-    }
-    Ok(())
-}
-
-fn remove_reservations(
-    state: &mut super::state::LedgerState<'_>,
-    identities: &BTreeSet<SnapshotLeaseId>,
-) {
-    for identity in identities {
-        state.lease_reservations.remove(identity);
-        state.lease_resume_markers.remove(identity);
-    }
-}
-
-pub(super) fn records(
-    snapshot: &crate::CatalogSnapshot,
-) -> Result<Vec<LeaseRecord>, LedgerFailure> {
-    let mut records = Vec::new();
-    for bytes in snapshot.plaintext_objects() {
-        if let Some(record) = decode(bytes)? {
-            records.push(record);
-        }
-    }
-    Ok(records)
-}
-
-fn fresh_identity() -> Result<SnapshotLeaseId, LedgerFailure> {
-    let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
-    let bytes = random
-        .get(..16)
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-    SnapshotLeaseId::new(bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{CatalogFailureCode, LedgerFailureCode, map_catalog_failure};
-
-    #[test]
-    fn catalog_failure_mapping_preserves_typed_lease_failures() {
-        let cases = [
-            (
-                CatalogFailureCode::InvalidInput,
-                LedgerFailureCode::InvalidInput,
-            ),
-            (
-                CatalogFailureCode::LimitExceeded,
-                LedgerFailureCode::LimitExceeded,
-            ),
-            (
-                CatalogFailureCode::StaleGeneration,
-                LedgerFailureCode::StaleGeneration,
-            ),
-            (
-                CatalogFailureCode::IdempotencyConflict,
-                LedgerFailureCode::IdempotencyConflict,
-            ),
-            (
-                CatalogFailureCode::StorageUnavailable,
-                LedgerFailureCode::StorageUnavailable,
-            ),
-            (
-                CatalogFailureCode::IntegrityCorruption,
-                LedgerFailureCode::IntegrityCorruption,
-            ),
-            (
-                CatalogFailureCode::AuthenticationFailed,
-                LedgerFailureCode::AuthenticationFailed,
-            ),
-            (
-                CatalogFailureCode::ConcurrentWriter,
-                LedgerFailureCode::ConcurrentWriter,
-            ),
-            (
-                CatalogFailureCode::ResourceAdmissionRefused,
-                LedgerFailureCode::ResourceAdmissionRefused,
-            ),
-            (
-                CatalogFailureCode::UnsupportedFormat,
-                LedgerFailureCode::UnsupportedFormat,
-            ),
-        ];
-
-        for (catalog, expected) in cases {
-            assert_eq!(map_catalog_failure(catalog), expected);
-        }
     }
 }

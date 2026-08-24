@@ -1,25 +1,31 @@
 use positron_kernel::LedgerSnapshot;
-use positron_signals::{LogScan, LogStore, ScanLimit};
+use positron_signals::ScanLimit;
 
 use crate::cursor::{self, CursorState};
 use crate::execution_state::{commit_position, stats_before_current, stats_with_current};
 use crate::execution_support::{
-    BatchDigestInput, QueryScanObserver, QueryValueObserver, batch_digest, charge_output,
-    charge_scan, limiting_budget, map_store_failure, result_digest,
+    BatchDigestInput, QueryScanObserver, batch_digest, charge_output, charge_scan, limiting_budget,
 };
-use crate::result_key::ResultResumeKey;
 use crate::{
-    QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader, QueryService, QueryStream,
-    QueryTerminal, ResultLease, ResultSnapshot,
+    QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryService, QueryStream,
+    QueryTerminal,
 };
 
-const MAX_SCAN_RECORDS: usize = 1_024;
-
+mod clock;
+mod contract;
 mod entry;
 mod lifecycle;
+mod memory;
+mod predicates;
 mod resources;
+mod results;
+mod scan;
 
+use contract::initial_header;
+use memory::plan_memory;
+use predicates::scan_predicates;
 use resources::ExecutionResources;
+use results::{find_resume_index, materialize_page, resume_key_for_page};
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub(super) fn run_page(
@@ -51,25 +57,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             Ok(frontier) => frontier,
             Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
         };
-        let initial_cursor = match pagination
-            .then(|| cursor::encode(&self.ledger.control_tokens(), state.clone()))
-            .transpose()
-        {
-            Ok(cursor) => cursor,
-            Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
-        };
-        let header = match QueryHeader::new(
-            &state.plan,
-            state.budget,
-            ResultSnapshot::new(
-                state.catalog_identity,
-                state.catalog_generation,
-                state.frontier,
-            ),
-            ResultLease::new(state.lease_identity, state.expiry),
-            initial_cursor,
-        ) {
-            Ok(header) => QueryEvent::Header(header),
+        let header = match initial_header(&self.ledger.control_tokens(), &state, pagination) {
+            Ok(header) => header,
             Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
         };
         macro_rules! framed {
@@ -117,19 +106,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_limit = framed!(
             usize::try_from(decoded_remaining)
                 .ok()
-                .map(|limit| limit.min(MAX_SCAN_RECORDS))
+                .map(|limit| limit.min(scan::MAX_SCAN_RECORDS))
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))
         );
         let scan_limit = framed!(
             ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
         );
-        let plan_memory = framed!(state.plan.retained_memory_bytes().and_then(|retained| {
-            let source = u64::try_from(state.source.as_ref().map_or(0, |source| source.len()))
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-            retained
-                .checked_add(source)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
-        }));
+        let plan_memory = framed!(plan_memory(&state));
         let execution_memory = framed!(
             state
                 .budget
@@ -149,50 +132,23 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state.cpu_work_units,
             state.budget.cpu_work_units(),
         );
-        let schema_query = state.plan.schema_query();
-        let schema_filter_used = schema.zip(schema_query).is_some();
-        // A body transform changes the value on which a textual predicate is
-        // evaluated. Raw text summaries can only prove absence for the stored
-        // bytes, so transformed predicates must use the exact post-transform
-        // path and retain reduced-pruning evidence.
-        let text_candidate = if state.plan.transform().is_some() {
-            None
-        } else {
-            framed!(state.plan.text_search_candidate())
-        };
-        let text_filter_used = schema.zip(text_candidate.as_ref()).is_some();
-        let scan_result = match (schema, schema_query, text_candidate.as_ref()) {
-            (Some(schema), None, Some(candidate)) => LogStore::new().scan_text_observed(
-                self.governor,
-                state.tenant,
-                snapshot,
-                LogScan::through(scan_limit, frontier).with_scanned_bytes(scanned_remaining),
-                schema,
-                candidate,
-                &state.cancellation,
-                &observer,
-            ),
-            (Some(schema), Some(query), _) => LogStore::new().scan_schema_observed(
-                self.governor,
-                state.tenant,
-                snapshot,
-                LogScan::through(scan_limit, frontier).with_scanned_bytes(scanned_remaining),
-                schema,
-                query,
-                &state.cancellation,
-                &mut observer,
-            ),
-            _ => LogStore::new().scan_observed(
-                self.governor,
-                state.tenant,
-                snapshot,
-                LogScan::through(scan_limit, frontier).with_scanned_bytes(scanned_remaining),
-                &state.cancellation,
-                &observer,
-            ),
-        };
+        let (schema_query, schema_filter_used, text_candidate, text_filter_used) =
+            framed!(scan_predicates(&state.plan, schema));
+        let scan_result = framed!(scan::execute_scan(
+            self.governor,
+            state.tenant,
+            snapshot,
+            frontier,
+            scan_limit,
+            scanned_remaining,
+            schema,
+            schema_query,
+            text_candidate.as_ref(),
+            &state.cancellation,
+            &mut observer,
+        ));
         state.cpu_work_units = observer.consumed();
-        let result = framed!(scan_result.map_err(map_store_failure));
+        let result = scan_result;
         state.reduced_pruning |= result.reduced_pruning();
         framed!(charge_scan(&mut state, &result));
         framed!(memory.acquire(result.retained_size_bytes()));
@@ -362,35 +318,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         ));
         state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let needs_resume = pagination && end < wanted;
-        let resume_key = if needs_resume {
-            let record = page
-                .last()
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal));
-            let record = framed!(record);
-            if record.count().is_none() {
-                Some(ResultResumeKey::from_record(record, digest))
-            } else {
-                let cancellation = state.cancellation.clone();
-                let mut observer = QueryValueObserver::new(
-                    self,
-                    &mut state.cpu_work_units,
-                    state.budget.cpu_work_units(),
-                    cancellation.clone(),
-                    crate::QueryWorkStage::Output,
-                );
-                Some(framed!(result_digest(
-                    &self.ledger.control_tokens(),
-                    &state.plan,
-                    record,
-                    &cancellation,
-                    &mut observer,
-                    &mut memory,
-                )))
-                .map(|digest| ResultResumeKey::from_record(record, digest))
-            }
-        } else {
-            None
-        };
+        let resume_key = framed!(resume_key_for_page(
+            self,
+            &mut state,
+            &page,
+            digest,
+            needs_resume,
+            &mut memory,
+        ));
         state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let post_digest_expired = framed!(self.observe_state(&mut state));
         if post_digest_expired {
@@ -460,78 +395,4 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             resources,
         )
     }
-
-    fn observe_state(&self, state: &mut CursorState) -> Result<bool, QueryFailure> {
-        let now = self.now()?;
-        if now < state.last_observed_at {
-            return Err(QueryFailure::new(QueryFailureCode::Internal));
-        }
-        state.last_observed_at = now;
-        state.elapsed_wall_seconds = now.saturating_sub(state.started_at);
-        Ok(now >= state.expiry)
-    }
-}
-
-fn find_resume_index<'kernel, 'catalog, 'ledger>(
-    service: &QueryService<'kernel, 'catalog, 'ledger>,
-    state: &mut CursorState,
-    records: &[crate::QueryRecord],
-    key: ResultResumeKey,
-    memory: &mut crate::memory::QueryMemory,
-) -> Result<usize, QueryFailure> {
-    let mut found = None;
-    for (index, record) in records.iter().enumerate() {
-        let digest = if key.is_aggregate() {
-            let cancellation = state.cancellation.clone();
-            let mut observer = QueryValueObserver::new(
-                service,
-                &mut state.cpu_work_units,
-                state.budget.cpu_work_units(),
-                cancellation.clone(),
-                crate::QueryWorkStage::Output,
-            );
-            result_digest(
-                &service.ledger.control_tokens(),
-                &state.plan,
-                record,
-                &cancellation,
-                &mut observer,
-                memory,
-            )?
-        } else {
-            state.prior_digest
-        };
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
-        if key.matches_record(record, digest) {
-            if found.replace(index).is_some() {
-                return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-            }
-        }
-    }
-    found
-        .and_then(|index| index.checked_add(1))
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
-}
-
-fn materialize_page(
-    records: crate::memory::RecordBuffer,
-    start: usize,
-    end: usize,
-    memory: &mut crate::memory::QueryMemory,
-) -> Result<Vec<crate::QueryRecord>, QueryFailure> {
-    if start > end || end > records.len() {
-        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-    }
-    let mut page = crate::memory::RecordBuffer::allocate(end - start, memory)?;
-    let (records, input_slots, _) = records.into_parts();
-    for (index, record) in records.into_iter().enumerate() {
-        let dynamic_bytes = record.retained_dynamic_bytes()?;
-        if (start..end).contains(&index) {
-            page.push_acquired(record, dynamic_bytes)?;
-        } else {
-            memory.release(dynamic_bytes)?;
-        }
-    }
-    memory.release(input_slots)?;
-    Ok(page.into_parts().0)
 }
