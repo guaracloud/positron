@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use super::super::super::snapshot_lease::publication_visible;
 use super::*;
-use crate::{OrdinaryPool, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
+use crate::{
+    OrdinaryPool, ResourceAmounts, ResourceDimension, SnapshotLeaseUsage, WorkClaim, WorkKind,
+};
 
 #[test]
 fn snapshot_lease_pins_exact_visibility_across_append_restart_release_and_expiry()
@@ -811,6 +813,38 @@ fn marked_snapshot_lease_post_rename_sync_reconciles_before_retry_and_reopen()
         let restarted = reopened.resume_snapshot_lease_with_marker(identity, 103, 1, [9; 32])?;
         assert_eq!(restarted.resume_count(), 3);
         assert_eq!(restarted.repeated_batch_count(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_usage_is_monotonic_and_survives_reopen() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        ledger
+            .record_snapshot_lease_usage(identity, SnapshotLeaseUsage::new(10, 2, 3, 4, 5, 6, 7))?;
+        ledger
+            .record_snapshot_lease_usage(identity, SnapshotLeaseUsage::new(11, 1, 2, 3, 4, 5, 9))?;
+        let usage = ledger.snapshot_lease_usage(identity, 101)?;
+        assert_eq!(usage.scanned_bytes(), 21);
+        assert_eq!(usage.decoded_records(), 3);
+        assert_eq!(usage.cpu_work_units(), 5);
+        assert_eq!(usage.wall_seconds(), 7);
+        assert_eq!(usage.output_rows(), 9);
+        assert_eq!(usage.output_bytes(), 11);
+        assert_eq!(usage.memory_peak_bytes(), 9);
+        drop(ledger);
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(102),
+        )?;
+        assert_eq!(reopened.snapshot_lease_usage(identity, 102)?, usage);
         Ok(())
     })
 }

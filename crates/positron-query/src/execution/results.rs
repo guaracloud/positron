@@ -7,7 +7,6 @@ pub(super) fn resume_key_for_page<'kernel, 'catalog, 'ledger>(
     service: &QueryService<'kernel, 'catalog, 'ledger>,
     state: &mut CursorState,
     page: &[crate::QueryRecord],
-    digest: [u8; 32],
     needs_resume: bool,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<Option<ResultResumeKey>, QueryFailure> {
@@ -17,13 +16,10 @@ pub(super) fn resume_key_for_page<'kernel, 'catalog, 'ledger>(
     let record = page
         .last()
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-    if record.count().is_none() {
-        return Ok(Some(ResultResumeKey::from_record(record, digest)));
-    }
     let cancellation = state.cancellation.clone();
     let mut observer = QueryValueObserver::new(
         service,
-        &mut state.cpu_work_units,
+        &mut state.physical_cpu_work_units,
         state.budget.cpu_work_units(),
         cancellation.clone(),
         crate::QueryWorkStage::Output,
@@ -36,6 +32,7 @@ pub(super) fn resume_key_for_page<'kernel, 'catalog, 'ledger>(
         &mut observer,
         memory,
     )?;
+    state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
     Ok(Some(ResultResumeKey::from_record(record, digest)))
 }
 
@@ -48,27 +45,23 @@ pub(super) fn find_resume_index<'kernel, 'catalog, 'ledger>(
 ) -> Result<usize, QueryFailure> {
     let mut found = None;
     for (index, record) in records.iter().enumerate() {
-        let digest = if key.is_aggregate() {
-            let cancellation = state.cancellation.clone();
-            let mut observer = QueryValueObserver::new(
-                service,
-                &mut state.cpu_work_units,
-                state.budget.cpu_work_units(),
-                cancellation.clone(),
-                crate::QueryWorkStage::Output,
-            );
-            result_digest(
-                &service.ledger.control_tokens(),
-                &state.plan,
-                record,
-                &cancellation,
-                &mut observer,
-                memory,
-            )?
-        } else {
-            state.prior_digest
-        };
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        let cancellation = state.cancellation.clone();
+        let mut observer = QueryValueObserver::new(
+            service,
+            &mut state.physical_cpu_work_units,
+            state.budget.cpu_work_units(),
+            cancellation.clone(),
+            crate::QueryWorkStage::Output,
+        );
+        let digest = result_digest(
+            &service.ledger.control_tokens(),
+            &state.plan,
+            record,
+            &cancellation,
+            &mut observer,
+            memory,
+        )?;
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         if key.matches_record(record, digest) {
             remember_match(&mut found, index)?;
         }

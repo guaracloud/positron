@@ -14,7 +14,7 @@ use super::super::{
     SegmentScope, map_frame_failure,
 };
 
-pub(super) fn rollback_marker_resize(
+pub(crate) fn rollback_marker_resize(
     state: &mut super::super::state::LedgerState<'_>,
     identity: SnapshotLeaseId,
     previous_amounts: crate::ResourceAmounts,
@@ -163,7 +163,7 @@ pub(crate) fn publication_visible(
     })
 }
 
-pub(super) fn map_catalog_failure(code: CatalogFailureCode) -> LedgerFailureCode {
+pub(crate) fn map_catalog_failure(code: CatalogFailureCode) -> LedgerFailureCode {
     match code {
         CatalogFailureCode::InvalidInput => LedgerFailureCode::InvalidInput,
         CatalogFailureCode::LimitExceeded => LedgerFailureCode::LimitExceeded,

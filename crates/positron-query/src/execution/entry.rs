@@ -3,7 +3,7 @@ use positron_kernel::SnapshotLeaseId;
 use std::sync::Arc;
 
 use crate::cursor;
-use crate::execution_state::{initial_state, validate_authorization};
+use crate::execution_state::{initial_state, merge_durable_usage, validate_authorization};
 use crate::execution_support::charge_work;
 use crate::execution_support::map_ledger_failure;
 use crate::{PlannedQuery, QueryCursor, QueryFailure, QueryFailureCode, QueryService, QueryStream};
@@ -56,7 +56,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
         let limit = state.plan.limit();
-        let resources = ExecutionResources::new(reservation, lease.identity());
+        let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());
         self.run_page(state, lease.snapshot(), limit, false, schema, resources)
     }
 
@@ -89,7 +89,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .map_err(map_ledger_failure)?;
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
-        let resources = ExecutionResources::new(reservation, lease.identity());
+        let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());
         self.run_page(
             state,
             lease.snapshot(),
@@ -122,29 +122,57 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now_seconds >= state.expiry {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
-        let reservation = self.reserve_query(tenant, state.budget)?;
-        let planning_memory =
-            crate::planning_memory::PlanningMemory::new(state.budget.memory_bytes());
-        let source_length = cursor::source_length(cursor)?;
-        let source_reservation = planning_memory.reserve(source_length)?;
-        let decoded = cursor::decode(&self.ledger.control_tokens(), cursor)?;
-        state.source = decoded.source;
-        state.language = decoded.language;
-        self.reconstruct_plan(&mut state, &planning_memory)?;
-        drop(source_reservation);
         let lease_id = SnapshotLeaseId::new(state.lease_identity)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        // The resumed page reservation is live before snapshot reconstruction.
-        let lease = self
+        let durable_usage = self
             .ledger
-            .resume_snapshot_lease_with_marker(
-                lease_id,
-                now_seconds,
-                state.sequence,
-                state.prior_digest,
-            )
+            .snapshot_lease_usage(lease_id, now_seconds)
             .map_err(map_ledger_failure)?;
-        let resources = ExecutionResources::new(reservation, lease.identity());
+        merge_durable_usage(&mut state, durable_usage);
+        let reservation = self.reserve_query(tenant, state.budget)?;
+        // Establish the bounded durable attempt marker before reconstructing
+        // source/plans, so failures after admission still have a lease-owned
+        // usage record to charge and clean up.
+        let lease = match self.ledger.resume_snapshot_lease_with_marker(
+            lease_id,
+            now_seconds,
+            state.sequence,
+            state.prior_digest,
+        ) {
+            Ok(lease) => lease,
+            Err(failure) => {
+                drop(reservation);
+                return Err(map_ledger_failure(failure));
+            },
+        };
+        merge_durable_usage(&mut state, lease.usage());
+        let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());
+        let planning_memory =
+            crate::planning_memory::PlanningMemory::new(state.budget.memory_bytes());
+        let source_length = match cursor::source_length(cursor) {
+            Ok(length) => length,
+            Err(failure) => {
+                return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+            },
+        };
+        let source_reservation = match planning_memory.reserve(source_length) {
+            Ok(reservation) => reservation,
+            Err(failure) => {
+                return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+            },
+        };
+        let decoded = match cursor::decode(&self.ledger.control_tokens(), cursor) {
+            Ok(decoded) => decoded,
+            Err(failure) => {
+                return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+            },
+        };
+        state.source = decoded.source;
+        state.language = decoded.language;
+        if let Err(failure) = self.reconstruct_plan(&mut state, &planning_memory) {
+            return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+        }
+        drop(source_reservation);
         if lease.snapshot().catalog_identity().to_bytes() != state.catalog_identity
             || lease.snapshot().catalog_generation() != state.catalog_generation
             || lease.snapshot().frontier().value() != state.frontier
@@ -159,7 +187,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         state.resume_count = lease.resume_count();
         state.repeated_batch_count = lease.repeated_batch_count();
         state.last_observed_at = now_seconds;
-        state.elapsed_wall_seconds = now_seconds.saturating_sub(state.started_at);
+        state.physical_elapsed_wall_seconds = now_seconds.saturating_sub(state.started_at);
         self.run_page(
             state,
             lease.snapshot(),

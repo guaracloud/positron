@@ -3,7 +3,7 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use super::format::position_from_value;
 use super::snapshot_lease_record::{
-    LeaseBlock, LeaseRecord, SnapshotLeaseId, valid_lease_interval,
+    LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, valid_lease_interval,
 };
 use super::{
     CommittedBlock, LedgerFailure, LedgerFailureCode, SegmentId, SegmentScope, StoreBlockIdentity,
@@ -12,9 +12,11 @@ use super::{
 const LEASE_MAGIC: [u8; 8] = *b"PSLEASE1";
 const LEASE_VERSION: u16 = 2;
 const LEASE_MARKER_VERSION: u16 = 3;
+const LEASE_USAGE_VERSION: u16 = 4;
 const LEASE_V1_HEADER_BYTES: usize = 105;
 const LEASE_V2_HEADER_BYTES: usize = 113;
 const LEASE_HEADER_BYTES: usize = 169;
+const LEASE_USAGE_HEADER_BYTES: usize = 225;
 const LEASE_BLOCK_BYTES: usize = 40;
 
 pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
@@ -26,7 +28,9 @@ pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
     let mut bytes =
         Vec::with_capacity(LEASE_HEADER_BYTES + record.blocks.len() * LEASE_BLOCK_BYTES);
     bytes.extend_from_slice(&LEASE_MAGIC);
-    let version = if record.resume_count > 0 || record.last_resume_sequence.is_some() {
+    let version = if !record.usage.is_zero() {
+        LEASE_USAGE_VERSION
+    } else if record.resume_count > 0 || record.last_resume_sequence.is_some() {
         LEASE_MARKER_VERSION
     } else {
         LEASE_VERSION
@@ -41,7 +45,7 @@ pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
     bytes.extend_from_slice(&record.frontier.value().to_be_bytes());
     bytes.extend_from_slice(&record.observed_at.to_be_bytes());
     bytes.extend_from_slice(&record.expiry.to_be_bytes());
-    if version == LEASE_MARKER_VERSION {
+    if version == LEASE_MARKER_VERSION || version == LEASE_USAGE_VERSION {
         bytes.extend_from_slice(&record.resume_count.to_be_bytes());
         bytes.extend_from_slice(&record.repeated_batch_count.to_be_bytes());
         bytes.extend_from_slice(
@@ -51,6 +55,15 @@ pub(super) fn encode(record: &LeaseRecord) -> Result<Vec<u8>, LedgerFailure> {
                 .to_be_bytes(),
         );
         bytes.extend_from_slice(&record.last_resume_prior_digest);
+    }
+    if version == LEASE_USAGE_VERSION {
+        bytes.extend_from_slice(&record.usage.scanned_bytes().to_be_bytes());
+        bytes.extend_from_slice(&record.usage.decoded_records().to_be_bytes());
+        bytes.extend_from_slice(&record.usage.cpu_work_units().to_be_bytes());
+        bytes.extend_from_slice(&record.usage.wall_seconds().to_be_bytes());
+        bytes.extend_from_slice(&record.usage.output_rows().to_be_bytes());
+        bytes.extend_from_slice(&record.usage.output_bytes().to_be_bytes());
+        bytes.extend_from_slice(&record.usage.memory_peak_bytes().to_be_bytes());
     }
     bytes.extend_from_slice(
         &u16::try_from(record.blocks.len())
@@ -74,6 +87,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
         1 => (LEASE_V1_HEADER_BYTES, 103),
         2 => (LEASE_V2_HEADER_BYTES, 111),
         LEASE_MARKER_VERSION => (LEASE_HEADER_BYTES, 167),
+        LEASE_USAGE_VERSION => (LEASE_USAGE_HEADER_BYTES, 223),
         _ => return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
     };
     let count = usize::from(u16::from_be_bytes(exact(bytes, count_offset)?));
@@ -117,7 +131,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     let (resume_count, repeated_batch_count, last_resume_sequence, last_resume_prior_digest) =
-        if version == LEASE_MARKER_VERSION {
+        if version == LEASE_MARKER_VERSION || version == LEASE_USAGE_VERSION {
             let resume_count = u64::from_be_bytes(exact(bytes, 111)?);
             let repeated_batch_count = u64::from_be_bytes(exact(bytes, 119)?);
             let sequence = u64::from_be_bytes(exact(bytes, 127)?);
@@ -136,6 +150,19 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
         } else {
             (0, 0, None, [0; 32])
         };
+    let usage = if version == LEASE_USAGE_VERSION {
+        SnapshotLeaseUsage::new(
+            u64::from_be_bytes(exact(bytes, 167)?),
+            u64::from_be_bytes(exact(bytes, 175)?),
+            u64::from_be_bytes(exact(bytes, 183)?),
+            u64::from_be_bytes(exact(bytes, 191)?),
+            u64::from_be_bytes(exact(bytes, 199)?),
+            u64::from_be_bytes(exact(bytes, 207)?),
+            u64::from_be_bytes(exact(bytes, 215)?),
+        )
+    } else {
+        SnapshotLeaseUsage::default()
+    };
     Ok(Some(LeaseRecord {
         identity: SnapshotLeaseId::new(exact(bytes, 10)?)?,
         scope,
@@ -148,6 +175,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<LeaseRecord>, LedgerFailure>
         repeated_batch_count,
         last_resume_sequence,
         last_resume_prior_digest,
+        usage,
         blocks,
     }))
 }

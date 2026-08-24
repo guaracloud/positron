@@ -25,6 +25,121 @@ impl SnapshotLeaseId {
     }
 }
 
+/// Monotonic physical work charged to one durable snapshot lease.
+///
+/// Additive dimensions count every admitted attempt; memory is the maximum
+/// live peak observed by the query. The value is fixed-size so durable lease
+/// metadata remains bounded across retries and reconnects.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SnapshotLeaseUsage {
+    scanned_bytes: u64,
+    decoded_records: u64,
+    cpu_work_units: u64,
+    wall_seconds: u64,
+    output_rows: u64,
+    output_bytes: u64,
+    memory_peak_bytes: u64,
+}
+
+impl SnapshotLeaseUsage {
+    #[must_use]
+    pub const fn new(
+        scanned_bytes: u64,
+        decoded_records: u64,
+        cpu_work_units: u64,
+        wall_seconds: u64,
+        output_rows: u64,
+        output_bytes: u64,
+        memory_peak_bytes: u64,
+    ) -> Self {
+        Self {
+            scanned_bytes,
+            decoded_records,
+            cpu_work_units,
+            wall_seconds,
+            output_rows,
+            output_bytes,
+            memory_peak_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn scanned_bytes(self) -> u64 {
+        self.scanned_bytes
+    }
+
+    #[must_use]
+    pub const fn decoded_records(self) -> u64 {
+        self.decoded_records
+    }
+
+    #[must_use]
+    pub const fn cpu_work_units(self) -> u64 {
+        self.cpu_work_units
+    }
+
+    #[must_use]
+    pub const fn wall_seconds(self) -> u64 {
+        self.wall_seconds
+    }
+
+    #[must_use]
+    pub const fn output_rows(self) -> u64 {
+        self.output_rows
+    }
+
+    #[must_use]
+    pub const fn output_bytes(self) -> u64 {
+        self.output_bytes
+    }
+
+    #[must_use]
+    pub const fn memory_peak_bytes(self) -> u64 {
+        self.memory_peak_bytes
+    }
+
+    pub(super) fn merge(self, delta: Self) -> Result<Self, LedgerFailure> {
+        Ok(Self {
+            scanned_bytes: self
+                .scanned_bytes
+                .checked_add(delta.scanned_bytes)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            decoded_records: self
+                .decoded_records
+                .checked_add(delta.decoded_records)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            cpu_work_units: self
+                .cpu_work_units
+                .checked_add(delta.cpu_work_units)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            wall_seconds: self
+                .wall_seconds
+                .checked_add(delta.wall_seconds)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            output_rows: self
+                .output_rows
+                .checked_add(delta.output_rows)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            output_bytes: self
+                .output_bytes
+                .checked_add(delta.output_bytes)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            memory_peak_bytes: self.memory_peak_bytes.max(delta.memory_peak_bytes),
+        })
+    }
+
+    #[must_use]
+    pub(super) const fn is_zero(self) -> bool {
+        self.scanned_bytes == 0
+            && self.decoded_records == 0
+            && self.cpu_work_units == 0
+            && self.wall_seconds == 0
+            && self.output_rows == 0
+            && self.output_bytes == 0
+            && self.memory_peak_bytes == 0
+    }
+}
+
 /// Bounded delivery marker owned by the Snapshot Lease authority.
 ///
 /// Query cursors are opaque immutable values, so the lease is the one place
@@ -38,6 +153,7 @@ pub(super) struct LeaseResumeMarker {
     pub(super) prior_digest: [u8; 32],
     pub(super) attempts: u64,
     pub(super) repeats: u64,
+    pub(super) usage: SnapshotLeaseUsage,
 }
 
 #[derive(Clone)]
@@ -53,6 +169,7 @@ pub(super) struct LeaseRecord {
     pub(super) repeated_batch_count: u64,
     pub(super) last_resume_sequence: Option<u64>,
     pub(super) last_resume_prior_digest: [u8; 32],
+    pub(super) usage: SnapshotLeaseUsage,
     pub(super) blocks: Vec<LeaseBlock>,
 }
 
@@ -113,6 +230,7 @@ mod tests {
             repeated_batch_count: 0,
             last_resume_sequence: None,
             last_resume_prior_digest: [0; 32],
+            usage: super::SnapshotLeaseUsage::default(),
             blocks: Vec::new(),
         }
     }

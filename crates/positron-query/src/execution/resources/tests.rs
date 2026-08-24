@@ -11,8 +11,8 @@ use positron_kernel::{
     OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume, PrimaryDataVolume,
     RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
     ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey,
-    SegmentScope, SnapshotLeaseId, StorageKernelResourceAuthority, TenantQuota, WorkClaim,
-    WorkKind,
+    SegmentScope, SnapshotLeaseId, SnapshotLeaseUsage, StorageKernelResourceAuthority, TenantQuota,
+    WorkClaim, WorkKind,
 };
 
 use super::ExecutionResources;
@@ -48,7 +48,7 @@ fn lease_identity_mismatch_releases_every_pre_stream_resource() -> Result<(), Bo
         let lease = ledger.create_snapshot_lease(100 + iteration, 200 + iteration)?;
         let identity = lease.identity();
         drop(lease);
-        let resources = ExecutionResources::new(admission, identity);
+        let resources = ExecutionResources::new(admission, identity, SnapshotLeaseUsage::default());
         let expected = SnapshotLeaseId::new([0x99; 16])?;
 
         let failure = match resources.validate_lease_identity(&ledger, expected.to_bytes()) {

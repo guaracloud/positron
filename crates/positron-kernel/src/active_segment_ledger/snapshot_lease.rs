@@ -1,79 +1,27 @@
-use std::collections::BTreeSet;
-
-use crate::{WorkClaim, WorkKind};
-
 use super::LedgerFailureCode::ResourceAdmissionRefused;
 use super::capacity::lease_claim;
 use super::snapshot_lease_codec::encode;
+use super::snapshot_lease_grant::SnapshotLeaseGrant;
 use super::snapshot_lease_record::{
-    LeaseBlock, LeaseRecord, SnapshotLeaseId, valid_lease_interval, validate_active_lease,
+    LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, valid_lease_interval,
+    validate_active_lease,
 };
+use crate::{WorkClaim, WorkKind};
+use std::collections::BTreeSet;
 #[path = "snapshot_lease_support.rs"]
 mod snapshot_lease_support;
-use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, LedgerSnapshot};
+use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 #[cfg(test)]
 pub(super) use snapshot_lease_support::publication_visible;
 pub(super) use snapshot_lease_support::{expired_in_scope, publish_many, records};
 use snapshot_lease_support::{
-    fresh_identity, map_catalog_failure, publish, reject_time_regression, remove_reservations,
-    rollback_marker_resize, snapshot_from_record,
+    fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,
 };
+pub(super) use snapshot_lease_support::{map_catalog_failure, rollback_marker_resize};
 pub(super) const MAX_SNAPSHOT_LEASES: usize = 64;
-
 #[cfg(test)]
 #[path = "snapshot_lease_tests.rs"]
 mod tests;
-
-pub struct SnapshotLeaseGrant<'kernel> {
-    identity: SnapshotLeaseId,
-    expiry: u64,
-    resume_count: u64,
-    repeated_batch_count: u64,
-    snapshot: LedgerSnapshot<'kernel>,
-}
-
-impl std::fmt::Debug for SnapshotLeaseGrant<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SnapshotLeaseGrant")
-            .field("identity", &self.identity)
-            .field("expiry", &self.expiry)
-            .field("snapshot", &"<pinned>")
-            .finish()
-    }
-}
-
-impl<'kernel> SnapshotLeaseGrant<'kernel> {
-    #[must_use]
-    pub const fn identity(&self) -> SnapshotLeaseId {
-        self.identity
-    }
-
-    #[must_use]
-    pub const fn expiry(&self) -> u64 {
-        self.expiry
-    }
-
-    #[must_use]
-    pub const fn resume_count(&self) -> u64 {
-        self.resume_count
-    }
-
-    #[must_use]
-    pub const fn repeated_batch_count(&self) -> u64 {
-        self.repeated_batch_count
-    }
-
-    #[must_use]
-    pub const fn snapshot(&self) -> &LedgerSnapshot<'kernel> {
-        &self.snapshot
-    }
-
-    #[must_use]
-    pub fn into_snapshot(self) -> LedgerSnapshot<'kernel> {
-        self.snapshot
-    }
-}
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     /// Creates a durable lease for an already-admitted query task. The caller's
@@ -122,6 +70,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             repeated_batch_count: 0,
             last_resume_sequence: None,
             last_resume_prior_digest: [0; 32],
+            usage: SnapshotLeaseUsage::default(),
             blocks: state.blocks.iter().map(LeaseBlock::from).collect(),
         };
         // Admit every capacity needed by the returned grant before publishing its
@@ -149,6 +98,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             expiry,
             resume_count: 0,
             repeated_batch_count: 0,
+            usage: SnapshotLeaseUsage::default(),
             snapshot,
         })
     }
@@ -231,7 +181,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     prior_digest: record.last_resume_prior_digest,
                     attempts: record.resume_count,
                     repeats: record.repeated_batch_count,
+                    usage: record.usage,
                 });
+            if previous.usage != record.usage {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            }
+            if previous.attempts > 0
+                && (sequence < previous.sequence
+                    || (sequence == previous.sequence && prior_digest != previous.prior_digest))
+            {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            }
             let repeated = previous.attempts > 0
                 && previous.sequence == sequence
                 && previous.prior_digest == prior_digest;
@@ -288,6 +248,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     prior_digest,
                     attempts: resume_count,
                     repeats: repeated_batch_count,
+                    usage: updated.usage,
                 },
             );
             (resume_count, repeated_batch_count)
@@ -299,6 +260,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             expiry: record.expiry,
             resume_count,
             repeated_batch_count,
+            usage: record.usage,
             snapshot,
         })
     }
@@ -312,7 +274,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.retry_pending_releases(&mut state)
     }
 
-    fn retry_pending_releases(
+    pub(super) fn retry_pending_releases(
         &self,
         state: &mut super::state::LedgerState<'kernel>,
     ) -> Result<(), LedgerFailure> {

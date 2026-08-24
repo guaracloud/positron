@@ -126,10 +126,6 @@ impl ResultResumeKey {
                     && self.record_ordinal == record.record_ordinal()))
             && self.result_digest == result_digest
     }
-
-    pub(crate) const fn is_aggregate(self) -> bool {
-        matches!(self.kind, ResultResumeKind::Aggregate)
-    }
 }
 
 #[cfg(test)]

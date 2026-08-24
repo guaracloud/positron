@@ -8,7 +8,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
         }
         state.last_observed_at = now;
-        state.elapsed_wall_seconds = now.saturating_sub(state.started_at);
+        state.physical_elapsed_wall_seconds = now.saturating_sub(state.started_at);
         Ok(now >= state.expiry)
     }
 }

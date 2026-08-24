@@ -7,6 +7,7 @@ use crate::{
     LogicalPlan, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange,
 };
 
+mod opaque;
 mod validation;
 #[cfg(fuzzing)]
 pub(crate) use validation::fuzz_reauthenticate;
@@ -29,40 +30,18 @@ const V1_CURSOR_BYTES: usize = V1_PAYLOAD_BYTES + 32;
 const V3_CURSOR_BYTES: usize = V3_PAYLOAD_BYTES + 32;
 const CURSOR_BYTES: usize = PAYLOAD_BYTES + 32;
 
+#[cfg(fuzzing)]
+pub(crate) const CURRENT_RESUME_KEY_START: usize = BASE_PAYLOAD_BYTES;
+#[cfg(fuzzing)]
+pub(crate) const CURRENT_RESUME_KEY_END: usize = CURRENT_RESUME_KEY_START + RESULT_RESUME_KEY_BYTES;
+#[cfg(fuzzing)]
+pub(crate) const CURRENT_AUTH_TAG_START: usize = CURRENT_RESUME_KEY_END;
+#[cfg(fuzzing)]
+pub(crate) const CURRENT_AUTH_TAG_END: usize = CURSOR_BYTES;
+
 /// Opaque authenticated continuation with one fixed bounded representation.
 #[derive(Clone, Eq, PartialEq)]
 pub struct QueryCursor(Vec<u8>);
-
-impl QueryCursor {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueryFailure> {
-        if !matches!(
-            bytes.len(),
-            V1_CURSOR_BYTES | V3_CURSOR_BYTES | CURSOR_BYTES
-        ) {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-        }
-        if bytes.len() == CURSOR_BYTES && bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-        }
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        owned.extend_from_slice(bytes);
-        Ok(Self(owned))
-    }
-
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for QueryCursor {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("QueryCursor { <opaque> }")
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct CursorState {
@@ -84,13 +63,20 @@ pub(crate) struct CursorState {
     pub(crate) budget: QueryBudget,
     pub(crate) scanned_bytes: u64,
     pub(crate) decoded_records: u64,
+    pub(crate) physical_scanned_bytes: u64,
+    pub(crate) physical_decoded_records: u64,
     pub(crate) output_rows: u64,
     pub(crate) output_bytes: u64,
+    pub(crate) physical_output_rows: u64,
+    pub(crate) physical_output_bytes: u64,
     pub(crate) memory_peak_bytes: u64,
+    pub(crate) physical_memory_peak_bytes: u64,
     pub(crate) started_at: u64,
     pub(crate) last_observed_at: u64,
     pub(crate) cpu_work_units: u64,
     pub(crate) elapsed_wall_seconds: u64,
+    pub(crate) physical_cpu_work_units: u64,
+    pub(crate) physical_elapsed_wall_seconds: u64,
     pub(crate) reduced_pruning: bool,
     pub(crate) resume_count: u64,
     pub(crate) repeated_batch_count: u64,
@@ -375,13 +361,20 @@ fn decode_internal(
         budget,
         scanned_bytes,
         decoded_records,
+        physical_scanned_bytes: scanned_bytes,
+        physical_decoded_records: decoded_records,
         output_rows,
         output_bytes,
+        physical_output_rows: output_rows,
+        physical_output_bytes: output_bytes,
         memory_peak_bytes,
+        physical_memory_peak_bytes: memory_peak_bytes,
         started_at,
         last_observed_at,
         cpu_work_units: actual_cpu_work_units,
         elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
+        physical_cpu_work_units: actual_cpu_work_units,
+        physical_elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
         reduced_pruning,
         resume_count: 0,
         repeated_batch_count: 0,

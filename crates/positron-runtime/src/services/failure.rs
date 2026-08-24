@@ -119,7 +119,12 @@ pub(super) fn collect_query_bodies(
                     .map_err(|_| ServiceFailure::CapacityUnavailable)?;
                 for record in batch.records() {
                     if let Some(body) = record.body_text() {
-                        bodies.push(body.to_owned());
+                        let mut owned = String::new();
+                        owned
+                            .try_reserve_exact(body.len())
+                            .map_err(|_| ServiceFailure::CapacityUnavailable)?;
+                        owned.push_str(body);
+                        bodies.push(owned);
                     }
                 }
             },

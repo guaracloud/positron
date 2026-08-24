@@ -244,7 +244,7 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
     let plan = service.plan_pipeline(
         fixture.context,
         "logs | range query_time -100 100 | limit 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?.with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?.with_cpu_work_units(32)?,
     )?;
     let first = service.execute_page(plan)?.collect::<Vec<_>>();
     let cursor = continuation(&first)?.clone();

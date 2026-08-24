@@ -14,9 +14,11 @@ mod recovery;
 mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_codec;
+mod snapshot_lease_grant;
 mod snapshot_lease_pending;
 mod snapshot_lease_record;
 mod snapshot_lease_recovery;
+mod snapshot_lease_usage;
 mod state;
 mod storage;
 mod types;
@@ -40,8 +42,10 @@ use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
-pub use snapshot_lease::SnapshotLeaseGrant;
-pub use snapshot_lease_record::{MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId};
+pub use snapshot_lease_grant::SnapshotLeaseGrant;
+pub use snapshot_lease_record::{
+    MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId, SnapshotLeaseUsage,
+};
 use state::{LedgerState, retain_recovered};
 use storage::LedgerStorage;
 pub use types::*;

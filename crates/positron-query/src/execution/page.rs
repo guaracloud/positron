@@ -1,8 +1,12 @@
-use positron_kernel::LedgerSnapshot;
-use positron_signals::ScanLimit;
-
+use super::contract::initial_header;
+use super::memory::plan_memory;
+use super::predicates::scan_predicates;
+use super::resources::ExecutionResources;
+use super::results::{find_resume_index, materialize_page, resume_key_for_page};
 use crate::cursor::{self, CursorState};
-use crate::execution_state::{commit_position, stats_before_current, stats_with_current};
+use crate::execution_state::{
+    commit_position, stats_before_current, stats_with_current, sync_cursor_counters,
+};
 use crate::execution_support::{
     BatchDigestInput, QueryScanObserver, batch_digest, charge_output, charge_scan, limiting_budget,
 };
@@ -10,12 +14,8 @@ use crate::{
     QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryService, QueryStream,
     QueryTerminal,
 };
-
-use super::contract::initial_header;
-use super::memory::plan_memory;
-use super::predicates::scan_predicates;
-use super::resources::ExecutionResources;
-use super::results::{find_resume_index, materialize_page, resume_key_for_page};
+use positron_kernel::LedgerSnapshot;
+use positron_signals::ScanLimit;
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub(super) fn run_page(
         &self,
@@ -69,7 +69,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let decoded_remaining = state
             .budget
             .decoded_records()
-            .checked_sub(state.decoded_records)
+            .checked_sub(state.physical_decoded_records)
             .ok_or_else(|| {
                 QueryFailure::budget_exhausted(crate::QueryBudgetDimension::DecodedRecords)
             });
@@ -87,7 +87,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state
                 .budget
                 .scanned_bytes()
-                .checked_sub(state.scanned_bytes)
+                .checked_sub(state.physical_scanned_bytes)
                 .ok_or_else(|| {
                     QueryFailure::budget_exhausted(crate::QueryBudgetDimension::ScannedBytes)
                 })
@@ -111,14 +111,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     crate::QueryBudgetDimension::MemoryBytes
                 ))
         );
-        state.memory_peak_bytes = state.memory_peak_bytes.max(plan_memory);
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(plan_memory);
         let mut memory = crate::memory::QueryMemory::new(execution_memory);
         framed!(memory.acquire(state.plan.search_memory_bytes()));
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         let mut observer = QueryScanObserver::new(
             self.work_meter.as_ref(),
             state.cancellation.clone(),
-            state.cpu_work_units,
+            state.physical_cpu_work_units,
             state.budget.cpu_work_units(),
         );
         let (schema_query, schema_filter_used, text_candidate, text_filter_used) =
@@ -138,7 +138,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         ) {
             Ok(result) => result,
             Err(failure) => {
-                state.cpu_work_units = observer.consumed();
+                state.physical_cpu_work_units = observer.consumed();
                 return self.failed_page(
                     Some(header),
                     failure,
@@ -148,12 +148,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 );
             },
         };
-        state.cpu_work_units = observer.consumed();
-        let result = scan_result;
-        state.reduced_pruning |= result.reduced_pruning();
-        framed!(charge_scan(&mut state, &result));
-        framed!(memory.acquire(result.retained_size_bytes()));
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        state.physical_cpu_work_units = observer.consumed();
+        state.reduced_pruning |= scan_result.reduced_pruning();
+        framed!(charge_scan(&mut state, &scan_result));
+        framed!(memory.acquire(scan_result.retained_size_bytes()));
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         if state.cancellation.is_cancelled() {
             return self.failed_page(
                 Some(header),
@@ -164,9 +163,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
         let wall_exhausted = framed!(self.observe_state(&mut state));
-        if wall_exhausted || limiting_budget(&state).is_some() || !result.complete() {
+        if wall_exhausted || limiting_budget(&state).is_some() || !scan_result.complete() {
             let dimension = limiting_budget(&state).unwrap_or_else(|| {
-                if result.scanned_bytes_limited() {
+                if scan_result.scanned_bytes_limited() {
                     crate::QueryBudgetDimension::ScannedBytes
                 } else {
                     crate::QueryBudgetDimension::DecodedRecords
@@ -180,7 +179,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-
         let has_operator_work = state.plan.has_advanced_operators();
         state.reduced_pruning |= state.plan.requires_post_decode_predicate_fallback()
             && !schema_filter_used
@@ -188,11 +186,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let records = framed!(crate::operators::execute(
             self,
             &mut state,
-            result,
+            scan_result,
             schema_filter_used,
             &mut memory,
         ));
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         let operator_wall_exhausted = if has_operator_work {
             framed!(self.observe_state(&mut state))
         } else {
@@ -207,11 +205,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-
         let output_rows_remaining = state
             .budget
             .output_rows()
-            .checked_sub(state.output_rows)
+            .checked_sub(state.physical_output_rows)
             .ok_or_else(|| QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows));
         let output_rows_remaining = framed!(output_rows_remaining);
         let wanted = usize::from(state.plan.limit()).min(records.len());
@@ -244,7 +241,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
         );
         let page = framed!(materialize_page(records, start, end, &mut memory));
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         let before_batch = stats_before_current(&state);
         if state.cancellation.is_cancelled() {
             return self.failed_page_with_stats(
@@ -269,8 +266,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
         let mut output_state = state.clone();
-        if let Err(failure) = charge_output(self, &mut output_state, &page, &state.cancellation) {
-            state.cpu_work_units = output_state.cpu_work_units;
+        if let Err(failure) =
+            charge_output(self, &mut output_state, &page, &state.cancellation, true)
+        {
+            state.physical_cpu_work_units = output_state.physical_cpu_work_units;
             return self.failed_page(Some(header), failure, &state, delivered_before, resources);
         }
         if let Some(dimension) = limiting_budget(&output_state) {
@@ -283,7 +282,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-        state.cpu_work_units = output_state.cpu_work_units;
+        state.physical_cpu_work_units = output_state.physical_cpu_work_units;
         if page.is_empty() {
             state = output_state;
             let stats = stats_before_current(&state);
@@ -300,7 +299,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let digest_limit = state.budget.cpu_work_units();
         let mut digest_observer = crate::execution_support::QueryValueObserver::new(
             self,
-            &mut state.cpu_work_units,
+            &mut state.physical_cpu_work_units,
             digest_limit,
             digest_cancellation.clone(),
             crate::QueryWorkStage::Output,
@@ -317,17 +316,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             },
             &mut memory,
         ));
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         let needs_resume = pagination && end < wanted;
         let resume_key = framed!(resume_key_for_page(
             self,
             &mut state,
             &page,
-            digest,
             needs_resume,
             &mut memory,
         ));
-        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         let post_digest_expired = framed!(self.observe_state(&mut state));
         if post_digest_expired {
             return self.failed_page(
@@ -339,10 +337,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
         output_state.last_observed_at = state.last_observed_at;
-        output_state.elapsed_wall_seconds = state.elapsed_wall_seconds;
-        output_state.cpu_work_units = state.cpu_work_units;
-        output_state.memory_peak_bytes =
-            output_state.memory_peak_bytes.max(state.memory_peak_bytes);
+        output_state.physical_elapsed_wall_seconds = state.physical_elapsed_wall_seconds;
+        output_state.physical_cpu_work_units = state.physical_cpu_work_units;
+        output_state.physical_memory_peak_bytes = output_state
+            .physical_memory_peak_bytes
+            .max(state.physical_memory_peak_bytes);
         state = output_state;
         let batch = QueryEvent::Batch(QueryBatch::new(
             state.sequence,
@@ -379,6 +378,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))
             );
             state.prior_digest = digest;
+            sync_cursor_counters(&mut state);
             let cursor =
                 framed_batch!(cursor::encode(&self.ledger.control_tokens(), state.clone(),));
             QueryTerminal::Continued(cursor)

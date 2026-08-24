@@ -69,6 +69,7 @@ pub(super) fn recover_reservations<'kernel>(
                     prior_digest: record.last_resume_prior_digest,
                     attempts: record.resume_count,
                     repeats: record.repeated_batch_count,
+                    usage: record.usage,
                 },
             );
         }

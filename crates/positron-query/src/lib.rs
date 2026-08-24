@@ -121,13 +121,20 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         budget,
         scanned_bytes: 0,
         decoded_records: 0,
+        physical_scanned_bytes: 0,
+        physical_decoded_records: 0,
         output_rows: 0,
         output_bytes: 0,
+        physical_output_rows: 0,
+        physical_output_bytes: 0,
         memory_peak_bytes: 512,
+        physical_memory_peak_bytes: 512,
         started_at: 0,
         last_observed_at: 0,
         cpu_work_units: 0,
         elapsed_wall_seconds: 0,
+        physical_cpu_work_units: 0,
+        physical_elapsed_wall_seconds: 0,
         reduced_pruning: true,
         resume_count: 0,
         repeated_batch_count: 0,
@@ -182,17 +189,21 @@ pub fn fuzz_query_cursor(data: &[u8]) {
                 *slot ^= *byte;
             }
         }
-        for (index, byte) in data.iter().take(32).enumerate() {
-            if let Some(slot) = variant.get_mut(351 + index) {
-                *slot ^= *byte;
-            }
+        for (index, slot) in variant
+            .get_mut(cursor::CURRENT_RESUME_KEY_START..cursor::CURRENT_RESUME_KEY_END)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            *slot ^= data[index % data.len()].wrapping_add(u8::try_from(index).unwrap_or(0));
         }
-        if data.len() >= 4_543 {
-            for (index, byte) in data.iter().skip(4_511).take(32).enumerate() {
-                if let Some(slot) = variant.get_mut(4_511 + index) {
-                    *slot ^= *byte;
-                }
-            }
+        for (index, slot) in variant
+            .get_mut(cursor::CURRENT_AUTH_TAG_START..cursor::CURRENT_AUTH_TAG_END)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            *slot ^= data[index % data.len()];
         }
         let _ = cursor::fuzz_reauthenticate(&protector, &mut variant);
         if let Ok(cursor) = QueryCursor::from_bytes(&variant) {
