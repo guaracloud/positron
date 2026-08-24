@@ -184,6 +184,10 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         ),
         "paged events: {paged_events:?}"
     );
+    let continued = paged_events
+        .last()
+        .cloned()
+        .ok_or("paged query omitted its terminal")?;
     assert_eq!(
         super::super::failure::collect_query_bodies(paged_events),
         Err(ServiceFailure::Internal)
@@ -222,6 +226,14 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
     );
     assert_eq!(
         super::super::failure::collect_query_bodies(vec![incomplete.clone(), header.clone()]),
+        Err(ServiceFailure::Internal)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![continued, header.clone()]),
+        Err(ServiceFailure::Internal)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![header.clone()]),
         Err(ServiceFailure::Internal)
     );
     assert_eq!(
