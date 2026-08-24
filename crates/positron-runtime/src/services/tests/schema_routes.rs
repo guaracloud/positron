@@ -206,7 +206,10 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
                 .with_cpu_work_units(16)?,
         )?;
-        let events = service.execute_page(query)?.collect::<Vec<_>>();
+        let events = service
+            .execute_page(query)
+            .map_err(|failure| format!("{state} initial page failed: {failure:?}"))?
+            .collect::<Vec<_>>();
         let cursor = match events.last() {
             Some(QueryEvent::Terminal(QueryTerminal::Continued(cursor))) => cursor.clone(),
             _ => return Err(format!("{state} query did not produce a cursor").into()),
@@ -235,7 +238,9 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
                 .with_cpu_work_units(16)?,
         );
         if code <= 2 {
-            assert_eq!(fresh_query?, ["first", "second"], "{state} fresh query");
+            let fresh_query = fresh_query
+                .map_err(|failure| format!("{state} fresh query failed: {failure:?}"))?;
+            assert_eq!(fresh_query, ["first", "second"], "{state} fresh query");
         } else {
             assert!(fresh_query.is_err(), "{state} fresh query must fail closed");
         }
