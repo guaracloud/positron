@@ -19,6 +19,7 @@ pub(super) fn ingest_authenticated<'authority>(
     context: AuthorizedContext,
     request: AuthenticatedOtlpLogsRequest<'authority>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
+    services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
     let batch = OtlpLogsReceiver::with_value_limit_profile(instance.value_limit_profile)
         .decode(request)
@@ -31,6 +32,7 @@ pub(super) fn ingest_native_batch(
     context: AuthorizedContext,
     batch: NativeLogBatch<'_>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
+    services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
     let policy = services
         .ingest_policy

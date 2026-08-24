@@ -135,6 +135,7 @@ impl ServiceHandle {
         protobuf: Vec<u8>,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
         let context = self.authorize_logs(bearer)?;
+        self.revalidate_ingest_context(context)?;
         let instance = &self.instance;
         let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
             context,
@@ -174,6 +175,7 @@ impl ServiceHandle {
         decoded: opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let instance = &self.instance;
         let capacity = reservation
             .reclaim(instance.resource_governor())
@@ -192,6 +194,7 @@ impl ServiceHandle {
         body: Vec<u8>,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let capacity = reservation
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
@@ -235,6 +238,7 @@ impl ServiceHandle {
         &self,
         context: AuthorizedContext,
     ) -> Result<ReceiverAdmissionLease, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let reservation =
             reserve_log_receiver_transport(context, self.instance.resource_governor())
                 .map_err(|failure| match failure {
@@ -250,6 +254,19 @@ impl ServiceHandle {
                 reservation: Mutex::new(Some(reservation)),
             }),
         })
+    }
+
+    pub(crate) fn revalidate_ingest_context(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<(), ServiceFailure> {
+        let identity = self
+            .instance
+            .durable_identity()
+            .map_err(|failure| classify_bootstrap_failure_code(failure.code()))?;
+        identity
+            .validate_ingest_context(context)
+            .map_err(|_| ServiceFailure::Unauthorized)
     }
 
     /// Runs the generated capability contract without adding a second API authority.

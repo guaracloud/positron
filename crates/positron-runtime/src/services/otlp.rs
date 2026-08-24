@@ -15,6 +15,7 @@ impl ServiceHandle {
         body: Vec<u8>,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let capacity = reservation
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
@@ -32,6 +33,7 @@ impl ServiceHandle {
         body: Vec<u8>,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let capacity = reservation
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;

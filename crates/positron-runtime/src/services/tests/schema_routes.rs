@@ -1,13 +1,14 @@
 use std::error::Error;
 use std::sync::Arc;
 
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use positron_domain::routing::SignalKind;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_ingest::LokiPushRequestEncoding;
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
     NativeLogAdmissionGroups,
 };
+use positron_ingest::{LokiPushRequestEncoding, OtlpLogsRequestEncoding};
 use positron_kernel::{ActiveSegmentLedger, SegmentScope};
 use positron_kernel::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
 use positron_query::{
@@ -578,6 +579,97 @@ fn admitted_active_ingest_is_revalidated_before_append_after_lifecycle_transitio
                 .is_empty()
         );
     }
+    Ok(())
+}
+
+#[test]
+fn stale_active_ingest_context_is_rejected_before_receiver_admission() -> Result<(), Box<dyn Error>>
+{
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let context = services.authorize_logs(&ingest)?;
+    let catalog = open_catalog(&initialized)?;
+    publish_lifecycle(&catalog, 2, 0xd1)?;
+    drop(catalog);
+
+    let before = initialized.resource_governor().inspect()?;
+    assert!(
+        matches!(
+            services.admit_logs(context),
+            Err(ServiceFailure::Unauthorized)
+        ),
+        "a context attributed while Active must not reserve after ReadOnly"
+    );
+    let after = initialized.resource_governor().inspect()?;
+    assert_eq!(after.outstanding_total(), before.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(
+            after.usage(dimension),
+            before.usage(dimension),
+            "{dimension:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_active_ingest_context_rejects_empty_request_before_native_planning()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let context = services.authorize_logs(&ingest)?;
+    let baseline = initialized.resource_governor().inspect()?;
+    let admission = services.admit_logs(context)?;
+    let reservation = admission.take()?;
+    let catalog = open_catalog(&initialized)?;
+    publish_lifecycle(&catalog, 2, 0xd2)?;
+    drop(catalog);
+
+    let result = services.ingest_decoded_otlp_logs(
+        context,
+        ExportLogsServiceRequest::default(),
+        reservation,
+    );
+    assert!(
+        matches!(result, Err(ServiceFailure::Unauthorized)),
+        "an empty stale request must not bypass lifecycle validation"
+    );
+    let after = initialized.resource_governor().inspect()?;
+    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(
+            after.usage(dimension),
+            baseline.usage(dimension),
+            "{dimension:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_active_ingest_context_is_rejected_before_protocol_decode() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let context = services.authorize_logs(&ingest)?;
+    let admission = services.admit_logs(context)?;
+    let reservation = admission.take()?;
+    let catalog = open_catalog(&initialized)?;
+    publish_lifecycle(&catalog, 2, 0xd3)?;
+    drop(catalog);
+
+    let result = services.ingest_encoded_otlp_http_logs(
+        context,
+        OtlpLogsRequestEncoding::Protobuf,
+        vec![0xff],
+        reservation,
+    );
+    assert!(
+        matches!(result, Err(ServiceFailure::Unauthorized)),
+        "lifecycle rejection must precede malformed-payload decoding"
+    );
     Ok(())
 }
 
