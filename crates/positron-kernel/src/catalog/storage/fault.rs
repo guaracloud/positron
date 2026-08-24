@@ -122,7 +122,7 @@ pub(crate) fn with_catalog_fault_after<T>(
     })
 }
 
-#[cfg(any(test, fuzzing, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_catalog_fault_hook_after<T>(
     event: CatalogFileEvent,
     preceding_occurrences: usize,
