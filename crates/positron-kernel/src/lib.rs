@@ -81,6 +81,8 @@ pub use catalog::{
     CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
     TransactionId,
 };
+#[cfg(feature = "test-support")]
+pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,

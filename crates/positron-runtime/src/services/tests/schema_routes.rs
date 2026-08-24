@@ -163,6 +163,48 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
 }
 
 #[test]
+fn public_query_route_preserves_failure_class_and_never_returns_incomplete_rows()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, query) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    for body in ["first", "second"] {
+        assert_eq!(
+            services
+                .ingest_otlp_logs(&ingest, request(body).encode_to_vec())?
+                .accepted_records(),
+            1
+        );
+    }
+    let budget = || {
+        QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)
+            .and_then(|budget| budget.with_cpu_work_units(1))
+    };
+    assert_eq!(
+        services.query_log_bodies(&query, "not a Positron query", budget()?),
+        Err(ServiceFailure::InvalidRequest)
+    );
+    assert_eq!(
+        services.query_log_bodies(
+            "not-the-query-credential",
+            "logs | range query_time 0 100 | limit 16",
+            budget()?,
+        ),
+        Err(ServiceFailure::Unauthorized)
+    );
+    assert_eq!(
+        services.query_log_bodies(
+            &query,
+            "logs | range query_time 0 100 | limit 16",
+            budget()?,
+        ),
+        Err(ServiceFailure::CapacityUnavailable),
+        "incomplete query terminals must not be reported as partial success"
+    );
+    Ok(())
+}
+
+#[test]
 fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
 -> Result<(), Box<dyn Error>> {
     for (state, code) in [
@@ -217,19 +259,29 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             _ => return Err(format!("{state} query did not produce a cursor").into()),
         };
         publish_lifecycle(&catalog, code, code)?;
-        if code != 1 {
+        let contended_authorization = services.authorize_logs(&ingest);
+        let direct_attribution = initialized.attribute(
+            PresentedCredential::parse(&ingest)?,
+            RequestedIntent::Ingest,
+            CompatibilityHints::none(),
+        );
+        assert_eq!(
+            direct_attribution.is_ok(),
+            code == 1,
+            "{state} stale attribution"
+        );
+        if code == 1 {
             assert!(
-                services.authorize_logs(&ingest).is_err(),
-                "{state} ingest authorization must fail closed"
+                contended_authorization.is_ok(),
+                "{state} read-only authorization must not require the writer"
+            );
+        } else {
+            assert_eq!(
+                contended_authorization,
+                Err(ServiceFailure::Unauthorized),
+                "{state} lifecycle rejection must remain authorization-shaped"
             );
         }
-        assert!(
-            matches!(
-                services.authorize_logs(&ingest),
-                Err(ServiceFailure::StorageUnavailable)
-            ),
-            "{state} catalog contention must not be reported as Unauthorized"
-        );
         drop(service);
         drop(ledger);
         drop(catalog);
@@ -331,6 +383,49 @@ fn read_only_query_uses_the_current_durable_identity_after_transition() -> Resul
         )?,
         ["first", "second"]
     );
+    Ok(())
+}
+
+#[test]
+fn admitted_active_ingest_is_revalidated_before_append_after_lifecycle_transition()
+-> Result<(), Box<dyn Error>> {
+    for (state, transaction, restore_transaction) in [
+        (2_u8, 0xf1_u8, 0x01_u8),
+        (3, 0xf2, 0x02),
+        (4, 0xf3, 0x03),
+        (5, 0xf4, 0x04),
+    ] {
+        let fixture = Fixture::new()?;
+        let (initialized, ingest, query_secret) = fixture.initialized()?;
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        let context = services.authorize_logs(&ingest)?;
+        let admission = services.admit_logs(context)?;
+        let reservation = admission.take()?;
+
+        let catalog = open_catalog(&initialized)?;
+        publish_lifecycle(&catalog, state, transaction)?;
+        drop(catalog);
+
+        assert_eq!(
+            services.ingest_decoded_otlp_logs(context, request("must-not-append"), reservation),
+            Err(ServiceFailure::Unauthorized),
+            "state {state}"
+        );
+
+        let catalog = open_catalog(&initialized)?;
+        publish_lifecycle(&catalog, 1, restore_transaction)?;
+        drop(catalog);
+        assert!(
+            services
+                .query_log_bodies(
+                    &query_secret,
+                    "logs | range query_time 0 100 | limit 10",
+                    QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)?
+                        .with_cpu_work_units(16)?,
+                )?
+                .is_empty()
+        );
+    }
     Ok(())
 }
 

@@ -115,6 +115,23 @@ fn transaction_identity_file_and_directory_sync_faults_restart_and_retry_idempot
 }
 
 #[test]
+fn read_only_current_snapshot_does_not_require_the_catalog_writer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(37))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    catalog.commit(catalog.pin()?.identity(), proposal(38, 9)?, None)?;
+
+    let snapshot = Catalog::read_current_snapshot(&authority, instance, secret())?;
+
+    assert_eq!(snapshot.number(), catalog.pin()?.number());
+    assert_eq!(snapshot.identity(), catalog.pin()?.identity());
+    Ok(())
+}
+
+#[test]
 fn interrupted_root_rewrap_restarts_with_predecessor_and_retries_idempotently()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TemporaryRoot::new()?;

@@ -1,6 +1,9 @@
 use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
+use positron_query::QueryFailureCode;
 
-use super::{ServiceFailure, map_admission_group_plan_failure, map_receive_failure};
+use super::{
+    ServiceFailure, map_admission_group_plan_failure, map_query_failure_code, map_receive_failure,
+};
 
 mod schema_maintenance;
 mod schema_replay_integrity;
@@ -90,5 +93,64 @@ fn replay_failures_preserve_resource_integrity_and_cancellation_classes() {
             positron_ingest::SchemaSessionFailure::Cancelled
         ),
         ServiceFailure::Cancelled
+    );
+}
+
+#[test]
+fn query_failures_preserve_runtime_error_classes() {
+    for (code, expected) in [
+        (QueryFailureCode::Unauthorized, ServiceFailure::Unauthorized),
+        (
+            QueryFailureCode::AuthorizationChanged,
+            ServiceFailure::Unauthorized,
+        ),
+        (
+            QueryFailureCode::InvalidBudget,
+            ServiceFailure::InvalidRequest,
+        ),
+        (
+            QueryFailureCode::InvalidCursor,
+            ServiceFailure::InvalidRequest,
+        ),
+        (
+            QueryFailureCode::SnapshotExpired,
+            ServiceFailure::InvalidRequest,
+        ),
+        (
+            QueryFailureCode::UnsupportedQuery,
+            ServiceFailure::InvalidRequest,
+        ),
+        (
+            QueryFailureCode::BudgetExhausted,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            QueryFailureCode::ResourceAdmissionRefused,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            QueryFailureCode::ResourceExhausted,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (QueryFailureCode::Cancelled, ServiceFailure::Cancelled),
+        (
+            QueryFailureCode::MalformedPersistentData,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            QueryFailureCode::StoreUnavailable,
+            ServiceFailure::StorageUnavailable,
+        ),
+        (QueryFailureCode::Internal, ServiceFailure::Internal),
+    ] {
+        assert_eq!(map_query_failure_code(code), expected, "{code:?}");
+    }
+}
+
+#[test]
+fn query_result_without_complete_terminal_is_not_success() {
+    assert_eq!(
+        super::failure::collect_query_bodies(std::iter::empty()),
+        Err(ServiceFailure::Internal)
     );
 }

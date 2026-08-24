@@ -1,4 +1,5 @@
 use positron_domain::routing::SignalKind;
+use positron_governance::AuthorizedContext;
 use positron_ingest::{
     AdmissionGroupOutcome, AuthenticatedOtlpLogsRequest, IngestFailureCode, IngestOutcome,
     IngestRequestOutcome, LogIngest, NativeLogBatch, OtlpLogsReceiver,
@@ -12,17 +13,19 @@ use super::{ServiceFailure, ServiceHandle, map_admission_group_plan_failure, map
 
 pub(super) fn ingest_authenticated<'authority>(
     services: &'authority ServiceHandle,
+    context: AuthorizedContext,
     request: AuthenticatedOtlpLogsRequest<'authority>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     let instance = &services.instance;
     let batch = OtlpLogsReceiver::with_value_limit_profile(instance.value_limit_profile)
         .decode(request)
         .map_err(map_receive_failure)?;
-    ingest_native_batch(services, batch)
+    ingest_native_batch(services, context, batch)
 }
 
 pub(super) fn ingest_native_batch(
     services: &ServiceHandle,
+    context: AuthorizedContext,
     batch: NativeLogBatch<'_>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     let instance = &services.instance;
@@ -40,6 +43,15 @@ pub(super) fn ingest_native_batch(
     if groups.is_empty() {
         return Ok(IngestRequestOutcome::new(Vec::new()));
     }
+    let catalog = open_catalog(instance)?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|_| ServiceFailure::StorageUnavailable)?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
+    identity
+        .validate_ingest_context(context)
+        .map_err(|_| ServiceFailure::Unauthorized)?;
     #[cfg(test)]
     if let Some(backend) = services
         .receiver_test_backend
@@ -49,7 +61,6 @@ pub(super) fn ingest_native_batch(
     {
         return Ok(backend.ingest(groups));
     }
-    let catalog = open_catalog(instance)?;
     let clock = LifecycleClock::new(SystemLifecycleClockSource);
     let mut outcomes = Vec::new();
     outcomes

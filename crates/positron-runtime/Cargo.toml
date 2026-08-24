@@ -11,7 +11,7 @@ homepage.workspace = true
 publish = false
 
 [features]
-test-support = []
+test-support = ["positron-kernel/test-support"]
 
 [dependencies]
 http = { version = "=1.5.0", default-features = false }

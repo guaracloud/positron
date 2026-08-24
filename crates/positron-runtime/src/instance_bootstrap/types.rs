@@ -9,7 +9,7 @@ use positron_kernel::{
     MountQualification, OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
 #[cfg(feature = "test-support")]
-use positron_kernel::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
+use positron_kernel::{GovernanceFixtureObject, GovernanceFixtureTarget};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,64 +167,23 @@ pub struct InitializedInstance {
 #[cfg(feature = "test-support")]
 #[derive(Clone)]
 pub struct GovernanceTestFixture {
-    object: Vec<u8>,
+    object: GovernanceFixtureObject,
 }
 
 #[cfg(feature = "test-support")]
 impl GovernanceTestFixture {
     fn new(object: &[u8]) -> Result<Self, BootstrapFailure> {
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(object.len())
+        let object = GovernanceFixtureObject::from_bytes(object)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        owned.extend_from_slice(object);
-        Ok(Self { object: owned })
+        Ok(Self { object })
     }
 
-    pub fn install_into(&self, catalog: &Catalog<'_>) -> Result<(), BootstrapFailure> {
-        let basis = catalog
-            .pin()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let mut objects = Vec::new();
-        objects
-            .try_reserve_exact(
-                usize::try_from(basis.number())
-                    .ok()
-                    .and_then(|number| number.checked_add(1))
-                    .ok_or_else(|| {
-                        BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
-                    })?,
-            )
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        for object_id in basis.object_identities() {
-            let object = basis
-                .object(object_id)
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
-                .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-            objects.push(
-                CatalogObject::new(object.to_vec()).map_err(|_| {
-                    BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
-                })?,
-            );
-        }
-        objects.push(
-            CatalogObject::new(self.object.clone())
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?,
-        );
-        catalog
-            .commit(
-                basis.identity(),
-                CatalogProposal::new(
-                    TransactionId::new([0x41; 16]).map_err(|_| {
-                        BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable)
-                    })?,
-                    FormatEpoch::CATALOG_V1,
-                    objects,
-                )
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
-                None,
-            )
-            .map(|_| ())
+    pub fn install_into<T: GovernanceFixtureTarget>(
+        &self,
+        target: &T,
+    ) -> Result<(), BootstrapFailure> {
+        target
+            .install_governance_fixture(&self.object)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
     }
 }
@@ -249,8 +208,8 @@ impl InitializedInstance {
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
-        let catalog =
-            Catalog::open(&self._authority, self.instance, secret).map_err(|failure| {
+        let snapshot = Catalog::read_current_snapshot(&self._authority, self.instance, secret)
+            .map_err(|failure| {
                 let code = match failure.code() {
                     CatalogFailureCode::ResourceAdmissionRefused
                     | CatalogFailureCode::LimitExceeded => {
@@ -269,9 +228,6 @@ impl InitializedInstance {
                 };
                 BootstrapFailure::new(code)
             })?;
-        let snapshot = catalog
-            .pin()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         positron_governance::Identity::open(&snapshot)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
     }
@@ -321,7 +277,11 @@ impl InitializedInstance {
         hints: positron_governance::CompatibilityHints,
     ) -> Result<positron_governance::AuthorizedContext, positron_governance::AttributionFailure>
     {
-        self.identity
+        // Never expose the boot-cached identity as a data-plane authority.
+        // Rebuild the immutable view from the current durable Catalog
+        // generation for every attribution request.
+        self.durable_identity()
+            .map_err(|_| positron_governance::AttributionFailure)?
             .attribute(&self.key, credential, intent, hints)
     }
 

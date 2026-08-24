@@ -210,6 +210,31 @@ impl Identity {
         Ok(())
     }
 
+    /// Revalidates a previously attributed ingest context against this
+    /// generation-pinned identity and its current durable lifecycle state.
+    pub fn validate_ingest_context(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<(), AttributionFailure> {
+        let tenant = context.tenant.ok_or(AttributionFailure)?;
+        if self
+            .ingest
+            .as_ref()
+            .is_none_or(|ingest| context.principal != ingest.principal)
+            || context.scope != Scope::Ingest
+            || tenant.principal_id() != context.principal
+            || tenant.scope() != Scope::Ingest
+            || tenant.tenant_id() != self.tenant
+            || context.authority != self.instance
+            || context.generation != self.generation
+            || context.lifecycle != self.lifecycle
+            || self.lifecycle != TenantLifecycleState::Active
+        {
+            return Err(AttributionFailure);
+        }
+        Ok(())
+    }
+
     /// Revalidates a previously attributed query context against the current
     /// durable identity and lifecycle authority.
     pub fn revalidate_query_context(

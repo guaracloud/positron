@@ -501,25 +501,34 @@ pub(super) fn publication_visible(
     remove: &BTreeSet<SnapshotLeaseId>,
     additions: &[Vec<u8>],
 ) -> bool {
-    let replacement_ids = additions
-        .iter()
-        .filter_map(|bytes| decode(bytes).ok().flatten())
-        .map(|record| record.identity)
-        .collect::<BTreeSet<_>>();
-    let objects = snapshot.plaintext_objects().collect::<Vec<_>>();
-    let mut decoded = Vec::new();
-    for bytes in &objects {
-        match decode(bytes) {
-            Ok(Some(record)) => decoded.push(record.identity),
-            Ok(None) => {},
-            Err(_) => return false,
-        }
+    // Reconcile against the immutable generation without materializing a
+    // second object set. The catalog is already bounded; each lookup is
+    // generation-pinned and therefore observes one coherent publication.
+    if snapshot
+        .plaintext_objects()
+        .any(|published| decode(published).is_err())
+    {
+        return false;
     }
     remove.iter().all(|identity| {
-        replacement_ids.contains(identity) || !decoded.iter().any(|candidate| candidate == identity)
-    }) && additions
-        .iter()
-        .all(|addition| objects.contains(&addition.as_slice()))
+        let replaced = additions.iter().any(|addition| {
+            decode(addition)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.identity == *identity)
+        });
+        replaced
+            || !snapshot.plaintext_objects().any(|published| {
+                decode(published)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.identity == *identity)
+            })
+    }) && additions.iter().all(|addition| {
+        snapshot
+            .plaintext_objects()
+            .any(|published| published == addition.as_slice())
+    })
 }
 
 fn map_catalog_failure(code: CatalogFailureCode) -> LedgerFailureCode {

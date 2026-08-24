@@ -12,10 +12,10 @@ use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureThresholds,
-    FixedLifecycleClockSource, GovernorFailure, GovernorPolicy, InstanceId,
-    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
-    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    FixedLifecycleClockSource, GovernanceFixtureObject, GovernanceFixtureTarget, GovernorFailure,
+    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
+    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
     ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
     StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, WorkClaim, WorkKind,
 };
@@ -533,7 +533,7 @@ impl KernelFixture {
         identity: &GovernanceTestFixture,
     ) -> Result<Self, Box<dyn Error>> {
         let fixture = Self::new(tenant, label)?;
-        identity.install_into(fixture.catalog)?;
+        identity.install_into(&fixture)?;
         Ok(fixture)
     }
 
@@ -810,6 +810,15 @@ impl KernelFixture {
         )?;
         self.ledger()?.append(block)?;
         Ok(())
+    }
+}
+
+impl GovernanceFixtureTarget for KernelFixture {
+    fn install_governance_fixture(
+        &self,
+        fixture: &GovernanceFixtureObject,
+    ) -> Result<(), positron_kernel::CatalogFailure> {
+        self.catalog.install_governance_fixture(fixture)
     }
 }
 

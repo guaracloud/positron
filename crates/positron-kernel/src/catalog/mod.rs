@@ -23,6 +23,8 @@ use crate::resource_governor::CatalogWriterLease;
 use crate::{RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority};
 
 use types::AuditFrontier;
+#[cfg(feature = "test-support")]
+pub use types::GovernanceFixtureObject;
 pub use types::{
     AuditIntent, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
     CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
@@ -112,6 +114,31 @@ impl<'authority> Catalog<'authority> {
             operation: Mutex::new(()),
             state: Mutex::new(state),
         })
+    }
+
+    /// Reads the highest complete authenticated generation without acquiring
+    /// the Catalog Writer lease.
+    pub fn read_current_snapshot(
+        authority: &'authority StorageKernelResourceAuthority,
+        instance: InstanceId,
+        secret: CatalogSecret,
+    ) -> Result<CatalogSnapshot, CatalogFailure> {
+        let recovery_claim =
+            RecoveryWorkClaim::system(RecoveryWorkKind::Repair, recovery_resource_claim())
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let _reservation = authority
+            .recovery()
+            .reserve(recovery_claim)
+            .map_err(CatalogFailure::admission)?;
+        let volume = authority
+            .primary_data_volume()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::ResourceAdmissionRefused))?;
+        let root = volume
+            ._root
+            .try_clone()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        let storage = CatalogStorage::inspect(&root)?;
+        Ok(recover(&storage, &secret, instance)?.current)
     }
 
     /// Pins the complete currently published immutable generation.
@@ -483,6 +510,43 @@ impl<'authority> Catalog<'authority> {
             .map(|plaintext| CatalogObject::new(plaintext.to_vec()))
             .collect::<Result<Vec<_>, _>>()?;
         CatalogProposal::new(transaction, epoch, objects)
+    }
+}
+
+/// Destination for the opaque governance fixture capability.
+#[cfg(feature = "test-support")]
+pub trait GovernanceFixtureTarget {
+    fn install_governance_fixture(
+        &self,
+        fixture: &GovernanceFixtureObject,
+    ) -> Result<(), CatalogFailure>;
+}
+
+#[cfg(feature = "test-support")]
+impl GovernanceFixtureTarget for Catalog<'_> {
+    fn install_governance_fixture(
+        &self,
+        fixture: &GovernanceFixtureObject,
+    ) -> Result<(), CatalogFailure> {
+        let basis = self.pin()?;
+        let capacity = usize::try_from(basis.number())
+            .ok()
+            .and_then(|number| number.checked_add(1))
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(capacity)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        for object_id in basis.object_identities() {
+            let object = basis
+                .object(object_id)?
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            objects.push(CatalogObject::new(object.to_vec())?);
+        }
+        objects.push(CatalogObject::new(fixture.plaintext.clone())?);
+        let transaction = TransactionId::new([0x41; 16])?;
+        let proposal = CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)?;
+        self.commit(basis.identity(), proposal, None).map(|_| ())
     }
 }
 

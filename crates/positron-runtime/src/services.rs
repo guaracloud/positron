@@ -12,7 +12,7 @@ use positron_ingest::{
     reserve_log_receiver_transport,
 };
 use positron_kernel::{ActiveSegmentLedger, Catalog, SegmentScope, TransferredResourceReservation};
-use positron_query::{QueryBudget, QueryEvent, QueryService};
+use positron_query::{QueryBudget, QueryService};
 
 use crate::InitializedInstance;
 
@@ -24,7 +24,11 @@ mod schema_bootstrap;
 mod schema_maintenance;
 
 pub use failure::ServiceFailure;
-use failure::{map_admission_group_plan_failure, map_receive_failure};
+#[cfg(test)]
+use failure::map_query_failure_code;
+use failure::{
+    collect_query_bodies, map_admission_group_plan_failure, map_query_failure, map_receive_failure,
+};
 #[cfg(test)]
 mod tests;
 
@@ -137,7 +141,7 @@ impl ServiceHandle {
             protobuf,
         )
         .map_err(map_receive_failure)?;
-        ingest::ingest_authenticated(self, request)
+        ingest::ingest_authenticated(self, context, request)
     }
 
     pub(crate) fn authorize_logs(&self, bearer: &str) -> Result<AuthorizedContext, ServiceFailure> {
@@ -197,7 +201,7 @@ impl ServiceHandle {
             context, decoded, capacity,
         )
         .map_err(map_receive_failure)?;
-        ingest::ingest_authenticated(self, request)
+        ingest::ingest_authenticated(self, context, request)
     }
 
     pub(crate) fn ingest_encoded_loki_push(
@@ -217,7 +221,7 @@ impl ServiceHandle {
         let batch = LokiPushReceiver::with_value_limit_profile(self.instance.value_limit_profile)
             .decode(request)
             .map_err(map_receive_failure)?;
-        ingest::ingest_native_batch(self, batch)
+        ingest::ingest_native_batch(self, context, batch)
     }
 
     pub(crate) fn logs_transport_limits(&self) -> Result<(usize, usize), ServiceFailure> {
@@ -300,6 +304,32 @@ impl ServiceHandle {
         budget: QueryBudget,
     ) -> Result<Vec<String>, ServiceFailure> {
         let instance = &self.instance;
+        let initial_identity =
+            instance
+                .durable_identity()
+                .map_err(|failure| match failure.code() {
+                    crate::BootstrapFailureCode::KeyCustodyUnavailable => {
+                        ServiceFailure::KeyUnavailable
+                    },
+                    crate::BootstrapFailureCode::ResourceUnavailable => {
+                        ServiceFailure::CapacityUnavailable
+                    },
+                    crate::BootstrapFailureCode::CorruptState
+                    | crate::BootstrapFailureCode::IdentityMismatch => ServiceFailure::CorruptState,
+                    crate::BootstrapFailureCode::StorageUnavailable
+                    | crate::BootstrapFailureCode::CatalogUnavailable => {
+                        ServiceFailure::StorageUnavailable
+                    },
+                    _ => ServiceFailure::Internal,
+                })?;
+        let context = initial_identity
+            .attribute(
+                &instance.key,
+                PresentedCredential::parse(bearer).map_err(|_| ServiceFailure::Unauthorized)?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| ServiceFailure::Unauthorized)?;
         let catalog = Catalog::open(
             &instance._authority,
             instance.instance,
@@ -314,14 +344,9 @@ impl ServiceHandle {
                 .pin()
                 .map_err(|_| ServiceFailure::StorageUnavailable)?,
         )
-        .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        let context = identity
-            .attribute(
-                &instance.key,
-                PresentedCredential::parse(bearer).map_err(|_| ServiceFailure::Unauthorized)?,
-                RequestedIntent::Query,
-                CompatibilityHints::none(),
-            )
+        .map_err(|_| ServiceFailure::CorruptState)?;
+        identity
+            .revalidate_query_context(context)
             .map_err(|_| ServiceFailure::Unauthorized)?;
         let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
         let protection = instance
@@ -333,7 +358,7 @@ impl ServiceHandle {
         let service = QueryService::new(instance._authority.governor(), &ledger, 100, identity);
         let query = service
             .plan_pipeline(context, source, budget)
-            .map_err(|_| ServiceFailure::InvalidRequest)?;
+            .map_err(|failure| map_query_failure(&failure))?;
         let schema = self
             .schema_sessions
             .session(instance.tenant, instance.resource_governor())
@@ -342,21 +367,9 @@ impl ServiceHandle {
             .with_catalog_view(instance.tenant, |catalog| {
                 service.execute_with_schema(query, catalog)
             })
-            .map_err(|_| ServiceFailure::StorageUnavailable)?
-            .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        Ok(events
-            .filter_map(|event| match event {
-                QueryEvent::Batch(batch) => Some(
-                    batch
-                        .records()
-                        .iter()
-                        .filter_map(|record| record.body_text().map(ToOwned::to_owned))
-                        .collect::<Vec<_>>(),
-                ),
-                QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
-            })
-            .flatten()
-            .collect())
+            .map_err(schema_bootstrap::classify_replay_failure)?
+            .map_err(|failure| map_query_failure(&failure))?;
+        collect_query_bodies(events)
     }
 }
 

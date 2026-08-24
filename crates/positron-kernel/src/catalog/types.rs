@@ -221,6 +221,28 @@ impl std::fmt::Debug for CatalogObject {
     }
 }
 
+/// Opaque governance object capability used only by integration-test fixtures.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct GovernanceFixtureObject {
+    pub(super) plaintext: Vec<u8>,
+}
+
+#[cfg(feature = "test-support")]
+impl GovernanceFixtureObject {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CatalogFailure> {
+        let mut plaintext = Vec::new();
+        plaintext
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        plaintext.extend_from_slice(bytes);
+        if plaintext.is_empty() || plaintext.len() > MAX_CATALOG_OBJECT_BYTES {
+            return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
+        }
+        Ok(Self { plaintext })
+    }
+}
+
 #[derive(Clone)]
 pub struct AuditIntent(pub(super) Vec<u8>);
 
