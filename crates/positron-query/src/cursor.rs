@@ -13,7 +13,6 @@ mod validation;
 pub(crate) use validation::fuzz_reauthenticate;
 pub(crate) use validation::source_length;
 use validation::{Reader, map_protection_failure};
-
 const MAGIC: [u8; 8] = *b"POSQCR05";
 const LEGACY_MAGIC: [u8; 8] = *b"POSQCR01";
 const CURSOR_PURPOSE: &[u8] = b"query-cursor-v5";
@@ -45,7 +44,6 @@ pub(crate) const CURRENT_VERSION_END: usize = CURRENT_VERSION_START + CURRENT_VE
 pub(crate) const CURRENT_AUTH_TAG_START: usize = CURRENT_VERSION_END;
 #[cfg(fuzzing)]
 pub(crate) const CURRENT_AUTH_TAG_END: usize = CURSOR_BYTES;
-
 /// Opaque authenticated continuation with one fixed bounded representation.
 #[derive(Clone, Eq, PartialEq)]
 pub struct QueryCursor(Vec<u8>);
