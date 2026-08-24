@@ -175,6 +175,62 @@ fn snapshot_lease_creation_prunes_expired_capacity_without_releasing_active_leas
 }
 
 #[test]
+fn durable_lease_inventory_cap_and_missing_reservation_fail_closed() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let template_identity = ledger.create_snapshot_lease(100, 1_000)?.identity();
+        let template = catalog
+            .pin()?
+            .plaintext_objects()
+            .find(|bytes| bytes.starts_with(b"PSLEASE1"))
+            .ok_or("snapshot lease catalog record missing")?
+            .to_vec();
+        ledger.release_snapshot_lease(template_identity)?;
+
+        let basis = catalog.pin()?;
+        let mut objects = basis
+            .plaintext_objects()
+            .map(|bytes| CatalogObject::new(bytes.to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for identity in 1_u8..=64 {
+            let mut bytes = template.clone();
+            bytes[10..26].copy_from_slice(&[identity; 16]);
+            objects.push(CatalogObject::new(bytes)?);
+        }
+        catalog.commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([0xe4; 16])?,
+                FormatEpoch::new(1)?,
+                objects,
+            )?,
+            None,
+        )?;
+
+        assert_eq!(
+            ledger
+                .create_snapshot_lease(200, 1_000)
+                .expect_err("the 65th active durable lease exceeds the hard cap")
+                .code(),
+            LedgerFailureCode::LimitExceeded
+        );
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(crate::SnapshotLeaseId::new([1; 16])?, 200)
+                .expect_err("a durable lease without a live reservation is corrupt")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_resume_fails_closed_on_bad_durable_shapes() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let ledger = ActiveSegmentLedger::open(
