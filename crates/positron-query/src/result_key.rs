@@ -147,4 +147,20 @@ mod tests {
         encoded[51] = 1;
         assert!(ResultResumeKey::decode(&encoded).is_err());
     }
+
+    #[test]
+    fn fixed_resume_key_round_trips_both_result_kinds() {
+        for kind in [1_u8, 2_u8] {
+            let mut encoded = [0; RESULT_RESUME_KEY_BYTES];
+            encoded[0] = kind;
+            encoded[1..9].copy_from_slice(&(-7_i64).to_be_bytes());
+            encoded[9..17].copy_from_slice(&1_u64.to_be_bytes());
+            encoded[17..19].copy_from_slice(&1_u16.to_be_bytes());
+            encoded[19..51].copy_from_slice(&[0x5a; 32]);
+            let decoded = ResultResumeKey::decode(&encoded)
+                .expect("canonical raw and aggregate keys must decode")
+                .expect("tagged keys must carry a result frontier");
+            assert_eq!(decoded.encode(), encoded);
+        }
+    }
 }

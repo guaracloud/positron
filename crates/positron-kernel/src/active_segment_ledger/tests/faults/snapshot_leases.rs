@@ -221,10 +221,28 @@ fn durable_lease_inventory_cap_and_missing_reservation_fail_closed() -> Result<(
                 .code(),
             LedgerFailureCode::LimitExceeded
         );
+        let missing_reservation = crate::SnapshotLeaseId::new([1; 16])?;
         assert_eq!(
             ledger
-                .resume_snapshot_lease(crate::SnapshotLeaseId::new([1; 16])?, 200)
+                .resume_snapshot_lease(missing_reservation, 200)
                 .expect_err("a durable lease without a live reservation is corrupt")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        assert_eq!(
+            ledger
+                .snapshot_lease_usage(missing_reservation, 200)
+                .expect_err("usage reads must reject a missing live reservation")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        assert_eq!(
+            ledger
+                .record_snapshot_lease_usage(
+                    missing_reservation,
+                    SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+                )
+                .expect_err("usage writes must reject a missing live reservation")
                 .code(),
             LedgerFailureCode::IntegrityCorruption
         );
@@ -845,6 +863,44 @@ fn snapshot_lease_usage_is_monotonic_and_survives_reopen() -> Result<(), Box<dyn
             &lease_clock(102),
         )?;
         assert_eq!(reopened.snapshot_lease_usage(identity, 102)?, usage);
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_usage_failures_are_typed_and_publication_is_retryable()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 101)?.identity();
+        assert_eq!(
+            ledger
+                .snapshot_lease_usage(identity, 99)
+                .expect_err("usage reads must reject a clock regression")
+                .code(),
+            LedgerFailureCode::InvalidInput
+        );
+        assert_eq!(
+            ledger
+                .snapshot_lease_usage(identity, 101)
+                .expect_err("usage reads must reject an expired lease")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+
+        let live = ledger.create_snapshot_lease(102, 200)?.identity();
+        let zero = ledger.record_snapshot_lease_usage(live, SnapshotLeaseUsage::default())?;
+        assert_eq!(zero, SnapshotLeaseUsage::default());
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+            ledger.record_snapshot_lease_usage(live, SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7))
+        })
+        .expect_err("a failed usage publication must remain retryable");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        let usage = ledger
+            .record_snapshot_lease_usage(live, SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7))?;
+        assert_eq!(usage.scanned_bytes(), 1);
+        assert_eq!(usage.memory_peak_bytes(), 7);
         Ok(())
     })
 }

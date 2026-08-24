@@ -208,7 +208,7 @@ mod tests {
     use positron_domain::identity::TenantId;
     use positron_domain::routing::{SignalKind, VirtualShardId};
 
-    use super::{LeaseRecord, SnapshotLeaseId, validate_active_lease};
+    use super::{LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, validate_active_lease};
     use crate::CatalogGenerationId;
     use crate::active_segment_ledger::SegmentScope;
     use positron_domain::routing::CommitPosition;
@@ -267,5 +267,32 @@ mod tests {
                 .code(),
             super::super::LedgerFailureCode::IntegrityCorruption
         );
+    }
+
+    #[test]
+    fn usage_merge_rejects_additive_counter_wrap_and_preserves_peak_semantics() {
+        let overflowing = [
+            SnapshotLeaseUsage::new(u64::MAX, 0, 0, 0, 0, 0, 0),
+            SnapshotLeaseUsage::new(0, u64::MAX, 0, 0, 0, 0, 0),
+            SnapshotLeaseUsage::new(0, 0, u64::MAX, 0, 0, 0, 0),
+            SnapshotLeaseUsage::new(0, 0, 0, u64::MAX, 0, 0, 0),
+            SnapshotLeaseUsage::new(0, 0, 0, 0, u64::MAX, 0, 0),
+            SnapshotLeaseUsage::new(0, 0, 0, 0, 0, u64::MAX, 0),
+        ];
+        for current in overflowing {
+            assert_eq!(
+                current
+                    .merge(SnapshotLeaseUsage::new(1, 1, 1, 1, 1, 1, 7))
+                    .expect_err("additive usage must fail closed before wrapping")
+                    .code(),
+                super::super::LedgerFailureCode::LimitExceeded
+            );
+        }
+        let merged = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 9)
+            .merge(SnapshotLeaseUsage::new(7, 8, 9, 10, 11, 12, 3))
+            .expect("non-overflowing usage must merge");
+        assert_eq!(merged.memory_peak_bytes(), 9);
+        assert_eq!(merged.scanned_bytes(), 8);
+        assert_eq!(merged.wall_seconds(), 14);
     }
 }

@@ -196,4 +196,16 @@ mod tests {
             QueryFailureCode::StoreUnavailable
         );
     }
+
+    #[test]
+    fn scan_limit_failure_preserves_decoded_budget_dimension() {
+        let failure = positron_signals::ScanLimit::new(usize::MAX)
+            .expect_err("an unrepresentable scan limit must be rejected");
+        let mapped = super::map_store_failure(failure);
+        assert_eq!(mapped.code(), QueryFailureCode::BudgetExhausted);
+        assert_eq!(
+            mapped.limiting_budget(),
+            Some(crate::QueryBudgetDimension::DecodedRecords)
+        );
+    }
 }
