@@ -89,9 +89,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         self.retry_pending_releases(&mut state)?;
         reject_time_regression(&state, now)?;
-        self.catalog
-            .refresh_state()
-            .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
         let basis = self.catalog.pin()?;
         let all_records = records(&basis)?;
         let expired = expired_in_scope(&all_records, self.scope, now);
