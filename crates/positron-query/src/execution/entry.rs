@@ -180,6 +180,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         {
             return Err(resources.fail_before_stream(
                 self.ledger,
+                &state,
                 QueryFailure::new(QueryFailureCode::InvalidCursor),
             ));
         }

@@ -26,7 +26,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let initially_exhausted = match self.observe_state(&mut state) {
             Ok(exhausted) => exhausted,
             Err(failure) => {
-                return Err(resources.fail_before_stream(self.ledger, failure));
+                return Err(resources.fail_before_stream(self.ledger, &state, failure));
             },
         };
         if initially_exhausted {
@@ -40,11 +40,15 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let frontier = match crate::execution_state::commit_position(state.frontier) {
             Ok(frontier) => frontier,
-            Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
+            Err(failure) => {
+                return Err(resources.fail_before_stream(self.ledger, &state, failure));
+            },
         };
         let header = match initial_header(&self.ledger.control_tokens(), &state, pagination) {
             Ok(header) => header,
-            Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
+            Err(failure) => {
+                return Err(resources.fail_before_stream(self.ledger, &state, failure));
+            },
         };
         macro_rules! framed {
             ($result:expr) => {

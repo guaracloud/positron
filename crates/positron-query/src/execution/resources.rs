@@ -49,10 +49,14 @@ impl ExecutionResources {
     }
 
     pub(super) fn fail_before_stream(
-        self,
+        mut self,
         ledger: &ActiveSegmentLedger<'_, '_>,
+        state: &crate::cursor::CursorState,
         primary: QueryFailure,
     ) -> QueryFailure {
+        if let Err(failure) = self.persist_usage(ledger, state) {
+            return failure;
+        }
         let cleanup = ledger
             .release_snapshot_lease(self.lease)
             .map_err(map_ledger_failure);
@@ -78,12 +82,17 @@ impl ExecutionResources {
     pub(super) fn validate_lease_identity(
         self,
         ledger: &ActiveSegmentLedger<'_, '_>,
+        state: &crate::cursor::CursorState,
         expected: [u8; 16],
     ) -> Result<Self, QueryFailure> {
         if self.lease.to_bytes() == expected {
             return Ok(self);
         }
-        Err(self.fail_before_stream(ledger, QueryFailure::new(crate::QueryFailureCode::Internal)))
+        Err(self.fail_before_stream(
+            ledger,
+            state,
+            QueryFailure::new(crate::QueryFailureCode::Internal),
+        ))
     }
 
     pub(super) fn into_stream(self) -> (TransferredResourceReservation, SnapshotLeaseId) {
