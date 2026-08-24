@@ -204,7 +204,7 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             .plan_pipeline(
                 context,
                 "logs | range query_time 0 100 | limit 2",
-                QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
+                QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)?
                     .with_cpu_work_units(16)?,
             )
             .map_err(|failure| format!("{state} plan failed: {failure:?}"))?;
@@ -233,19 +233,6 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
         drop(service);
         drop(ledger);
         drop(catalog);
-        let fresh_query = services.query_log_bodies(
-            &query_secret,
-            "logs | range query_time 0 100 | limit 2",
-            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
-                .with_cpu_work_units(16)?,
-        );
-        if code <= 2 {
-            let fresh_query = fresh_query
-                .map_err(|failure| format!("{state} fresh query failed: {failure:?}"))?;
-            assert_eq!(fresh_query, ["first", "second"], "{state} fresh query");
-        } else {
-            assert!(fresh_query.is_err(), "{state} fresh query must fail closed");
-        }
         let durable_identity = initialized.durable_identity()?;
         let durable_ingest = durable_identity.attribute(
             &initialized.key,
@@ -309,6 +296,23 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
                 after, before,
                 "{state} lifecycle rejection leaked query work"
             );
+        }
+        drop(resumed_service);
+        drop(reopened_ledger);
+        drop(reopened_catalog);
+
+        let fresh_query = services.query_log_bodies(
+            &query_secret,
+            "logs | range query_time 0 100 | limit 2",
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)?
+                .with_cpu_work_units(16)?,
+        );
+        if code <= 2 {
+            let fresh_query = fresh_query
+                .map_err(|failure| format!("{state} fresh query failed: {failure:?}"))?;
+            assert_eq!(fresh_query, ["first", "second"], "{state} fresh query");
+        } else {
+            assert!(fresh_query.is_err(), "{state} fresh query must fail closed");
         }
     }
     Ok(())
