@@ -5,8 +5,8 @@ use positron_ingest::{
     IngestRequestOutcome, LogIngest, NativeLogBatch, OtlpLogsReceiver,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, LifecycleClock, SegmentScope, StoreBlockIdentity,
-    SystemLifecycleClockSource,
+    ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
+    StoreBlockIdentity, SystemLifecycleClockSource,
 };
 
 use super::{
@@ -97,6 +97,13 @@ fn open_catalog<'instance>(
     .map_err(|failure| classify_catalog_failure_code(failure.code()))
 }
 
+pub(super) const fn map_ledger_failure_code(code: LedgerFailureCode) -> IngestFailureCode {
+    match classify_ledger_failure_code(code) {
+        ServiceFailure::CapacityUnavailable => IngestFailureCode::CapacityUnavailable,
+        _ => IngestFailureCode::StorageUnavailable,
+    }
+}
+
 fn ingest_group<S: positron_kernel::LifecycleClockSource>(
     instance: &crate::InitializedInstance,
     catalog: &Catalog<'_>,
@@ -112,13 +119,7 @@ fn ingest_group<S: positron_kernel::LifecycleClockSource>(
     };
     let ledger = match ActiveSegmentLedger::open(&instance._authority, catalog, scope, protection) {
         Ok(ledger) => ledger,
-        Err(failure) => {
-            let code = match classify_ledger_failure_code(failure.code()) {
-                ServiceFailure::CapacityUnavailable => IngestFailureCode::CapacityUnavailable,
-                _ => IngestFailureCode::StorageUnavailable,
-            };
-            return IngestOutcome::Retryable(code);
-        },
+        Err(failure) => return IngestOutcome::Retryable(map_ledger_failure_code(failure.code())),
     };
     let identity = match instance
         .key

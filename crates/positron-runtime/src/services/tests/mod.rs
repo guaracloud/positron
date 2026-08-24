@@ -299,5 +299,15 @@ fn query_setup_failures_use_one_catalog_and_ledger_classification_table() {
             expected,
             "{code:?}"
         );
+        let expected_ingest = if expected == ServiceFailure::CapacityUnavailable {
+            positron_ingest::IngestFailureCode::CapacityUnavailable
+        } else {
+            positron_ingest::IngestFailureCode::StorageUnavailable
+        };
+        assert_eq!(
+            super::ingest::map_ledger_failure_code(code),
+            expected_ingest,
+            "ingest mapping: {code:?}"
+        );
     }
 }
