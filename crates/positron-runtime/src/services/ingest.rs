@@ -34,6 +34,18 @@ pub(super) fn ingest_native_batch(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
+    // Hold the canonical Catalog writer lease while the native batch is
+    // admitted and published. A lifecycle transition cannot pass the final
+    // identity check and interleave with append through a second Catalog.
+    let catalog = open_catalog(instance)?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
+    identity
+        .validate_ingest_context(context)
+        .map_err(|_| ServiceFailure::Unauthorized)?;
     let policy = services
         .ingest_policy
         .pin()
@@ -48,15 +60,6 @@ pub(super) fn ingest_native_batch(
     if groups.is_empty() {
         return Ok(IngestRequestOutcome::new(Vec::new()));
     }
-    let catalog = open_catalog(instance)?;
-    let snapshot = catalog
-        .pin()
-        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
-    let identity =
-        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
-    identity
-        .validate_ingest_context(context)
-        .map_err(|_| ServiceFailure::Unauthorized)?;
     #[cfg(test)]
     if let Some(backend) = services
         .receiver_test_backend
