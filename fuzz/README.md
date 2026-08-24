@@ -54,7 +54,7 @@ cargo +nightly fuzz run query_sql
 ```
 
 The authenticated cursor boundary target checks bounded cursor ownership,
-lossless round trips, and truncation rejection. The current 4543-byte cursor
+lossless round trips, and truncation rejection. The current 4545-byte cursor
 encoding is the only resumable wire. The legacy 341-byte and v3 373-byte
 authenticated encodings are recognized only to return the stable invalid-cursor
 result; their numeric-offset semantics are rejected. All other lengths are

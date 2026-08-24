@@ -14,18 +14,21 @@ pub(crate) use validation::fuzz_reauthenticate;
 pub(crate) use validation::source_length;
 use validation::{Reader, map_protection_failure};
 
-const MAGIC: [u8; 8] = *b"POSQCR04";
+const MAGIC: [u8; 8] = *b"POSQCR05";
 const LEGACY_MAGIC: [u8; 8] = *b"POSQCR01";
-const CURSOR_PURPOSE: &[u8] = b"query-cursor-v4";
+const CURSOR_PURPOSE: &[u8] = b"query-cursor-v5";
 const LEGACY_CURSOR_PURPOSE: &[u8] = b"query-cursor-v1";
+const API_VERSION: u8 = 1;
+const LANGUAGE_VERSION: u8 = 1;
 const V1_PAYLOAD_BYTES: usize = 309;
 const V3_PAYLOAD_BYTES: usize = 341;
 const MAX_PLAN_SOURCE_BYTES: usize = 4_096;
 const PLAN_SOURCE_HEADER_BYTES: usize = 1 + 2;
+const CURRENT_VERSION_BYTES: usize = 2;
 const CURRENT_PREFIX_BYTES: usize = V3_PAYLOAD_BYTES - std::mem::size_of::<u16>();
 const BASE_PAYLOAD_BYTES: usize =
     CURRENT_PREFIX_BYTES + 9 + PLAN_SOURCE_HEADER_BYTES + MAX_PLAN_SOURCE_BYTES;
-const PAYLOAD_BYTES: usize = BASE_PAYLOAD_BYTES + RESULT_RESUME_KEY_BYTES;
+const PAYLOAD_BYTES: usize = BASE_PAYLOAD_BYTES + RESULT_RESUME_KEY_BYTES + CURRENT_VERSION_BYTES;
 const V1_CURSOR_BYTES: usize = V1_PAYLOAD_BYTES + 32;
 const V3_CURSOR_BYTES: usize = V3_PAYLOAD_BYTES + 32;
 const CURSOR_BYTES: usize = PAYLOAD_BYTES + 32;
@@ -35,7 +38,11 @@ pub(crate) const CURRENT_RESUME_KEY_START: usize = BASE_PAYLOAD_BYTES;
 #[cfg(fuzzing)]
 pub(crate) const CURRENT_RESUME_KEY_END: usize = CURRENT_RESUME_KEY_START + RESULT_RESUME_KEY_BYTES;
 #[cfg(fuzzing)]
-pub(crate) const CURRENT_AUTH_TAG_START: usize = CURRENT_RESUME_KEY_END;
+pub(crate) const CURRENT_VERSION_START: usize = CURRENT_RESUME_KEY_END;
+#[cfg(fuzzing)]
+pub(crate) const CURRENT_VERSION_END: usize = CURRENT_VERSION_START + CURRENT_VERSION_BYTES;
+#[cfg(fuzzing)]
+pub(crate) const CURRENT_AUTH_TAG_START: usize = CURRENT_VERSION_END;
 #[cfg(fuzzing)]
 pub(crate) const CURRENT_AUTH_TAG_END: usize = CURSOR_BYTES;
 
@@ -162,6 +169,8 @@ pub(crate) fn encode(
         .map(ResultResumeKey::encode)
         .unwrap_or([0; RESULT_RESUME_KEY_BYTES]);
     bytes.extend_from_slice(&encoded_resume_key);
+    bytes.push(API_VERSION);
+    bytes.push(LANGUAGE_VERSION);
     let authentication = protector
         .authenticate_query_cursor(CURSOR_PURPOSE, &bytes)
         .map_err(map_protection_failure)?;
@@ -339,6 +348,9 @@ fn decode_internal(
         (None, None)
     };
     let resume_key = ResultResumeKey::decode(reader.bytes(RESULT_RESUME_KEY_BYTES)?)?;
+    if reader.array::<1>()?[0] != API_VERSION || reader.array::<1>()?[0] != LANGUAGE_VERSION {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
     if language.is_none() || (retain_source && source.is_none()) {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }

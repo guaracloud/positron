@@ -78,7 +78,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
             .expect("a bounded cursor must remain decodable after a lossless copy");
         assert_eq!(reparsed, cursor);
     }
-    if matches!(data.len(), 341 | 373 | 4_543) {
+    if matches!(data.len(), 341 | 373 | 4_545) {
         assert!(QueryCursor::from_bytes(&data[..data.len() - 1]).is_err());
     }
 
@@ -180,9 +180,33 @@ pub fn fuzz_query_cursor(data: &[u8]) {
 
     if !data.is_empty() {
         let mut variant = canonical.as_bytes().to_vec();
-        const MUTATION_OFFSETS: [usize; 24] = [
-            16, 32, 48, 64, 80, 96, 104, 112, 123, 157, 165, 197, 213, 221, 237, 253, 261, 269,
-            275, 283, 315, 347, 348, 349,
+        const MUTATION_OFFSETS: [usize; 26] = [
+            16,
+            32,
+            48,
+            64,
+            80,
+            96,
+            104,
+            112,
+            123,
+            157,
+            165,
+            197,
+            213,
+            221,
+            237,
+            253,
+            261,
+            269,
+            275,
+            283,
+            315,
+            347,
+            348,
+            349,
+            cursor::CURRENT_VERSION_START,
+            cursor::CURRENT_VERSION_START + 1,
         ];
         for (index, byte) in data.iter().take(MUTATION_OFFSETS.len()).enumerate() {
             if let Some(slot) = variant.get_mut(MUTATION_OFFSETS[index]) {

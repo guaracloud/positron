@@ -905,7 +905,7 @@ fn resume_clock_failure_is_reported_before_lease_reacquisition() -> Result<(), B
 fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Result<(), Box<dyn Error>>
 {
     let fixture = CursorFixture::new()?;
-    assert_eq!(fixture.cursor.as_bytes().len(), 4543);
+    assert_eq!(fixture.cursor.as_bytes().len(), 4545);
     for (label, rewrite) in [
         (
             "magic",
@@ -1131,6 +1131,11 @@ fn rewritten_existing_cursor(
     rewrite: impl FnOnce(&mut Vec<u8>),
     purpose: &[u8],
 ) -> Result<QueryCursor, Box<dyn Error>> {
+    let purpose = if purpose == b"query-cursor-v4" {
+        b"query-cursor-v5".as_slice()
+    } else {
+        purpose
+    };
     let mut payload = cursor.as_bytes()[..cursor.as_bytes().len() - 32].to_vec();
     rewrite(&mut payload);
     let protector = fixture.kernel.ledger()?.control_tokens();
@@ -1150,6 +1155,57 @@ fn legacy_cursor(fixture: &CursorFixture) -> Result<QueryCursor, Box<dyn Error>>
     let authentication = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
+}
+
+#[test]
+fn authenticated_cursor_rejects_unknown_api_and_language_versions() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let payload_len = fixture
+        .cursor
+        .as_bytes()
+        .len()
+        .checked_sub(32)
+        .ok_or("cursor omitted its authentication tag")?;
+    let version_start = payload_len
+        .checked_sub(2)
+        .ok_or("cursor omitted versions")?;
+    for offset in version_start..payload_len {
+        let cursor = rewritten_cursor(&fixture, |bytes| bytes[offset] = 2, b"query-cursor-v4")?;
+        assert_eq!(
+            fixture
+                .service()
+                .resume(fixture.context, &cursor)
+                .expect_err("unknown authenticated cursor version must fail closed")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn previous_current_cursor_wire_is_rejected_without_downgrade() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let payload_len = fixture
+        .cursor
+        .as_bytes()
+        .len()
+        .checked_sub(32)
+        .ok_or("cursor omitted its authentication tag")?;
+    let mut payload = fixture.cursor.as_bytes()[..payload_len].to_vec();
+    payload[..8].copy_from_slice(b"POSQCR04");
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v4", &payload)?;
+    payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v4", &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    assert_eq!(
+        QueryCursor::from_bytes(&payload)
+            .expect_err("the superseded current wire must not downgrade")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    Ok(())
 }
 
 fn rewritten_source_cursor(
@@ -1174,9 +1230,9 @@ fn rewritten_source_cursor(
         .digest_query_cursor(b"query-plan-source-v1", &encoding)?;
     payload[123..155].copy_from_slice(&digest);
     let protector = fixture.kernel.ledger()?.control_tokens();
-    let initial = protector.authenticate_query_cursor(b"query-cursor-v4", &payload)?;
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
-    let authentication = protector.authenticate_query_cursor(b"query-cursor-v4", &payload)?;
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
 }
