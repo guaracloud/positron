@@ -69,10 +69,8 @@ pub(super) fn find_resume_index<'kernel, 'catalog, 'ledger>(
             state.prior_digest
         };
         state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
-        if key.matches_record(record, digest) {
-            if found.replace(index).is_some() {
-                return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-            }
+        if key.matches_record(record, digest) && found.replace(index).is_some() {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
     }
     found

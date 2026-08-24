@@ -7,7 +7,11 @@ use crate::{QueryCancellation, QueryFailure};
 
 pub(super) const MAX_SCAN_RECORDS: usize = 1_024;
 
-pub(super) fn execute_scan<'kernel, 'catalog>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the scan adapter forwards one bounded request to the three canonical signal-store paths"
+)]
+pub(super) fn execute_scan<'kernel>(
     governor: ResourceGovernor<'kernel>,
     tenant: TenantId,
     snapshot: &LedgerSnapshot<'kernel>,

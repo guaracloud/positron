@@ -1,18 +1,17 @@
 use crate::LogicalPlan;
 use crate::QueryFailure;
 
+type ScanPredicates<'plan> = (
+    Option<&'plan positron_signals::SchemaQuery>,
+    bool,
+    Option<positron_signals::TextSearchCandidate>,
+    bool,
+);
+
 pub(super) fn scan_predicates<'plan>(
     plan: &'plan LogicalPlan,
     schema: Option<&positron_signals::SchemaCatalog>,
-) -> Result<
-    (
-        Option<&'plan positron_signals::SchemaQuery>,
-        bool,
-        Option<positron_signals::TextSearchCandidate>,
-        bool,
-    ),
-    QueryFailure,
-> {
+) -> Result<ScanPredicates<'plan>, QueryFailure> {
     let schema_query = plan.schema_query();
     let schema_filter_used = schema.zip(schema_query).is_some();
     let text_candidate = if plan.transform().is_some() {
