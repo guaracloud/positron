@@ -6,6 +6,8 @@ mod cursor;
 mod lifecycle;
 #[path = "acknowledged_logs/parity.rs"]
 mod parity;
+#[path = "acknowledged_logs/query_lifecycle_admission.rs"]
+mod query_lifecycle_admission;
 #[path = "acknowledged_logs/support.rs"]
 mod support;
 #[path = "acknowledged_logs/terminal_and_bounds.rs"]

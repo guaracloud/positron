@@ -11,13 +11,15 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureThresholds,
-    FixedLifecycleClockSource, GovernanceFixtureObject, GovernanceFixtureTarget, GovernorFailure,
-    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
-    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, DiskObservation,
+    DiskPressureThresholds, FixedLifecycleClockSource, FormatEpoch, GovernanceFixtureObject,
+    GovernanceFixtureTarget, GovernorFailure, GovernorPolicy, InstanceId,
+    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
+    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
+    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
     ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
-    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, WorkClaim, WorkKind,
+    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim,
+    WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
@@ -627,6 +629,39 @@ impl KernelFixture {
         let snapshot = self.catalog.pin()?;
         positron_governance::Identity::open(&snapshot)
             .map_err(|_| "governance identity missing from fixture catalog".into())
+    }
+
+    pub fn publish_lifecycle_for_test(
+        &self,
+        state: u8,
+        transaction: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let basis = self.catalog.pin()?;
+        let mut objects = basis
+            .object_identities()
+            .map(|identity| {
+                let bytes = basis.object(identity)?.ok_or("missing Catalog object")?;
+                let mut bytes = bytes.to_vec();
+                if bytes.starts_with(b"POSGOV01")
+                    || bytes.starts_with(b"POSGOV02")
+                    || bytes.starts_with(b"POSGOV03")
+                {
+                    let offset = bytes.len().checked_sub(5).ok_or("identity too short")?;
+                    bytes[offset] = state;
+                }
+                CatalogObject::new(bytes).map_err(|failure| -> Box<dyn Error> { Box::new(failure) })
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        self.catalog.commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([transaction; 16])?,
+                FormatEpoch::CATALOG_V1,
+                std::mem::take(&mut objects),
+            )?,
+            None,
+        )?;
+        Ok(())
     }
 
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 #[path = "snapshot_lease_support.rs"]
 mod snapshot_lease_support;
 use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
+use crate::CatalogGenerationId;
 #[cfg(test)]
 pub(super) use snapshot_lease_support::publication_visible;
 pub(super) use snapshot_lease_support::{expired_in_scope, publish_many, records};
@@ -32,6 +33,26 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         now: u64,
         expiry: u64,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.create_snapshot_lease_internal(now, expiry, None)
+    }
+
+    /// Creates a lease only if the durable Catalog is still the generation
+    /// that the caller validated for admission.
+    pub fn create_snapshot_lease_at_catalog(
+        &self,
+        now: u64,
+        expiry: u64,
+        expected_catalog: CatalogGenerationId,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.create_snapshot_lease_internal(now, expiry, Some(expected_catalog))
+    }
+
+    fn create_snapshot_lease_internal(
+        &self,
+        now: u64,
+        expiry: u64,
+        expected_catalog: Option<CatalogGenerationId>,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
         if !valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -41,7 +62,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         self.retry_pending_releases(&mut state)?;
         reject_time_regression(&state, now)?;
+        self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
+        if expected_catalog.is_some_and(|expected| expected != basis.identity()) {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
         let all_records = records(&basis)?;
         let expired = expired_in_scope(&all_records, self.scope, now);
         for record in all_records

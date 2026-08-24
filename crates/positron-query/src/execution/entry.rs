@@ -33,7 +33,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         schema: Option<&positron_signals::SchemaCatalog>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let tenant = self.validate_current_query_context(query.context)?;
+        let (tenant, catalog_identity) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
@@ -51,7 +51,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         // immutable lease snapshot is constructed.
         let lease = self
             .ledger
-            .create_snapshot_lease(now, expiry)
+            .create_snapshot_lease_at_catalog(now, expiry, catalog_identity)
             .map_err(map_ledger_failure)?;
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
@@ -64,7 +64,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let tenant = self.validate_current_query_context(query.context)?;
+        let (tenant, catalog_identity) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
@@ -85,7 +85,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         // immutable lease snapshot is constructed.
         let lease = self
             .ledger
-            .create_snapshot_lease(now_seconds, expiry)
+            .create_snapshot_lease_at_catalog(now_seconds, expiry, catalog_identity)
             .map_err(map_ledger_failure)?;
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());

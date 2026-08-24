@@ -35,7 +35,8 @@ use crate::catalog::Catalog;
 use crate::data_protection::ObjectDataKey;
 use crate::resource_governor::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
 use crate::{
-    RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority, WorkClaim, WorkKind,
+    CatalogSnapshot, RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority,
+    WorkClaim, WorkKind,
 };
 
 use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
@@ -99,6 +100,16 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     #[must_use]
     pub fn control_tokens(&self) -> crate::ControlTokenProtector<'_> {
         self.catalog.control_tokens()
+    }
+
+    /// Refreshes and pins the latest authenticated Catalog generation.
+    ///
+    /// Query authorization is generation-pinned, so callers must use this
+    /// boundary immediately before admitting a durable snapshot lease rather
+    /// than relying on an identity captured during planning.
+    pub fn current_catalog_snapshot(&self) -> Result<CatalogSnapshot, LedgerFailure> {
+        self.catalog.refresh_state()?;
+        self.catalog.pin().map_err(Into::into)
     }
 
     pub fn open(
