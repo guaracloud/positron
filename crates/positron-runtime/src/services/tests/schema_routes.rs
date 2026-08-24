@@ -399,6 +399,7 @@ fn admitted_active_ingest_is_revalidated_before_append_after_lifecycle_transitio
         let (initialized, ingest, query_secret) = fixture.initialized()?;
         let services = ServiceHandle::new(Arc::clone(&initialized))?;
         let context = services.authorize_logs(&ingest)?;
+        let governor_before = initialized._authority.governor().inspect()?;
         let admission = services.admit_logs(context)?;
         let reservation = admission.take()?;
 
@@ -411,6 +412,29 @@ fn admitted_active_ingest_is_revalidated_before_append_after_lifecycle_transitio
             Err(ServiceFailure::Unauthorized),
             "state {state}"
         );
+        let governor_after = initialized._authority.governor().inspect()?;
+        assert_eq!(
+            governor_after.outstanding_total(),
+            governor_before.outstanding_total(),
+            "state {state} leaked a reservation",
+        );
+        assert_eq!(
+            governor_after.outstanding_ordinary(),
+            governor_before.outstanding_ordinary(),
+            "state {state} leaked ordinary capacity",
+        );
+        assert_eq!(
+            governor_after.outstanding_recovery(),
+            governor_before.outstanding_recovery(),
+            "state {state} leaked recovery capacity",
+        );
+        for dimension in positron_kernel::ResourceDimension::ALL {
+            assert_eq!(
+                governor_after.usage(dimension),
+                governor_before.usage(dimension),
+                "state {state} leaked {dimension:?}",
+            );
+        }
 
         let catalog = open_catalog(&initialized)?;
         publish_lifecycle(&catalog, 1, restore_transaction)?;

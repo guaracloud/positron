@@ -25,16 +25,15 @@ impl ServiceHandle {
                 .map_err(|_| ServiceFailure::KeyUnavailable)?,
         )
         .map_err(|_| ServiceFailure::StorageUnavailable)?;
+        let identity = positron_governance::Identity::open(
+            &catalog
+                .pin()
+                .map_err(|_| ServiceFailure::StorageUnavailable)?,
+        )
+        .map_err(|_| ServiceFailure::CorruptState)?;
         instance
             .ingest_policy
-            .activate(
-                &catalog,
-                &instance.identity,
-                context,
-                expected,
-                key,
-                candidate,
-            )
+            .activate(&catalog, &identity, context, expected, key, candidate)
             .map_err(|failure| match failure.code() {
                 PolicyAdministrationFailureCode::Unauthorized => ServiceFailure::Unauthorized,
                 PolicyAdministrationFailureCode::PersistenceUnavailable
