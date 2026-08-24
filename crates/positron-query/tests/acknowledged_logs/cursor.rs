@@ -333,8 +333,8 @@ fn resume_rejects_cumulative_counter_underflow_before_additional_work() -> Resul
     let decoded_underflow = rewritten_cursor(
         &fixture,
         |bytes| {
-            bytes[229..237].copy_from_slice(&1_u64.to_be_bytes());
-            bytes[293..301].copy_from_slice(&2_u64.to_be_bytes());
+            bytes[227..235].copy_from_slice(&1_u64.to_be_bytes());
+            bytes[291..299].copy_from_slice(&2_u64.to_be_bytes());
         },
         b"query-cursor-v4",
     )?;
@@ -359,8 +359,8 @@ fn resume_rejects_cumulative_counter_underflow_before_additional_work() -> Resul
     let output_underflow = rewritten_cursor(
         &fixture,
         |bytes| {
-            bytes[301..309].copy_from_slice(&3_u64.to_be_bytes());
-            bytes[237..245].copy_from_slice(&2_u64.to_be_bytes());
+            bytes[299..307].copy_from_slice(&3_u64.to_be_bytes());
+            bytes[235..243].copy_from_slice(&2_u64.to_be_bytes());
         },
         b"query-cursor-v4",
     )?;
@@ -379,39 +379,19 @@ fn resume_rejects_cumulative_counter_underflow_before_additional_work() -> Resul
 }
 
 #[test]
-fn legacy_cursor_preserves_event_and_ingest_axis_plan_digests() -> Result<(), Box<dyn Error>> {
-    for axis in [2_u8, 3_u8] {
+fn legacy_numeric_cursor_is_rejected_without_resuming_any_temporal_axis()
+-> Result<(), Box<dyn Error>> {
+    for _axis in [2_u8, 3_u8] {
         let fixture = CursorFixture::new()?;
-        let mut encoding = Vec::with_capacity(19);
-        encoding.push(axis);
-        encoding.extend_from_slice(&(-100_i64).to_be_bytes());
-        encoding.extend_from_slice(&100_i64.to_be_bytes());
-        encoding.extend_from_slice(&2_u16.to_be_bytes());
-        let digest = fixture
-            .kernel
-            .ledger()?
-            .control_tokens()
-            .digest(b"query-plan-v1", &encoding)?;
-        let legacy = rewritten_cursor(
-            &fixture,
-            |bytes| {
-                bytes[..8].copy_from_slice(b"POSQCR01");
-                bytes[104] = axis;
-                bytes.drain(317..4449);
-                bytes.drain(261..269);
-                bytes[123..155].copy_from_slice(&digest);
-            },
-            b"query-cursor-v1",
-        )?;
-        let events = fixture
-            .service()
-            .resume(fixture.context, &legacy)
-            .expect("legacy axis digest must authenticate before execution")
-            .collect::<Vec<_>>();
-        assert!(matches!(
-            events.last(),
-            Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
-        ));
+        let legacy = legacy_cursor(&fixture)?;
+        assert_eq!(
+            fixture
+                .service()
+                .resume(fixture.context, &legacy)
+                .expect_err("legacy numeric cursor must never resume")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
     }
     Ok(())
 }
@@ -429,7 +409,7 @@ fn resume_rejects_a_reconstructed_plan_that_cannot_fit_its_memory_budget()
     fixture.cursor = continuation(&first)?.clone();
     let constrained = rewritten_cursor(
         &fixture,
-        |bytes| bytes[253..261].copy_from_slice(&100_000_u64.to_be_bytes()),
+        |bytes| bytes[251..259].copy_from_slice(&100_000_u64.to_be_bytes()),
         b"query-cursor-v4",
     )?;
     let failure = fixture
@@ -525,6 +505,50 @@ fn aggregate_resume_reconstructs_grouping_from_the_authenticated_source()
     assert!(matches!(
         resumed.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn result_resume_key_corruption_or_missing_frontier_fails_closed() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let plan = fixture.service().plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = fixture.service().execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+
+    let malformed = rewritten_existing_cursor(
+        &fixture,
+        &cursor,
+        |bytes| bytes[4_447] = 9,
+        b"query-cursor-v4",
+    )?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &malformed)
+            .expect_err("unknown resume-key tag must fail closed")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+
+    let missing = rewritten_existing_cursor(
+        &fixture,
+        &cursor,
+        |bytes| bytes[4_448] ^= 1,
+        b"query-cursor-v4",
+    )?;
+    let missing_events = fixture
+        .service()
+        .resume(fixture.context, &missing)?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        missing_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::InvalidCursor
     ));
     Ok(())
 }
@@ -706,7 +730,7 @@ fn resume_clock_failure_is_reported_before_lease_reacquisition() -> Result<(), B
 fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Result<(), Box<dyn Error>>
 {
     let fixture = CursorFixture::new()?;
-    assert_eq!(fixture.cursor.as_bytes().len(), 4481);
+    assert_eq!(fixture.cursor.as_bytes().len(), 4543);
     for (label, rewrite) in [
         (
             "magic",
@@ -714,28 +738,28 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         ),
         ("axis", |bytes: &mut Vec<u8>| bytes[104] = u8::MAX),
         ("plan digest", |bytes: &mut Vec<u8>| bytes[123] ^= 1),
-        ("zero lease", |bytes: &mut Vec<u8>| bytes[197..213].fill(0)),
+        ("zero lease", |bytes: &mut Vec<u8>| bytes[195..211].fill(0)),
         ("zero cpu budget", |bytes: &mut Vec<u8>| {
-            bytes[261..269].fill(0)
+            bytes[259..267].fill(0)
         }),
         ("overlong wall budget", |bytes: &mut Vec<u8>| {
-            bytes[269..277].copy_from_slice(&3_601_u64.to_be_bytes())
+            bytes[267..275].copy_from_slice(&3_601_u64.to_be_bytes())
         }),
         ("invalid pruning flag", |bytes: &mut Vec<u8>| {
-            bytes[349] = 2;
+            bytes[347] = 2;
         }),
         ("invalid plan language", |bytes: &mut Vec<u8>| {
-            bytes[350] = 3;
+            bytes[348] = 3;
         }),
         ("legacy source length", |bytes: &mut Vec<u8>| {
-            bytes[350] = 0;
-            bytes[351..353].copy_from_slice(&1_u16.to_be_bytes());
+            bytes[348] = 0;
+            bytes[349..351].copy_from_slice(&1_u16.to_be_bytes());
         }),
         ("source padding", |bytes: &mut Vec<u8>| {
-            bytes[4448] = 1;
+            bytes[4446] = 1;
         }),
         ("overlong source length", |bytes: &mut Vec<u8>| {
-            bytes[351..353].copy_from_slice(&4_097_u16.to_be_bytes());
+            bytes[349..351].copy_from_slice(&4_097_u16.to_be_bytes());
         }),
     ] {
         if label == "magic" {
@@ -755,8 +779,8 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
     let source_free = rewritten_cursor(
         &fixture,
         |bytes| {
-            bytes[350] = 0;
-            bytes[351..353].fill(0);
+            bytes[348] = 0;
+            bytes[349..351].fill(0);
         },
         b"query-cursor-v4",
     )?;
@@ -784,9 +808,9 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         &source_fixture,
         |bytes| {
             bytes[123..155].copy_from_slice(&basic_digest);
-            bytes[350] = 0;
-            bytes[351..353].fill(0);
-            bytes[353..4449].fill(0);
+            bytes[348] = 0;
+            bytes[349..351].fill(0);
+            bytes[351..4447].fill(0);
         },
         b"query-cursor-v4",
     )?;
@@ -817,9 +841,9 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
             |bytes| {
                 bytes[104] = axis;
                 bytes[123..155].copy_from_slice(&axis_digest);
-                bytes[350] = 0;
-                bytes[351..353].fill(0);
-                bytes[353..4449].fill(0);
+                bytes[348] = 0;
+                bytes[349..351].fill(0);
+                bytes[351..4447].fill(0);
             },
             b"query-cursor-v4",
         )?;
@@ -846,19 +870,19 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         (
             "output rows budget",
             (|bytes: &mut Vec<u8>| {
-                bytes[237..245].copy_from_slice(&1_u64.to_be_bytes());
+                bytes[235..243].copy_from_slice(&1_u64.to_be_bytes());
             }) as fn(&mut Vec<u8>),
         ),
         (
             "maximum range budget",
             (|bytes: &mut Vec<u8>| {
-                bytes[277..285].copy_from_slice(&1_u64.to_be_bytes());
+                bytes[275..283].copy_from_slice(&1_u64.to_be_bytes());
             }) as fn(&mut Vec<u8>),
         ),
         (
             "memory budget",
             (|bytes: &mut Vec<u8>| {
-                bytes[253..261].copy_from_slice(&1_u64.to_be_bytes());
+                bytes[251..259].copy_from_slice(&1_u64.to_be_bytes());
             }) as fn(&mut Vec<u8>),
         ),
     ] {
@@ -878,58 +902,28 @@ fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Resul
         );
     }
 
-    let legacy_plan_digest = {
-        let mut encoding = Vec::with_capacity(19);
-        encoding.push(1);
-        encoding.extend_from_slice(&(-100_i64).to_be_bytes());
-        encoding.extend_from_slice(&100_i64.to_be_bytes());
-        encoding.extend_from_slice(&2_u16.to_be_bytes());
-        fixture
-            .kernel
-            .ledger()?
-            .control_tokens()
-            .digest(b"query-plan-v1", &encoding)?
-    };
-    let legacy = rewritten_cursor(
-        &fixture,
-        |bytes| {
-            bytes[..8].copy_from_slice(b"POSQCR01");
-            bytes.drain(317..4449);
-            bytes.drain(261..269);
-            bytes[123..155].copy_from_slice(&legacy_plan_digest);
-        },
-        b"query-cursor-v1",
-    )
-    .map_err(|error| format!("legacy construction failed: {error:?}"))?;
+    let legacy = legacy_cursor(&fixture)?;
     assert_eq!(legacy.as_bytes().len(), 341);
-    let invalid_legacy = rewritten_cursor(
-        &fixture,
-        |bytes| {
-            bytes[..8].copy_from_slice(b"POSQCR01");
-            bytes.drain(317..4449);
-            bytes.drain(261..269);
-            bytes[123..155].fill(0);
-        },
-        b"query-cursor-v1",
-    )?;
     assert_eq!(
         fixture
             .service()
-            .resume(fixture.context, &invalid_legacy)
-            .expect_err("legacy plan digest is authenticated")
+            .resume(fixture.context, &legacy)
+            .expect_err("legacy cursor is not a resumable wire")
             .code(),
         QueryFailureCode::InvalidCursor
     );
-    let events = fixture
-        .service()
-        .resume(fixture.context, &legacy)
-        .map_err(|failure| format!("legacy resume failed: {failure:?}"))?
-        .collect::<Vec<_>>();
-    assert_eq!(bodies(&events), ["second"]);
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &legacy)
+            .expect_err("legacy numeric cursor must never resume")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
     let truncated = fixture
         .cursor
         .as_bytes()
-        .get(..4480)
+        .get(..4542)
         .ok_or("cursor too short")?;
     assert_eq!(
         QueryCursor::from_bytes(truncated)
@@ -953,12 +947,32 @@ fn rewritten_cursor(
     rewrite: impl FnOnce(&mut Vec<u8>),
     purpose: &[u8],
 ) -> Result<QueryCursor, Box<dyn Error>> {
-    let mut payload = fixture.cursor.as_bytes()[..fixture.cursor.as_bytes().len() - 32].to_vec();
+    rewritten_existing_cursor(fixture, &fixture.cursor, rewrite, purpose)
+}
+
+fn rewritten_existing_cursor(
+    fixture: &CursorFixture,
+    cursor: &QueryCursor,
+    rewrite: impl FnOnce(&mut Vec<u8>),
+    purpose: &[u8],
+) -> Result<QueryCursor, Box<dyn Error>> {
+    let mut payload = cursor.as_bytes()[..cursor.as_bytes().len() - 32].to_vec();
     rewrite(&mut payload);
     let protector = fixture.kernel.ledger()?.control_tokens();
     let initial = protector.authenticate_query_cursor(purpose, &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
     let authentication = protector.authenticate_query_cursor(purpose, &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(QueryCursor::from_bytes(&payload)?)
+}
+
+fn legacy_cursor(fixture: &CursorFixture) -> Result<QueryCursor, Box<dyn Error>> {
+    let mut payload = vec![0_u8; 309];
+    payload[..8].copy_from_slice(b"POSQCR01");
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
+    payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
 }
@@ -971,9 +985,9 @@ fn rewritten_source_cursor(
     let mut payload = cursor.as_bytes()[..cursor.as_bytes().len() - 32].to_vec();
     let source_bytes = source.as_bytes();
     let source_length = u16::try_from(source_bytes.len())?;
-    payload[351..353].copy_from_slice(&source_length.to_be_bytes());
-    payload[353..4449].fill(0);
-    payload[353..353 + source_bytes.len()].copy_from_slice(source_bytes);
+    payload[349..351].copy_from_slice(&source_length.to_be_bytes());
+    payload[351..4447].fill(0);
+    payload[351..351 + source_bytes.len()].copy_from_slice(source_bytes);
     let mut encoding = Vec::with_capacity(1 + 2 + source_bytes.len());
     encoding.push(1);
     encoding.extend_from_slice(&source_length.to_be_bytes());

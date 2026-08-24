@@ -19,6 +19,7 @@ mod planning_observer;
 mod planning_string;
 mod query_service;
 mod quoted;
+mod result_key;
 mod runtime;
 mod search;
 mod search_transfer;
@@ -75,7 +76,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
             .expect("a bounded cursor must remain decodable after a lossless copy");
         assert_eq!(reparsed, cursor);
     }
-    if matches!(data.len(), 341 | 373 | 4_481) {
+    if matches!(data.len(), 341 | 373 | 4_543) {
         assert!(QueryCursor::from_bytes(&data[..data.len() - 1]).is_err());
     }
 
@@ -110,7 +111,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         source: Some(std::sync::Arc::from(source.to_vec().into_boxed_slice())),
         language: Some(query_service::QueryLanguage::Pipeline),
         plan_digest,
-        offset: 0,
+        resume_key: None,
         sequence: 0,
         prior_digest: [0; 32],
         lease_identity: [4; 16],
@@ -172,7 +173,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         let mut variant = canonical.as_bytes().to_vec();
         const MUTATION_OFFSETS: [usize; 24] = [
             16, 32, 48, 64, 80, 96, 104, 112, 123, 157, 165, 197, 213, 221, 237, 253, 261, 269,
-            277, 285, 317, 349, 350, 351,
+            275, 283, 315, 347, 348, 349,
         ];
         for (index, byte) in data.iter().take(MUTATION_OFFSETS.len()).enumerate() {
             if let Some(slot) = variant.get_mut(MUTATION_OFFSETS[index]) {
@@ -180,13 +181,13 @@ pub fn fuzz_query_cursor(data: &[u8]) {
             }
         }
         for (index, byte) in data.iter().take(32).enumerate() {
-            if let Some(slot) = variant.get_mut(353 + index) {
+            if let Some(slot) = variant.get_mut(351 + index) {
                 *slot ^= *byte;
             }
         }
-        if data.len() >= 4_481 {
-            for (index, byte) in data.iter().skip(4_449).take(32).enumerate() {
-                if let Some(slot) = variant.get_mut(4_449 + index) {
+        if data.len() >= 4_543 {
+            for (index, byte) in data.iter().skip(4_511).take(32).enumerate() {
+                if let Some(slot) = variant.get_mut(4_511 + index) {
                     *slot ^= *byte;
                 }
             }

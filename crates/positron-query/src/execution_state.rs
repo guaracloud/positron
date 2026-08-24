@@ -84,7 +84,7 @@ pub(crate) fn initial_state<'kernel>(
             source: Some(source),
             language: Some(language),
             plan_digest,
-            offset: 0,
+            resume_key: None,
             sequence: 0,
             prior_digest: [0; 32],
             lease_identity: lease_identity.to_bytes(),

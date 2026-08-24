@@ -315,8 +315,8 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
     // The old POSQCR01 4,481-byte representation was an ambiguous pre-v4
     // source-bearing cursor. Only the genuinely legacy v1/v3 shapes remain
     // accepted; current cursors have an explicit version/domain marker.
-    assert!(QueryCursor::from_bytes(&[0; 4481]).is_err());
-    assert!(QueryCursor::from_bytes(&[0; 4482]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 4543]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 4544]).is_err());
     assert_eq!(
         format!("{:?}", QueryCursor::from_bytes(&[0; 341])?),
         "QueryCursor { <opaque> }"

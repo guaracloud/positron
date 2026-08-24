@@ -2,6 +2,7 @@ use positron_domain::identity::{PrincipalId, TenantId};
 use positron_kernel::{ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector};
 use std::sync::Arc;
 
+use crate::result_key::{RESULT_RESUME_KEY_BYTES, ResultResumeKey};
 use crate::{
     LogicalPlan, QueryBudget, QueryFailure, QueryFailureCode, TemporalAxis, TemporalRange,
 };
@@ -14,8 +15,10 @@ const V1_PAYLOAD_BYTES: usize = 309;
 const V3_PAYLOAD_BYTES: usize = 341;
 const MAX_PLAN_SOURCE_BYTES: usize = 4_096;
 const PLAN_SOURCE_HEADER_BYTES: usize = 1 + 2;
-const PAYLOAD_BYTES: usize =
-    V3_PAYLOAD_BYTES + 9 + PLAN_SOURCE_HEADER_BYTES + MAX_PLAN_SOURCE_BYTES;
+const CURRENT_PREFIX_BYTES: usize = V3_PAYLOAD_BYTES - std::mem::size_of::<u16>();
+const BASE_PAYLOAD_BYTES: usize =
+    CURRENT_PREFIX_BYTES + 9 + PLAN_SOURCE_HEADER_BYTES + MAX_PLAN_SOURCE_BYTES;
+const PAYLOAD_BYTES: usize = BASE_PAYLOAD_BYTES + RESULT_RESUME_KEY_BYTES;
 const V1_CURSOR_BYTES: usize = V1_PAYLOAD_BYTES + 32;
 const V3_CURSOR_BYTES: usize = V3_PAYLOAD_BYTES + 32;
 const CURSOR_BYTES: usize = PAYLOAD_BYTES + 32;
@@ -67,7 +70,7 @@ pub(crate) struct CursorState {
     pub(crate) source: Option<Arc<[u8]>>,
     pub(crate) language: Option<crate::query_service::QueryLanguage>,
     pub(crate) plan_digest: [u8; 32],
-    pub(crate) offset: u16,
+    pub(crate) resume_key: Option<ResultResumeKey>,
     pub(crate) sequence: u64,
     pub(crate) prior_digest: [u8; 32],
     pub(crate) lease_identity: [u8; 16],
@@ -121,7 +124,6 @@ pub(crate) fn encode(
     bytes.extend_from_slice(&state.plan.limit().to_be_bytes());
     let _ = protector;
     bytes.extend_from_slice(&state.plan_digest);
-    bytes.extend_from_slice(&state.offset.to_be_bytes());
     bytes.extend_from_slice(&state.sequence.to_be_bytes());
     bytes.extend_from_slice(&state.prior_digest);
     bytes.extend_from_slice(&state.lease_identity);
@@ -162,7 +164,12 @@ pub(crate) fn encode(
             .to_be_bytes(),
     );
     bytes.extend_from_slice(source);
-    bytes.resize(CURSOR_BYTES - 32, 0);
+    bytes.resize(BASE_PAYLOAD_BYTES, 0);
+    let encoded_resume_key = state
+        .resume_key
+        .map(ResultResumeKey::encode)
+        .unwrap_or([0; RESULT_RESUME_KEY_BYTES]);
+    bytes.extend_from_slice(&encoded_resume_key);
     let authentication = protector
         .authenticate_query_cursor(CURSOR_PURPOSE, &bytes)
         .map_err(map_protection_failure)?;
@@ -220,6 +227,9 @@ fn decode_internal(
     protector
         .verify_query_cursor(purpose, payload, authentication)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+    if legacy {
+        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+    }
     let mut reader = Reader::new(payload);
     let magic = reader.array::<8>()?;
     if (legacy && magic != LEGACY_MAGIC) || (!legacy && magic != MAGIC) || reader.u64()? != epoch {
@@ -243,7 +253,6 @@ fn decode_internal(
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let plan = LogicalPlan::logs(axis, range, reader.u16()?);
     let encoded_plan_digest = reader.array::<32>()?;
-    let offset = reader.u16()?;
     let sequence = reader.u64()?;
     let prior_digest = reader.array()?;
     let lease_identity = reader.array()?;
@@ -337,6 +346,7 @@ fn decode_internal(
     } else {
         (None, None)
     };
+    let resume_key = ResultResumeKey::decode(reader.bytes(RESULT_RESUME_KEY_BYTES)?)?;
     if legacy && encoded_plan_digest != plan_digest(protector, &plan)? {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
@@ -354,7 +364,7 @@ fn decode_internal(
         source,
         language,
         plan_digest: encoded_plan_digest,
-        offset,
+        resume_key,
         sequence,
         prior_digest,
         lease_identity,
@@ -453,14 +463,14 @@ pub(crate) fn source_length(cursor: &QueryCursor) -> Result<u64, QueryFailure> {
         .get(..PAYLOAD_BYTES)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let language = payload
-        .get(V3_PAYLOAD_BYTES + 9)
+        .get(CURRENT_PREFIX_BYTES + 9)
         .copied()
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     if !matches!(language, 1 | 2) {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let length = payload
-        .get(V3_PAYLOAD_BYTES + 10..V3_PAYLOAD_BYTES + 12)
+        .get(CURRENT_PREFIX_BYTES + 10..CURRENT_PREFIX_BYTES + 12)
         .and_then(|bytes| bytes.try_into().ok())
         .map(u16::from_be_bytes)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
@@ -520,7 +530,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURSOR_BYTES, ControlTokenFailure, QueryCursor, QueryFailureCode, V3_PAYLOAD_BYTES,
+        CURRENT_PREFIX_BYTES, CURSOR_BYTES, ControlTokenFailure, QueryCursor, QueryFailureCode,
         map_protection_failure, source_length,
     };
 
@@ -547,7 +557,7 @@ mod tests {
     #[test]
     fn source_length_rejects_unknown_language_and_checked_overflow() {
         let mut bytes = vec![0_u8; CURSOR_BYTES];
-        bytes[V3_PAYLOAD_BYTES + 9] = 3;
+        bytes[CURRENT_PREFIX_BYTES + 9] = 3;
         assert_eq!(
             source_length(&QueryCursor(bytes.clone()))
                 .expect_err("unknown language must fail closed")
@@ -555,8 +565,8 @@ mod tests {
             QueryFailureCode::InvalidCursor
         );
 
-        bytes[V3_PAYLOAD_BYTES + 9] = 1;
-        bytes[V3_PAYLOAD_BYTES + 10..V3_PAYLOAD_BYTES + 12]
+        bytes[CURRENT_PREFIX_BYTES + 9] = 1;
+        bytes[CURRENT_PREFIX_BYTES + 10..CURRENT_PREFIX_BYTES + 12]
             .copy_from_slice(&4_097_u16.to_be_bytes());
         assert_eq!(
             source_length(&QueryCursor(bytes))

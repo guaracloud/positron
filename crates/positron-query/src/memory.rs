@@ -98,6 +98,10 @@ impl RecordBuffer {
         &mut self.records
     }
 
+    pub(crate) fn as_slice(&self) -> &[QueryRecord] {
+        &self.records
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.records.len()
     }

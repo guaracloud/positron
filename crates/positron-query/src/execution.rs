@@ -4,9 +4,10 @@ use positron_signals::{LogScan, LogStore, ScanLimit};
 use crate::cursor::{self, CursorState};
 use crate::execution_state::{commit_position, stats_before_current, stats_with_current};
 use crate::execution_support::{
-    BatchDigestInput, QueryScanObserver, batch_digest, charge_output, charge_scan, limiting_budget,
-    map_store_failure,
+    BatchDigestInput, QueryScanObserver, QueryValueObserver, batch_digest, charge_output,
+    charge_scan, limiting_budget, map_store_failure, result_digest,
 };
+use crate::result_key::ResultResumeKey;
 use crate::{
     QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryHeader, QueryService, QueryStream,
     QueryTerminal, ResultLease, ResultSnapshot,
@@ -256,13 +257,32 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .checked_sub(state.output_rows)
             .ok_or_else(|| QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows));
         let output_rows_remaining = framed!(output_rows_remaining);
-        let wanted = usize::from(state.plan.limit())
-            .min(records.len())
-            .min(usize::try_from(output_rows_remaining).unwrap_or(usize::MAX));
-        let start = usize::from(state.offset);
+        let wanted = usize::from(state.plan.limit()).min(records.len());
+        let start = match state.resume_key {
+            Some(key) => framed!(find_resume_index(
+                self,
+                &mut state,
+                records.as_slice(),
+                key,
+                &mut memory,
+            )),
+            None => 0,
+        };
+        if start > wanted {
+            return self.failed_page(
+                Some(header),
+                QueryFailure::new(QueryFailureCode::InvalidCursor),
+                &state,
+                delivered_before,
+                resources,
+            );
+        }
+        let page_capacity = usize::try_from(output_rows_remaining)
+            .unwrap_or(usize::MAX)
+            .min(usize::from(batch_limit));
         let end = framed!(
             start
-                .checked_add(usize::from(batch_limit))
+                .checked_add(page_capacity)
                 .map(|end| end.min(wanted))
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
         );
@@ -341,6 +361,37 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             &mut memory,
         ));
         state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        let needs_resume = pagination && end < wanted;
+        let resume_key = if needs_resume {
+            let record = page
+                .last()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal));
+            let record = framed!(record);
+            if record.count().is_none() {
+                Some(ResultResumeKey::from_record(record, digest))
+            } else {
+                let cancellation = state.cancellation.clone();
+                let mut observer = QueryValueObserver::new(
+                    self,
+                    &mut state.cpu_work_units,
+                    state.budget.cpu_work_units(),
+                    cancellation.clone(),
+                    crate::QueryWorkStage::Output,
+                );
+                Some(framed!(result_digest(
+                    &self.ledger.control_tokens(),
+                    &state.plan,
+                    record,
+                    &cancellation,
+                    &mut observer,
+                    &mut memory,
+                )))
+                .map(|digest| ResultResumeKey::from_record(record, digest))
+            }
+        } else {
+            None
+        };
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
         let post_digest_expired = framed!(self.observe_state(&mut state));
         if post_digest_expired {
             return self.failed_page(
@@ -383,10 +434,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 }
             };
         }
-        let terminal = if pagination && end < wanted {
-            state.offset = framed_batch!(
-                u16::try_from(end).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
-            );
+        let terminal = if needs_resume {
+            state.resume_key = resume_key;
             state.sequence = framed_batch!(
                 state
                     .sequence
@@ -398,6 +447,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 framed_batch!(cursor::encode(&self.ledger.control_tokens(), state.clone(),));
             QueryTerminal::Continued(cursor)
         } else {
+            state.resume_key = resume_key;
             state.prior_digest = digest;
             QueryTerminal::Complete(stats_with_current(&state))
         };
@@ -420,6 +470,47 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         state.elapsed_wall_seconds = now.saturating_sub(state.started_at);
         Ok(now >= state.expiry)
     }
+}
+
+fn find_resume_index<'kernel, 'catalog, 'ledger>(
+    service: &QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+    records: &[crate::QueryRecord],
+    key: ResultResumeKey,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<usize, QueryFailure> {
+    let mut found = None;
+    for (index, record) in records.iter().enumerate() {
+        let digest = if key.is_aggregate() {
+            let cancellation = state.cancellation.clone();
+            let mut observer = QueryValueObserver::new(
+                service,
+                &mut state.cpu_work_units,
+                state.budget.cpu_work_units(),
+                cancellation.clone(),
+                crate::QueryWorkStage::Output,
+            );
+            result_digest(
+                &service.ledger.control_tokens(),
+                &state.plan,
+                record,
+                &cancellation,
+                &mut observer,
+                memory,
+            )?
+        } else {
+            state.prior_digest
+        };
+        state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
+        if key.matches_record(record, digest) {
+            if found.replace(index).is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+            }
+        }
+    }
+    found
+        .and_then(|index| index.checked_add(1))
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
 }
 
 fn materialize_page(
