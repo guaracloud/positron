@@ -442,7 +442,7 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
                 && incomplete.stats().scanned_bytes() > 0
                 && incomplete.stats().decoded_records() == 2
                 && incomplete.stats().output_bytes() == u64::try_from(output_bytes)?
-                && incomplete.stats().cpu_work_units() == 4
+                && incomplete.stats().cpu_work_units() == 5
                 && incomplete.stats().wall_seconds() == 0
                 && incomplete.stats().last_sequence() == Some(0)
                 && incomplete.stats().result_digest() == digest

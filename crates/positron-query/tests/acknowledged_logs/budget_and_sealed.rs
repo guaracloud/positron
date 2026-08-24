@@ -551,7 +551,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 10)?.with_cpu_work_units(4)?,
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 10)?.with_cpu_work_units(5)?,
     )?;
     let first = service.execute_page(planned)?.collect::<Vec<_>>();
     let cursor = match first.last() {
@@ -565,7 +565,7 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().records() == 1
-                && incomplete.stats().cpu_work_units() == 5
+                && incomplete.stats().cpu_work_units() == 6
                 && incomplete.stats().wall_seconds() == 2
                 && incomplete.stats().last_sequence() == Some(0)
                 && incomplete.stats().result_digest() != [0; 32]
