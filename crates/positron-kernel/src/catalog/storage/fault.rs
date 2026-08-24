@@ -32,6 +32,7 @@ pub(crate) enum CatalogFileEvent {
     PartialRewrapWrite,
     SynchronizeRewrap,
     SynchronizeRewrapDirectory,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
     BeforeLeaseMarkerBasis,
 }
 
