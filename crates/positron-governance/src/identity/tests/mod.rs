@@ -163,6 +163,30 @@ fn initial_identity_decoder_rejects_truncation_corruption_and_trailing_data() {
     assert!(decode_initial_identity(&empty_display).is_err());
 }
 
+#[test]
+fn identity_decoder_rejects_colliding_data_plane_principals_and_unknown_lifecycle() {
+    let mut ingest_collision = encoded_identity();
+    let ingest_offset = ingest_collision
+        .windows(16)
+        .position(|window| window == [12_u8; 16].as_slice())
+        .expect("ingest principal");
+    ingest_collision[ingest_offset..ingest_offset + 16].copy_from_slice(&[3; 16]);
+    assert!(decode_initial_identity(&ingest_collision).is_err());
+
+    let mut query_collision = encoded_identity();
+    let query_offset = query_collision
+        .windows(16)
+        .position(|window| window == [15_u8; 16].as_slice())
+        .expect("query principal");
+    query_collision[query_offset..query_offset + 16].copy_from_slice(&[12; 16]);
+    assert!(decode_initial_identity(&query_collision).is_err());
+
+    let mut unknown_lifecycle = encoded_identity();
+    let lifecycle_offset = unknown_lifecycle.len().checked_sub(5).expect("lifecycle");
+    unknown_lifecycle[lifecycle_offset] = 9;
+    assert!(decode_initial_identity(&unknown_lifecycle).is_err());
+}
+
 fn literal_v1_identity() -> Vec<u8> {
     let mut encoded = b"POSGOV01".to_vec();
     encoded.extend_from_slice(&[1; 16]);

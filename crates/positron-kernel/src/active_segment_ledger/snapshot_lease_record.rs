@@ -85,3 +85,69 @@ pub(super) fn validate_active_lease(record: &LeaseRecord, now: u64) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use positron_domain::identity::TenantId;
+    use positron_domain::routing::{SignalKind, VirtualShardId};
+
+    use super::{LeaseRecord, SnapshotLeaseId, validate_active_lease};
+    use crate::CatalogGenerationId;
+    use crate::active_segment_ledger::SegmentScope;
+    use positron_domain::routing::CommitPosition;
+
+    fn record(observed_at: u64, expiry: u64) -> LeaseRecord {
+        LeaseRecord {
+            identity: SnapshotLeaseId::new([1; 16]).expect("nonzero lease identity"),
+            scope: SegmentScope::new(
+                TenantId::from_bytes([2; 16]).expect("tenant"),
+                SignalKind::Logs,
+                VirtualShardId::new(1).expect("shard"),
+            ),
+            catalog_identity: CatalogGenerationId::from_authenticated_bytes([3; 32]),
+            catalog_generation: 1,
+            frontier: CommitPosition::origin(),
+            observed_at,
+            expiry,
+            resume_count: 0,
+            repeated_batch_count: 0,
+            last_resume_sequence: None,
+            last_resume_prior_digest: [0; 32],
+            blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn active_lease_validation_allows_expiry_and_rejects_clock_regression() {
+        assert!(validate_active_lease(&record(100, 200), 200).is_ok());
+        assert_eq!(
+            validate_active_lease(&record(100, 200), 99)
+                .expect_err("clock regression must be rejected")
+                .code(),
+            super::super::LedgerFailureCode::InvalidInput
+        );
+
+        let invalid_interval = record(100, 100);
+        assert_eq!(
+            super::super::snapshot_lease_codec::encode(&invalid_interval)
+                .expect_err("zero-length lease interval must not be encoded")
+                .code(),
+            super::super::LedgerFailureCode::LimitExceeded
+        );
+
+        let mut invalid_marker = record(100, 200);
+        invalid_marker.resume_count = 1;
+        invalid_marker.last_resume_sequence = Some(1);
+        invalid_marker.repeated_batch_count = 2;
+        let mut encoded = super::super::snapshot_lease_codec::encode(&invalid_marker)
+            .expect("valid marker shape");
+        encoded[119..127].copy_from_slice(&2_u64.to_be_bytes());
+        assert_eq!(
+            super::super::snapshot_lease_codec::decode(&encoded)
+                .err()
+                .expect("contradictory marker counters must fail closed")
+                .code(),
+            super::super::LedgerFailureCode::IntegrityCorruption
+        );
+    }
+}

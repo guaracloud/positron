@@ -229,3 +229,12 @@ fn bounded_search_patterns_reject_invalid_and_over_limit_input() {
         QueryFailureCode::UnsupportedQuery
     );
 }
+
+#[test]
+fn invalid_regex_pruning_input_falls_back_to_no_physical_evidence() {
+    assert!(
+        super::mandatory_literals("[")
+            .expect("invalid pruning syntax is a conservative fallback")
+            .is_empty()
+    );
+}

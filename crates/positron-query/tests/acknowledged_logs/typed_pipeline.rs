@@ -3228,6 +3228,47 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
 }
 
 #[test]
+fn cancellation_after_scan_returns_one_terminal_without_output() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("cancel-after-scan")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let meter = CancellingOperatorCallMeter::shared_for_stage(
+        positron_query::QueryWorkStage::ScanDecode,
+        2,
+    );
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+        fixture.kernel.identity()?,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn operator_wall_budget_is_checked_before_output() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-operator-wall")?;
     fixture.kernel.append_log("one", 20, 1)?;

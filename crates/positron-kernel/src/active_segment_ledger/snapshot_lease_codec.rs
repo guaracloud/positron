@@ -183,3 +183,22 @@ impl From<&CommittedBlock> for LeaseBlock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LEASE_MAGIC, decode};
+    use crate::active_segment_ledger::LedgerFailureCode;
+
+    #[test]
+    fn unknown_snapshot_lease_version_fails_closed() {
+        let mut bytes = LEASE_MAGIC.to_vec();
+        bytes.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            decode(&bytes)
+                .err()
+                .expect("unknown snapshot lease versions must fail closed")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+    }
+}
