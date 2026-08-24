@@ -88,7 +88,6 @@ impl QueryFixtureForAxis {
             kernel.ledger()?,
             1,
             TestClock::shared(100),
-            kernel.identity()?,
         );
         let source = format!("logs | range {axis} -100 100 | limit 2");
         let plan = service.plan_pipeline(

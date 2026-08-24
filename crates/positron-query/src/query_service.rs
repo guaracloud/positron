@@ -32,7 +32,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         governor: ResourceGovernor<'kernel>,
         ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
         batch_limit: u16,
-        _identity: Identity,
     ) -> Self {
         Self::with_runtime(
             governor,
@@ -40,7 +39,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             batch_limit,
             Arc::new(crate::runtime::SystemQueryClock),
             Arc::new(crate::runtime::FixedQueryWorkMeter),
-            _identity,
         )
     }
 
@@ -49,7 +47,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
         batch_limit: u16,
         clock: Arc<dyn crate::QueryClock>,
-        _identity: Identity,
     ) -> Self {
         Self::with_runtime(
             governor,
@@ -57,7 +54,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             batch_limit,
             clock,
             Arc::new(crate::runtime::FixedQueryWorkMeter),
-            _identity,
         )
     }
 
@@ -67,7 +63,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         batch_limit: u16,
         clock: Arc<dyn crate::QueryClock>,
         work_meter: Arc<dyn crate::QueryWorkMeter>,
-        _identity: Identity,
     ) -> Self {
         Self {
             governor,

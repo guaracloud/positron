@@ -46,7 +46,6 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
         fixture.ledger()?,
         1,
         clock.clone(),
-        fixture.identity()?,
     );
     let plan = service.plan_pipeline(
         context,
@@ -64,7 +63,6 @@ fn authenticated_cursor_resumes_the_same_snapshot_and_repeats_deterministically(
         fixture.ledger()?,
         1,
         clock.clone(),
-        fixture.identity()?,
     )
     .resume(context, &cursor)?;
     let resumed_events = resumed.by_ref().take(2).collect::<Vec<_>>();
@@ -180,7 +178,6 @@ fn resume_admits_before_reconstructing_the_authenticated_plan() -> Result<(), Bo
         std::sync::Arc::new(super::support::FailingStageWorkMeter(
             positron_query::QueryWorkStage::Parse,
         )),
-        fixture.kernel.identity()?,
     );
     let failure = match service.resume(fixture.context, &fixture.cursor) {
         Err(failure) => failure,
@@ -212,7 +209,6 @@ fn terminal_stats_report_cumulative_resume_and_repeat_state() -> Result<(), Box<
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
-        fixture.kernel.identity()?,
     );
     let mut first = service.resume(fixture.context, &fixture.cursor)?;
     assert!(matches!(first.next(), Some(QueryEvent::Header(_))));
@@ -256,7 +252,6 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
-        fixture.kernel.identity()?,
     )
     .resume(fixture.context, &cursor)?;
     let first_retry_header = first_retry.next().ok_or("retry header missing")?;
@@ -271,7 +266,6 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
-        fixture.kernel.identity()?,
     )
     .resume(fixture.context, &cursor)?;
     assert_eq!(second_retry.next(), Some(first_retry_header));
@@ -283,7 +277,6 @@ fn resumable_delivery_matrix_preserves_page_bytes_and_cumulative_stats()
         fixture.kernel.ledger()?,
         1,
         fixture.clock.clone(),
-        fixture.kernel.identity()?,
     )
     .resume(fixture.context, &cursor)?
     .collect::<Vec<_>>();
@@ -544,7 +537,6 @@ fn aggregate_resume_reports_digest_work_failure_before_delivering_rows()
         1,
         fixture.clock.clone(),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let plan = service.plan_pipeline(
         fixture.context,
@@ -580,7 +572,6 @@ fn aggregate_resume_reports_digest_work_failure_before_delivering_rows()
         1,
         fixture.clock.clone(),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let plan = service.plan_pipeline(
         fixture.context,
@@ -607,7 +598,6 @@ fn post_digest_clock_failure_persists_physical_output_without_delivery()
         1,
         Arc::clone(&clock) as Arc<dyn positron_query::QueryClock>,
         Arc::new(super::support::ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let plan = service.plan_pipeline(
         fixture.context,
@@ -835,12 +825,7 @@ fn cursor_tampering_expiry_and_wrong_authority_fail_before_resume_work()
         "cursor-frontier-regression",
         &governance,
     )?;
-    let behind = super::support::zero_work_service(
-        empty.authority.governor(),
-        empty.ledger()?,
-        1,
-        empty.identity()?,
-    );
+    let behind = super::support::zero_work_service(empty.authority.governor(), empty.ledger()?, 1);
     assert_eq!(
         behind
             .resume(fixture.context, &fixture.cursor)
@@ -889,7 +874,6 @@ fn resume_clock_failure_is_reported_before_lease_reacquisition() -> Result<(), B
         fixture.kernel.ledger()?,
         1,
         std::sync::Arc::new(super::support::FailingClock),
-        fixture.kernel.identity()?,
     );
     assert_eq!(
         service
@@ -1282,7 +1266,6 @@ impl CursorFixture {
             kernel.ledger()?,
             1,
             clock.clone(),
-            kernel.identity()?,
         );
         let plan = service.plan_pipeline(
             context,
@@ -1310,7 +1293,6 @@ impl CursorFixture {
             self.kernel.ledger().expect("fixture ledger"),
             1,
             self.clock.clone(),
-            self.kernel.identity().expect("fixture identity"),
         )
     }
 }

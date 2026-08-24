@@ -277,7 +277,6 @@ pub fn zero_work_service<'kernel, 'catalog, 'ledger>(
     governor: positron_kernel::ResourceGovernor<'kernel>,
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
-    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -285,7 +284,6 @@ pub fn zero_work_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(0)),
-        identity,
     )
 }
 
@@ -294,7 +292,6 @@ pub fn zero_work_clock_service<'kernel, 'catalog, 'ledger>(
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
     clock: Arc<dyn positron_query::QueryClock>,
-    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -302,7 +299,6 @@ pub fn zero_work_clock_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         clock,
         Arc::new(ConstantWorkMeter(0)),
-        identity,
     )
 }
 
@@ -310,7 +306,6 @@ pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
     governor: positron_kernel::ResourceGovernor<'kernel>,
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
-    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -318,7 +313,6 @@ pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         TestClock::shared(100),
         Arc::new(ZeroScanWorkMeter),
-        identity,
     )
 }
 
@@ -327,7 +321,6 @@ pub fn stage_work_clock_service<'kernel, 'catalog, 'ledger>(
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     batch_limit: u16,
     clock: Arc<dyn positron_query::QueryClock>,
-    identity: positron_governance::Identity,
 ) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
     positron_query::QueryService::with_runtime(
         governor,
@@ -335,7 +328,6 @@ pub fn stage_work_clock_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         clock,
         Arc::new(ZeroScanWorkMeter),
-        identity,
     )
 }
 
@@ -623,12 +615,6 @@ impl KernelFixture {
         self.ledger
             .as_ref()
             .ok_or_else(|| "ledger unavailable".into())
-    }
-
-    pub fn identity(&self) -> Result<positron_governance::Identity, Box<dyn Error>> {
-        let snapshot = self.catalog.pin()?;
-        positron_governance::Identity::open(&snapshot)
-            .map_err(|_| "governance identity missing from fixture catalog".into())
     }
 
     pub fn publish_lifecycle_for_test(

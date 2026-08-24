@@ -52,7 +52,7 @@ pub(super) fn query_log_bodies(
         .map_err(|_| ServiceFailure::KeyUnavailable)?;
     let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
         .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
-    let service = QueryService::new(instance._authority.governor(), &ledger, 100, identity);
+    let service = QueryService::new(instance._authority.governor(), &ledger, 100);
     let query = service
         .plan_pipeline(context, source, budget)
         .map_err(|failure| map_query_failure(&failure))?;

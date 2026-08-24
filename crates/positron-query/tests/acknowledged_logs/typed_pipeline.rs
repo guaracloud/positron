@@ -24,7 +24,6 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = "pipeline:v1 logs | range query_time -100 100 | project query_time, commit_position | limit 1";
 
@@ -74,7 +73,6 @@ fn output_budget_failure_persists_emitted_size_work_without_logical_delivery()
         1,
         TestClock::shared(100),
         Arc::new(OutputOnlyWorkMeter),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -123,7 +121,6 @@ fn projection_preserves_query_time_and_optional_event_time_simultaneously()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -192,7 +189,6 @@ fn temporal_projection_preserves_provenance_quality_and_kernel_ingest_time()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -289,7 +285,6 @@ fn temporal_projection_preserves_provenance_quality_and_kernel_ingest_time()
         16,
         TestClock::shared(2_000_000_000),
         Arc::new(ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let grouped = grouping_service.plan_pipeline(
         fixture.context,
@@ -350,7 +345,6 @@ fn event_time_grouping_orders_missing_before_present_on_a_query_time_range()
         16,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -410,7 +404,6 @@ fn event_time_range_excludes_records_without_event_time() -> Result<(), Box<dyn 
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -458,7 +451,6 @@ fn event_time_ordering_uses_selected_axis_and_intrinsic_ties_in_both_directions(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -515,7 +507,6 @@ fn empty_string_body_equality_remains_distinct_from_a_missing_body() -> Result<(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -548,7 +539,6 @@ fn quoted_pipeline_literals_preserve_stage_delimiters_as_body_data() -> Result<(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -576,7 +566,6 @@ fn escaped_pipeline_literals_round_trip_quote_backslash_and_pipe() -> Result<(),
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -639,7 +628,6 @@ fn grouping_and_projection_preserve_every_native_body_kind_without_coercion()
         16,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -699,7 +687,6 @@ fn projection_preserves_missing_and_native_body_values() -> Result<(), Box<dyn E
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = "pipeline:v1 logs | range query_time -100 100 | project body | limit 3";
     let query = service.plan_pipeline(
@@ -810,7 +797,6 @@ fn typed_body_equality_accepts_every_native_literal_without_coercion() -> Result
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
 
     for ((literal, _), expected) in candidates.iter().zip(&expected) {
@@ -897,7 +883,6 @@ fn attribute_filters_and_projection_preserve_paths_occurrences_and_native_types(
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = concat!(
         "pipeline:v1 logs | range query_time 0 100 | ",
@@ -1115,7 +1100,6 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
         1,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let source = r#"pipeline:v1 logs | range query_time 0 100 | project record["x"] | limit 1"#;
     let exact_peak = 69_891_u64
@@ -1201,7 +1185,6 @@ fn attribute_grouping_keeps_missing_distinct_from_the_full_occurrence_set()
         16,
         TestClock::shared(2_000_000_000),
         Arc::new(ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -1247,7 +1230,6 @@ fn version_one_equality_rejects_untyped_literal_syntax() -> Result<(), Box<dyn E
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
 
     for literal in ["true", "7", "[1]", "float(1.0)"] {
@@ -1274,7 +1256,6 @@ fn version_one_rejects_malformed_or_noncanonical_typed_literals() -> Result<(), 
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
 
@@ -1341,7 +1322,6 @@ fn version_one_rejects_malformed_attribute_paths_and_selectors() -> Result<(), B
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
 
@@ -1398,7 +1378,6 @@ fn typed_count_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn Error>
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = "pipeline:v1 logs | range query_time -100 100 | aggregate count | limit 1";
 
@@ -1453,7 +1432,6 @@ fn result_header_preserves_both_total_order_directions() -> Result<(), Box<dyn E
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -1504,7 +1482,6 @@ fn grouped_schema_describes_native_keys_and_unsigned_counts() -> Result<(), Box<
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -1551,7 +1528,6 @@ fn batch_digest_binds_the_complete_typed_projection_and_repeats_stably()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 16, 1, 16, 1_048_576, 60)?;
 
@@ -1589,7 +1565,6 @@ fn batch_digest_streams_valid_bodies_larger_than_control_token_payloads()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = "pipeline:v1 logs | range query_time -100 100 | project body | limit 1";
     let execute = || -> Result<[u8; 32], Box<dyn Error>> {
@@ -1640,7 +1615,6 @@ fn same_time_records_in_one_block_have_a_stable_total_identity_across_reopen()
             fixture.kernel.authority.governor(),
             fixture.kernel.ledger()?,
             16,
-            fixture.kernel.identity()?,
         );
         let query = service.plan_pipeline(
             fixture.context,
@@ -1704,7 +1678,6 @@ fn default_total_order_charges_every_comparison_and_exhausts_explicitly()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = "logs | range query_time -100 100 | limit 2";
 
@@ -1765,7 +1738,6 @@ fn structurally_observed_filter_does_not_retain_a_proxy_work_charge() -> Result<
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         2,
-        fixture.kernel.identity()?,
     );
     let source = r#"pipeline:v1 logs | range query_time -100 100 | filter body == string("match") | limit 2"#;
 
@@ -1813,7 +1785,6 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         16,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
     let ordinary_peak = 1_996_u64
@@ -1887,7 +1858,6 @@ fn default_total_order_observes_cancellation_inside_sorting() -> Result<(), Box<
         16,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -1927,7 +1897,6 @@ fn cancellation_interrupts_substantial_default_sort_work() -> Result<(), Box<dyn
         16,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -1975,7 +1944,6 @@ fn versioned_pipeline_rejects_operator_combinations_it_cannot_execute() -> Resul
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     for source in [
@@ -2014,7 +1982,6 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
         16,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(0)),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -2110,7 +2077,6 @@ fn grouped_count_emits_deterministic_typed_intrinsic_rows() -> Result<(), Box<dy
         16,
         TestClock::shared(100),
         Arc::new(TestWorkMeter),
-        fixture.kernel.identity()?,
     );
     let work_exhausted = metered_service.plan_pipeline(
         fixture.context,
@@ -2186,7 +2152,6 @@ fn grouped_key_comparisons_consume_the_exact_cumulative_work_budget() -> Result<
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 2";
 
@@ -2239,7 +2204,6 @@ fn group_key_construction_charges_large_native_values_before_lookup() -> Result<
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -2281,7 +2245,6 @@ fn cancellation_is_polled_during_native_group_key_construction() -> Result<(), B
         16,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -2330,7 +2293,6 @@ fn deep_native_predicate_work_exhausts_before_any_result_prefix() -> Result<(), 
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let source = format!(
         "pipeline:v1 logs | range query_time -100 100 | filter body == {literal} | limit 1"
@@ -2373,7 +2335,6 @@ fn deep_native_body_projection_defers_recursive_work_to_output() -> Result<(), B
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -2413,7 +2374,6 @@ fn deep_native_output_and_digest_share_the_cumulative_cpu_budget() -> Result<(),
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -2454,7 +2414,6 @@ fn deep_native_digest_traversal_is_cumulatively_metered() -> Result<(), Box<dyn 
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let source = "pipeline:v1 logs | range query_time -100 100 | project body | limit 1";
     let query = service.plan_pipeline(
@@ -2518,7 +2477,6 @@ fn cancellation_interrupts_deep_native_digest_before_batch_delivery() -> Result<
         1,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let before = fixture
         .kernel
@@ -2599,7 +2557,6 @@ fn deep_attribute_path_projection_is_cumulatively_metered() -> Result<(), Box<dy
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let source = format!("pipeline:v1 logs | range query_time -100 100 | project {path} | limit 1");
     let query = service.plan_pipeline(
@@ -2676,7 +2633,6 @@ fn cancellation_interrupts_deep_attribute_projection_before_allocation_delivery(
         1,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let before = fixture
         .kernel
@@ -2755,7 +2711,6 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let budget =
         QueryBudget::new(1_048_576, 1, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?;
@@ -2861,7 +2816,6 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
         1,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let source = r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("absent") | limit 1"#;
     let exhausted = metered_service.plan_pipeline(
@@ -2909,7 +2863,6 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
         1,
         TestClock::shared(100),
         Arc::clone(&cancelling_meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let cancelled = cancelling_service.plan_pipeline(
         fixture.context,
@@ -2951,7 +2904,6 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     for (literal, expected_batch) in [("one", true), ("absent", false)] {
         let verified = verified_service.plan_pipeline(
@@ -3026,7 +2978,6 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let active_budget =
         QueryBudget::new(1_048_576, 3, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(128)?;
@@ -3082,7 +3033,6 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let reopened_fallback = fallback_reopened_service.plan_pipeline(
         fixture.context,
@@ -3122,7 +3072,6 @@ fn cancellation_interrupts_grouping_and_releases_query_resources() -> Result<(),
         8,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let before = fixture
         .kernel
@@ -3211,7 +3160,6 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -3238,7 +3186,6 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
             1,
             TestClock::shared(100),
             Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-            fixture.kernel.identity()?,
         );
         let query = service.plan_pipeline(
             fixture.context,
@@ -3279,7 +3226,6 @@ fn cancellation_after_scan_returns_one_terminal_without_output() -> Result<(), B
         1,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -3315,7 +3261,6 @@ fn operator_wall_budget_is_checked_before_output() -> Result<(), Box<dyn Error>>
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 100, 100, 100, 160]),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -3346,7 +3291,6 @@ fn post_digest_wall_expiry_never_claims_an_unqueued_batch() -> Result<(), Box<dy
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 100, 100, 100, 100, 100, 160]),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -3384,7 +3328,6 @@ fn versioned_pipeline_searches_body_text_without_matching_other_records()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
 
     let query = service.plan_pipeline(
@@ -3419,7 +3362,6 @@ fn body_search_memory_peak_includes_matcher_and_retained_rows() -> Result<(), Bo
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source = "pipeline:v1 logs | range query_time -100 100 | search body contains \"timed out\" | limit 1";
 
@@ -3478,7 +3420,6 @@ fn body_regex_memory_peak_includes_automaton_and_retained_rows() -> Result<(), B
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let source =
         r#"pipeline:v1 logs | range query_time -100 100 | search body =~ "timed.*out" | limit 1"#;
@@ -3530,7 +3471,6 @@ fn schema_backed_text_search_keeps_index_lookup_within_query_budget() -> Result<
         1,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(1)),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -3583,7 +3523,6 @@ fn schema_backed_regex_search_keeps_index_and_dfa_work_bounded() -> Result<(), B
         1,
         TestClock::shared(100),
         Arc::new(ConstantWorkMeter(1)),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -3635,7 +3574,6 @@ fn versioned_pipeline_regex_search_is_anchored_and_rejects_unbounded_patterns()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
 
@@ -3712,7 +3650,6 @@ fn body_search_polls_cancellation_during_matching() -> Result<(), Box<dyn Error>
         16,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,

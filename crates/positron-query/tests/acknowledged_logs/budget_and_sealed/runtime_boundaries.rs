@@ -21,7 +21,6 @@ fn clock_only_runtime_override_preserves_normal_query_execution() -> Result<(), 
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -46,7 +45,6 @@ fn output_wall_budget_is_checked_after_page_materialization() -> Result<(), Box<
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 100, 100, 100, 160]),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -99,7 +97,6 @@ fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<d
         1,
         std::sync::Arc::new(FailingClock),
         std::sync::Arc::new(TestWorkMeter),
-        fixture.identity()?,
     );
     assert_eq!(
         failure_code(service.plan_pipeline(
@@ -115,7 +112,6 @@ fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<d
         1,
         TestClock::shared(100),
         std::sync::Arc::new(FailingWorkMeter),
-        fixture.identity()?,
     );
     assert_eq!(
         failure_code(service.plan_pipeline(
@@ -131,7 +127,6 @@ fn runtime_meter_failures_and_clock_regression_fail_closed() -> Result<(), Box<d
         1,
         SequenceClock::shared([100, 99]),
         std::sync::Arc::new(TestWorkMeter),
-        fixture.identity()?,
     );
     assert_eq!(
         failure_code(service.plan_pipeline(
@@ -153,7 +148,6 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         1,
         SequenceClock::shared([100, 104]),
         std::sync::Arc::new(TestWorkMeter),
-        fixture.kernel.identity()?,
     );
     let wall_failure = failure(service.plan_pipeline(
         fixture.context,
@@ -172,7 +166,6 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         1,
         TestClock::shared(100),
         std::sync::Arc::new(ConstantWorkMeter(2)),
-        fixture.kernel.identity()?,
     );
     let cpu_failure = failure(service.plan_pipeline(
         fixture.context,
@@ -190,7 +183,6 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 99]),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -210,7 +202,6 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 160]),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -230,7 +221,6 @@ fn runtime_boundaries_fail_closed_before_or_between_query_stages() -> Result<(),
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 100, 100, 99]),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -254,7 +244,6 @@ fn planning_failures_identify_the_effective_budget_limit() -> Result<(), Box<dyn
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         1,
-        fixture.kernel.identity()?,
     );
     let output_rows = match service.plan_pipeline(
         fixture.context,
@@ -317,7 +306,6 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
             1,
             TestClock::shared(100),
             std::sync::Arc::new(FailingStageWorkMeter(stage)),
-            fixture.kernel.identity()?,
         );
         let planned = service.plan_pipeline(
             fixture.context,
@@ -341,7 +329,6 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
         std::sync::Arc::new(FailingStageWorkMeter(
             positron_query::QueryWorkStage::Operators,
         )),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -361,7 +348,6 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 100, 160]),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -381,7 +367,6 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
         fixture.kernel.ledger()?,
         1,
         SequenceClock::shared([100, 100, 100, 100, 100, 100, 160]),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -403,7 +388,6 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(200),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,

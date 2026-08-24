@@ -32,7 +32,6 @@ fn key_value_transforms_charge_candidate_and_canonical_capacity_at_exact_boundar
             fixture.kernel.authority.governor(),
             fixture.kernel.ledger()?,
             16,
-            fixture.kernel.identity()?,
         );
         let budget = |memory| {
             QueryBudget::new(1_048_576, 16, 16, 1_048_576, memory, 60)

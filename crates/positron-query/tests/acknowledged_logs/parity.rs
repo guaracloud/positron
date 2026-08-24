@@ -34,12 +34,8 @@ fn pipeline_and_sql_share_one_plan_and_read_acknowledged_active_logs() -> Result
     )?;
     fixture.append_log("acknowledged", 20, 1)?;
 
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        100,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     let pipeline = service.plan_pipeline(
         context,
@@ -106,12 +102,8 @@ fn pipeline_and_sql_require_the_same_explicit_bounded_temporal_range() -> Result
     fixture.append_log("inside", 20, 2)?;
     fixture.append_log("exclusive-end", 30, 3)?;
     fixture.append_log("outside", 40, 4)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        100,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     let pipeline =
         service.plan_pipeline(context, "logs | range event_time 10 30 | limit 16", budget)?;
@@ -194,12 +186,8 @@ fn sql_compiles_typed_projection_and_body_filter_to_the_pipeline_plan() -> Resul
         &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("keep", 20, 1)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
 
     let pipeline = service.plan_pipeline(
@@ -249,12 +237,8 @@ fn sql_compiles_search_and_grouped_count_to_the_same_typed_plan() -> Result<(), 
         "sql-operators-parity-kernel",
         &instance.governance_fixture_for_test()?,
     )?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
 
     let pipeline = service.plan_pipeline(
@@ -516,12 +500,8 @@ fn sql_rejects_mutation_joins_and_unbounded_or_ambiguous_forms() -> Result<(), B
         "sql-rejections-kernel",
         &instance.governance_fixture_for_test()?,
     )?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     for source in [
         "SELECT * FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
@@ -611,12 +591,8 @@ fn sql_body_expressions_preserve_bounded_transform_parity() -> Result<(), Box<dy
         "sql-transform-parity-kernel",
         &instance.governance_fixture_for_test()?,
     )?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60);
     let budget = budget?;
     for (pipeline, sql) in [
@@ -697,12 +673,8 @@ fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box
         &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("versioned", 20, 1)?;
-    let service = super::support::stage_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::stage_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | limit 1",
@@ -741,12 +713,8 @@ fn versioned_pipeline_filters_on_an_intrinsic_body_literal() -> Result<(), Box<d
     )?;
     fixture.append_log("keep", 20, 1)?;
     fixture.append_log("discard", 21, 2)?;
-    let service = super::support::stage_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::stage_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | limit 16",
@@ -788,12 +756,8 @@ fn versioned_pipeline_projects_bounded_intrinsic_columns() -> Result<(), Box<dyn
         &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("projected", 20, 1)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | project query_time, commit_position | limit 16",
@@ -841,12 +805,8 @@ fn versioned_pipeline_supports_bounded_exact_body_search() -> Result<(), Box<dyn
     )?;
     fixture.append_log("exact match", 20, 1)?;
     fixture.append_log("other", 21, 2)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | search body == \"exact match\" | limit 16",
@@ -903,12 +863,8 @@ fn versioned_pipeline_rejects_unimplemented_or_malformed_stages() -> Result<(), 
         "pipeline-rejections-kernel",
         &instance.governance_fixture_for_test()?,
     )?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
 
     for source in [
@@ -991,12 +947,8 @@ fn advanced_native_page_execution_stays_with_the_pagination_authority() -> Resul
         &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("bounded", 20, 1)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time 0 100 | filter body == \"bounded\" | limit 1",
@@ -1042,12 +994,8 @@ fn versioned_pipeline_counts_filtered_records_with_a_typed_aggregate() -> Result
     fixture.append_log("keep", 20, 1)?;
     fixture.append_log("keep", 21, 2)?;
     fixture.append_log("discard", 22, 3)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | filter body == \"keep\" | aggregate count | limit 1",
@@ -1097,12 +1045,8 @@ fn versioned_pipeline_orders_by_intrinsic_time_with_commit_tie_breaking()
     fixture.seal_and_reopen()?;
     fixture.append_log("earlier", 10, 2)?;
     fixture.append_log("same-time", 20, 3)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
         "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position asc | limit 16",
@@ -1145,12 +1089,8 @@ fn native_operator_work_consumes_the_cumulative_query_budget() -> Result<(), Box
         &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("keep", 20, 1)?;
-    let service = super::support::stage_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::stage_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget =
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(2)?;
     let query = service.plan_pipeline(

@@ -19,7 +19,6 @@ fn sequential_non_resumable_completion_reclaims_every_snapshot_lease() -> Result
         fixture.kernel.ledger()?,
         1,
         clock,
-        fixture.kernel.identity()?,
     );
     for _ in 0..65 {
         let query = service.plan_pipeline(
@@ -57,7 +56,6 @@ fn admission_and_snapshot_lease_remain_owned_until_stream_terminal_or_drop()
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let planned = service.plan_pipeline(
         fixture.context,
@@ -103,7 +101,6 @@ fn compiled_matcher_stream_drop_reclaims_its_single_query_admission() -> Result<
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let before = fixture.kernel.authority.governor().inspect()?;
     let query = service.plan_pipeline(
@@ -134,7 +131,6 @@ fn repeated_logical_plan_access_borrows_one_admitted_plan() -> Result<(), Box<dy
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -156,7 +152,6 @@ fn repeated_pre_stream_failures_release_admission_and_snapshot_leases() -> Resul
         fixture.kernel.ledger()?,
         1,
         PeriodicFailingClock::shared(),
-        fixture.kernel.identity()?,
     );
     for _ in 0..65 {
         let planned = service.plan_pipeline(
@@ -250,7 +245,6 @@ fn paged_drop_retains_only_after_a_resume_cursor_is_delivered() -> Result<(), Bo
         fixture.kernel.ledger()?,
         1,
         clock,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -285,7 +279,6 @@ fn paged_drop_before_header_delivery_reclaims_every_snapshot_lease() -> Result<(
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     for _ in 0..65 {
         let query = service.plan_pipeline(
@@ -306,7 +299,6 @@ fn observed_paged_completion_reclaims_every_snapshot_lease() -> Result<(), Box<d
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     for _ in 0..65 {
         let query = service.plan_pipeline(
@@ -332,7 +324,6 @@ fn paged_drop_after_batch_before_terminal_replays_the_same_batch() -> Result<(),
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -372,7 +363,6 @@ fn observed_paged_completion_makes_its_cursor_unavailable() -> Result<(), Box<dy
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -405,7 +395,6 @@ fn observed_paged_incomplete_is_terminal_and_not_resumable() -> Result<(), Box<d
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -445,7 +434,6 @@ fn cancellation_reports_only_delivered_batches_and_releases_idempotently()
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -530,7 +518,6 @@ fn retained_cancellation_handle_stops_result_delivery_with_delivered_only_truth(
         fixture.kernel.ledger()?,
         1,
         TestClock::shared(100),
-        fixture.kernel.identity()?,
     );
 
     let query = service.plan_pipeline(

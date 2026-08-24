@@ -242,7 +242,6 @@ fn default_cpu_budget_completes_one_normal_fitting_record() -> Result<(), Box<dy
         1,
         TestClock::shared(100),
         Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.identity()?,
     );
     let budget = QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?;
     let query = service.plan_pipeline(
@@ -282,12 +281,8 @@ fn finite_budget_exhaustion_is_one_typed_incomplete_terminal() -> Result<(), Box
         &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("larger-than-the-scan-budget", 20, 1)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        100,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 1",
@@ -351,7 +346,6 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         16,
         TestClock::shared(100),
         std::sync::Arc::new(super::support::ConstantWorkMeter(1)),
-        fixture.identity()?,
     );
     let query = service.plan_pipeline(
         context,
@@ -421,7 +415,6 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         16,
         TestClock::shared(2_000_000_000),
         std::sync::Arc::clone(&meter) as std::sync::Arc<dyn positron_query::QueryWorkMeter>,
-        fixture.identity()?,
     );
     let cancelling = cancelling_service.plan_pipeline(
         context,
@@ -474,7 +467,6 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
         16,
         clock,
         std::sync::Arc::new(TestWorkMeter),
-        fixture.identity()?,
     );
     let before = fixture.authority.governor().inspect()?;
     let planned = service.plan_pipeline(
@@ -503,7 +495,6 @@ fn wall_and_cpu_budgets_are_runtime_enforced_and_reserved_as_query_work()
         fixture.ledger()?,
         16,
         StepClock::shared(200),
-        fixture.identity()?,
     );
     let planned = wall_service.plan_pipeline(
         context,
@@ -546,7 +537,6 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
         fixture.ledger()?,
         1,
         clock.clone(),
-        fixture.identity()?,
     );
     let planned = service.plan_pipeline(
         context,
@@ -599,12 +589,8 @@ fn resume_uses_the_remaining_decoded_record_budget_before_scanning() -> Result<(
     )?;
     fixture.append_log("one", 20, 1)?;
     fixture.append_log("two", 21, 2)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        1,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 1);
     let planned = service.plan_pipeline(
         context,
         "logs | range query_time -100 100 | limit 2",
@@ -651,12 +637,8 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     fixture.append_log("sealed", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active", 21, 2)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        100,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let query = service.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
@@ -680,12 +662,8 @@ fn sealed_and_successor_active_logs_share_one_ordered_query_result() -> Result<(
     assert_eq!(first, ["sealed", "active"]);
 
     fixture.seal_and_reopen()?;
-    let restarted = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        100,
-        fixture.identity()?,
-    );
+    let restarted =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 100);
     let query = restarted.plan_sql(
         context,
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 2",
@@ -729,12 +707,8 @@ fn full_text_search_keeps_active_and_sealed_results_equivalent() -> Result<(), B
     fixture.append_log("sealed timeout", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("active timeout", 21, 2)?;
-    let service = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let service =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let source = "pipeline:v1 logs | range query_time -100 100 | search body contains \"timeout\" | limit 16";
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
     let first = service
@@ -755,12 +729,8 @@ fn full_text_search_keeps_active_and_sealed_results_equivalent() -> Result<(), B
     assert_eq!(first, ["sealed timeout", "active timeout"]);
 
     fixture.seal_and_reopen()?;
-    let restarted = super::support::zero_work_service(
-        fixture.authority.governor(),
-        fixture.ledger()?,
-        16,
-        fixture.identity()?,
-    );
+    let restarted =
+        super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let after_restart = restarted
         .execute(restarted.plan_pipeline(context, source, budget)?)?
         .filter_map(|event| match event {

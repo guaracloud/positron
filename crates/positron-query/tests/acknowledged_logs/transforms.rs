@@ -27,7 +27,6 @@ fn json_query_transform_decodes_bounded_native_object_without_mutating_source()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -73,7 +72,6 @@ fn json_transform_can_expand_a_source_body_within_the_memory_budget() -> Result<
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -100,7 +98,6 @@ fn logfmt_query_transform_decodes_quoted_and_typed_fields() -> Result<(), Box<dy
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,
@@ -145,7 +142,6 @@ fn transforms_preserve_unicode_and_allow_trailing_logfmt_whitespace() -> Result<
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let json = service.plan_pipeline(
         fixture.context,
@@ -193,7 +189,6 @@ fn transforms_preserve_unicode_and_allow_trailing_logfmt_whitespace() -> Result<
         logfmt_fixture.kernel.authority.governor(),
         logfmt_fixture.kernel.ledger()?,
         16,
-        logfmt_fixture.kernel.identity()?,
     );
     let logfmt = logfmt_service.plan_pipeline(
         logfmt_fixture.context,
@@ -234,7 +229,6 @@ fn explicit_cast_changes_only_the_query_value_and_reports_cast_failure()
         fixture.kernel.authority.governor(),
         fixture.kernel.ledger()?,
         16,
-        fixture.kernel.identity()?,
     );
     let query = service.plan_pipeline(
         fixture.context,

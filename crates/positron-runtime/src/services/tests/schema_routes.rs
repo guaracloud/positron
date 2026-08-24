@@ -93,12 +93,7 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
     let scope = SegmentScope::new(initialized.tenant, SignalKind::Logs, initialized.logs_shard);
     let protection = initialized.key.segment_key(initialized.instance, scope)?;
     let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)?;
-    let query_service = QueryService::new(
-        initialized.resource_governor(),
-        &ledger,
-        100,
-        initialized.identity.clone(),
-    );
+    let query_service = QueryService::new(initialized.resource_governor(), &ledger, 100);
     let context = initialized.attribute(
         PresentedCredential::parse(&query_secret)?,
         RequestedIntent::Query,
@@ -162,12 +157,7 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         super::super::failure::collect_query_bodies(header_after_terminal),
         Err(ServiceFailure::Internal)
     );
-    let paged_service = QueryService::new(
-        initialized.resource_governor(),
-        &ledger,
-        1,
-        initialized.identity.clone(),
-    );
+    let paged_service = QueryService::new(initialized.resource_governor(), &ledger, 1);
     let paged = paged_service.plan_pipeline(
         context,
         source,
@@ -365,12 +355,7 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             RequestedIntent::Query,
             CompatibilityHints::none(),
         )?;
-        let service = QueryService::new(
-            initialized.resource_governor(),
-            &ledger,
-            1,
-            initialized.identity.clone(),
-        );
+        let service = QueryService::new(initialized.resource_governor(), &ledger, 1);
         let query = service
             .plan_pipeline(
                 context,
@@ -439,7 +424,6 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
         );
 
         let reopened_catalog = open_catalog(&initialized)?;
-        let reopened_identity = positron_governance::Identity::open(&reopened_catalog.pin()?)?;
         let reopened_protection = initialized.key.segment_key(initialized.instance, scope)?;
         let reopened_ledger = ActiveSegmentLedger::open(
             &initialized._authority,
@@ -447,12 +431,8 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             scope,
             reopened_protection,
         )?;
-        let resumed_service = QueryService::new(
-            initialized.resource_governor(),
-            &reopened_ledger,
-            1,
-            reopened_identity,
-        );
+        let resumed_service =
+            QueryService::new(initialized.resource_governor(), &reopened_ledger, 1);
         let before = initialized
             .resource_governor()
             .inspect()?
