@@ -3,7 +3,8 @@ use positron_kernel::{CatalogFailureCode, LedgerFailureCode};
 use positron_query::QueryFailureCode;
 
 use super::{
-    ServiceFailure, map_admission_group_plan_failure, map_query_failure_code, map_receive_failure,
+    ServiceFailure, classify_bootstrap_failure_code, map_admission_group_plan_failure,
+    map_query_failure_code, map_receive_failure,
 };
 
 mod schema_maintenance;
@@ -65,6 +66,66 @@ fn cancellation_is_not_reclassified_as_a_storage_failure() {
         ServiceFailure::Cancelled.bootstrap_code(),
         crate::BootstrapFailureCode::ResourceUnavailable
     );
+}
+
+#[test]
+fn bootstrap_failures_use_an_exhaustive_service_classification_table() {
+    for (code, expected) in [
+        (
+            crate::BootstrapFailureCode::InvalidRoots,
+            ServiceFailure::Internal,
+        ),
+        (
+            crate::BootstrapFailureCode::InconsistentRoots,
+            ServiceFailure::Internal,
+        ),
+        (
+            crate::BootstrapFailureCode::AlreadyInitialized,
+            ServiceFailure::Internal,
+        ),
+        (
+            crate::BootstrapFailureCode::StorageUnavailable,
+            ServiceFailure::StorageUnavailable,
+        ),
+        (
+            crate::BootstrapFailureCode::KeyCustodyUnavailable,
+            ServiceFailure::KeyUnavailable,
+        ),
+        (
+            crate::BootstrapFailureCode::ResourceUnavailable,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            crate::BootstrapFailureCode::CatalogUnavailable,
+            ServiceFailure::StorageUnavailable,
+        ),
+        (
+            crate::BootstrapFailureCode::LedgerUnavailable,
+            ServiceFailure::Internal,
+        ),
+        (
+            crate::BootstrapFailureCode::CorruptState,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            crate::BootstrapFailureCode::IdentityMismatch,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            crate::BootstrapFailureCode::ClaimUnavailable,
+            ServiceFailure::Internal,
+        ),
+        (
+            crate::BootstrapFailureCode::ClaimDestructionFailed,
+            ServiceFailure::Internal,
+        ),
+        (
+            crate::BootstrapFailureCode::EntropyUnavailable,
+            ServiceFailure::Internal,
+        ),
+    ] {
+        assert_eq!(classify_bootstrap_failure_code(code), expected, "{code:?}");
+    }
 }
 
 #[test]
@@ -291,6 +352,10 @@ fn query_setup_failures_use_one_catalog_and_ledger_classification_table() {
         (
             LedgerFailureCode::SnapshotExpired,
             ServiceFailure::CatalogUnavailable,
+        ),
+        (
+            LedgerFailureCode::StaleResumeMarker,
+            ServiceFailure::InvalidRequest,
         ),
         (LedgerFailureCode::Cancelled, ServiceFailure::Cancelled),
     ] {

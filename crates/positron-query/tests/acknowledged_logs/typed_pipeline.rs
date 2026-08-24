@@ -9,7 +9,8 @@ use positron_query::{
 
 use super::support::{
     BlockingOperatorWorkMeter, CancellingOperatorCallMeter, CancellingStageWorkMeter,
-    ConstantWorkMeter, SequenceClock, StageCountingWorkMeter, TestClock, TestWorkMeter,
+    ConstantWorkMeter, OutputOnlyWorkMeter, SequenceClock, StageCountingWorkMeter, TestClock,
+    TestWorkMeter,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -58,6 +59,43 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
                 && incomplete.stats().output_bytes() == 0
                 && incomplete.stats().limiting_budget()
                     == Some(positron_query::QueryBudgetDimension::OutputBytes)
+    ));
+    Ok(())
+}
+
+#[test]
+fn output_budget_failure_persists_emitted_size_work_without_logical_delivery()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("output-budget-physical-attempt")?;
+    fixture.kernel.append_log("body", 20, 1)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(OutputOnlyWorkMeter),
+        fixture.kernel.identity()?,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1, 1_048_576, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::OutputBytes)
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().cpu_work_units() > 0
     ));
     Ok(())
 }

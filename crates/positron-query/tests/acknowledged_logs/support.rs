@@ -123,6 +123,8 @@ pub struct FailAfterArmOutputMeter {
     fail_after: u64,
 }
 
+pub struct OutputOnlyWorkMeter;
+
 impl FailAfterArmOutputMeter {
     pub fn shared(fail_after: u64) -> Arc<Self> {
         Arc::new(Self {
@@ -150,6 +152,15 @@ impl positron_query::QueryWorkMeter for FailAfterArmOutputMeter {
         } else {
             Ok(0)
         }
+    }
+}
+
+impl positron_query::QueryWorkMeter for OutputOnlyWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(u64::from(stage == positron_query::QueryWorkStage::Output))
     }
 }
 

@@ -4,16 +4,12 @@ use super::predicates::scan_predicates;
 use super::resources::ExecutionResources;
 use super::results::{find_resume_index, materialize_page, resume_key_for_page};
 use crate::cursor::{self, CursorState};
-use crate::execution_state::{
-    commit_position, stats_before_current, stats_with_current, sync_cursor_counters,
-};
+use crate::execution_state::{stats_before_current, stats_with_current, sync_cursor_counters};
 use crate::execution_support::{
     BatchDigestInput, QueryScanObserver, batch_digest, charge_output, charge_scan, limiting_budget,
+    preserve_output_attempt,
 };
-use crate::{
-    QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryService, QueryStream,
-    QueryTerminal,
-};
+use crate::{QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryService, QueryStream};
 use positron_kernel::LedgerSnapshot;
 use positron_signals::ScanLimit;
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
@@ -42,7 +38,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-        let frontier = match commit_position(state.frontier) {
+        let frontier = match crate::execution_state::commit_position(state.frontier) {
             Ok(frontier) => frontier,
             Err(failure) => return Err(resources.fail_before_stream(self.ledger, failure)),
         };
@@ -269,16 +265,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if let Err(failure) =
             charge_output(self, &mut output_state, &page, &state.cancellation, true)
         {
-            state.physical_cpu_work_units = output_state.physical_cpu_work_units;
+            preserve_output_attempt(&mut state, &output_state);
             return self.failed_page(Some(header), failure, &state, delivered_before, resources);
         }
         if let Some(dimension) = limiting_budget(&output_state) {
-            return self.failed_page_with_stats(
+            preserve_output_attempt(&mut state, &output_state);
+            return self.failed_page(
                 Some(header),
                 QueryFailure::budget_exhausted(dimension),
                 &state,
                 delivered_before,
-                before_batch,
                 resources,
             );
         }
@@ -287,7 +283,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state = output_state;
             let stats = stats_before_current(&state);
             return self.stream(
-                vec![header, QueryEvent::Terminal(QueryTerminal::Complete(stats))],
+                vec![
+                    header,
+                    QueryEvent::Terminal(crate::QueryTerminal::Complete(stats)),
+                ],
                 &state,
                 pagination,
                 delivered_before,
@@ -381,11 +380,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             sync_cursor_counters(&mut state);
             let cursor =
                 framed_batch!(cursor::encode(&self.ledger.control_tokens(), state.clone(),));
-            QueryTerminal::Continued(cursor)
+            crate::QueryTerminal::Continued(cursor)
         } else {
             state.resume_key = resume_key;
             state.prior_digest = digest;
-            QueryTerminal::Complete(stats_with_current(&state))
+            crate::QueryTerminal::Complete(stats_with_current(&state))
         };
         self.stream(
             vec![header, batch, QueryEvent::Terminal(terminal)],

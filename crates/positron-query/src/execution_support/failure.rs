@@ -25,6 +25,7 @@ const fn map_ledger_failure_code(code: positron_kernel::LedgerFailureCode) -> Qu
             QueryFailureCode::MalformedPersistentData
         },
         positron_kernel::LedgerFailureCode::SnapshotExpired => QueryFailureCode::SnapshotExpired,
+        positron_kernel::LedgerFailureCode::StaleResumeMarker => QueryFailureCode::InvalidCursor,
         positron_kernel::LedgerFailureCode::LimitExceeded => QueryFailureCode::InvalidBudget,
         positron_kernel::LedgerFailureCode::ResourceAdmissionRefused => {
             QueryFailureCode::ResourceAdmissionRefused
@@ -139,6 +140,10 @@ mod tests {
             (
                 positron_kernel::LedgerFailureCode::RecoveryRequired,
                 QueryFailureCode::MalformedPersistentData,
+            ),
+            (
+                positron_kernel::LedgerFailureCode::StaleResumeMarker,
+                QueryFailureCode::InvalidCursor,
             ),
             (
                 positron_kernel::LedgerFailureCode::Cancelled,

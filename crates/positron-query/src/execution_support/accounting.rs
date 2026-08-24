@@ -82,6 +82,12 @@ pub(crate) fn charge_output(
     Ok(())
 }
 
+pub(crate) fn preserve_output_attempt(state: &mut CursorState, output_state: &CursorState) {
+    state.physical_output_rows = output_state.physical_output_rows;
+    state.physical_output_bytes = output_state.physical_output_bytes;
+    state.physical_cpu_work_units = output_state.physical_cpu_work_units;
+}
+
 fn record_emitted_size_bytes(
     record: &QueryRecord,
     observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,

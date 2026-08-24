@@ -59,6 +59,26 @@ pub(super) const fn classify_catalog_failure_code(code: CatalogFailureCode) -> S
     }
 }
 
+pub(super) const fn classify_bootstrap_failure_code(
+    code: crate::BootstrapFailureCode,
+) -> ServiceFailure {
+    match code {
+        crate::BootstrapFailureCode::KeyCustodyUnavailable => ServiceFailure::KeyUnavailable,
+        crate::BootstrapFailureCode::ResourceUnavailable => ServiceFailure::CapacityUnavailable,
+        crate::BootstrapFailureCode::CorruptState
+        | crate::BootstrapFailureCode::IdentityMismatch => ServiceFailure::CorruptState,
+        crate::BootstrapFailureCode::StorageUnavailable
+        | crate::BootstrapFailureCode::CatalogUnavailable => ServiceFailure::StorageUnavailable,
+        crate::BootstrapFailureCode::InvalidRoots
+        | crate::BootstrapFailureCode::InconsistentRoots
+        | crate::BootstrapFailureCode::AlreadyInitialized
+        | crate::BootstrapFailureCode::LedgerUnavailable
+        | crate::BootstrapFailureCode::ClaimUnavailable
+        | crate::BootstrapFailureCode::ClaimDestructionFailed
+        | crate::BootstrapFailureCode::EntropyUnavailable => ServiceFailure::Internal,
+    }
+}
+
 pub(super) const fn classify_ledger_failure_code(code: LedgerFailureCode) -> ServiceFailure {
     match code {
         LedgerFailureCode::ResourceAdmissionRefused
@@ -75,6 +95,7 @@ pub(super) const fn classify_ledger_failure_code(code: LedgerFailureCode) -> Ser
         | LedgerFailureCode::ConcurrentWriter
         | LedgerFailureCode::IdempotencyConflict
         | LedgerFailureCode::SnapshotExpired => ServiceFailure::CatalogUnavailable,
+        LedgerFailureCode::StaleResumeMarker => ServiceFailure::InvalidRequest,
         LedgerFailureCode::Cancelled => ServiceFailure::Cancelled,
     }
 }

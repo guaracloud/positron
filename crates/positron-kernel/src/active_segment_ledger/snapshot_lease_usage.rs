@@ -4,9 +4,22 @@ use super::capacity::lease_claim;
 use super::snapshot_lease::{map_catalog_failure, publish_many, records, rollback_marker_resize};
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_record::{
-    LeaseResumeMarker, SnapshotLeaseId, SnapshotLeaseUsage, validate_active_lease,
+    LeaseRecord, LeaseResumeMarker, SnapshotLeaseId, SnapshotLeaseUsage, validate_active_lease,
 };
 use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
+
+fn cache_marker(state: &mut super::state::LedgerState<'_>, record: &LeaseRecord) {
+    state.lease_resume_markers.insert(
+        record.identity,
+        LeaseResumeMarker {
+            sequence: record.last_resume_sequence.unwrap_or_default(),
+            prior_digest: record.last_resume_prior_digest,
+            attempts: record.resume_count,
+            repeats: record.repeated_batch_count,
+            usage: record.usage,
+        },
+    );
+}
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     /// Returns the physical work charged to an active lease.
@@ -83,6 +96,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let mut updated = record.clone();
         updated.usage = usage;
         let encoded = encode(&updated)?;
+        let expected_encoded = encoded.clone();
         let amounts = lease_claim(encoded.len())?;
         let previous_amounts = {
             let reservation = state
@@ -103,21 +117,69 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             &BTreeSet::from([identity]),
             vec![encoded],
         ) {
-            if failure.completion_state() != super::LedgerCompletionState::CommitAmbiguous {
-                rollback_marker_resize(&mut state, identity, previous_amounts)?;
+            if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
+                return self.reconcile_ambiguous_usage(
+                    &mut state,
+                    identity,
+                    &record,
+                    &updated,
+                    &expected_encoded,
+                    previous_amounts,
+                );
             }
+            rollback_marker_resize(&mut state, identity, previous_amounts)?;
             return Err(failure);
         }
-        state.lease_resume_markers.insert(
-            identity,
-            LeaseResumeMarker {
-                sequence: updated.last_resume_sequence.unwrap_or_default(),
-                prior_digest: updated.last_resume_prior_digest,
-                attempts: updated.resume_count,
-                repeats: updated.repeated_batch_count,
-                usage,
-            },
-        );
+        cache_marker(&mut state, &updated);
         Ok(usage)
+    }
+
+    pub(super) fn reconcile_ambiguous_usage(
+        &self,
+        state: &mut super::state::LedgerState<'_>,
+        identity: SnapshotLeaseId,
+        previous: &LeaseRecord,
+        expected: &LeaseRecord,
+        expected_encoded: &[u8],
+        previous_amounts: crate::ResourceAmounts,
+    ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
+        let observed = self
+            .catalog
+            .refresh_state()
+            .ok()
+            .and_then(|()| self.catalog.pin().ok())
+            .and_then(|snapshot| {
+                snapshot.plaintext_objects().find_map(|bytes| {
+                    let record = super::snapshot_lease_codec::decode(bytes).ok().flatten()?;
+                    (record.identity == identity && record.scope == self.scope).then_some(record)
+                })
+            });
+
+        if let Some(record) = observed.as_ref() {
+            if record.usage == expected.usage
+                && super::snapshot_lease_codec::encode(record)
+                    .ok()
+                    .is_some_and(|encoded| encoded == expected_encoded)
+            {
+                cache_marker(state, record);
+                return Ok(record.usage);
+            }
+            if record.usage == previous.usage {
+                cache_marker(state, record);
+                rollback_marker_resize(state, identity, previous_amounts)?;
+                return Err(LedgerFailure::ambiguous(
+                    LedgerFailureCode::StorageUnavailable,
+                ));
+            }
+        }
+
+        // The durable outcome cannot be proven. Drop the in-memory marker so a
+        // bounded refresh on the next attempt cannot turn an ambiguous write
+        // into a false integrity failure. Keep the enlarged reservation until
+        // that retry reconciles the durable record.
+        state.lease_resume_markers.remove(&identity);
+        Err(LedgerFailure::ambiguous(
+            LedgerFailureCode::StorageUnavailable,
+        ))
     }
 }

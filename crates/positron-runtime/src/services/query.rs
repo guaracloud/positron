@@ -3,8 +3,8 @@ use positron_kernel::{ActiveSegmentLedger, Catalog, SegmentScope};
 use positron_query::{QueryBudget, QueryService};
 
 use super::{
-    ServiceFailure, ServiceHandle, classify_catalog_failure_code, classify_ledger_failure_code,
-    collect_query_bodies, map_query_failure, schema_bootstrap,
+    ServiceFailure, ServiceHandle, classify_bootstrap_failure_code, classify_catalog_failure_code,
+    classify_ledger_failure_code, collect_query_bodies, map_query_failure, schema_bootstrap,
 };
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 
@@ -18,15 +18,7 @@ pub(super) fn query_log_bodies(
     let instance = &services.instance;
     let initial_identity = instance
         .durable_identity()
-        .map_err(|failure| match failure.code() {
-            crate::BootstrapFailureCode::KeyCustodyUnavailable => ServiceFailure::KeyUnavailable,
-            crate::BootstrapFailureCode::ResourceUnavailable => ServiceFailure::CapacityUnavailable,
-            crate::BootstrapFailureCode::CorruptState
-            | crate::BootstrapFailureCode::IdentityMismatch => ServiceFailure::CorruptState,
-            crate::BootstrapFailureCode::StorageUnavailable
-            | crate::BootstrapFailureCode::CatalogUnavailable => ServiceFailure::StorageUnavailable,
-            _ => ServiceFailure::Internal,
-        })?;
+        .map_err(|failure| classify_bootstrap_failure_code(failure.code()))?;
     let context = initial_identity
         .attribute(
             &instance.key,

@@ -190,7 +190,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 && (sequence < previous.sequence
                     || (sequence == previous.sequence && prior_digest != previous.prior_digest))
             {
-                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleResumeMarker));
             }
             let repeated = previous.attempts > 0
                 && previous.sequence == sequence

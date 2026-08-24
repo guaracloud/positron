@@ -728,6 +728,46 @@ fn marked_snapshot_lease_persists_ambiguous_resume_counts_across_restart()
 }
 
 #[test]
+fn stale_resume_markers_are_invalid_cursor_failures() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        ledger.resume_snapshot_lease_with_marker(identity, 101, 2, [9; 32])?;
+
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease_with_marker(identity, 102, 1, [9; 32])
+                .expect_err("a cursor behind the durable boundary must be rejected")
+                .code(),
+            LedgerFailureCode::StaleResumeMarker
+        );
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease_with_marker(identity, 103, 2, [8; 32])
+                .expect_err("a conflicting cursor at the durable boundary must be rejected")
+                .code(),
+            LedgerFailureCode::StaleResumeMarker
+        );
+        let mut state = ledger.state.lock().map_err(|_| "ledger state")?;
+        state
+            .lease_resume_markers
+            .get_mut(&identity)
+            .ok_or("resume marker")?
+            .usage = SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0);
+        drop(state);
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease_with_marker(identity, 104, 2, [9; 32])
+                .expect_err("inconsistent durable and cached usage must fail closed")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn marked_snapshot_lease_reserves_its_added_persistent_metadata() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
@@ -888,6 +928,24 @@ fn snapshot_lease_usage_failures_are_typed_and_publication_is_retryable()
                 .code(),
             LedgerFailureCode::SnapshotExpired
         );
+        drop(ledger);
+        let ledger = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )?;
+        assert_eq!(
+            ledger
+                .record_snapshot_lease_usage(
+                    identity,
+                    SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+                )
+                .expect_err("usage writes must reject an expired lease")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
 
         let live = ledger.create_snapshot_lease(102, 200)?.identity();
         let zero = ledger.record_snapshot_lease_usage(live, SnapshotLeaseUsage::default())?;
@@ -901,6 +959,122 @@ fn snapshot_lease_usage_failures_are_typed_and_publication_is_retryable()
             .record_snapshot_lease_usage(live, SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7))?;
         assert_eq!(usage.scanned_bytes(), 1);
         assert_eq!(usage.memory_peak_bytes(), 7);
+
+        let reconciled =
+            with_catalog_fault(CatalogFileEvent::SynchronizeGenerationDirectory, || {
+                ledger
+                    .record_snapshot_lease_usage(live, SnapshotLeaseUsage::new(1, 1, 1, 1, 1, 1, 1))
+            })?;
+        assert_eq!(reconciled.scanned_bytes(), 2);
+        assert_eq!(ledger.snapshot_lease_usage(live, 103)?, reconciled);
+        drop(ledger);
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(104),
+        )?;
+        assert_eq!(reopened.snapshot_lease_usage(live, 104)?, reconciled);
+        Ok(())
+    })
+}
+
+#[test]
+fn ambiguous_usage_reconciliation_preserves_new_old_and_unknown_truth() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let basis = catalog.pin()?;
+        let previous = super::super::super::snapshot_lease::records(&basis)?
+            .into_iter()
+            .find(|record| record.identity == identity)
+            .ok_or("lease record")?;
+        let mut expected = previous.clone();
+        expected.usage = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+        let expected_encoded = super::super::super::snapshot_lease_codec::encode(&expected)?;
+
+        let mut state = ledger.state.lock().map_err(|_| "ledger state")?;
+        let previous_amounts = state
+            .lease_reservations
+            .get(&identity)
+            .ok_or("lease reservation")?
+            .granted();
+        let old = ledger
+            .reconcile_ambiguous_usage(
+                &mut state,
+                identity,
+                &previous,
+                &expected,
+                &expected_encoded,
+                previous_amounts,
+            )
+            .expect_err("old durable usage must remain retryable");
+        assert_eq!(old.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            old.completion_state(),
+            crate::LedgerCompletionState::CommitAmbiguous
+        );
+
+        let usage = SnapshotLeaseUsage::new(3, 0, 0, 0, 0, 0, 0);
+        drop(state);
+        ledger.record_snapshot_lease_usage(identity, usage)?;
+        let basis = catalog.pin()?;
+        let applied = super::super::super::snapshot_lease::records(&basis)?
+            .into_iter()
+            .find(|record| record.identity == identity)
+            .ok_or("updated lease record")?;
+        let expected_encoded = super::super::super::snapshot_lease_codec::encode(&applied)?;
+        let mut state = ledger.state.lock().map_err(|_| "ledger state")?;
+        let result = ledger.reconcile_ambiguous_usage(
+            &mut state,
+            identity,
+            &previous,
+            &applied,
+            &expected_encoded,
+            previous_amounts,
+        )?;
+        assert_eq!(result, applied.usage);
+
+        let mut tampered_encoding = expected_encoded.clone();
+        let first = tampered_encoding
+            .first_mut()
+            .ok_or("encoded lease record")?;
+        *first ^= 1;
+        let tampered = ledger
+            .reconcile_ambiguous_usage(
+                &mut state,
+                identity,
+                &previous,
+                &applied,
+                &tampered_encoding,
+                previous_amounts,
+            )
+            .expect_err("matching usage with a mismatched authenticated encoding is ambiguous");
+        assert_eq!(tampered.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            tampered.completion_state(),
+            crate::LedgerCompletionState::CommitAmbiguous
+        );
+
+        let unknown_identity = crate::SnapshotLeaseId::new([0x77; 16])?;
+        let unknown = ledger
+            .reconcile_ambiguous_usage(
+                &mut state,
+                unknown_identity,
+                &previous,
+                &expected,
+                &expected_encoded,
+                previous_amounts,
+            )
+            .expect_err("an unverifiable durable outcome must remain ambiguous");
+        assert_eq!(unknown.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            unknown.completion_state(),
+            crate::LedgerCompletionState::CommitAmbiguous
+        );
         Ok(())
     })
 }

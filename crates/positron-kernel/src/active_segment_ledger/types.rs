@@ -321,8 +321,8 @@ pub enum LedgerFailureCode {
     RecoveryRequired,
     Cancelled,
     SnapshotExpired,
+    StaleResumeMarker,
 }
-
 /// Whether the failed call is safe to retry in place or requires recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LedgerCompletionState {
