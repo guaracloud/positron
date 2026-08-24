@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+
+use super::super::super::snapshot_lease::publication_visible;
 use super::*;
 use crate::{OrdinaryPool, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 
@@ -167,6 +170,73 @@ fn snapshot_lease_creation_prunes_expired_capacity_without_releasing_active_leas
             ledger.resume_snapshot_lease(active, 166)?.identity(),
             active
         );
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_resume_fails_closed_on_bad_durable_shapes() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xe1, |bytes| bytes[113] ^= 1)?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("a mismatched durable block identity must fail closed")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })?;
+
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xe2, |bytes| {
+            bytes[87..95].copy_from_slice(&u64::MAX.to_be_bytes());
+        })?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("a frontier beyond the live ledger must fail closed")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn publication_reconciliation_rejects_malformed_durable_lease_objects() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xe3, append_lease_trailing_byte)?;
+        let snapshot = catalog.pin()?;
+        assert!(!publication_visible(
+            &snapshot,
+            &BTreeSet::from([identity]),
+            &[],
+        ));
         Ok(())
     })
 }

@@ -496,7 +496,7 @@ pub(super) fn publish_many(
     }
 }
 
-fn publication_visible(
+pub(super) fn publication_visible(
     snapshot: &crate::CatalogSnapshot,
     remove: &BTreeSet<SnapshotLeaseId>,
     additions: &[Vec<u8>],
