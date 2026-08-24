@@ -172,6 +172,70 @@ fn snapshot_lease_creation_prunes_expired_capacity_without_releasing_active_leas
 }
 
 #[test]
+fn expired_markers_are_bounded_across_repeated_expiry_and_reopen() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let baseline = authority.governor().inspect()?;
+
+        for now in 100..=160 {
+            let identity = ledger.create_snapshot_lease(now, now + 1)?.identity();
+            ledger.resume_snapshot_lease_with_marker(identity, now, 1, [now as u8; 32])?;
+            assert_eq!(ledger.snapshot_lease_marker_count_for_test(), 1);
+            if now < 160 {
+                let next = ledger.create_snapshot_lease(now + 1, now + 2)?.identity();
+                assert_ne!(next, identity);
+                assert_eq!(ledger.snapshot_lease_marker_count_for_test(), 0);
+                ledger.release_snapshot_lease(next)?;
+            }
+        }
+
+        let expired = ledger
+            .resume_snapshot_lease(crate::SnapshotLeaseId::new([0x01; 16])?, 161)
+            .expect_err("the synthetic identity is not a durable lease");
+        assert_eq!(expired.code(), LedgerFailureCode::SnapshotExpired);
+        assert_eq!(ledger.snapshot_lease_marker_count_for_test(), 0);
+        assert_eq!(
+            catalog
+                .pin()?
+                .plaintext_objects()
+                .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            authority.governor().inspect()?.outstanding_total(),
+            baseline.outstanding_total()
+        );
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(
+                authority.governor().inspect()?.usage(dimension),
+                baseline.usage(dimension)
+            );
+        }
+
+        drop(ledger);
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(161),
+        )?;
+        assert_eq!(
+            catalog
+                .pin()?
+                .plaintext_objects()
+                .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                .count(),
+            0
+        );
+        drop(reopened);
+        Ok(())
+    })
+}
+
+#[test]
 fn refused_snapshot_capacity_never_publishes_or_retains_a_lease() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let ledger = ActiveSegmentLedger::open(
@@ -587,6 +651,40 @@ fn marked_snapshot_lease_publication_failure_rolls_back_capacity_resize()
                 .resume_count(),
             1
         );
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_snapshot_lease_post_rename_sync_reconciles_before_retry_and_reopen()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let first = with_catalog_fault(CatalogFileEvent::SynchronizeGenerationDirectory, || {
+            ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])
+        })
+        .expect("a visible marker must reconcile as a successful publication");
+        assert_eq!(first.resume_count(), 1);
+        drop(first);
+
+        let retry = ledger.resume_snapshot_lease_with_marker(identity, 102, 1, [9; 32])?;
+        assert_eq!(retry.resume_count(), 2);
+        assert_eq!(retry.repeated_batch_count(), 1);
+        drop(retry);
+        drop(ledger);
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(103),
+        )?;
+        let restarted = reopened.resume_snapshot_lease_with_marker(identity, 103, 1, [9; 32])?;
+        assert_eq!(restarted.resume_count(), 3);
+        assert_eq!(restarted.repeated_batch_count(), 2);
         Ok(())
     })
 }

@@ -16,7 +16,7 @@ use positron_query::{
 use prost::Message;
 
 use super::schema_maintenance::{Fixture, open_catalog, request};
-use crate::services::{ReceiverTestBackend, ServiceHandle};
+use crate::services::{ReceiverTestBackend, ServiceFailure, ServiceHandle};
 
 #[test]
 fn real_otlp_and_loki_routes_share_one_live_schema_session() -> Result<(), Box<dyn Error>> {
@@ -218,9 +218,27 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
                 "{state} ingest authorization must fail closed"
             );
         }
+        assert!(
+            matches!(
+                services.authorize_logs(&ingest),
+                Err(ServiceFailure::StorageUnavailable)
+            ),
+            "{state} catalog contention must not be reported as Unauthorized"
+        );
         drop(service);
         drop(ledger);
         drop(catalog);
+        let fresh_query = services.query_log_bodies(
+            &query_secret,
+            "logs | range query_time 0 100 | limit 2",
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
+                .with_cpu_work_units(16)?,
+        );
+        if code <= 2 {
+            assert_eq!(fresh_query?, ["first", "second"], "{state} fresh query");
+        } else {
+            assert!(fresh_query.is_err(), "{state} fresh query must fail closed");
+        }
         let durable_identity = initialized.durable_identity()?;
         let durable_ingest = durable_identity.attribute(
             &initialized.key,

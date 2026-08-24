@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
-    BootstrapKeyCustody, Catalog, InstanceBootstrapStorage, InstanceId, MountQualification,
-    OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
+    BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
+    MountQualification, OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
 #[cfg(feature = "test-support")]
 use positron_kernel::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
@@ -249,13 +249,31 @@ impl InitializedInstance {
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
-        let catalog = Catalog::open(&self._authority, self.instance, secret)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let catalog =
+            Catalog::open(&self._authority, self.instance, secret).map_err(|failure| {
+                let code = match failure.code() {
+                    CatalogFailureCode::ResourceAdmissionRefused
+                    | CatalogFailureCode::LimitExceeded => {
+                        BootstrapFailureCode::ResourceUnavailable
+                    },
+                    CatalogFailureCode::StorageUnavailable
+                    | CatalogFailureCode::ConcurrentWriter
+                    | CatalogFailureCode::StaleGeneration
+                    | CatalogFailureCode::IdempotencyConflict
+                    | CatalogFailureCode::InvalidInput
+                    | CatalogFailureCode::IntegrityCorruption
+                    | CatalogFailureCode::AuthenticationFailed
+                    | CatalogFailureCode::UnsupportedFormat => {
+                        BootstrapFailureCode::CatalogUnavailable
+                    },
+                };
+                BootstrapFailure::new(code)
+            })?;
         let snapshot = catalog
             .pin()
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         positron_governance::Identity::open(&snapshot)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
     }
 
     /// Returns a typed governed fixture capability for external integration

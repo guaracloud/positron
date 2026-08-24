@@ -76,6 +76,15 @@ impl std::fmt::Debug for ActiveSegmentLedger<'_, '_> {
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    #[cfg(test)]
+    pub(super) fn snapshot_lease_marker_count_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .expect("test ledger state is not poisoned")
+            .lease_resume_markers
+            .len()
+    }
+
     /// Returns the Data Protection-owned bounded control-token operation.
     #[must_use]
     pub fn control_tokens(&self) -> crate::ControlTokenProtector<'_> {

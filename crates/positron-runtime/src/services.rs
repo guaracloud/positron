@@ -152,7 +152,27 @@ impl ServiceHandle {
         let instance = &self.instance;
         let identity = instance
             .durable_identity()
-            .map_err(|_| ServiceFailure::Unauthorized)?;
+            .map_err(|failure| match failure.code() {
+                crate::BootstrapFailureCode::KeyCustodyUnavailable => {
+                    ServiceFailure::KeyUnavailable
+                },
+                crate::BootstrapFailureCode::ResourceUnavailable => {
+                    ServiceFailure::CapacityUnavailable
+                },
+                crate::BootstrapFailureCode::CorruptState
+                | crate::BootstrapFailureCode::IdentityMismatch => ServiceFailure::CorruptState,
+                crate::BootstrapFailureCode::StorageUnavailable
+                | crate::BootstrapFailureCode::CatalogUnavailable => {
+                    ServiceFailure::StorageUnavailable
+                },
+                crate::BootstrapFailureCode::InvalidRoots
+                | crate::BootstrapFailureCode::InconsistentRoots
+                | crate::BootstrapFailureCode::AlreadyInitialized
+                | crate::BootstrapFailureCode::LedgerUnavailable
+                | crate::BootstrapFailureCode::ClaimUnavailable
+                | crate::BootstrapFailureCode::ClaimDestructionFailed
+                | crate::BootstrapFailureCode::EntropyUnavailable => ServiceFailure::Internal,
+            })?;
         identity
             .attribute(
                 &instance.key,
@@ -280,13 +300,6 @@ impl ServiceHandle {
         budget: QueryBudget,
     ) -> Result<Vec<String>, ServiceFailure> {
         let instance = &self.instance;
-        let context = instance
-            .attribute(
-                PresentedCredential::parse(bearer).map_err(|_| ServiceFailure::Unauthorized)?,
-                RequestedIntent::Query,
-                CompatibilityHints::none(),
-            )
-            .map_err(|_| ServiceFailure::Unauthorized)?;
         let catalog = Catalog::open(
             &instance._authority,
             instance.instance,
@@ -302,6 +315,14 @@ impl ServiceHandle {
                 .map_err(|_| ServiceFailure::StorageUnavailable)?,
         )
         .map_err(|_| ServiceFailure::StorageUnavailable)?;
+        let context = identity
+            .attribute(
+                &instance.key,
+                PresentedCredential::parse(bearer).map_err(|_| ServiceFailure::Unauthorized)?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| ServiceFailure::Unauthorized)?;
         let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
         let protection = instance
             .key

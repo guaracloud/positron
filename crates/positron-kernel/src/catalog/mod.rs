@@ -440,7 +440,7 @@ impl<'authority> Catalog<'authority> {
         })
     }
 
-    fn refresh_state(&self) -> Result<(), CatalogFailure> {
+    pub(crate) fn refresh_state(&self) -> Result<(), CatalogFailure> {
         let mut state = self
             .state
             .lock()
