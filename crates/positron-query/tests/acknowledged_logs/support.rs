@@ -117,6 +117,42 @@ impl positron_query::QueryClock for SequenceClock {
 
 pub struct FailingStageWorkMeter(pub positron_query::QueryWorkStage);
 
+pub struct FailAfterArmOutputMeter {
+    armed: std::sync::atomic::AtomicBool,
+    output_calls: AtomicU64,
+    fail_after: u64,
+}
+
+impl FailAfterArmOutputMeter {
+    pub fn shared(fail_after: u64) -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            output_calls: AtomicU64::new(0),
+            fail_after,
+        })
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl positron_query::QueryWorkMeter for FailAfterArmOutputMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage == positron_query::QueryWorkStage::Output
+            && self.armed.load(Ordering::SeqCst)
+            && self.output_calls.fetch_add(1, Ordering::SeqCst) >= self.fail_after
+        {
+            Err(positron_query::QueryWorkFailure)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
 impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
     fn units(
         &self,

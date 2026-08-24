@@ -131,3 +131,24 @@ impl ResultResumeKey {
         matches!(self.kind, ResultResumeKind::Aggregate)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RESULT_RESUME_KEY_BYTES, ResultResumeKey};
+
+    #[test]
+    fn fixed_resume_key_rejects_short_empty_and_nonzero_reserved_bytes() {
+        assert!(ResultResumeKey::decode(&[0; RESULT_RESUME_KEY_BYTES - 1]).is_err());
+
+        let mut empty = [0; RESULT_RESUME_KEY_BYTES];
+        empty[1] = 1;
+        assert!(ResultResumeKey::decode(&empty).is_err());
+
+        let mut encoded = [0; RESULT_RESUME_KEY_BYTES];
+        encoded[0] = 1;
+        encoded[18] = 1;
+        assert!(ResultResumeKey::decode(&encoded).is_ok());
+        encoded[51] = 1;
+        assert!(ResultResumeKey::decode(&encoded).is_err());
+    }
+}

@@ -69,13 +69,21 @@ pub(super) fn find_resume_index<'kernel, 'catalog, 'ledger>(
             state.prior_digest
         };
         state.memory_peak_bytes = state.memory_peak_bytes.max(memory.peak());
-        if key.matches_record(record, digest) && found.replace(index).is_some() {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        if key.matches_record(record, digest) {
+            remember_match(&mut found, index)?;
         }
     }
     found
         .and_then(|index| index.checked_add(1))
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))
+}
+
+fn remember_match(found: &mut Option<usize>, index: usize) -> Result<(), QueryFailure> {
+    if found.replace(index).is_some() {
+        Err(QueryFailure::new(QueryFailureCode::InvalidCursor))
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn materialize_page(
@@ -99,4 +107,34 @@ pub(super) fn materialize_page(
     }
     memory.release(input_slots)?;
     Ok(page.into_parts().0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{materialize_page, remember_match};
+    use crate::QueryFailureCode;
+    use crate::memory::{QueryMemory, RecordBuffer};
+
+    #[test]
+    fn materialization_rejects_an_invalid_resume_window_before_allocation() {
+        let mut memory = QueryMemory::new(1_024);
+        let records = RecordBuffer::allocate(0, &mut memory).expect("empty input fits");
+        assert_eq!(
+            materialize_page(records, 1, 0, &mut memory)
+                .expect_err("resume window cannot run backwards")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+    }
+
+    #[test]
+    fn duplicate_resume_matches_fail_closed_instead_of_selecting_one_row() {
+        let mut found = Some(0);
+        assert_eq!(
+            remember_match(&mut found, 1)
+                .expect_err("ambiguous resume frontier must fail closed")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+    }
 }

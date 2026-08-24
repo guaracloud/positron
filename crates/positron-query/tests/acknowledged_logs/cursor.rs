@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::sync::Arc;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_query::{
@@ -7,7 +8,7 @@ use positron_query::{
 use positron_runtime::GovernanceTestFixture;
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
-use super::support::{KernelFixture, TemporaryRoots, TestClock};
+use super::support::{FailAfterArmOutputMeter, KernelFixture, TemporaryRoots, TestClock};
 
 #[path = "cursor/event_time.rs"]
 mod event_time;
@@ -356,6 +357,27 @@ fn resume_rejects_cumulative_counter_underflow_before_additional_work() -> Resul
     ));
 
     let fixture = CursorFixture::new()?;
+    let scanned_underflow = rewritten_cursor(
+        &fixture,
+        |bytes| {
+            bytes[219..227].copy_from_slice(&1_u64.to_be_bytes());
+            bytes[283..291].copy_from_slice(&2_u64.to_be_bytes());
+        },
+        b"query-cursor-v4",
+    )?;
+    let scanned_events = fixture
+        .service()
+        .resume(fixture.context, &scanned_underflow)?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        scanned_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::BudgetExhausted
+                && failure.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::ScannedBytes)
+    ));
+
+    let fixture = CursorFixture::new()?;
     let output_underflow = rewritten_cursor(
         &fixture,
         |bytes| {
@@ -510,6 +532,67 @@ fn aggregate_resume_reconstructs_grouping_from_the_authenticated_source()
 }
 
 #[test]
+fn aggregate_resume_reports_digest_work_failure_before_delivering_rows()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let meter = FailAfterArmOutputMeter::shared(0);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        fixture.clock.clone(),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+        fixture.kernel.identity()?,
+    );
+    let plan = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = service.execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+    meter.arm();
+
+    let resumed = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert!(
+        resumed
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        resumed.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::Internal
+    ));
+
+    let fixture = CursorFixture::new()?;
+    let meter = FailAfterArmOutputMeter::shared(2);
+    meter.arm();
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        fixture.clock.clone(),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+        fixture.kernel.identity()?,
+    );
+    let plan = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let initial_failure = service.execute_page(plan)?.collect::<Vec<_>>();
+    assert!(matches!(
+        initial_failure.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::Internal
+    ));
+    Ok(())
+}
+
+#[test]
 fn result_resume_key_corruption_or_missing_frontier_fails_closed() -> Result<(), Box<dyn Error>> {
     let fixture = CursorFixture::new()?;
     let plan = fixture.service().plan_pipeline(
@@ -550,6 +633,54 @@ fn result_resume_key_corruption_or_missing_frontier_fails_closed() -> Result<(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
             if failure.code() == QueryFailureCode::InvalidCursor
     ));
+
+    let empty_key = rewritten_existing_cursor(
+        &fixture,
+        &cursor,
+        |bytes| {
+            bytes[4_447] = 0;
+            bytes[4_448] = 1;
+        },
+        b"query-cursor-v4",
+    )?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &empty_key)
+            .expect_err("nonzero bytes in an empty resume key must fail closed")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+
+    let reserved_key = rewritten_existing_cursor(
+        &fixture,
+        &cursor,
+        |bytes| bytes[4_447 + 51] = 1,
+        b"query-cursor-v4",
+    )?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &reserved_key)
+            .expect_err("nonzero resume-key padding must fail closed")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+
+    let principal_mismatch = rewritten_existing_cursor(
+        &fixture,
+        &cursor,
+        |bytes| bytes[16] ^= 1,
+        b"query-cursor-v4",
+    )?;
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &principal_mismatch)
+            .expect_err("cursor principal binding must be enforced")
+            .code(),
+        QueryFailureCode::Unauthorized
+    );
     Ok(())
 }
 

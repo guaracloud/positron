@@ -151,6 +151,12 @@ mod tests {
 
     #[test]
     fn source_length_rejects_unknown_language_and_checked_overflow() {
+        assert_eq!(
+            source_length(&QueryCursor(vec![0; CURSOR_BYTES - 1]))
+                .expect("legacy-sized input is handled before allocation"),
+            0
+        );
+
         let mut bytes = vec![0_u8; CURSOR_BYTES];
         bytes[CURRENT_PREFIX_BYTES + 9] = 3;
         assert_eq!(

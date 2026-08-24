@@ -156,3 +156,72 @@ pub(crate) fn limiting_budget(state: &CursorState) -> Option<QueryBudgetDimensio
 pub(crate) fn exhausted(state: &CursorState) -> bool {
     limiting_budget(state).is_some()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use positron_domain::identity::{PrincipalId, TenantId};
+
+    use super::limiting_budget;
+    use crate::cursor::CursorState;
+    use crate::{
+        LogicalPlan, QueryBudget, QueryBudgetDimension, QueryCancellation, TemporalAxis,
+        TemporalRange,
+    };
+
+    fn state() -> CursorState {
+        CursorState {
+            principal: PrincipalId::from_bytes([1; 16]).expect("test principal"),
+            tenant: TenantId::from_bytes([2; 16]).expect("test tenant"),
+            authorization_generation: 1,
+            catalog_identity: [3; 32],
+            catalog_generation: 1,
+            frontier: 1,
+            plan: Arc::new(LogicalPlan::logs(
+                TemporalAxis::QueryTime,
+                TemporalRange::new(-1, 1).expect("test range"),
+                1,
+            )),
+            source: None,
+            language: None,
+            plan_digest: [4; 32],
+            resume_key: None,
+            sequence: 0,
+            prior_digest: [0; 32],
+            lease_identity: [5; 16],
+            expiry: 10,
+            budget: QueryBudget::new(10, 10, 10, 10, 10, 10).expect("test budget"),
+            scanned_bytes: 0,
+            decoded_records: 0,
+            output_rows: 0,
+            output_bytes: 0,
+            memory_peak_bytes: 0,
+            started_at: 0,
+            last_observed_at: 0,
+            cpu_work_units: 0,
+            elapsed_wall_seconds: 0,
+            reduced_pruning: false,
+            resume_count: 0,
+            repeated_batch_count: 0,
+            cancellation: QueryCancellation::new(),
+        }
+    }
+
+    #[test]
+    fn limiting_budget_reports_scan_before_decode_overrun() {
+        let mut scan = state();
+        scan.scanned_bytes = scan.budget.scanned_bytes() + 1;
+        assert_eq!(
+            limiting_budget(&scan),
+            Some(QueryBudgetDimension::ScannedBytes)
+        );
+
+        let mut decode = state();
+        decode.decoded_records = decode.budget.decoded_records() + 1;
+        assert_eq!(
+            limiting_budget(&decode),
+            Some(QueryBudgetDimension::DecodedRecords)
+        );
+    }
+}
