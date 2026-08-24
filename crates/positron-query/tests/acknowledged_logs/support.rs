@@ -606,7 +606,7 @@ pub struct KernelFixture {
 }
 
 pub fn publish_lifecycle_at_catalog_for_test(
-    catalog: &'static Catalog<'static>,
+    catalog: &Catalog<'_>,
     state: u8,
     transaction: u8,
 ) -> Result<(), Box<dyn Error>> {

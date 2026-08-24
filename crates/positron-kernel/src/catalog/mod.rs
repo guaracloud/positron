@@ -34,7 +34,10 @@ use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority}
 #[cfg(feature = "test-support")]
 pub use fixture::GovernanceFixtureTarget;
 #[cfg(feature = "test-support")]
-pub use storage::{CatalogPublicationFault, with_catalog_publication_fault_after};
+pub use storage::{
+    CatalogPublicationFault, with_catalog_publication_fault_after,
+    with_catalog_publication_hook_after,
+};
 use types::AuditFrontier;
 #[cfg(feature = "test-support")]
 pub use types::GovernanceFixtureObject;
@@ -47,6 +50,11 @@ pub use types::{
 
 #[cfg(any(test, fuzzing))]
 pub(crate) use storage::with_catalog_fault;
+
+#[cfg(any(test, fuzzing, feature = "test-support"))]
+pub(crate) use storage::before_lease_marker_basis;
+#[cfg(test)]
+pub(crate) use storage::fault::with_catalog_fault_hook_after;
 
 #[cfg(any(test, fuzzing))]
 pub(crate) use storage::fault::CatalogFileEvent;

@@ -14,6 +14,7 @@ use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 use crate::CatalogGenerationId;
 #[cfg(test)]
 pub(super) use snapshot_lease_support::publication_visible;
+use snapshot_lease_support::publish_many_with_expected_catalog;
 pub(super) use snapshot_lease_support::{expired_in_scope, publish_many, records};
 use snapshot_lease_support::{
     fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,
@@ -260,6 +261,19 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             updated.last_resume_prior_digest = prior_digest;
             let encoded = encode(&updated)?;
             let amounts = lease_claim(encoded.len())?;
+            #[cfg(any(test, fuzzing, feature = "test-support"))]
+            crate::catalog::before_lease_marker_basis(self.catalog)
+                .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
+            let marker_basis = self
+                .catalog
+                .pin()
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+            if expected_catalog.is_some_and(|(expected_identity, expected_generation)| {
+                marker_basis.identity() != expected_identity
+                    || marker_basis.number() != expected_generation
+            }) {
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            }
             let previous_amounts = {
                 let reservation = state
                     .lease_reservations
@@ -273,16 +287,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 }
                 previous
             };
-            let marker_basis = match self.catalog.pin() {
-                Ok(basis) => basis,
-                Err(_) => {
-                    rollback_marker_resize(&mut state, identity, previous_amounts)?;
-                    return Err(LedgerFailure::new(LedgerFailureCode::StorageUnavailable));
-                },
-            };
-            if let Err(failure) = publish_many(
+            let expected_identity = expected_catalog
+                .map_or(marker_basis.identity(), |(expected_identity, _)| {
+                    expected_identity
+                });
+            if let Err(failure) = publish_many_with_expected_catalog(
                 self.catalog,
                 &marker_basis,
+                expected_identity,
                 &BTreeSet::from([identity]),
                 vec![encoded],
             ) {

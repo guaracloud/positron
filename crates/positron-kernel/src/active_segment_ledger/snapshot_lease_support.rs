@@ -96,6 +96,16 @@ pub(crate) fn publish_many(
     remove: &BTreeSet<SnapshotLeaseId>,
     add: Vec<Vec<u8>>,
 ) -> Result<(), LedgerFailure> {
+    publish_many_with_expected_catalog(catalog, basis, basis.identity(), remove, add)
+}
+
+pub(crate) fn publish_many_with_expected_catalog(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    expected_catalog: crate::CatalogGenerationId,
+    remove: &BTreeSet<SnapshotLeaseId>,
+    add: Vec<Vec<u8>>,
+) -> Result<(), LedgerFailure> {
     let mut objects = basis
         .plaintext_objects()
         .filter(|bytes| {
@@ -111,7 +121,7 @@ pub(crate) fn publish_many(
     }
     let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
     match catalog.commit(
-        basis.identity(),
+        expected_catalog,
         CatalogProposal::new(transaction, FormatEpoch::new(FORMAT_EPOCH)?, objects)?,
         None,
     ) {

@@ -82,7 +82,10 @@ pub use catalog::{
     TransactionId,
 };
 #[cfg(feature = "test-support")]
-pub use catalog::{CatalogPublicationFault, with_catalog_publication_fault_after};
+pub use catalog::{
+    CatalogPublicationFault, with_catalog_publication_fault_after,
+    with_catalog_publication_hook_after,
+};
 #[cfg(feature = "test-support")]
 pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 
