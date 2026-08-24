@@ -153,4 +153,32 @@ fn query_result_without_complete_terminal_is_not_success() {
         super::failure::collect_query_bodies(std::iter::empty()),
         Err(ServiceFailure::Internal)
     );
+    for (failure, expected) in [
+        (
+            ServiceFailure::CorruptState,
+            crate::BootstrapFailureCode::CorruptState,
+        ),
+        (
+            ServiceFailure::KeyUnavailable,
+            crate::BootstrapFailureCode::KeyCustodyUnavailable,
+        ),
+        (
+            ServiceFailure::CatalogUnavailable,
+            crate::BootstrapFailureCode::CatalogUnavailable,
+        ),
+        (
+            ServiceFailure::StorageUnavailable,
+            crate::BootstrapFailureCode::CatalogUnavailable,
+        ),
+        (
+            ServiceFailure::LedgerUnavailable,
+            crate::BootstrapFailureCode::LedgerUnavailable,
+        ),
+        (
+            ServiceFailure::CapacityUnavailable,
+            crate::BootstrapFailureCode::ResourceUnavailable,
+        ),
+    ] {
+        assert_eq!(failure.bootstrap_code(), expected);
+    }
 }

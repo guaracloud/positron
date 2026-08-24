@@ -126,6 +126,68 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         ),
         "exact events: {exact_events:?}"
     );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(exact_events.clone())?,
+        vec!["one".to_owned(), "two".to_owned()]
+    );
+    let complete = exact_events
+        .last()
+        .cloned()
+        .ok_or("exact query omitted its terminal")?;
+    let batch = exact_events
+        .iter()
+        .find(|event| matches!(event, QueryEvent::Batch(_)))
+        .cloned()
+        .ok_or("exact query omitted its batch")?;
+    let mut duplicate_complete = exact_events.clone();
+    duplicate_complete.push(complete);
+    assert_eq!(
+        super::super::failure::collect_query_bodies(duplicate_complete),
+        Err(ServiceFailure::Internal)
+    );
+    let mut batch_after_terminal = exact_events.clone();
+    batch_after_terminal.push(batch);
+    assert_eq!(
+        super::super::failure::collect_query_bodies(batch_after_terminal),
+        Err(ServiceFailure::Internal)
+    );
+    let header = exact_events
+        .first()
+        .cloned()
+        .ok_or("exact query omitted its header")?;
+    let mut header_after_terminal = exact_events.clone();
+    header_after_terminal.push(header);
+    assert_eq!(
+        super::super::failure::collect_query_bodies(header_after_terminal),
+        Err(ServiceFailure::Internal)
+    );
+    let paged_service = QueryService::new(
+        initialized.resource_governor(),
+        &ledger,
+        1,
+        initialized.identity.clone(),
+    );
+    let paged = paged_service.plan_pipeline(
+        context,
+        source,
+        QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?.with_cpu_work_units(16)?,
+    )?;
+    let paged_events = schema
+        .with_catalog_view(initialized.tenant, |_view| {
+            paged_service.execute_page(paged)
+        })??
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            paged_events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Continued(_)))
+        ),
+        "paged events: {paged_events:?}"
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(paged_events),
+        Err(ServiceFailure::InvalidRequest)
+    );
 
     let exhausted = query_service.plan_pipeline(
         context,
@@ -200,6 +262,18 @@ fn public_query_route_preserves_failure_class_and_never_returns_incomplete_rows(
         ),
         Err(ServiceFailure::CapacityUnavailable),
         "incomplete query terminals must not be reported as partial success"
+    );
+    let complete_budget = || {
+        QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)
+            .and_then(|budget| budget.with_cpu_work_units(16))
+    };
+    assert_eq!(
+        services.query_log_bodies(
+            &query,
+            "logs | range query_time 0 100 | limit 16",
+            complete_budget()?,
+        )?,
+        vec!["first".to_owned(), "second".to_owned()]
     );
     Ok(())
 }
