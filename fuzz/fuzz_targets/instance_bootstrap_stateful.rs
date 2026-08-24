@@ -215,7 +215,7 @@ fuzz_target!(|data: &[u8]| {
                         .expect("the claimed bootstrap principal remains authoritative");
                     assert_eq!(authorized.tenant_attribution(), None);
                     let audit = instance
-                        .inspect_governance(authorized)
+                        .inspect_governance_for_fixture(authorized)
                         .expect("system administration authorizes governance inspection");
                     assert_eq!(audit.audit_records().len(), 1);
                     let heterogeneous = audit
@@ -287,7 +287,9 @@ fuzz_target!(|data: &[u8]| {
                             InitializationPlan::non_interactive(),
                         )
                     {
-                        assert!(other_instance.inspect_governance(context).is_err());
+                        assert!(other_instance
+                            .inspect_governance_for_fixture(context)
+                            .is_err());
                     }
                 }
             },

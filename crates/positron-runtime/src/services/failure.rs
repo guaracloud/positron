@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
+use positron_kernel::{CatalogFailureCode, LedgerFailureCode};
 use positron_query::{QueryEvent, QueryFailure, QueryFailureCode, QueryTerminal};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +43,42 @@ pub(super) fn map_query_failure(failure: &QueryFailure) -> ServiceFailure {
     map_query_failure_code(failure.code())
 }
 
+pub(super) const fn classify_catalog_failure_code(code: CatalogFailureCode) -> ServiceFailure {
+    match code {
+        CatalogFailureCode::ResourceAdmissionRefused | CatalogFailureCode::LimitExceeded => {
+            ServiceFailure::CapacityUnavailable
+        },
+        CatalogFailureCode::StorageUnavailable => ServiceFailure::StorageUnavailable,
+        CatalogFailureCode::IntegrityCorruption
+        | CatalogFailureCode::AuthenticationFailed
+        | CatalogFailureCode::UnsupportedFormat
+        | CatalogFailureCode::InvalidInput => ServiceFailure::CorruptState,
+        CatalogFailureCode::StaleGeneration
+        | CatalogFailureCode::ConcurrentWriter
+        | CatalogFailureCode::IdempotencyConflict => ServiceFailure::CatalogUnavailable,
+    }
+}
+
+pub(super) const fn classify_ledger_failure_code(code: LedgerFailureCode) -> ServiceFailure {
+    match code {
+        LedgerFailureCode::ResourceAdmissionRefused
+        | LedgerFailureCode::LimitExceeded
+        | LedgerFailureCode::StorageExhausted => ServiceFailure::CapacityUnavailable,
+        LedgerFailureCode::StorageUnavailable => ServiceFailure::StorageUnavailable,
+        LedgerFailureCode::IntegrityCorruption
+        | LedgerFailureCode::AuthenticationFailed
+        | LedgerFailureCode::UnsupportedFormat
+        | LedgerFailureCode::InvalidInput
+        | LedgerFailureCode::PhysicalScopeMismatch
+        | LedgerFailureCode::RecoveryRequired => ServiceFailure::CorruptState,
+        LedgerFailureCode::StaleGeneration
+        | LedgerFailureCode::ConcurrentWriter
+        | LedgerFailureCode::IdempotencyConflict
+        | LedgerFailureCode::SnapshotExpired => ServiceFailure::CatalogUnavailable,
+        LedgerFailureCode::Cancelled => ServiceFailure::Cancelled,
+    }
+}
+
 pub(super) const fn map_query_failure_code(code: QueryFailureCode) -> ServiceFailure {
     match code {
         QueryFailureCode::Unauthorized | QueryFailureCode::AuthorizationChanged => {
@@ -65,13 +102,18 @@ pub(super) fn collect_query_bodies(
     events: impl IntoIterator<Item = QueryEvent>,
 ) -> Result<Vec<String>, ServiceFailure> {
     let mut bodies = Vec::new();
-    let mut complete = false;
-    let mut terminal_seen = false;
+    let mut header_seen = false;
+    let mut terminal: Option<Result<(), ServiceFailure>> = None;
     for event in events {
+        if terminal.is_some() {
+            return Err(ServiceFailure::Internal);
+        }
         match event {
-            QueryEvent::Header(_) if !terminal_seen => {},
+            QueryEvent::Header(_) if !header_seen => {
+                header_seen = true;
+            },
             QueryEvent::Header(_) => return Err(ServiceFailure::Internal),
-            QueryEvent::Batch(batch) if !terminal_seen => {
+            QueryEvent::Batch(batch) if header_seen => {
                 bodies
                     .try_reserve(batch.records().len())
                     .map_err(|_| ServiceFailure::CapacityUnavailable)?;
@@ -82,25 +124,31 @@ pub(super) fn collect_query_bodies(
                 }
             },
             QueryEvent::Batch(_) => return Err(ServiceFailure::Internal),
-            QueryEvent::Terminal(QueryTerminal::Complete(_)) if !terminal_seen => {
-                terminal_seen = true;
-                complete = true;
-            },
-            QueryEvent::Terminal(QueryTerminal::Complete(_)) => {
+            QueryEvent::Terminal(QueryTerminal::Complete(_)) if !header_seen => {
                 return Err(ServiceFailure::Internal);
             },
+            QueryEvent::Terminal(QueryTerminal::Incomplete(_)) if !header_seen => {
+                return Err(ServiceFailure::Internal);
+            },
+            QueryEvent::Terminal(QueryTerminal::Continued(_)) if !header_seen => {
+                return Err(ServiceFailure::Internal);
+            },
+            QueryEvent::Terminal(QueryTerminal::Complete(_)) => terminal = Some(Ok(())),
             QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)) => {
-                return Err(map_query_failure_code(incomplete.code()));
+                terminal = Some(Err(map_query_failure_code(incomplete.code())));
             },
             QueryEvent::Terminal(QueryTerminal::Continued(_)) => {
-                return Err(ServiceFailure::InvalidRequest);
+                terminal = Some(Err(ServiceFailure::Internal));
             },
         }
     }
-    if complete {
-        Ok(bodies)
-    } else {
-        Err(ServiceFailure::Internal)
+    if !header_seen {
+        return Err(ServiceFailure::Internal);
+    }
+    match terminal {
+        Some(Ok(())) => Ok(bodies),
+        Some(Err(failure)) => Err(failure),
+        None => Err(ServiceFailure::Internal),
     }
 }
 

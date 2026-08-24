@@ -140,13 +140,13 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         .cloned()
         .ok_or("exact query omitted its batch")?;
     let mut duplicate_complete = exact_events.clone();
-    duplicate_complete.push(complete);
+    duplicate_complete.push(complete.clone());
     assert_eq!(
         super::super::failure::collect_query_bodies(duplicate_complete),
         Err(ServiceFailure::Internal)
     );
     let mut batch_after_terminal = exact_events.clone();
-    batch_after_terminal.push(batch);
+    batch_after_terminal.push(batch.clone());
     assert_eq!(
         super::super::failure::collect_query_bodies(batch_after_terminal),
         Err(ServiceFailure::Internal)
@@ -156,7 +156,7 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         .cloned()
         .ok_or("exact query omitted its header")?;
     let mut header_after_terminal = exact_events.clone();
-    header_after_terminal.push(header);
+    header_after_terminal.push(header.clone());
     assert_eq!(
         super::super::failure::collect_query_bodies(header_after_terminal),
         Err(ServiceFailure::Internal)
@@ -186,7 +186,7 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
     );
     assert_eq!(
         super::super::failure::collect_query_bodies(paged_events),
-        Err(ServiceFailure::InvalidRequest)
+        Err(ServiceFailure::Internal)
     );
 
     let exhausted = query_service.plan_pipeline(
@@ -211,6 +211,48 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
                 && failure.stats().limiting_budget()
                     == Some(QueryBudgetDimension::CpuWorkUnits)
     ));
+
+    let incomplete = exhausted_events
+        .last()
+        .cloned()
+        .ok_or("exhausted query omitted its terminal")?;
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![header.clone(), incomplete.clone()]),
+        Err(ServiceFailure::CapacityUnavailable)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![incomplete.clone(), header.clone()]),
+        Err(ServiceFailure::Internal)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![batch.clone(), complete.clone()]),
+        Err(ServiceFailure::Internal)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![complete.clone(), header.clone()]),
+        Err(ServiceFailure::Internal)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![
+            header.clone(),
+            batch.clone(),
+            complete.clone(),
+            incomplete
+        ]),
+        Err(ServiceFailure::Internal)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![
+            header.clone(),
+            header.clone(),
+            complete.clone()
+        ]),
+        Err(ServiceFailure::Internal)
+    );
+    assert_eq!(
+        super::super::failure::collect_query_bodies(vec![header.clone(), batch, complete]),
+        Ok(vec!["one".to_owned(), "two".to_owned()])
+    );
 
     let refused = match query_service.plan_pipeline(
         context,

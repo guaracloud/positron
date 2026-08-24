@@ -5,11 +5,14 @@ use positron_ingest::{
     IngestRequestOutcome, LogIngest, NativeLogBatch, OtlpLogsReceiver,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
-    StoreBlockIdentity, SystemLifecycleClockSource,
+    ActiveSegmentLedger, Catalog, LifecycleClock, SegmentScope, StoreBlockIdentity,
+    SystemLifecycleClockSource,
 };
 
-use super::{ServiceFailure, ServiceHandle, map_admission_group_plan_failure, map_receive_failure};
+use super::{
+    ServiceFailure, ServiceHandle, failure::classify_catalog_failure_code,
+    failure::classify_ledger_failure_code, map_admission_group_plan_failure, map_receive_failure,
+};
 
 pub(super) fn ingest_authenticated<'authority>(
     services: &'authority ServiceHandle,
@@ -46,7 +49,7 @@ pub(super) fn ingest_native_batch(
     let catalog = open_catalog(instance)?;
     let snapshot = catalog
         .pin()
-        .map_err(|_| ServiceFailure::StorageUnavailable)?;
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
     let identity =
         positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
     identity
@@ -91,7 +94,7 @@ fn open_catalog<'instance>(
             .catalog_secret(instance.instance)
             .map_err(|_| ServiceFailure::KeyUnavailable)?,
     )
-    .map_err(|_| ServiceFailure::StorageUnavailable)
+    .map_err(|failure| classify_catalog_failure_code(failure.code()))
 }
 
 fn ingest_group<S: positron_kernel::LifecycleClockSource>(
@@ -109,10 +112,13 @@ fn ingest_group<S: positron_kernel::LifecycleClockSource>(
     };
     let ledger = match ActiveSegmentLedger::open(&instance._authority, catalog, scope, protection) {
         Ok(ledger) => ledger,
-        Err(failure) if failure.code() == LedgerFailureCode::ResourceAdmissionRefused => {
-            return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
+        Err(failure) => {
+            let code = match classify_ledger_failure_code(failure.code()) {
+                ServiceFailure::CapacityUnavailable => IngestFailureCode::CapacityUnavailable,
+                _ => IngestFailureCode::StorageUnavailable,
+            };
+            return IngestOutcome::Retryable(code);
         },
-        Err(_) => return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
     };
     let identity = match instance
         .key

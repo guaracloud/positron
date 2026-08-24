@@ -147,7 +147,11 @@ impl InitializationPlan {
 
 pub struct InitializedInstance {
     pub(crate) key: BootstrapKeyCustody,
+    // Retained only for in-crate bootstrap fixtures; product authorization
+    // always reads the current durable identity through `durable_identity`.
+    #[allow(dead_code)]
     pub(crate) identity: positron_governance::Identity,
+    #[allow(dead_code)]
     pub(super) audit: Vec<positron_governance::GovernanceAuditEntry>,
     pub(crate) _authority: StorageKernelResourceAuthority,
     pub(crate) instance: InstanceId,
@@ -291,7 +295,8 @@ impl InitializedInstance {
         self._authority.governor()
     }
 
-    pub fn inspect_governance(
+    #[cfg(any(test, fuzzing))]
+    pub fn inspect_governance_for_fixture(
         &self,
         context: positron_governance::AuthorizedContext,
     ) -> Result<

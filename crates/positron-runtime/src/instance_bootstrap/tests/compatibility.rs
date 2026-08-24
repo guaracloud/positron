@@ -45,7 +45,7 @@ fn legacy_initialized_instance_reopens_and_preserves_its_one_time_admin_claim()
     )?;
     assert_eq!(
         reopened
-            .inspect_governance(administrator)?
+            .inspect_governance_for_fixture(administrator)?
             .audit_records()
             .len(),
         1,

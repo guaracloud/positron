@@ -5,7 +5,7 @@ use positron_governance::{
 use positron_ingest::IngestPolicy;
 use positron_kernel::Catalog;
 
-use super::{ServiceFailure, ServiceHandle};
+use super::{ServiceFailure, ServiceHandle, failure::classify_catalog_failure_code};
 
 impl ServiceHandle {
     pub fn activate_ingest_policy(
@@ -24,11 +24,11 @@ impl ServiceHandle {
                 .catalog_secret(instance.instance)
                 .map_err(|_| ServiceFailure::KeyUnavailable)?,
         )
-        .map_err(|_| ServiceFailure::StorageUnavailable)?;
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
         let identity = positron_governance::Identity::open(
             &catalog
                 .pin()
-                .map_err(|_| ServiceFailure::StorageUnavailable)?,
+                .map_err(|failure| classify_catalog_failure_code(failure.code()))?,
         )
         .map_err(|_| ServiceFailure::CorruptState)?;
         instance

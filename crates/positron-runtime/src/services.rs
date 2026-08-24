@@ -27,7 +27,8 @@ pub use failure::ServiceFailure;
 #[cfg(test)]
 use failure::map_query_failure_code;
 use failure::{
-    collect_query_bodies, map_admission_group_plan_failure, map_query_failure, map_receive_failure,
+    classify_catalog_failure_code, classify_ledger_failure_code, collect_query_bodies,
+    map_admission_group_plan_failure, map_query_failure, map_receive_failure,
 };
 #[cfg(test)]
 mod tests;
@@ -338,11 +339,11 @@ impl ServiceHandle {
                 .catalog_secret(instance.instance)
                 .map_err(|_| ServiceFailure::KeyUnavailable)?,
         )
-        .map_err(|_| ServiceFailure::StorageUnavailable)?;
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
         let identity = positron_governance::Identity::open(
             &catalog
                 .pin()
-                .map_err(|_| ServiceFailure::StorageUnavailable)?,
+                .map_err(|failure| classify_catalog_failure_code(failure.code()))?,
         )
         .map_err(|_| ServiceFailure::CorruptState)?;
         identity
@@ -354,7 +355,7 @@ impl ServiceHandle {
             .segment_key(instance.instance, scope)
             .map_err(|_| ServiceFailure::KeyUnavailable)?;
         let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-            .map_err(|_| ServiceFailure::StorageUnavailable)?;
+            .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
         let service = QueryService::new(instance._authority.governor(), &ledger, 100, identity);
         let query = service
             .plan_pipeline(context, source, budget)

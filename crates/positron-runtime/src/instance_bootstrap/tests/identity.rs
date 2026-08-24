@@ -100,7 +100,7 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let inspection = initialized.inspect_governance(administrator_context)?;
+    let inspection = initialized.inspect_governance_for_fixture(administrator_context)?;
     let audit = inspection.audit_records().to_vec();
     assert_eq!(audit.len(), 1);
     let initialization = audit[0].as_initialization().expect("initialization audit");
@@ -131,7 +131,12 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    assert_eq!(reopened.inspect_governance(context)?.audit_records(), audit);
+    assert_eq!(
+        reopened
+            .inspect_governance_for_fixture(context)?
+            .audit_records(),
+        audit
+    );
     drop(reopened);
 
     let retried = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
@@ -141,7 +146,12 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    assert_eq!(retried.inspect_governance(context)?.audit_records(), audit);
+    assert_eq!(
+        retried
+            .inspect_governance_for_fixture(context)?
+            .audit_records(),
+        audit
+    );
     Ok(())
 }
 

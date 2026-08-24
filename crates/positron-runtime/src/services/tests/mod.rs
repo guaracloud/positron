@@ -1,4 +1,5 @@
 use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
+use positron_kernel::{CatalogFailureCode, LedgerFailureCode};
 use positron_query::QueryFailureCode;
 
 use super::{
@@ -180,5 +181,123 @@ fn query_result_without_complete_terminal_is_not_success() {
         ),
     ] {
         assert_eq!(failure.bootstrap_code(), expected);
+    }
+}
+
+#[test]
+fn query_setup_failures_use_one_catalog_and_ledger_classification_table() {
+    for (code, expected) in [
+        (
+            CatalogFailureCode::ResourceAdmissionRefused,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            CatalogFailureCode::LimitExceeded,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            CatalogFailureCode::StorageUnavailable,
+            ServiceFailure::StorageUnavailable,
+        ),
+        (
+            CatalogFailureCode::IntegrityCorruption,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            CatalogFailureCode::AuthenticationFailed,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            CatalogFailureCode::UnsupportedFormat,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            CatalogFailureCode::InvalidInput,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            CatalogFailureCode::StaleGeneration,
+            ServiceFailure::CatalogUnavailable,
+        ),
+        (
+            CatalogFailureCode::ConcurrentWriter,
+            ServiceFailure::CatalogUnavailable,
+        ),
+        (
+            CatalogFailureCode::IdempotencyConflict,
+            ServiceFailure::CatalogUnavailable,
+        ),
+    ] {
+        assert_eq!(
+            super::failure::classify_catalog_failure_code(code),
+            expected,
+            "{code:?}"
+        );
+    }
+
+    for (code, expected) in [
+        (
+            LedgerFailureCode::ResourceAdmissionRefused,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            LedgerFailureCode::LimitExceeded,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            LedgerFailureCode::StorageExhausted,
+            ServiceFailure::CapacityUnavailable,
+        ),
+        (
+            LedgerFailureCode::StorageUnavailable,
+            ServiceFailure::StorageUnavailable,
+        ),
+        (
+            LedgerFailureCode::IntegrityCorruption,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            LedgerFailureCode::AuthenticationFailed,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            LedgerFailureCode::UnsupportedFormat,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            LedgerFailureCode::InvalidInput,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            LedgerFailureCode::PhysicalScopeMismatch,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            LedgerFailureCode::RecoveryRequired,
+            ServiceFailure::CorruptState,
+        ),
+        (
+            LedgerFailureCode::StaleGeneration,
+            ServiceFailure::CatalogUnavailable,
+        ),
+        (
+            LedgerFailureCode::ConcurrentWriter,
+            ServiceFailure::CatalogUnavailable,
+        ),
+        (
+            LedgerFailureCode::IdempotencyConflict,
+            ServiceFailure::CatalogUnavailable,
+        ),
+        (
+            LedgerFailureCode::SnapshotExpired,
+            ServiceFailure::CatalogUnavailable,
+        ),
+        (LedgerFailureCode::Cancelled, ServiceFailure::Cancelled),
+    ] {
+        assert_eq!(
+            super::failure::classify_ledger_failure_code(code),
+            expected,
+            "{code:?}"
+        );
     }
 }
