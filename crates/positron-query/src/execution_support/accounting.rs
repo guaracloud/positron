@@ -230,14 +230,14 @@ mod tests {
     #[test]
     fn limiting_budget_reports_scan_before_decode_overrun() {
         let mut scan = state();
-        scan.scanned_bytes = scan.budget.scanned_bytes() + 1;
+        scan.physical_scanned_bytes = scan.budget.scanned_bytes() + 1;
         assert_eq!(
             limiting_budget(&scan),
             Some(QueryBudgetDimension::ScannedBytes)
         );
 
         let mut decode = state();
-        decode.decoded_records = decode.budget.decoded_records() + 1;
+        decode.physical_decoded_records = decode.budget.decoded_records() + 1;
         assert_eq!(
             limiting_budget(&decode),
             Some(QueryBudgetDimension::DecodedRecords)
