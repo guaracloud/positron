@@ -106,6 +106,34 @@ pub(crate) fn publish_many_with_expected_catalog(
     remove: &BTreeSet<SnapshotLeaseId>,
     add: Vec<Vec<u8>>,
 ) -> Result<(), LedgerFailure> {
+    publish_many_with_expected_catalog_inner(catalog, basis, expected_catalog, remove, add, true)
+        .map(|_| ())
+}
+
+pub(crate) fn publish_many_with_expected_catalog_snapshot(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    expected_catalog: crate::CatalogGenerationId,
+    remove: &BTreeSet<SnapshotLeaseId>,
+) -> Result<crate::CatalogSnapshot, LedgerFailure> {
+    publish_many_with_expected_catalog_inner(
+        catalog,
+        basis,
+        expected_catalog,
+        remove,
+        Vec::new(),
+        false,
+    )
+}
+
+fn publish_many_with_expected_catalog_inner(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    expected_catalog: crate::CatalogGenerationId,
+    remove: &BTreeSet<SnapshotLeaseId>,
+    add: Vec<Vec<u8>>,
+    reconcile_visible: bool,
+) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let mut objects = basis
         .plaintext_objects()
         .filter(|bytes| {
@@ -125,15 +153,24 @@ pub(crate) fn publish_many_with_expected_catalog(
         CatalogProposal::new(transaction, FormatEpoch::new(FORMAT_EPOCH)?, objects)?,
         None,
     ) {
-        Ok(_) => Ok(()),
+        Ok(commit) => Ok(commit.snapshot().clone()),
         Err(failure) => {
             let code = map_catalog_failure(failure.code());
+            if code == LedgerFailureCode::StaleGeneration {
+                return Err(LedgerFailure::new(code));
+            }
+            if !reconcile_visible {
+                return Err(match code {
+                    LedgerFailureCode::StorageUnavailable => LedgerFailure::ambiguous(code),
+                    _ => LedgerFailure::new(code),
+                });
+            }
             if catalog.refresh_state().is_err() {
                 return Err(LedgerFailure::ambiguous(code));
             }
             let current = catalog.pin().map_err(|_| LedgerFailure::ambiguous(code))?;
             if publication_visible(&current, remove, &add) {
-                Ok(())
+                Ok(current)
             } else {
                 Err(LedgerFailure::new(code))
             }

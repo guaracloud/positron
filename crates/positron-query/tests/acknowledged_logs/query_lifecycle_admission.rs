@@ -3,7 +3,10 @@ use std::error::Error;
 use positron_kernel::{LedgerFailureCode, with_catalog_publication_hook_after};
 use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
 
-use super::support::{LifecycleTransitionClock, publish_lifecycle_at_catalog_for_test};
+use super::support::{
+    LifecycleTransitionClock, TestClock, publish_lifecycle_at_catalog_for_test,
+    zero_work_clock_service,
+};
 use super::terminal_and_bounds::QueryFixture;
 
 #[test]
@@ -76,6 +79,49 @@ fn resume_rejects_a_lifecycle_transition_at_marker_admission() -> Result<(), Box
         .resume(fixture.context, &cursor)
         .expect_err("resume must not admit a marker after lifecycle revocation");
     assert_eq!(failure.code(), QueryFailureCode::AuthorizationChanged);
+    Ok(())
+}
+
+#[test]
+fn resume_prunes_an_unrelated_expired_lease_before_marker_admission() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("resume-expired-lease-admission")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let initial = fixture.service(1)?;
+    let planned = initial.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let cursor = initial
+        .execute_page(planned)?
+        .collect::<Vec<_>>()
+        .into_iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial query omitted its continuation cursor")?;
+    let _expired = fixture.kernel.ledger()?.create_snapshot_lease(100, 101)?;
+    let service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(101),
+    );
+
+    let events = service
+        .resume(fixture.context, &cursor)
+        .expect("internal expiry pruning must not stale its own marker basis")
+        .collect::<Vec<_>>();
+    assert!(!events.iter().any(|event| {
+        matches!(
+            event,
+            QueryEvent::Terminal(QueryTerminal::Incomplete(failure))
+                if failure.code() == QueryFailureCode::AuthorizationChanged
+        )
+    }));
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 use super::contract::initial_header;
-use super::memory::plan_memory;
+use super::page_budget::prepare_page_budget;
 use super::predicates::scan_predicates;
 use super::resources::ExecutionResources;
 use super::results::{find_resume_index, materialize_page, resume_key_for_page};
@@ -11,7 +11,6 @@ use crate::execution_support::{
 };
 use crate::{QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryService, QueryStream};
 use positron_kernel::LedgerSnapshot;
-use positron_signals::ScanLimit;
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub(super) fn run_page(
         &self,
@@ -66,55 +65,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 }
             };
         }
-        let decoded_remaining = state
-            .budget
-            .decoded_records()
-            .checked_sub(state.physical_decoded_records)
-            .ok_or_else(|| {
-                QueryFailure::budget_exhausted(crate::QueryBudgetDimension::DecodedRecords)
-            });
-        let decoded_remaining = framed!(decoded_remaining);
-        if decoded_remaining == 0 {
-            return self.failed_page(
-                Some(header),
-                QueryFailure::budget_exhausted(crate::QueryBudgetDimension::DecodedRecords),
-                &state,
-                delivered_before,
-                resources,
-            );
-        }
-        let scanned_remaining = framed!(
-            state
-                .budget
-                .scanned_bytes()
-                .checked_sub(state.physical_scanned_bytes)
-                .ok_or_else(|| {
-                    QueryFailure::budget_exhausted(crate::QueryBudgetDimension::ScannedBytes)
-                })
-        );
-        let scan_limit = framed!(
-            usize::try_from(decoded_remaining)
-                .ok()
-                .map(|limit| limit.min(super::scan::MAX_SCAN_RECORDS))
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))
-        );
-        let scan_limit = framed!(
-            ScanLimit::new(scan_limit).map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
-        );
-        let plan_memory = framed!(plan_memory(&state));
-        let execution_memory = framed!(
-            state
-                .budget
-                .memory_bytes()
-                .checked_sub(plan_memory)
-                .ok_or_else(|| QueryFailure::budget_exhausted(
-                    crate::QueryBudgetDimension::MemoryBytes
-                ))
-        );
-        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(plan_memory);
-        let mut memory = crate::memory::QueryMemory::new(execution_memory);
-        framed!(memory.acquire(state.plan.search_memory_bytes()));
-        state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
+        let (scanned_remaining, scan_limit, mut memory) = framed!(prepare_page_budget(&mut state));
         let mut observer = QueryScanObserver::new(
             self.work_meter.as_ref(),
             state.cancellation.clone(),

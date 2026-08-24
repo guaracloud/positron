@@ -4,6 +4,7 @@ mod entry;
 mod lifecycle;
 mod memory;
 mod page;
+mod page_budget;
 mod predicates;
 mod resources;
 mod results;

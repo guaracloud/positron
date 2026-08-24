@@ -760,6 +760,36 @@ fn marked_snapshot_lease_rejects_a_stale_catalog_before_marker_publication()
 }
 
 #[test]
+fn marked_snapshot_lease_prunes_an_unrelated_expired_lease_before_marker_admission()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let _expired = ledger.create_snapshot_lease(100, 101)?;
+        let active = ledger.create_snapshot_lease(100, 200)?;
+        let identity = active.identity();
+        let expected = ledger.current_catalog_snapshot()?;
+        let expected_catalog = expected.identity();
+        let expected_generation = expected.number();
+        drop(active);
+
+        let resumed = ledger
+            .resume_snapshot_lease_with_marker_at_catalog(
+                identity,
+                101,
+                1,
+                [9; 32],
+                expected_catalog,
+                expected_generation,
+            )
+            .expect("internal expiry pruning must not stale its own marker basis");
+        assert_eq!(resumed.resume_count(), 1);
+        assert_eq!(resumed.repeated_batch_count(), 0);
+        Ok(())
+    })
+}
+
+#[test]
 fn marked_snapshot_lease_rejects_a_catalog_transition_at_marker_publication()
 -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
