@@ -36,6 +36,8 @@ use marker::{MarkerDecode, decode_marker, encode_marker};
 pub(crate) use fault::with_catalog_fault;
 #[cfg(test)]
 pub(crate) use fault::with_catalog_fault_after;
+#[cfg(feature = "test-support")]
+pub use fault::{CatalogPublicationFault, with_catalog_publication_fault_after};
 
 pub(super) const FRAME_OVERHEAD_BYTES: usize = 315;
 const MAX_COMMIT_FRAME_BYTES: usize = 262_144;

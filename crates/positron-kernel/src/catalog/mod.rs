@@ -33,6 +33,8 @@ use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority}
 
 #[cfg(feature = "test-support")]
 pub use fixture::GovernanceFixtureTarget;
+#[cfg(feature = "test-support")]
+pub use storage::{CatalogPublicationFault, with_catalog_publication_fault_after};
 use types::AuditFrontier;
 #[cfg(feature = "test-support")]
 pub use types::GovernanceFixtureObject;

@@ -82,6 +82,8 @@ pub use catalog::{
     TransactionId,
 };
 #[cfg(feature = "test-support")]
+pub use catalog::{CatalogPublicationFault, with_catalog_publication_fault_after};
+#[cfg(feature = "test-support")]
 pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 
 pub use active_segment_ledger::{

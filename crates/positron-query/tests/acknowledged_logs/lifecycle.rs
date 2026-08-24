@@ -1,6 +1,9 @@
 use std::error::Error;
 
-use positron_kernel::{LedgerFailureCode, SnapshotLeaseId, WorkClass};
+use positron_kernel::{
+    CatalogPublicationFault, LedgerFailureCode, SnapshotLeaseId, SnapshotLeaseUsage, WorkClass,
+    with_catalog_publication_fault_after,
+};
 use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal};
 
 use super::support::{PeriodicFailingClock, TestClock};
@@ -178,6 +181,61 @@ fn repeated_pre_stream_failures_release_admission_and_snapshot_leases() -> Resul
             0
         );
     }
+    Ok(())
+}
+
+#[test]
+fn pre_stream_usage_publication_failure_remains_durable_and_retryable() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("pre-stream-usage-publication-fault")?;
+    let ledger = fixture.kernel.ledger()?;
+    let lease = ledger.create_snapshot_lease(100, 200)?;
+    let identity = lease.identity();
+    let usage = SnapshotLeaseUsage::new(17, 3, 5, 7, 11, 13, 19);
+
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            ledger.record_snapshot_lease_usage(identity, usage)
+        })
+        .expect_err("the injected pre-stream usage publication must fail");
+    assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        ledger.snapshot_lease_usage(identity, 100)?,
+        SnapshotLeaseUsage::default()
+    );
+
+    assert_eq!(ledger.record_snapshot_lease_usage(identity, usage)?, usage);
+    assert_eq!(ledger.snapshot_lease_usage(identity, 100)?, usage);
+    ledger.release_snapshot_lease(identity)?;
+    Ok(())
+}
+
+#[test]
+fn query_pre_stream_usage_failure_is_typed_and_releases_admission() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("query-pre-stream-usage-publication-fault")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let service = fixture.service(1)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        budget(),
+    )?;
+
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+            service.execute_page(query)
+        })
+        .expect_err("the injected pre-stream usage publication must fail closed");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        0
+    );
     Ok(())
 }
 
