@@ -300,21 +300,37 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
         drop(resumed_service);
         drop(reopened_ledger);
         drop(reopened_catalog);
+    }
+    Ok(())
+}
 
-        let fresh_query = services.query_log_bodies(
+#[test]
+fn read_only_query_uses_the_current_durable_identity_after_transition() -> Result<(), Box<dyn Error>>
+{
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, query_secret) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    for body in ["first", "second"] {
+        assert_eq!(
+            services
+                .ingest_otlp_logs(&ingest, request(body).encode_to_vec())?
+                .accepted_records(),
+            1
+        );
+    }
+    let catalog = open_catalog(&initialized)?;
+    publish_lifecycle(&catalog, 2, 0xe5)?;
+    drop(catalog);
+
+    assert_eq!(
+        services.query_log_bodies(
             &query_secret,
             "logs | range query_time 0 100 | limit 2",
             QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)?
                 .with_cpu_work_units(16)?,
-        );
-        if code <= 2 {
-            let fresh_query = fresh_query
-                .map_err(|failure| format!("{state} fresh query failed: {failure:?}"))?;
-            assert_eq!(fresh_query, ["first", "second"], "{state} fresh query");
-        } else {
-            assert!(fresh_query.is_err(), "{state} fresh query must fail closed");
-        }
-    }
+        )?,
+        ["first", "second"]
+    );
     Ok(())
 }
 
