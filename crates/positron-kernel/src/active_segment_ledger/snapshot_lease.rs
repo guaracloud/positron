@@ -589,3 +589,58 @@ fn fresh_identity() -> Result<SnapshotLeaseId, LedgerFailure> {
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
     SnapshotLeaseId::new(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CatalogFailureCode, LedgerFailureCode, map_catalog_failure};
+
+    #[test]
+    fn catalog_failure_mapping_preserves_typed_lease_failures() {
+        let cases = [
+            (
+                CatalogFailureCode::InvalidInput,
+                LedgerFailureCode::InvalidInput,
+            ),
+            (
+                CatalogFailureCode::LimitExceeded,
+                LedgerFailureCode::LimitExceeded,
+            ),
+            (
+                CatalogFailureCode::StaleGeneration,
+                LedgerFailureCode::StaleGeneration,
+            ),
+            (
+                CatalogFailureCode::IdempotencyConflict,
+                LedgerFailureCode::IdempotencyConflict,
+            ),
+            (
+                CatalogFailureCode::StorageUnavailable,
+                LedgerFailureCode::StorageUnavailable,
+            ),
+            (
+                CatalogFailureCode::IntegrityCorruption,
+                LedgerFailureCode::IntegrityCorruption,
+            ),
+            (
+                CatalogFailureCode::AuthenticationFailed,
+                LedgerFailureCode::AuthenticationFailed,
+            ),
+            (
+                CatalogFailureCode::ConcurrentWriter,
+                LedgerFailureCode::ConcurrentWriter,
+            ),
+            (
+                CatalogFailureCode::ResourceAdmissionRefused,
+                LedgerFailureCode::ResourceAdmissionRefused,
+            ),
+            (
+                CatalogFailureCode::UnsupportedFormat,
+                LedgerFailureCode::UnsupportedFormat,
+            ),
+        ];
+
+        for (catalog, expected) in cases {
+            assert_eq!(map_catalog_failure(catalog), expected);
+        }
+    }
+}
