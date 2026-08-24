@@ -34,18 +34,6 @@ pub(super) fn ingest_native_batch(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
-    // Hold the canonical Catalog writer lease while the native batch is
-    // admitted and published. A lifecycle transition cannot pass the final
-    // identity check and interleave with append through a second Catalog.
-    let catalog = open_catalog(instance)?;
-    let snapshot = catalog
-        .pin()
-        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
-    let identity =
-        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
-    identity
-        .validate_ingest_context(context)
-        .map_err(|_| ServiceFailure::Unauthorized)?;
     let policy = services
         .ingest_policy
         .pin()
@@ -69,6 +57,19 @@ pub(super) fn ingest_native_batch(
     {
         return Ok(backend.ingest(groups));
     }
+    // Planning can run for an arbitrary bounded duration. Acquire the sole
+    // Catalog writer only after planning and keep it through the final ledger
+    // publications, so a lifecycle transition cannot pass the final identity
+    // check and interleave with append while unrelated planning is blocked.
+    let catalog = open_catalog(instance)?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
+    identity
+        .validate_ingest_context(context)
+        .map_err(|_| ServiceFailure::Unauthorized)?;
     let clock = LifecycleClock::new(SystemLifecycleClockSource);
     let mut outcomes = Vec::new();
     outcomes
