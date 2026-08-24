@@ -291,7 +291,9 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
         let resumed = resumed_service.resume(context, &cursor);
         if code == 1 {
-            let _ = resumed?.collect::<Vec<_>>();
+            let _ = resumed
+                .map_err(|failure| format!("{state} resume failed: {failure:?}"))?
+                .collect::<Vec<_>>();
         } else {
             let failure = resumed.expect_err("lifecycle transition must reject the stale context");
             assert_eq!(failure.code(), QueryFailureCode::Unauthorized, "{state}");
