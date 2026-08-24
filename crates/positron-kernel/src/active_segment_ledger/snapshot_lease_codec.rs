@@ -202,6 +202,94 @@ fn signal_from_tag(tag: u8) -> Result<SignalKind, LedgerFailure> {
     }
 }
 
+#[cfg(fuzzing)]
+pub(super) fn fuzz_snapshot_lease_record(data: &[u8]) {
+    if data.len() > 128 {
+        return;
+    }
+    let variants = [fuzz_record(0), fuzz_record(1), fuzz_record(2)];
+    for record in variants {
+        let Ok(encoded) = encode(&record) else {
+            continue;
+        };
+        fuzz_candidate(&encoded, data);
+        if record.resume_count == 0 && record.usage.is_zero() {
+            let legacy = v1_encoding(&encoded);
+            fuzz_candidate(&legacy, data);
+        }
+    }
+}
+
+#[cfg(fuzzing)]
+fn fuzz_record(variant: u8) -> LeaseRecord {
+    let usage = match variant {
+        2 => SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7),
+        _ => SnapshotLeaseUsage::default(),
+    };
+    LeaseRecord {
+        identity: SnapshotLeaseId::new([variant.saturating_add(1); 16])
+            .expect("fuzz lease identity is nonzero"),
+        scope: super::SegmentScope::new(
+            TenantId::from_bytes([0x22; 16]).expect("fuzz tenant"),
+            SignalKind::Logs,
+            VirtualShardId::new(1).expect("fuzz shard"),
+        ),
+        catalog_identity: crate::CatalogGenerationId::from_authenticated_bytes([0x33; 32]),
+        catalog_generation: 7,
+        frontier: positron_domain::routing::CommitPosition::origin(),
+        observed_at: 1_000,
+        expiry: 1_100,
+        resume_count: u64::from(variant == 1),
+        repeated_batch_count: 0,
+        last_resume_sequence: (variant == 1).then_some(3),
+        last_resume_prior_digest: [0x44; 32],
+        usage,
+        blocks: Vec::new(),
+    }
+}
+
+#[cfg(fuzzing)]
+fn fuzz_candidate(encoded: &[u8], data: &[u8]) {
+    let _ = decode(encoded).map(|record| {
+        if let Some(record) = record {
+            let _ = encode(&record);
+        }
+    });
+    let mutation_offsets = [
+        8, 9, 10, 26, 42, 43, 47, 79, 87, 95, 103, 111, 119, 127, 135, 167, 175, 183, 191, 199,
+        207, 215, 223,
+    ];
+    for (index, offset) in mutation_offsets.iter().copied().enumerate() {
+        let Some(&value) = data.get(index) else {
+            break;
+        };
+        if offset >= encoded.len() {
+            continue;
+        }
+        let mut candidate = encoded.to_vec();
+        candidate[offset] ^= value;
+        let _ = decode(&candidate);
+    }
+    if !encoded.is_empty() {
+        let cut = data.first().map_or(encoded.len() / 2, |value| {
+            usize::from(*value) % encoded.len()
+        });
+        let _ = decode(&encoded[..cut]);
+    }
+    let mut appended = encoded.to_vec();
+    appended.extend(data.iter().copied().take(8));
+    let _ = decode(&appended);
+}
+
+#[cfg(fuzzing)]
+fn v1_encoding(v2: &[u8]) -> Vec<u8> {
+    let mut v1 = Vec::with_capacity(v2.len().saturating_sub(8));
+    v1.extend_from_slice(&v2[..95]);
+    v1[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    v1.extend_from_slice(&v2[103..]);
+    v1
+}
+
 impl From<&CommittedBlock> for LeaseBlock {
     fn from(block: &CommittedBlock) -> Self {
         Self {

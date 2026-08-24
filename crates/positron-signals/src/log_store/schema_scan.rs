@@ -165,6 +165,13 @@ impl LogStore {
                     break;
                 },
             };
+            observer
+                .observe_scanned_bytes(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .map_err(LogStoreFailure::observation)?;
+            scanned_bytes = next_scanned_bytes;
             let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
             let coverage = schema
                 .verified_query_coverage_observed(block.identity(), digest, query, observer)
@@ -174,7 +181,6 @@ impl LogStore {
                 Some(true) => {},
                 None => reduced_pruning = true,
             }
-            scanned_bytes = next_scanned_bytes;
             let decode =
                 codec::BlockDecode::observed(tenant, block.payload(), cancellation, &*observer)?;
             let oversized = decode.record_count() > remaining;

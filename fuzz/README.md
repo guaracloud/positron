@@ -28,6 +28,14 @@ Current storage target:
 cargo +nightly fuzz run primary_data_volume_stateful
 ```
 
+The active-segment state-machine target also exercises bounded snapshot-lease
+creation, marked resume/repeat, usage recording, release, expiry, and reopen
+recovery alongside append and persisted-corruption transitions:
+
+```console
+cargo +nightly fuzz run active_segment_ledger_stateful --sanitizer none -- -runs=1000
+```
+
 The bounded query matcher target exercises substring matching, the static
 regex automaton, and conservative text-pruning candidate extraction:
 
@@ -54,6 +62,14 @@ rejected before any resume state is constructed:
 
 ```console
 cargo +nightly fuzz run query_cursor --sanitizer none -- -runs=1000
+```
+
+The persistent snapshot-lease target exercises the production PSLEASE1 v1
+through v4 codec, including marker and physical-usage fields, checked lengths,
+unknown tags, truncation, and overflow mutations:
+
+```console
+cargo +nightly fuzz run snapshot_lease_record --sanitizer none -- -runs=1000
 ```
 
 The physical query-search target builds bounded authenticated Store Blocks and

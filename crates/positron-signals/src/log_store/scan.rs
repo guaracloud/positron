@@ -25,6 +25,16 @@ pub trait ScanObserver {
     /// Accounts deterministic bounded decode operations. Raw payload volume is
     /// accounted separately by `scanned_bytes` and is never duplicated here.
     fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode>;
+
+    /// Accounts an authenticated block payload admitted for physical scan.
+    fn observe_scanned_bytes(&self, _bytes: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+
+    /// Accounts a record after canonical decode and validation succeeded.
+    fn observe_decoded_records(&self, _records: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
 }
 
 pub(super) struct NeverCancelled;

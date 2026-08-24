@@ -147,6 +147,10 @@ pub use catalog::fuzz_catalog_stateful;
 #[doc(hidden)]
 pub use active_segment_ledger::fuzz_active_segment_stateful;
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use active_segment_ledger::fuzz_snapshot_lease_record;
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, TryLockError};

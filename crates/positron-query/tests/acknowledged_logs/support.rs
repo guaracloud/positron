@@ -86,6 +86,39 @@ impl positron_query::QueryClock for PeriodicFailingClock {
     }
 }
 
+pub struct FailAfterArmClock {
+    armed: std::sync::atomic::AtomicBool,
+    calls: AtomicU64,
+    fail_after: u64,
+}
+
+impl FailAfterArmClock {
+    pub fn shared(fail_after: u64) -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+            fail_after,
+        })
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl positron_query::QueryClock for FailAfterArmClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        if !self.armed.load(Ordering::SeqCst) {
+            return Ok(100);
+        }
+        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.fail_after {
+            Err(positron_query::QueryClockFailure)
+        } else {
+            Ok(100)
+        }
+    }
+}
+
 pub struct FailingWorkMeter;
 
 impl positron_query::QueryWorkMeter for FailingWorkMeter {

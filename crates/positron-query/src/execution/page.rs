@@ -6,7 +6,7 @@ use super::results::{find_resume_index, materialize_page, resume_key_for_page};
 use crate::cursor::{self, CursorState};
 use crate::execution_state::{stats_before_current, stats_with_current, sync_cursor_counters};
 use crate::execution_support::{
-    BatchDigestInput, QueryScanObserver, batch_digest, charge_output, charge_scan, limiting_budget,
+    BatchDigestInput, QueryScanObserver, batch_digest, charge_output, limiting_budget,
     preserve_output_attempt,
 };
 use crate::{QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryService, QueryStream};
@@ -116,6 +116,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state.cancellation.clone(),
             state.physical_cpu_work_units,
             state.budget.cpu_work_units(),
+            state.physical_scanned_bytes,
+            state.budget.scanned_bytes(),
+            state.physical_decoded_records,
+            state.budget.decoded_records(),
         );
         let (schema_query, schema_filter_used, text_candidate, text_filter_used) =
             framed!(scan_predicates(&state.plan, schema));
@@ -134,7 +138,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         ) {
             Ok(result) => result,
             Err(failure) => {
-                state.physical_cpu_work_units = observer.consumed();
+                observer.harvest(&mut state);
+                state.physical_memory_peak_bytes =
+                    state.physical_memory_peak_bytes.max(memory.peak());
                 return self.failed_page(
                     Some(header),
                     failure,
@@ -144,9 +150,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 );
             },
         };
-        state.physical_cpu_work_units = observer.consumed();
+        observer.harvest(&mut state);
         state.reduced_pruning |= scan_result.reduced_pruning();
-        framed!(charge_scan(&mut state, &scan_result));
         framed!(memory.acquire(scan_result.retained_size_bytes()));
         state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         if state.cancellation.is_cancelled() {
@@ -160,13 +165,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let wall_exhausted = framed!(self.observe_state(&mut state));
         if wall_exhausted || limiting_budget(&state).is_some() || !scan_result.complete() {
-            let dimension = limiting_budget(&state).unwrap_or_else(|| {
-                if scan_result.scanned_bytes_limited() {
-                    crate::QueryBudgetDimension::ScannedBytes
-                } else {
-                    crate::QueryBudgetDimension::DecodedRecords
-                }
-            });
+            let dimension = limiting_budget(&state)
+                .or(scan_result
+                    .scanned_bytes_limited()
+                    .then_some(crate::QueryBudgetDimension::ScannedBytes))
+                .unwrap_or(crate::QueryBudgetDimension::DecodedRecords);
             return self.failed_page(
                 Some(header),
                 QueryFailure::budget_exhausted(dimension),
@@ -249,8 +252,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-        let output_wall_exhausted = framed!(self.observe_state(&mut state));
-        if output_wall_exhausted || limiting_budget(&state).is_some() {
+        if framed!(self.observe_state(&mut state)) || limiting_budget(&state).is_some() {
             let dimension =
                 limiting_budget(&state).unwrap_or(crate::QueryBudgetDimension::WallSeconds);
             return self.failed_page(
@@ -268,8 +270,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             preserve_output_attempt(&mut state, &output_state);
             return self.failed_page(Some(header), failure, &state, delivered_before, resources);
         }
+        preserve_output_attempt(&mut state, &output_state);
         if let Some(dimension) = limiting_budget(&output_state) {
-            preserve_output_attempt(&mut state, &output_state);
             return self.failed_page(
                 Some(header),
                 QueryFailure::budget_exhausted(dimension),
@@ -278,7 +280,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-        state.physical_cpu_work_units = output_state.physical_cpu_work_units;
         if page.is_empty() {
             state = output_state;
             let stats = stats_before_current(&state);

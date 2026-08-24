@@ -8,7 +8,9 @@ use positron_query::{
 use positron_runtime::GovernanceTestFixture;
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
-use super::support::{FailAfterArmOutputMeter, KernelFixture, TemporaryRoots, TestClock};
+use super::support::{
+    FailAfterArmClock, FailAfterArmOutputMeter, KernelFixture, TemporaryRoots, TestClock,
+};
 
 #[path = "cursor/event_time.rs"]
 mod event_time;
@@ -565,6 +567,8 @@ fn aggregate_resume_reports_digest_work_failure_before_delivering_rows()
         resumed.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
             if failure.code() == QueryFailureCode::Internal
+                && failure.stats().records() == 1
+                && failure.stats().output_bytes() > 0
     ));
 
     let fixture = CursorFixture::new()?;
@@ -588,6 +592,46 @@ fn aggregate_resume_reports_digest_work_failure_before_delivering_rows()
         initial_failure.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
             if failure.code() == QueryFailureCode::Internal
+    ));
+    Ok(())
+}
+
+#[test]
+fn post_digest_clock_failure_persists_physical_output_without_delivery()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let clock = FailAfterArmClock::shared(5);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        Arc::clone(&clock) as Arc<dyn positron_query::QueryClock>,
+        Arc::new(super::support::ConstantWorkMeter(0)),
+        fixture.kernel.identity()?,
+    );
+    let plan = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let first = service.execute_page(plan)?.collect::<Vec<_>>();
+    let cursor = continuation(&first)?.clone();
+    clock.arm();
+
+    let resumed = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert!(
+        resumed
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        resumed.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+            if failure.code() == QueryFailureCode::Internal
+                && failure.stats().records() == 1
+                && failure.stats().output_bytes() == 23
     ));
     Ok(())
 }

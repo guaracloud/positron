@@ -407,8 +407,8 @@ fn decoded_budget_never_reports_a_partial_store_block_as_decoded() -> Result<(),
         exhausted_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
             if incomplete.code() == QueryFailureCode::BudgetExhausted
-                && incomplete.stats().decoded_records() == 0
-                && incomplete.stats().scanned_bytes() == 0
+                && incomplete.stats().decoded_records() == 1
+                && incomplete.stats().scanned_bytes() > 0
                 && incomplete.stats().cpu_work_units() > preflight_exhaustion.cpu_work_units()
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::CpuWorkUnits)

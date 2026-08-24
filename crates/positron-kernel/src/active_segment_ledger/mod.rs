@@ -62,6 +62,12 @@ pub fn fuzz_active_segment_stateful(data: &[u8]) {
     fuzzing::fuzz_active_segment_stateful(data);
 }
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_snapshot_lease_record(data: &[u8]) {
+    snapshot_lease_codec::fuzz_snapshot_lease_record(data);
+}
+
 /// The Storage Kernel-owned active segment for one physical tenant/signal/shard scope.
 pub struct ActiveSegmentLedger<'kernel, 'catalog> {
     _writer: ActiveSegmentLedgerLease<'kernel>,

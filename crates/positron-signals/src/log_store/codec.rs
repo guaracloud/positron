@@ -273,7 +273,9 @@ fn decode_block_records(
             return Err(LogStoreFailure::cancelled());
         }
         let decoded = record::decode(input, limits, version)?;
-        records.push(decoded.into_stored(snapshot));
+        let record = decoded.into_stored(snapshot);
+        input.observe_decoded_record()?;
+        records.push(record);
     }
     // The hard decoded-record bound applies to semantic record construction,
     // not to authenticated framing. Consume the unretained tail with a

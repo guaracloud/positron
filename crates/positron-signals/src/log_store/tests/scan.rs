@@ -68,6 +68,33 @@ impl super::super::ScanObserver for BudgetedScanObserver {
     }
 }
 
+struct ProgressScanObserver {
+    scanned_bytes: AtomicU64,
+    decoded_records: AtomicU64,
+}
+
+impl super::super::ScanObserver for ProgressScanObserver {
+    fn observe_work(&self, _units: u64) -> Result<(), super::super::ScanObservationFailureCode> {
+        Ok(())
+    }
+
+    fn observe_scanned_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<(), super::super::ScanObservationFailureCode> {
+        self.scanned_bytes.fetch_add(bytes, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn observe_decoded_records(
+        &self,
+        records: u64,
+    ) -> Result<(), super::super::ScanObservationFailureCode> {
+        self.decoded_records.fetch_add(records, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[test]
 fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
@@ -269,6 +296,28 @@ fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn
         before
     );
 
+    let progress = ProgressScanObserver {
+        scanned_bytes: AtomicU64::new(0),
+        decoded_records: AtomicU64::new(0),
+    };
+    let observed = LogStore::new().scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &progress,
+    )?;
+    assert_eq!(
+        progress.scanned_bytes.load(Ordering::SeqCst),
+        observed.scanned_bytes()
+    );
+    assert_eq!(
+        progress.decoded_records.load(Ordering::SeqCst),
+        observed.decoded_records()
+    );
+    drop(observed);
+
     let recording = RecordingScanObserver(AtomicU64::new(0));
     let observed = LogStore::new().scan_observed(
         authority.governor(),
@@ -423,6 +472,26 @@ fn oversized_block_preflight_has_an_exact_observed_work_boundary() -> Result<(),
         )
         .expect_err("structurally malformed unretained tail must fail closed");
     assert_eq!(malformed.code(), LogStoreFailureCode::MalformedBlock);
+    let malformed_progress = ProgressScanObserver {
+        scanned_bytes: AtomicU64::new(0),
+        decoded_records: AtomicU64::new(0),
+    };
+    let malformed_observed = LogStore::new()
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &malformed_ledger.snapshot()?,
+            scan,
+            &NeverCancelled,
+            &malformed_progress,
+        )
+        .expect_err("observed malformed blocks still fail closed");
+    assert_eq!(
+        malformed_observed.code(),
+        LogStoreFailureCode::MalformedBlock
+    );
+    assert!(malformed_progress.scanned_bytes.load(Ordering::SeqCst) > 0);
+    assert_eq!(malformed_progress.decoded_records.load(Ordering::SeqCst), 1);
 
     let before = authority
         .governor()

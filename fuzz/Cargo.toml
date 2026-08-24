@@ -70,6 +70,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "snapshot_lease_record"
+path = "fuzz_targets/snapshot_lease_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "instance_bootstrap_stateful"
 path = "fuzz_targets/instance_bootstrap_stateful.rs"
 test = false

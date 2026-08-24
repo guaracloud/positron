@@ -10,7 +10,7 @@ mod traversal;
 mod vocabulary;
 
 pub(crate) use accounting::{
-    charge_output, charge_scan, charge_work, charge_work_counter, cpu_work_exhausted, exhausted,
+    charge_output, charge_work, charge_work_counter, cpu_work_exhausted, exhausted,
     limiting_budget, preserve_output_attempt,
 };
 pub(crate) use digest::{BatchDigestInput, batch_digest, result_digest};

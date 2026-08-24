@@ -11,7 +11,7 @@ use crate::{Catalog, CatalogSecret, InstanceId, MountQualification, PrimaryDataV
 use super::fault::{LedgerFileEvent, with_ledger_fault};
 use super::{
     ActiveSegmentLedger, LedgerFailureCode, PreparedStoreBlock, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity,
+    SnapshotLeaseId, SnapshotLeaseUsage, StoreBlockIdentity,
 };
 
 mod oracle;
@@ -67,9 +67,10 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     let scope = scope();
     let mut ledger = open(&authority, &catalog, scope).expect("fresh ledger opens");
     let mut oracle = Oracle::new();
+    let mut lease: Option<(SnapshotLeaseId, u64)> = None;
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
-        match selector % 13 {
+        match selector % 19 {
             0 => {
                 let (identity, payload) = block_parts(index, selector);
                 let receipt = ledger
@@ -134,11 +135,59 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     }
                 }
             },
-            operation => {
-                let artifact = PersistedArtifact::from_operation(operation)
+            7..=12 => {
+                let artifact = PersistedArtifact::from_operation(selector % 19)
                     .expect("the corruption operation is in range");
                 assert_eq!(run_persisted_corruption_case(artifact, selector), artifact);
             },
+            13 => {
+                if lease.is_none() {
+                    let now = fuzz_now();
+                    let expiry = now.checked_add(30).expect("fuzz lease expiry is bounded");
+                    if let Ok(grant) = ledger.create_snapshot_lease(now, expiry) {
+                        lease = Some((grant.identity(), expiry));
+                    }
+                }
+            },
+            14 => {
+                if let Some((identity, _)) = lease {
+                    let _ = ledger.resume_snapshot_lease_with_marker(
+                        identity,
+                        fuzz_now(),
+                        1,
+                        [0x51; 32],
+                    );
+                }
+            },
+            15 => {
+                if let Some((identity, _)) = lease {
+                    let _ = ledger.resume_snapshot_lease_with_marker(
+                        identity,
+                        fuzz_now(),
+                        1,
+                        [0x51; 32],
+                    );
+                }
+            },
+            16 => {
+                if let Some((identity, _)) = lease.take() {
+                    let _ = ledger.release_snapshot_lease(identity);
+                }
+            },
+            17 => {
+                if let Some((identity, expiry)) = lease.take() {
+                    let _ = ledger.resume_snapshot_lease(identity, expiry);
+                }
+            },
+            18 => {
+                if let Some((identity, _)) = lease {
+                    let _ = ledger.record_snapshot_lease_usage(
+                        identity,
+                        SnapshotLeaseUsage::new(1, 1, 1, 1, 1, 1, 1),
+                    );
+                }
+            },
+            _ => {},
         }
         oracle.assert_ledger(&ledger);
     }
@@ -150,6 +199,12 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
         recovered.snapshot().expect("final frontier").frontier(),
         oracle.frontier()
     );
+}
+
+fn fuzz_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1_000, |duration| duration.as_secs())
 }
 
 fn block_parts(index: usize, selector: u8) -> (StoreBlockIdentity, Vec<u8>) {

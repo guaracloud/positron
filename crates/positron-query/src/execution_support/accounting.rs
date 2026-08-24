@@ -1,21 +1,6 @@
 use crate::cursor::CursorState;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord};
 
-pub(crate) fn charge_scan(
-    state: &mut CursorState,
-    result: &positron_signals::LogScanResult<'_>,
-) -> Result<(), QueryFailure> {
-    state.physical_scanned_bytes = state
-        .physical_scanned_bytes
-        .checked_add(result.scanned_bytes())
-        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::ScannedBytes))?;
-    state.physical_decoded_records = state
-        .physical_decoded_records
-        .checked_add(result.decoded_records())
-        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::DecodedRecords))?;
-    Ok(())
-}
-
 pub(crate) fn charge_work(
     state: &mut CursorState,
     cpu_work_units: u64,
@@ -86,6 +71,12 @@ pub(crate) fn preserve_output_attempt(state: &mut CursorState, output_state: &Cu
     state.physical_output_rows = output_state.physical_output_rows;
     state.physical_output_bytes = output_state.physical_output_bytes;
     state.physical_cpu_work_units = output_state.physical_cpu_work_units;
+    state.physical_memory_peak_bytes = state
+        .physical_memory_peak_bytes
+        .max(output_state.physical_memory_peak_bytes);
+    state.physical_elapsed_wall_seconds = state
+        .physical_elapsed_wall_seconds
+        .max(output_state.physical_elapsed_wall_seconds);
 }
 
 fn record_emitted_size_bytes(

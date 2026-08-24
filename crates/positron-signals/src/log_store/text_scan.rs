@@ -123,6 +123,13 @@ impl LogStore {
                     break;
                 },
             };
+            observer
+                .observe_scanned_bytes(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .map_err(LogStoreFailure::observation)?;
+            scanned_bytes = next_scanned_bytes;
             if let Some((schema, candidate)) = text {
                 observer
                     .observe_work(1)
@@ -137,7 +144,6 @@ impl LogStore {
                     None => reduced_pruning = true,
                 }
             }
-            scanned_bytes = next_scanned_bytes;
             let decode = super::codec::BlockDecode::observed(
                 tenant,
                 block.payload(),
