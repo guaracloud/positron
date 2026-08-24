@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_kernel::{MountQualification, PrimaryDataVolume};
 
+#[cfg(feature = "test-support")]
+use super::super::GovernanceFixtureObject;
 use super::super::storage::fault::CatalogFileEvent;
 use super::super::storage::{with_catalog_fault, with_catalog_fault_after};
 use super::super::{
@@ -13,6 +15,27 @@ use super::super::{
 use super::support::establish_catalog_authority;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "test-support")]
+#[test]
+fn governance_fixture_object_checks_its_bound_before_copying() {
+    assert_eq!(
+        GovernanceFixtureObject::from_bytes(&[])
+            .map(|_| ())
+            .expect_err("empty fixture object must be rejected")
+            .code(),
+        CatalogFailureCode::LimitExceeded
+    );
+    let oversized = vec![0_u8; 1_048_577];
+    assert_eq!(
+        GovernanceFixtureObject::from_bytes(&oversized)
+            .map(|_| ())
+            .expect_err("oversized fixture object must be rejected")
+            .code(),
+        CatalogFailureCode::LimitExceeded
+    );
+    assert!(GovernanceFixtureObject::from_bytes(b"POSGOV03").is_ok());
+}
 
 struct TemporaryRoot(PathBuf);
 

@@ -231,14 +231,14 @@ pub struct GovernanceFixtureObject {
 #[cfg(feature = "test-support")]
 impl GovernanceFixtureObject {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CatalogFailure> {
+        if bytes.is_empty() || bytes.len() > MAX_CATALOG_OBJECT_BYTES {
+            return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
+        }
         let mut plaintext = Vec::new();
         plaintext
             .try_reserve_exact(bytes.len())
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         plaintext.extend_from_slice(bytes);
-        if plaintext.is_empty() || plaintext.len() > MAX_CATALOG_OBJECT_BYTES {
-            return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
-        }
         Ok(Self { plaintext })
     }
 }
