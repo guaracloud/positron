@@ -1,8 +1,9 @@
 use std::error::Error;
 
 use positron_kernel::LedgerFailureCode;
-use positron_query::{QueryBudget, QueryFailureCode};
+use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
 
+use super::support::LifecycleTransitionClock;
 use super::terminal_and_bounds::QueryFixture;
 
 #[test]
@@ -40,5 +41,40 @@ fn snapshot_lease_admission_rejects_a_catalog_generation_changed_after_validatio
         .create_snapshot_lease_at_catalog(100, 160, validated.identity())
         .expect_err("lease admission must reject a changed Catalog basis");
     assert_eq!(failure.code(), LedgerFailureCode::StaleGeneration);
+    Ok(())
+}
+
+#[test]
+fn resume_rejects_a_lifecycle_transition_at_marker_admission() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("resume-lifecycle-admission")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let initial = fixture.service(1)?;
+    let planned = initial.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let cursor = initial
+        .execute_page(planned)?
+        .collect::<Vec<_>>()
+        .into_iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial query omitted its continuation cursor")?;
+    let clock = LifecycleTransitionClock::shared(fixture.kernel.catalog_for_test(), 3, 0xd6);
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        clock,
+    );
+
+    let failure = service
+        .resume(fixture.context, &cursor)
+        .expect_err("resume must not admit a marker after lifecycle revocation");
+    assert_eq!(failure.code(), QueryFailureCode::AuthorizationChanged);
     Ok(())
 }

@@ -728,6 +728,38 @@ fn marked_snapshot_lease_persists_ambiguous_resume_counts_across_restart()
 }
 
 #[test]
+fn marked_snapshot_lease_rejects_a_stale_catalog_before_marker_publication()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let expected_catalog = lease.snapshot().catalog_identity();
+        let expected_generation = lease.snapshot().catalog_generation();
+        drop(lease);
+
+        publish_lease_rewrite(catalog, 0xa8, |_| {})?;
+        let failure = ledger
+            .resume_snapshot_lease_with_marker_at_catalog(
+                identity,
+                101,
+                1,
+                [9; 32],
+                expected_catalog,
+                expected_generation,
+            )
+            .expect_err("a changed Catalog generation must fence marker admission");
+        assert_eq!(failure.code(), LedgerFailureCode::StaleGeneration);
+
+        let resumed = ledger.resume_snapshot_lease_with_marker(identity, 102, 1, [9; 32])?;
+        assert_eq!(resumed.resume_count(), 1);
+        assert_eq!(resumed.repeated_batch_count(), 0);
+        Ok(())
+    })
+}
+
+#[test]
 fn stale_resume_markers_are_invalid_cursor_failures() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));

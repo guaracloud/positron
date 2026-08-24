@@ -1,5 +1,5 @@
 use positron_governance::AuthorizedContext;
-use positron_kernel::SnapshotLeaseId;
+use positron_kernel::{LedgerFailureCode, SnapshotLeaseId};
 use std::sync::Arc;
 
 use crate::cursor;
@@ -33,7 +33,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         schema: Option<&positron_signals::SchemaCatalog>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let (tenant, catalog_identity) = self.current_query_catalog(query.context)?;
+        let (tenant, catalog_identity, _) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
@@ -64,7 +64,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let (tenant, catalog_identity) = self.current_query_catalog(query.context)?;
+        let (tenant, catalog_identity, _) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
@@ -105,7 +105,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
         cursor: &QueryCursor,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let tenant = self.validate_current_query_context(context)?;
+        let (tenant, catalog_identity, catalog_generation) = self.current_query_catalog(context)?;
         let mut state = cursor::decode_for_admission(&self.ledger.control_tokens(), cursor)?;
         validate_authorization(
             state.principal,
@@ -133,15 +133,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         // Establish the bounded durable attempt marker before reconstructing
         // source/plans, so failures after admission still have a lease-owned
         // usage record to charge and clean up.
-        let lease = match self.ledger.resume_snapshot_lease_with_marker(
+        let lease = match self.ledger.resume_snapshot_lease_with_marker_at_catalog(
             lease_id,
             now_seconds,
             state.sequence,
             state.prior_digest,
+            catalog_identity,
+            catalog_generation,
         ) {
             Ok(lease) => lease,
             Err(failure) => {
                 drop(reservation);
+                if failure.code() == LedgerFailureCode::StaleGeneration {
+                    return Err(QueryFailure::new(QueryFailureCode::AuthorizationChanged));
+                }
                 return Err(map_ledger_failure(failure));
             },
         };

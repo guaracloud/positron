@@ -136,7 +136,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         identity: SnapshotLeaseId,
         now: u64,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        self.resume_snapshot_lease_marked(identity, now, None)
+        self.resume_snapshot_lease_marked(identity, now, None, None)
     }
 
     /// Resumes a lease while recording the immutable cursor boundary being
@@ -154,7 +154,26 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         sequence: u64,
         prior_digest: [u8; 32],
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        self.resume_snapshot_lease_marked(identity, now, Some((sequence, prior_digest)))
+        self.resume_snapshot_lease_marked(identity, now, Some((sequence, prior_digest)), None)
+    }
+
+    /// Resumes a lease with a marker only when the durable Catalog still
+    /// matches the generation admitted by the query context.
+    pub fn resume_snapshot_lease_with_marker_at_catalog(
+        &self,
+        identity: SnapshotLeaseId,
+        now: u64,
+        sequence: u64,
+        prior_digest: [u8; 32],
+        expected_catalog: CatalogGenerationId,
+        expected_generation: u64,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.resume_snapshot_lease_marked(
+            identity,
+            now,
+            Some((sequence, prior_digest)),
+            Some((expected_catalog, expected_generation)),
+        )
     }
 
     fn resume_snapshot_lease_marked(
@@ -162,6 +181,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         identity: SnapshotLeaseId,
         now: u64,
         marker: Option<(u64, [u8; 32])>,
+        expected_catalog: Option<(CatalogGenerationId, u64)>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
         let mut state = self
             .state
@@ -173,6 +193,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .refresh_state()
             .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
         let basis = self.catalog.pin()?;
+        if expected_catalog.is_some_and(|(identity, generation)| {
+            basis.identity() != identity || basis.number() != generation
+        }) {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
         let all_records = records(&basis)?;
         let expired = expired_in_scope(&all_records, self.scope, now);
         if !expired.is_empty() {

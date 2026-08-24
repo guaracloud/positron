@@ -264,13 +264,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
     ) -> Result<positron_domain::identity::TenantId, QueryFailure> {
         self.current_query_catalog(context)
-            .map(|(tenant, _)| tenant)
+            .map(|(tenant, _, _)| tenant)
     }
 
     pub(crate) fn current_query_catalog(
         &self,
         context: AuthorizedContext,
-    ) -> Result<(positron_domain::identity::TenantId, CatalogGenerationId), QueryFailure> {
+    ) -> Result<
+        (
+            positron_domain::identity::TenantId,
+            CatalogGenerationId,
+            u64,
+        ),
+        QueryFailure,
+    > {
         let tenant = crate::execution_state::query_tenant(context)?;
         let snapshot = self
             .ledger
@@ -281,7 +288,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         identity
             .revalidate_query_context(context)
             .map_err(|_| QueryFailure::new(QueryFailureCode::Unauthorized))?;
-        Ok((tenant, snapshot.identity()))
+        Ok((tenant, snapshot.identity(), snapshot.number()))
     }
 
     pub(crate) fn now(&self) -> Result<u64, QueryFailure> {

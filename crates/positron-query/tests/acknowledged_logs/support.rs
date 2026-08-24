@@ -48,6 +48,37 @@ impl StepClock {
     }
 }
 
+pub struct LifecycleTransitionClock {
+    catalog: &'static Catalog<'static>,
+    state: u8,
+    transaction: u8,
+    transitioned: std::sync::atomic::AtomicBool,
+}
+
+impl LifecycleTransitionClock {
+    pub fn shared(catalog: &'static Catalog<'static>, state: u8, transaction: u8) -> Arc<Self> {
+        Arc::new(Self {
+            catalog,
+            state,
+            transaction,
+            transitioned: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+impl positron_query::QueryClock for LifecycleTransitionClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        if !self
+            .transitioned
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            publish_lifecycle_at_catalog_for_test(self.catalog, self.state, self.transaction)
+                .map_err(|_| positron_query::QueryClockFailure)?;
+        }
+        Ok(101)
+    }
+}
+
 pub struct TestWorkMeter;
 
 impl positron_query::QueryWorkMeter for TestWorkMeter {
@@ -574,6 +605,39 @@ pub struct KernelFixture {
     _root: TemporaryRoots,
 }
 
+pub fn publish_lifecycle_at_catalog_for_test(
+    catalog: &'static Catalog<'static>,
+    state: u8,
+    transaction: u8,
+) -> Result<(), Box<dyn Error>> {
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .object_identities()
+        .map(|identity| {
+            let bytes = basis.object(identity)?.ok_or("missing Catalog object")?;
+            let mut bytes = bytes.to_vec();
+            if bytes.starts_with(b"POSGOV01")
+                || bytes.starts_with(b"POSGOV02")
+                || bytes.starts_with(b"POSGOV03")
+            {
+                let offset = bytes.len().checked_sub(5).ok_or("identity too short")?;
+                bytes[offset] = state;
+            }
+            CatalogObject::new(bytes).map_err(|failure| -> Box<dyn Error> { Box::new(failure) })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([transaction; 16])?,
+            FormatEpoch::CATALOG_V1,
+            std::mem::take(&mut objects),
+        )?,
+        None,
+    )?;
+    Ok(())
+}
+
 impl KernelFixture {
     pub fn new(tenant: TenantId, label: &str) -> Result<Self, Box<dyn Error>> {
         let root = TemporaryRoots::new(label)?;
@@ -622,32 +686,11 @@ impl KernelFixture {
         state: u8,
         transaction: u8,
     ) -> Result<(), Box<dyn Error>> {
-        let basis = self.catalog.pin()?;
-        let mut objects = basis
-            .object_identities()
-            .map(|identity| {
-                let bytes = basis.object(identity)?.ok_or("missing Catalog object")?;
-                let mut bytes = bytes.to_vec();
-                if bytes.starts_with(b"POSGOV01")
-                    || bytes.starts_with(b"POSGOV02")
-                    || bytes.starts_with(b"POSGOV03")
-                {
-                    let offset = bytes.len().checked_sub(5).ok_or("identity too short")?;
-                    bytes[offset] = state;
-                }
-                CatalogObject::new(bytes).map_err(|failure| -> Box<dyn Error> { Box::new(failure) })
-            })
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-        self.catalog.commit(
-            basis.identity(),
-            CatalogProposal::new(
-                TransactionId::new([transaction; 16])?,
-                FormatEpoch::CATALOG_V1,
-                std::mem::take(&mut objects),
-            )?,
-            None,
-        )?;
-        Ok(())
+        publish_lifecycle_at_catalog_for_test(self.catalog, state, transaction)
+    }
+
+    pub fn catalog_for_test(&self) -> &'static Catalog<'static> {
+        self.catalog
     }
 
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {
