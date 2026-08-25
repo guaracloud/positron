@@ -17,6 +17,8 @@ pub(super) struct LedgerState<'kernel> {
     pub(super) next_sequence: u64,
     pub(super) poisoned: bool,
     pub(super) lease_reservations: BTreeMap<super::SnapshotLeaseId, ResourceReservation<'kernel>>,
+    pub(super) lease_reservation_baselines:
+        BTreeMap<super::SnapshotLeaseId, crate::ResourceAmounts>,
     pub(super) lease_resume_markers:
         BTreeMap<super::SnapshotLeaseId, super::snapshot_lease_record::LeaseResumeMarker>,
     pub(super) pending_lease_releases: super::snapshot_lease_pending::PendingLeaseReleases,

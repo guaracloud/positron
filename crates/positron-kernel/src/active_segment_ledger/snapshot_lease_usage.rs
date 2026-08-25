@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use super::capacity::lease_claim;
-use super::snapshot_lease::{map_catalog_failure, publish_many, records, rollback_marker_resize};
+use super::snapshot_lease::LeaseReservationTransaction;
+use super::snapshot_lease::{map_catalog_failure, publish_many, records};
 use super::snapshot_lease_attempt::SnapshotLeaseAttempt;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_record::{
@@ -135,6 +136,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             let expected = previous.merge(delta)?;
             if record.usage == expected {
                 cache_marker(&mut state, &record);
+                if state.lease_reservation_baselines.contains_key(&identity) {
+                    LeaseReservationTransaction::begin(&mut state, identity)?.commit(&mut state);
+                }
                 return Ok(expected);
             }
             if record.usage != previous {
@@ -145,6 +149,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             record.usage.merge(delta)?
         };
         if usage == record.usage {
+            if state.lease_reservation_baselines.contains_key(&identity) {
+                LeaseReservationTransaction::begin(&mut state, identity)?.rollback(&mut state)?;
+            }
             return Ok(usage);
         }
 
@@ -153,19 +160,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let encoded = encode(&updated)?;
         let expected_encoded = encoded.clone();
         let amounts = lease_claim(encoded.len())?;
-        let previous_amounts = {
-            let reservation = state
-                .lease_reservations
-                .get_mut(&identity)
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
-            let previous = reservation.granted();
-            if previous != amounts {
-                reservation
-                    .try_resize(amounts)
-                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-            }
-            previous
-        };
+        let transaction = LeaseReservationTransaction::begin(&mut state, identity)?;
+        if let Err(failure) = transaction.resize(&mut state, amounts) {
+            transaction.cancel(&mut state);
+            return Err(failure);
+        }
         let publication = (|| {
             #[cfg(any(test, fuzzing, feature = "test-support"))]
             super::fault::emit_event(super::fault::LedgerFileEvent::BeforeLeaseUsagePublication)?;
@@ -189,37 +188,46 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     &record,
                     &updated,
                     &expected_encoded,
-                    previous_amounts,
                 );
-                if reconciled.is_err()
-                    && retries < MAX_USAGE_PUBLICATION_RETRIES
-                    && self
-                        .catalog
-                        .refresh_state()
-                        .ok()
-                        .and_then(|()| self.catalog.pin().ok())
-                        .and_then(|basis| records(&basis).ok())
-                        .is_some_and(|records| {
-                            records.into_iter().any(|candidate| {
-                                candidate.identity == identity
-                                    && candidate.scope == self.scope
-                                    && candidate.usage == record.usage
-                            })
-                        })
-                {
-                    drop(state);
-                    return self.record_snapshot_lease_usage_inner(
-                        identity,
-                        attempt,
-                        delta,
-                        retries + 1,
-                    );
+                match reconciled {
+                    Ok(usage) => {
+                        transaction.commit(&mut state);
+                        return Ok(usage);
+                    },
+                    Err(_failure)
+                        if retries < MAX_USAGE_PUBLICATION_RETRIES
+                            && self
+                                .catalog
+                                .refresh_state()
+                                .ok()
+                                .and_then(|()| self.catalog.pin().ok())
+                                .and_then(|basis| records(&basis).ok())
+                                .is_some_and(|records| {
+                                    records.into_iter().any(|candidate| {
+                                        candidate.identity == identity
+                                            && candidate.scope == self.scope
+                                            && candidate.usage == record.usage
+                                    })
+                                }) =>
+                    {
+                        drop(state);
+                        return self.record_snapshot_lease_usage_inner(
+                            identity,
+                            attempt,
+                            delta,
+                            retries + 1,
+                        );
+                    },
+                    Err(failure) => {
+                        transaction.rollback(&mut state)?;
+                        return Err(failure);
+                    },
                 }
-                return reconciled;
             }
-            rollback_marker_resize(&mut state, identity, previous_amounts)?;
+            transaction.rollback(&mut state)?;
             return Err(failure);
         }
+        transaction.commit(&mut state);
         cache_marker(&mut state, &updated);
         Ok(usage)
     }
@@ -231,8 +239,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         previous: &LeaseRecord,
         expected: &LeaseRecord,
         expected_encoded: &[u8],
-        previous_amounts: crate::ResourceAmounts,
     ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
+        #[cfg(any(test, fuzzing, feature = "test-support"))]
+        super::fault::emit_event(super::fault::LedgerFileEvent::BeforeLeaseUsageReconciliation)?;
         let observed = self
             .catalog
             .refresh_state()
@@ -258,7 +267,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             && record.usage == previous.usage
         {
             cache_marker(state, record);
-            rollback_marker_resize(state, identity, previous_amounts)?;
             return Err(LedgerFailure::ambiguous(
                 LedgerFailureCode::StorageUnavailable,
             ));

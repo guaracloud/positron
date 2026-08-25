@@ -1,4 +1,3 @@
-use super::LedgerFailureCode::ResourceAdmissionRefused;
 use super::capacity::lease_claim;
 use super::snapshot_lease_attempt::SnapshotLeaseAttempt;
 use super::snapshot_lease_codec::encode;
@@ -15,13 +14,13 @@ mod snapshot_lease_lifecycle;
 mod snapshot_lease_support;
 use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 use crate::CatalogGenerationId;
-#[cfg(test)]
-pub(super) use snapshot_lease_support::publication_visible;
-pub(super) use snapshot_lease_support::{expired_in_scope, publish_many, records};
+pub(super) use snapshot_lease_support::map_catalog_failure;
+pub(super) use snapshot_lease_support::{
+    LeaseReservationTransaction, expired_in_scope, publish_many, records,
+};
 use snapshot_lease_support::{
     fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,
 };
-pub(super) use snapshot_lease_support::{map_catalog_failure, rollback_marker_resize};
 use snapshot_lease_support::{
     publish_many_with_expected_catalog, publish_many_with_expected_catalog_snapshot,
 };
@@ -290,19 +289,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                         return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
                     }
                 }
-                let previous_amounts = {
-                    let reservation =
-                        state.lease_reservations.get_mut(&identity).ok_or_else(|| {
-                            LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
-                        })?;
-                    let previous = reservation.granted();
-                    if previous != amounts {
-                        reservation
-                            .try_resize(amounts)
-                            .map_err(|_| LedgerFailure::new(ResourceAdmissionRefused))?;
-                    }
-                    previous
-                };
+                let transaction = LeaseReservationTransaction::begin(&mut state, identity)?;
+                if let Err(failure) = transaction.resize(&mut state, amounts) {
+                    transaction.cancel(&mut state);
+                    return Err(failure);
+                }
                 let expected_identity = if expired.is_empty() {
                     expected_catalog.map_or(marker_basis.identity(), |(expected_identity, _)| {
                         expected_identity
@@ -310,17 +301,24 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 } else {
                     marker_basis.identity()
                 };
-                if let Err(failure) = publish_many_with_expected_catalog(
-                    self.catalog,
-                    &marker_basis,
-                    expected_identity,
-                    &BTreeSet::from([identity]),
-                    vec![encoded],
-                ) {
+                let publication = (|| {
+                    #[cfg(any(test, fuzzing, feature = "test-support"))]
+                    super::fault::emit_event(
+                        super::fault::LedgerFileEvent::BeforeLeaseMarkerPublication,
+                    )?;
+                    publish_many_with_expected_catalog(
+                        self.catalog,
+                        &marker_basis,
+                        expected_identity,
+                        &BTreeSet::from([identity]),
+                        vec![encoded],
+                    )
+                })();
+                if let Err(failure) = publication {
                     if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
                         state.lease_resume_markers.remove(&identity);
                     } else {
-                        rollback_marker_resize(&mut state, identity, previous_amounts)?;
+                        transaction.rollback(&mut state)?;
                     }
                     return Err(failure);
                 }
@@ -334,6 +332,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                         usage: updated.usage,
                     },
                 );
+                transaction.commit(&mut state);
                 (resume_count, repeated_batch_count, Some(attempt))
             } else {
                 (record.resume_count, record.repeated_batch_count, None)

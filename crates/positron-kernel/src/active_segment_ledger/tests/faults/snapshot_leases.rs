@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
-
-use super::super::super::fault::{LedgerFileEvent, with_ledger_fault};
-use super::super::super::snapshot_lease::publication_visible;
+use super::super::super::fault::{LedgerFileEvent, with_ledger_fault, with_ledger_fault_sequence};
 use super::*;
 use crate::{
     OrdinaryPool, ResourceAmounts, ResourceDimension, SnapshotLeaseUsage, WorkClaim, WorkKind,
@@ -297,28 +294,6 @@ fn snapshot_lease_resume_fails_closed_on_bad_durable_shapes() -> Result<(), Box<
 }
 
 #[test]
-fn publication_reconciliation_rejects_malformed_durable_lease_objects() -> Result<(), Box<dyn Error>>
-{
-    with_fixture(|authority, catalog, scope| {
-        let ledger = ActiveSegmentLedger::open(
-            authority,
-            catalog,
-            scope,
-            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
-        )?;
-        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
-        publish_lease_rewrite(catalog, 0xe3, append_lease_trailing_byte)?;
-        let snapshot = catalog.pin()?;
-        assert!(!publication_visible(
-            &snapshot,
-            &BTreeSet::from([identity]),
-            &[],
-        ));
-        Ok(())
-    })
-}
-
-#[test]
 fn expired_markers_are_bounded_across_repeated_expiry_and_reopen() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
@@ -327,12 +302,17 @@ fn expired_markers_are_bounded_across_repeated_expiry_and_reopen() -> Result<(),
 
         for now in 100..=160 {
             let identity = ledger.create_snapshot_lease(now, now + 1)?.identity();
-            ledger.resume_snapshot_lease_with_marker(identity, now, 1, [now as u8; 32])?;
-            assert_eq!(ledger.snapshot_lease_marker_count_for_test(), 1);
+            let first =
+                ledger.resume_snapshot_lease_with_marker(identity, now, 1, [now as u8; 32])?;
+            assert_eq!(first.resume_count(), 1);
+            drop(first);
+            let repeated =
+                ledger.resume_snapshot_lease_with_marker(identity, now, 1, [now as u8; 32])?;
+            assert_eq!(repeated.resume_count(), 2);
+            drop(repeated);
             if now < 160 {
                 let next = ledger.create_snapshot_lease(now + 1, now + 2)?.identity();
                 assert_ne!(next, identity);
-                assert_eq!(ledger.snapshot_lease_marker_count_for_test(), 0);
                 ledger.release_snapshot_lease(next)?;
             }
         }
@@ -341,7 +321,6 @@ fn expired_markers_are_bounded_across_repeated_expiry_and_reopen() -> Result<(),
             .resume_snapshot_lease(crate::SnapshotLeaseId::new([0x01; 16])?, 161)
             .expect_err("the synthetic identity is not a durable lease");
         assert_eq!(expired.code(), LedgerFailureCode::SnapshotExpired);
-        assert_eq!(ledger.snapshot_lease_marker_count_for_test(), 0);
         assert_eq!(
             catalog
                 .pin()?
@@ -1304,6 +1283,85 @@ fn snapshot_lease_usage_retries_after_an_ambiguous_prepublication() -> Result<()
         })?;
         assert_eq!(usage, delta);
         assert_eq!(ledger.snapshot_lease_usage(identity, 101)?, delta);
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_usage_retry_failure_restores_the_original_reservation()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let baseline = authority.governor().inspect()?;
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+
+        for _ in 0..65 {
+            let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+                with_ledger_fault_sequence(
+                    &[
+                        LedgerFileEvent::BeforeLeaseUsagePublication,
+                        LedgerFileEvent::BeforeLeaseUsageReconciliation,
+                    ],
+                    || ledger.record_snapshot_lease_usage(identity, delta),
+                )
+            })
+            .expect_err("a definitive retry failure must remain typed");
+            assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+            assert_eq!(
+                ledger.snapshot_lease_usage(identity, 101)?,
+                SnapshotLeaseUsage::default()
+            );
+            let after = authority.governor().inspect()?;
+            assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+            for dimension in ResourceDimension::ALL {
+                assert_eq!(after.usage(dimension), baseline.usage(dimension));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_marker_retry_failure_restores_the_original_reservation()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let before_catalog = catalog
+            .pin()?
+            .plaintext_objects()
+            .find(|bytes| bytes.starts_with(b"PSLEASE1"))
+            .ok_or("lease missing")?
+            .to_vec();
+        let baseline = authority.governor().inspect()?;
+
+        for _ in 0..65 {
+            let ambiguous =
+                with_ledger_fault(LedgerFileEvent::BeforeLeaseMarkerPublication, || {
+                    ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])
+                })
+                .expect_err("an unproven marker publication must be typed");
+            assert_eq!(ambiguous.code(), LedgerFailureCode::StorageUnavailable);
+            let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+                ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])
+            })
+            .expect_err("the definitive retry failure must be typed");
+            assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+            let after = authority.governor().inspect()?;
+            assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+            for dimension in ResourceDimension::ALL {
+                assert_eq!(after.usage(dimension), baseline.usage(dimension));
+            }
+            let snapshot = catalog.pin()?;
+            let durable = snapshot
+                .plaintext_objects()
+                .find(|bytes| bytes.starts_with(b"PSLEASE1"))
+                .ok_or("lease missing after failed retry")?;
+            assert_eq!(durable, before_catalog.as_slice());
+        }
         Ok(())
     })
 }

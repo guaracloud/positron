@@ -14,7 +14,7 @@ use super::super::{
     SegmentScope, map_frame_failure,
 };
 
-pub(crate) fn rollback_marker_resize(
+fn rollback_lease_reservation(
     state: &mut super::super::state::LedgerState<'_>,
     identity: SnapshotLeaseId,
     previous_amounts: crate::ResourceAmounts,
@@ -29,6 +29,66 @@ pub(crate) fn rollback_marker_resize(
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
     }
     Ok(())
+}
+
+pub(crate) struct LeaseReservationTransaction {
+    identity: SnapshotLeaseId,
+    original: crate::ResourceAmounts,
+}
+
+impl LeaseReservationTransaction {
+    pub(crate) fn begin(
+        state: &mut super::super::state::LedgerState<'_>,
+        identity: SnapshotLeaseId,
+    ) -> Result<Self, LedgerFailure> {
+        let original = state
+            .lease_reservation_baselines
+            .get(&identity)
+            .copied()
+            .or_else(|| {
+                state
+                    .lease_reservations
+                    .get(&identity)
+                    .map(|value| value.granted())
+            })
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        state.lease_reservation_baselines.insert(identity, original);
+        Ok(Self { identity, original })
+    }
+
+    pub(crate) fn resize(
+        &self,
+        state: &mut super::super::state::LedgerState<'_>,
+        amounts: crate::ResourceAmounts,
+    ) -> Result<(), LedgerFailure> {
+        let reservation = state
+            .lease_reservations
+            .get_mut(&self.identity)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        if reservation.granted() != amounts {
+            reservation
+                .try_resize(amounts)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit(self, state: &mut super::super::state::LedgerState<'_>) {
+        state.lease_reservation_baselines.remove(&self.identity);
+    }
+
+    pub(crate) fn cancel(self, state: &mut super::super::state::LedgerState<'_>) {
+        state.lease_reservation_baselines.remove(&self.identity);
+    }
+
+    pub(crate) fn rollback(
+        self,
+        state: &mut super::super::state::LedgerState<'_>,
+    ) -> Result<(), LedgerFailure> {
+        rollback_lease_reservation(state, self.identity, self.original)?;
+        state.lease_reservation_baselines.remove(&self.identity);
+        Ok(())
+    }
 }
 
 pub(super) fn snapshot_from_record<'kernel>(
@@ -253,6 +313,7 @@ pub(super) fn remove_reservations(
 ) {
     for identity in identities {
         state.lease_reservations.remove(identity);
+        state.lease_reservation_baselines.remove(identity);
         state.lease_resume_markers.remove(identity);
     }
 }

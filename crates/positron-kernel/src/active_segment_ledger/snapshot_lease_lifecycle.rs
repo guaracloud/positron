@@ -33,6 +33,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         }
         for identity in pending {
             state.lease_reservations.remove(&identity);
+            state.lease_reservation_baselines.remove(&identity);
             state.lease_resume_markers.remove(&identity);
         }
         state.pending_lease_releases.clear();
@@ -70,6 +71,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             vec![encoded],
         )?;
         let previous = state.lease_reservations.insert(record.identity, retained);
+        state.lease_reservation_baselines.remove(&record.identity);
         let Some(previous) = previous else {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         };
