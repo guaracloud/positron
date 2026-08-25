@@ -1079,6 +1079,48 @@ fn snapshot_lease_usage_failures_are_typed_and_publication_is_retryable()
     })
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn snapshot_lease_marker_test_support_rejects_unknown_leases() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        ledger.create_snapshot_lease(100, 200)?;
+        let unknown = crate::SnapshotLeaseId::new([0x77; 16])?;
+        let failure = crate::publish_snapshot_lease_marker_for_test(catalog, unknown, 0x91)
+            .expect_err("test marker publication must reject an unknown lease");
+        assert_eq!(
+            failure.code(),
+            crate::CatalogFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn snapshot_lease_marker_test_support_rejects_zero_transaction_identity()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        ledger.resume_snapshot_lease_with_marker(lease.identity(), 101, 1, [0x91; 32])?;
+        let failure = crate::publish_snapshot_lease_marker_for_test(catalog, lease.identity(), 0)
+            .expect_err("test marker publication must reject a zero transaction identity");
+        assert_eq!(failure.code(), crate::CatalogFailureCode::LimitExceeded);
+        Ok(())
+    })
+}
+
 #[test]
 fn ambiguous_usage_reconciliation_preserves_new_old_and_unknown_truth() -> Result<(), Box<dyn Error>>
 {
