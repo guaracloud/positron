@@ -28,7 +28,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 return Err(resources.fail_before_stream(self.ledger, &state, failure));
             },
         };
-        if initially_exhausted {
+        if initially_exhausted || state.physical_elapsed_wall_seconds >= state.budget.wall_seconds()
+        {
             return self.failed_page(
                 None,
                 QueryFailure::budget_exhausted(crate::QueryBudgetDimension::WallSeconds),

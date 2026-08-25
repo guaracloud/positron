@@ -627,6 +627,11 @@ fn repeated_resumes_retain_durable_wall_usage_at_the_exact_boundary() -> Result<
         .resume(fixture.context, &cursor)
         .expect("durable wall accounting must retain the resumable lease")
         .collect::<Vec<_>>();
+    assert!(
+        exhausted
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Header(_) | QueryEvent::Batch(_)))
+    );
     assert!(matches!(
         exhausted.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
