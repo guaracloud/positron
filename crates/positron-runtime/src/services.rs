@@ -293,6 +293,40 @@ impl ServiceHandle {
     ) -> Result<Vec<String>, ServiceFailure> {
         query::query_log_bodies(self, bearer, self.instance.logs_shard, source, budget)
     }
+
+    #[cfg(test)]
+    pub(crate) fn query_events_for_test(
+        &self,
+        context: AuthorizedContext,
+        source: &str,
+        budget: QueryBudget,
+        page_limit: Option<u16>,
+    ) -> Result<query::QueryTestOutcome, ServiceFailure> {
+        query::query_events_for_test(
+            self,
+            context,
+            self.instance.logs_shard,
+            source,
+            budget,
+            page_limit,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_query_events_for_test(
+        &self,
+        context: AuthorizedContext,
+        cursor: &positron_query::QueryCursor,
+        batch_limit: u16,
+    ) -> Result<query::QueryTestOutcome, ServiceFailure> {
+        query::resume_query_events_for_test(
+            self,
+            context,
+            cursor,
+            self.instance.logs_shard,
+            batch_limit,
+        )
+    }
 }
 
 #[derive(Clone)]

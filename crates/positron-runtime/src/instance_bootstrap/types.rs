@@ -8,8 +8,6 @@ use positron_kernel::{
     BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
     MountQualification, OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
-#[cfg(feature = "test-support")]
-use positron_kernel::{GovernanceFixtureObject, GovernanceFixtureTarget};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,30 +166,6 @@ pub struct InitializedInstance {
     pub(super) claim_available: bool,
 }
 
-#[cfg(feature = "test-support")]
-#[derive(Clone)]
-pub struct GovernanceTestFixture {
-    object: GovernanceFixtureObject,
-}
-
-#[cfg(feature = "test-support")]
-impl GovernanceTestFixture {
-    fn new(object: &[u8]) -> Result<Self, BootstrapFailure> {
-        let object = GovernanceFixtureObject::from_bytes(object)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        Ok(Self { object })
-    }
-
-    pub fn install_into<T: GovernanceFixtureTarget>(
-        &self,
-        target: &T,
-    ) -> Result<(), BootstrapFailure> {
-        target
-            .install_governance_fixture(&self.object)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
-    }
-}
-
 impl std::fmt::Debug for InitializedInstance {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -234,37 +208,6 @@ impl InitializedInstance {
             })?;
         positron_governance::Identity::open(&snapshot)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
-    }
-
-    /// Returns a typed governed fixture capability for external integration
-    /// tests. The authenticated Catalog object never crosses this boundary.
-    #[doc(hidden)]
-    #[cfg(feature = "test-support")]
-    pub fn governance_fixture_for_test(&self) -> Result<GovernanceTestFixture, BootstrapFailure> {
-        let secret = self
-            .key
-            .catalog_secret(self.instance)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
-        let catalog = Catalog::open(&self._authority, self.instance, secret)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let snapshot = catalog
-            .pin()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        for object_id in snapshot.object_identities() {
-            let object = snapshot
-                .object(object_id)
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-            if let Some(object) = object
-                && (object.starts_with(b"POSGOV01")
-                    || object.starts_with(b"POSGOV02")
-                    || object.starts_with(b"POSGOV03"))
-            {
-                return GovernanceTestFixture::new(object);
-            }
-        }
-        Err(BootstrapFailure::new(
-            BootstrapFailureCode::CatalogUnavailable,
-        ))
     }
 
     pub(crate) fn begin_shutdown(&self) -> Result<(), BootstrapFailure> {

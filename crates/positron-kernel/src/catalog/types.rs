@@ -2,6 +2,8 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use crate::data_protection::{DataProtection, SecretKeyBytes};
+#[cfg(feature = "test-support")]
+use positron_domain::lifecycle::TenantLifecycleState;
 
 mod commit;
 mod failure;
@@ -242,6 +244,27 @@ impl GovernanceFixtureObject {
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         plaintext.extend_from_slice(bytes);
         Ok(Self { plaintext })
+    }
+
+    /// Returns the same opaque fixture with its typed tenant lifecycle changed.
+    #[doc(hidden)]
+    pub fn with_lifecycle(&self, lifecycle: TenantLifecycleState) -> Result<Self, CatalogFailure> {
+        let mut plaintext = self.plaintext.clone();
+        let start = plaintext
+            .len()
+            .checked_sub(5)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let suffix = plaintext
+            .get_mut(start..)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        suffix.copy_from_slice(match lifecycle {
+            TenantLifecycleState::Active => &[1, 4, 0, 1, 1],
+            TenantLifecycleState::ReadOnly => &[2, 4, 0, 1, 1],
+            TenantLifecycleState::Suspended => &[3, 4, 0, 1, 1],
+            TenantLifecycleState::Purging => &[4, 4, 0, 1, 1],
+            TenantLifecycleState::Purged => &[5, 4, 0, 1, 1],
+        });
+        Self::from_bytes(&plaintext)
     }
 }
 

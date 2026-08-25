@@ -2,21 +2,20 @@ use std::error::Error;
 use std::sync::Arc;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use positron_domain::routing::SignalKind;
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
     NativeLogAdmissionGroups,
 };
 use positron_ingest::{LokiPushRequestEncoding, OtlpLogsRequestEncoding};
-use positron_kernel::{ActiveSegmentLedger, SegmentScope};
-use positron_kernel::{CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
 use positron_query::{
-    QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
+    QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryTerminal,
 };
 use prost::Message;
 
-use super::schema_maintenance::{Fixture, open_catalog, request};
+use super::super::query::QueryTestOutcome;
+use super::schema_maintenance::{Fixture, request};
 use crate::services::{ReceiverTestBackend, ServiceFailure, ServiceHandle};
 
 #[test]
@@ -89,11 +88,6 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         );
     }
 
-    let catalog = open_catalog(&initialized)?;
-    let scope = SegmentScope::new(initialized.tenant, SignalKind::Logs, initialized.logs_shard);
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
-    let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)?;
-    let query_service = QueryService::new(initialized.resource_governor(), &ledger, 100);
     let context = initialized.attribute(
         PresentedCredential::parse(&query_secret)?,
         RequestedIntent::Query,
@@ -101,19 +95,17 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
     )?;
     let source = "logs | range query_time 0 100 | limit 16";
 
-    let exact = query_service.plan_pipeline(
+    let exact_events = match services.query_events_for_test(
         context,
         source,
         QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?.with_cpu_work_units(16)?,
-    )?;
-    let schema = services
-        .schema_sessions
-        .session(initialized.tenant, initialized.resource_governor())?;
-    let exact_events = schema
-        .with_catalog_view(initialized.tenant, |view| {
-            query_service.execute_with_schema(exact, view)
-        })??
-        .collect::<Vec<_>>();
+        None,
+    )? {
+        QueryTestOutcome::Events(events) => events,
+        QueryTestOutcome::Failure(code) => {
+            return Err(format!("exact query failed: {code:?}").into());
+        },
+    };
     assert!(
         matches!(
             exact_events.last(),
@@ -157,17 +149,17 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         super::super::failure::collect_query_bodies(header_after_terminal),
         Err(ServiceFailure::Internal)
     );
-    let paged_service = QueryService::new(initialized.resource_governor(), &ledger, 1);
-    let paged = paged_service.plan_pipeline(
+    let paged_events = match services.query_events_for_test(
         context,
         source,
         QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?.with_cpu_work_units(16)?,
-    )?;
-    let paged_events = schema
-        .with_catalog_view(initialized.tenant, |_view| {
-            paged_service.execute_page(paged)
-        })??
-        .collect::<Vec<_>>();
+        Some(1),
+    )? {
+        QueryTestOutcome::Events(events) => events,
+        QueryTestOutcome::Failure(code) => {
+            return Err(format!("paged query failed: {code:?}").into());
+        },
+    };
     assert!(
         matches!(
             paged_events.last(),
@@ -184,16 +176,17 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         Err(ServiceFailure::Internal)
     );
 
-    let exhausted = query_service.plan_pipeline(
+    let exhausted_events = match services.query_events_for_test(
         context,
         source,
         QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?.with_cpu_work_units(15)?,
-    )?;
-    let exhausted_events = schema
-        .with_catalog_view(initialized.tenant, |view| {
-            query_service.execute_with_schema(exhausted, view)
-        })??
-        .collect::<Vec<_>>();
+        None,
+    )? {
+        QueryTestOutcome::Events(events) => events,
+        QueryTestOutcome::Failure(code) => {
+            return Err(format!("exhausted query failed: {code:?}").into());
+        },
+    };
     assert!(matches!(
         exhausted_events.first(),
         Some(QueryEvent::Header(_))
@@ -257,15 +250,18 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
         Ok(vec!["one".to_owned(), "two".to_owned()])
     );
 
-    let refused = match query_service.plan_pipeline(
+    let refused = match services.query_events_for_test(
         context,
         source,
         QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?.with_cpu_work_units(17)?,
-    ) {
-        Ok(_) => return Err("17 CPU work units exceeded the production query pool".into()),
-        Err(failure) => failure,
+        None,
+    )? {
+        QueryTestOutcome::Failure(code) => code,
+        QueryTestOutcome::Events(_) => {
+            return Err("17 CPU work units exceeded the production query pool".into());
+        },
     };
-    assert_eq!(refused.code(), QueryFailureCode::ResourceAdmissionRefused);
+    assert_eq!(refused, QueryFailureCode::ResourceAdmissionRefused);
     Ok(())
 }
 
@@ -326,12 +322,12 @@ fn public_query_route_preserves_failure_class_and_never_returns_incomplete_rows(
 #[test]
 fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
 -> Result<(), Box<dyn Error>> {
-    for (state, code) in [
-        ("active", 1_u8),
-        ("read-only", 2),
-        ("suspended", 3),
-        ("purging", 4),
-        ("purged", 5),
+    for (state, lifecycle, ingest_allowed, query_allowed) in [
+        ("active", TenantLifecycleState::Active, true, true),
+        ("read-only", TenantLifecycleState::ReadOnly, false, true),
+        ("suspended", TenantLifecycleState::Suspended, false, false),
+        ("purging", TenantLifecycleState::Purging, false, false),
+        ("purged", TenantLifecycleState::Purged, false, false),
     ] {
         let fixture = Fixture::new()?;
         let (initialized, ingest, query_secret) = fixture.initialized()?;
@@ -345,34 +341,28 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
                 1
             );
         }
-        let catalog = open_catalog(&initialized)?;
-        let scope = SegmentScope::new(initialized.tenant, SignalKind::Logs, initialized.logs_shard);
-        let protection = initialized.key.segment_key(initialized.instance, scope)?;
-        let ledger =
-            ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)?;
         let context = initialized.attribute(
             PresentedCredential::parse(&query_secret)?,
             RequestedIntent::Query,
             CompatibilityHints::none(),
         )?;
-        let service = QueryService::new(initialized.resource_governor(), &ledger, 1);
-        let query = service
-            .plan_pipeline(
-                context,
-                "logs | range query_time 0 100 | limit 2",
-                QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)?
-                    .with_cpu_work_units(16)?,
-            )
-            .map_err(|failure| format!("{state} plan failed: {failure:?}"))?;
-        let events = service
-            .execute_page(query)
-            .map_err(|failure| format!("{state} initial page failed: {failure:?}"))?
-            .collect::<Vec<_>>();
+        let events = match services.query_events_for_test(
+            context,
+            "logs | range query_time 0 100 | limit 2",
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)?
+                .with_cpu_work_units(16)?,
+            Some(1),
+        )? {
+            QueryTestOutcome::Events(events) => events,
+            QueryTestOutcome::Failure(code) => {
+                return Err(format!("{state} initial page failed: {code:?}").into());
+            },
+        };
         let cursor = match events.last() {
             Some(QueryEvent::Terminal(QueryTerminal::Continued(cursor))) => cursor.clone(),
             _ => return Err(format!("{state} query did not produce a cursor").into()),
         };
-        publish_lifecycle(&catalog, code, code)?;
+        initialized.set_governance_lifecycle_for_test(lifecycle)?;
         let contended_authorization = services.authorize_logs(&ingest);
         let direct_attribution = initialized.attribute(
             PresentedCredential::parse(&ingest)?,
@@ -381,10 +371,10 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
         );
         assert_eq!(
             direct_attribution.is_ok(),
-            code == 1,
+            ingest_allowed,
             "{state} stale attribution"
         );
-        if code == 1 {
+        if ingest_allowed {
             assert!(
                 contended_authorization.is_ok(),
                 "{state} read-only authorization must not require the writer"
@@ -396,61 +386,51 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
                 "{state} lifecycle rejection must remain authorization-shaped"
             );
         }
-        drop(service);
-        drop(ledger);
-        drop(catalog);
-        let durable_identity = initialized.durable_identity()?;
-        let durable_ingest = durable_identity.attribute(
-            &initialized.key,
+        let durable_ingest = initialized.attribute(
             PresentedCredential::parse(&ingest)?,
             RequestedIntent::Ingest,
             CompatibilityHints::none(),
         );
-        let durable_query = durable_identity.attribute(
-            &initialized.key,
+        let durable_query = initialized.attribute(
             PresentedCredential::parse(&query_secret)?,
             RequestedIntent::Query,
             CompatibilityHints::none(),
         );
         assert_eq!(
             durable_ingest.is_ok(),
-            code == 1,
+            ingest_allowed,
             "{state} ingest identity state"
         );
         assert_eq!(
             durable_query.is_ok(),
-            code <= 2,
+            query_allowed,
             "{state} query identity state"
         );
 
-        let reopened_catalog = open_catalog(&initialized)?;
-        let reopened_protection = initialized.key.segment_key(initialized.instance, scope)?;
-        let reopened_ledger = ActiveSegmentLedger::open(
-            &initialized._authority,
-            &reopened_catalog,
-            scope,
-            reopened_protection,
-        )?;
-        let resumed_service =
-            QueryService::new(initialized.resource_governor(), &reopened_ledger, 1);
         let before = initialized
             .resource_governor()
             .inspect()?
             .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
-        let resumed = resumed_service.resume(context, &cursor);
-        if code == 1 {
-            let _ = resumed
-                .map_err(|failure| format!("{state} resume failed: {failure:?}"))?
-                .collect::<Vec<_>>();
+        let resumed = services.resume_query_events_for_test(context, &cursor, 1)?;
+        if ingest_allowed {
+            match resumed {
+                QueryTestOutcome::Events(_) => {},
+                QueryTestOutcome::Failure(code) => {
+                    return Err(format!("{state} resume failed: {code:?}").into());
+                },
+            }
         } else {
-            let failure = resumed.expect_err("lifecycle transition must reject the stale context");
-            assert_eq!(failure.code(), QueryFailureCode::Unauthorized, "{state}");
+            assert_eq!(
+                resumed,
+                QueryTestOutcome::Failure(QueryFailureCode::Unauthorized),
+                "{state}"
+            );
         }
         let after = initialized
             .resource_governor()
             .inspect()?
             .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
-        if code == 1 {
+        if ingest_allowed {
             assert_eq!(after, 0, "{state} completion did not release query work");
         } else {
             assert_eq!(
@@ -458,9 +438,6 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
                 "{state} lifecycle rejection leaked query work"
             );
         }
-        drop(resumed_service);
-        drop(reopened_ledger);
-        drop(reopened_catalog);
     }
     Ok(())
 }
@@ -479,9 +456,7 @@ fn read_only_query_uses_the_current_durable_identity_after_transition() -> Resul
             1
         );
     }
-    let catalog = open_catalog(&initialized)?;
-    publish_lifecycle(&catalog, 2, 0xe5)?;
-    drop(catalog);
+    initialized.set_governance_lifecycle_for_test(TenantLifecycleState::ReadOnly)?;
 
     assert_eq!(
         services.query_log_bodies(
@@ -498,30 +473,28 @@ fn read_only_query_uses_the_current_durable_identity_after_transition() -> Resul
 #[test]
 fn admitted_active_ingest_is_revalidated_before_append_after_lifecycle_transition()
 -> Result<(), Box<dyn Error>> {
-    for (state, transaction, restore_transaction) in [
-        (2_u8, 0xf1_u8, 0x01_u8),
-        (3, 0xf2, 0x02),
-        (4, 0xf3, 0x03),
-        (5, 0xf4, 0x04),
+    for (state, lifecycle) in [
+        ("read-only", TenantLifecycleState::ReadOnly),
+        ("suspended", TenantLifecycleState::Suspended),
+        ("purging", TenantLifecycleState::Purging),
+        ("purged", TenantLifecycleState::Purged),
     ] {
         let fixture = Fixture::new()?;
         let (initialized, ingest, query_secret) = fixture.initialized()?;
         let services = ServiceHandle::new(Arc::clone(&initialized))?;
         let context = services.authorize_logs(&ingest)?;
-        let governor_before = initialized._authority.governor().inspect()?;
+        let governor_before = initialized.resource_governor().inspect()?;
         let admission = services.admit_logs(context)?;
         let reservation = admission.take()?;
 
-        let catalog = open_catalog(&initialized)?;
-        publish_lifecycle(&catalog, state, transaction)?;
-        drop(catalog);
+        initialized.set_governance_lifecycle_for_test(lifecycle)?;
 
         assert_eq!(
             services.ingest_decoded_otlp_logs(context, request("must-not-append"), reservation),
             Err(ServiceFailure::Unauthorized),
             "state {state}"
         );
-        let governor_after = initialized._authority.governor().inspect()?;
+        let governor_after = initialized.resource_governor().inspect()?;
         assert_eq!(
             governor_after.outstanding_total(),
             governor_before.outstanding_total(),
@@ -545,9 +518,7 @@ fn admitted_active_ingest_is_revalidated_before_append_after_lifecycle_transitio
             );
         }
 
-        let catalog = open_catalog(&initialized)?;
-        publish_lifecycle(&catalog, 1, restore_transaction)?;
-        drop(catalog);
+        initialized.set_governance_lifecycle_for_test(TenantLifecycleState::Active)?;
         assert!(
             services
                 .query_log_bodies(
@@ -569,9 +540,7 @@ fn stale_active_ingest_context_is_rejected_before_receiver_admission() -> Result
     let (initialized, ingest, _) = fixture.initialized()?;
     let services = ServiceHandle::new(Arc::clone(&initialized))?;
     let context = services.authorize_logs(&ingest)?;
-    let catalog = open_catalog(&initialized)?;
-    publish_lifecycle(&catalog, 2, 0xd1)?;
-    drop(catalog);
+    initialized.set_governance_lifecycle_for_test(TenantLifecycleState::ReadOnly)?;
 
     let before = initialized.resource_governor().inspect()?;
     assert!(
@@ -603,9 +572,7 @@ fn stale_active_ingest_context_rejects_empty_request_before_native_planning()
     let baseline = initialized.resource_governor().inspect()?;
     let admission = services.admit_logs(context)?;
     let reservation = admission.take()?;
-    let catalog = open_catalog(&initialized)?;
-    publish_lifecycle(&catalog, 2, 0xd2)?;
-    drop(catalog);
+    initialized.set_governance_lifecycle_for_test(TenantLifecycleState::ReadOnly)?;
 
     let result = services.ingest_decoded_otlp_logs(
         context,
@@ -636,9 +603,7 @@ fn stale_active_ingest_context_is_rejected_before_protocol_decode() -> Result<()
     let context = services.authorize_logs(&ingest)?;
     let admission = services.admit_logs(context)?;
     let reservation = admission.take()?;
-    let catalog = open_catalog(&initialized)?;
-    publish_lifecycle(&catalog, 2, 0xd3)?;
-    drop(catalog);
+    initialized.set_governance_lifecycle_for_test(TenantLifecycleState::ReadOnly)?;
 
     let result = services.ingest_encoded_otlp_http_logs(
         context,
@@ -650,39 +615,6 @@ fn stale_active_ingest_context_is_rejected_before_protocol_decode() -> Result<()
         matches!(result, Err(ServiceFailure::Unauthorized)),
         "lifecycle rejection must precede malformed-payload decoding"
     );
-    Ok(())
-}
-
-fn publish_lifecycle(
-    catalog: &positron_kernel::Catalog<'_>,
-    state: u8,
-    transaction_byte: u8,
-) -> Result<(), Box<dyn Error>> {
-    let basis = catalog.pin()?;
-    let mut objects = basis
-        .object_identities()
-        .map(|identity| {
-            let bytes = basis.object(identity)?.ok_or("missing Catalog object")?;
-            let mut bytes = bytes.to_vec();
-            if bytes.starts_with(b"POSGOV01")
-                || bytes.starts_with(b"POSGOV02")
-                || bytes.starts_with(b"POSGOV03")
-            {
-                let offset = bytes.len().checked_sub(5).ok_or("identity too short")?;
-                bytes[offset] = state;
-            }
-            CatalogObject::new(bytes).map_err(|failure| -> Box<dyn Error> { Box::new(failure) })
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    catalog.commit(
-        basis.identity(),
-        CatalogProposal::new(
-            TransactionId::new([transaction_byte; 16])?,
-            FormatEpoch::CATALOG_V1,
-            std::mem::take(&mut objects),
-        )?,
-        None,
-    )?;
     Ok(())
 }
 
