@@ -89,15 +89,25 @@ impl TailSession<'_, '_, '_, '_> {
         if let Some(header) = self.header.take() {
             return Some(TailEvent::Header(header));
         }
-        if self.revalidate().is_err() || self.terminal.is_some() {
+        if let Err(failure) = self.revalidate() {
+            if self.terminal.is_none() {
+                self.terminal = Some(super::admission::terminal_for_failure(
+                    failure.code(),
+                    Some(self.cursor.clone()),
+                ));
+            }
+            return self.take_terminal();
+        }
+        if self.terminal.is_some() {
             return self.take_terminal();
         }
         if let Some(batch) = self.buffer.front_cloned() {
             let (digest, sequence) = match self.pending_batches.front() {
                 Some((_, digest)) => (*digest, self.next_sequence),
                 None => {
-                    let _ = self.sync_progress();
-                    self.terminal = Some(TailTerminal::StoreUnavailable(Some(self.cursor.clone())));
+                    self.terminal_after_progress_failure(TailTerminal::StoreUnavailable(Some(
+                        self.cursor.clone(),
+                    )));
                     return self.take_terminal();
                 },
             };
@@ -116,11 +126,11 @@ impl TailSession<'_, '_, '_, '_> {
             Ok(()) if !self.buffer.is_empty() => self.poll(),
             Ok(()) => Some(TailEvent::Idle),
             Err(failure) => {
-                let _ = self.sync_progress();
-                self.terminal = Some(super::admission::terminal_for_failure(
+                let terminal = super::admission::terminal_for_failure(
                     failure.code(),
                     Some(self.cursor.clone()),
-                ));
+                );
+                self.terminal_after_progress_failure(terminal);
                 self.take_terminal()
             },
         }
@@ -134,11 +144,25 @@ impl TailSession<'_, '_, '_, '_> {
     }
     fn finish(&mut self, kind: fn(Option<TailCursor>) -> TailTerminal) {
         if self.terminal.is_none() {
-            let _ = self.sync_progress();
             self.buffer.clear();
             self.pending_batches.clear();
             self.terminal = Some(kind(Some(self.cursor.clone())));
+            self.replace_terminal_after_progress_failure();
         }
+    }
+
+    fn replace_terminal_after_progress_failure(&mut self) {
+        if let Err(failure) = self.sync_progress() {
+            self.terminal = Some(super::admission::terminal_for_failure(
+                failure.code(),
+                Some(self.cursor.clone()),
+            ));
+        }
+    }
+
+    pub(super) fn terminal_after_progress_failure(&mut self, terminal: TailTerminal) {
+        self.terminal = Some(terminal);
+        self.replace_terminal_after_progress_failure();
     }
     fn take_terminal(&mut self) -> Option<TailEvent> {
         if let Some(terminal) = self.terminal.as_mut()

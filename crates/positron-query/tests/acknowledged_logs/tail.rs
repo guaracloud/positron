@@ -12,7 +12,8 @@ use positron_query::{
 };
 
 use super::support::{
-    CancellingStageWorkMeter, TestClock, stage_work_service, zero_work_clock_service,
+    CancellingStageWorkMeter, FailAfterArmClock, TestClock, stage_work_service,
+    zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -47,6 +48,33 @@ fn tail_reads_acknowledged_history_then_stays_idle_until_disconnect() -> Result<
     assert!(matches!(
         tail.poll(),
         Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_revalidation_failure_emits_one_terminal() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-revalidation-failure")?;
+    let clock = FailAfterArmClock::shared(0);
+    let service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        clock.clone(),
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    clock.arm();
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable(Some(_))))
     ));
     assert!(tail.poll().is_none());
     Ok(())

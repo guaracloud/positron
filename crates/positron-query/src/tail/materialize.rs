@@ -169,8 +169,9 @@ impl TailSession<'_, '_, '_, '_> {
             &mut digest_memory,
         )?;
         if self.buffer.push(records).is_err() {
-            let _ = self.sync_progress();
-            self.terminal = Some(TailTerminal::ConsumerLagged(Some(self.cursor.clone())));
+            self.terminal_after_progress_failure(TailTerminal::ConsumerLagged(Some(
+                self.cursor.clone(),
+            )));
             return Ok(());
         }
         self.pending_batches.push_back((positions, digest));
