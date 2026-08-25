@@ -257,13 +257,13 @@ impl GovernanceFixtureObject {
         let suffix = plaintext
             .get_mut(start..)
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
-        suffix.copy_from_slice(match lifecycle {
-            TenantLifecycleState::Active => &[1, 4, 0, 1, 1],
-            TenantLifecycleState::ReadOnly => &[2, 4, 0, 1, 1],
-            TenantLifecycleState::Suspended => &[3, 4, 0, 1, 1],
-            TenantLifecycleState::Purging => &[4, 4, 0, 1, 1],
-            TenantLifecycleState::Purged => &[5, 4, 0, 1, 1],
-        });
+        suffix[0] = match lifecycle {
+            TenantLifecycleState::Active => 1,
+            TenantLifecycleState::ReadOnly => 2,
+            TenantLifecycleState::Suspended => 3,
+            TenantLifecycleState::Purging => 4,
+            TenantLifecycleState::Purged => 5,
+        };
         Self::from_bytes(&plaintext)
     }
 }
