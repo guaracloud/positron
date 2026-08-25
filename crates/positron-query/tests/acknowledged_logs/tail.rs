@@ -32,18 +32,109 @@ fn tail_reads_acknowledged_history_then_stays_idle_until_disconnect() -> Result<
     };
     assert_eq!(batch.records().len(), 1);
     assert_eq!(batch.records()[0].body_text(), Some("one"));
+    tail.acknowledge(batch.sequence(), batch.digest())?;
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
     fixture.kernel.append_log("live", 2, 2)?;
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("live tail batch missing after ingest append".into());
     };
     assert_eq!(batch.records()[0].body_text(), Some("live"));
+    tail.acknowledge(batch.sequence(), batch.digest())?;
     tail.disconnect();
     assert!(matches!(
         tail.poll(),
         Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
     ));
     assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_poll_requires_an_explicit_acknowledgement_before_advancing_cursor()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-explicit-ack")?;
+    fixture.kernel.append_log("one", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = tail.cursor().clone();
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("tail batch missing".into());
+    };
+
+    assert_eq!(tail.cursor(), &safe_cursor);
+    assert_eq!(
+        tail.acknowledge(batch.sequence() + 1, batch.digest())
+            .expect_err("out-of-order acknowledgement must be rejected")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    assert_eq!(
+        tail.acknowledge(batch.sequence(), [9; 32])
+            .expect_err("forged acknowledgement digest must be rejected")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    assert_ne!(tail.cursor(), &safe_cursor);
+    tail.disconnect();
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn tail_disconnect_before_ack_replays_the_same_batch_identity() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-ack-replay")?;
+    fixture.kernel.append_log("one", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(first)) = tail.poll() else {
+        return Err("initial tail batch missing".into());
+    };
+    let cursor = tail.cursor().clone();
+    tail.disconnect();
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+    ));
+    drop(tail);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut resumed = service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(repeated)) = resumed.poll() else {
+        return Err("replayed tail batch missing".into());
+    };
+    assert_eq!(repeated.sequence(), first.sequence());
+    assert_eq!(repeated.digest(), first.digest());
+    assert_eq!(repeated.prior_digest(), first.prior_digest());
+    assert_eq!(repeated.records().len(), first.records().len());
+    assert_eq!(
+        repeated.records()[0].body_text(),
+        first.records()[0].body_text()
+    );
+    assert!(repeated.records()[0].replayed());
     Ok(())
 }
 
@@ -61,7 +152,10 @@ fn tail_cursor_resumes_after_ledger_reopen_without_a_gap() -> Result<(), Box<dyn
         )?;
         let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
         assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-        assert!(matches!(tail.poll(), Some(TailEvent::Batch(_))));
+        let Some(TailEvent::Batch(batch)) = tail.poll() else {
+            return Err("restart history batch missing".into());
+        };
+        tail.acknowledge(batch.sequence(), batch.digest())?;
         tail.cursor().clone()
     };
 
@@ -650,6 +744,7 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
     assert_eq!(batch.records().len(), 2);
     assert_eq!(batch.records()[0].body_text(), Some("one"));
     assert_eq!(batch.records()[1].body_text(), Some("two"));
+    tail.acknowledge(batch.sequence(), batch.digest())?;
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
     fixture.kernel.append_log("live-one", 3, 3)?;
     fixture.kernel.append_logs_to(
@@ -668,6 +763,7 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
     };
     assert_eq!(batch.records()[0].body_text(), Some("live-one"));
     assert_eq!(batch.records()[1].body_text(), Some("live-two"));
+    tail.acknowledge(batch.sequence(), batch.digest())?;
     let cursor = tail.cursor().clone();
     let mismatch = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?])?;
     let query = service.plan_pipeline(
@@ -751,10 +847,12 @@ fn tail_historical_max_rows_is_global_across_shards() -> Result<(), Box<dyn Erro
         return Err("global shard-limited batch missing".into());
     };
     assert_eq!(batch.records().len(), 2);
+    tail.acknowledge(batch.sequence(), batch.digest())?;
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("remaining bounded historical batch missing".into());
     };
     assert_eq!(batch.records().len(), 2);
+    tail.acknowledge(batch.sequence(), batch.digest())?;
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
     Ok(())
 }
@@ -818,6 +916,7 @@ fn tail_resume_starts_after_the_last_delivered_record_in_a_multi_record_block()
         return Err("first partial tail batch missing".into());
     };
     assert_eq!(batch.records()[0].body_text(), Some("row-1"));
+    first.acknowledge(batch.sequence(), batch.digest())?;
     let cursor = first.cursor().clone();
     drop(first);
 
@@ -858,6 +957,7 @@ fn tail_resume_preserves_batch_chain_and_cumulative_output_budget() -> Result<()
     let Some(TailEvent::Batch(first)) = tail.poll() else {
         return Err("first tail batch missing".into());
     };
+    tail.acknowledge(first.sequence(), first.digest())?;
     let cursor = tail.cursor().clone();
     assert_eq!(first.sequence(), 0);
     assert_eq!(first.prior_digest(), [0; 32]);
@@ -875,6 +975,7 @@ fn tail_resume_preserves_batch_chain_and_cumulative_output_budget() -> Result<()
     assert_eq!(second.sequence(), 1);
     assert_eq!(second.prior_digest(), first.digest());
     assert_eq!(second.records()[0].body_text(), Some("second"));
+    resumed.acknowledge(second.sequence(), second.digest())?;
     assert!(matches!(
         resumed.poll(),
         Some(TailEvent::Terminal(TailTerminal::BudgetExhausted(Some(_))))
@@ -1055,6 +1156,7 @@ fn tail_reads_committed_active_and_sealed_rows_without_a_complete_terminal()
         .filter_map(|record| record.body_text())
         .collect::<Vec<_>>();
     assert_eq!(bodies, ["sealed", "active"]);
+    tail.acknowledge(batch.sequence(), batch.digest())?;
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
     Ok(())
 }

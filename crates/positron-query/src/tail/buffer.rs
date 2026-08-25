@@ -98,6 +98,10 @@ impl TailBuffer {
         Some(batch)
     }
 
+    pub(crate) fn front_cloned(&self) -> Option<Vec<QueryRecord>> {
+        self.batches.front().cloned()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.batches.is_empty()
     }

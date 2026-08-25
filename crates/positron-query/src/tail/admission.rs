@@ -280,6 +280,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             next_sequence,
             prior_digest,
             replay,
+            last_acknowledged: None,
             scanned_bytes,
             decoded_records,
             output_rows,

@@ -49,6 +49,7 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) next_sequence: u64,
     pub(super) prior_digest: [u8; 32],
     pub(super) replay: bool,
+    pub(super) last_acknowledged: Option<(u64, [u8; 32])>,
     pub(super) scanned_bytes: u64,
     pub(super) decoded_records: u64,
     pub(super) output_rows: u64,
@@ -60,6 +61,25 @@ impl TailSession<'_, '_, '_, '_> {
     pub fn cursor(&self) -> &TailCursor {
         &self.cursor
     }
+
+    pub fn acknowledge(&mut self, sequence: u64, digest: [u8; 32]) -> Result<(), QueryFailure> {
+        let Some((positions, expected_digest)) = self.pending_batches.front().cloned() else {
+            return (self.last_acknowledged == Some((sequence, digest)))
+                .then_some(())
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor));
+        };
+        if sequence != self.next_sequence || digest != expected_digest {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        if self.buffer.pop().is_none() {
+            return Err(super::internal());
+        }
+        self.pending_batches.pop_front();
+        self.advance(positions, digest)?;
+        self.last_acknowledged = Some((sequence, digest));
+        Ok(())
+    }
+
     pub fn poll(&mut self) -> Option<TailEvent> {
         if self.terminal_emitted {
             return None;
@@ -70,24 +90,20 @@ impl TailSession<'_, '_, '_, '_> {
         if self.revalidate().is_err() || self.terminal.is_some() {
             return self.take_terminal();
         }
-        if let Some(batch) = self.buffer.pop() {
-            let (positions, digest) = match self.pending_batches.pop_front() {
-                Some(pending) => pending,
+        if let Some(batch) = self.buffer.front_cloned() {
+            let (digest, sequence) = match self.pending_batches.front() {
+                Some((_, digest)) => (*digest, self.next_sequence),
                 None => {
                     let _ = self.sync_progress();
                     self.terminal = Some(TailTerminal::StoreUnavailable(Some(self.cursor.clone())));
                     return self.take_terminal();
                 },
             };
-            let prior = self.prior_digest;
-            if self.advance(positions, digest).is_err() {
-                let _ = self.sync_progress();
-                self.terminal = Some(TailTerminal::StoreUnavailable(Some(self.cursor.clone())));
-                return self.take_terminal();
-            }
-            let sequence = self.next_sequence.saturating_sub(1);
             return Some(TailEvent::Batch(QueryBatch::new(
-                sequence, batch, prior, digest,
+                sequence,
+                batch,
+                self.prior_digest,
+                digest,
             )));
         }
         if let Some(terminal) = self.terminal.take() {
