@@ -2,19 +2,24 @@ use super::snapshot_lease::MAX_SNAPSHOT_LEASES;
 use super::snapshot_lease_record::SnapshotLeaseId;
 use super::{LedgerFailure, LedgerFailureCode};
 
+// A create may publish one new lease while pruning the maximum number of
+// expired leases. Keep that one bounded extra cleanup identity explicit rather
+// than silently relying on the active-lease ceiling.
+const MAX_PENDING_LEASE_RELEASES: usize = MAX_SNAPSHOT_LEASES + 1;
+
 /// Fixed-capacity cleanup intent owned by the ledger that owns snapshot leases.
 ///
-/// A release is registered before fallible catalog publication. The capacity is
-/// exactly the active lease ceiling, so every valid active identity always has a
-/// nonallocating retry slot.
+/// A release is registered before fallible catalog publication. The capacity
+/// covers every active identity plus the one new identity that a create can
+/// publish alongside a full expired set, so retries remain nonallocating.
 pub(super) struct PendingLeaseReleases {
-    identities: [Option<SnapshotLeaseId>; MAX_SNAPSHOT_LEASES],
+    identities: [Option<SnapshotLeaseId>; MAX_PENDING_LEASE_RELEASES],
 }
 
 impl PendingLeaseReleases {
     pub(super) const fn new() -> Self {
         Self {
-            identities: [None; MAX_SNAPSHOT_LEASES],
+            identities: [None; MAX_PENDING_LEASE_RELEASES],
         }
     }
 
@@ -42,5 +47,34 @@ impl PendingLeaseReleases {
 
     pub(super) fn clear(&mut self) {
         self.identities.fill(None);
+    }
+
+    pub(super) fn remove(&mut self, identity: SnapshotLeaseId) {
+        if let Some(slot) = self
+            .identities
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|held| held == identity))
+        {
+            *slot = None;
+        }
+    }
+}
+
+pub(super) fn register_all(
+    pending: &mut PendingLeaseReleases,
+    identities: impl IntoIterator<Item = SnapshotLeaseId>,
+) -> Result<(), LedgerFailure> {
+    for identity in identities {
+        pending.register(identity)?;
+    }
+    Ok(())
+}
+
+pub(super) fn remove_all(
+    pending: &mut PendingLeaseReleases,
+    identities: impl IntoIterator<Item = SnapshotLeaseId>,
+) {
+    for identity in identities {
+        pending.remove(identity);
     }
 }

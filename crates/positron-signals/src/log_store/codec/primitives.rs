@@ -127,6 +127,15 @@ impl<'a> Input<'a> {
         Ok(())
     }
 
+    pub(super) fn observe_decoded_record(&self) -> Result<(), LogStoreFailure> {
+        if let Some(observer) = self.observer {
+            observer
+                .observe_decoded_records(1)
+                .map_err(LogStoreFailure::observation)?;
+        }
+        Ok(())
+    }
+
     fn poll_copy(&self, count: usize) -> Result<(), LogStoreFailure> {
         self.poll_cancellation()?;
         let chunks = count / CANCELLATION_POLL_BYTES;

@@ -5,11 +5,12 @@ use crate::{ResourceReservation, WorkClaim, WorkKind};
 use super::capacity::lease_claim;
 use super::snapshot_lease::{MAX_SNAPSHOT_LEASES, expired_in_scope, publish_many, records};
 use super::snapshot_lease_codec::encode;
-use super::snapshot_lease_record::{SnapshotLeaseId, validate_active_lease};
+use super::snapshot_lease_record::{LeaseResumeMarker, SnapshotLeaseId, validate_active_lease};
 use super::{LedgerFailure, LedgerFailureCode, SegmentScope};
 
 pub(super) struct RecoveredLeases<'kernel> {
     pub(super) reservations: BTreeMap<SnapshotLeaseId, ResourceReservation<'kernel>>,
+    pub(super) resume_markers: BTreeMap<SnapshotLeaseId, LeaseResumeMarker>,
     pub(super) last_observed: u64,
 }
 
@@ -58,7 +59,20 @@ pub(super) fn recover_reservations<'kernel>(
         publish_many(catalog, snapshot, &remove, additions)?;
     }
     let mut retained = BTreeMap::new();
+    let mut resume_markers = BTreeMap::new();
     for record in active {
+        if record.resume_count > 0 {
+            resume_markers.insert(
+                record.identity,
+                LeaseResumeMarker {
+                    sequence: record.last_resume_sequence.unwrap_or_default(),
+                    prior_digest: record.last_resume_prior_digest,
+                    attempts: record.resume_count,
+                    repeats: record.repeated_batch_count,
+                    usage: record.usage,
+                },
+            );
+        }
         let encoded = encode(&record)?;
         let claim = WorkClaim::tenant(
             scope.tenant,
@@ -76,6 +90,7 @@ pub(super) fn recover_reservations<'kernel>(
     }
     Ok(RecoveredLeases {
         reservations: retained,
+        resume_markers,
         last_observed: if persisted_last_observed == 0 { 0 } else { now },
     })
 }

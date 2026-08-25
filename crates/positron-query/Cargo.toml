@@ -30,4 +30,4 @@ regex-syntax = "=0.8.11"
 [dev-dependencies]
 positron-kernel = { path = "../positron-kernel", features = ["test-support"] }
 positron-policy = { path = "../positron-policy" }
-positron-runtime = { path = "../positron-runtime" }
+positron-runtime = { path = "../positron-runtime", features = ["test-support"] }

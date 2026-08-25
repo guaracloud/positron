@@ -27,7 +27,11 @@ fn pipeline_and_sql_share_one_plan_and_read_acknowledged_active_logs() -> Result
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "parity-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "parity-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("acknowledged", 20, 1)?;
 
     let service =
@@ -89,7 +93,11 @@ fn pipeline_and_sql_require_the_same_explicit_bounded_temporal_range() -> Result
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "temporal-parity-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "temporal-parity-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("inclusive-start", 10, 1)?;
     fixture.append_log("inside", 20, 2)?;
     fixture.append_log("exclusive-end", 30, 3)?;
@@ -172,7 +180,11 @@ fn sql_compiles_typed_projection_and_body_filter_to_the_pipeline_plan() -> Resul
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-typed-parity-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "sql-typed-parity-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("keep", 20, 1)?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
@@ -220,7 +232,11 @@ fn sql_compiles_search_and_grouped_count_to_the_same_typed_plan() -> Result<(), 
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-operators-parity-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "sql-operators-parity-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
@@ -479,7 +495,11 @@ fn sql_rejects_mutation_joins_and_unbounded_or_ambiguous_forms() -> Result<(), B
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-rejections-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "sql-rejections-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
@@ -566,7 +586,11 @@ fn sql_body_expressions_preserve_bounded_transform_parity() -> Result<(), Box<dy
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "sql-transform-parity-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "sql-transform-parity-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60);
@@ -643,7 +667,11 @@ fn versioned_native_pipeline_executes_through_the_typed_plan() -> Result<(), Box
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "versioned-pipeline-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "versioned-pipeline-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("versioned", 20, 1)?;
     let service =
         super::support::stage_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
@@ -678,7 +706,11 @@ fn versioned_pipeline_filters_on_an_intrinsic_body_literal() -> Result<(), Box<d
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-filter-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "pipeline-filter-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("keep", 20, 1)?;
     fixture.append_log("discard", 21, 2)?;
     let service =
@@ -718,7 +750,11 @@ fn versioned_pipeline_projects_bounded_intrinsic_columns() -> Result<(), Box<dyn
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-project-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "pipeline-project-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("projected", 20, 1)?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
@@ -762,7 +798,11 @@ fn versioned_pipeline_supports_bounded_exact_body_search() -> Result<(), Box<dyn
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-search-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "pipeline-search-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("exact match", 20, 1)?;
     fixture.append_log("other", 21, 2)?;
     let service =
@@ -818,7 +858,11 @@ fn versioned_pipeline_rejects_unimplemented_or_malformed_stages() -> Result<(), 
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-rejections-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "pipeline-rejections-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?;
@@ -897,25 +941,31 @@ fn advanced_native_page_execution_stays_with_the_pagination_authority() -> Resul
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(
+    let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "pipeline-page-authority-kernel",
+        &instance.governance_fixture_for_test()?,
     )?;
+    fixture.append_log("bounded", 20, 1)?;
     let service =
         super::support::zero_work_service(fixture.authority.governor(), fixture.ledger()?, 16);
     let query = service.plan_pipeline(
         context,
-        "pipeline:v1 logs | range query_time 0 1 | filter body == \"bounded\" | limit 1",
+        "pipeline:v1 logs | range query_time 0 100 | filter body == \"bounded\" | limit 1",
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
     )?;
-    let failure = service
-        .execute_page(query)
-        .err()
-        .ok_or("advanced native page execution was accepted")?;
-    assert_eq!(
-        failure.code(),
-        positron_query::QueryFailureCode::UnsupportedQuery
-    );
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    let body = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch
+                .records()
+                .first()
+                .and_then(|record| record.body_text()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("advanced native page did not emit a record")?;
+    assert_eq!(body, "bounded");
     Ok(())
 }
 
@@ -936,7 +986,11 @@ fn versioned_pipeline_counts_filtered_records_with_a_typed_aggregate() -> Result
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-count-kernel")?;
+    let fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "pipeline-count-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("keep", 20, 1)?;
     fixture.append_log("keep", 21, 2)?;
     fixture.append_log("discard", 22, 3)?;
@@ -982,7 +1036,11 @@ fn versioned_pipeline_orders_by_intrinsic_time_with_commit_tie_breaking()
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let mut fixture = KernelFixture::new(instance.default_tenant_id(), "pipeline-order-kernel")?;
+    let mut fixture = KernelFixture::new_with_identity(
+        instance.default_tenant_id(),
+        "pipeline-order-kernel",
+        &instance.governance_fixture_for_test()?,
+    )?;
     fixture.append_log("later", 20, 1)?;
     fixture.seal_and_reopen()?;
     fixture.append_log("earlier", 10, 2)?;
@@ -1025,9 +1083,10 @@ fn native_operator_work_consumes_the_cumulative_query_budget() -> Result<(), Box
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
-    let fixture = KernelFixture::new(
+    let fixture = KernelFixture::new_with_identity(
         instance.default_tenant_id(),
         "pipeline-operator-budget-kernel",
+        &instance.governance_fixture_for_test()?,
     )?;
     fixture.append_log("keep", 20, 1)?;
     let service =

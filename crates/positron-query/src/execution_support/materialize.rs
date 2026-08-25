@@ -51,7 +51,7 @@ pub(crate) fn query_record(
                     Some(value) => {
                         let mut observer = super::QueryValueObserver::new(
                             service,
-                            &mut state.cpu_work_units,
+                            &mut state.physical_cpu_work_units,
                             state.budget.cpu_work_units(),
                             state.cancellation.clone(),
                             crate::QueryWorkStage::Operators,
@@ -66,7 +66,7 @@ pub(crate) fn query_record(
                     Some(value) => {
                         let mut observer = super::QueryValueObserver::new(
                             service,
-                            &mut state.cpu_work_units,
+                            &mut state.physical_cpu_work_units,
                             state.budget.cpu_work_units(),
                             state.cancellation.clone(),
                             crate::QueryWorkStage::Operators,
@@ -82,7 +82,7 @@ pub(crate) fn query_record(
                     Some(value) => {
                         let mut observer = super::QueryValueObserver::new(
                             service,
-                            &mut state.cpu_work_units,
+                            &mut state.physical_cpu_work_units,
                             state.budget.cpu_work_units(),
                             state.cancellation.clone(),
                             crate::QueryWorkStage::Operators,
@@ -97,7 +97,7 @@ pub(crate) fn query_record(
                 crate::plan::FilterPredicate::AttributeEquals(query) => {
                     let mut observer = super::QueryValueObserver::new(
                         service,
-                        &mut state.cpu_work_units,
+                        &mut state.physical_cpu_work_units,
                         state.budget.cpu_work_units(),
                         state.cancellation.clone(),
                         crate::QueryWorkStage::Operators,
@@ -132,7 +132,7 @@ pub(crate) fn query_record(
             record.stored(),
             selected_columns,
             service,
-            &mut state.cpu_work_units,
+            &mut state.physical_cpu_work_units,
             cpu_limit,
             cancellation.clone(),
             transformed.memory(),

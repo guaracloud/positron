@@ -2,10 +2,14 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use crate::data_protection::{DataProtection, SecretKeyBytes};
+#[cfg(feature = "test-support")]
+use positron_domain::lifecycle::TenantLifecycleState;
 
+mod commit;
 mod failure;
 mod snapshot;
 
+pub use commit::{CatalogCommit, CatalogRotation};
 pub use failure::{CatalogFailure, CatalogFailureCode};
 pub use snapshot::CatalogSnapshot;
 pub(super) use snapshot::{AuditFrontier, SnapshotData};
@@ -221,6 +225,49 @@ impl std::fmt::Debug for CatalogObject {
     }
 }
 
+/// Opaque governance object capability used only by integration-test fixtures.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct GovernanceFixtureObject {
+    pub(super) plaintext: Vec<u8>,
+}
+
+#[cfg(feature = "test-support")]
+impl GovernanceFixtureObject {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CatalogFailure> {
+        if bytes.is_empty() || bytes.len() > MAX_CATALOG_OBJECT_BYTES {
+            return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
+        }
+        let mut plaintext = Vec::new();
+        plaintext
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        plaintext.extend_from_slice(bytes);
+        Ok(Self { plaintext })
+    }
+
+    /// Returns the same opaque fixture with its typed tenant lifecycle changed.
+    #[doc(hidden)]
+    pub fn with_lifecycle(&self, lifecycle: TenantLifecycleState) -> Result<Self, CatalogFailure> {
+        let mut plaintext = self.plaintext.clone();
+        let start = plaintext
+            .len()
+            .checked_sub(5)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let suffix = plaintext
+            .get_mut(start..)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        suffix[0] = match lifecycle {
+            TenantLifecycleState::Active => 1,
+            TenantLifecycleState::ReadOnly => 2,
+            TenantLifecycleState::Suspended => 3,
+            TenantLifecycleState::Purging => 4,
+            TenantLifecycleState::Purged => 5,
+        };
+        Self::from_bytes(&plaintext)
+    }
+}
+
 #[derive(Clone)]
 pub struct AuditIntent(pub(super) Vec<u8>);
 
@@ -324,58 +371,5 @@ impl GovernanceAuditRecord {
     #[must_use]
     pub fn intent(&self) -> &[u8] {
         &self.intent
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CatalogCommit {
-    pub(super) snapshot: CatalogSnapshot,
-    pub(super) audit: Option<GovernanceAuditRecord>,
-}
-
-/// The durable Catalog publications that authorize one completed root-key rotation.
-#[derive(Clone, Debug)]
-pub struct CatalogRotation {
-    pub(super) started: CatalogCommit,
-    pub(super) verified: CatalogCommit,
-    pub(super) completed: CatalogCommit,
-}
-
-impl CatalogRotation {
-    #[must_use]
-    pub fn started(&self) -> &CatalogCommit {
-        &self.started
-    }
-
-    #[must_use]
-    pub fn verified(&self) -> &CatalogCommit {
-        &self.verified
-    }
-
-    #[must_use]
-    pub fn completed(&self) -> &CatalogCommit {
-        &self.completed
-    }
-}
-
-impl CatalogCommit {
-    #[must_use]
-    pub fn identity(&self) -> CatalogGenerationId {
-        self.snapshot.identity()
-    }
-
-    #[must_use]
-    pub fn number(&self) -> u64 {
-        self.snapshot.number()
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> &CatalogSnapshot {
-        &self.snapshot
-    }
-
-    #[must_use]
-    pub fn governance_audit_record(&self) -> Option<&GovernanceAuditRecord> {
-        self.audit.as_ref()
     }
 }

@@ -2,11 +2,15 @@ mod codec;
 mod operation;
 mod resources;
 mod storage;
+#[cfg(any(test, feature = "test-support"))]
+mod test_support;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::GovernanceTestFixture;
 pub use types::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
     InitializationPlan, InitializedInstance,

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
-    BootstrapKeyCustody, InstanceBootstrapStorage, InstanceId, MountQualification,
-    OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
+    BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
+    MountQualification, OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
 
@@ -145,7 +145,11 @@ impl InitializationPlan {
 
 pub struct InitializedInstance {
     pub(crate) key: BootstrapKeyCustody,
+    // Fixture-only inspection data; product authorization always reads the
+    // current durable identity through `durable_identity`.
+    #[cfg(any(test, fuzzing))]
     pub(crate) identity: positron_governance::Identity,
+    #[cfg(any(test, fuzzing))]
     pub(super) audit: Vec<positron_governance::GovernanceAuditEntry>,
     pub(crate) _authority: StorageKernelResourceAuthority,
     pub(crate) instance: InstanceId,
@@ -175,6 +179,37 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
+    pub(crate) fn durable_identity(
+        &self,
+    ) -> Result<positron_governance::Identity, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let snapshot = Catalog::read_current_snapshot(&self._authority, self.instance, secret)
+            .map_err(|failure| {
+                let code = match failure.code() {
+                    CatalogFailureCode::ResourceAdmissionRefused
+                    | CatalogFailureCode::LimitExceeded => {
+                        BootstrapFailureCode::ResourceUnavailable
+                    },
+                    CatalogFailureCode::StorageUnavailable
+                    | CatalogFailureCode::ConcurrentWriter
+                    | CatalogFailureCode::StaleGeneration
+                    | CatalogFailureCode::IdempotencyConflict
+                    | CatalogFailureCode::InvalidInput
+                    | CatalogFailureCode::IntegrityCorruption
+                    | CatalogFailureCode::AuthenticationFailed
+                    | CatalogFailureCode::UnsupportedFormat => {
+                        BootstrapFailureCode::CatalogUnavailable
+                    },
+                };
+                BootstrapFailure::new(code)
+            })?;
+        positron_governance::Identity::open(&snapshot)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
+    }
+
     pub(crate) fn begin_shutdown(&self) -> Result<(), BootstrapFailure> {
         self._authority
             .begin_shutdown()
@@ -189,7 +224,11 @@ impl InitializedInstance {
         hints: positron_governance::CompatibilityHints,
     ) -> Result<positron_governance::AuthorizedContext, positron_governance::AttributionFailure>
     {
-        self.identity
+        // Never expose the boot-cached identity as a data-plane authority.
+        // Rebuild the immutable view from the current durable Catalog
+        // generation for every attribution request.
+        self.durable_identity()
+            .map_err(|_| positron_governance::AttributionFailure)?
             .attribute(&self.key, credential, intent, hints)
     }
 
@@ -199,7 +238,8 @@ impl InitializedInstance {
         self._authority.governor()
     }
 
-    pub fn inspect_governance(
+    #[cfg(any(test, fuzzing))]
+    pub fn inspect_governance_for_fixture(
         &self,
         context: positron_governance::AuthorizedContext,
     ) -> Result<

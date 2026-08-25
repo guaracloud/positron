@@ -10,9 +10,56 @@ use super::super::{
     AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject, CatalogProposal,
     CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, TransactionId,
 };
+#[cfg(feature = "test-support")]
+use super::super::{GovernanceFixtureObject, GovernanceFixtureTarget};
 use super::support::establish_catalog_authority;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "test-support")]
+#[test]
+fn governance_fixture_object_checks_its_bound_before_copying() {
+    assert_eq!(
+        GovernanceFixtureObject::from_bytes(&[])
+            .map(|_| ())
+            .expect_err("empty fixture object must be rejected")
+            .code(),
+        CatalogFailureCode::LimitExceeded
+    );
+    let oversized = vec![0_u8; 1_048_577];
+    assert_eq!(
+        GovernanceFixtureObject::from_bytes(&oversized)
+            .map(|_| ())
+            .expect_err("oversized fixture object must be rejected")
+            .code(),
+        CatalogFailureCode::LimitExceeded
+    );
+    assert!(GovernanceFixtureObject::from_bytes(b"POSGOV03").is_ok());
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn default_governance_fixture_target_delegates_installation() {
+    struct DelegatingTarget(AtomicU64);
+
+    impl GovernanceFixtureTarget for DelegatingTarget {
+        fn install_governance_fixture(
+            &self,
+            _fixture: &GovernanceFixtureObject,
+        ) -> Result<(), CatalogFailure> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let target = DelegatingTarget(AtomicU64::new(0));
+    let fixture = GovernanceFixtureObject::from_bytes(b"POSGOV03")
+        .expect("the bounded test fixture must be accepted");
+    target
+        .replace_governance_fixture(&fixture)
+        .expect("the default replacement must delegate installation");
+    assert_eq!(target.0.load(Ordering::Relaxed), 1);
+}
 
 struct TemporaryRoot(PathBuf);
 
@@ -111,6 +158,23 @@ fn transaction_identity_file_and_directory_sync_faults_restart_and_retry_idempot
         )?;
         assert_eq!(committed.number(), 1, "{event:?}");
     }
+    Ok(())
+}
+
+#[test]
+fn read_only_current_snapshot_does_not_require_the_catalog_writer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(37))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    catalog.commit(catalog.pin()?.identity(), proposal(38, 9)?, None)?;
+
+    let snapshot = Catalog::read_current_snapshot(&authority, instance, secret())?;
+
+    assert_eq!(snapshot.number(), catalog.pin()?.number());
+    assert_eq!(snapshot.identity(), catalog.pin()?.identity());
     Ok(())
 }
 

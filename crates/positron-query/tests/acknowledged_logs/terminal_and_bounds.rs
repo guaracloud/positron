@@ -307,6 +307,14 @@ fn parsers_budgets_keys_and_cursor_bytes_enforce_exact_public_bounds() -> Result
     assert!(QueryCursor::from_bytes(&[0; 340]).is_err());
     assert!(QueryCursor::from_bytes(&[0; 341]).is_ok());
     assert!(QueryCursor::from_bytes(&[0; 342]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 373]).is_ok());
+    assert!(QueryCursor::from_bytes(&[0; 382]).is_err());
+    // The old POSQCR01 4,481-byte representation was an ambiguous pre-v4
+    // source-bearing cursor. Only the genuinely legacy v1/v3 shapes remain
+    // accepted; current cursors have an explicit version/domain marker.
+    assert!(QueryCursor::from_bytes(&[0; 4543]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 4544]).is_err());
+    assert!(QueryCursor::from_bytes(&[0; 4545]).is_err());
     assert_eq!(
         format!("{:?}", QueryCursor::from_bytes(&[0; 341])?),
         "QueryCursor { <opaque> }"
@@ -513,9 +521,23 @@ fn native_literal_peak_memory_is_admitted_before_validation_output() -> Result<(
     let source = format!(
         "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"items\"] any = array({values}) ORDER BY query_time, commit_position LIMIT 1"
     );
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 30_697, 60)?;
-    drop(service.plan_sql(fixture.context, &source, budget)?);
-    let under_budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 30_696, 60)?;
+    let exact_memory = 30_697_u64
+        .checked_add(u64::try_from(source.len())?)
+        .ok_or("native literal source bound overflowed")?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, exact_memory, 60)?;
+    drop(
+        service
+            .plan_sql(fixture.context, &source, budget)
+            .map_err(|failure| format!("exact native literal planning failed: {failure:?}"))?,
+    );
+    let under_budget = QueryBudget::new(
+        1_048_576,
+        16,
+        16,
+        1_048_576,
+        exact_memory.checked_sub(1).ok_or("memory underflowed")?,
+        60,
+    )?;
     let failure = match service.plan_sql(fixture.context, &source, under_budget) {
         Ok(_) => return Err("one byte below native literal peak unexpectedly succeeded".into()),
         Err(failure) => failure,
@@ -538,9 +560,19 @@ fn bounded_path_segments_transfer_exact_capacity() -> Result<(), Box<dyn Error>>
     let source = format!(
         "SELECT record{path} FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1"
     );
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 3_974, 60)?;
+    let exact_memory = 3_974_u64
+        .checked_add(u64::try_from(source.len())?)
+        .ok_or("path source bound overflowed")?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, exact_memory, 60)?;
     drop(service.plan_sql(fixture.context, &source, budget)?);
-    let under_budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 3_973, 60)?;
+    let under_budget = QueryBudget::new(
+        1_048_576,
+        16,
+        16,
+        1_048_576,
+        exact_memory.checked_sub(1).ok_or("memory underflowed")?,
+        60,
+    )?;
     let failure = match service.plan_sql(fixture.context, &source, under_budget) {
         Ok(_) => return Err("one byte below path capacity unexpectedly succeeded".into()),
         Err(failure) => failure,
@@ -559,12 +591,22 @@ fn sql_index_selector_transfers_both_owned_reservations() -> Result<(), Box<dyn 
     let service = fixture.service(16)?;
     let before = fixture.kernel.authority.governor().inspect()?;
     let source = "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"payload\"] INDEX(123) = string(\"x\") ORDER BY query_time, commit_position LIMIT 1";
-    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 3_944, 60)?;
+    let exact_memory = 3_944_u64
+        .checked_add(u64::try_from(source.len())?)
+        .ok_or("index source bound overflowed")?;
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, exact_memory, 60)?;
     drop(service.plan_sql(fixture.context, source, budget)?);
     let failure = match service.plan_sql(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 3_943, 60)?,
+        QueryBudget::new(
+            1_048_576,
+            16,
+            16,
+            1_048_576,
+            exact_memory.checked_sub(1).ok_or("memory underflowed")?,
+            60,
+        )?,
     ) {
         Ok(_) => {
             return Err("one byte below index selector capacity unexpectedly succeeded".into());
@@ -689,23 +731,44 @@ fn native_scalar_queries_transfer_exact_string_and_bytes_capacity() -> Result<()
     let sql_float = "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 AND record[\"payload\"] any = float_bits(0x3ff0000000000000) ORDER BY query_time, commit_position LIMIT 1";
     let budget = |memory| QueryBudget::new(1_048_576, 16, 16, 1_048_576, memory, 60);
 
-    let pipeline_string_plan =
-        service.plan_pipeline(fixture.context, &pipeline_string, budget(4_159)?)?;
-    let sql_string_plan = service.plan_sql(fixture.context, &sql_string, budget(4_813)?)?;
+    let pipeline_string_plan = service.plan_pipeline(
+        fixture.context,
+        &pipeline_string,
+        budget(4_159 + u64::try_from(pipeline_string.len())?)?,
+    )?;
+    let sql_string_plan = service.plan_sql(
+        fixture.context,
+        &sql_string,
+        budget(4_813 + u64::try_from(sql_string.len())?)?,
+    )?;
     assert_eq!(
         pipeline_string_plan.logical_plan(),
         sql_string_plan.logical_plan()
     );
-    let pipeline_bytes_plan =
-        service.plan_pipeline(fixture.context, &pipeline_bytes, budget(3_903)?)?;
-    let sql_bytes_plan = service.plan_sql(fixture.context, &sql_bytes, budget(4_556)?)?;
+    let pipeline_bytes_plan = service.plan_pipeline(
+        fixture.context,
+        &pipeline_bytes,
+        budget(3_903 + u64::try_from(pipeline_bytes.len())?)?,
+    )?;
+    let sql_bytes_plan = service.plan_sql(
+        fixture.context,
+        &sql_bytes,
+        budget(4_556 + u64::try_from(sql_bytes.len())?)?,
+    )?;
     assert_eq!(
         pipeline_bytes_plan.logical_plan(),
         sql_bytes_plan.logical_plan()
     );
-    let pipeline_float_plan =
-        service.plan_pipeline(fixture.context, pipeline_float, budget(8_192)?)?;
-    let sql_float_plan = service.plan_sql(fixture.context, sql_float, budget(8_192)?)?;
+    let pipeline_float_plan = service.plan_pipeline(
+        fixture.context,
+        pipeline_float,
+        budget(8_192 + u64::try_from(pipeline_float.len())?)?,
+    )?;
+    let sql_float_plan = service.plan_sql(
+        fixture.context,
+        sql_float,
+        budget(8_192 + u64::try_from(sql_float.len())?)?,
+    )?;
     assert_eq!(
         pipeline_float_plan.logical_plan(),
         sql_float_plan.logical_plan()
@@ -806,7 +869,9 @@ impl QueryFixture {
             RequestedIntent::SystemAdministration,
             CompatibilityHints::none(),
         )?;
-        let kernel = KernelFixture::new(instance.default_tenant_id(), label)?;
+        let governance = instance.governance_fixture_for_test()?;
+        let kernel =
+            KernelFixture::new_with_identity(instance.default_tenant_id(), label, &governance)?;
         Ok(Self {
             _roots: roots,
             kernel,

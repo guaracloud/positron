@@ -10,6 +10,8 @@ mod execution;
 mod execution_state;
 mod execution_support;
 mod failure;
+#[cfg(fuzzing)]
+mod fuzzing;
 mod memory;
 mod native_literal;
 mod operators;
@@ -19,6 +21,7 @@ mod planning_observer;
 mod planning_string;
 mod query_service;
 mod quoted;
+mod result_key;
 mod runtime;
 mod search;
 mod search_transfer;
@@ -58,7 +61,190 @@ pub fn fuzz_query_inputs(data: &[u8]) {
         let memory = planning_memory::PlanningMemory::new(4_096);
         let _ = service::parse_sql(source, &memory);
     }
-    let _ = QueryCursor::from_bytes(data);
+    fuzz_query_cursor(data);
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_query_cursor(data: &[u8]) {
+    const MAX_FUZZ_INPUT_BYTES: usize = 65_536;
+    if data.len() > MAX_FUZZ_INPUT_BYTES {
+        return;
+    }
+    let parsed = QueryCursor::from_bytes(data);
+    if let Ok(cursor) = parsed {
+        assert_eq!(cursor.as_bytes(), data);
+        let reparsed = QueryCursor::from_bytes(cursor.as_bytes())
+            .expect("a bounded cursor must remain decodable after a lossless copy");
+        assert_eq!(reparsed, cursor);
+    }
+    if matches!(data.len(), 341 | 373 | 4_545) {
+        assert!(QueryCursor::from_bytes(&data[..data.len() - 1]).is_err());
+    }
+
+    let protector = positron_kernel::fuzz_control_token_protector();
+    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
+        .expect("fuzz principal fixture is valid");
+    let tenant = positron_domain::identity::TenantId::from_bytes([2; 16])
+        .expect("fuzz tenant fixture is valid");
+    let range = TemporalRange::new(-100, 100).expect("fuzz range is ordered");
+    let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
+    let source = b"pipeline:v1 logs | range query_time -100 100 | limit 1";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)
+        .expect("fuzz budget is valid")
+        .with_cpu_work_units(1_024)
+        .expect("fuzz CPU budget is valid");
+    let parsed_plan = service::parse_pipeline(
+        std::str::from_utf8(source).expect("fixture source is UTF-8"),
+        &planning_memory::PlanningMemory::new(budget.memory_bytes()),
+    )
+    .expect("fixture source parses");
+    let plan_digest = parsed_plan
+        .canonical_digest(&protector)
+        .expect("fixture plan digest is bounded");
+    let state = cursor::CursorState {
+        principal,
+        tenant,
+        authorization_generation: 7,
+        catalog_identity: [3; 32],
+        catalog_generation: 8,
+        frontier: 1,
+        plan: std::sync::Arc::new(plan),
+        source: Some(std::sync::Arc::from(source.to_vec().into_boxed_slice())),
+        language: Some(query_service::QueryLanguage::Pipeline),
+        plan_digest,
+        resume_key: None,
+        sequence: 0,
+        prior_digest: [0; 32],
+        lease_identity: [4; 16],
+        expiry: 60,
+        budget,
+        scanned_bytes: 0,
+        decoded_records: 0,
+        physical_scanned_bytes: 0,
+        physical_decoded_records: 0,
+        output_rows: 0,
+        output_bytes: 0,
+        physical_output_rows: 0,
+        physical_output_bytes: 0,
+        memory_peak_bytes: 512,
+        physical_memory_peak_bytes: 512,
+        started_at: 0,
+        last_observed_at: 0,
+        cpu_work_units: 0,
+        elapsed_wall_seconds: 0,
+        physical_cpu_work_units: 0,
+        physical_elapsed_wall_seconds: 0,
+        reduced_pruning: true,
+        resume_count: 0,
+        repeated_batch_count: 0,
+        cancellation: QueryCancellation::new(),
+    };
+    let canonical = cursor::encode(&protector, state).expect("fuzz cursor fixture is valid");
+    let decoded = cursor::decode(&protector, &canonical).expect("fixture must authenticate");
+    assert_eq!(decoded.principal, principal);
+    assert_eq!(decoded.tenant, tenant);
+    assert_eq!(decoded.authorization_generation, 7);
+    assert_eq!(decoded.frontier, 1);
+    assert_eq!(decoded.expiry, 60);
+    assert_eq!(decoded.plan.limit(), 1);
+    assert_eq!(decoded.memory_peak_bytes, 512);
+    assert!(decoded.reduced_pruning);
+    execution_state::validate_authorization(
+        principal,
+        tenant,
+        7,
+        decoded.principal,
+        decoded.tenant,
+        decoded.authorization_generation,
+    )
+    .expect("fixture authorization is valid");
+    let _ = execution_state::commit_position(decoded.frontier);
+    let source = std::str::from_utf8(
+        decoded
+            .source
+            .as_deref()
+            .expect("fixture source is retained"),
+    )
+    .expect("fixture source is UTF-8");
+    let parsed = service::parse_pipeline(
+        source,
+        &planning_memory::PlanningMemory::new(decoded.budget.memory_bytes()),
+    )
+    .expect("fixture source parses");
+    assert_eq!(parsed.limit(), decoded.plan.limit());
+    let decoded_digest = parsed
+        .canonical_digest(&protector)
+        .expect("decoded plan digest is bounded");
+    assert_eq!(decoded_digest, decoded.plan_digest);
+
+    if !data.is_empty() {
+        let mut variant = canonical.as_bytes().to_vec();
+        const MUTATION_OFFSETS: [usize; 26] = [
+            16,
+            32,
+            48,
+            64,
+            80,
+            96,
+            104,
+            112,
+            123,
+            157,
+            165,
+            197,
+            213,
+            221,
+            237,
+            253,
+            261,
+            269,
+            275,
+            283,
+            315,
+            347,
+            348,
+            349,
+            cursor::CURRENT_VERSION_START,
+            cursor::CURRENT_VERSION_START + 1,
+        ];
+        for (index, byte) in data.iter().take(MUTATION_OFFSETS.len()).enumerate() {
+            if let Some(slot) = variant.get_mut(MUTATION_OFFSETS[index]) {
+                *slot ^= *byte;
+            }
+        }
+        for (index, slot) in variant
+            .get_mut(cursor::CURRENT_RESUME_KEY_START..cursor::CURRENT_RESUME_KEY_END)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            *slot ^= data[index % data.len()].wrapping_add(u8::try_from(index).unwrap_or(0));
+        }
+        for (index, slot) in variant
+            .get_mut(cursor::CURRENT_AUTH_TAG_START..cursor::CURRENT_AUTH_TAG_END)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            *slot ^= data[index % data.len()];
+        }
+        let _ = cursor::fuzz_reauthenticate(&protector, &mut variant);
+        if let Ok(cursor) = QueryCursor::from_bytes(&variant) {
+            if let Ok(state) = cursor::decode(&protector, &cursor) {
+                let _ = execution_state::validate_authorization(
+                    principal,
+                    tenant,
+                    7,
+                    state.principal,
+                    state.tenant,
+                    state.authorization_generation,
+                );
+                let _ = execution_state::commit_position(state.frontier);
+                let _ = state.expiry.checked_sub(state.started_at);
+            }
+        }
+    }
 }
 
 #[cfg(fuzzing)]
@@ -217,126 +403,5 @@ pub fn fuzz_query_search_matcher(data: &[u8]) {
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub fn fuzz_query_transforms(data: &[u8]) {
-    let Ok(source) = std::str::from_utf8(data) else {
-        return;
-    };
-    struct Unobserved;
-    impl transform::TransformObserver for Unobserved {
-        fn step(&mut self) -> Result<(), QueryFailure> {
-            Ok(())
-        }
-    }
-    let profile = positron_domain::value::ValueLimitProfile::release_1_system_maximum();
-    if data.len() > transform::MAX_TRANSFORM_INPUT_BYTES {
-        let candidate = positron_domain::value::CandidateAttributeValue::string(source.to_owned());
-        let value = match candidate.validate_log_body(profile) {
-            Ok(value) => value,
-            Err(failure) => {
-                assert_eq!(
-                    failure.code(),
-                    positron_domain::outcome::DomainFailureCode::ValueLimitExceeded
-                );
-                return;
-            },
-        };
-        for transform in [
-            transform::BodyTransform::Json,
-            transform::BodyTransform::Logfmt,
-            transform::BodyTransform::Cast(transform::CastTarget::String),
-            transform::BodyTransform::Cast(transform::CastTarget::Integer),
-            transform::BodyTransform::Cast(transform::CastTarget::Float),
-            transform::BodyTransform::Cast(transform::CastTarget::Boolean),
-        ] {
-            let mut observer = Unobserved;
-            let result = transform.apply_with_facts(&value, &mut observer);
-            assert!(matches!(
-                result,
-                Err(failure)
-                    if failure.code() == QueryFailureCode::UnsupportedQuery
-            ));
-        }
-        return;
-    }
-    let mut bits = [0_u8; 8];
-    for (index, byte) in data.iter().take(bits.len()).enumerate() {
-        if let Some(slot) = bits.get_mut(index) {
-            *slot = *byte;
-        }
-    }
-    let candidates = [
-        positron_domain::value::CandidateAttributeValue::string(source.to_owned()),
-        positron_domain::value::CandidateAttributeValue::null(),
-        positron_domain::value::CandidateAttributeValue::boolean(data.len() % 2 == 0),
-        positron_domain::value::CandidateAttributeValue::signed_integer(i64::from_le_bytes(bits)),
-        positron_domain::value::CandidateAttributeValue::floating_point_bits(u64::from_le_bytes(
-            bits,
-        )),
-    ];
-    struct Limited {
-        remaining: u16,
-    }
-    impl transform::TransformObserver for Limited {
-        fn step(&mut self) -> Result<(), QueryFailure> {
-            if self.remaining == 0 {
-                return Err(QueryFailure::budget_exhausted(
-                    QueryBudgetDimension::CpuWorkUnits,
-                ));
-            }
-            self.remaining -= 1;
-            Ok(())
-        }
-    }
-    let transforms = [
-        transform::BodyTransform::Json,
-        transform::BodyTransform::Logfmt,
-        transform::BodyTransform::Cast(transform::CastTarget::String),
-        transform::BodyTransform::Cast(transform::CastTarget::Integer),
-        transform::BodyTransform::Cast(transform::CastTarget::Float),
-        transform::BodyTransform::Cast(transform::CastTarget::Boolean),
-    ];
-    for candidate in candidates {
-        let Ok(value) = candidate.validate_log_body(profile) else {
-            continue;
-        };
-        for transform in transforms {
-            let mut observer = Unobserved;
-            let outcome = transform.apply(&value, &mut observer);
-            if let Ok(output) = &outcome {
-                let mut repeat_observer = Unobserved;
-                assert_eq!(
-                    outcome,
-                    transform.apply(&value, &mut repeat_observer),
-                    "transform outcome must be deterministic"
-                );
-                match transform {
-                    transform::BodyTransform::Cast(transform::CastTarget::String) => {
-                        assert!(output.as_str().is_some());
-                    },
-                    transform::BodyTransform::Cast(transform::CastTarget::Integer) => {
-                        assert!(output.as_signed_integer().is_some());
-                    },
-                    transform::BodyTransform::Cast(transform::CastTarget::Float) => {
-                        assert!(output.as_floating_point_bits().is_some());
-                    },
-                    transform::BodyTransform::Cast(transform::CastTarget::Boolean) => {
-                        assert!(output.as_boolean().is_some());
-                    },
-                    transform::BodyTransform::Json | transform::BodyTransform::Logfmt => {},
-                }
-            }
-            let mut limited = Limited { remaining: 0 };
-            if let Err(failure) = transform.apply(&value, &mut limited) {
-                assert!(
-                    matches!(
-                        failure.code(),
-                        QueryFailureCode::BudgetExhausted
-                            | QueryFailureCode::UnsupportedQuery
-                            | QueryFailureCode::ResourceExhausted
-                            | QueryFailureCode::Cancelled
-                    ),
-                    "observed transform failures must retain stable budget vocabulary"
-                );
-            }
-        }
-    }
+    fuzzing::fuzz_query_transforms(data);
 }

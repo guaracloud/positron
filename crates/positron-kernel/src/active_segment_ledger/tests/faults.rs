@@ -5,7 +5,7 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use super::support::{TemporaryRoot, establish_authority};
 use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_errno, with_ledger_fault};
-use crate::catalog::{CatalogFileEvent, with_catalog_fault};
+use crate::catalog::{CatalogFileEvent, with_catalog_fault, with_catalog_fault_hook_after};
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
     InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
@@ -15,6 +15,7 @@ use crate::{
 
 mod admission_faults;
 mod sealing_faults;
+mod snapshot_lease_capacity;
 mod snapshot_leases;
 
 fn prepared(

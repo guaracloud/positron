@@ -31,6 +31,9 @@ pub(crate) use context::{
     FrameObjectContext, FrameObjectId, FrameScope, FrameSequence, KeyEpoch, SegmentFramePurpose,
     SystemObjectKind,
 };
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use control_token::fuzz_control_token_protector;
 pub use control_token::{
     ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector, QueryResultDigest,
 };

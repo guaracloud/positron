@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use positron_domain::identity::TenantId;
+use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, GovernorPolicy,
@@ -11,12 +11,15 @@ use positron_kernel::{
     OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume, PrimaryDataVolume,
     RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
     ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey,
-    SegmentScope, SnapshotLeaseId, StorageKernelResourceAuthority, TenantQuota, WorkClaim,
-    WorkKind,
+    SegmentScope, SnapshotLeaseId, SnapshotLeaseUsage, StorageKernelResourceAuthority, TenantQuota,
+    WorkClaim, WorkKind,
 };
 
 use super::ExecutionResources;
 use crate::QueryFailureCode;
+use crate::cursor::CursorState;
+use crate::{LogicalPlan, QueryBudget, QueryCancellation, TemporalAxis, TemporalRange};
+use std::sync::Arc;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -48,10 +51,12 @@ fn lease_identity_mismatch_releases_every_pre_stream_resource() -> Result<(), Bo
         let lease = ledger.create_snapshot_lease(100 + iteration, 200 + iteration)?;
         let identity = lease.identity();
         drop(lease);
-        let resources = ExecutionResources::new(admission, identity);
+        let resources = ExecutionResources::new(admission, identity, SnapshotLeaseUsage::default());
         let expected = SnapshotLeaseId::new([0x99; 16])?;
 
-        let failure = match resources.validate_lease_identity(&ledger, expected.to_bytes()) {
+        let state = test_cursor_state(identity.to_bytes());
+        let failure = match resources.validate_lease_identity(&ledger, &state, expected.to_bytes())
+        {
             Ok(_) => return Err("mismatched stream identity was accepted".into()),
             Err(failure) => failure,
         };
@@ -70,6 +75,91 @@ fn lease_identity_mismatch_releases_every_pre_stream_resource() -> Result<(), Bo
         }
     }
     Ok(())
+}
+
+#[test]
+fn failed_usage_reconciliation_retains_the_durable_lease_for_retry() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x41; 16])?,
+        CatalogSecret::from_owned(Box::new([0x42; 32]), Box::new([0x43; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(1)?),
+        SegmentProtectionKey::from_owned(Box::new([0x44; 32])),
+    )?;
+    let admission = authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::new([1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0]),
+    )?)?;
+    let lease = ledger.create_snapshot_lease(100, 200)?;
+    let identity = lease.identity();
+    let usage = SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0);
+    assert_eq!(ledger.record_snapshot_lease_usage(identity, usage)?, usage);
+    let resources = ExecutionResources::new(admission, identity, usage);
+    let state = test_cursor_state(identity.to_bytes());
+
+    let failure = resources.fail_before_stream(
+        &ledger,
+        &state,
+        crate::QueryFailure::new(QueryFailureCode::Internal),
+    );
+    assert_eq!(failure.code(), QueryFailureCode::Internal);
+    assert_eq!(ledger.snapshot_lease_usage(identity, 100)?, usage);
+    ledger.release_snapshot_lease(identity)?;
+    Ok(())
+}
+
+fn test_cursor_state(lease_identity: [u8; 16]) -> CursorState {
+    CursorState {
+        principal: PrincipalId::from_bytes([0x35; 16]).expect("non-zero principal"),
+        tenant: TenantId::from_bytes([0x64; 16]).expect("non-zero tenant"),
+        authorization_generation: 1,
+        catalog_identity: [0x36; 32],
+        catalog_generation: 1,
+        frontier: 1,
+        plan: Arc::new(LogicalPlan::logs(
+            TemporalAxis::QueryTime,
+            TemporalRange::new(-1, 1).expect("ordered range"),
+            1,
+        )),
+        source: None,
+        language: None,
+        plan_digest: [0; 32],
+        resume_key: None,
+        sequence: 0,
+        prior_digest: [0; 32],
+        lease_identity,
+        expiry: 200,
+        budget: QueryBudget::new(100, 10, 10, 100, 1_000, 100).expect("valid budget"),
+        scanned_bytes: 0,
+        decoded_records: 0,
+        physical_scanned_bytes: 0,
+        physical_decoded_records: 0,
+        output_rows: 0,
+        output_bytes: 0,
+        physical_output_rows: 0,
+        physical_output_bytes: 0,
+        memory_peak_bytes: 0,
+        physical_memory_peak_bytes: 0,
+        started_at: 100,
+        last_observed_at: 100,
+        cpu_work_units: 0,
+        elapsed_wall_seconds: 0,
+        physical_cpu_work_units: 0,
+        physical_elapsed_wall_seconds: 0,
+        reduced_pruning: false,
+        resume_count: 0,
+        repeated_batch_count: 0,
+        cancellation: QueryCancellation::new(),
+    }
 }
 
 struct TemporaryRoot(PathBuf);

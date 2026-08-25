@@ -5,7 +5,9 @@ use positron_ingest::{
 };
 use positron_kernel::{ActiveSegmentLedger, Catalog};
 
-use super::ServiceFailure;
+use super::{
+    ServiceFailure, failure::classify_catalog_failure_code, failure::classify_ledger_failure_code,
+};
 
 pub(super) struct RecoveredSchema {
     pub(super) registry: TenantSchemaRegistry,
@@ -54,10 +56,10 @@ pub(super) fn recover(
             .catalog_secret(instance.instance)
             .map_err(|_| ServiceFailure::KeyUnavailable)?,
     )
-    .map_err(|_| ServiceFailure::CatalogUnavailable)?;
+    .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
     let basis = catalog
         .pin()
-        .map_err(|_| ServiceFailure::CatalogUnavailable)?;
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
     let checkpoint = load_schema_checkpoint(&basis, instance.tenant, instance.resource_governor())
         .map_err(|failure| {
             if failure.catalog_code().is_some() {
@@ -82,18 +84,12 @@ pub(super) fn recover(
             .segment_key(instance.instance, scope)
             .map_err(|_| ServiceFailure::KeyUnavailable)?;
         let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-            .map_err(|failure| match failure.code() {
-            positron_kernel::LedgerFailureCode::ResourceAdmissionRefused
-            | positron_kernel::LedgerFailureCode::LimitExceeded => {
-                ServiceFailure::CapacityUnavailable
-            },
-            _ => ServiceFailure::LedgerUnavailable,
-        })?;
+            .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
         // `replay` retains the admitted repair CPU/task reservation while the
         // immutable snapshot is constructed and replayed.
         let snapshot = ledger
             .snapshot()
-            .map_err(|_| ServiceFailure::LedgerUnavailable)?;
+            .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
         replay
             .replay_snapshot_cancellable(&snapshot, cancellation)
             .map_err(classify_replay_failure)?;

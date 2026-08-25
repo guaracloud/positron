@@ -98,9 +98,13 @@ pub(super) fn outcome(
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let admission_group_planner =
         Arc::new(positron_ingest::FixedAdmissionGroupPlanner::new(logs_shard));
+    #[cfg(not(any(test, fuzzing)))]
+    let _ = (identity, audit);
     Ok(InitializedInstance {
         key,
+        #[cfg(any(test, fuzzing))]
         identity,
+        #[cfg(any(test, fuzzing))]
         audit,
         _authority: authority,
         instance: record.instance,

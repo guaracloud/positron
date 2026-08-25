@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_domain::routing::CommitPosition;
 use positron_governance::AuthorizedContext;
-use positron_kernel::{LedgerSnapshot, ResourceReservation, SnapshotLeaseId};
+use positron_kernel::{LedgerSnapshot, ResourceReservation, SnapshotLeaseId, SnapshotLeaseUsage};
 
 use crate::cursor::CursorState;
 use crate::stream::QueryCounters;
@@ -13,17 +13,20 @@ pub(crate) fn stats_before_current(state: &CursorState) -> QueryStats {
     QueryStats::new(
         QueryCounters {
             records: state.output_rows,
-            scanned_bytes: state.scanned_bytes,
-            decoded_records: state.decoded_records,
+            scanned_bytes: state.physical_scanned_bytes,
+            decoded_records: state.physical_decoded_records,
             output_bytes: state.output_bytes,
-            memory_peak_bytes: state.memory_peak_bytes,
-            cpu_work_units: state.cpu_work_units,
-            wall_seconds: state.elapsed_wall_seconds,
+            memory_peak_bytes: state.physical_memory_peak_bytes,
+            cpu_work_units: state.physical_cpu_work_units,
+            wall_seconds: state.physical_elapsed_wall_seconds,
         },
         (state.prior_digest != [0; 32])
             .then(|| state.sequence.checked_sub(1))
             .flatten(),
         state.prior_digest,
+        state.budget,
+        state.resume_count,
+        state.repeated_batch_count,
     )
     .with_reduced_pruning(state.reduced_pruning)
 }
@@ -32,15 +35,18 @@ pub(crate) fn stats_with_current(state: &CursorState) -> QueryStats {
     QueryStats::new(
         QueryCounters {
             records: state.output_rows,
-            scanned_bytes: state.scanned_bytes,
-            decoded_records: state.decoded_records,
+            scanned_bytes: state.physical_scanned_bytes,
+            decoded_records: state.physical_decoded_records,
             output_bytes: state.output_bytes,
-            memory_peak_bytes: state.memory_peak_bytes,
-            cpu_work_units: state.cpu_work_units,
-            wall_seconds: state.elapsed_wall_seconds,
+            memory_peak_bytes: state.physical_memory_peak_bytes,
+            cpu_work_units: state.physical_cpu_work_units,
+            wall_seconds: state.physical_elapsed_wall_seconds,
         },
         Some(state.sequence),
         state.prior_digest,
+        state.budget,
+        state.resume_count,
+        state.repeated_batch_count,
     )
     .with_reduced_pruning(state.reduced_pruning)
 }
@@ -55,7 +61,10 @@ pub(crate) fn initial_state<'kernel>(
     let PlannedQuery {
         context,
         plan,
+        source,
+        language,
         budget,
+        plan_digest,
         _reservation,
         started_at,
         last_observed_at,
@@ -72,7 +81,10 @@ pub(crate) fn initial_state<'kernel>(
             catalog_generation: snapshot.catalog_generation(),
             frontier: snapshot.frontier().value(),
             plan,
-            offset: 0,
+            source: Some(source),
+            language: Some(language),
+            plan_digest,
+            resume_key: None,
             sequence: 0,
             prior_digest: [0; 32],
             lease_identity: lease_identity.to_bytes(),
@@ -80,18 +92,49 @@ pub(crate) fn initial_state<'kernel>(
             budget,
             scanned_bytes: 0,
             decoded_records: 0,
+            physical_scanned_bytes: 0,
+            physical_decoded_records: 0,
             output_rows: 0,
             output_bytes: 0,
+            physical_output_rows: 0,
+            physical_output_bytes: 0,
             memory_peak_bytes: 0,
+            physical_memory_peak_bytes: 0,
             started_at,
             last_observed_at,
             cpu_work_units,
             elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
+            physical_cpu_work_units: cpu_work_units,
+            physical_elapsed_wall_seconds: last_observed_at.saturating_sub(started_at),
             reduced_pruning: false,
+            resume_count: 0,
+            repeated_batch_count: 0,
             cancellation,
         },
         _reservation,
     )
+}
+
+pub(crate) fn merge_durable_usage(state: &mut CursorState, usage: SnapshotLeaseUsage) {
+    state.physical_scanned_bytes = state.physical_scanned_bytes.max(usage.scanned_bytes());
+    state.physical_decoded_records = state.physical_decoded_records.max(usage.decoded_records());
+    state.physical_cpu_work_units = state.physical_cpu_work_units.max(usage.cpu_work_units());
+    state.physical_elapsed_wall_seconds = state
+        .physical_elapsed_wall_seconds
+        .max(usage.wall_seconds());
+    state.physical_output_rows = state.physical_output_rows.max(usage.output_rows());
+    state.physical_output_bytes = state.physical_output_bytes.max(usage.output_bytes());
+    state.physical_memory_peak_bytes = state
+        .physical_memory_peak_bytes
+        .max(usage.memory_peak_bytes());
+}
+
+pub(crate) fn sync_cursor_counters(state: &mut CursorState) {
+    state.scanned_bytes = state.physical_scanned_bytes;
+    state.decoded_records = state.physical_decoded_records;
+    state.cpu_work_units = state.physical_cpu_work_units;
+    state.elapsed_wall_seconds = state.physical_elapsed_wall_seconds;
+    state.memory_peak_bytes = state.physical_memory_peak_bytes;
 }
 
 pub(crate) fn query_tenant(context: AuthorizedContext) -> Result<TenantId, QueryFailure> {

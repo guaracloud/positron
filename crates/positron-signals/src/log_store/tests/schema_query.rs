@@ -246,7 +246,7 @@ fn text_summary_prunes_absent_blocks_and_survives_reopen() -> Result<(), Box<dyn
     )?;
     assert!(pruned.records().is_empty());
     assert_eq!(pruned.decoded_records(), 0);
-    assert_eq!(pruned.scanned_bytes(), 0);
+    assert!(pruned.scanned_bytes() > 0);
     assert!(!pruned.reduced_pruning());
 
     let present = TextSearchCandidate::literal("pha")?
@@ -306,7 +306,7 @@ fn text_summary_prunes_absent_blocks_and_survives_reopen() -> Result<(), Box<dyn
         &observer,
     )?;
     assert_eq!(reopened_pruned.records(), pruned.records());
-    assert_eq!(reopened_pruned.scanned_bytes(), 0);
+    assert!(reopened_pruned.scanned_bytes() > 0);
     assert!(!reopened_pruned.reduced_pruning());
 
     let budget_failure = store
@@ -445,6 +445,30 @@ fn text_scan_limit_stops_before_next_block_candidate_work() -> Result<(), Box<dy
     assert_eq!(result.records().len(), 1);
     assert!(!result.complete());
     assert_eq!(budget.0.load(Ordering::SeqCst), 0);
+
+    let first_block_bytes = u64::try_from(
+        ledger
+            .snapshot()?
+            .blocks()
+            .first()
+            .ok_or("first text block missing")?
+            .payload()
+            .len(),
+    )?;
+    let limited = store.scan_text_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::all(ScanLimit::new(1)?).with_scanned_bytes(first_block_bytes - 1),
+        &schema,
+        &candidate,
+        &NeverCancelled,
+        &RecordingTextWork(AtomicU64::new(0)),
+    )?;
+    assert!(limited.records().is_empty());
+    assert!(!limited.complete());
+    assert_eq!(limited.scanned_bytes(), 0);
+    assert!(limited.scanned_bytes_limited());
     Ok(())
 }
 
@@ -726,7 +750,7 @@ fn scalar_fallback_is_scoped_to_the_non_fitting_root() -> Result<(), Box<dyn Err
         ),
     )?;
     assert!(result.records().is_empty());
-    assert_eq!(result.scanned_bytes(), 0);
+    assert!(result.scanned_bytes() > 0);
     assert!(!result.reduced_pruning());
     Ok(())
 }
@@ -1181,7 +1205,7 @@ fn scalar_index_prunes_an_absent_same_type_value() -> Result<(), Box<dyn Error>>
         &query("indexed", "two")?,
     )?;
     assert!(result.records().is_empty());
-    assert_eq!(result.scanned_bytes(), 0);
+    assert!(result.scanned_bytes() > 0);
     assert!(!result.reduced_pruning());
     Ok(())
 }
@@ -1248,7 +1272,7 @@ fn scalar_index_prunes_an_absent_nested_value() -> Result<(), Box<dyn Error>> {
         ),
     )?;
     assert!(result.records().is_empty());
-    assert_eq!(result.scanned_bytes(), 0);
+    assert!(result.scanned_bytes() > 0);
     assert!(!result.reduced_pruning());
     Ok(())
 }
@@ -1389,7 +1413,7 @@ fn scalar_index_round_trips_each_native_scalar_dictionary() -> Result<(), Box<dy
             &SchemaQuery::value(path, OccurrenceSelector::Any, absent),
         )?;
         assert!(missing.records().is_empty(), "absent value for {key}");
-        assert_eq!(missing.scanned_bytes(), 0, "pruned value for {key}");
+        assert!(missing.scanned_bytes() > 0, "admitted value for {key}");
         assert!(!missing.reduced_pruning());
     }
     for (namespace, key) in [
@@ -1425,7 +1449,7 @@ fn scalar_index_round_trips_each_native_scalar_dictionary() -> Result<(), Box<dy
             ),
         )?;
         assert!(absent.records().is_empty());
-        assert_eq!(absent.scanned_bytes(), 0);
+        assert!(absent.scanned_bytes() > 0);
         assert!(!absent.reduced_pruning());
     }
     Ok(())
@@ -1653,7 +1677,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         ),
     )?;
     assert!(pruned.records().is_empty());
-    assert_eq!(pruned.scanned_bytes(), 0);
+    assert!(pruned.scanned_bytes() > 0);
     assert!(!pruned.reduced_pruning());
 
     for value in [
@@ -1675,7 +1699,7 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
             ),
         )?;
         assert!(other_type.records().is_empty());
-        assert_eq!(other_type.scanned_bytes(), 0);
+        assert!(other_type.scanned_bytes() > 0);
         assert!(!other_type.reduced_pruning());
     }
     for value in [
@@ -1700,12 +1724,12 @@ fn public_schema_scan_filters_durable_generic_and_overflow_records() -> Result<(
         assert!(composite.reduced_pruning());
     }
     for (kind, expected_records, expected_scanned) in [
-        (AttributeValueKind::Null, 0, 0),
-        (AttributeValueKind::Boolean, 0, 0),
-        (AttributeValueKind::SignedInteger, 0, 0),
-        (AttributeValueKind::FloatingPoint, 0, 0),
+        (AttributeValueKind::Null, 0, 1),
+        (AttributeValueKind::Boolean, 0, 1),
+        (AttributeValueKind::SignedInteger, 0, 1),
+        (AttributeValueKind::FloatingPoint, 0, 1),
         (AttributeValueKind::String, 2, 1),
-        (AttributeValueKind::Bytes, 0, 0),
+        (AttributeValueKind::Bytes, 0, 1),
     ] {
         let typed = store.scan_schema(
             authority.governor(),
@@ -1989,6 +2013,28 @@ fn public_schema_scan_honors_scope_frontier_and_result_bounds() -> Result<(), Bo
     assert_eq!(bounded.records().len(), 1);
     assert!(!bounded.complete());
     drop(bounded);
+
+    let first_block_bytes = u64::try_from(
+        snapshot
+            .blocks()
+            .first()
+            .ok_or("first schema block missing")?
+            .payload()
+            .len(),
+    )?;
+    let limited = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(1)?).with_scanned_bytes(first_block_bytes - 1),
+        &schema,
+        &query("match", "value")?,
+    )?;
+    assert!(limited.records().is_empty());
+    assert!(!limited.complete());
+    assert_eq!(limited.scanned_bytes(), 0);
+    assert!(limited.scanned_bytes_limited());
+    drop(limited);
 
     let observed = observed_schema_scan(
         &store,

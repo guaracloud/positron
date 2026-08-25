@@ -337,6 +337,9 @@ mod tests {
             },
             None,
             [0; 32],
+            QueryBudget::new(1, 1, 1, 1, 1, 1).expect("test budget is valid"),
+            0,
+            0,
         )
     }
 

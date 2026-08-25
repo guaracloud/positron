@@ -13,19 +13,24 @@ mod receipt;
 mod recovery;
 mod scope_discovery;
 mod snapshot_lease;
+mod snapshot_lease_attempt;
 mod snapshot_lease_codec;
+mod snapshot_lease_grant;
 mod snapshot_lease_pending;
 mod snapshot_lease_record;
 mod snapshot_lease_recovery;
+mod snapshot_lease_usage;
 mod state;
 mod storage;
+#[cfg(feature = "test-support")]
+mod test_support;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
 use std::fmt::Formatter;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use positron_domain::routing::CommitPosition;
 
@@ -33,17 +38,23 @@ use crate::catalog::Catalog;
 use crate::data_protection::ObjectDataKey;
 use crate::resource_governor::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
 use crate::{
-    RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority, WorkClaim, WorkKind,
+    CatalogSnapshot, RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority,
+    WorkClaim, WorkKind,
 };
 
 use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
-pub use snapshot_lease::SnapshotLeaseGrant;
-pub use snapshot_lease_record::{MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId};
+pub use snapshot_lease_attempt::SnapshotLeaseAttempt;
+pub use snapshot_lease_grant::SnapshotLeaseGrant;
+pub use snapshot_lease_record::{
+    MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId, SnapshotLeaseUsage,
+};
 use state::{LedgerState, retain_recovered};
 use storage::LedgerStorage;
+#[cfg(feature = "test-support")]
+pub use test_support::publish_snapshot_lease_marker_for_test;
 pub use types::*;
 
 const MAX_STORE_BLOCK_BYTES: usize = 1_048_576;
@@ -58,6 +69,12 @@ pub fn fuzz_active_segment_stateful(data: &[u8]) {
     fuzzing::fuzz_active_segment_stateful(data);
 }
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_snapshot_lease_record(data: &[u8]) {
+    snapshot_lease_codec::fuzz_snapshot_lease_record(data);
+}
+
 /// The Storage Kernel-owned active segment for one physical tenant/signal/shard scope.
 pub struct ActiveSegmentLedger<'kernel, 'catalog> {
     _writer: ActiveSegmentLedgerLease<'kernel>,
@@ -67,6 +84,7 @@ pub struct ActiveSegmentLedger<'kernel, 'catalog> {
     storage: LedgerStorage,
     key: ObjectDataKey,
     state: Mutex<LedgerState<'kernel>>,
+    lease_attempts: Arc<Mutex<snapshot_lease_attempt::LeaseAttemptRegistry>>,
 }
 
 impl std::fmt::Debug for ActiveSegmentLedger<'_, '_> {
@@ -81,6 +99,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     pub fn control_tokens(&self) -> crate::ControlTokenProtector<'_> {
         self.catalog.control_tokens()
     }
+
+    /// Refreshes and pins the latest authenticated Catalog generation.
+    ///
+    /// Query authorization is generation-pinned, so callers must use this
+    /// boundary immediately before admitting a durable snapshot lease rather
+    /// than relying on an identity captured during planning.
+    pub fn current_catalog_snapshot(&self) -> Result<CatalogSnapshot, LedgerFailure> {
+        self.catalog.refresh_state()?;
+        self.catalog.pin().map_err(Into::into)
+    }
+
     pub fn open(
         authority: &'kernel StorageKernelResourceAuthority,
         catalog: &'catalog Catalog<'kernel>,
@@ -246,9 +275,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 next_sequence: 0,
                 poisoned: false,
                 lease_reservations: recovered_leases.reservations,
+                lease_reservation_baselines: std::collections::BTreeMap::new(),
+                lease_resume_markers: recovered_leases.resume_markers,
                 pending_lease_releases: snapshot_lease_pending::PendingLeaseReleases::new(),
                 last_snapshot_lease_time: recovered_leases.last_observed,
             }),
+            lease_attempts: Arc::new(Mutex::new(
+                snapshot_lease_attempt::LeaseAttemptRegistry::new(),
+            )),
         })
     }
 

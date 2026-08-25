@@ -98,11 +98,34 @@ impl RecordBuffer {
         &mut self.records
     }
 
+    pub(crate) fn as_slice(&self) -> &[QueryRecord] {
+        &self.records
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.records.len()
     }
 
     pub(crate) fn into_parts(self) -> (Vec<QueryRecord>, u64, u64) {
         (self.records, self.slot_bytes, self.dynamic_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryMemory;
+    use crate::QueryFailureCode;
+
+    #[test]
+    fn releasing_more_than_the_live_query_memory_is_an_internal_failure() {
+        let mut memory = QueryMemory::new(8);
+        memory.acquire(8).expect("bounded acquisition should fit");
+        assert_eq!(
+            memory
+                .release(9)
+                .expect_err("release cannot underflow")
+                .code(),
+            QueryFailureCode::Internal
+        );
     }
 }

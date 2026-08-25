@@ -217,6 +217,29 @@ fn explicit_cancel_reports_exact_release_and_never_double_releases()
 }
 
 #[test]
+fn reservation_debug_output_is_bounded_and_redacted() -> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(75)?;
+    let governor = establish(tenant)?;
+    let reservation = governor.reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    assert_eq!(
+        format!("{reservation:?}"),
+        "ResourceReservation { <bounded capability> }"
+    );
+    let transferred = reservation.transfer();
+    assert_eq!(
+        format!("{transferred:?}"),
+        "TransferredResourceReservation { <bounded capability> }"
+    );
+    drop(transferred);
+    assert_eq!(governor.inspect()?.outstanding_total(), 0);
+    Ok(())
+}
+
+#[test]
 fn bounded_observations_report_capacity_pressure_and_stable_refusal_reasons()
 -> Result<(), Box<dyn std::error::Error>> {
     let registered = tenant(75)?;

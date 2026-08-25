@@ -44,9 +44,6 @@ impl QueryBatch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Cumulative statistics for the current bounded native-query execution state.
-///
-/// Stable cross-reconnect resume and repeat counters are intentionally absent
-/// until the resumable-results contract owns their semantics.
 pub struct QueryStats {
     records: u64,
     scanned_bytes: u64,
@@ -57,6 +54,9 @@ pub struct QueryStats {
     wall_seconds: u64,
     last_sequence: Option<u64>,
     result_digest: [u8; 32],
+    cumulative_budget: crate::QueryBudget,
+    resume_count: u64,
+    repeated_batch_count: u64,
     limiting_budget: Option<QueryBudgetDimension>,
     reduced_pruning: bool,
 }
@@ -76,6 +76,9 @@ impl QueryStats {
         counters: QueryCounters,
         last_sequence: Option<u64>,
         result_digest: [u8; 32],
+        cumulative_budget: crate::QueryBudget,
+        resume_count: u64,
+        repeated_batch_count: u64,
     ) -> Self {
         Self {
             records: counters.records,
@@ -87,6 +90,9 @@ impl QueryStats {
             wall_seconds: counters.wall_seconds,
             last_sequence,
             result_digest,
+            cumulative_budget,
+            resume_count,
+            repeated_batch_count,
             limiting_budget: None,
             reduced_pruning: false,
         }
@@ -108,10 +114,12 @@ impl QueryStats {
     pub const fn records(self) -> u64 {
         self.records
     }
+
     #[must_use]
     pub const fn scanned_bytes(self) -> u64 {
         self.scanned_bytes
     }
+
     #[must_use]
     pub const fn decoded_records(self) -> u64 {
         self.decoded_records
@@ -120,6 +128,7 @@ impl QueryStats {
     pub const fn output_bytes(self) -> u64 {
         self.output_bytes
     }
+
     #[must_use]
     pub const fn memory_peak_bytes(self) -> u64 {
         self.memory_peak_bytes
@@ -139,6 +148,28 @@ impl QueryStats {
     #[must_use]
     pub const fn result_digest(self) -> [u8; 32] {
         self.result_digest
+    }
+
+    /// Returns the immutable cumulative limits governing every page and
+    /// reconnect of this query snapshot.
+    #[must_use]
+    pub const fn cumulative_budget(self) -> crate::QueryBudget {
+        self.cumulative_budget
+    }
+
+    /// Returns the number of authenticated resume operations represented by
+    /// this execution state.
+    #[must_use]
+    pub const fn resume_count(self) -> u64 {
+        self.resume_count
+    }
+
+    /// Returns the number of result batches replayed after an ambiguous
+    /// delivery. The current native stream reports this conservatively until
+    /// the delivery acknowledgement boundary is observed.
+    #[must_use]
+    pub const fn repeated_batch_count(self) -> u64 {
+        self.repeated_batch_count
     }
 
     #[must_use]

@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use positron_domain::routing::SignalKind;
 use positron_governance::{
     AuthorizedContext, CompatibilityHints, IngestPolicyServingSnapshot, PresentedCredential,
     RequestedIntent,
@@ -11,8 +10,8 @@ use positron_ingest::{
     LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry,
     reserve_log_receiver_transport,
 };
-use positron_kernel::{ActiveSegmentLedger, Catalog, SegmentScope, TransferredResourceReservation};
-use positron_query::{QueryBudget, QueryEvent, QueryService};
+use positron_kernel::TransferredResourceReservation;
+use positron_query::QueryBudget;
 
 use crate::InitializedInstance;
 
@@ -20,11 +19,17 @@ mod failure;
 mod ingest;
 mod otlp;
 mod policy;
+mod query;
 mod schema_bootstrap;
 mod schema_maintenance;
 
 pub use failure::ServiceFailure;
-use failure::{map_admission_group_plan_failure, map_receive_failure};
+#[cfg(test)]
+use failure::map_query_failure_code;
+use failure::{
+    classify_bootstrap_failure_code, classify_catalog_failure_code, classify_ledger_failure_code,
+    collect_query_bodies, map_admission_group_plan_failure, map_query_failure, map_receive_failure,
+};
 #[cfg(test)]
 mod tests;
 
@@ -130,6 +135,7 @@ impl ServiceHandle {
         protobuf: Vec<u8>,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
         let context = self.authorize_logs(bearer)?;
+        self.revalidate_ingest_context(context)?;
         let instance = &self.instance;
         let request = AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
             context,
@@ -137,7 +143,7 @@ impl ServiceHandle {
             protobuf,
         )
         .map_err(map_receive_failure)?;
-        ingest::ingest_authenticated(self, request)
+        ingest::ingest_authenticated(self, context, request)
     }
 
     pub(crate) fn authorize_logs(&self, bearer: &str) -> Result<AuthorizedContext, ServiceFailure> {
@@ -150,8 +156,12 @@ impl ServiceHandle {
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, ServiceFailure> {
         let instance = &self.instance;
-        instance
+        let identity = instance
+            .durable_identity()
+            .map_err(|failure| classify_bootstrap_failure_code(failure.code()))?;
+        identity
             .attribute(
+                &instance.key,
                 PresentedCredential::parse(bearer).map_err(|_| ServiceFailure::Unauthorized)?,
                 RequestedIntent::Ingest,
                 hints,
@@ -165,6 +175,7 @@ impl ServiceHandle {
         decoded: opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let instance = &self.instance;
         let capacity = reservation
             .reclaim(instance.resource_governor())
@@ -173,7 +184,7 @@ impl ServiceHandle {
             context, decoded, capacity,
         )
         .map_err(map_receive_failure)?;
-        ingest::ingest_authenticated(self, request)
+        ingest::ingest_authenticated(self, context, request)
     }
 
     pub(crate) fn ingest_encoded_loki_push(
@@ -183,6 +194,7 @@ impl ServiceHandle {
         body: Vec<u8>,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let capacity = reservation
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
@@ -193,7 +205,7 @@ impl ServiceHandle {
         let batch = LokiPushReceiver::with_value_limit_profile(self.instance.value_limit_profile)
             .decode(request)
             .map_err(map_receive_failure)?;
-        ingest::ingest_native_batch(self, batch)
+        ingest::ingest_native_batch(self, context, batch)
     }
 
     pub(crate) fn logs_transport_limits(&self) -> Result<(usize, usize), ServiceFailure> {
@@ -226,6 +238,7 @@ impl ServiceHandle {
         &self,
         context: AuthorizedContext,
     ) -> Result<ReceiverAdmissionLease, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let reservation =
             reserve_log_receiver_transport(context, self.instance.resource_governor())
                 .map_err(|failure| match failure {
@@ -241,6 +254,19 @@ impl ServiceHandle {
                 reservation: Mutex::new(Some(reservation)),
             }),
         })
+    }
+
+    pub(crate) fn revalidate_ingest_context(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<(), ServiceFailure> {
+        let identity = self
+            .instance
+            .durable_identity()
+            .map_err(|failure| classify_bootstrap_failure_code(failure.code()))?;
+        identity
+            .validate_ingest_context(context)
+            .map_err(|_| ServiceFailure::Unauthorized)
     }
 
     /// Runs the generated capability contract without adding a second API authority.
@@ -265,67 +291,41 @@ impl ServiceHandle {
         source: &str,
         budget: QueryBudget,
     ) -> Result<Vec<String>, ServiceFailure> {
-        self.query_log_bodies_on_shard(bearer, self.instance.logs_shard, source, budget)
+        query::query_log_bodies(self, bearer, self.instance.logs_shard, source, budget)
     }
 
-    fn query_log_bodies_on_shard(
+    #[cfg(test)]
+    pub(crate) fn query_events_for_test(
         &self,
-        bearer: &str,
-        shard: positron_domain::routing::VirtualShardId,
+        context: AuthorizedContext,
         source: &str,
         budget: QueryBudget,
-    ) -> Result<Vec<String>, ServiceFailure> {
-        let instance = &self.instance;
-        let context = instance
-            .attribute(
-                PresentedCredential::parse(bearer).map_err(|_| ServiceFailure::Unauthorized)?,
-                RequestedIntent::Query,
-                CompatibilityHints::none(),
-            )
-            .map_err(|_| ServiceFailure::Unauthorized)?;
-        let catalog = Catalog::open(
-            &instance._authority,
-            instance.instance,
-            instance
-                .key
-                .catalog_secret(instance.instance)
-                .map_err(|_| ServiceFailure::KeyUnavailable)?,
+        page_limit: Option<u16>,
+    ) -> Result<query::QueryTestOutcome, ServiceFailure> {
+        query::query_events_for_test(
+            self,
+            context,
+            self.instance.logs_shard,
+            source,
+            budget,
+            page_limit,
         )
-        .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
-        let protection = instance
-            .key
-            .segment_key(instance.instance, scope)
-            .map_err(|_| ServiceFailure::KeyUnavailable)?;
-        let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-            .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        let service = QueryService::new(instance._authority.governor(), &ledger, 100);
-        let query = service
-            .plan_pipeline(context, source, budget)
-            .map_err(|_| ServiceFailure::InvalidRequest)?;
-        let schema = self
-            .schema_sessions
-            .session(instance.tenant, instance.resource_governor())
-            .map_err(|_| ServiceFailure::CapacityUnavailable)?;
-        let events = schema
-            .with_catalog_view(instance.tenant, |catalog| {
-                service.execute_with_schema(query, catalog)
-            })
-            .map_err(|_| ServiceFailure::StorageUnavailable)?
-            .map_err(|_| ServiceFailure::StorageUnavailable)?;
-        Ok(events
-            .filter_map(|event| match event {
-                QueryEvent::Batch(batch) => Some(
-                    batch
-                        .records()
-                        .iter()
-                        .filter_map(|record| record.body_text().map(ToOwned::to_owned))
-                        .collect::<Vec<_>>(),
-                ),
-                QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
-            })
-            .flatten()
-            .collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_query_events_for_test(
+        &self,
+        context: AuthorizedContext,
+        cursor: &positron_query::QueryCursor,
+        batch_limit: u16,
+    ) -> Result<query::QueryTestOutcome, ServiceFailure> {
+        query::resume_query_events_for_test(
+            self,
+            context,
+            cursor,
+            self.instance.logs_shard,
+            batch_limit,
+        )
     }
 }
 

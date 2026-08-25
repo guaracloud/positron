@@ -254,6 +254,10 @@ impl BoundedRegex {
         self.pruning_literals.as_deref().unwrap_or_default()
     }
 
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
     pub(crate) fn source_memory_bytes(&self) -> Result<u64, QueryFailure> {
         u64::try_from(self.source.capacity())
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))

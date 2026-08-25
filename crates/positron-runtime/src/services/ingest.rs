@@ -1,4 +1,5 @@
 use positron_domain::routing::SignalKind;
+use positron_governance::AuthorizedContext;
 use positron_ingest::{
     AdmissionGroupOutcome, AuthenticatedOtlpLogsRequest, IngestFailureCode, IngestOutcome,
     IngestRequestOutcome, LogIngest, NativeLogBatch, OtlpLogsReceiver,
@@ -8,23 +9,30 @@ use positron_kernel::{
     StoreBlockIdentity, SystemLifecycleClockSource,
 };
 
-use super::{ServiceFailure, ServiceHandle, map_admission_group_plan_failure, map_receive_failure};
+use super::{
+    ServiceFailure, ServiceHandle, failure::classify_catalog_failure_code,
+    failure::classify_ledger_failure_code, map_admission_group_plan_failure, map_receive_failure,
+};
 
 pub(super) fn ingest_authenticated<'authority>(
     services: &'authority ServiceHandle,
+    context: AuthorizedContext,
     request: AuthenticatedOtlpLogsRequest<'authority>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
+    services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
     let batch = OtlpLogsReceiver::with_value_limit_profile(instance.value_limit_profile)
         .decode(request)
         .map_err(map_receive_failure)?;
-    ingest_native_batch(services, batch)
+    ingest_native_batch(services, context, batch)
 }
 
 pub(super) fn ingest_native_batch(
     services: &ServiceHandle,
+    context: AuthorizedContext,
     batch: NativeLogBatch<'_>,
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
+    services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
     let policy = services
         .ingest_policy
@@ -49,7 +57,19 @@ pub(super) fn ingest_native_batch(
     {
         return Ok(backend.ingest(groups));
     }
+    // Planning can run for an arbitrary bounded duration. Acquire the sole
+    // Catalog writer only after planning and keep it through the final ledger
+    // publications, so a lifecycle transition cannot pass the final identity
+    // check and interleave with append while unrelated planning is blocked.
     let catalog = open_catalog(instance)?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
+    identity
+        .validate_ingest_context(context)
+        .map_err(|_| ServiceFailure::Unauthorized)?;
     let clock = LifecycleClock::new(SystemLifecycleClockSource);
     let mut outcomes = Vec::new();
     outcomes
@@ -80,7 +100,14 @@ fn open_catalog<'instance>(
             .catalog_secret(instance.instance)
             .map_err(|_| ServiceFailure::KeyUnavailable)?,
     )
-    .map_err(|_| ServiceFailure::StorageUnavailable)
+    .map_err(|failure| classify_catalog_failure_code(failure.code()))
+}
+
+pub(super) const fn map_ledger_failure_code(code: LedgerFailureCode) -> IngestFailureCode {
+    match classify_ledger_failure_code(code) {
+        ServiceFailure::CapacityUnavailable => IngestFailureCode::CapacityUnavailable,
+        _ => IngestFailureCode::StorageUnavailable,
+    }
 }
 
 fn ingest_group<S: positron_kernel::LifecycleClockSource>(
@@ -98,10 +125,7 @@ fn ingest_group<S: positron_kernel::LifecycleClockSource>(
     };
     let ledger = match ActiveSegmentLedger::open(&instance._authority, catalog, scope, protection) {
         Ok(ledger) => ledger,
-        Err(failure) if failure.code() == LedgerFailureCode::ResourceAdmissionRefused => {
-            return IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable);
-        },
-        Err(_) => return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
+        Err(failure) => return IngestOutcome::Retryable(map_ledger_failure_code(failure.code())),
     };
     let identity = match instance
         .key

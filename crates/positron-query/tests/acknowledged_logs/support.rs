@@ -11,18 +11,21 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, DiskObservation, DiskPressureThresholds,
-    FixedLifecycleClockSource, GovernorFailure, GovernorPolicy, InstanceId,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, DiskObservation,
+    DiskPressureThresholds, FixedLifecycleClockSource, FormatEpoch, GovernanceFixtureObject,
+    GovernanceFixtureTarget, GovernorFailure, GovernorPolicy, InstanceId,
     InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
     OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
     RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
     ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
-    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, WorkClaim, WorkKind,
+    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim,
+    WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
     PolicyReceiver,
 };
+use positron_runtime::GovernanceTestFixture;
 use positron_signals::{LogRecord, LogStore};
 
 pub struct TestClock(AtomicU64);
@@ -42,6 +45,37 @@ pub struct StepClock(AtomicU64);
 impl StepClock {
     pub fn shared(now: u64) -> Arc<Self> {
         Arc::new(Self(AtomicU64::new(now)))
+    }
+}
+
+pub struct LifecycleTransitionClock {
+    catalog: &'static Catalog<'static>,
+    state: u8,
+    transaction: u8,
+    transitioned: std::sync::atomic::AtomicBool,
+}
+
+impl LifecycleTransitionClock {
+    pub fn shared(catalog: &'static Catalog<'static>, state: u8, transaction: u8) -> Arc<Self> {
+        Arc::new(Self {
+            catalog,
+            state,
+            transaction,
+            transitioned: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+impl positron_query::QueryClock for LifecycleTransitionClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        if !self
+            .transitioned
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            publish_lifecycle_at_catalog_for_test(self.catalog, self.state, self.transaction)
+                .map_err(|_| positron_query::QueryClockFailure)?;
+        }
+        Ok(101)
     }
 }
 
@@ -85,6 +119,39 @@ impl positron_query::QueryClock for PeriodicFailingClock {
     }
 }
 
+pub struct FailAfterArmClock {
+    armed: std::sync::atomic::AtomicBool,
+    calls: AtomicU64,
+    fail_after: u64,
+}
+
+impl FailAfterArmClock {
+    pub fn shared(fail_after: u64) -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+            fail_after,
+        })
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl positron_query::QueryClock for FailAfterArmClock {
+    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
+        if !self.armed.load(Ordering::SeqCst) {
+            return Ok(100);
+        }
+        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.fail_after {
+            Err(positron_query::QueryClockFailure)
+        } else {
+            Ok(100)
+        }
+    }
+}
+
 pub struct FailingWorkMeter;
 
 impl positron_query::QueryWorkMeter for FailingWorkMeter {
@@ -115,6 +182,53 @@ impl positron_query::QueryClock for SequenceClock {
 }
 
 pub struct FailingStageWorkMeter(pub positron_query::QueryWorkStage);
+
+pub struct FailAfterArmOutputMeter {
+    armed: std::sync::atomic::AtomicBool,
+    output_calls: AtomicU64,
+    fail_after: u64,
+}
+
+pub struct OutputOnlyWorkMeter;
+
+impl FailAfterArmOutputMeter {
+    pub fn shared(fail_after: u64) -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            output_calls: AtomicU64::new(0),
+            fail_after,
+        })
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl positron_query::QueryWorkMeter for FailAfterArmOutputMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        if stage == positron_query::QueryWorkStage::Output
+            && self.armed.load(Ordering::SeqCst)
+            && self.output_calls.fetch_add(1, Ordering::SeqCst) >= self.fail_after
+        {
+            Err(positron_query::QueryWorkFailure)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+impl positron_query::QueryWorkMeter for OutputOnlyWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(u64::from(stage == positron_query::QueryWorkStage::Output))
+    }
+}
 
 impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
     fn units(
@@ -491,6 +605,39 @@ pub struct KernelFixture {
     _root: TemporaryRoots,
 }
 
+pub fn publish_lifecycle_at_catalog_for_test(
+    catalog: &Catalog<'_>,
+    state: u8,
+    transaction: u8,
+) -> Result<(), Box<dyn Error>> {
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .object_identities()
+        .map(|identity| {
+            let bytes = basis.object(identity)?.ok_or("missing Catalog object")?;
+            let mut bytes = bytes.to_vec();
+            if bytes.starts_with(b"POSGOV01")
+                || bytes.starts_with(b"POSGOV02")
+                || bytes.starts_with(b"POSGOV03")
+            {
+                let offset = bytes.len().checked_sub(5).ok_or("identity too short")?;
+                bytes[offset] = state;
+            }
+            CatalogObject::new(bytes).map_err(|failure| -> Box<dyn Error> { Box::new(failure) })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([transaction; 16])?,
+            FormatEpoch::CATALOG_V1,
+            std::mem::take(&mut objects),
+        )?,
+        None,
+    )?;
+    Ok(())
+}
+
 impl KernelFixture {
     pub fn new(tenant: TenantId, label: &str) -> Result<Self, Box<dyn Error>> {
         let root = TemporaryRoots::new(label)?;
@@ -518,10 +665,32 @@ impl KernelFixture {
         })
     }
 
+    pub fn new_with_identity(
+        tenant: TenantId,
+        label: &str,
+        identity: &GovernanceTestFixture,
+    ) -> Result<Self, Box<dyn Error>> {
+        let fixture = Self::new(tenant, label)?;
+        identity.install_into(&fixture)?;
+        Ok(fixture)
+    }
+
     pub fn ledger(&self) -> Result<&ActiveSegmentLedger<'static, 'static>, Box<dyn Error>> {
         self.ledger
             .as_ref()
             .ok_or_else(|| "ledger unavailable".into())
+    }
+
+    pub fn publish_lifecycle_for_test(
+        &self,
+        state: u8,
+        transaction: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        publish_lifecycle_at_catalog_for_test(self.catalog, state, transaction)
+    }
+
+    pub fn catalog_for_test(&self) -> &'static Catalog<'static> {
+        self.catalog
     }
 
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {
@@ -532,6 +701,22 @@ impl KernelFixture {
             self.catalog,
             SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
             SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+        )?);
+        Ok(())
+    }
+
+    pub fn reopen_ledger(&mut self) -> Result<(), Box<dyn Error>> {
+        let ledger = self.ledger.take().ok_or("ledger unavailable")?;
+        drop(ledger);
+        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+            101_000_000_000,
+        )));
+        self.ledger = Some(ActiveSegmentLedger::open_with_clock(
+            self.authority,
+            self.catalog,
+            SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+            &clock,
         )?);
         Ok(())
     }
@@ -769,6 +954,15 @@ impl KernelFixture {
         )?;
         self.ledger()?.append(block)?;
         Ok(())
+    }
+}
+
+impl GovernanceFixtureTarget for KernelFixture {
+    fn install_governance_fixture(
+        &self,
+        fixture: &GovernanceFixtureObject,
+    ) -> Result<(), positron_kernel::CatalogFailure> {
+        self.catalog.install_governance_fixture(fixture)
     }
 }
 

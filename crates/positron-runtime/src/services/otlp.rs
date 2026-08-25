@@ -15,6 +15,7 @@ impl ServiceHandle {
         body: Vec<u8>,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let capacity = reservation
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
@@ -22,7 +23,7 @@ impl ServiceHandle {
             context, encoding, body, capacity,
         )
         .map_err(map_receive_failure)?;
-        ingest_authenticated(self, request)
+        ingest_authenticated(self, context, request)
     }
 
     pub(crate) fn ingest_encoded_loki_otlp_logs(
@@ -32,6 +33,7 @@ impl ServiceHandle {
         body: Vec<u8>,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
         let capacity = reservation
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
@@ -39,6 +41,6 @@ impl ServiceHandle {
             context, encoding, body, capacity,
         )
         .map_err(map_receive_failure)?;
-        ingest_authenticated(self, request)
+        ingest_authenticated(self, context, request)
     }
 }

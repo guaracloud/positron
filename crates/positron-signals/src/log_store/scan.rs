@@ -25,6 +25,16 @@ pub trait ScanObserver {
     /// Accounts deterministic bounded decode operations. Raw payload volume is
     /// accounted separately by `scanned_bytes` and is never duplicated here.
     fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode>;
+
+    /// Accounts an authenticated block payload admitted for physical scan.
+    fn observe_scanned_bytes(&self, _bytes: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+
+    /// Accounts a record after canonical decode and validation succeeded.
+    fn observe_decoded_records(&self, _records: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
 }
 
 pub(super) struct NeverCancelled;
@@ -78,6 +88,7 @@ impl ScanLimit {
 pub struct LogScan {
     limit: ScanLimit,
     frontier: Option<CommitPosition>,
+    scanned_bytes: Option<u64>,
 }
 
 impl LogScan {
@@ -86,6 +97,7 @@ impl LogScan {
         Self {
             limit,
             frontier: None,
+            scanned_bytes: None,
         }
     }
 
@@ -94,6 +106,7 @@ impl LogScan {
         Self {
             limit,
             frontier: Some(frontier),
+            scanned_bytes: None,
         }
     }
 
@@ -106,6 +119,40 @@ impl LogScan {
     pub const fn frontier(self) -> Option<CommitPosition> {
         self.frontier
     }
+
+    /// Applies the cumulative raw-payload ceiling to this scan. The Signal
+    /// Store checks this limit before authenticated block metadata, index, or
+    /// decode work, so an atomic block that cannot fit contributes no work or
+    /// result prefix.
+    #[must_use]
+    pub const fn with_scanned_bytes(self, limit: u64) -> Self {
+        Self {
+            limit: self.limit,
+            frontier: self.frontier,
+            scanned_bytes: Some(limit),
+        }
+    }
+
+    #[must_use]
+    pub const fn scanned_bytes_limit(self) -> Option<u64> {
+        self.scanned_bytes
+    }
+}
+
+pub(super) fn admit_block_bytes(
+    scanned_bytes: u64,
+    block_bytes: usize,
+    limit: Option<u64>,
+) -> Result<Option<u64>, LogStoreFailure> {
+    let block_bytes = u64::try_from(block_bytes).map_err(|_| LogStoreFailure::limit_exceeded())?;
+    let next = scanned_bytes
+        .checked_add(block_bytes)
+        .ok_or_else(LogStoreFailure::limit_exceeded)?;
+    if limit.is_some_and(|limit| next > limit) {
+        Ok(None)
+    } else {
+        Ok(Some(next))
+    }
 }
 
 /// A bounded logical result that holds its query capacity until drop.
@@ -115,17 +162,20 @@ pub struct LogScanResult<'kernel> {
     decoded_records: u64,
     complete: bool,
     scanned_bytes: u64,
+    scanned_bytes_limited: bool,
     retained_size_bytes: u64,
     reduced_pruning: bool,
     _capacity: ResourceReservation<'kernel>,
 }
 
 impl<'kernel> LogScanResult<'kernel> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) const fn new(
         records: Vec<ScannedLogRecord>,
         decoded_records: u64,
         complete: bool,
         scanned_bytes: u64,
+        scanned_bytes_limited: bool,
         retained_size_bytes: u64,
         reduced_pruning: bool,
         capacity: ResourceReservation<'kernel>,
@@ -135,6 +185,7 @@ impl<'kernel> LogScanResult<'kernel> {
             decoded_records,
             complete,
             scanned_bytes,
+            scanned_bytes_limited,
             retained_size_bytes,
             reduced_pruning,
             _capacity: capacity,
@@ -167,6 +218,11 @@ impl<'kernel> LogScanResult<'kernel> {
     #[must_use]
     pub const fn scanned_bytes(&self) -> u64 {
         self.scanned_bytes
+    }
+
+    #[must_use]
+    pub const fn scanned_bytes_limited(&self) -> bool {
+        self.scanned_bytes_limited
     }
 
     /// Returns the canonical conservative bytes retained by the decoded result.

@@ -1,6 +1,8 @@
 use super::LedgerFailure;
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 use super::io::map_errno;
+#[cfg(any(test, fuzzing, feature = "test-support"))]
+use std::cell::RefCell;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LedgerFileEvent {
@@ -25,35 +27,66 @@ pub(super) enum LedgerFileEvent {
     PartialSegmentHeaderWrite,
     SynchronizeSegmentHeader,
     SynchronizeSegmentDirectory,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    BeforeLeaseUsagePublication,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    AfterLeaseUsagePublication,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    BeforeLeaseUsageReconciliation,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    BeforeLeaseMarkerPublication,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    BeforeLeaseCreationReconciliation,
 }
 
 pub(super) fn emit_event(_event: LedgerFileEvent) -> Result<(), LedgerFailure> {
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    if matches!(
+        _event,
+        LedgerFileEvent::BeforeLeaseUsagePublication
+            | LedgerFileEvent::AfterLeaseUsagePublication
+            | LedgerFileEvent::BeforeLeaseUsageReconciliation
+            | LedgerFileEvent::BeforeLeaseMarkerPublication
+            | LedgerFileEvent::BeforeLeaseCreationReconciliation
+    ) && injected_errno(_event).is_some()
+    {
+        return Err(LedgerFailure::ambiguous(
+            super::LedgerFailureCode::StorageUnavailable,
+        ));
+    }
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
     if let Some(error) = injected_errno(_event) {
         return Err(map_errno(error));
     }
     Ok(())
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 thread_local! {
-    static LEDGER_FAULT: std::cell::Cell<Option<(LedgerFileEvent, rustix::io::Errno)>> = const { std::cell::Cell::new(None) };
+    static LEDGER_FAULT: RefCell<Option<Vec<(LedgerFileEvent, rustix::io::Errno)>>> = const { RefCell::new(None) };
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 fn injected_errno(event: LedgerFileEvent) -> Option<rustix::io::Errno> {
     LEDGER_FAULT.with(|fault| {
-        if fault.get().is_some_and(|(candidate, _)| candidate == event) {
-            let error = fault.get().map(|(_, error)| error);
-            fault.set(None);
-            error
+        let mut fault = fault.borrow_mut();
+        let sequence = fault.as_mut()?;
+        if sequence
+            .first()
+            .is_some_and(|(candidate, _)| *candidate == event)
+        {
+            let (_, error) = sequence.remove(0);
+            if sequence.is_empty() {
+                *fault = None;
+            }
+            Some(error)
         } else {
             None
         }
     })
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 pub(super) fn injected_partial_write_length(
     event: LedgerFileEvent,
     length: usize,
@@ -61,7 +94,7 @@ pub(super) fn injected_partial_write_length(
     injected_errno(event).map(|_| length.saturating_sub(1).max(1))
 }
 
-#[cfg(not(any(test, fuzzing)))]
+#[cfg(not(any(test, fuzzing, feature = "test-support")))]
 pub(super) const fn injected_partial_write_length(
     _event: LedgerFileEvent,
     _length: usize,
@@ -81,9 +114,28 @@ pub(crate) fn with_ledger_errno<T>(
     action: impl FnOnce() -> T,
 ) -> T {
     LEDGER_FAULT.with(|fault| {
-        let previous = fault.replace(Some((event, error)));
+        let previous = fault.replace(Some(vec![(event, error)]));
         let result = action();
-        fault.set(previous);
+        fault.replace(previous);
+        result
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn with_ledger_fault_sequence<T>(
+    events: &[LedgerFileEvent],
+    action: impl FnOnce() -> T,
+) -> T {
+    LEDGER_FAULT.with(|fault| {
+        let previous = fault.replace(Some(
+            events
+                .iter()
+                .copied()
+                .map(|event| (event, rustix::io::Errno::IO))
+                .collect(),
+        ));
+        let result = action();
+        fault.replace(previous);
         result
     })
 }

@@ -81,12 +81,22 @@ pub use catalog::{
     CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
     TransactionId,
 };
+#[cfg(feature = "test-support")]
+pub use catalog::{
+    CatalogPublicationFault, with_catalog_publication_fault_after,
+    with_catalog_publication_hook_after,
+};
+#[cfg(feature = "test-support")]
+pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 
+#[cfg(feature = "test-support")]
+pub use active_segment_ledger::publish_snapshot_lease_marker_for_test;
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
     LedgerFailure, LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS,
     PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseGrant, SnapshotLeaseId, StoreBlockIdentity,
+    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseUsage,
+    StoreBlockIdentity,
 };
 
 pub use data_protection::{
@@ -135,11 +145,19 @@ pub use data_protection::fuzz_local_root_key_file;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
+pub use data_protection::fuzz_control_token_protector;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
 pub use catalog::fuzz_catalog_stateful;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use active_segment_ledger::fuzz_active_segment_stateful;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use active_segment_ledger::fuzz_snapshot_lease_record;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};

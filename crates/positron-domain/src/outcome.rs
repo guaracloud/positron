@@ -222,3 +222,22 @@ impl Display for DomainFailure {
 }
 
 impl Error for DomainFailure {}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompletionState, DomainFailure, DomainFailureCode, FailureSource, RetryClass};
+
+    #[test]
+    fn allocation_unavailable_preserves_bounded_retry_contract() {
+        let failure = DomainFailure::allocation_unavailable();
+
+        assert_eq!(failure.code(), DomainFailureCode::AllocationUnavailable);
+        assert_eq!(failure.retry_class(), RetryClass::AfterBackoff);
+        assert_eq!(failure.completion_state(), CompletionState::Rejected);
+        assert_eq!(failure.source(), FailureSource::AttributeValue);
+        assert_eq!(
+            failure.to_string(),
+            "bounded validation allocation unavailable"
+        );
+    }
+}

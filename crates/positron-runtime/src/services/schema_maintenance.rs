@@ -6,7 +6,7 @@ use positron_kernel::{
     WorkClaim, WorkKind,
 };
 
-use super::ServiceFailure;
+use super::{ServiceFailure, failure::classify_catalog_failure_code};
 
 const MAX_ATTEMPTS: u8 = 3;
 pub(super) fn publish_quiescent_checkpoint(
@@ -203,22 +203,6 @@ fn maintenance_amounts(memory: u64) -> ResourceAmounts {
 
 fn map_catalog(failure: positron_kernel::CatalogFailure) -> ServiceFailure {
     classify_catalog_failure_code(failure.code())
-}
-
-const fn classify_catalog_failure_code(code: CatalogFailureCode) -> ServiceFailure {
-    match code {
-        CatalogFailureCode::ResourceAdmissionRefused | CatalogFailureCode::LimitExceeded => {
-            ServiceFailure::CapacityUnavailable
-        },
-        CatalogFailureCode::StorageUnavailable => ServiceFailure::StorageUnavailable,
-        CatalogFailureCode::IntegrityCorruption
-        | CatalogFailureCode::AuthenticationFailed
-        | CatalogFailureCode::UnsupportedFormat
-        | CatalogFailureCode::InvalidInput => ServiceFailure::CorruptState,
-        CatalogFailureCode::StaleGeneration
-        | CatalogFailureCode::ConcurrentWriter
-        | CatalogFailureCode::IdempotencyConflict => ServiceFailure::CatalogUnavailable,
-    }
 }
 
 #[cfg(test)]

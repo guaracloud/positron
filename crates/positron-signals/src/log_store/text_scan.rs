@@ -1,3 +1,4 @@
+use super::scan::admit_block_bytes;
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
     LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, WorkClaim, WorkKind,
@@ -95,6 +96,7 @@ impl LogStore {
         let mut scanned_bytes = 0_u64;
         let limit = scan.limit().value();
         let mut complete = true;
+        let mut scanned_bytes_limited = false;
         let mut reduced_pruning = false;
         for block in snapshot.blocks() {
             check_scan_cancellation(cancellation)?;
@@ -109,6 +111,25 @@ impl LogStore {
                 complete = false;
                 break;
             }
+            let next_scanned_bytes = match admit_block_bytes(
+                scanned_bytes,
+                block.payload().len(),
+                scan.scanned_bytes_limit(),
+            )? {
+                Some(next) => next,
+                None => {
+                    complete = false;
+                    scanned_bytes_limited = true;
+                    break;
+                },
+            };
+            observer
+                .observe_scanned_bytes(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .map_err(LogStoreFailure::observation)?;
+            scanned_bytes = next_scanned_bytes;
             if let Some((schema, candidate)) = text {
                 observer
                     .observe_work(1)
@@ -123,12 +144,6 @@ impl LogStore {
                     None => reduced_pruning = true,
                 }
             }
-            scanned_bytes = scanned_bytes
-                .checked_add(
-                    u64::try_from(block.payload().len())
-                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
-                )
-                .ok_or_else(LogStoreFailure::limit_exceeded)?;
             let decode = super::codec::BlockDecode::observed(
                 tenant,
                 block.payload(),
@@ -168,6 +183,7 @@ impl LogStore {
             decoded_records,
             complete,
             scanned_bytes,
+            scanned_bytes_limited,
             retained_size_bytes,
             reduced_pruning,
             capacity,

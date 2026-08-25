@@ -9,7 +9,8 @@ use positron_query::{
 
 use super::support::{
     BlockingOperatorWorkMeter, CancellingOperatorCallMeter, CancellingStageWorkMeter,
-    ConstantWorkMeter, SequenceClock, StageCountingWorkMeter, TestClock, TestWorkMeter,
+    ConstantWorkMeter, OutputOnlyWorkMeter, SequenceClock, StageCountingWorkMeter, TestClock,
+    TestWorkMeter,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -57,6 +58,42 @@ fn typed_projection_bytes_obey_the_exact_output_budget() -> Result<(), Box<dyn E
                 && incomplete.stats().output_bytes() == 0
                 && incomplete.stats().limiting_budget()
                     == Some(positron_query::QueryBudgetDimension::OutputBytes)
+    ));
+    Ok(())
+}
+
+#[test]
+fn output_budget_failure_persists_emitted_size_work_without_logical_delivery()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("output-budget-physical-attempt")?;
+    fixture.kernel.append_log("body", 20, 1)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(OutputOnlyWorkMeter),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 1, 1_048_576, 60)?,
+    )?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::OutputBytes)
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+                && incomplete.stats().cpu_work_units() > 0
     ));
     Ok(())
 }
@@ -1042,8 +1079,6 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
     use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
     use positron_policy::NativeLogAttribute;
 
-    const EXACT_PEAK_BYTES: u64 = 69_891;
-
     let fixture = QueryFixture::new("attribute-projection-memory")?;
     fixture.kernel.append_attribute_logs(
         vec![(
@@ -1067,12 +1102,14 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
         Arc::new(ConstantWorkMeter(0)),
     );
     let source = r#"pipeline:v1 logs | range query_time 0 100 | project record["x"] | limit 1"#;
+    let exact_peak = 69_891_u64
+        .checked_add(u64::try_from(source.len())?)
+        .ok_or("attribute projection peak overflowed")?;
 
     let exact = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, EXACT_PEAK_BYTES, 60)?
-            .with_cpu_work_units(16)?,
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, exact_peak, 60)?.with_cpu_work_units(16)?,
     )?;
     let exact_events = service.execute(exact)?.collect::<Vec<_>>();
     assert!(
@@ -1088,7 +1125,7 @@ fn occurrence_set_projection_obeys_its_exact_canonical_peak_memory_bound()
     let exhausted = service.plan_pipeline(
         fixture.context,
         source,
-        QueryBudget::new(1_048_576, 1, 1, 1_048_576, EXACT_PEAK_BYTES - 1, 60)?
+        QueryBudget::new(1_048_576, 1, 1, 1_048_576, exact_peak - 1, 60)?
             .with_cpu_work_units(16)?,
     )?;
     let exhausted_events = service.execute(exhausted)?.collect::<Vec<_>>();
@@ -1750,7 +1787,10 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
         Arc::new(ConstantWorkMeter(0)),
     );
     let ordinary = "logs | range query_time -100 100 | limit 2";
-    for (memory_bytes, expected_complete) in [(1_996, true), (1_995, false)] {
+    let ordinary_peak = 1_996_u64
+        .checked_add(u64::try_from(ordinary.len())?)
+        .ok_or("ordinary peak overflowed")?;
+    for (memory_bytes, expected_complete) in [(ordinary_peak, true), (ordinary_peak - 1, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             ordinary,
@@ -1777,7 +1817,10 @@ fn ordinary_sort_and_grouping_enforce_canonical_peak_memory_boundaries()
     fixture.kernel.append_log("fourth", 40, 4)?;
     let grouped =
         "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 4";
-    for (memory_bytes, expected_complete) in [(3_831, true), (3_830, false)] {
+    let grouped_peak = 3_831_u64
+        .checked_add(u64::try_from(grouped.len())?)
+        .ok_or("grouped peak overflowed")?;
+    for (memory_bytes, expected_complete) in [(grouped_peak, true), (grouped_peak - 1, false)] {
         let query = service.plan_pipeline(
             fixture.context,
             grouped,
@@ -2688,7 +2731,7 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
             SchemaValue::string("absent"),
         ),
     )?;
-    assert_eq!(stored_pruned.scanned_bytes(), 0);
+    assert!(stored_pruned.scanned_bytes() > 0);
     let absent = service.plan_pipeline(
         fixture.context,
         r#"pipeline:v1 logs | range query_time -100 100 | filter record["indexed"] any == string("absent") | limit 1"#,
@@ -2705,7 +2748,7 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
     let Some(QueryEvent::Terminal(QueryTerminal::Complete(pruned_stats))) = pruned.last() else {
         return Err("schema-pruned query did not complete".into());
     };
-    assert_eq!(pruned_stats.scanned_bytes(), 0);
+    assert!(pruned_stats.scanned_bytes() > 0);
     assert_eq!(pruned_stats.decoded_records(), 0);
     assert!(!pruned_stats.reduced_pruning());
 
@@ -2806,7 +2849,7 @@ fn schema_catalog_prunes_false_attribute_predicates_without_changing_exact_resul
         exact_events.last(),
         Some(QueryEvent::Terminal(QueryTerminal::Complete(stats)))
             if stats.cpu_work_units() == 11
-                && stats.scanned_bytes() == 0
+                && stats.scanned_bytes() > 0
                 && stats.decoded_records() == 0
     ));
 
@@ -3170,6 +3213,46 @@ fn cancellation_is_observed_after_scan_and_before_output_construction() -> Resul
 }
 
 #[test]
+fn cancellation_after_scan_returns_one_terminal_without_output() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("cancel-after-scan")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    let meter = CancellingOperatorCallMeter::shared_for_stage(
+        positron_query::QueryWorkStage::ScanDecode,
+        2,
+    );
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 1, 1, 64, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+                && incomplete.stats().records() == 0
+                && incomplete.stats().output_bytes() == 0
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn operator_wall_budget_is_checked_before_output() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("typed-operator-wall")?;
     fixture.kernel.append_log("one", 20, 1)?;
@@ -3298,6 +3381,7 @@ fn body_search_memory_peak_includes_matcher_and_retained_rows() -> Result<(), Bo
     assert!(peak > 40_000, "matcher memory was not retained: {peak}");
     let peak = peak
         .checked_add(457)
+        .and_then(|bytes| bytes.checked_add(u64::try_from(source.len()).ok()?))
         .ok_or("plan memory boundary overflowed")?;
 
     for (memory_bytes, expected_complete) in [(peak, true), (peak - 1, false)] {

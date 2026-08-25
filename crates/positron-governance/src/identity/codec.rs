@@ -1,4 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use positron_domain::lifecycle::TenantLifecycleState;
 
 use super::{Identity, IdentityFailure};
 
@@ -82,7 +83,15 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
             return Err(IdentityFailure);
         }
     }
-    if cursor.take_array::<5>()? != [1, 4, 0, 1, 1] || !cursor.is_empty() {
+    let lifecycle = match cursor.take_array::<5>()? {
+        [1, 4, 0, 1, 1] => TenantLifecycleState::Active,
+        [2, 4, 0, 1, 1] => TenantLifecycleState::ReadOnly,
+        [3, 4, 0, 1, 1] => TenantLifecycleState::Suspended,
+        [4, 4, 0, 1, 1] => TenantLifecycleState::Purging,
+        [5, 4, 0, 1, 1] => TenantLifecycleState::Purged,
+        _ => return Err(IdentityFailure),
+    };
+    if !cursor.is_empty() {
         return Err(IdentityFailure);
     }
     Ok(Identity {
@@ -95,6 +104,7 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
         hash,
         ingest,
         query,
+        lifecycle,
     })
 }
 

@@ -37,6 +37,28 @@ pub(crate) fn batch_digest(
     result
 }
 
+pub(crate) fn result_digest(
+    protector: &positron_kernel::ControlTokenProtector<'_>,
+    plan: &LogicalPlan,
+    record: &QueryRecord,
+    cancellation: &crate::QueryCancellation,
+    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
+    memory: &mut crate::memory::QueryMemory,
+) -> Result<[u8; 32], QueryFailure> {
+    batch_digest(
+        protector,
+        BatchDigestInput {
+            prior: [0; 32],
+            sequence: 0,
+            plan,
+            records: std::slice::from_ref(record),
+            cancellation,
+            observer,
+        },
+        memory,
+    )
+}
+
 fn batch_digest_with_acquired_state(
     protector: &positron_kernel::ControlTokenProtector<'_>,
     prior: [u8; 32],

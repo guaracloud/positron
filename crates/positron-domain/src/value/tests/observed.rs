@@ -7,6 +7,7 @@ use crate::value::{
 struct CountingObserver {
     fail_at_structure: Option<usize>,
     fail_at_allocation: Option<usize>,
+    allocation_limit: Option<usize>,
     structures: usize,
     payloads: usize,
     allocation_calls: usize,
@@ -36,7 +37,11 @@ impl NativeValueObserver for CountingObserver {
         if self.fail_at_allocation == Some(self.allocation_calls) {
             return Err("allocation admission failed");
         }
-        self.live_bytes = self.live_bytes.saturating_add(bytes);
+        let next = self.live_bytes.saturating_add(bytes);
+        if self.allocation_limit.is_some_and(|limit| next > limit) {
+            return Err("allocation budget exhausted");
+        }
+        self.live_bytes = next;
         self.allocations.push(bytes);
         Ok(())
     }
@@ -140,6 +145,54 @@ fn observed_validation_releases_output_capacity_on_cancellation() {
 }
 
 #[test]
+fn observed_validation_charges_candidate_and_output_at_exact_boundary() {
+    let candidate = CandidateAttributeValue::array(vec![CandidateAttributeValue::null()]);
+    let mut under = CountingObserver {
+        allocation_limit: Some(159),
+        ..CountingObserver::default()
+    };
+    under
+        .observe_allocation(96)
+        .expect("the parser candidate fits below the boundary");
+    assert_eq!(
+        candidate
+            .validate_log_body_observed(ValueLimitProfile::release_1_system_maximum(), &mut under,),
+        Err(ObservedValueFailure::Observer(
+            "allocation budget exhausted"
+        ))
+    );
+    assert_eq!(under.live_bytes, 96);
+    under
+        .release_allocation(96)
+        .expect("candidate cleanup is balanced");
+    assert_eq!(under.live_bytes, 0);
+
+    let candidate = CandidateAttributeValue::array(vec![CandidateAttributeValue::null()]);
+    let mut exact = CountingObserver {
+        allocation_limit: Some(160),
+        ..CountingObserver::default()
+    };
+    exact
+        .observe_allocation(96)
+        .expect("the parser candidate fits at the boundary");
+    let facts = candidate
+        .validate_log_body_observed_with_facts(
+            ValueLimitProfile::release_1_system_maximum(),
+            &mut exact,
+        )
+        .expect("candidate and canonical output fit exactly");
+    assert_eq!(facts.retained_heap_bytes(), 64);
+    assert_eq!(exact.live_bytes, 160);
+    exact
+        .release_allocation(64)
+        .expect("canonical output cleanup is balanced");
+    exact
+        .release_allocation(96)
+        .expect("candidate cleanup is balanced");
+    assert_eq!(exact.live_bytes, 0);
+}
+
+#[test]
 fn observed_validation_propagates_allocation_admission_failure() {
     let candidate = CandidateAttributeValue::array(vec![CandidateAttributeValue::null()]);
     let mut observer = CountingObserver {
@@ -178,4 +231,39 @@ fn observed_validation_releases_capacity_when_collection_value_limit_is_exceeded
     assert_eq!(observer.allocations, vec![128]);
     assert_eq!(observer.releases, vec![128]);
     assert_eq!(observer.live_bytes, 0);
+}
+
+#[test]
+fn observed_validation_reconciles_capacity_failures_without_leaking_admission() {
+    let mut overflow = CountingObserver::default();
+    overflow
+        .observe_allocation(2)
+        .expect("the synthetic admitted capacity fits");
+    assert!(
+        super::super::reconcile_output_capacity(
+            &Vec::<u8>::with_capacity(2),
+            usize::MAX,
+            2,
+            &mut overflow,
+        )
+        .is_err()
+    );
+    assert_eq!(overflow.releases, vec![2]);
+    assert_eq!(overflow.live_bytes, 0);
+
+    let mut additional_failure = CountingObserver {
+        fail_at_allocation: Some(1),
+        ..CountingObserver::default()
+    };
+    assert!(
+        super::super::reconcile_output_capacity(
+            &Vec::<u8>::with_capacity(1),
+            1,
+            0,
+            &mut additional_failure,
+        )
+        .is_err()
+    );
+    assert_eq!(additional_failure.releases, vec![0]);
+    assert_eq!(additional_failure.live_bytes, 0);
 }

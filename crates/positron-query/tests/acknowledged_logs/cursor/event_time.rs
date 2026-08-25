@@ -75,9 +75,11 @@ impl QueryFixtureForAxis {
             RequestedIntent::Query,
             CompatibilityHints::none(),
         )?;
-        let kernel = Box::leak(Box::new(KernelFixture::new(
+        let governance = instance.governance_fixture_for_test()?;
+        let kernel = Box::leak(Box::new(KernelFixture::new_with_identity(
             instance.default_tenant_id(),
             "event-time-cursor-kernel",
+            &governance,
         )?));
         kernel.append_log("first", 20, 1)?;
         kernel.append_log("second", 21, 2)?;

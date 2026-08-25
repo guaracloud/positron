@@ -23,6 +23,7 @@ pub(super) struct ResizeRequest {
     pub(super) identity: ReservationIdentity,
     pub(super) old: ResourceAmounts,
     pub(super) new: ResourceAmounts,
+    pub(super) preserve_existing: bool,
 }
 
 impl GovernorInner {
@@ -80,6 +81,7 @@ impl GovernorInner {
             identity,
             old,
             new,
+            preserve_existing,
         } = request;
         if state.lifecycle == GovernorLifecycle::Fenced {
             return Err(retained_resize(class, state.disk_pressure));
@@ -161,13 +163,19 @@ impl GovernorInner {
                 .map_err(|failure| {
                     ResizeFailure::admission(
                         failure,
-                        ExistingCapacityDisposition::CancelledBeforeLimit,
+                        if preserve_existing {
+                            ExistingCapacityDisposition::CapacityRetained
+                        } else {
+                            ExistingCapacityDisposition::CancelledBeforeLimit
+                        },
                     )
                 })
         };
         let new_pools = match planned {
             Ok(pools) => pools,
-            Err(failure) if failure.code == ResizeFailureCode::AdmissionRefused => {
+            Err(failure)
+                if failure.code == ResizeFailureCode::AdmissionRefused && !preserve_existing =>
+            {
                 let Some(outstanding) = state.outstanding.checked_sub(1) else {
                     return Err(fence_resize(state, class));
                 };

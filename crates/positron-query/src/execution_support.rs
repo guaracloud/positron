@@ -10,10 +10,10 @@ mod traversal;
 mod vocabulary;
 
 pub(crate) use accounting::{
-    charge_output, charge_scan, charge_work, charge_work_counter, cpu_work_exhausted, exhausted,
-    limiting_budget,
+    charge_output, charge_work, charge_work_counter, cpu_work_exhausted, exhausted,
+    limiting_budget, preserve_output_attempt,
 };
-pub(crate) use digest::{BatchDigestInput, batch_digest};
+pub(crate) use digest::{BatchDigestInput, batch_digest, result_digest};
 pub(crate) use failure::{map_domain_value_failure, map_ledger_failure, map_store_failure};
 pub(crate) use grouping::aggregate_records;
 pub(crate) use materialize::query_record;

@@ -1,4 +1,5 @@
 use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug};
+use positron_domain::lifecycle::TenantLifecycleState;
 
 use super::codec::decode_initial_identity;
 use super::{
@@ -65,6 +66,39 @@ fn current_governance_identity_uses_v3_magic() {
 }
 
 #[test]
+fn durable_lifecycle_states_are_decoded_and_query_readability_is_fail_closed() {
+    for (encoding, expected, readable) in [
+        (1, TenantLifecycleState::Active, true),
+        (2, TenantLifecycleState::ReadOnly, true),
+        (3, TenantLifecycleState::Suspended, false),
+        (4, TenantLifecycleState::Purging, false),
+        (5, TenantLifecycleState::Purged, false),
+    ] {
+        let mut encoded = encoded_identity();
+        let lifecycle_byte = encoded.len().checked_sub(5).expect("lifecycle bytes");
+        encoded[lifecycle_byte] = encoding;
+        let identity = decode_initial_identity(&encoded).expect("lifecycle identity");
+        assert_eq!(identity.lifecycle, expected);
+        let tenant = TenantAttribution::new(
+            identity.query.as_ref().expect("query authority").principal,
+            Scope::Query,
+            identity.tenant,
+        )
+        .expect("tenant attribution");
+        let context = AuthorizedContext {
+            principal: tenant.principal_id(),
+            scope: Scope::Query,
+            tenant: Some(tenant),
+            authority: identity.instance,
+            generation: identity.generation,
+            lifecycle: expected,
+        };
+        assert_eq!(context.tenant_lifecycle(), expected);
+        assert_eq!(identity.validate_query_context(context).is_ok(), readable);
+    }
+}
+
+#[test]
 fn unknown_or_layout_mismatched_governance_versions_fail_closed() {
     let mut unknown = literal_v1_identity();
     unknown[..8].copy_from_slice(b"POSGOV04");
@@ -127,6 +161,30 @@ fn initial_identity_decoder_rejects_truncation_corruption_and_trailing_data() {
     empty_display.drain(49..63);
     empty_display[48] = 0;
     assert!(decode_initial_identity(&empty_display).is_err());
+}
+
+#[test]
+fn identity_decoder_rejects_colliding_data_plane_principals_and_unknown_lifecycle() {
+    let mut ingest_collision = encoded_identity();
+    let ingest_offset = ingest_collision
+        .windows(16)
+        .position(|window| window == [12_u8; 16].as_slice())
+        .expect("ingest principal");
+    ingest_collision[ingest_offset..ingest_offset + 16].copy_from_slice(&[3; 16]);
+    assert!(decode_initial_identity(&ingest_collision).is_err());
+
+    let mut query_collision = encoded_identity();
+    let query_offset = query_collision
+        .windows(16)
+        .position(|window| window == [15_u8; 16].as_slice())
+        .expect("query principal");
+    query_collision[query_offset..query_offset + 16].copy_from_slice(&[12; 16]);
+    assert!(decode_initial_identity(&query_collision).is_err());
+
+    let mut unknown_lifecycle = encoded_identity();
+    let lifecycle_offset = unknown_lifecycle.len().checked_sub(5).expect("lifecycle");
+    unknown_lifecycle[lifecycle_offset] = 9;
+    assert!(decode_initial_identity(&unknown_lifecycle).is_err());
 }
 
 fn literal_v1_identity() -> Vec<u8> {
@@ -207,6 +265,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             ),
             authority: identity.instance,
             generation: 0,
+            lifecycle: TenantLifecycleState::Active,
         },
         AuthorizedContext {
             principal: identity.principal,
@@ -221,6 +280,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             ),
             authority: identity.instance,
             generation: 0,
+            lifecycle: TenantLifecycleState::Active,
         },
         AuthorizedContext {
             principal: identity.principal,
@@ -228,6 +288,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             tenant: None,
             authority: [99; 16],
             generation: 0,
+            lifecycle: TenantLifecycleState::Active,
         },
         AuthorizedContext {
             principal: PrincipalId::from_bytes([99; 16]).expect("forged principal"),
@@ -235,6 +296,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             tenant: None,
             authority: identity.instance,
             generation: 0,
+            lifecycle: TenantLifecycleState::Active,
         },
     ] {
         assert_eq!(

@@ -1,26 +1,11 @@
 use crate::cursor::CursorState;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord};
 
-pub(crate) fn charge_scan(
-    state: &mut CursorState,
-    result: &positron_signals::LogScanResult<'_>,
-) -> Result<(), QueryFailure> {
-    state.scanned_bytes = state
-        .scanned_bytes
-        .checked_add(result.scanned_bytes())
-        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::ScannedBytes))?;
-    state.decoded_records = state
-        .decoded_records
-        .checked_add(result.decoded_records())
-        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::DecodedRecords))?;
-    Ok(())
-}
-
 pub(crate) fn charge_work(
     state: &mut CursorState,
     cpu_work_units: u64,
 ) -> Result<(), QueryFailure> {
-    charge_work_counter(&mut state.cpu_work_units, cpu_work_units)
+    charge_work_counter(&mut state.physical_cpu_work_units, cpu_work_units)
 }
 
 pub(crate) fn charge_work_counter(
@@ -42,19 +27,25 @@ pub(crate) fn charge_output(
     state: &mut CursorState,
     page: &[QueryRecord],
     cancellation: &crate::QueryCancellation,
+    logical_delivery: bool,
 ) -> Result<(), QueryFailure> {
-    state.output_rows = state
-        .output_rows
-        .checked_add(
-            u64::try_from(page.len())
-                .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?,
-        )
+    let rows = u64::try_from(page.len())
+        .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
+    state.physical_output_rows = state
+        .physical_output_rows
+        .checked_add(rows)
         .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
+    if logical_delivery {
+        state.output_rows = state
+            .output_rows
+            .checked_add(rows)
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
+    }
     let mut page_bytes = 0_u64;
     for record in page {
         let mut observer = super::QueryValueObserver::new(
             service,
-            &mut state.cpu_work_units,
+            &mut state.physical_cpu_work_units,
             state.budget.cpu_work_units(),
             cancellation.clone(),
             crate::QueryWorkStage::Output,
@@ -63,11 +54,29 @@ pub(crate) fn charge_output(
             .checked_add(record_emitted_size_bytes(record, &mut observer)?)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
     }
-    state.output_bytes = state
-        .output_bytes
+    state.physical_output_bytes = state
+        .physical_output_bytes
         .checked_add(page_bytes)
         .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
+    if logical_delivery {
+        state.output_bytes = state
+            .output_bytes
+            .checked_add(page_bytes)
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
+    }
     Ok(())
+}
+
+pub(crate) fn preserve_output_attempt(state: &mut CursorState, output_state: &CursorState) {
+    state.physical_output_rows = output_state.physical_output_rows;
+    state.physical_output_bytes = output_state.physical_output_bytes;
+    state.physical_cpu_work_units = output_state.physical_cpu_work_units;
+    state.physical_memory_peak_bytes = state
+        .physical_memory_peak_bytes
+        .max(output_state.physical_memory_peak_bytes);
+    state.physical_elapsed_wall_seconds = state
+        .physical_elapsed_wall_seconds
+        .max(output_state.physical_elapsed_wall_seconds);
 }
 
 fn record_emitted_size_bytes(
@@ -136,17 +145,17 @@ fn checked_u64(value: usize) -> Result<u64, QueryFailure> {
 }
 
 pub(crate) fn limiting_budget(state: &CursorState) -> Option<QueryBudgetDimension> {
-    if state.scanned_bytes > state.budget.scanned_bytes() {
+    if state.physical_scanned_bytes > state.budget.scanned_bytes() {
         Some(QueryBudgetDimension::ScannedBytes)
-    } else if state.decoded_records > state.budget.decoded_records() {
+    } else if state.physical_decoded_records > state.budget.decoded_records() {
         Some(QueryBudgetDimension::DecodedRecords)
-    } else if state.output_rows > state.budget.output_rows() {
+    } else if state.physical_output_rows > state.budget.output_rows() {
         Some(QueryBudgetDimension::OutputRows)
-    } else if state.output_bytes > state.budget.output_bytes() {
+    } else if state.physical_output_bytes > state.budget.output_bytes() {
         Some(QueryBudgetDimension::OutputBytes)
-    } else if state.cpu_work_units > state.budget.cpu_work_units() {
+    } else if state.physical_cpu_work_units > state.budget.cpu_work_units() {
         Some(QueryBudgetDimension::CpuWorkUnits)
-    } else if state.elapsed_wall_seconds >= state.budget.wall_seconds() {
+    } else if state.physical_elapsed_wall_seconds >= state.budget.wall_seconds() {
         Some(QueryBudgetDimension::WallSeconds)
     } else {
         None
@@ -155,4 +164,80 @@ pub(crate) fn limiting_budget(state: &CursorState) -> Option<QueryBudgetDimensio
 
 pub(crate) fn exhausted(state: &CursorState) -> bool {
     limiting_budget(state).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use positron_domain::identity::{PrincipalId, TenantId};
+
+    use super::limiting_budget;
+    use crate::cursor::CursorState;
+    use crate::{
+        LogicalPlan, QueryBudget, QueryBudgetDimension, QueryCancellation, TemporalAxis,
+        TemporalRange,
+    };
+
+    fn state() -> CursorState {
+        CursorState {
+            principal: PrincipalId::from_bytes([1; 16]).expect("test principal"),
+            tenant: TenantId::from_bytes([2; 16]).expect("test tenant"),
+            authorization_generation: 1,
+            catalog_identity: [3; 32],
+            catalog_generation: 1,
+            frontier: 1,
+            plan: Arc::new(LogicalPlan::logs(
+                TemporalAxis::QueryTime,
+                TemporalRange::new(-1, 1).expect("test range"),
+                1,
+            )),
+            source: None,
+            language: None,
+            plan_digest: [4; 32],
+            resume_key: None,
+            sequence: 0,
+            prior_digest: [0; 32],
+            lease_identity: [5; 16],
+            expiry: 10,
+            budget: QueryBudget::new(10, 10, 10, 10, 10, 10).expect("test budget"),
+            scanned_bytes: 0,
+            decoded_records: 0,
+            physical_scanned_bytes: 0,
+            physical_decoded_records: 0,
+            output_rows: 0,
+            output_bytes: 0,
+            physical_output_rows: 0,
+            physical_output_bytes: 0,
+            memory_peak_bytes: 0,
+            physical_memory_peak_bytes: 0,
+            started_at: 0,
+            last_observed_at: 0,
+            cpu_work_units: 0,
+            elapsed_wall_seconds: 0,
+            physical_cpu_work_units: 0,
+            physical_elapsed_wall_seconds: 0,
+            reduced_pruning: false,
+            resume_count: 0,
+            repeated_batch_count: 0,
+            cancellation: QueryCancellation::new(),
+        }
+    }
+
+    #[test]
+    fn limiting_budget_reports_scan_before_decode_overrun() {
+        let mut scan = state();
+        scan.physical_scanned_bytes = scan.budget.scanned_bytes() + 1;
+        assert_eq!(
+            limiting_budget(&scan),
+            Some(QueryBudgetDimension::ScannedBytes)
+        );
+
+        let mut decode = state();
+        decode.physical_decoded_records = decode.budget.decoded_records() + 1;
+        assert_eq!(
+            limiting_budget(&decode),
+            Some(QueryBudgetDimension::DecodedRecords)
+        );
+    }
 }

@@ -6,12 +6,16 @@ mod cursor;
 mod lifecycle;
 #[path = "acknowledged_logs/parity.rs"]
 mod parity;
+#[path = "acknowledged_logs/query_lifecycle_admission.rs"]
+mod query_lifecycle_admission;
 #[path = "acknowledged_logs/support.rs"]
 mod support;
 #[path = "acknowledged_logs/terminal_and_bounds.rs"]
 mod terminal_and_bounds;
 #[path = "acknowledged_logs/transform_capacity.rs"]
 mod transform_capacity;
+#[path = "acknowledged_logs/transform_capacity_key_values.rs"]
+mod transform_capacity_key_values;
 #[path = "acknowledged_logs/transform_edges.rs"]
 mod transform_edges;
 #[path = "acknowledged_logs/transform_json_edges.rs"]

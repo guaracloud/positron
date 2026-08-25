@@ -1,3 +1,4 @@
+use super::scan::admit_block_bytes;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::SignalKind;
 use positron_domain::value::{NativeValueObserver, ObservedValueFailure};
@@ -132,6 +133,7 @@ impl LogStore {
         let mut scanned_bytes = 0_u64;
         let mut decoded_records = 0_usize;
         let mut complete = true;
+        let mut scanned_bytes_limited = false;
         let mut reduced_pruning = false;
         'blocks: for block in snapshot.blocks() {
             check_cancellation(cancellation)?;
@@ -151,6 +153,25 @@ impl LogStore {
                 complete = false;
                 break;
             }
+            let next_scanned_bytes = match admit_block_bytes(
+                scanned_bytes,
+                block.payload().len(),
+                scan.scanned_bytes_limit(),
+            )? {
+                Some(next) => next,
+                None => {
+                    complete = false;
+                    scanned_bytes_limited = true;
+                    break;
+                },
+            };
+            observer
+                .observe_scanned_bytes(
+                    u64::try_from(block.payload().len())
+                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
+                )
+                .map_err(LogStoreFailure::observation)?;
+            scanned_bytes = next_scanned_bytes;
             let digest = block.content_digest().map_err(LogStoreFailure::kernel)?;
             let coverage = schema
                 .verified_query_coverage_observed(block.identity(), digest, query, observer)
@@ -160,12 +181,6 @@ impl LogStore {
                 Some(true) => {},
                 None => reduced_pruning = true,
             }
-            scanned_bytes = scanned_bytes
-                .checked_add(
-                    u64::try_from(block.payload().len())
-                        .map_err(|_| LogStoreFailure::limit_exceeded())?,
-                )
-                .ok_or_else(LogStoreFailure::limit_exceeded)?;
             let decode =
                 codec::BlockDecode::observed(tenant, block.payload(), cancellation, &*observer)?;
             let oversized = decode.record_count() > remaining;
@@ -206,6 +221,7 @@ impl LogStore {
             u64::try_from(decoded_records).map_err(|_| LogStoreFailure::limit_exceeded())?,
             complete,
             scanned_bytes,
+            scanned_bytes_limited,
             retained_size_bytes,
             reduced_pruning,
             capacity,

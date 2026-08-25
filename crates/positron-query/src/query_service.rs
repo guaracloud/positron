@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use positron_domain::identity::Scope;
-use positron_governance::AuthorizedContext;
+use positron_governance::{AuthorizedContext, Identity};
 use positron_kernel::{
-    ActiveSegmentLedger, ResourceAmounts, ResourceGovernor, WorkClaim, WorkKind,
+    ActiveSegmentLedger, CatalogGenerationId, ResourceAmounts, ResourceGovernor, WorkClaim,
+    WorkKind,
 };
 
 use crate::{
@@ -11,6 +12,12 @@ use crate::{
 };
 
 const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryLanguage {
+    Pipeline,
+    Sql,
+}
 
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
@@ -72,7 +79,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         source: &str,
         budget: QueryBudget,
     ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
-        self.plan(context, source, budget, crate::service::parse_pipeline)
+        self.plan(context, source, budget, QueryLanguage::Pipeline)
     }
 
     pub fn plan_sql(
@@ -81,7 +88,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         source: &str,
         budget: QueryBudget,
     ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
-        self.plan(context, source, budget, crate::service::parse_sql)
+        self.plan(context, source, budget, QueryLanguage::Sql)
     }
 
     fn plan(
@@ -89,26 +96,32 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
         source: &str,
         budget: QueryBudget,
-        parser: fn(
-            &str,
-            &crate::planning_memory::PlanningMemory,
-        ) -> Result<LogicalPlan, QueryFailure>,
+        language: QueryLanguage,
     ) -> Result<PlannedQuery<'kernel>, QueryFailure> {
         let tenant = context
             .tenant_attribution()
             .filter(|attribution| attribution.scope() == Scope::Query)
             .map(|attribution| attribution.tenant_id())
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
+        self.validate_current_query_context(context)?;
         if source.len() > MAX_QUERY_SOURCE_BYTES {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         let started_at = self.now()?;
         let reservation = self.reserve_query(tenant, budget)?;
         let planning_memory = crate::planning_memory::PlanningMemory::new(budget.memory_bytes());
+        let source_memory = planning_memory.reserve(
+            u64::try_from(source.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?,
+        )?;
         let parse_work_units = self.work_units(crate::QueryWorkStage::Parse)?;
-        let mut plan = parser(source, &planning_memory)?;
-        let parser_retained = planning_memory.take_retained();
-        let compile_work_units = plan.search_compile_work_units();
+        let (plan, planning_memory_reservation, compile_work_units) =
+            self.compile_plan(source, language, &planning_memory, budget)?;
+        let mut source_bytes = Vec::new();
+        source_bytes
+            .try_reserve_exact(source.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        source_bytes.extend_from_slice(source.as_bytes());
         let cpu_work_units = if compile_work_units == 0 {
             parse_work_units
         } else {
@@ -134,27 +147,60 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::CpuWorkUnits,
             ));
         }
-        let retained_plan_memory = plan.retained_memory_bytes()?;
-        (retained_plan_memory <= budget.memory_bytes())
-            .then_some(())
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::MemoryBytes))?;
-        if retained_plan_memory
-            .checked_add(plan.search_memory_bytes())
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
-            > budget.memory_bytes()
-        {
-            return Err(QueryFailure::for_budget(
-                QueryFailureCode::InvalidBudget,
-                QueryBudgetDimension::MemoryBytes,
-            ));
-        }
-        let parser_retained_bytes = parser_retained.bytes();
-        let plan_retained_bytes = retained_plan_memory
-            .checked_sub(parser_retained_bytes)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-        let planning_memory = planning_memory.reserve(plan_retained_bytes)?;
-        drop(parser_retained);
+        let plan_digest = plan.canonical_digest(&self.ledger.control_tokens())?;
+        drop(source_memory);
+        Ok(PlannedQuery {
+            context,
+            plan: Arc::new(plan),
+            source: Arc::from(source_bytes.into_boxed_slice()),
+            language,
+            budget,
+            plan_digest,
+            _reservation: reservation,
+            _planning_memory: planning_memory_reservation,
+            started_at,
+            last_observed_at,
+            cpu_work_units,
+            cancellation: crate::QueryCancellation::new(),
+        })
+    }
+
+    pub(crate) fn compile_plan(
+        &self,
+        source: &str,
+        language: QueryLanguage,
+        memory: &crate::planning_memory::PlanningMemory,
+        budget: QueryBudget,
+    ) -> Result<
+        (
+            LogicalPlan,
+            crate::planning_memory::PlanningReservation,
+            u64,
+        ),
+        QueryFailure,
+    > {
+        let mut plan = match language {
+            QueryLanguage::Pipeline => crate::service::parse_pipeline(source, memory)?,
+            QueryLanguage::Sql => crate::service::parse_sql(source, memory)?,
+        };
+        let parser_retained = memory.take_retained();
+        let compile_work_units = plan.search_compile_work_units();
         plan.compile_search()?;
+        self.validate_plan_bounds(&plan, budget)?;
+        let retained_plan_bytes = plan
+            .retained_memory_bytes()?
+            .checked_sub(parser_retained.bytes())
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let plan_reservation = memory.reserve(retained_plan_bytes)?;
+        drop(parser_retained);
+        Ok((plan, plan_reservation, compile_work_units))
+    }
+
+    fn validate_plan_bounds(
+        &self,
+        plan: &LogicalPlan,
+        budget: QueryBudget,
+    ) -> Result<(), QueryFailure> {
         if plan.limit() == 0 || plan.limit() > 1_024 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
@@ -174,17 +220,18 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 QueryBudgetDimension::MaximumTimeRangeNanoseconds,
             ));
         }
-        Ok(PlannedQuery {
-            context,
-            plan: Arc::new(plan),
-            budget,
-            _reservation: reservation,
-            _planning_memory: planning_memory,
-            started_at,
-            last_observed_at,
-            cpu_work_units,
-            cancellation: crate::QueryCancellation::new(),
-        })
+        let retained = plan.retained_memory_bytes()?;
+        if retained
+            .checked_add(plan.search_memory_bytes())
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+            > budget.memory_bytes()
+        {
+            return Err(QueryFailure::for_budget(
+                QueryFailureCode::InvalidBudget,
+                QueryBudgetDimension::MemoryBytes,
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn reserve_query(
@@ -210,6 +257,38 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         self.governor
             .reserve(claim)
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
+    }
+
+    pub(crate) fn validate_current_query_context(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<positron_domain::identity::TenantId, QueryFailure> {
+        self.current_query_catalog(context)
+            .map(|(tenant, _, _)| tenant)
+    }
+
+    pub(crate) fn current_query_catalog(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<
+        (
+            positron_domain::identity::TenantId,
+            CatalogGenerationId,
+            u64,
+        ),
+        QueryFailure,
+    > {
+        let tenant = crate::execution_state::query_tenant(context)?;
+        let snapshot = self
+            .ledger
+            .current_catalog_snapshot()
+            .map_err(crate::execution_support::map_ledger_failure)?;
+        let identity = Identity::open(&snapshot)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::MalformedPersistentData))?;
+        identity
+            .revalidate_query_context(context)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Unauthorized))?;
+        Ok((tenant, snapshot.identity(), snapshot.number()))
     }
 
     pub(crate) fn now(&self) -> Result<u64, QueryFailure> {
