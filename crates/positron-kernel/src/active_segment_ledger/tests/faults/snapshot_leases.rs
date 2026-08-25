@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use super::super::super::snapshot_lease::publication_visible;
+use super::super::super::snapshot_lease_attempt::{LeaseAttemptRegistry, SnapshotLeaseAttempt};
 use super::*;
 use crate::{
-    OrdinaryPool, ResourceAmounts, ResourceDimension, SnapshotLeaseUsage, WorkClaim, WorkKind,
+    OrdinaryPool, ResourceAmounts, ResourceDimension, SnapshotLeaseId, SnapshotLeaseUsage,
+    WorkClaim, WorkKind,
 };
 
 #[test]
@@ -748,6 +751,203 @@ fn marked_snapshot_lease_rejects_a_second_live_attempt() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn marked_usage_rejects_legacy_writes_while_the_attempt_is_live() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        let failure = ledger
+            .record_snapshot_lease_usage(identity, SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0))
+            .expect_err("a legacy usage writer cannot race a marked attempt");
+        assert_eq!(failure.code(), LedgerFailureCode::ConcurrentWriter);
+        drop(marked);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_usage_rejects_an_attempt_owned_by_another_registry() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let foreign_registry = Arc::new(Mutex::new(LeaseAttemptRegistry::new()));
+        let attempt = SnapshotLeaseAttempt::acquire(&foreign_registry, lease.identity(), 1)?;
+
+        let failure = ledger
+            .record_snapshot_lease_usage_for_attempt(
+                &attempt,
+                SnapshotLeaseUsage::default(),
+                SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+            )
+            .expect_err("an attempt from another registry must not authorize usage");
+        assert_eq!(failure.code(), LedgerFailureCode::ConcurrentWriter);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_usage_rejects_a_stale_attempt_count_and_divergent_previous_usage()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let mut marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        let attempt = marked
+            .take_attempt()
+            .ok_or("marked resume did not retain its attempt guard")?;
+        let previous = marked.usage();
+        let delta = SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0);
+
+        let mut stale_count = attempt;
+        stale_count.set_resume_count(0);
+        let stale = ledger
+            .record_snapshot_lease_usage_for_attempt(&stale_count, previous, delta)
+            .expect_err("a usage write must match the admitted resume count");
+        assert_eq!(stale.code(), LedgerFailureCode::ConcurrentWriter);
+        stale_count.set_resume_count(1);
+        let first =
+            ledger.record_snapshot_lease_usage_for_attempt(&stale_count, previous, delta)?;
+        assert_eq!(first.scanned_bytes(), 1);
+        let divergent = ledger
+            .record_snapshot_lease_usage_for_attempt(
+                &stale_count,
+                previous,
+                SnapshotLeaseUsage::new(2, 0, 0, 0, 0, 0, 0),
+            )
+            .expect_err("a retry with an obsolete usage base must not merge twice");
+        assert_eq!(divergent.code(), LedgerFailureCode::ConcurrentWriter);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_usage_rejects_an_expired_attempt() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let lease = ledger.create_snapshot_lease(100, 101)?;
+        let identity = lease.identity();
+        drop(lease);
+        let mut marked = ledger.resume_snapshot_lease_with_marker(identity, 100, 1, [9; 32])?;
+        let attempt = marked
+            .take_attempt()
+            .ok_or("marked resume did not retain its attempt guard")?;
+        {
+            let mut state = ledger.state.lock().map_err(|_| "ledger state")?;
+            state.last_snapshot_lease_time = 101;
+        }
+        let failure = ledger
+            .record_snapshot_lease_usage_for_attempt(
+                &attempt,
+                SnapshotLeaseUsage::default(),
+                SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+            )
+            .expect_err("expired durable attempts cannot publish usage");
+        assert_eq!(failure.code(), LedgerFailureCode::SnapshotExpired);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_resume_reports_expiry_cleanup_publication_failure() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let _expired = ledger.create_snapshot_lease(100, 101)?;
+        let active = ledger.create_snapshot_lease(100, 200)?.identity();
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            ledger.resume_snapshot_lease_with_marker(active, 101, 1, [9; 32])
+        })
+        .expect_err("expiry cleanup must remain ambiguous when its publication sync fails");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        let resumed = ledger.resume_snapshot_lease_with_marker(active, 102, 1, [9; 32])?;
+        assert_eq!(resumed.resume_count(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_resume_rejects_a_missing_reservation_before_marker_publication()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        ledger
+            .state
+            .lock()
+            .map_err(|_| "ledger state")?
+            .lease_reservations
+            .remove(&identity);
+        let failure = ledger
+            .resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])
+            .expect_err("a durable lease without a retained reservation is corrupt");
+        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        Ok(())
+    })
+}
+
+#[test]
+fn lease_attempt_guard_maps_poisoned_registry_to_typed_concurrency() -> Result<(), Box<dyn Error>> {
+    let registry = Arc::new(Mutex::new(LeaseAttemptRegistry::new()));
+    let poisoned = Arc::clone(&registry);
+    std::thread::spawn(move || {
+        let _guard = poisoned.lock().expect("registry lock");
+        panic!("poison the test registry");
+    })
+    .join()
+    .expect_err("the registry poison fixture must panic");
+    let identity = SnapshotLeaseId::new([0x81; 16])?;
+    let failure = match SnapshotLeaseAttempt::acquire(&registry, identity, 0) {
+        Ok(_) => return Err("poisoned attempt registry was accepted".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LedgerFailureCode::ConcurrentWriter);
+    Ok(())
+}
+
+#[test]
+fn lease_attempt_drop_releases_a_poisoned_registry_without_panicking() -> Result<(), Box<dyn Error>>
+{
+    let registry = Arc::new(Mutex::new(LeaseAttemptRegistry::new()));
+    let attempt = SnapshotLeaseAttempt::acquire(&registry, SnapshotLeaseId::new([0x82; 16])?, 0)?;
+    let poisoned = Arc::clone(&registry);
+    std::thread::spawn(move || {
+        let _guard = poisoned.lock().expect("registry lock");
+        panic!("poison the test registry");
+    })
+    .join()
+    .expect_err("the registry poison fixture must panic");
+    drop(attempt);
+    Ok(())
+}
+
+#[test]
 fn durable_marker_sequence_cannot_be_rewound_by_a_stale_cache() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
@@ -1067,6 +1267,52 @@ fn marked_usage_retry_acknowledges_an_already_durable_delta() -> Result<(), Box<
             expected
         );
         assert_eq!(ledger.snapshot_lease_usage(identity, 101)?, expected);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_usage_retries_after_an_ambiguous_old_durable_value() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        let basis = catalog.pin()?;
+        let previous = super::super::super::snapshot_lease::records(&basis)?
+            .into_iter()
+            .find(|record| record.identity == identity)
+            .ok_or("marked lease record")?;
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+        let mut expected = previous.clone();
+        expected.usage = previous.usage.merge(delta)?;
+        let retried = ledger.retry_ambiguous_usage_for_test(
+            identity,
+            previous.clone(),
+            expected.clone(),
+            delta,
+            0,
+        )?;
+        assert_eq!(retried, marked.usage().merge(delta)?);
+
+        let previous_at_limit = expected.clone();
+        let mut expected_at_limit = previous_at_limit.clone();
+        expected_at_limit.usage = previous_at_limit.usage.merge(delta)?;
+        let failure = ledger
+            .retry_ambiguous_usage_for_test(
+                identity,
+                previous_at_limit,
+                expected_at_limit,
+                delta,
+                1,
+            )
+            .expect_err("an unproven durable outcome must remain ambiguous");
+        assert_eq!(
+            failure.completion_state(),
+            LedgerCompletionState::CommitAmbiguous
+        );
+        drop(marked);
         Ok(())
     })
 }
