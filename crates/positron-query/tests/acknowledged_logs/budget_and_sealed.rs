@@ -572,6 +572,73 @@ fn resume_enforces_the_original_cumulative_cpu_and_wall_budget() -> Result<(), B
 }
 
 #[test]
+fn repeated_resumes_retain_durable_wall_usage_at_the_exact_boundary() -> Result<(), Box<dyn Error>>
+{
+    let fixture = super::terminal_and_bounds::QueryFixture::new("concurrent-wall-budget")?;
+    for (identity, body) in [(1, "one"), (2, "two"), (3, "three")] {
+        fixture
+            .kernel
+            .append_log(body, i64::from(identity), identity)?;
+    }
+    let budget =
+        QueryBudget::new(1_048_576, 16, 3, 1_048_576, 1_048_576, 6)?.with_cpu_work_units(128)?;
+    let initial = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let cursor = initial
+        .execute_page(initial.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 3",
+            budget,
+        )?)?
+        .collect::<Vec<_>>()
+        .into_iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial query omitted its continuation cursor")?;
+
+    let service = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(102),
+    );
+    let first = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    let second = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        first.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Continued(_)))
+    ));
+    assert!(matches!(
+        second.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Continued(_)))
+    ));
+
+    let exhausted = service
+        .resume(fixture.context, &cursor)
+        .expect("durable wall accounting must retain the resumable lease")
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        exhausted.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().wall_seconds() == 6
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::WallSeconds)
+    ));
+    Ok(())
+}
+
+#[test]
 fn resume_uses_the_remaining_decoded_record_budget_before_scanning() -> Result<(), Box<dyn Error>> {
     let (_roots, paths) = bootstrap_paths("cumulative-decoded-budget")?;
     InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;

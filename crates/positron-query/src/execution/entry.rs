@@ -122,6 +122,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now_seconds < state.last_observed_at {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
         }
+        let resume_elapsed = now_seconds
+            .checked_sub(state.last_observed_at)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
         if now_seconds >= state.expiry {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
@@ -177,6 +180,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             }
         };
         merge_durable_usage(&mut state, lease.usage());
+        if state.physical_elapsed_wall_seconds < state.budget.wall_seconds() {
+            state.physical_elapsed_wall_seconds = state
+                .physical_elapsed_wall_seconds
+                .checked_add(resume_elapsed)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        }
         let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());
         let planning_memory =
             crate::planning_memory::PlanningMemory::new(state.budget.memory_bytes());
@@ -219,7 +228,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         state.resume_count = lease.resume_count();
         state.repeated_batch_count = lease.repeated_batch_count();
         state.last_observed_at = now_seconds;
-        state.physical_elapsed_wall_seconds = now_seconds.saturating_sub(state.started_at);
         self.run_page(
             state,
             lease.snapshot(),
