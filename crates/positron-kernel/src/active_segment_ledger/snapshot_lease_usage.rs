@@ -11,25 +11,6 @@ use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 
 const MAX_USAGE_PUBLICATION_RETRIES: u8 = 1;
 
-struct AmbiguousUsageRetry<'record> {
-    identity: SnapshotLeaseId,
-    attempt: Option<(u64, SnapshotLeaseUsage)>,
-    delta: SnapshotLeaseUsage,
-    retries: u8,
-    record: &'record LeaseRecord,
-}
-
-struct UsagePublication<'record> {
-    identity: SnapshotLeaseId,
-    attempt: Option<(u64, SnapshotLeaseUsage)>,
-    delta: SnapshotLeaseUsage,
-    retries: u8,
-    previous: &'record LeaseRecord,
-    updated: &'record LeaseRecord,
-    expected_encoded: &'record [u8],
-    previous_amounts: crate::ResourceAmounts,
-}
-
 fn cache_marker(state: &mut super::state::LedgerState<'_>, record: &LeaseRecord) {
     state
         .lease_resume_markers
@@ -191,126 +172,46 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             &BTreeSet::from([identity]),
             vec![encoded],
         ) {
-            return self.handle_usage_publication_failure(
-                state,
-                failure,
-                UsagePublication {
+            if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
+                let reconciled = self.reconcile_ambiguous_usage(
+                    &mut state,
                     identity,
-                    attempt,
-                    delta,
-                    retries,
-                    previous: &record,
-                    updated: &updated,
-                    expected_encoded: &expected_encoded,
+                    &record,
+                    &updated,
+                    &expected_encoded,
                     previous_amounts,
-                },
-            );
+                );
+                if reconciled.is_err()
+                    && retries < MAX_USAGE_PUBLICATION_RETRIES
+                    && self
+                        .catalog
+                        .refresh_state()
+                        .ok()
+                        .and_then(|()| self.catalog.pin().ok())
+                        .and_then(|basis| records(&basis).ok())
+                        .is_some_and(|records| {
+                            records.into_iter().any(|candidate| {
+                                candidate.identity == identity
+                                    && candidate.scope == self.scope
+                                    && candidate.usage == record.usage
+                            })
+                        })
+                {
+                    drop(state);
+                    return self.record_snapshot_lease_usage_inner(
+                        identity,
+                        attempt,
+                        delta,
+                        retries + 1,
+                    );
+                }
+                return reconciled;
+            }
+            rollback_marker_resize(&mut state, identity, previous_amounts)?;
+            return Err(failure);
         }
         cache_marker(&mut state, &updated);
         Ok(usage)
-    }
-
-    fn retry_ambiguous_usage(
-        &self,
-        state: std::sync::MutexGuard<'_, super::state::LedgerState<'_>>,
-        retry: AmbiguousUsageRetry<'_>,
-        reconciled: Result<SnapshotLeaseUsage, LedgerFailure>,
-    ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
-        if reconciled.is_err()
-            && retry.retries < MAX_USAGE_PUBLICATION_RETRIES
-            && self
-                .catalog
-                .refresh_state()
-                .ok()
-                .and_then(|()| self.catalog.pin().ok())
-                .and_then(|basis| records(&basis).ok())
-                .is_some_and(|records| {
-                    records.into_iter().any(|candidate| {
-                        candidate.identity == retry.identity
-                            && candidate.scope == self.scope
-                            && candidate.usage == retry.record.usage
-                    })
-                })
-        {
-            drop(state);
-            return self.record_snapshot_lease_usage_inner(
-                retry.identity,
-                retry.attempt,
-                retry.delta,
-                retry.retries + 1,
-            );
-        }
-        reconciled
-    }
-
-    fn handle_usage_publication_failure(
-        &self,
-        mut state: std::sync::MutexGuard<'_, super::state::LedgerState<'_>>,
-        failure: LedgerFailure,
-        publication: UsagePublication<'_>,
-    ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
-        if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
-            let reconciled = self.reconcile_ambiguous_usage(
-                &mut state,
-                publication.identity,
-                publication.previous,
-                publication.updated,
-                publication.expected_encoded,
-                publication.previous_amounts,
-            );
-            return self.retry_ambiguous_usage(
-                state,
-                AmbiguousUsageRetry {
-                    identity: publication.identity,
-                    attempt: publication.attempt,
-                    delta: publication.delta,
-                    retries: publication.retries,
-                    record: publication.previous,
-                },
-                reconciled,
-            );
-        }
-        rollback_marker_resize(
-            &mut state,
-            publication.identity,
-            publication.previous_amounts,
-        )?;
-        Err(failure)
-    }
-
-    #[cfg(test)]
-    pub(super) fn retry_ambiguous_usage_for_test(
-        &self,
-        identity: SnapshotLeaseId,
-        previous: LeaseRecord,
-        expected: LeaseRecord,
-        delta: SnapshotLeaseUsage,
-        retries: u8,
-    ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
-        let previous_amounts = state
-            .lease_reservations
-            .get(&identity)
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
-            .granted();
-        let expected_encoded = encode(&expected)?;
-        self.handle_usage_publication_failure(
-            state,
-            LedgerFailure::ambiguous(LedgerFailureCode::StorageUnavailable),
-            UsagePublication {
-                identity,
-                attempt: Some((expected.resume_count, previous.usage)),
-                delta,
-                retries,
-                previous: &previous,
-                updated: &expected,
-                expected_encoded: &expected_encoded,
-                previous_amounts,
-            },
-        )
     }
 
     pub(super) fn reconcile_ambiguous_usage(

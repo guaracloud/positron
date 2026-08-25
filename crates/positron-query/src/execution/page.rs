@@ -186,6 +186,24 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
+        if start < wanted && output_rows_remaining == 0 {
+            return self.failed_page(
+                Some(header),
+                QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows),
+                &state,
+                delivered_before,
+                resources,
+            );
+        }
+        if start < wanted && state.physical_output_bytes >= state.budget.output_bytes() {
+            return self.failed_page(
+                Some(header),
+                QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputBytes),
+                &state,
+                delivered_before,
+                resources,
+            );
+        }
         let page_capacity = usize::try_from(output_rows_remaining)
             .unwrap_or(usize::MAX)
             .min(usize::from(batch_limit));

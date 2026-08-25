@@ -8,7 +8,7 @@ use positron_query::{
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
-use positron_kernel::{ResourceDimension, WorkClass};
+use positron_kernel::{ResourceDimension, SnapshotLeaseId, SnapshotLeaseUsage, WorkClass};
 
 use super::support::{
     BlockingOperatorWorkMeter, CancellingStageWorkMeter, KernelFixture, StageCountingWorkMeter,
@@ -639,6 +639,63 @@ fn repeated_resumes_retain_durable_wall_usage_at_the_exact_boundary() -> Result<
                 && incomplete.stats().wall_seconds() == 6
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::WallSeconds)
+    ));
+    Ok(())
+}
+
+#[test]
+fn zero_remaining_output_rows_with_pending_replay_is_incomplete() -> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("output-rows-replay-boundary")?;
+    for (identity, body) in [(1, "one"), (2, "two"), (3, "three")] {
+        fixture
+            .kernel
+            .append_log(body, i64::from(identity), identity)?;
+    }
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let service = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let first = service
+        .execute_page(service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit 2",
+            budget,
+        )?)?
+        .collect::<Vec<_>>();
+    let cursor = continued_cursor(&first)?.clone();
+
+    let raw_identity = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header.lease().identity()),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("query header missing")?;
+    let identity = SnapshotLeaseId::new(raw_identity)?;
+    let usage = fixture
+        .kernel
+        .ledger()?
+        .record_snapshot_lease_usage(identity, SnapshotLeaseUsage::new(0, 0, 0, 0, 1, 0, 0))?;
+    assert_eq!(usage.output_rows(), 2);
+
+    let replay = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert!(
+        replay
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        replay.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 1
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::OutputRows)
     ));
     Ok(())
 }
