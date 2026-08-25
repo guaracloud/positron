@@ -135,6 +135,17 @@ impl QueryRecord {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_with_retained_bytes(
+        mut self,
+        body_retained_bytes: u64,
+        attribute_retained_bytes: u64,
+    ) -> Self {
+        self.body_retained_bytes = body_retained_bytes;
+        self.attribute_retained_bytes = attribute_retained_bytes;
+        self
+    }
+
     pub(crate) fn grouped_count_record(fields: GroupedCountFields, count: u64) -> Self {
         Self {
             body: fields.body,

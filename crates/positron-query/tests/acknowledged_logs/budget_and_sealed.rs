@@ -138,6 +138,18 @@ fn scanned_bytes_are_atomic_across_schema_text() -> Result<(), Box<dyn Error>> {
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::ScannedBytes)
     ));
+    let tiny_budget = QueryBudget::new(1, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let tiny = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, tiny_budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(
+        !tiny
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
     Ok(())
 }
 
@@ -215,6 +227,18 @@ fn scanned_bytes_are_atomic_across_schema_attribute() -> Result<(), Box<dyn Erro
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::ScannedBytes)
     ));
+    let tiny_budget = QueryBudget::new(1, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let tiny = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, tiny_budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(
+        !tiny
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
     Ok(())
 }
 

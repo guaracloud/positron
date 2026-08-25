@@ -301,68 +301,92 @@ pub fn fuzz_tail_cursor(data: &[u8]) {
 #[doc(hidden)]
 pub fn fuzz_tail_state_machine(data: &[u8]) {
     const MAX_ROWS: usize = 64;
+    const MAX_DELIVERED: usize = MAX_ROWS * 4;
+    let protector = positron_kernel::fuzz_control_token_protector();
+    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
+        .expect("fuzz principal fixture is valid");
+    let tenant = positron_domain::identity::TenantId::from_bytes([2; 16])
+        .expect("fuzz tenant fixture is valid");
+    let shard =
+        positron_domain::routing::VirtualShardId::new(1).expect("fuzz shard fixture is valid");
+    let mut state = tail::TailCursorState::new(
+        principal,
+        tenant,
+        7,
+        [3; 32],
+        [5; 32],
+        vec![tail::TailPosition::new(
+            shard,
+            positron_domain::routing::CommitPosition::origin(),
+        )],
+        4_096,
+        0,
+        [0; 32],
+    )
+    .expect("fuzz cursor state is valid");
+    let mut cursor = tail::TailCursor::encode(&protector, &state).expect("fuzz cursor encodes");
     let mut committed = Vec::new();
     let mut delivered = Vec::new();
-    let mut safe = 0_u64;
     let mut next = 1_u64;
-    let mut terminal = false;
+    let mut next_delivery = 0_usize;
+    let mut terminal_count = 0_u8;
     let mut connected = true;
-    let mut expired = false;
     for action in data.iter().copied().take(4_096) {
-        match action % 10 {
+        match action % 8 {
             0 if committed.len() < MAX_ROWS => {
                 committed.push(next);
                 next = next.saturating_add(1);
             },
-            1 => {
-                if let Some(position) = committed.last().copied() {
-                    if connected && !terminal && !expired {
+            1 if connected && terminal_count == 0 => {
+                if let Some(position) = committed.get(next_delivery).copied() {
+                    if delivered.len() < MAX_DELIVERED {
                         delivered.push(position);
-                        safe = safe.max(position);
+                        next_delivery = next_delivery.saturating_add(1);
+                        let position = positron_domain::routing::CommitPosition::origin()
+                            .advance_by(
+                                std::num::NonZeroU64::new(position)
+                                    .expect("fuzz positions are non-zero"),
+                            )
+                            .expect("fuzz position remains bounded");
+                        state = state
+                            .advance_batch(
+                                &[tail::TailPosition::new(shard, position)],
+                                [u8::try_from(position.value()).unwrap_or(u8::MAX); 32],
+                            )
+                            .expect("monotonic tail cursor advances");
+                        cursor = tail::TailCursor::encode(&protector, &state)
+                            .expect("advanced fuzz cursor encodes");
                     }
                 }
             },
-            2 => {
-                if connected && !terminal && !expired && committed.len() > delivered.len() {
-                    connected = false;
+            2 => connected = false,
+            3 if terminal_count == 0 => {
+                connected = true;
+                if next_delivery > 0 && delivered.len() < MAX_DELIVERED {
+                    delivered.push(committed[next_delivery - 1]);
                 }
             },
-            3 => connected = true,
-            4 => terminal = true,
-            5 => expired = true,
-            6 if terminal => terminal = false,
-            7 => {
-                if connected && !terminal && !expired {
-                    for position in committed
-                        .iter()
-                        .copied()
-                        .filter(|position| *position <= safe)
-                    {
-                        if delivered.len() >= MAX_ROWS * 2 {
-                            break;
-                        }
-                        delivered.push(position);
-                    }
-                }
+            4 | 5 if terminal_count == 0 => {
+                terminal_count = 1;
+                connected = false;
             },
-            8 => {
-                if connected && !terminal && !expired && delivered.len() < MAX_ROWS {
-                    if let Some(position) = committed.get(delivered.len()).copied() {
-                        delivered.push(position);
-                    }
+            6 => {
+                if let Ok(decoded) = tail::TailCursor::decode(&protector, &cursor) {
+                    assert_eq!(decoded, state);
                 }
             },
             _ => {},
         }
         assert!(committed.len() <= MAX_ROWS);
-        assert!(delivered.len() <= MAX_ROWS * 2);
-        assert!(terminal || !expired || !connected || safe <= next);
-        assert!(committed.iter().all(|position| *position <= next));
+        assert!(delivered.len() <= MAX_DELIVERED);
+        assert!(terminal_count <= 1);
+        assert!(next_delivery <= committed.len());
         assert!(
             delivered
                 .iter()
-                .all(|position| *position <= safe || *position <= next)
+                .all(|position| committed.contains(position))
         );
+        assert!(state.positions()[0].position().value() <= next);
     }
 }
 

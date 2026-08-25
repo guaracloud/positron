@@ -101,4 +101,60 @@ impl TailBuffer {
     pub(crate) fn is_empty(&self) -> bool {
         self.batches.is_empty()
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.batches.clear();
+        self.rows = 0;
+        self.bytes = 0;
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::{MAX_BYTES, TailBuffer};
+    use crate::stream::QueryRecord;
+
+    #[test]
+    fn pop_reconciles_underflow_and_overflowed_dynamic_accounting() {
+        let mut buffer = TailBuffer::new(2, MAX_BYTES).expect("bounded buffer");
+        buffer
+            .push(vec![QueryRecord::count_record(1)])
+            .expect("record fits in the buffer");
+        buffer.rows = 0;
+        buffer.bytes = 0;
+        assert!(buffer.pop().is_some());
+
+        let mut buffer = TailBuffer::new(2, MAX_BYTES).expect("bounded buffer");
+        buffer.batches.push_back(vec![
+            QueryRecord::count_record(1).test_with_retained_bytes(u64::MAX, 1),
+        ]);
+        buffer.rows = 1;
+        buffer.bytes = 1;
+        assert!(buffer.pop().is_some());
+        assert_eq!(buffer.bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_BYTES, TailBuffer};
+    use crate::QueryFailureCode;
+
+    #[test]
+    fn invalid_windows_and_empty_batches_are_refused() {
+        for (rows, bytes) in [(0, 1), (1, 0), (1_025, 1), (1, MAX_BYTES + 1)] {
+            assert!(matches!(
+                TailBuffer::new(rows, bytes),
+                Err(failure) if failure.code() == QueryFailureCode::InvalidBudget
+            ));
+        }
+        let mut buffer = TailBuffer::new(1, 1).expect("valid bounded window");
+        assert_eq!(
+            buffer
+                .push(Vec::new())
+                .expect_err("empty batches are not deliverable")
+                .code(),
+            QueryFailureCode::ResourceAdmissionRefused
+        );
+    }
 }

@@ -1,6 +1,6 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_kernel::CommittedLedgerReader;
+use positron_kernel::{CommittedLedgerReader, ControlTokenProtector};
 
 use crate::{QueryFailure, QueryFailureCode};
 
@@ -59,23 +59,36 @@ impl<'kernel, 'catalog> TailSourceSet<'kernel, 'catalog> {
         self.tenant
     }
 
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        let mut digest = [0_u8; 32];
-        digest[0] = match self.signal {
+    pub(crate) fn digest(
+        &self,
+        protector: &ControlTokenProtector<'_>,
+    ) -> Result<[u8; 32], QueryFailure> {
+        let bytes = 1_usize
+            .checked_add(std::mem::size_of::<[u8; 16]>())
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(self.readers.len().checked_mul(4)?))
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        let mut canonical = Vec::new();
+        canonical
+            .try_reserve_exact(bytes)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        canonical.extend_from_slice(b"T");
+        canonical.extend_from_slice(&self.tenant.to_bytes());
+        canonical.push(match self.signal {
             SignalKind::Logs => 1,
             SignalKind::Traces => 2,
-        };
-        for (index, reader) in self.readers.iter().enumerate() {
-            let offset = 1 + (index % 7) * 4;
-            let bytes = reader.scope().shard_id().value().to_be_bytes();
-            for (slot, byte) in bytes.iter().enumerate() {
-                digest[offset + slot] = digest[offset + slot].wrapping_add(*byte);
-            }
+        });
+        canonical.extend_from_slice(
+            &u8::try_from(self.readers.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?
+                .to_be_bytes(),
+        );
+        for reader in &self.readers {
+            canonical.extend_from_slice(&reader.scope().shard_id().value().to_be_bytes());
         }
-        if let Ok(count) = u8::try_from(self.readers.len()) {
-            digest[31] = count;
-        }
-        digest
+        protector
+            .digest(b"tail-source-set-v1", &canonical)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
     }
 
     pub(crate) fn contains(&self, shard: VirtualShardId) -> bool {

@@ -7,6 +7,15 @@ use crate::{QueryCancellation, QueryFailure};
 
 pub(super) const MAX_SCAN_RECORDS: usize = 1_024;
 
+#[derive(Clone, Copy)]
+pub(crate) enum ScanAfter {
+    Position(positron_domain::routing::CommitPosition),
+    Record(
+        positron_domain::routing::CommitPosition,
+        positron_domain::routing::RecordOrdinal,
+    ),
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the scan adapter forwards one bounded request to the three canonical signal-store paths"
@@ -15,7 +24,7 @@ pub(crate) fn execute_scan<'kernel>(
     governor: ResourceGovernor<'kernel>,
     tenant: TenantId,
     snapshot: &LedgerSnapshot<'kernel>,
-    after: Option<positron_domain::routing::CommitPosition>,
+    after: Option<ScanAfter>,
     frontier: positron_domain::routing::CommitPosition,
     scan_limit: ScanLimit,
     scanned_remaining: u64,
@@ -26,7 +35,10 @@ pub(crate) fn execute_scan<'kernel>(
     observer: &mut QueryScanObserver<'_>,
 ) -> Result<LogScanResult<'kernel>, QueryFailure> {
     let scan = match after {
-        Some(after) => LogScan::between(scan_limit, after, frontier),
+        Some(ScanAfter::Position(after)) => LogScan::between(scan_limit, after, frontier),
+        Some(ScanAfter::Record(position, ordinal)) => {
+            LogScan::between_record(scan_limit, position, ordinal, frontier)
+        },
         None => LogScan::through(scan_limit, frontier),
     }
     .with_scanned_bytes(scanned_remaining);

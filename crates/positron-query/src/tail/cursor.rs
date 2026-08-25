@@ -4,12 +4,13 @@ use positron_kernel::{ControlTokenAuthentication, ControlTokenProtector};
 
 use crate::{QueryFailure, QueryFailureCode};
 
-const MAGIC: [u8; 8] = *b"POSTCUR2";
-const PURPOSE: &[u8] = b"tail-cursor-v2";
+const MAGIC: [u8; 8] = *b"POSTCUR3";
+const PURPOSE: &[u8] = b"tail-cursor-v3";
+const VERSION: u16 = 2;
 const MAX_SHARDS: usize = 64;
 const MAX_BYTES: usize = 2_048;
 const AUTH_BYTES: usize = 32;
-const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 2;
+const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TailPosition {
@@ -59,9 +60,15 @@ pub struct TailCursorState {
     plan_digest: [u8; 32],
     signal_digest: [u8; 32],
     positions: Vec<TailPosition>,
+    record_bound: bool,
     expiry: u64,
     sequence: u64,
     prior_digest: [u8; 32],
+    scanned_bytes: u64,
+    decoded_records: u64,
+    output_rows: u64,
+    output_bytes: u64,
+    cpu_work_units: u64,
 }
 
 impl TailCursorState {
@@ -91,9 +98,15 @@ impl TailCursorState {
             plan_digest,
             signal_digest,
             positions,
+            record_bound: false,
             expiry,
             sequence,
             prior_digest,
+            scanned_bytes: 0,
+            decoded_records: 0,
+            output_rows: 0,
+            output_bytes: 0,
+            cpu_work_units: 0,
         })
     }
     pub const fn principal(&self) -> PrincipalId {
@@ -114,6 +127,9 @@ impl TailCursorState {
     pub fn positions(&self) -> &[TailPosition] {
         &self.positions
     }
+    pub const fn record_bound(&self) -> bool {
+        self.record_bound
+    }
     pub const fn expiry(&self) -> u64 {
         self.expiry
     }
@@ -122,6 +138,36 @@ impl TailCursorState {
     }
     pub const fn prior_digest(&self) -> [u8; 32] {
         self.prior_digest
+    }
+    pub const fn scanned_bytes(&self) -> u64 {
+        self.scanned_bytes
+    }
+    pub const fn decoded_records(&self) -> u64 {
+        self.decoded_records
+    }
+    pub const fn output_rows(&self) -> u64 {
+        self.output_rows
+    }
+    pub const fn output_bytes(&self) -> u64 {
+        self.output_bytes
+    }
+    pub const fn cpu_work_units(&self) -> u64 {
+        self.cpu_work_units
+    }
+
+    pub(crate) fn set_progress(
+        &mut self,
+        scanned_bytes: u64,
+        decoded_records: u64,
+        output_rows: u64,
+        output_bytes: u64,
+        cpu_work_units: u64,
+    ) {
+        self.scanned_bytes = scanned_bytes;
+        self.decoded_records = decoded_records;
+        self.output_rows = output_rows;
+        self.output_bytes = output_bytes;
+        self.cpu_work_units = cpu_work_units;
     }
 
     pub fn validate_for_resume(
@@ -172,7 +218,7 @@ impl TailCursorState {
             entry.ordinal = update.ordinal;
         }
         let sequence = self.sequence.checked_add(1).ok_or_else(invalid)?;
-        Self::new(
+        let mut state = Self::new(
             self.principal,
             self.tenant,
             self.authorization_generation,
@@ -182,7 +228,58 @@ impl TailCursorState {
             self.expiry,
             sequence,
             digest,
-        )
+        )?;
+        state.record_bound = true;
+        state.set_progress(
+            self.scanned_bytes,
+            self.decoded_records,
+            self.output_rows,
+            self.output_bytes,
+            self.cpu_work_units,
+        );
+        Ok(state)
+    }
+
+    pub(crate) fn advance_positions(&self, updates: &[TailPosition]) -> Result<Self, QueryFailure> {
+        if updates.is_empty() {
+            return Err(invalid());
+        }
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(self.positions.len())
+            .map_err(|_| resource())?;
+        positions.extend_from_slice(&self.positions);
+        for update in updates {
+            let entry = positions
+                .iter_mut()
+                .find(|entry| entry.shard == update.shard)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+            if (update.position, update.ordinal) < (entry.position, entry.ordinal) {
+                return Err(invalid());
+            }
+            entry.position = update.position;
+            entry.ordinal = update.ordinal;
+        }
+        let mut state = Self::new(
+            self.principal,
+            self.tenant,
+            self.authorization_generation,
+            self.plan_digest,
+            self.signal_digest,
+            positions,
+            self.expiry,
+            self.sequence,
+            self.prior_digest,
+        )?;
+        state.record_bound = true;
+        state.set_progress(
+            self.scanned_bytes,
+            self.decoded_records,
+            self.output_rows,
+            self.output_bytes,
+            self.cpu_work_units,
+        );
+        Ok(state)
     }
 }
 
@@ -204,7 +301,7 @@ impl TailCursor {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(total).map_err(|_| resource())?;
         bytes.extend_from_slice(&MAGIC);
-        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&VERSION.to_be_bytes());
         bytes.extend_from_slice(&0_u64.to_be_bytes());
         bytes.extend_from_slice(&state.principal.to_bytes());
         bytes.extend_from_slice(&state.tenant.to_bytes());
@@ -214,6 +311,11 @@ impl TailCursor {
         bytes.extend_from_slice(&state.expiry.to_be_bytes());
         bytes.extend_from_slice(&state.sequence.to_be_bytes());
         bytes.extend_from_slice(&state.prior_digest);
+        bytes.extend_from_slice(&state.scanned_bytes.to_be_bytes());
+        bytes.extend_from_slice(&state.decoded_records.to_be_bytes());
+        bytes.extend_from_slice(&state.output_rows.to_be_bytes());
+        bytes.extend_from_slice(&state.output_bytes.to_be_bytes());
+        bytes.extend_from_slice(&state.cpu_work_units.to_be_bytes());
         bytes.extend_from_slice(
             &(u16::try_from(state.positions.len()).map_err(|_| invalid())?).to_be_bytes(),
         );
@@ -221,7 +323,7 @@ impl TailCursor {
             bytes.extend_from_slice(&position.shard.value().to_be_bytes());
             bytes.extend_from_slice(&position.position.value().to_be_bytes());
             bytes.extend_from_slice(&position.ordinal.value().to_be_bytes());
-            bytes.extend_from_slice(&[0; 2]);
+            bytes.extend_from_slice(&[u8::from(state.record_bound), 0]);
         }
         let auth = protector
             .authenticate_query_cursor(PURPOSE, &bytes)
@@ -247,7 +349,7 @@ impl TailCursor {
         }
         let payload_len = bytes.len().checked_sub(AUTH_BYTES).ok_or_else(invalid)?;
         let (payload, tag) = bytes.split_at(payload_len);
-        if payload.get(..8) != Some(MAGIC.as_slice()) || u16_at(payload, 8)? != 1 {
+        if payload.get(..8) != Some(MAGIC.as_slice()) || u16_at(payload, 8)? != VERSION {
             return Err(invalid());
         }
         let epoch = u64_at(payload, 10)?;
@@ -266,7 +368,12 @@ impl TailCursor {
         let expiry = u64_at(payload, 122)?;
         let sequence = u64_at(payload, 130)?;
         let prior = array_at_at::<32>(payload, 138)?;
-        let count = usize::from(u16_at(payload, 170)?);
+        let scanned_bytes = u64_at(payload, 170)?;
+        let decoded_records = u64_at(payload, 178)?;
+        let output_rows = u64_at(payload, 186)?;
+        let output_bytes = u64_at(payload, 194)?;
+        let cpu_work_units = u64_at(payload, 202)?;
+        let count = usize::from(u16_at(payload, 210)?);
         if count == 0 || count > MAX_SHARDS {
             return Err(invalid());
         }
@@ -278,6 +385,7 @@ impl TailCursor {
         }
         let mut positions = Vec::new();
         positions.try_reserve_exact(count).map_err(|_| resource())?;
+        let mut record_bound = None;
         for index in 0..count {
             let offset = PREFIX_BYTES
                 .checked_add(index.checked_mul(16).ok_or_else(invalid)?)
@@ -291,11 +399,29 @@ impl TailCursor {
             };
             let ordinal = RecordOrdinal::new(u16::from_be_bytes(array_at(payload, offset + 12)?))
                 .map_err(|_| invalid())?;
+            let position_record_bound = match payload.get(offset + 14) {
+                Some(0) => false,
+                Some(1) => true,
+                _ => return Err(invalid()),
+            };
+            if record_bound.is_some_and(|value| value != position_record_bound) {
+                return Err(invalid());
+            }
+            record_bound = Some(position_record_bound);
             positions.push(TailPosition::with_ordinal(shard, position, ordinal));
         }
-        TailCursorState::new(
+        let mut state = TailCursorState::new(
             principal, tenant, generation, plan, signal, positions, expiry, sequence, prior,
-        )
+        )?;
+        state.record_bound = record_bound.ok_or_else(invalid)?;
+        state.set_progress(
+            scanned_bytes,
+            decoded_records,
+            output_rows,
+            output_bytes,
+            cpu_work_units,
+        );
+        Ok(state)
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueryFailure> {
         if bytes.len() < PREFIX_BYTES + 16 + AUTH_BYTES || bytes.len() > MAX_BYTES {
@@ -341,4 +467,110 @@ fn invalid() -> QueryFailure {
 }
 fn resource() -> QueryFailure {
     QueryFailure::new(QueryFailureCode::ResourceExhausted)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use positron_domain::identity::{PrincipalId, TenantId};
+    use positron_domain::routing::{CommitPosition, VirtualShardId};
+
+    use super::{TailCursorState, TailPosition};
+    use crate::QueryFailureCode;
+
+    fn state() -> TailCursorState {
+        TailCursorState::new(
+            PrincipalId::from_bytes([1; 16]).expect("principal"),
+            TenantId::from_bytes([2; 16]).expect("tenant"),
+            1,
+            [3; 32],
+            [4; 32],
+            vec![TailPosition::new(
+                VirtualShardId::new(1).expect("shard"),
+                CommitPosition::origin()
+                    .advance_by(NonZeroU64::new(2).expect("non-zero"))
+                    .expect("position"),
+            )],
+            100,
+            0,
+            [0; 32],
+        )
+        .expect("valid cursor state")
+    }
+
+    #[test]
+    fn state_advancement_rejects_empty_unknown_and_rewound_updates() {
+        let state = state();
+        assert_eq!(
+            state
+                .advance_batch(&[], [5; 32])
+                .expect_err("empty batch")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(
+            state
+                .advance_positions(&[])
+                .expect_err("empty position update")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+
+        let unknown = TailPosition::new(
+            VirtualShardId::new(2).expect("shard"),
+            CommitPosition::origin(),
+        );
+        assert_eq!(
+            state
+                .advance_batch(&[unknown], [5; 32])
+                .expect_err("unknown shard")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(
+            state
+                .advance_positions(&[unknown])
+                .expect_err("unknown shard")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+
+        let rewound = TailPosition::new(
+            VirtualShardId::new(1).expect("shard"),
+            CommitPosition::origin(),
+        );
+        assert_eq!(
+            state
+                .advance_batch(&[rewound], [5; 32])
+                .expect_err("rewound batch")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(
+            state
+                .advance_positions(&[rewound])
+                .expect_err("rewound position")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+
+        let mut malformed = state;
+        malformed.positions.push(malformed.positions[0]);
+        let update = malformed.positions[0];
+        assert_eq!(
+            malformed
+                .advance_batch(&[update], [5; 32])
+                .expect_err("duplicate state")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(
+            malformed
+                .advance_positions(&[update])
+                .expect_err("duplicate state")
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+    }
 }
