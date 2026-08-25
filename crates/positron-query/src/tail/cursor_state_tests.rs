@@ -100,3 +100,51 @@ fn state_advancement_rejects_empty_unknown_and_rewound_updates() {
         QueryFailureCode::InvalidCursor
     );
 }
+
+#[test]
+fn state_validation_rejects_expired_mismatched_and_budget_changed_resumes() {
+    let state = state();
+
+    assert_eq!(state.budget_digest(), [0; 32]);
+    assert_eq!(super::invalid().code(), QueryFailureCode::InvalidCursor);
+    assert_eq!(
+        super::resource().code(),
+        QueryFailureCode::ResourceExhausted
+    );
+
+    assert_eq!(
+        state
+            .validate_budget([9; 32])
+            .expect_err("changed budget")
+            .code(),
+        QueryFailureCode::AuthorizationChanged
+    );
+    assert_eq!(
+        state
+            .validate_for_resume(
+                state.principal(),
+                state.tenant(),
+                state.authorization_generation(),
+                state.plan_digest(),
+                state.signal_digest(),
+                state.expiry(),
+            )
+            .expect_err("expired cursor")
+            .code(),
+        QueryFailureCode::SnapshotExpired
+    );
+    assert_eq!(
+        state
+            .validate_for_resume(
+                PrincipalId::from_bytes([8; 16]).expect("principal"),
+                state.tenant(),
+                state.authorization_generation(),
+                state.plan_digest(),
+                state.signal_digest(),
+                1,
+            )
+            .expect_err("mismatched principal")
+            .code(),
+        QueryFailureCode::AuthorizationChanged
+    );
+}

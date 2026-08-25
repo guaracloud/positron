@@ -99,6 +99,7 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
     );
     assert_eq!(state.plan_digest(), state.plan_digest());
     assert_eq!(state.signal_digest(), state.signal_digest());
+    assert!(state.budget_digest().iter().any(|byte| *byte != 0));
     assert_eq!(state.sequence(), 0);
     assert_eq!(state.prior_digest(), [0; 32]);
     assert_eq!(
@@ -434,6 +435,34 @@ fn tail_admission_rejects_expired_budget_and_cursor_vector_mismatch() -> Result<
     )?;
     let failure = match service.resume_tail(query, &vector_cursor) {
         Ok(_) => return Err("mismatched cursor vector unexpectedly resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
+
+    let missing_source_position = TailCursor::encode(
+        &fixture.kernel.ledger()?.control_tokens(),
+        &TailCursorState::new(
+            state.principal(),
+            state.tenant(),
+            state.authorization_generation(),
+            state.plan_digest(),
+            state.signal_digest(),
+            vec![TailPosition::new(
+                VirtualShardId::new(2)?,
+                state.positions()[0].position(),
+            )],
+            state.expiry(),
+            state.sequence(),
+            state.prior_digest(),
+        )?,
+    )?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let failure = match service.resume_tail(query, &missing_source_position) {
+        Ok(_) => return Err("cursor without a source position unexpectedly resumed".into()),
         Err(failure) => failure,
     };
     assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
