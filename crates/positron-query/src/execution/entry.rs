@@ -122,9 +122,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now_seconds < state.last_observed_at {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
         }
-        let resume_elapsed = now_seconds
-            .checked_sub(state.last_observed_at)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let resume_elapsed = now_seconds - state.last_observed_at;
         if now_seconds >= state.expiry {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
@@ -155,27 +153,18 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                         if failure.code() == LedgerFailureCode::StaleGeneration
                             && retries < MAX_RESUME_CATALOG_RETRIES =>
                     {
-                        let refreshed = match self.current_query_catalog(context) {
-                            Ok(refreshed) => refreshed,
-                            Err(failure) if failure.code() == QueryFailureCode::Unauthorized => {
-                                drop(reservation);
-                                return Err(QueryFailure::new(
-                                    QueryFailureCode::AuthorizationChanged,
-                                ));
-                            },
-                            Err(failure) => {
-                                drop(reservation);
-                                return Err(failure);
-                            },
-                        };
+                        let refreshed = self.current_query_catalog(context).map_err(|failure| {
+                            if failure.code() == QueryFailureCode::Unauthorized {
+                                QueryFailure::new(QueryFailureCode::AuthorizationChanged)
+                            } else {
+                                failure
+                            }
+                        })?;
                         catalog_identity = refreshed.1;
                         catalog_generation = refreshed.2;
                         retries += 1;
                     },
-                    Err(failure) => {
-                        drop(reservation);
-                        return Err(map_ledger_failure(failure));
-                    },
+                    Err(failure) => return Err(map_ledger_failure(failure)),
                 }
             }
         };

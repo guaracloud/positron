@@ -7,9 +7,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now < state.last_observed_at {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
         }
-        let elapsed = now
-            .checked_sub(state.last_observed_at)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let elapsed = now - state.last_observed_at;
         state.physical_elapsed_wall_seconds = state
             .physical_elapsed_wall_seconds
             .checked_add(elapsed)
