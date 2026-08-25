@@ -1,8 +1,13 @@
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use positron_domain::routing::SignalKind;
 use positron_kernel::{ActiveSegmentLedger, Catalog, SegmentScope};
 use positron_query::{QueryBudget, QueryService};
 #[cfg(test)]
-use positron_query::{QueryCursor, QueryEvent, QueryFailureCode};
+use positron_query::{QueryClock, QueryClockFailure, QueryCursor, QueryEvent, QueryFailureCode};
 
 use super::{
     ServiceFailure, ServiceHandle, classify_bootstrap_failure_code, classify_catalog_failure_code,
@@ -15,6 +20,19 @@ use positron_governance::{CompatibilityHints, PresentedCredential, RequestedInte
 pub(crate) enum QueryTestOutcome {
     Events(Vec<QueryEvent>),
     Failure(QueryFailureCode),
+}
+
+#[cfg(test)]
+struct RuntimeTestQueryClock;
+
+#[cfg(test)]
+impl QueryClock for RuntimeTestQueryClock {
+    fn now_seconds(&self) -> Result<u64, QueryClockFailure> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|_| QueryClockFailure)
+    }
 }
 
 #[cfg(test)]
@@ -43,10 +61,11 @@ pub(super) fn query_events_for_test(
         .map_err(|_| ServiceFailure::KeyUnavailable)?;
     let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
         .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
-    let service = QueryService::new(
+    let service = QueryService::with_clock(
         instance.resource_governor(),
         &ledger,
         page_limit.unwrap_or(100),
+        Arc::new(RuntimeTestQueryClock),
     );
     let query = match service.plan_pipeline(context, source, budget) {
         Ok(query) => query,
@@ -94,7 +113,12 @@ pub(super) fn resume_query_events_for_test(
         .map_err(|_| ServiceFailure::KeyUnavailable)?;
     let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
         .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
-    let service = QueryService::new(instance.resource_governor(), &ledger, batch_limit);
+    let service = QueryService::with_clock(
+        instance.resource_governor(),
+        &ledger,
+        batch_limit,
+        Arc::new(RuntimeTestQueryClock),
+    );
     let events = service
         .resume(context, cursor)
         .map_err(|failure| QueryTestOutcome::Failure(failure.code()));
