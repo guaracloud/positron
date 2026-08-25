@@ -4,7 +4,7 @@ use crate::stream::{QueryBatch, QueryHeader, ResultLease, ResultSnapshot};
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
-use super::cursor::{TailCursor, TailCursorState, TailPosition};
+use super::cursor::{TailCursor, TailCursorState, TailPosition, budget_digest};
 use super::source::TailSourceSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +218,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         frontiers.push((snapshot.scope().shard_id(), snapshot.frontier()));
         frontiers.sort_unstable_by_key(|(shard, _)| *shard);
         let digest = sources.digest(&self.ledger.control_tokens())?;
+        let expected_budget = budget_digest(&self.ledger.control_tokens(), query.budget)?;
         let (state, cursor, replay) = match resume {
             Some((state, cursor)) => {
                 if state.positions().len() != sources.readers().len()
@@ -231,6 +232,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 let replay = !state.record_bound()
                     && state.sequence() == 0
                     && state.prior_digest() == [0; 32];
+                state.validate_budget(expected_budget)?;
                 (state, cursor, replay)
             },
             None => {
@@ -248,7 +250,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                         )
                     })
                     .collect();
-                let state = TailCursorState::new(
+                let mut state = TailCursorState::new(
                     query.context.principal_id(),
                     tenant,
                     query.context.authorization_generation(),
@@ -259,6 +261,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     0,
                     [0; 32],
                 )?;
+                state.set_budget_digest(expected_budget);
                 let cursor = TailCursor::encode(&self.ledger.control_tokens(), &state)?;
                 (state, cursor, false)
             },

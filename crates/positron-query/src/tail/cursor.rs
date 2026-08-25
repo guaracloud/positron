@@ -10,7 +10,7 @@ const VERSION: u16 = 2;
 const MAX_SHARDS: usize = 64;
 const MAX_BYTES: usize = 2_048;
 const AUTH_BYTES: usize = 32;
-const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 2;
+const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 32 + 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TailPosition {
@@ -69,6 +69,7 @@ pub struct TailCursorState {
     output_rows: u64,
     output_bytes: u64,
     cpu_work_units: u64,
+    budget_digest: [u8; 32],
 }
 
 impl TailCursorState {
@@ -107,6 +108,7 @@ impl TailCursorState {
             output_rows: 0,
             output_bytes: 0,
             cpu_work_units: 0,
+            budget_digest: [0; 32],
         })
     }
     pub const fn principal(&self) -> PrincipalId {
@@ -153,6 +155,20 @@ impl TailCursorState {
     }
     pub const fn cpu_work_units(&self) -> u64 {
         self.cpu_work_units
+    }
+    pub const fn budget_digest(&self) -> [u8; 32] {
+        self.budget_digest
+    }
+
+    pub(crate) fn set_budget_digest(&mut self, digest: [u8; 32]) {
+        self.budget_digest = digest;
+    }
+
+    pub(crate) fn validate_budget(&self, expected: [u8; 32]) -> Result<(), QueryFailure> {
+        if self.budget_digest != expected {
+            return Err(QueryFailure::new(QueryFailureCode::AuthorizationChanged));
+        }
+        Ok(())
     }
 
     pub(crate) fn set_progress(
@@ -237,6 +253,7 @@ impl TailCursorState {
             self.output_bytes,
             self.cpu_work_units,
         );
+        state.budget_digest = self.budget_digest;
         Ok(state)
     }
 
@@ -279,6 +296,7 @@ impl TailCursorState {
             self.output_bytes,
             self.cpu_work_units,
         );
+        state.budget_digest = self.budget_digest;
         Ok(state)
     }
 }
@@ -316,6 +334,7 @@ impl TailCursor {
         bytes.extend_from_slice(&state.output_rows.to_be_bytes());
         bytes.extend_from_slice(&state.output_bytes.to_be_bytes());
         bytes.extend_from_slice(&state.cpu_work_units.to_be_bytes());
+        bytes.extend_from_slice(&state.budget_digest);
         bytes.extend_from_slice(
             &(u16::try_from(state.positions.len()).map_err(|_| invalid())?).to_be_bytes(),
         );
@@ -373,7 +392,8 @@ impl TailCursor {
         let output_rows = u64_at(payload, 186)?;
         let output_bytes = u64_at(payload, 194)?;
         let cpu_work_units = u64_at(payload, 202)?;
-        let count = usize::from(u16_at(payload, 210)?);
+        let budget_digest = array_at_at::<32>(payload, 210)?;
+        let count = usize::from(u16_at(payload, 242)?);
         if count == 0 || count > MAX_SHARDS {
             return Err(invalid());
         }
@@ -421,6 +441,7 @@ impl TailCursor {
             output_bytes,
             cpu_work_units,
         );
+        state.budget_digest = budget_digest;
         Ok(state)
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueryFailure> {
@@ -467,6 +488,31 @@ fn invalid() -> QueryFailure {
 }
 fn resource() -> QueryFailure {
     QueryFailure::new(QueryFailureCode::ResourceExhausted)
+}
+
+pub(crate) fn budget_digest(
+    protector: &ControlTokenProtector<'_>,
+    budget: crate::QueryBudget,
+) -> Result<[u8; 32], QueryFailure> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(8 * std::mem::size_of::<u64>())
+        .map_err(|_| resource())?;
+    for value in [
+        budget.scanned_bytes(),
+        budget.decoded_records(),
+        budget.output_rows(),
+        budget.output_bytes(),
+        budget.memory_bytes(),
+        budget.cpu_work_units(),
+        budget.wall_seconds(),
+        budget.maximum_time_range_nanoseconds(),
+    ] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    protector
+        .digest(b"tail-budget-v1", &bytes)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
 }
 
 #[cfg(test)]
