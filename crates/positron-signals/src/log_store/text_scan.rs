@@ -1,4 +1,4 @@
-use super::scan::{admit_block_bytes, includes_block};
+use super::scan::{admit_block_bytes, includes_block, skipped_records};
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
     LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, WorkClaim, WorkKind,
@@ -145,11 +145,14 @@ impl LogStore {
                 observer,
             )?;
             let block_records = decode.record_count();
-            if block_records > remaining {
-                let decoded = decode.decode(snapshot, remaining, cancellation)?;
-                for (ordinal, record) in decoded.records.into_iter().enumerate() {
-                    let ordinal = u16::try_from(ordinal)
-                        .ok()
+            let skipped = skipped_records(scan, block.position());
+            let available = block_records.saturating_sub(skipped);
+            if available > remaining {
+                let decoded = decode.decode_after(snapshot, skipped, remaining, cancellation)?;
+                for (offset, record) in decoded.records.into_iter().enumerate() {
+                    let ordinal = skipped
+                        .checked_add(offset)
+                        .and_then(|ordinal| u16::try_from(ordinal).ok())
                         .and_then(|ordinal| {
                             positron_domain::routing::RecordOrdinal::new(ordinal).ok()
                         })
@@ -159,10 +162,11 @@ impl LogStore {
                 complete = false;
                 break;
             }
-            let decoded = decode.decode(snapshot, remaining, cancellation)?;
-            for (ordinal, record) in decoded.records.into_iter().enumerate() {
-                let ordinal = u16::try_from(ordinal)
-                    .ok()
+            let decoded = decode.decode_after(snapshot, skipped, remaining, cancellation)?;
+            for (offset, record) in decoded.records.into_iter().enumerate() {
+                let ordinal = skipped
+                    .checked_add(offset)
+                    .and_then(|ordinal| u16::try_from(ordinal).ok())
                     .and_then(|ordinal| positron_domain::routing::RecordOrdinal::new(ordinal).ok())
                     .ok_or_else(LogStoreFailure::malformed_block)?;
                 records.push(ScannedLogRecord::new(record, block.position(), ordinal));
