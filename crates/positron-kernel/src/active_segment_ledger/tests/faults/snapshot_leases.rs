@@ -1121,6 +1121,53 @@ fn snapshot_lease_marker_test_support_rejects_zero_transaction_identity()
     })
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn snapshot_lease_marker_test_support_rejects_malformed_repeat_field() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        publish_lease_rewrite(catalog, 0x92, |bytes| bytes.truncate(119))?;
+        let failure =
+            crate::publish_snapshot_lease_marker_for_test(catalog, lease.identity(), 0x93)
+                .expect_err("test marker publication must reject a truncated repeat field");
+        assert_eq!(
+            failure.code(),
+            crate::CatalogFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn snapshot_lease_marker_test_support_rejects_repeat_overflow() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        ledger.resume_snapshot_lease_with_marker(lease.identity(), 101, 1, [0x91; 32])?;
+        publish_lease_rewrite(catalog, 0x94, |bytes| {
+            bytes[119..127].copy_from_slice(&u64::MAX.to_be_bytes());
+        })?;
+        let failure =
+            crate::publish_snapshot_lease_marker_for_test(catalog, lease.identity(), 0x95)
+                .expect_err("test marker publication must reject repeat overflow");
+        assert_eq!(failure.code(), crate::CatalogFailureCode::LimitExceeded);
+        Ok(())
+    })
+}
+
 #[test]
 fn ambiguous_usage_reconciliation_preserves_new_old_and_unknown_truth() -> Result<(), Box<dyn Error>>
 {
