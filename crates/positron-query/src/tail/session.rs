@@ -1,13 +1,11 @@
 use std::collections::VecDeque;
 
-use positron_domain::routing::VirtualShardId;
-use positron_kernel::CommittedLedgerReader;
-
-use crate::stream::{QueryBatch, QueryHeader, QueryRecord, ResultLease, ResultSnapshot};
+use crate::stream::{QueryBatch, QueryHeader, ResultLease, ResultSnapshot};
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
 use super::cursor::{TailCursor, TailCursorState, TailPosition};
+use super::source::TailSourceSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TailStart {
@@ -18,6 +16,7 @@ pub enum TailStart {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TailTerminal {
     ConsumerLagged(Option<TailCursor>),
+    BudgetExhausted(Option<TailCursor>),
     Expired(Option<TailCursor>),
     AuthorizationChanged(Option<TailCursor>),
     Cancelled(Option<TailCursor>),
@@ -37,17 +36,23 @@ pub enum TailEvent {
 pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) service: &'service QueryService<'kernel, 'catalog, 'ledger>,
     pub(super) query: PlannedQuery<'kernel>,
-    pub(super) reader: CommittedLedgerReader<'kernel, 'catalog>,
-    state: TailCursorState,
-    cursor: TailCursor,
-    header: Option<QueryHeader>,
-    buffer: TailBuffer,
-    pending_positions: VecDeque<TailPosition>,
-    terminal: Option<TailTerminal>,
-    terminal_emitted: bool,
-    next_sequence: u64,
-    prior_digest: [u8; 32],
-    shard: VirtualShardId,
+    pub(super) sources: TailSourceSet<'kernel, 'catalog>,
+    _lease: positron_kernel::SnapshotLeaseGrant<'kernel>,
+    pub(super) state: TailCursorState,
+    pub(super) cursor: TailCursor,
+    pub(super) header: Option<QueryHeader>,
+    pub(super) buffer: TailBuffer,
+    pub(super) pending_batches: VecDeque<(Vec<TailPosition>, [u8; 32])>,
+    pub(super) terminal: Option<TailTerminal>,
+    pub(super) terminal_emitted: bool,
+    pub(super) next_sequence: u64,
+    pub(super) prior_digest: [u8; 32],
+    pub(super) replay: bool,
+    pub(super) scanned_bytes: u64,
+    pub(super) decoded_records: u64,
+    pub(super) output_rows: u64,
+    pub(super) output_bytes: u64,
+    pub(super) cpu_work_units: u64,
 }
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
@@ -56,7 +61,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         start: TailStart,
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
-        self.admit_tail(query, start, None)
+        let reader = self
+            .ledger
+            .reader()
+            .map_err(crate::execution_support::map_ledger_failure)?;
+        self.tail_with_sources(query, start, TailSourceSet::single(reader)?)
+    }
+
+    pub fn tail_with_sources(
+        &self,
+        query: PlannedQuery<'kernel>,
+        start: TailStart,
+        sources: TailSourceSet<'kernel, 'catalog>,
+    ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
+        self.admit_tail(query, start, None, sources)
     }
 
     pub fn resume_tail(
@@ -64,9 +82,22 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         cursor: &TailCursor,
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
+        let reader = self
+            .ledger
+            .reader()
+            .map_err(crate::execution_support::map_ledger_failure)?;
+        self.resume_tail_with_sources(query, cursor, TailSourceSet::single(reader)?)
+    }
+
+    pub fn resume_tail_with_sources(
+        &self,
+        query: PlannedQuery<'kernel>,
+        cursor: &TailCursor,
+        sources: TailSourceSet<'kernel, 'catalog>,
+    ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
         let state = TailCursor::decode(&self.ledger.control_tokens(), cursor)?;
         let (tenant, _, _generation) = self.current_query_catalog(query.context)?;
-        let signal_digest = signal_digest(self.ledger.scope());
+        let signal_digest = sources.digest();
         state.validate_for_resume(
             query.context.principal_id(),
             tenant,
@@ -75,10 +106,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             signal_digest,
             self.now()?,
         )?;
-        if state.positions().len() != 1 {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-        }
-        self.admit_tail(query, TailStart::Now, Some((state, cursor.clone())))
+        self.admit_tail(
+            query,
+            TailStart::Now,
+            Some((state, cursor.clone())),
+            sources,
+        )
     }
 
     fn admit_tail(
@@ -86,10 +119,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         start: TailStart,
         resume: Option<(TailCursorState, TailCursor)>,
+        sources: TailSourceSet<'kernel, 'catalog>,
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
         let (tenant, catalog_identity, generation) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        if query.plan.tail_incompatible() {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         let now = self.now()?;
         let expiry = query
@@ -104,43 +141,75 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
-        let reader = self
+        let lease = self
             .ledger
-            .reader()
+            .create_snapshot_lease(now, expiry)
             .map_err(crate::execution_support::map_ledger_failure)?;
-        let snapshot = reader
-            .snapshot()
-            .map_err(crate::execution_support::map_ledger_failure)?;
-        let shard = snapshot.scope().shard_id();
-        if snapshot.scope().tenant_id() != tenant {
+        if sources.tenant() != tenant {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
-        let digest = signal_digest(snapshot.scope());
-        let (state, cursor, initial_frontier) = match resume {
+        let mut frontiers = Vec::new();
+        frontiers
+            .try_reserve_exact(sources.readers().len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        let mut header_snapshot = None;
+        for reader in sources.readers() {
+            let snapshot = reader
+                .snapshot()
+                .map_err(crate::execution_support::map_ledger_failure)?;
+            if snapshot.scope().tenant_id() != tenant {
+                return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+            }
+            if header_snapshot.is_none() {
+                header_snapshot = Some(snapshot);
+            } else {
+                frontiers.push((snapshot.scope().shard_id(), snapshot.frontier()));
+            }
+        }
+        let snapshot = header_snapshot.ok_or_else(super::internal)?;
+        frontiers.push((snapshot.scope().shard_id(), snapshot.frontier()));
+        frontiers.sort_unstable_by_key(|(shard, _)| *shard);
+        let digest = sources.digest();
+        let (state, cursor, replay) = match resume {
             Some((state, cursor)) => {
-                let frontier = state.positions()[0].position();
-                (state, cursor, frontier)
+                if state.positions().len() != sources.readers().len()
+                    || state
+                        .positions()
+                        .iter()
+                        .any(|position| !sources.contains(position.shard()))
+                {
+                    return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+                }
+                (state, cursor, true)
             },
             None => {
-                let frontier = match start {
-                    TailStart::Now => snapshot.frontier(),
-                    TailStart::Historical { .. } => {
-                        positron_domain::routing::CommitPosition::origin()
-                    },
-                };
+                let positions = frontiers
+                    .iter()
+                    .map(|(shard, frontier)| {
+                        TailPosition::new(
+                            *shard,
+                            match start {
+                                TailStart::Now => *frontier,
+                                TailStart::Historical { .. } => {
+                                    positron_domain::routing::CommitPosition::origin()
+                                },
+                            },
+                        )
+                    })
+                    .collect();
                 let state = TailCursorState::new(
                     query.context.principal_id(),
                     tenant,
                     query.context.authorization_generation(),
                     query.plan_digest,
                     digest,
-                    vec![TailPosition::new(shard, frontier)],
+                    positions,
                     expiry,
                     0,
                     [0; 32],
                 )?;
                 let cursor = TailCursor::encode(&self.ledger.control_tokens(), &state)?;
-                (state, cursor, frontier)
+                (state, cursor, false)
             },
         };
         let max_rows = match start {
@@ -159,26 +228,32 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 generation,
                 snapshot.frontier().value(),
             ),
-            ResultLease::new([0; 16], expiry),
+            ResultLease::new(lease.identity().to_bytes(), expiry),
             None,
         )?;
         let mut session = TailSession {
             service: self,
             query,
-            reader,
+            sources,
+            _lease: lease,
             state,
             cursor,
             header: Some(header),
             buffer,
-            pending_positions: VecDeque::new(),
+            pending_batches: VecDeque::new(),
             terminal: None,
             terminal_emitted: false,
             next_sequence: 0,
             prior_digest: [0; 32],
-            shard,
+            replay,
+            scanned_bytes: 0,
+            decoded_records: 0,
+            output_rows: 0,
+            output_bytes: 0,
+            cpu_work_units: 0,
         };
         if matches!(start, TailStart::Historical { .. }) {
-            session.fill_snapshot(&snapshot, initial_frontier, max_rows)?;
+            session.fill_sources(max_rows)?;
         }
         Ok(session)
     }
@@ -196,19 +271,21 @@ impl TailSession<'_, '_, '_, '_> {
             return Some(TailEvent::Header(header));
         }
         if let Some(batch) = self.buffer.pop() {
-            if let Some(position) = self.pending_positions.pop_front() {
-                let _ = self.advance(position);
-            }
-            let sequence = if self.next_sequence == 0 {
-                0
-            } else {
-                self.next_sequence - 1
+            let (positions, digest) = match self.pending_batches.pop_front() {
+                Some(pending) => pending,
+                None => {
+                    self.terminal = Some(TailTerminal::StoreUnavailable(Some(self.cursor.clone())));
+                    return self.take_terminal();
+                },
             };
+            let prior = self.prior_digest;
+            if self.advance(positions, digest).is_err() {
+                self.terminal = Some(TailTerminal::StoreUnavailable(Some(self.cursor.clone())));
+                return self.take_terminal();
+            }
+            let sequence = self.next_sequence.saturating_sub(1);
             return Some(TailEvent::Batch(QueryBatch::new(
-                sequence,
-                batch,
-                self.prior_digest,
-                self.prior_digest,
+                sequence, batch, prior, digest,
             )));
         }
         if let Some(terminal) = self.terminal.take() {
@@ -218,27 +295,19 @@ impl TailSession<'_, '_, '_, '_> {
         if self.revalidate().is_err() {
             return self.take_terminal();
         }
-        match self.reader.snapshot() {
-            Ok(snapshot) => {
-                let after = self
-                    .state
-                    .positions()
-                    .first()
-                    .map_or(positron_domain::routing::CommitPosition::origin(), |p| {
-                        p.position()
-                    });
-                if self
-                    .fill_snapshot(&snapshot, after, super::MAX_TAIL_BATCH_ROWS)
-                    .is_ok()
-                    && !self.buffer.is_empty()
-                {
-                    self.poll()
-                } else {
-                    Some(TailEvent::Idle)
-                }
-            },
-            Err(_) => {
-                self.terminal = Some(TailTerminal::StoreUnavailable(Some(self.cursor.clone())));
+        match self.fill_sources(super::MAX_TAIL_BATCH_ROWS) {
+            Ok(()) if !self.buffer.is_empty() => self.poll(),
+            Ok(()) => Some(TailEvent::Idle),
+            Err(failure) => {
+                self.terminal = Some(match failure.code() {
+                    QueryFailureCode::BudgetExhausted => {
+                        TailTerminal::BudgetExhausted(Some(self.cursor.clone()))
+                    },
+                    QueryFailureCode::Cancelled => {
+                        TailTerminal::Cancelled(Some(self.cursor.clone()))
+                    },
+                    _ => TailTerminal::StoreUnavailable(Some(self.cursor.clone())),
+                });
                 self.take_terminal()
             },
         }
@@ -261,38 +330,14 @@ impl TailSession<'_, '_, '_, '_> {
             TailEvent::Terminal(terminal)
         })
     }
-    fn fill_snapshot(
+    fn advance(
         &mut self,
-        snapshot: &positron_kernel::LedgerSnapshot<'_>,
-        after: positron_domain::routing::CommitPosition,
-        limit: usize,
+        positions: Vec<TailPosition>,
+        digest: [u8; 32],
     ) -> Result<(), QueryFailure> {
-        let mut records = Vec::new();
-        let mut last = None;
-        for block in snapshot.blocks() {
-            if block.position() <= after || records.len() >= limit {
-                continue;
-            }
-            records.push(QueryRecord::count_record(1));
-            last = Some(TailPosition::new(self.shard, block.position()));
-        }
-        if records.is_empty() {
-            return Ok(());
-        }
-        let position = last.ok_or_else(super::internal)?;
-        if self.buffer.push(records).is_err() {
-            self.terminal = Some(TailTerminal::ConsumerLagged(Some(self.cursor.clone())));
-            return Ok(());
-        }
-        self.pending_positions.push_back(position);
-        Ok(())
-    }
-    fn advance(&mut self, position: TailPosition) -> Result<(), QueryFailure> {
-        let digest = self.prior_digest;
-        self.state =
-            self.state
-                .advance(self.shard, position.position(), position.ordinal(), digest)?;
+        self.state = self.state.advance_batch(&positions, digest)?;
         self.cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &self.state)?;
+        self.prior_digest = digest;
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
@@ -320,14 +365,4 @@ impl TailSession<'_, '_, '_, '_> {
                 });
             })
     }
-}
-
-fn signal_digest(scope: positron_kernel::SegmentScope) -> [u8; 32] {
-    let mut digest = [0; 32];
-    digest[0] = match scope.signal_kind() {
-        positron_domain::routing::SignalKind::Logs => 1,
-        positron_domain::routing::SignalKind::Traces => 2,
-    };
-    digest[1..5].copy_from_slice(&scope.shard_id().value().to_be_bytes());
-    digest
 }

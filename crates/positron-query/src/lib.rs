@@ -50,7 +50,8 @@ pub use stream::{
 };
 pub use stream_lifecycle::QueryStream;
 pub use tail::{
-    TailCursor, TailCursorState, TailEvent, TailPosition, TailSession, TailStart, TailTerminal,
+    TailCursor, TailCursorState, TailEvent, TailPosition, TailSession, TailSourceSet, TailStart,
+    TailTerminal,
 };
 
 #[cfg(fuzzing)]
@@ -87,10 +88,10 @@ pub fn fuzz_query_cursor(data: &[u8]) {
     }
 
     let protector = positron_kernel::fuzz_control_token_protector();
-    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
-        .expect("fuzz principal fixture is valid");
     let tenant = positron_domain::identity::TenantId::from_bytes([2; 16])
         .expect("fuzz tenant fixture is valid");
+    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
+        .expect("fuzz principal fixture is valid");
     let range = TemporalRange::new(-100, 100).expect("fuzz range is ordered");
     let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
     let source = b"pipeline:v1 logs | range query_time -100 100 | limit 1";
@@ -259,13 +260,18 @@ pub fn fuzz_tail_cursor(data: &[u8]) {
     }
     let _ = QueryCursor::from_bytes(data);
     let protector = positron_kernel::fuzz_control_token_protector();
+    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
+        .expect("fuzz principal fixture is valid");
     let tenant = positron_domain::identity::TenantId::from_bytes([2; 16])
         .expect("fuzz tenant fixture is valid");
     let shard =
         positron_domain::routing::VirtualShardId::new(1).expect("fuzz shard fixture is valid");
     let state = tail::TailCursorState::new(
+        principal,
         tenant,
+        7,
         [3; 32],
+        [5; 32],
         vec![tail::TailPosition::new(
             shard,
             positron_domain::routing::CommitPosition::origin(),
@@ -288,6 +294,75 @@ pub fn fuzz_tail_cursor(data: &[u8]) {
         }
         let _ = tail::TailCursor::from_bytes(&mutated)
             .and_then(|cursor| tail::TailCursor::decode(&protector, &cursor));
+    }
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_tail_state_machine(data: &[u8]) {
+    const MAX_ROWS: usize = 64;
+    let mut committed = Vec::new();
+    let mut delivered = Vec::new();
+    let mut safe = 0_u64;
+    let mut next = 1_u64;
+    let mut terminal = false;
+    let mut connected = true;
+    let mut expired = false;
+    for action in data.iter().copied().take(4_096) {
+        match action % 10 {
+            0 if committed.len() < MAX_ROWS => {
+                committed.push(next);
+                next = next.saturating_add(1);
+            },
+            1 => {
+                if let Some(position) = committed.last().copied() {
+                    if connected && !terminal && !expired {
+                        delivered.push(position);
+                        safe = safe.max(position);
+                    }
+                }
+            },
+            2 => {
+                if connected && !terminal && !expired && committed.len() > delivered.len() {
+                    connected = false;
+                }
+            },
+            3 => connected = true,
+            4 => terminal = true,
+            5 => expired = true,
+            6 if terminal => terminal = false,
+            7 => {
+                if connected && !terminal && !expired {
+                    for position in committed
+                        .iter()
+                        .copied()
+                        .filter(|position| *position <= safe)
+                    {
+                        if delivered.len() >= MAX_ROWS * 2 {
+                            break;
+                        }
+                        delivered.push(position);
+                    }
+                }
+            },
+            8 => {
+                if connected && !terminal && !expired && delivered.len() < MAX_ROWS {
+                    if let Some(position) = committed.get(delivered.len()).copied() {
+                        delivered.push(position);
+                    }
+                }
+            },
+            _ => {},
+        }
+        assert!(committed.len() <= MAX_ROWS);
+        assert!(delivered.len() <= MAX_ROWS * 2);
+        assert!(terminal || !expired || !connected || safe <= next);
+        assert!(committed.iter().all(|position| *position <= next));
+        assert!(
+            delivered
+                .iter()
+                .all(|position| *position <= safe || *position <= next)
+        );
     }
 }
 

@@ -147,27 +147,30 @@ impl TailCursorState {
         Ok(())
     }
 
-    pub(crate) fn advance(
+    pub(crate) fn advance_batch(
         &self,
-        shard: VirtualShardId,
-        position: CommitPosition,
-        ordinal: RecordOrdinal,
+        updates: &[TailPosition],
         digest: [u8; 32],
     ) -> Result<Self, QueryFailure> {
+        if updates.is_empty() {
+            return Err(invalid());
+        }
         let mut positions = Vec::new();
         positions
             .try_reserve_exact(self.positions.len())
             .map_err(|_| resource())?;
         positions.extend_from_slice(&self.positions);
-        let entry = positions
-            .iter_mut()
-            .find(|entry| entry.shard == shard)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        if (position, ordinal) < (entry.position, entry.ordinal) {
-            return Err(invalid());
+        for update in updates {
+            let entry = positions
+                .iter_mut()
+                .find(|entry| entry.shard == update.shard)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+            if (update.position, update.ordinal) < (entry.position, entry.ordinal) {
+                return Err(invalid());
+            }
+            entry.position = update.position;
+            entry.ordinal = update.ordinal;
         }
-        entry.position = position;
-        entry.ordinal = ordinal;
         let sequence = self.sequence.checked_add(1).ok_or_else(invalid)?;
         Self::new(
             self.principal,

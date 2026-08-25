@@ -208,6 +208,10 @@ impl LogicalPlan {
             || self.transform.is_some()
     }
 
+    pub(crate) fn tail_incompatible(&self) -> bool {
+        self.aggregate.is_some() || self.ordering != OrderSpec::ascending(self.axis)
+    }
+
     pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
         self.filter.as_ref()
     }

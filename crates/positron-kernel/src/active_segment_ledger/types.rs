@@ -14,6 +14,7 @@ use crate::IngestTime;
 use crate::ResourceReservation;
 
 mod prepared;
+mod protection_clone;
 pub use prepared::PreparedStoreBlock;
 
 /// The immutable tenant, Signal Store, and Virtual Shard boundary of one active segment.
@@ -116,15 +117,6 @@ pub(super) type SegmentKeyRoute = SegmentEnvelopeRoute;
 pub struct SegmentProtectionKey {
     pub(super) key: SecretKeyBytes,
     pub(super) route: SegmentKeyRoute,
-}
-
-impl Clone for SegmentProtectionKey {
-    fn clone(&self) -> Self {
-        Self {
-            key: SecretKeyBytes::from_owned(Box::new(*self.key.expose_to_backend())),
-            route: self.route,
-        }
-    }
 }
 
 impl SegmentProtectionKey {

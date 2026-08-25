@@ -83,6 +83,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             self.governor,
             state.tenant,
             snapshot,
+            None,
             frontier,
             scan_limit,
             scanned_remaining,

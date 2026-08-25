@@ -1,9 +1,12 @@
 mod buffer;
 mod cursor;
+mod materialize;
 mod session;
+mod source;
 
 pub use cursor::{TailCursor, TailCursorState, TailPosition};
 pub use session::{TailEvent, TailSession, TailStart, TailTerminal};
+pub use source::TailSourceSet;
 
 use crate::{QueryFailure, QueryFailureCode};
 

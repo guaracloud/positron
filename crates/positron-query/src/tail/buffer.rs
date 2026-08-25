@@ -37,9 +37,15 @@ impl TailBuffer {
                 QueryFailureCode::ResourceAdmissionRefused,
             ));
         }
+        let dynamic = batch.iter().try_fold(0_u64, |total, record| {
+            total
+                .checked_add(record.retained_dynamic_bytes()?)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))
+        })?;
         let bytes = rows
             .checked_mul(std::mem::size_of::<QueryRecord>())
             .and_then(|value| u64::try_from(value).ok())
+            .and_then(|value| value.checked_add(dynamic))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let next = self
             .bytes
@@ -70,7 +76,17 @@ impl TailBuffer {
             .len()
             .checked_mul(std::mem::size_of::<QueryRecord>())
             .and_then(|value| u64::try_from(value).ok());
-        if let Some(bytes) = bytes {
+        let dynamic = batch
+            .iter()
+            .try_fold(0_u64, |total, record| {
+                total
+                    .checked_add(record.retained_dynamic_bytes().map_err(|_| ())?)
+                    .ok_or(())
+            })
+            .ok();
+        if let (Some(bytes), Some(dynamic)) = (bytes, dynamic)
+            && let Some(bytes) = bytes.checked_add(dynamic)
+        {
             if self.bytes >= bytes {
                 self.bytes -= bytes;
             } else {

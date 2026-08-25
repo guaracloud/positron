@@ -29,6 +29,11 @@ impl std::fmt::Debug for CommittedLedgerReader<'_, '_> {
 }
 
 impl<'kernel, 'catalog> CommittedLedgerReader<'kernel, 'catalog> {
+    #[must_use]
+    pub const fn scope(&self) -> SegmentScope {
+        self.scope
+    }
+
     pub fn open(
         authority: &'kernel StorageKernelResourceAuthority,
         catalog: &'catalog Catalog<'kernel>,

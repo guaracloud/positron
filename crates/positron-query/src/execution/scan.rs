@@ -11,10 +11,11 @@ pub(super) const MAX_SCAN_RECORDS: usize = 1_024;
     clippy::too_many_arguments,
     reason = "the scan adapter forwards one bounded request to the three canonical signal-store paths"
 )]
-pub(super) fn execute_scan<'kernel>(
+pub(crate) fn execute_scan<'kernel>(
     governor: ResourceGovernor<'kernel>,
     tenant: TenantId,
     snapshot: &LedgerSnapshot<'kernel>,
+    after: Option<positron_domain::routing::CommitPosition>,
     frontier: positron_domain::routing::CommitPosition,
     scan_limit: ScanLimit,
     scanned_remaining: u64,
@@ -24,7 +25,11 @@ pub(super) fn execute_scan<'kernel>(
     cancellation: &QueryCancellation,
     observer: &mut QueryScanObserver<'_>,
 ) -> Result<LogScanResult<'kernel>, QueryFailure> {
-    let scan = LogScan::through(scan_limit, frontier).with_scanned_bytes(scanned_remaining);
+    let scan = match after {
+        Some(after) => LogScan::between(scan_limit, after, frontier),
+        None => LogScan::through(scan_limit, frontier),
+    }
+    .with_scanned_bytes(scanned_remaining);
     let result = match (schema, schema_query, text_candidate) {
         (Some(schema), None, Some(candidate)) => LogStore::new().scan_text_observed(
             governor,

@@ -34,6 +34,7 @@ pub struct QueryRecord {
     count: Option<u64>,
     attributes: Vec<AttributeProjection>,
     attribute_retained_bytes: u64,
+    replayed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +109,7 @@ impl QueryRecord {
             count: None,
             attributes: selection.attributes,
             attribute_retained_bytes: selection.attribute_retained_bytes,
+            replayed: false,
         }
     }
 
@@ -129,6 +131,7 @@ impl QueryRecord {
             count: Some(count),
             attributes: Vec::new(),
             attribute_retained_bytes: 0,
+            replayed: false,
         }
     }
 
@@ -152,6 +155,7 @@ impl QueryRecord {
             count: Some(count),
             attributes: fields.attributes,
             attribute_retained_bytes: fields.attribute_retained_bytes,
+            replayed: false,
         }
     }
 
@@ -210,6 +214,16 @@ impl QueryRecord {
     #[must_use]
     pub const fn count(&self) -> Option<u64> {
         self.count
+    }
+
+    #[must_use]
+    pub const fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    pub(crate) const fn mark_replayed(mut self) -> Self {
+        self.replayed = true;
+        self
     }
 
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition, RecordOrdinal) {

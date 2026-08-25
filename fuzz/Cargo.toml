@@ -147,6 +147,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "tail_state_machine"
+path = "fuzz_targets/tail_state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "query_sql"
 path = "fuzz_targets/query_sql.rs"
 test = false

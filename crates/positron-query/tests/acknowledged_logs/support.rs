@@ -754,6 +754,17 @@ impl KernelFixture {
         candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
+        let ledger = self.ledger()?;
+        self.append_logs_to(ledger, self.shard, candidates, identity)
+    }
+
+    pub fn append_logs_to(
+        &self,
+        ledger: &ActiveSegmentLedger<'static, 'static>,
+        shard: VirtualShardId,
+        candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
         let mut records = Vec::new();
         records.try_reserve_exact(candidates.len())?;
         for (event_time, body) in candidates {
@@ -778,11 +789,11 @@ impl KernelFixture {
             capacity,
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
             self.tenant,
-            self.shard,
+            shard,
             StoreBlockIdentity::new([identity; 16])?,
             records,
         )?;
-        self.ledger()?.append(block.into_store_block())?;
+        ledger.append(block.into_store_block())?;
         Ok(())
     }
 
