@@ -29,7 +29,6 @@ pub(super) const MAX_SNAPSHOT_LEASES: usize = 64;
 #[cfg(test)]
 #[path = "snapshot_lease_tests.rs"]
 mod tests;
-
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     /// Creates a durable lease for an already-admitted query task. The caller's
     /// query reservation covers construction CPU; the returned grant retains
@@ -55,7 +54,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
 
     fn create_snapshot_lease_internal(
         &self,
-        now: u64,
+        mut now: u64,
         expiry: u64,
         expected_catalog: Option<CatalogGenerationId>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
@@ -67,7 +66,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         self.retry_pending_releases(&mut state)?;
-        reject_time_regression(&state, now)?;
+        now = state.last_snapshot_lease_time.max(now);
+        if !valid_lease_interval(now, expiry) {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
         if expected_catalog.is_some_and(|expected| expected != basis.identity()) {

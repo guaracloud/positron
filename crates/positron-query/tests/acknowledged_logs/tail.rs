@@ -48,6 +48,48 @@ fn tail_reads_acknowledged_history_then_stays_idle_until_disconnect() -> Result<
 }
 
 #[test]
+fn tail_cursor_resumes_after_ledger_reopen_without_a_gap() -> Result<(), Box<dyn Error>> {
+    let mut fixture = QueryFixture::new("tail-restart-resume")?;
+    fixture.kernel.append_log("before-restart", 1, 1)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let cursor = {
+        let service = fixture.service(16)?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit 2",
+            budget,
+        )?;
+        let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        assert!(matches!(tail.poll(), Some(TailEvent::Batch(_))));
+        tail.cursor().clone()
+    };
+
+    fixture.kernel.reopen_ledger()?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut resumed = service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(resumed.poll(), Some(TailEvent::Idle)));
+
+    fixture.kernel.append_log("after-restart", 2, 2)?;
+    let Some(TailEvent::Batch(batch)) = resumed.poll() else {
+        return Err("restarted tail missed the post-restart record".into());
+    };
+    assert_eq!(batch.records()[0].body_text(), Some("after-restart"));
+    resumed.disconnect();
+    assert!(matches!(
+        resumed.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+    ));
+    Ok(())
+}
+
+#[test]
 fn tail_cursor_tamper_fails_closed_on_resume() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-resume")?;
     let service = fixture.service(16)?;
