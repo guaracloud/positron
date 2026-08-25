@@ -2,6 +2,7 @@ use super::capacity::lease_claim;
 use super::snapshot_lease_attempt::SnapshotLeaseAttempt;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_grant::SnapshotLeaseGrant;
+use super::snapshot_lease_pending::{register_all, remove_all};
 use super::snapshot_lease_record::{
     LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
     valid_lease_interval, validate_active_lease,
@@ -119,6 +120,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        register_all(&mut state.pending_lease_releases, expired.iter().copied())?;
         state.pending_lease_releases.register(identity)?;
         if state
             .lease_reservations
@@ -127,6 +129,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         {
             state.lease_reservations.remove(&identity);
             state.pending_lease_releases.remove(identity);
+            remove_all(&mut state.pending_lease_releases, expired.iter().copied());
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
         let publication = (|| {
@@ -141,6 +144,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             if failure.completion_state() != LedgerCompletionState::CommitAmbiguous {
                 state.lease_reservations.remove(&identity);
                 state.pending_lease_releases.remove(identity);
+                remove_all(&mut state.pending_lease_releases, expired.iter().copied());
             }
             return Err(failure);
         }
@@ -235,12 +239,21 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let expired = expired_in_scope(&all_records, self.scope, now);
         let mut marker_basis = basis;
         if !expired.is_empty() {
-            marker_basis = publish_many_with_expected_catalog_snapshot(
+            register_all(&mut state.pending_lease_releases, expired.iter().copied())?;
+            marker_basis = match publish_many_with_expected_catalog_snapshot(
                 self.catalog,
                 &marker_basis,
                 marker_basis.identity(),
                 &expired,
-            )?;
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(failure) => {
+                    if failure.completion_state() != LedgerCompletionState::CommitAmbiguous {
+                        remove_all(&mut state.pending_lease_releases, expired.iter().copied());
+                    }
+                    return Err(failure);
+                },
+            };
             remove_reservations(&mut state, &expired);
         }
         state.last_snapshot_lease_time = now;

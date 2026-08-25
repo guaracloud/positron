@@ -1,5 +1,6 @@
 use super::*;
 use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_fault};
+use crate::catalog::with_catalog_fault_hook_after;
 use crate::{
     OrdinaryPool, ResourceAmounts, ResourceDimension, SnapshotLeaseUsage, WorkClaim, WorkKind,
 };
@@ -41,6 +42,24 @@ fn fixed_lease_clock(seconds: i64) -> crate::LifecycleClock<crate::FixedLifecycl
     crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(
         positron_domain::time::UnixNanoseconds::new(seconds * 1_000_000_000),
     ))
+}
+
+fn publish_catalog_rewrite(catalog: &crate::Catalog<'_>) -> Result<(), Box<dyn Error>> {
+    let basis = catalog.pin()?;
+    let objects = basis
+        .plaintext_objects()
+        .map(|bytes| crate::CatalogObject::new(bytes.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    catalog.commit(
+        basis.identity(),
+        crate::CatalogProposal::new(
+            crate::TransactionId::new([0xa5; 16])?,
+            crate::FormatEpoch::new(1)?,
+            objects,
+        )?,
+        None,
+    )?;
+    Ok(())
 }
 
 #[test]
@@ -161,6 +180,250 @@ fn ambiguous_lease_creation_is_owned_by_bounded_cleanup_before_retry() -> Result
         )?;
         assert_same_resources(baseline, authority.governor().inspect()?);
         drop(reopened);
+        Ok(())
+    })
+}
+
+#[test]
+fn ambiguous_expired_lease_pruning_on_create_retains_cleanup_ownership()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let initial = authority.governor().inspect()?;
+
+        for attempt in 0..65 {
+            let now = 100 + attempt * 3;
+            let baseline = authority.governor().inspect()?;
+            let expired = ledger.create_snapshot_lease(now, now + 1)?;
+            let expired_identity = expired.identity();
+            drop(expired);
+            let marked =
+                ledger.resume_snapshot_lease_with_marker(expired_identity, now, 1, [7; 32])?;
+            drop(marked);
+
+            let failure =
+                with_ledger_fault(LedgerFileEvent::BeforeLeaseCreationReconciliation, || {
+                    ledger.create_snapshot_lease(now + 1, now + 100)
+                })
+                .expect_err("an unproven prune-and-create publication must remain typed");
+            assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+            assert_eq!(
+                failure.completion_state(),
+                LedgerCompletionState::CommitAmbiguous
+            );
+
+            let replacement = ledger.create_snapshot_lease(now + 2, now + 101)?;
+            let replacement_identity = replacement.identity();
+            drop(replacement);
+            ledger.release_snapshot_lease(replacement_identity)?;
+            assert_same_resources(baseline, authority.governor().inspect()?);
+            assert_eq!(
+                catalog
+                    .pin()?
+                    .plaintext_objects()
+                    .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                    .count(),
+                0
+            );
+        }
+
+        drop(ledger);
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &fixed_lease_clock(500),
+        )?;
+        assert_same_resources(initial, authority.governor().inspect()?);
+        drop(reopened);
+        Ok(())
+    })
+}
+
+#[test]
+fn ambiguous_expired_lease_pruning_on_resume_retains_cleanup_ownership()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let initial = authority.governor().inspect()?;
+
+        for attempt in 0..65 {
+            let now = 100 + attempt * 3;
+            let baseline = authority.governor().inspect()?;
+            let expired = ledger.create_snapshot_lease(now, now + 1)?;
+            let expired_identity = expired.identity();
+            drop(expired);
+            let marked =
+                ledger.resume_snapshot_lease_with_marker(expired_identity, now, 1, [7; 32])?;
+            drop(marked);
+            let target = ledger.create_snapshot_lease(now, now + 100)?;
+            let target_identity = target.identity();
+            drop(target);
+
+            let failure =
+                with_catalog_fault(CatalogFileEvent::SynchronizeGenerationDirectory, || {
+                    ledger.resume_snapshot_lease_with_marker(target_identity, now + 1, 1, [9; 32])
+                })
+                .expect_err("an unproven expired-lease prune must remain typed");
+            assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+            assert_eq!(
+                failure.completion_state(),
+                LedgerCompletionState::CommitAmbiguous
+            );
+
+            ledger.release_snapshot_lease(expired_identity)?;
+            let resumed =
+                ledger.resume_snapshot_lease_with_marker(target_identity, now + 1, 1, [9; 32])?;
+            drop(resumed);
+            ledger.release_snapshot_lease(target_identity)?;
+            assert_same_resources(baseline, authority.governor().inspect()?);
+            assert_eq!(
+                catalog
+                    .pin()?
+                    .plaintext_objects()
+                    .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                    .count(),
+                0
+            );
+        }
+
+        drop(ledger);
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &fixed_lease_clock(500),
+        )?;
+        assert_same_resources(initial, authority.governor().inspect()?);
+        drop(reopened);
+        Ok(())
+    })
+}
+
+#[test]
+fn definitive_expired_lease_pruning_failure_retains_cleanup_ownership() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let baseline = authority.governor().inspect()?;
+        let expired = ledger.create_snapshot_lease(100, 101)?;
+        let expired_identity = expired.identity();
+        drop(expired);
+        let marked = ledger.resume_snapshot_lease_with_marker(expired_identity, 100, 1, [7; 32])?;
+        drop(marked);
+        let target = ledger.create_snapshot_lease(100, 200)?;
+        let target_identity = target.identity();
+        drop(target);
+
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+            ledger.resume_snapshot_lease_with_marker(target_identity, 101, 1, [9; 32])
+        })
+        .expect_err("a definitive prune failure must remain retryable");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            failure.completion_state(),
+            LedgerCompletionState::RejectedBeforeMutation
+        );
+
+        let resumed = ledger.resume_snapshot_lease_with_marker(target_identity, 101, 1, [9; 32])?;
+        drop(resumed);
+        ledger.release_snapshot_lease(target_identity)?;
+        assert_same_resources(baseline, authority.governor().inspect()?);
+        assert_eq!(
+            catalog
+                .pin()?
+                .plaintext_objects()
+                .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                .count(),
+            0
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn stale_expired_lease_pruning_failure_retains_cleanup_ownership() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let baseline = authority.governor().inspect()?;
+        let expired = ledger.create_snapshot_lease(100, 101)?;
+        let expired_identity = expired.identity();
+        drop(expired);
+        let target = ledger.create_snapshot_lease(100, 200)?;
+        let target_identity = target.identity();
+        drop(target);
+
+        let failure = with_catalog_fault_hook_after(
+            CatalogFileEvent::BeforeLeaseMarkerBasis,
+            0,
+            |catalog| publish_catalog_rewrite(catalog).expect("catalog rewrite"),
+            || ledger.resume_snapshot_lease_with_marker(target_identity, 101, 1, [9; 32]),
+        )
+        .expect_err("a concurrent catalog transition must fence pruning");
+        assert_eq!(failure.code(), LedgerFailureCode::StaleGeneration);
+
+        let resumed = ledger.resume_snapshot_lease_with_marker(target_identity, 101, 1, [9; 32])?;
+        drop(resumed);
+        ledger.release_snapshot_lease(target_identity)?;
+        assert_same_resources(baseline, authority.governor().inspect()?);
+        assert_eq!(
+            catalog
+                .pin()?
+                .plaintext_objects()
+                .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(expired_identity, 102)
+                .expect_err("the expired lease must remain absent")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn definitive_expired_lease_pruning_create_failure_releases_cleanup_ownership()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let baseline = authority.governor().inspect()?;
+        let expired = ledger.create_snapshot_lease(100, 101)?;
+        let expired_identity = expired.identity();
+        drop(expired);
+
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+            ledger.create_snapshot_lease(101, 201)
+        })
+        .expect_err("a definitive create publication failure must be typed");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            failure.completion_state(),
+            LedgerCompletionState::RejectedBeforeMutation
+        );
+
+        let retry = ledger.create_snapshot_lease(101, 201)?;
+        let retry_identity = retry.identity();
+        drop(retry);
+        ledger.release_snapshot_lease(retry_identity)?;
+        assert_same_resources(baseline, authority.governor().inspect()?);
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(expired_identity, 102)
+                .expect_err("the expired lease must remain absent")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
         Ok(())
     })
 }

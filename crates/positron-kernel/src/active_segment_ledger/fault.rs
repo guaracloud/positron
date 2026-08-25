@@ -121,7 +121,7 @@ pub(crate) fn with_ledger_errno<T>(
     })
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(test)]
 pub(crate) fn with_ledger_fault_sequence<T>(
     events: &[LedgerFileEvent],
     action: impl FnOnce() -> T,

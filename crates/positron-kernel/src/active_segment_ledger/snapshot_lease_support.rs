@@ -315,6 +315,7 @@ pub(super) fn remove_reservations(
         state.lease_reservations.remove(identity);
         state.lease_reservation_baselines.remove(identity);
         state.lease_resume_markers.remove(identity);
+        state.pending_lease_releases.remove(*identity);
     }
 }
 
