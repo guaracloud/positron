@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 mod snapshot_lease_lifecycle;
 #[path = "snapshot_lease_support.rs"]
 mod snapshot_lease_support;
-use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
+use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFailureCode};
 use crate::CatalogGenerationId;
 pub(super) use snapshot_lease_support::map_catalog_failure;
 pub(super) use snapshot_lease_support::{
@@ -119,9 +119,33 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        publish(self.catalog, &basis, &expired, Some(encoded))?;
+        state.pending_lease_releases.register(identity)?;
+        if state
+            .lease_reservations
+            .insert(identity, retained)
+            .is_some()
+        {
+            state.lease_reservations.remove(&identity);
+            state.pending_lease_releases.remove(identity);
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        let publication = (|| {
+            publish(self.catalog, &basis, &expired, Some(encoded))?;
+            #[cfg(any(test, fuzzing, feature = "test-support"))]
+            super::fault::emit_event(
+                super::fault::LedgerFileEvent::BeforeLeaseCreationReconciliation,
+            )?;
+            Ok::<(), LedgerFailure>(())
+        })();
+        if let Err(failure) = publication {
+            if failure.completion_state() != LedgerCompletionState::CommitAmbiguous {
+                state.lease_reservations.remove(&identity);
+                state.pending_lease_releases.remove(identity);
+            }
+            return Err(failure);
+        }
         remove_reservations(&mut state, &expired);
-        state.lease_reservations.insert(identity, retained);
+        state.pending_lease_releases.remove(identity);
         state.last_snapshot_lease_time = now;
         Ok(SnapshotLeaseGrant {
             identity,

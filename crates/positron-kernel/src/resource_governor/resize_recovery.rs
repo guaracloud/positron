@@ -46,6 +46,7 @@ impl GovernorInner {
             identity,
             old,
             new,
+            preserve_existing,
         } = request;
         let class = WorkClass::DurabilityRecovery;
         if state.lifecycle == GovernorLifecycle::Fenced {
@@ -230,7 +231,7 @@ impl GovernorInner {
                     })
             };
         if let Err(admission) = admission {
-            let retain = kind.retains_capacity_on_resize_failure();
+            let retain = preserve_existing || kind.retains_capacity_on_resize_failure();
             if !retain {
                 let Some(outstanding) = state.outstanding.checked_sub(1) else {
                     return Err(fence_resize(state, class));

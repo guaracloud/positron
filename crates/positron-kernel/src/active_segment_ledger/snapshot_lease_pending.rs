@@ -43,4 +43,14 @@ impl PendingLeaseReleases {
     pub(super) fn clear(&mut self) {
         self.identities.fill(None);
     }
+
+    pub(super) fn remove(&mut self, identity: SnapshotLeaseId) {
+        if let Some(slot) = self
+            .identities
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|held| held == identity))
+        {
+            *slot = None;
+        }
+    }
 }

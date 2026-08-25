@@ -35,6 +35,8 @@ pub(super) enum LedgerFileEvent {
     BeforeLeaseUsageReconciliation,
     #[cfg(any(test, fuzzing, feature = "test-support"))]
     BeforeLeaseMarkerPublication,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    BeforeLeaseCreationReconciliation,
 }
 
 pub(super) fn emit_event(_event: LedgerFileEvent) -> Result<(), LedgerFailure> {
@@ -45,6 +47,7 @@ pub(super) fn emit_event(_event: LedgerFileEvent) -> Result<(), LedgerFailure> {
             | LedgerFileEvent::AfterLeaseUsagePublication
             | LedgerFileEvent::BeforeLeaseUsageReconciliation
             | LedgerFileEvent::BeforeLeaseMarkerPublication
+            | LedgerFileEvent::BeforeLeaseCreationReconciliation
     ) && injected_errno(_event).is_some()
     {
         return Err(LedgerFailure::ambiguous(

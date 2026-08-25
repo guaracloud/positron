@@ -67,7 +67,7 @@ impl LeaseReservationTransaction {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
         if reservation.granted() != amounts {
             reservation
-                .try_resize(amounts)
+                .try_resize_preserving_capacity(amounts)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         }
         Ok(())

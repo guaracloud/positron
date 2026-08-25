@@ -51,6 +51,23 @@ impl<'authority> ResourceReservation<'authority> {
         &mut self,
         new_amounts: ResourceAmounts,
     ) -> Result<ResizeOutcome, ResizeFailure> {
+        self.try_resize_with_policy(new_amounts, false)
+    }
+
+    /// Replans a lease-owned metadata reservation without surrendering the
+    /// existing grant when admission refuses the replacement.
+    pub(crate) fn try_resize_preserving_capacity(
+        &mut self,
+        new_amounts: ResourceAmounts,
+    ) -> Result<ResizeOutcome, ResizeFailure> {
+        self.try_resize_with_policy(new_amounts, true)
+    }
+
+    fn try_resize_with_policy(
+        &mut self,
+        new_amounts: ResourceAmounts,
+        preserve_existing: bool,
+    ) -> Result<ResizeOutcome, ResizeFailure> {
         if !self.active {
             return Err(ResizeFailure::inactive(
                 self.identity.class(),
@@ -69,6 +86,7 @@ impl<'authority> ResourceReservation<'authority> {
             identity: self.identity,
             old: self.amounts,
             new: new_amounts,
+            preserve_existing,
         }) {
             Ok(commit) => {
                 self.owner = commit.owner;

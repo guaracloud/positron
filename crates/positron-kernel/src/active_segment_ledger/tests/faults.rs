@@ -15,6 +15,7 @@ use crate::{
 
 mod admission_faults;
 mod sealing_faults;
+mod snapshot_lease_capacity;
 mod snapshot_leases;
 
 fn prepared(
