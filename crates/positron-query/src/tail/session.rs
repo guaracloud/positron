@@ -5,6 +5,7 @@ use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
 use super::cursor::{TailCursor, TailCursorState, TailPosition};
+use super::lease::TailLeaseOwner;
 use super::source::TailSourceSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +39,7 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) query: PlannedQuery<'kernel>,
     pub(super) sources: TailSourceSet<'kernel, 'catalog>,
     pub(super) _lease: positron_kernel::SnapshotLeaseGrant<'kernel>,
+    pub(super) lease_owner: TailLeaseOwner<'ledger, 'kernel, 'catalog>,
     pub(super) state: TailCursorState,
     pub(super) cursor: TailCursor,
     pub(super) header: Option<crate::stream::QueryHeader>,
@@ -139,6 +141,12 @@ impl TailSession<'_, '_, '_, '_> {
         }
     }
     fn take_terminal(&mut self) -> Option<TailEvent> {
+        if let Some(terminal) = self.terminal.as_mut()
+            && let Err(failure) = self.lease_owner.release()
+        {
+            *terminal =
+                super::admission::terminal_for_failure(failure.code(), Some(self.cursor.clone()));
+        }
         take_terminal_value(&mut self.terminal, &mut self.terminal_emitted)
     }
     fn advance(

@@ -5,6 +5,7 @@ use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
 use super::cursor::{TailCursor, TailCursorState, TailPosition, budget_digest};
+use super::lease::TailLeaseOwner;
 use super::session::{TailSession, TailStart, TailTerminal};
 use super::source::TailSourceSet;
 
@@ -148,6 +149,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .ledger
             .create_snapshot_lease(now, expiry)
             .map_err(crate::execution_support::map_ledger_failure)?;
+        let lease_owner = TailLeaseOwner::new(self.ledger, lease.identity());
         if sources.tenant() != tenant {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
@@ -262,6 +264,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             query,
             sources,
             _lease: lease,
+            lease_owner,
             state,
             cursor,
             header: Some(header),

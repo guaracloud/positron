@@ -2,7 +2,10 @@ use std::error::Error;
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::AttributeValueKind;
-use positron_kernel::{ActiveSegmentLedger, SegmentProtectionKey};
+use positron_kernel::{
+    ActiveSegmentLedger, CatalogPublicationFault, SegmentProtectionKey, SnapshotLeaseId, WorkClass,
+    with_catalog_publication_fault_after,
+};
 use positron_query::{
     QueryBudget, QueryEvent, QueryFailureCode, TailCursor, TailCursorState, TailEvent,
     TailPosition, TailSourceSet, TailStart, TailTerminal,
@@ -135,6 +138,210 @@ fn tail_disconnect_before_ack_replays_the_same_batch_identity() -> Result<(), Bo
         first.records()[0].body_text()
     );
     assert!(repeated.records()[0].replayed());
+    Ok(())
+}
+
+#[test]
+fn tail_drop_releases_its_durable_lease_and_admission() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-drop-release")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let baseline = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    let lease_identity = match tail.poll() {
+        Some(TailEvent::Header(header)) => SnapshotLeaseId::new(header.lease().identity())?,
+        _ => return Err("tail header missing".into()),
+    };
+    assert!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail)
+            > baseline
+    );
+    drop(tail);
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .resume_snapshot_lease(lease_identity, 100)
+            .expect_err("dropped tail must release its durable lease")
+            .code(),
+        positron_kernel::LedgerFailureCode::SnapshotExpired
+    );
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        baseline
+    );
+    Ok(())
+}
+
+#[test]
+fn tail_release_failure_is_one_terminal_and_drop_retries_deferred_cleanup()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-release-retry")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    let lease_identity = match tail.poll() {
+        Some(TailEvent::Header(header)) => SnapshotLeaseId::new(header.lease().identity())?,
+        _ => return Err("tail header missing".into()),
+    };
+    tail.disconnect();
+    let terminal =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            tail.poll()
+        });
+    assert!(matches!(
+        terminal,
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable(Some(_))))
+    ));
+    assert!(tail.poll().is_none());
+    drop(tail);
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .resume_snapshot_lease(lease_identity, 100)
+            .expect_err("deferred release must complete on Drop retry")
+            .code(),
+        positron_kernel::LedgerFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
+fn tail_historical_admission_failure_releases_the_lease_before_returning()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-admission-release")?;
+    fixture.kernel.append_malformed_log_block(1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let baseline = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    if service
+        .tail(query, TailStart::Historical { max_rows: 1 })
+        .is_ok()
+    {
+        return Err("malformed historical data unexpectedly admitted".into());
+    }
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        baseline
+    );
+    Ok(())
+}
+
+#[test]
+fn tail_terminal_and_drop_paths_reclaim_lease_capacity_repeatedly() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-terminal-release-loop")?;
+    let clock = TestClock::shared(100);
+    let service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        clock.clone(),
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    for attempt in 0..65 {
+        clock.set(100);
+        let baseline = fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail);
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit 1",
+            budget,
+        )?;
+        let mut tail = service.tail(query, TailStart::Now)?;
+        let lease_identity = match tail.poll() {
+            Some(TailEvent::Header(header)) => SnapshotLeaseId::new(header.lease().identity())?,
+            _ => return Err("tail header missing".into()),
+        };
+        match attempt % 4 {
+            0 => {
+                tail.cancel();
+                assert!(matches!(
+                    tail.poll(),
+                    Some(TailEvent::Terminal(TailTerminal::Cancelled(Some(_))))
+                ));
+            },
+            1 => {
+                tail.disconnect();
+                assert!(matches!(
+                    tail.poll(),
+                    Some(TailEvent::Terminal(TailTerminal::Disconnected(Some(_))))
+                ));
+            },
+            2 => {},
+            _ => {
+                clock.set(160);
+                assert!(matches!(
+                    tail.poll(),
+                    Some(TailEvent::Terminal(TailTerminal::Expired(Some(_))))
+                ));
+            },
+        }
+        drop(tail);
+        clock.set(100);
+        assert_eq!(
+            fixture
+                .kernel
+                .ledger()?
+                .resume_snapshot_lease(lease_identity, 100)
+                .expect_err("terminal/drop path must release the durable lease")
+                .code(),
+            positron_kernel::LedgerFailureCode::SnapshotExpired
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .authority
+                .governor()
+                .inspect()?
+                .outstanding_for(WorkClass::InteractiveQueryTail),
+            baseline
+        );
+    }
     Ok(())
 }
 

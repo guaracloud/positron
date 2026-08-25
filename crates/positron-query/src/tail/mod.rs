@@ -1,6 +1,7 @@
 mod admission;
 mod buffer;
 mod cursor;
+mod lease;
 mod materialize;
 mod session;
 mod source;
