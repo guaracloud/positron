@@ -95,6 +95,17 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
     )?;
     let source = "logs | range query_time 0 100 | limit 16";
 
+    assert_eq!(
+        services.query_events_for_test(
+            context,
+            source,
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
+                .with_cpu_work_units(16)?,
+            Some(0),
+        )?,
+        QueryTestOutcome::Failure(QueryFailureCode::InvalidBudget)
+    );
+
     let exact_events = match services.query_events_for_test(
         context,
         source,

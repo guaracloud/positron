@@ -4,14 +4,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_kernel::{MountQualification, PrimaryDataVolume};
 
-#[cfg(feature = "test-support")]
-use super::super::GovernanceFixtureObject;
 use super::super::storage::fault::CatalogFileEvent;
 use super::super::storage::{with_catalog_fault, with_catalog_fault_after};
 use super::super::{
     AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject, CatalogProposal,
     CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, TransactionId,
 };
+#[cfg(feature = "test-support")]
+use super::super::{GovernanceFixtureObject, GovernanceFixtureTarget};
 use super::support::establish_catalog_authority;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +35,30 @@ fn governance_fixture_object_checks_its_bound_before_copying() {
         CatalogFailureCode::LimitExceeded
     );
     assert!(GovernanceFixtureObject::from_bytes(b"POSGOV03").is_ok());
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn default_governance_fixture_target_delegates_installation() {
+    struct DelegatingTarget(AtomicU64);
+
+    impl GovernanceFixtureTarget for DelegatingTarget {
+        fn install_governance_fixture(
+            &self,
+            _fixture: &GovernanceFixtureObject,
+        ) -> Result<(), CatalogFailure> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let target = DelegatingTarget(AtomicU64::new(0));
+    let fixture = GovernanceFixtureObject::from_bytes(b"POSGOV03")
+        .expect("the bounded test fixture must be accepted");
+    target
+        .replace_governance_fixture(&fixture)
+        .expect("the default replacement must delegate installation");
+    assert_eq!(target.0.load(Ordering::Relaxed), 1);
 }
 
 struct TemporaryRoot(PathBuf);

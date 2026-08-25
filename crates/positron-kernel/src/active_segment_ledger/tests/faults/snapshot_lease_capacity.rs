@@ -164,3 +164,48 @@ fn ambiguous_lease_creation_is_owned_by_bounded_cleanup_before_retry() -> Result
         Ok(())
     })
 }
+
+#[test]
+fn definitive_lease_creation_failure_releases_prepublication_ownership()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let baseline = authority.governor().inspect()?;
+
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+            ledger.create_snapshot_lease(100, 200)
+        })
+        .expect_err("a definitive publication failure must not retain a lease");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            authority.governor().inspect()?.outstanding_total(),
+            baseline.outstanding_total()
+        );
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(
+                authority.governor().inspect()?.usage(dimension),
+                baseline.usage(dimension),
+                "definitive creation failure leaked {dimension:?}",
+            );
+        }
+        assert_eq!(
+            catalog
+                .pin()?
+                .plaintext_objects()
+                .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                .count(),
+            0
+        );
+
+        let retry = ledger.create_snapshot_lease(101, 201)?;
+        let identity = retry.identity();
+        drop(retry);
+        ledger.release_snapshot_lease(identity)?;
+        assert_eq!(
+            authority.governor().inspect()?.outstanding_total(),
+            baseline.outstanding_total()
+        );
+        Ok(())
+    })
+}
