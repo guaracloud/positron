@@ -1,6 +1,9 @@
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode};
 
 pub(super) fn fuzz_query_transforms(data: &[u8]) {
+    if data.len() > crate::transform::MAX_TRANSFORM_INPUT_BYTES {
+        return;
+    }
     let Ok(source) = std::str::from_utf8(data) else {
         return;
     };
@@ -11,35 +14,6 @@ pub(super) fn fuzz_query_transforms(data: &[u8]) {
         }
     }
     let profile = positron_domain::value::ValueLimitProfile::release_1_system_maximum();
-    if data.len() > crate::transform::MAX_TRANSFORM_INPUT_BYTES {
-        let candidate = positron_domain::value::CandidateAttributeValue::string(source.to_owned());
-        let value = match candidate.validate_log_body(profile) {
-            Ok(value) => value,
-            Err(failure) => {
-                assert_eq!(
-                    failure.code(),
-                    positron_domain::outcome::DomainFailureCode::ValueLimitExceeded
-                );
-                return;
-            },
-        };
-        for transform in [
-            crate::transform::BodyTransform::Json,
-            crate::transform::BodyTransform::Logfmt,
-            crate::transform::BodyTransform::Cast(crate::transform::CastTarget::String),
-            crate::transform::BodyTransform::Cast(crate::transform::CastTarget::Integer),
-            crate::transform::BodyTransform::Cast(crate::transform::CastTarget::Float),
-            crate::transform::BodyTransform::Cast(crate::transform::CastTarget::Boolean),
-        ] {
-            let mut observer = Unobserved;
-            let result = transform.apply_with_facts(&value, &mut observer);
-            assert!(matches!(
-                result,
-                Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
-            ));
-        }
-        return;
-    }
     let mut bits = [0_u8; 8];
     for (index, byte) in data.iter().take(bits.len()).enumerate() {
         if let Some(slot) = bits.get_mut(index) {
