@@ -701,6 +701,66 @@ fn zero_remaining_output_rows_with_pending_replay_is_incomplete() -> Result<(), 
 }
 
 #[test]
+fn zero_remaining_output_bytes_with_pending_replay_is_incomplete() -> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("output-bytes-replay-boundary")?;
+    for (identity, body) in [(1, "one"), (2, "two"), (3, "three")] {
+        fixture
+            .kernel
+            .append_log(body, i64::from(identity), identity)?;
+    }
+    let budget = QueryBudget::new(1_048_576, 16, 2, 17, 1_048_576, 60)?;
+    let service = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let first = service
+        .execute_page(service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | project query_time, commit_position | limit 2",
+            budget,
+        )?)?
+        .collect::<Vec<_>>();
+    let cursor = continued_cursor(&first)?.clone();
+    let raw_identity = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header.lease().identity()),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("query header missing")?;
+    let identity = SnapshotLeaseId::new(raw_identity)?;
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot_lease_usage(identity, 100)?
+            .output_bytes(),
+        17
+    );
+
+    let replay = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert!(
+        replay
+            .iter()
+            .all(|event| !matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        replay.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().records() == 1
+                && incomplete.stats().output_bytes() == 17
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::OutputBytes)
+    ));
+    Ok(())
+}
+
+#[test]
 fn concurrent_resumes_admit_one_attempt_at_the_budget_boundary() -> Result<(), Box<dyn Error>> {
     let fixture = super::terminal_and_bounds::QueryFixture::new("concurrent-resume-attempt")?;
     fixture.kernel.append_log("one", 20, 1)?;

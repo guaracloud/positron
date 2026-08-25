@@ -1,5 +1,5 @@
 use super::LedgerFailure;
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 use super::io::map_errno;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,22 +25,36 @@ pub(super) enum LedgerFileEvent {
     PartialSegmentHeaderWrite,
     SynchronizeSegmentHeader,
     SynchronizeSegmentDirectory,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    BeforeLeaseUsagePublication,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    AfterLeaseUsagePublication,
 }
 
 pub(super) fn emit_event(_event: LedgerFileEvent) -> Result<(), LedgerFailure> {
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    if matches!(
+        _event,
+        LedgerFileEvent::BeforeLeaseUsagePublication | LedgerFileEvent::AfterLeaseUsagePublication
+    ) && injected_errno(_event).is_some()
+    {
+        return Err(LedgerFailure::ambiguous(
+            super::LedgerFailureCode::StorageUnavailable,
+        ));
+    }
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
     if let Some(error) = injected_errno(_event) {
         return Err(map_errno(error));
     }
     Ok(())
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 thread_local! {
     static LEDGER_FAULT: std::cell::Cell<Option<(LedgerFileEvent, rustix::io::Errno)>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 fn injected_errno(event: LedgerFileEvent) -> Option<rustix::io::Errno> {
     LEDGER_FAULT.with(|fault| {
         if fault.get().is_some_and(|(candidate, _)| candidate == event) {
@@ -53,7 +67,7 @@ fn injected_errno(event: LedgerFileEvent) -> Option<rustix::io::Errno> {
     })
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 pub(super) fn injected_partial_write_length(
     event: LedgerFileEvent,
     length: usize,
@@ -61,7 +75,7 @@ pub(super) fn injected_partial_write_length(
     injected_errno(event).map(|_| length.saturating_sub(1).max(1))
 }
 
-#[cfg(not(any(test, fuzzing)))]
+#[cfg(not(any(test, fuzzing, feature = "test-support")))]
 pub(super) const fn injected_partial_write_length(
     _event: LedgerFileEvent,
     _length: usize,

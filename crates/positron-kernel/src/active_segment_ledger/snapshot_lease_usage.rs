@@ -166,12 +166,22 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
             previous
         };
-        if let Err(failure) = publish_many(
-            self.catalog,
-            &basis,
-            &BTreeSet::from([identity]),
-            vec![encoded],
-        ) {
+        let publication = (|| {
+            #[cfg(any(test, fuzzing, feature = "test-support"))]
+            super::fault::emit_event(super::fault::LedgerFileEvent::BeforeLeaseUsagePublication)?;
+            publish_many(
+                self.catalog,
+                &basis,
+                &BTreeSet::from([identity]),
+                vec![encoded],
+            )
+        })()
+        .and_then(|()| {
+            #[cfg(any(test, fuzzing, feature = "test-support"))]
+            super::fault::emit_event(super::fault::LedgerFileEvent::AfterLeaseUsagePublication)?;
+            Ok(())
+        });
+        if let Err(failure) = publication {
             if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
                 let reconciled = self.reconcile_ambiguous_usage(
                     &mut state,
@@ -235,22 +245,23 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 })
             });
 
-        if let Some(record) = observed.as_ref() {
-            if record.usage == expected.usage
-                && super::snapshot_lease_codec::encode(record)
-                    .ok()
-                    .is_some_and(|encoded| encoded == expected_encoded)
-            {
-                cache_marker(state, record);
-                return Ok(record.usage);
-            }
-            if record.usage == previous.usage {
-                cache_marker(state, record);
-                rollback_marker_resize(state, identity, previous_amounts)?;
-                return Err(LedgerFailure::ambiguous(
-                    LedgerFailureCode::StorageUnavailable,
-                ));
-            }
+        if let Some(record) = observed.as_ref()
+            && record.usage == expected.usage
+            && super::snapshot_lease_codec::encode(record)
+                .ok()
+                .is_some_and(|encoded| encoded == expected_encoded)
+        {
+            cache_marker(state, record);
+            return Ok(record.usage);
+        }
+        if let Some(record) = observed.as_ref()
+            && record.usage == previous.usage
+        {
+            cache_marker(state, record);
+            rollback_marker_resize(state, identity, previous_amounts)?;
+            return Err(LedgerFailure::ambiguous(
+                LedgerFailureCode::StorageUnavailable,
+            ));
         }
 
         // The durable outcome cannot be proven. Drop the in-memory marker so a

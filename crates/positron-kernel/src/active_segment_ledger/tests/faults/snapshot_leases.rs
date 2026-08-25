@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use super::super::super::fault::{LedgerFileEvent, with_ledger_fault};
 use super::super::super::snapshot_lease::publication_visible;
 use super::*;
 use crate::{
@@ -769,6 +770,101 @@ fn marked_usage_rejects_legacy_writes_while_the_attempt_is_live() -> Result<(), 
 }
 
 #[test]
+fn marked_usage_replays_are_idempotent_and_reject_divergent_bases() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let mut marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        let attempt = marked
+            .take_attempt()
+            .ok_or("marked resume did not retain its attempt guard")?;
+        let previous = marked.usage();
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+
+        let first = ledger.record_snapshot_lease_usage_for_attempt(&attempt, previous, delta)?;
+        assert_eq!(first, previous.merge(delta)?);
+        assert_eq!(
+            ledger.record_snapshot_lease_usage_for_attempt(&attempt, previous, delta)?,
+            first
+        );
+        let divergent = ledger
+            .record_snapshot_lease_usage_for_attempt(
+                &attempt,
+                previous,
+                SnapshotLeaseUsage::new(2, 2, 3, 4, 5, 6, 7),
+            )
+            .expect_err("a retry with an obsolete usage base must not merge twice");
+        assert_eq!(divergent.code(), LedgerFailureCode::ConcurrentWriter);
+        Ok(())
+    })
+}
+
+#[test]
+fn usage_attempt_from_a_reopened_ledger_is_rejected() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let mut marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        let previous = marked.usage();
+        let attempt = marked
+            .take_attempt()
+            .ok_or("marked resume did not retain its attempt guard")?;
+        drop(marked);
+        drop(ledger);
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )?;
+        let failure = reopened
+            .record_snapshot_lease_usage_for_attempt(
+                &attempt,
+                previous,
+                SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+            )
+            .expect_err("an attempt guard cannot cross a ledger reopen");
+        assert_eq!(failure.code(), LedgerFailureCode::ConcurrentWriter);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_usage_rejects_a_durable_resume_count_change() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let mut marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        let previous = marked.usage();
+        let attempt = marked
+            .take_attempt()
+            .ok_or("marked resume did not retain its attempt guard")?;
+        publish_lease_rewrite(catalog, 0xe5, |bytes| {
+            bytes[111..119].copy_from_slice(&2_u64.to_be_bytes());
+        })?;
+        let failure = ledger
+            .record_snapshot_lease_usage_for_attempt(
+                &attempt,
+                previous,
+                SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+            )
+            .expect_err("usage must reject a durable marker from another attempt");
+        assert_eq!(failure.code(), LedgerFailureCode::ConcurrentWriter);
+        Ok(())
+    })
+}
+
+#[test]
 fn marked_resume_reports_expiry_cleanup_publication_failure() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let ledger = ActiveSegmentLedger::open(
@@ -1145,6 +1241,69 @@ fn snapshot_lease_usage_failures_are_typed_and_publication_is_retryable()
             &lease_clock(104),
         )?;
         assert_eq!(reopened.snapshot_lease_usage(live, 104)?, reconciled);
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_usage_writes_reject_a_durable_expiry_at_the_observed_time()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        drop(ledger.resume_snapshot_lease(identity, 101)?);
+        drop(ledger);
+        publish_lease_rewrite(catalog, 0xe7, |bytes| {
+            bytes[103..111].copy_from_slice(&101_u64.to_be_bytes());
+        })?;
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )?;
+        let failure = reopened
+            .record_snapshot_lease_usage(identity, SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0))
+            .expect_err("usage must reject an expired durable lease");
+        assert_eq!(failure.code(), LedgerFailureCode::SnapshotExpired);
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_usage_ambiguous_publication_reconciles_durable_truth()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+
+        let usage = with_ledger_fault(LedgerFileEvent::AfterLeaseUsagePublication, || {
+            ledger.record_snapshot_lease_usage(identity, delta)
+        })?;
+        assert_eq!(usage, delta);
+        assert_eq!(ledger.snapshot_lease_usage(identity, 101)?, delta);
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_lease_usage_retries_after_an_ambiguous_prepublication() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+
+        let usage = with_ledger_fault(LedgerFileEvent::BeforeLeaseUsagePublication, || {
+            ledger.record_snapshot_lease_usage(identity, delta)
+        })?;
+        assert_eq!(usage, delta);
+        assert_eq!(ledger.snapshot_lease_usage(identity, 101)?, delta);
         Ok(())
     })
 }
