@@ -1,7 +1,7 @@
 use crate::Catalog;
 use crate::resource_governor::{StorageKernelResourceAuthority, WorkClaim, WorkKind};
 
-use super::capacity::snapshot_retained_claim;
+use super::capacity::{recovery_claim, snapshot_retained_claim};
 use super::reconstruction::reconstruct;
 use super::recovery::RecoveryMode;
 use super::storage::LedgerStorage;
@@ -47,7 +47,7 @@ impl<'kernel, 'catalog> CommittedLedgerReader<'kernel, 'catalog> {
             authority,
             catalog,
             scope,
-            storage: LedgerStorage::open(volume)?,
+            storage: LedgerStorage::open_observed(volume)?,
             protection,
         })
     }
@@ -60,6 +60,17 @@ impl<'kernel, 'catalog> CommittedLedgerReader<'kernel, 'catalog> {
             self.catalog.refresh_state()?;
             let basis = self.catalog.pin()?;
             let metadata = self.storage.catalog_segments_observed(&basis, self.scope)?;
+            let reconstruction_claim = WorkClaim::tenant(
+                self.scope.tenant_id(),
+                WorkKind::InteractiveQueryTail,
+                recovery_claim(),
+            )
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+            let _reconstruction_capacity = self
+                .authority
+                .governor()
+                .reserve(reconstruction_claim)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
             let reconstruction = reconstruct(
                 &self.storage,
                 &metadata,

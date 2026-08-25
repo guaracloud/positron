@@ -13,7 +13,10 @@ use super::fault::{LedgerFileEvent, emit_event, injected_partial_write_length};
 use super::format::{
     SegmentMetadata, SegmentState, decode_header, decode_metadata, encode_header, encode_metadata,
 };
-use super::io::{map_errno, map_io_error, open_or_create_directory, open_regular, synchronize};
+use super::io::{
+    map_errno, map_io_error, open_existing_directory, open_or_create_directory, open_regular,
+    synchronize,
+};
 use super::recovery::frontier_temporary_name;
 use super::recovery::{
     RecoveryMode, RecoveryState, frontier_name, publish_frontier, recover_with_mode, segment_name,
@@ -76,6 +79,17 @@ impl LedgerStorage {
         let sealed = open_or_create_directory(&segments, "sealed")?;
         synchronize(&segments)?;
         synchronize(&volume._root)?;
+        Ok(Self {
+            active,
+            sealed,
+            current: None,
+        })
+    }
+
+    pub(super) fn open_observed(volume: &OwnedPrimaryDataVolume) -> Result<Self, LedgerFailure> {
+        let segments = open_existing_directory(&volume._root, "segments")?;
+        let active = open_existing_directory(&segments, "active")?;
+        let sealed = open_existing_directory(&segments, "sealed")?;
         Ok(Self {
             active,
             sealed,
