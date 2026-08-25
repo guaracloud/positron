@@ -1065,6 +1065,83 @@ fn tail_historical_max_rows_is_global_across_shards() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn tail_multi_shard_history_uses_canonical_query_time_order() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-shard-order")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(20),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "late".to_owned(),
+                )),
+            ),
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "tie-one".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x55; 32])),
+    )?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "early".to_owned(),
+                )),
+            ),
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "tie-two".to_owned(),
+                )),
+            ),
+        ],
+        2,
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        budget,
+    )?;
+    let mut tail =
+        service.tail_with_sources(query, TailStart::Historical { max_rows: 4 }, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("multi-shard ordered batch missing".into());
+    };
+    let bodies = batch
+        .records()
+        .iter()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["early", "tie-one", "tie-two", "late"]);
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    Ok(())
+}
+
+#[test]
 fn tail_resume_exposes_replayed_rows_after_an_undelivered_cursor() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-replay")?;
     let service = fixture.service(16)?;
