@@ -10,6 +10,8 @@ mod parity;
 mod query_lifecycle_admission;
 #[path = "acknowledged_logs/support.rs"]
 mod support;
+#[path = "acknowledged_logs/tail.rs"]
+mod tail;
 #[path = "acknowledged_logs/terminal_and_bounds.rs"]
 mod terminal_and_bounds;
 #[path = "acknowledged_logs/transform_capacity.rs"]

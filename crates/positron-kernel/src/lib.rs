@@ -92,11 +92,11 @@ pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 #[cfg(feature = "test-support")]
 pub use active_segment_ledger::publish_snapshot_lease_marker_for_test;
 pub use active_segment_ledger::{
-    ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
-    LedgerFailure, LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS,
-    PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseUsage,
-    StoreBlockIdentity,
+    ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
+    LedgerCompletionState, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
+    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, SealedSegment, SegmentId,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId,
+    SnapshotLeaseUsage, StoreBlockIdentity,
 };
 
 pub use data_protection::{

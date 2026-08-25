@@ -64,6 +64,13 @@ rejected before any resume state is constructed:
 cargo +nightly fuzz run query_cursor --sanitizer none -- -runs=1000
 ```
 
+The live-tail cursor target checks bounded shard-frontier decoding,
+authentication, duplicate-shard rejection, and truncation handling:
+
+```console
+cargo +nightly fuzz run tail_cursor --sanitizer none -- -runs=1000
+```
+
 The persistent snapshot-lease target exercises the production PSLEASE1 v1
 through v4 codec, including marker and physical-usage fields, checked lengths,
 unknown tags, truncation, and overflow mutations:

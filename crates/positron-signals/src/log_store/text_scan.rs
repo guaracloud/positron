@@ -1,4 +1,4 @@
-use super::scan::admit_block_bytes;
+use super::scan::{admit_block_bytes, includes_block};
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
     LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, WorkClaim, WorkKind,
@@ -60,10 +60,7 @@ impl LogStore {
         let mut encoded_bytes = 0_u64;
         for block in snapshot.blocks() {
             check_scan_cancellation(cancellation)?;
-            if scan
-                .frontier()
-                .is_some_and(|frontier| block.position() > frontier)
-            {
+            if !includes_block(scan, block.position()) {
                 continue;
             }
             encoded_bytes = encoded_bytes
@@ -100,10 +97,7 @@ impl LogStore {
         let mut reduced_pruning = false;
         for block in snapshot.blocks() {
             check_scan_cancellation(cancellation)?;
-            if scan
-                .frontier()
-                .is_some_and(|frontier| block.position() > frontier)
-            {
+            if !includes_block(scan, block.position()) {
                 continue;
             }
             let remaining = limit.saturating_sub(records.len());

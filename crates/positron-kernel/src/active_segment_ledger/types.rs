@@ -118,6 +118,15 @@ pub struct SegmentProtectionKey {
     pub(super) route: SegmentKeyRoute,
 }
 
+impl Clone for SegmentProtectionKey {
+    fn clone(&self) -> Self {
+        Self {
+            key: SecretKeyBytes::from_owned(Box::new(*self.key.expose_to_backend())),
+            route: self.route,
+        }
+    }
+}
+
 impl SegmentProtectionKey {
     #[must_use]
     pub fn from_owned(bytes: Box<[u8; 32]>) -> Self {

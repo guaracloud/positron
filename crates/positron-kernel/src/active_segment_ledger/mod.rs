@@ -9,7 +9,9 @@ mod fuzzing;
 mod io;
 mod protection;
 mod publication;
+mod reader;
 mod receipt;
+mod reconstruction;
 mod recovery;
 mod scope_discovery;
 mod snapshot_lease;
@@ -32,8 +34,6 @@ mod tests;
 use std::fmt::Formatter;
 use std::sync::{Arc, Mutex};
 
-use positron_domain::routing::CommitPosition;
-
 use crate::catalog::Catalog;
 use crate::data_protection::ObjectDataKey;
 use crate::resource_governor::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
@@ -46,12 +46,14 @@ use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
+pub use reader::CommittedLedgerReader;
+use reconstruction::reconstruct;
 pub use snapshot_lease_attempt::SnapshotLeaseAttempt;
 pub use snapshot_lease_grant::SnapshotLeaseGrant;
 pub use snapshot_lease_record::{
     MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId, SnapshotLeaseUsage,
 };
-use state::{LedgerState, retain_recovered};
+use state::LedgerState;
 use storage::LedgerStorage;
 #[cfg(feature = "test-support")]
 pub use test_support::publish_snapshot_lease_marker_for_test;
@@ -82,6 +84,7 @@ pub struct ActiveSegmentLedger<'kernel, 'catalog> {
     catalog: &'catalog Catalog<'kernel>,
     scope: SegmentScope,
     storage: LedgerStorage,
+    protection: SegmentProtectionKey,
     key: ObjectDataKey,
     state: Mutex<LedgerState<'kernel>>,
     lease_attempts: Arc<Mutex<snapshot_lease_attempt::LeaseAttemptRegistry>>,
@@ -183,49 +186,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         )?;
         let snapshot = catalog.pin()?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
-        let mut segments = metadata.iter().copied().peekable();
-        let mut blocks = Vec::new();
-        let mut retained_bytes = 0_usize;
-        let mut frontier = CommitPosition::origin();
-        let mut recovered_active = None;
-        while let Some(first) = segments.peek().copied() {
-            let base = first.base_position;
-            if base != frontier {
-                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-            }
-
-            let mut advancing_sealed = None;
-            let mut active = None;
-            while let Some(segment) = segments.next_if(|candidate| candidate.base_position == base)
-            {
-                let (key, recovered) =
-                    storage.recover_segment(segment, &protection, catalog.instance())?;
-                if segment.state == SegmentState::Active {
-                    active = Some((segment, key, recovered));
-                } else if recovered.frontier == base {
-                    retain_recovered(recovered, &mut blocks, &mut retained_bytes, &mut frontier)?;
-                } else if advancing_sealed
-                    .replace((segment, key, recovered))
-                    .is_some()
-                {
-                    return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-                }
-            }
-
-            if advancing_sealed.is_some() && active.is_some() {
-                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-            }
-            if let Some((_segment, _key, recovered)) = advancing_sealed {
-                retain_recovered(recovered, &mut blocks, &mut retained_bytes, &mut frontier)?;
-            }
-            if let Some((segment, key, recovered)) = active {
-                if segments.peek().is_some() {
-                    return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-                }
-                retain_recovered(recovered, &mut blocks, &mut retained_bytes, &mut frontier)?;
-                recovered_active = Some((segment, key));
-            }
-        }
+        let reconstruction = reconstruct(
+            &storage,
+            &metadata,
+            &protection,
+            catalog.instance(),
+            recovery::RecoveryMode::Repair,
+        )?;
+        let blocks = reconstruction.blocks;
+        let retained_bytes = reconstruction.retained_bytes;
+        let frontier = reconstruction.frontier;
+        let recovered_active = reconstruction.recovered_active;
 
         let recovered_capacity = if blocks.is_empty() {
             None
@@ -265,6 +236,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             catalog,
             scope,
             storage,
+            protection,
             key,
             state: Mutex::new(LedgerState {
                 _capacity: reservation,
@@ -284,6 +256,22 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 snapshot_lease_attempt::LeaseAttemptRegistry::new(),
             )),
         })
+    }
+
+    /// Opens a read-only observation handle without acquiring another writer
+    /// lease. The reader shares the immutable protection capability only.
+    pub fn reader(&self) -> Result<CommittedLedgerReader<'kernel, 'catalog>, LedgerFailure> {
+        CommittedLedgerReader::open(
+            self.authority,
+            self.catalog,
+            self.scope,
+            self.protection.clone(),
+        )
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> SegmentScope {
+        self.scope
     }
 
     /// Builds an immutable snapshot for an already-admitted task. The caller's
