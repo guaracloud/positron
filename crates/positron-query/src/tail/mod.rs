@@ -1,3 +1,4 @@
+mod admission;
 mod buffer;
 mod cursor;
 mod materialize;
