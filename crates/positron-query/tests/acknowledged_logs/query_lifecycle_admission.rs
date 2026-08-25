@@ -1,6 +1,8 @@
 use std::error::Error;
 
-use positron_kernel::{LedgerFailureCode, with_catalog_publication_hook_after};
+use positron_kernel::{
+    LedgerFailureCode, publish_snapshot_lease_marker_for_test, with_catalog_publication_hook_after,
+};
 use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal};
 
 use super::support::{
@@ -122,6 +124,64 @@ fn resume_prunes_an_unrelated_expired_lease_before_marker_admission() -> Result<
                 if failure.code() == QueryFailureCode::AuthorizationChanged
         )
     }));
+    Ok(())
+}
+
+#[test]
+fn resume_rebases_over_unrelated_lease_marker_churn() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("resume-unrelated-lease-churn")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let initial = fixture.service(1)?;
+    let planned = initial.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let cursor = initial
+        .execute_page(planned)?
+        .collect::<Vec<_>>()
+        .into_iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial query omitted its continuation cursor")?;
+    let unrelated = fixture.kernel.ledger()?.create_snapshot_lease(100, 200)?;
+    fixture.kernel.ledger()?.resume_snapshot_lease_with_marker(
+        unrelated.identity(),
+        101,
+        1,
+        [8; 32],
+    )?;
+    let service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(101),
+    );
+
+    let events = with_catalog_publication_hook_after(
+        0,
+        move |catalog| {
+            publish_snapshot_lease_marker_for_test(catalog, unrelated.identity(), 0xd9)
+                .expect("unrelated lease marker publication");
+        },
+        || service.resume(fixture.context, &cursor),
+    )
+    .expect("benign unrelated lease churn must be rebased")
+    .collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Batch(_)))
+            .count(),
+        1
+    );
     Ok(())
 }
 

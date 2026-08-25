@@ -10,6 +10,8 @@ use crate::{PlannedQuery, QueryCursor, QueryFailure, QueryFailureCode, QueryServ
 
 use super::resources::ExecutionResources;
 
+const MAX_RESUME_CATALOG_RETRIES: u8 = 1;
+
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub fn execute(
         &self,
@@ -105,7 +107,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         context: AuthorizedContext,
         cursor: &QueryCursor,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let (tenant, catalog_identity, catalog_generation) = self.current_query_catalog(context)?;
+        let (tenant, mut catalog_identity, mut catalog_generation) =
+            self.current_query_catalog(context)?;
         let mut state = cursor::decode_for_admission(&self.ledger.control_tokens(), cursor)?;
         validate_authorization(
             state.principal,
@@ -133,22 +136,45 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         // Establish the bounded durable attempt marker before reconstructing
         // source/plans, so failures after admission still have a lease-owned
         // usage record to charge and clean up.
-        let lease = match self.ledger.resume_snapshot_lease_with_marker_at_catalog(
-            lease_id,
-            now_seconds,
-            state.sequence,
-            state.prior_digest,
-            catalog_identity,
-            catalog_generation,
-        ) {
-            Ok(lease) => lease,
-            Err(failure) => {
-                drop(reservation);
-                if failure.code() == LedgerFailureCode::StaleGeneration {
-                    return Err(QueryFailure::new(QueryFailureCode::AuthorizationChanged));
+        let lease = {
+            let mut retries = 0;
+            loop {
+                match self.ledger.resume_snapshot_lease_with_marker_at_catalog(
+                    lease_id,
+                    now_seconds,
+                    state.sequence,
+                    state.prior_digest,
+                    catalog_identity,
+                    catalog_generation,
+                ) {
+                    Ok(lease) => break lease,
+                    Err(failure)
+                        if failure.code() == LedgerFailureCode::StaleGeneration
+                            && retries < MAX_RESUME_CATALOG_RETRIES =>
+                    {
+                        let refreshed = match self.current_query_catalog(context) {
+                            Ok(refreshed) => refreshed,
+                            Err(failure) if failure.code() == QueryFailureCode::Unauthorized => {
+                                drop(reservation);
+                                return Err(QueryFailure::new(
+                                    QueryFailureCode::AuthorizationChanged,
+                                ));
+                            },
+                            Err(failure) => {
+                                drop(reservation);
+                                return Err(failure);
+                            },
+                        };
+                        catalog_identity = refreshed.1;
+                        catalog_generation = refreshed.2;
+                        retries += 1;
+                    },
+                    Err(failure) => {
+                        drop(reservation);
+                        return Err(map_ledger_failure(failure));
+                    },
                 }
-                return Err(map_ledger_failure(failure));
-            },
+            }
         };
         merge_durable_usage(&mut state, lease.usage());
         let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());

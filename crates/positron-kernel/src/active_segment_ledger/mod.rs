@@ -21,6 +21,8 @@ mod snapshot_lease_recovery;
 mod snapshot_lease_usage;
 mod state;
 mod storage;
+#[cfg(feature = "test-support")]
+mod test_support;
 mod types;
 
 #[cfg(test)]
@@ -49,6 +51,8 @@ pub use snapshot_lease_record::{
 };
 use state::{LedgerState, retain_recovered};
 use storage::LedgerStorage;
+#[cfg(feature = "test-support")]
+pub use test_support::publish_snapshot_lease_marker_for_test;
 pub use types::*;
 
 const MAX_STORE_BLOCK_BYTES: usize = 1_048_576;
