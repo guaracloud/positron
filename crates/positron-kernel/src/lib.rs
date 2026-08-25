@@ -95,7 +95,8 @@ pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
     LedgerFailure, LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS,
     PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseUsage, StoreBlockIdentity,
+    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseUsage,
+    StoreBlockIdentity,
 };
 
 pub use data_protection::{

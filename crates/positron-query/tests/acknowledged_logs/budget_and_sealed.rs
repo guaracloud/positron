@@ -11,8 +11,8 @@ use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_kernel::{ResourceDimension, WorkClass};
 
 use super::support::{
-    CancellingStageWorkMeter, KernelFixture, StageCountingWorkMeter, StepClock, TemporaryRoots,
-    TestClock, TestWorkMeter,
+    BlockingOperatorWorkMeter, CancellingStageWorkMeter, KernelFixture, StageCountingWorkMeter,
+    StepClock, TemporaryRoots, TestClock, TestWorkMeter,
 };
 
 #[path = "budget_and_sealed/runtime_boundaries.rs"]
@@ -639,6 +639,64 @@ fn repeated_resumes_retain_durable_wall_usage_at_the_exact_boundary() -> Result<
                 && incomplete.stats().wall_seconds() == 6
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::WallSeconds)
+    ));
+    Ok(())
+}
+
+#[test]
+fn concurrent_resumes_admit_one_attempt_at_the_budget_boundary() -> Result<(), Box<dyn Error>> {
+    let fixture = super::terminal_and_bounds::QueryFixture::new("concurrent-resume-attempt")?;
+    fixture.kernel.append_log("one", 20, 1)?;
+    fixture.kernel.append_log("two", 21, 2)?;
+    let initial = super::support::zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+    );
+    let budget =
+        QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(3)?;
+    let first = initial
+        .execute_page(initial.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | aggregate count by body | limit 2",
+            budget,
+        )?)?
+        .collect::<Vec<_>>();
+    let cursor = continued_cursor(&first)?.clone();
+
+    let meter = BlockingOperatorWorkMeter::shared(1);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let first_events = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let worker = scope.spawn(|| {
+            service
+                .resume(fixture.context, &cursor)
+                .map(|stream| stream.collect::<Vec<_>>())
+        });
+        meter.wait_until_blocked()?;
+        let second = service
+            .resume(fixture.context, &cursor)
+            .expect_err("a live attempt must block a second resume before scan/output");
+        assert_eq!(second.code(), QueryFailureCode::StoreUnavailable);
+        meter.release()?;
+        worker
+            .join()
+            .map_err(|_| "concurrent resume worker panicked")?
+            .map_err(Into::into)
+    })?;
+    assert!(matches!(
+        first_events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.stats().cpu_work_units() == 4
+                && incomplete.stats().records() <= 1
+                && incomplete.stats().limiting_budget()
+                    == Some(QueryBudgetDimension::CpuWorkUnits)
     ));
     Ok(())
 }

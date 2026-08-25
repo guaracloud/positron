@@ -147,13 +147,23 @@ impl SnapshotLeaseUsage {
 /// ambiguous batch delivery. This state is deliberately bounded to one
 /// marker per active lease and is not a second query scheduler or cursor
 /// authority.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub(super) struct LeaseResumeMarker {
     pub(super) sequence: u64,
     pub(super) prior_digest: [u8; 32],
     pub(super) attempts: u64,
     pub(super) repeats: u64,
     pub(super) usage: SnapshotLeaseUsage,
+}
+
+pub(super) fn resume_marker_for(record: &LeaseRecord) -> LeaseResumeMarker {
+    LeaseResumeMarker {
+        sequence: record.last_resume_sequence.unwrap_or_default(),
+        prior_digest: record.last_resume_prior_digest,
+        attempts: record.resume_count,
+        repeats: record.repeated_batch_count,
+        usage: record.usage,
+    }
 }
 
 #[derive(Clone)]

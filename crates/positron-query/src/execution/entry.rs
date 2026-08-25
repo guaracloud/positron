@@ -128,16 +128,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let lease_id = SnapshotLeaseId::new(state.lease_identity)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        let durable_usage = self
-            .ledger
-            .snapshot_lease_usage(lease_id, now_seconds)
-            .map_err(map_ledger_failure)?;
-        merge_durable_usage(&mut state, durable_usage);
         let reservation = self.reserve_query(tenant, state.budget)?;
         // Establish the bounded durable attempt marker before reconstructing
         // source/plans, so failures after admission still have a lease-owned
         // usage record to charge and clean up.
-        let lease = {
+        let mut lease = {
             let mut retries = 0;
             loop {
                 match self.ledger.resume_snapshot_lease_with_marker_at_catalog(
@@ -175,7 +170,17 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .checked_add(resume_elapsed)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
         }
-        let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());
+        let attempt = match lease.take_attempt() {
+            Some(attempt) => attempt,
+            None => {
+                self.ledger
+                    .release_snapshot_lease(lease.identity())
+                    .map_err(map_ledger_failure)?;
+                return Err(QueryFailure::new(QueryFailureCode::Internal));
+            },
+        };
+        let resources =
+            ExecutionResources::with_attempt(reservation, lease.identity(), lease.usage(), attempt);
         let planning_memory =
             crate::planning_memory::PlanningMemory::new(state.budget.memory_bytes());
         let source_length = match cursor::source_length(cursor) {

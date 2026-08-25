@@ -708,9 +708,11 @@ fn marked_snapshot_lease_persists_ambiguous_resume_counts_across_restart()
         let first = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
         assert_eq!(first.resume_count(), 1);
         assert_eq!(first.repeated_batch_count(), 0);
+        drop(first);
         let second = ledger.resume_snapshot_lease_with_marker(identity, 102, 1, [9; 32])?;
         assert_eq!(second.resume_count(), 2);
         assert_eq!(second.repeated_batch_count(), 1);
+        drop(second);
         drop(ledger);
 
         let reopened = ActiveSegmentLedger::open_with_clock(
@@ -723,6 +725,45 @@ fn marked_snapshot_lease_persists_ambiguous_resume_counts_across_restart()
         let third = reopened.resume_snapshot_lease_with_marker(identity, 103, 1, [9; 32])?;
         assert_eq!(third.resume_count(), 3);
         assert_eq!(third.repeated_batch_count(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_snapshot_lease_rejects_a_second_live_attempt() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let first = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+
+        let second = ledger
+            .resume_snapshot_lease_with_marker(identity, 102, 1, [9; 32])
+            .expect_err("a lease cannot admit a second live attempt");
+        assert_eq!(second.code(), LedgerFailureCode::ConcurrentWriter);
+        drop(first);
+        Ok(())
+    })
+}
+
+#[test]
+fn durable_marker_sequence_cannot_be_rewound_by_a_stale_cache() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let first = ledger.resume_snapshot_lease_with_marker(identity, 101, 5, [9; 32])?;
+        drop(first);
+        publish_lease_rewrite(catalog, 0xaa, |bytes| {
+            bytes[127..135].copy_from_slice(&7_u64.to_be_bytes());
+        })?;
+
+        let failure = ledger
+            .resume_snapshot_lease_with_marker(identity, 102, 6, [9; 32])
+            .expect_err("durable marker order must outrank an older cache");
+        assert_eq!(failure.code(), LedgerFailureCode::StaleResumeMarker);
         Ok(())
     })
 }
@@ -855,13 +896,9 @@ fn stale_resume_markers_are_invalid_cursor_failures() -> Result<(), Box<dyn Erro
             .ok_or("resume marker")?
             .usage = SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0);
         drop(state);
-        assert_eq!(
-            ledger
-                .resume_snapshot_lease_with_marker(identity, 104, 2, [9; 32])
-                .expect_err("inconsistent durable and cached usage must fail closed")
-                .code(),
-            LedgerFailureCode::IntegrityCorruption
-        );
+        let reconciled = ledger.resume_snapshot_lease_with_marker(identity, 104, 2, [9; 32])?;
+        assert_eq!(reconciled.resume_count(), 2);
+        assert_eq!(reconciled.repeated_batch_count(), 1);
         Ok(())
     })
 }
@@ -1002,6 +1039,34 @@ fn snapshot_lease_usage_is_monotonic_and_survives_reopen() -> Result<(), Box<dyn
             &lease_clock(102),
         )?;
         assert_eq!(reopened.snapshot_lease_usage(identity, 102)?, usage);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_usage_retry_acknowledges_an_already_durable_delta() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        let mut marked = ledger.resume_snapshot_lease_with_marker(identity, 101, 1, [9; 32])?;
+        let attempt = marked
+            .take_attempt()
+            .ok_or("marked resume did not retain its attempt guard")?;
+        let previous = marked.usage();
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+        let expected = previous.merge(delta)?;
+
+        let applied = with_catalog_fault(CatalogFileEvent::SynchronizeGenerationDirectory, || {
+            ledger.record_snapshot_lease_usage_for_attempt(&attempt, previous, delta)
+        })?;
+        assert_eq!(applied, expected);
+        assert_eq!(
+            ledger.record_snapshot_lease_usage_for_attempt(&attempt, previous, delta)?,
+            expected
+        );
+        assert_eq!(ledger.snapshot_lease_usage(identity, 101)?, expected);
         Ok(())
     })
 }

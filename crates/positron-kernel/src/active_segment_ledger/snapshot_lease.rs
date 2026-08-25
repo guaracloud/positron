@@ -1,10 +1,11 @@
 use super::LedgerFailureCode::ResourceAdmissionRefused;
 use super::capacity::lease_claim;
+use super::snapshot_lease_attempt::SnapshotLeaseAttempt;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_grant::SnapshotLeaseGrant;
 use super::snapshot_lease_record::{
-    LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, valid_lease_interval,
-    validate_active_lease,
+    LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
+    valid_lease_interval, validate_active_lease,
 };
 use crate::{WorkClaim, WorkKind};
 use std::collections::BTreeSet;
@@ -130,6 +131,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             repeated_batch_count: 0,
             usage: SnapshotLeaseUsage::default(),
             snapshot,
+            attempt: None,
         })
     }
 
@@ -194,6 +196,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         self.retry_pending_releases(&mut state)?;
         reject_time_regression(&state, now)?;
+        let mut active_attempt = marker
+            .map(|_| SnapshotLeaseAttempt::acquire(&self.lease_attempts, identity, 0))
+            .transpose()?;
         self.catalog
             .refresh_state()
             .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
@@ -232,106 +237,107 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             self.normalize_legacy_lease(&mut state, &mut record, now)?;
         }
         let snapshot = snapshot_from_record(self, &state, &record)?;
-        let (resume_count, repeated_batch_count) = if let Some((sequence, prior_digest)) = marker {
-            let previous = state
-                .lease_resume_markers
-                .get(&identity)
-                .copied()
-                .unwrap_or(super::snapshot_lease_record::LeaseResumeMarker {
-                    sequence: record.last_resume_sequence.unwrap_or_default(),
-                    prior_digest: record.last_resume_prior_digest,
-                    attempts: record.resume_count,
-                    repeats: record.repeated_batch_count,
-                    usage: record.usage,
-                });
-            if previous.usage != record.usage {
-                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-            }
-            if previous.attempts > 0
-                && (sequence < previous.sequence
-                    || (sequence == previous.sequence && prior_digest != previous.prior_digest))
-            {
-                return Err(LedgerFailure::new(LedgerFailureCode::StaleResumeMarker));
-            }
-            let repeated = previous.attempts > 0
-                && previous.sequence == sequence
-                && previous.prior_digest == prior_digest;
-            let resume_count = previous
-                .attempts
-                .checked_add(1)
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            let repeated_batch_count = previous
-                .repeats
-                .checked_add(u64::from(repeated))
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            let mut updated = record.clone();
-            updated.resume_count = resume_count;
-            updated.repeated_batch_count = repeated_batch_count;
-            updated.last_resume_sequence = Some(sequence);
-            updated.last_resume_prior_digest = prior_digest;
-            let encoded = encode(&updated)?;
-            let amounts = lease_claim(encoded.len())?;
-            #[cfg(any(test, fuzzing, feature = "test-support"))]
-            crate::catalog::before_lease_marker_basis(self.catalog)
-                .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
-            if expired.is_empty() {
-                marker_basis = self
-                    .catalog
-                    .pin()
-                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-                if expected_catalog.is_some_and(|(expected_identity, expected_generation)| {
-                    marker_basis.identity() != expected_identity
-                        || marker_basis.number() != expected_generation
-                }) {
-                    return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        let (resume_count, repeated_batch_count, attempt) =
+            if let Some((sequence, prior_digest)) = marker {
+                let durable_marker = resume_marker_for(&record);
+                let previous = match state.lease_resume_markers.get(&identity).copied() {
+                    Some(cached) if cached == durable_marker => cached,
+                    _ => {
+                        state.lease_resume_markers.insert(identity, durable_marker);
+                        durable_marker
+                    },
+                };
+                if previous.attempts > 0
+                    && (sequence < previous.sequence
+                        || (sequence == previous.sequence && prior_digest != previous.prior_digest))
+                {
+                    return Err(LedgerFailure::new(LedgerFailureCode::StaleResumeMarker));
                 }
-            }
-            let previous_amounts = {
-                let reservation = state
-                    .lease_reservations
-                    .get_mut(&identity)
-                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
-                let previous = reservation.granted();
-                if previous != amounts {
-                    reservation
-                        .try_resize(amounts)
-                        .map_err(|_| LedgerFailure::new(ResourceAdmissionRefused))?;
+                let repeated = previous.attempts > 0
+                    && previous.sequence == sequence
+                    && previous.prior_digest == prior_digest;
+                let resume_count = previous
+                    .attempts
+                    .checked_add(1)
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+                let repeated_batch_count = previous
+                    .repeats
+                    .checked_add(u64::from(repeated))
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+                let mut attempt = active_attempt
+                    .take()
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+                attempt.set_resume_count(resume_count);
+                let mut updated = record.clone();
+                updated.resume_count = resume_count;
+                updated.repeated_batch_count = repeated_batch_count;
+                updated.last_resume_sequence = Some(sequence);
+                updated.last_resume_prior_digest = prior_digest;
+                let encoded = encode(&updated)?;
+                let amounts = lease_claim(encoded.len())?;
+                #[cfg(any(test, fuzzing, feature = "test-support"))]
+                crate::catalog::before_lease_marker_basis(self.catalog)
+                    .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
+                if expired.is_empty() {
+                    marker_basis = self
+                        .catalog
+                        .pin()
+                        .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+                    if expected_catalog.is_some_and(|(expected_identity, expected_generation)| {
+                        marker_basis.identity() != expected_identity
+                            || marker_basis.number() != expected_generation
+                    }) {
+                        return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+                    }
                 }
-                previous
-            };
-            let expected_identity = if expired.is_empty() {
-                expected_catalog.map_or(marker_basis.identity(), |(expected_identity, _)| {
-                    expected_identity
-                })
+                let previous_amounts = {
+                    let reservation =
+                        state.lease_reservations.get_mut(&identity).ok_or_else(|| {
+                            LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
+                        })?;
+                    let previous = reservation.granted();
+                    if previous != amounts {
+                        reservation
+                            .try_resize(amounts)
+                            .map_err(|_| LedgerFailure::new(ResourceAdmissionRefused))?;
+                    }
+                    previous
+                };
+                let expected_identity = if expired.is_empty() {
+                    expected_catalog.map_or(marker_basis.identity(), |(expected_identity, _)| {
+                        expected_identity
+                    })
+                } else {
+                    marker_basis.identity()
+                };
+                if let Err(failure) = publish_many_with_expected_catalog(
+                    self.catalog,
+                    &marker_basis,
+                    expected_identity,
+                    &BTreeSet::from([identity]),
+                    vec![encoded],
+                ) {
+                    if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
+                        state.lease_resume_markers.remove(&identity);
+                    } else {
+                        rollback_marker_resize(&mut state, identity, previous_amounts)?;
+                    }
+                    return Err(failure);
+                }
+                state.lease_resume_markers.insert(
+                    identity,
+                    super::snapshot_lease_record::LeaseResumeMarker {
+                        sequence,
+                        prior_digest,
+                        attempts: resume_count,
+                        repeats: repeated_batch_count,
+                        usage: updated.usage,
+                    },
+                );
+                (resume_count, repeated_batch_count, Some(attempt))
             } else {
-                marker_basis.identity()
+                (record.resume_count, record.repeated_batch_count, None)
             };
-            if let Err(failure) = publish_many_with_expected_catalog(
-                self.catalog,
-                &marker_basis,
-                expected_identity,
-                &BTreeSet::from([identity]),
-                vec![encoded],
-            ) {
-                if failure.completion_state() != super::LedgerCompletionState::CommitAmbiguous {
-                    rollback_marker_resize(&mut state, identity, previous_amounts)?;
-                }
-                return Err(failure);
-            }
-            state.lease_resume_markers.insert(
-                identity,
-                super::snapshot_lease_record::LeaseResumeMarker {
-                    sequence,
-                    prior_digest,
-                    attempts: resume_count,
-                    repeats: repeated_batch_count,
-                    usage: updated.usage,
-                },
-            );
-            (resume_count, repeated_batch_count)
-        } else {
-            (record.resume_count, record.repeated_batch_count)
-        };
         Ok(SnapshotLeaseGrant {
             identity,
             expiry: record.expiry,
@@ -339,6 +345,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             repeated_batch_count,
             usage: record.usage,
             snapshot,
+            attempt,
         })
     }
 

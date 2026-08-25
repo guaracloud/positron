@@ -2,23 +2,19 @@ use std::collections::BTreeSet;
 
 use super::capacity::lease_claim;
 use super::snapshot_lease::{map_catalog_failure, publish_many, records, rollback_marker_resize};
+use super::snapshot_lease_attempt::SnapshotLeaseAttempt;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_record::{
-    LeaseRecord, LeaseResumeMarker, SnapshotLeaseId, SnapshotLeaseUsage, validate_active_lease,
+    LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for, validate_active_lease,
 };
 use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 
+const MAX_USAGE_PUBLICATION_RETRIES: u8 = 1;
+
 fn cache_marker(state: &mut super::state::LedgerState<'_>, record: &LeaseRecord) {
-    state.lease_resume_markers.insert(
-        record.identity,
-        LeaseResumeMarker {
-            sequence: record.last_resume_sequence.unwrap_or_default(),
-            prior_digest: record.last_resume_prior_digest,
-            attempts: record.resume_count,
-            repeats: record.repeated_batch_count,
-            usage: record.usage,
-        },
-    );
+    state
+        .lease_resume_markers
+        .insert(record.identity, resume_marker_for(record));
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
@@ -67,10 +63,54 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         identity: SnapshotLeaseId,
         delta: SnapshotLeaseUsage,
     ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
+        self.record_snapshot_lease_usage_inner(identity, None, delta, 0)
+    }
+
+    /// Adds physical work for one admitted marked-resume attempt.
+    ///
+    /// The attempt token makes a retry after an ambiguous publication
+    /// idempotent: an already durable expected usage value is acknowledged
+    /// without merging the delta a second time.
+    pub fn record_snapshot_lease_usage_for_attempt(
+        &self,
+        attempt: &SnapshotLeaseAttempt,
+        previous: SnapshotLeaseUsage,
+        delta: SnapshotLeaseUsage,
+    ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
+        if !attempt.belongs_to(&self.lease_attempts) {
+            return Err(LedgerFailure::new(LedgerFailureCode::ConcurrentWriter));
+        }
+        self.record_snapshot_lease_usage_inner(
+            attempt.identity(),
+            Some((attempt.resume_count(), previous)),
+            delta,
+            0,
+        )
+    }
+
+    fn record_snapshot_lease_usage_inner(
+        &self,
+        identity: SnapshotLeaseId,
+        attempt: Option<(u64, SnapshotLeaseUsage)>,
+        delta: SnapshotLeaseUsage,
+        retries: u8,
+    ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        if attempt.is_none() {
+            let active = {
+                let registry = self
+                    .lease_attempts
+                    .try_lock()
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+                registry.contains(identity)
+            };
+            if active {
+                return Err(LedgerFailure::new(LedgerFailureCode::ConcurrentWriter));
+            }
+        }
         self.retry_pending_releases(&mut state)?;
         self.catalog
             .refresh_state()
@@ -88,7 +128,22 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if !state.lease_reservations.contains_key(&identity) {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
-        let usage = record.usage.merge(delta)?;
+        let usage = if let Some((resume_count, previous)) = attempt {
+            if record.resume_count != resume_count {
+                return Err(LedgerFailure::new(LedgerFailureCode::ConcurrentWriter));
+            }
+            let expected = previous.merge(delta)?;
+            if record.usage == expected {
+                cache_marker(&mut state, &record);
+                return Ok(expected);
+            }
+            if record.usage != previous {
+                return Err(LedgerFailure::new(LedgerFailureCode::ConcurrentWriter));
+            }
+            expected
+        } else {
+            record.usage.merge(delta)?
+        };
         if usage == record.usage {
             return Ok(usage);
         }
@@ -118,7 +173,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             vec![encoded],
         ) {
             if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
-                return self.reconcile_ambiguous_usage(
+                let reconciled = self.reconcile_ambiguous_usage(
                     &mut state,
                     identity,
                     &record,
@@ -126,6 +181,31 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     &expected_encoded,
                     previous_amounts,
                 );
+                if reconciled.is_err()
+                    && retries < MAX_USAGE_PUBLICATION_RETRIES
+                    && self
+                        .catalog
+                        .refresh_state()
+                        .ok()
+                        .and_then(|()| self.catalog.pin().ok())
+                        .and_then(|basis| records(&basis).ok())
+                        .is_some_and(|records| {
+                            records.into_iter().any(|candidate| {
+                                candidate.identity == identity
+                                    && candidate.scope == self.scope
+                                    && candidate.usage == record.usage
+                            })
+                        })
+                {
+                    drop(state);
+                    return self.record_snapshot_lease_usage_inner(
+                        identity,
+                        attempt,
+                        delta,
+                        retries + 1,
+                    );
+                }
+                return reconciled;
             }
             rollback_marker_resize(&mut state, identity, previous_amounts)?;
             return Err(failure);

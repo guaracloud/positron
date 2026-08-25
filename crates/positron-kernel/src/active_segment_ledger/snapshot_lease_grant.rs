@@ -1,4 +1,5 @@
 use super::LedgerSnapshot;
+use super::SnapshotLeaseAttempt;
 use super::snapshot_lease_record::{SnapshotLeaseId, SnapshotLeaseUsage};
 
 pub struct SnapshotLeaseGrant<'kernel> {
@@ -8,6 +9,7 @@ pub struct SnapshotLeaseGrant<'kernel> {
     pub(super) repeated_batch_count: u64,
     pub(super) usage: SnapshotLeaseUsage,
     pub(super) snapshot: LedgerSnapshot<'kernel>,
+    pub(super) attempt: Option<SnapshotLeaseAttempt>,
 }
 
 impl std::fmt::Debug for SnapshotLeaseGrant<'_> {
@@ -50,6 +52,10 @@ impl<'kernel> SnapshotLeaseGrant<'kernel> {
     #[must_use]
     pub const fn snapshot(&self) -> &LedgerSnapshot<'kernel> {
         &self.snapshot
+    }
+
+    pub fn take_attempt(&mut self) -> Option<SnapshotLeaseAttempt> {
+        self.attempt.take()
     }
 
     #[must_use]

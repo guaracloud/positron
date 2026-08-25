@@ -1,6 +1,6 @@
 use positron_kernel::{
-    ActiveSegmentLedger, ResourceReservation, SnapshotLeaseId, SnapshotLeaseUsage,
-    TransferredResourceReservation,
+    ActiveSegmentLedger, ResourceReservation, SnapshotLeaseAttempt, SnapshotLeaseId,
+    SnapshotLeaseUsage, TransferredResourceReservation,
 };
 
 use crate::QueryFailure;
@@ -12,6 +12,7 @@ pub(crate) struct ExecutionResources {
     admission: TransferredResourceReservation,
     lease: SnapshotLeaseId,
     usage_before: SnapshotLeaseUsage,
+    attempt: Option<SnapshotLeaseAttempt>,
 }
 
 impl ExecutionResources {
@@ -24,6 +25,21 @@ impl ExecutionResources {
             admission: reservation.transfer(),
             lease,
             usage_before,
+            attempt: None,
+        }
+    }
+
+    pub(super) fn with_attempt(
+        reservation: ResourceReservation<'_>,
+        lease: SnapshotLeaseId,
+        usage_before: SnapshotLeaseUsage,
+        attempt: SnapshotLeaseAttempt,
+    ) -> Self {
+        Self {
+            admission: reservation.transfer(),
+            lease,
+            usage_before,
+            attempt: Some(attempt),
         }
     }
 
@@ -42,9 +58,13 @@ impl ExecutionResources {
             checked_delta(state.physical_output_bytes, previous.output_bytes())?,
             state.physical_memory_peak_bytes,
         );
-        self.usage_before = ledger
-            .record_snapshot_lease_usage(self.lease, delta)
-            .map_err(map_ledger_failure)?;
+        self.usage_before = match self.attempt.as_ref() {
+            Some(attempt) => {
+                ledger.record_snapshot_lease_usage_for_attempt(attempt, previous, delta)
+            },
+            None => ledger.record_snapshot_lease_usage(self.lease, delta),
+        }
+        .map_err(map_ledger_failure)?;
         Ok(())
     }
 

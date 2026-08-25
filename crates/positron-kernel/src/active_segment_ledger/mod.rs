@@ -13,6 +13,7 @@ mod receipt;
 mod recovery;
 mod scope_discovery;
 mod snapshot_lease;
+mod snapshot_lease_attempt;
 mod snapshot_lease_codec;
 mod snapshot_lease_grant;
 mod snapshot_lease_pending;
@@ -29,7 +30,7 @@ mod types;
 mod tests;
 
 use std::fmt::Formatter;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use positron_domain::routing::CommitPosition;
 
@@ -45,6 +46,7 @@ use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
+pub use snapshot_lease_attempt::SnapshotLeaseAttempt;
 pub use snapshot_lease_grant::SnapshotLeaseGrant;
 pub use snapshot_lease_record::{
     MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId, SnapshotLeaseUsage,
@@ -82,6 +84,7 @@ pub struct ActiveSegmentLedger<'kernel, 'catalog> {
     storage: LedgerStorage,
     key: ObjectDataKey,
     state: Mutex<LedgerState<'kernel>>,
+    lease_attempts: Arc<Mutex<snapshot_lease_attempt::LeaseAttemptRegistry>>,
 }
 
 impl std::fmt::Debug for ActiveSegmentLedger<'_, '_> {
@@ -285,6 +288,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 pending_lease_releases: snapshot_lease_pending::PendingLeaseReleases::new(),
                 last_snapshot_lease_time: recovered_leases.last_observed,
             }),
+            lease_attempts: Arc::new(Mutex::new(
+                snapshot_lease_attempt::LeaseAttemptRegistry::new(),
+            )),
         })
     }
 
