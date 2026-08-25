@@ -104,6 +104,30 @@ fn snapshot_lease_public_time_and_signal_boundaries_are_typed_and_restartable()
 }
 
 #[test]
+fn fresh_lease_rejects_expiry_before_the_recovered_clock_floor() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let held = ledger.create_snapshot_lease(100, 200)?.identity();
+        drop(ledger);
+
+        let reopened = ActiveSegmentLedger::open_with_clock(
+            authority,
+            catalog,
+            scope,
+            key(),
+            &lease_clock(101),
+        )?;
+        let failure = reopened
+            .create_snapshot_lease(100, 101)
+            .expect_err("the durable clock floor must preserve a positive lease interval");
+        assert_eq!(failure.code(), LedgerFailureCode::InvalidInput);
+        reopened.release_snapshot_lease(held)?;
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_ttl_ceiling_is_exact_and_rejection_precedes_all_mutation()
 -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
@@ -859,6 +883,33 @@ fn marked_resume_reports_expiry_cleanup_publication_failure() -> Result<(), Box<
         })
         .expect_err("expiry cleanup must remain ambiguous when its publication sync fails");
         assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        let resumed = ledger.resume_snapshot_lease_with_marker(active, 102, 1, [9; 32])?;
+        assert_eq!(resumed.resume_count(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn marked_resume_releases_expiry_cleanup_after_a_definitive_publication_failure()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let _expired = ledger.create_snapshot_lease(100, 101)?;
+        let active = ledger.create_snapshot_lease(100, 200)?.identity();
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+            ledger.resume_snapshot_lease_with_marker(active, 101, 1, [9; 32])
+        })
+        .expect_err("definitive expiry cleanup failures must be returned before mutation");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            failure.completion_state(),
+            LedgerCompletionState::RejectedBeforeMutation
+        );
         let resumed = ledger.resume_snapshot_lease_with_marker(active, 102, 1, [9; 32])?;
         assert_eq!(resumed.resume_count(), 1);
         Ok(())

@@ -2,7 +2,9 @@ use super::capacity::lease_claim;
 use super::snapshot_lease_attempt::SnapshotLeaseAttempt;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_grant::SnapshotLeaseGrant;
-use super::snapshot_lease_pending::{register_all, remove_all};
+use super::snapshot_lease_pending::{
+    cleanup_expired_on_resume_failure, register_all, register_lease_reservation, remove_all,
+};
 use super::snapshot_lease_record::{
     LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
     valid_lease_interval, validate_active_lease,
@@ -122,18 +124,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        register_all(&mut state.pending_lease_releases, expired.iter().copied())?;
-        state.pending_lease_releases.register(identity)?;
-        if state
-            .lease_reservations
-            .insert(identity, retained)
-            .is_some()
-        {
-            state.lease_reservations.remove(&identity);
-            state.pending_lease_releases.remove(identity);
-            remove_all(&mut state.pending_lease_releases, expired.iter().copied());
-            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-        }
+        let state = &mut *state;
+        let (reservations, pending) = (
+            &mut state.lease_reservations,
+            &mut state.pending_lease_releases,
+        );
+        register_lease_reservation(reservations, pending, identity, retained, &expired)?;
         let publication = (|| {
             publish(self.catalog, &basis, &expired, Some(encoded))?;
             #[cfg(any(test, fuzzing, feature = "test-support"))]
@@ -150,7 +146,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
             return Err(failure);
         }
-        remove_reservations(&mut state, &expired);
+        remove_reservations(state, &expired);
         state.pending_lease_releases.remove(identity);
         state.last_snapshot_lease_time = now;
         Ok(SnapshotLeaseGrant {
@@ -250,10 +246,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             ) {
                 Ok(snapshot) => snapshot,
                 Err(failure) => {
-                    if failure.completion_state() != LedgerCompletionState::CommitAmbiguous {
-                        remove_all(&mut state.pending_lease_releases, expired.iter().copied());
-                    }
-                    return Err(failure);
+                    return Err(cleanup_expired_on_resume_failure(
+                        &mut state.pending_lease_releases,
+                        &expired,
+                        failure,
+                    ));
                 },
             };
             remove_reservations(&mut state, &expired);
