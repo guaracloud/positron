@@ -51,7 +51,7 @@ pub use stream::{
 pub use stream_lifecycle::QueryStream;
 pub use tail::{
     TailCursor, TailCursorState, TailEvent, TailPosition, TailSession, TailSourceSet, TailStart,
-    TailTerminal,
+    TailStats, TailTerminal,
 };
 
 #[cfg(fuzzing)]

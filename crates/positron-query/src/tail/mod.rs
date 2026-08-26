@@ -5,10 +5,12 @@ mod lease;
 mod materialize;
 mod session;
 mod source;
+mod terminal;
 
 pub use cursor::{TailCursor, TailCursorState, TailPosition};
-pub use session::{TailEvent, TailSession, TailStart, TailTerminal};
+pub use session::{TailEvent, TailSession, TailStart};
 pub use source::TailSourceSet;
+pub use terminal::{TailStats, TailTerminal};
 
 use crate::{QueryFailure, QueryFailureCode};
 

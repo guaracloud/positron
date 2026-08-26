@@ -79,6 +79,29 @@ pub(crate) fn preserve_output_attempt(state: &mut CursorState, output_state: &Cu
         .max(output_state.physical_elapsed_wall_seconds);
 }
 
+pub(crate) fn output_bytes_for_records(
+    service: &crate::QueryService<'_, '_, '_>,
+    records: &[QueryRecord],
+    cpu_work_units: &mut u64,
+    cpu_work_limit: u64,
+    cancellation: &crate::QueryCancellation,
+) -> Result<u64, QueryFailure> {
+    let mut output_bytes = 0_u64;
+    for record in records {
+        let mut observer = super::QueryValueObserver::new(
+            service,
+            cpu_work_units,
+            cpu_work_limit,
+            cancellation.clone(),
+            crate::QueryWorkStage::Output,
+        );
+        output_bytes = output_bytes
+            .checked_add(record_emitted_size_bytes(record, &mut observer)?)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+    }
+    Ok(output_bytes)
+}
+
 fn record_emitted_size_bytes(
     record: &QueryRecord,
     observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,

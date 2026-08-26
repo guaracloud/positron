@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use crate::stream::QueryBatch;
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
@@ -7,22 +5,12 @@ use super::buffer::TailBuffer;
 use super::cursor::{TailCursor, TailCursorState, TailPosition};
 use super::lease::TailLeaseOwner;
 use super::source::TailSourceSet;
+use super::terminal::{TailStats, TailTerminal, TerminalKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TailStart {
     Now,
     Historical { max_rows: usize },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TailTerminal {
-    ConsumerLagged(Option<TailCursor>),
-    BudgetExhausted(Option<TailCursor>),
-    Expired(Option<TailCursor>),
-    AuthorizationChanged(Option<TailCursor>),
-    Cancelled(Option<TailCursor>),
-    Disconnected(Option<TailCursor>),
-    StoreUnavailable(Option<TailCursor>),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -32,6 +20,13 @@ pub enum TailEvent {
     Batch(QueryBatch),
     Idle,
     Terminal(TailTerminal),
+}
+
+pub(super) struct PendingBatch {
+    pub(super) positions: Vec<TailPosition>,
+    pub(super) digest: [u8; 32],
+    pub(super) rows: u64,
+    pub(super) bytes: u64,
 }
 
 pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
@@ -44,7 +39,7 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) cursor: TailCursor,
     pub(super) header: Option<crate::stream::QueryHeader>,
     pub(super) buffer: TailBuffer,
-    pub(super) pending_batches: VecDeque<(Vec<TailPosition>, [u8; 32])>,
+    pub(super) pending_batch: Option<PendingBatch>,
     pub(super) historical_frontiers: Vec<TailPosition>,
     pub(super) terminal: Option<TailTerminal>,
     pub(super) terminal_emitted: bool,
@@ -57,6 +52,10 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) output_rows: u64,
     pub(super) output_bytes: u64,
     pub(super) cpu_work_units: u64,
+    pub(super) memory_peak_bytes: u64,
+    pub(super) elapsed_seconds: u64,
+    pub(super) resume_count: u64,
+    pub(super) repeated_batch_count: u64,
 }
 
 impl TailSession<'_, '_, '_, '_> {
@@ -65,19 +64,35 @@ impl TailSession<'_, '_, '_, '_> {
     }
 
     pub fn acknowledge(&mut self, sequence: u64, digest: [u8; 32]) -> Result<(), QueryFailure> {
-        let Some((positions, expected_digest)) = self.pending_batches.front().cloned() else {
+        let Some(pending) = self.pending_batch.as_ref() else {
             return (self.last_acknowledged == Some((sequence, digest)))
                 .then_some(())
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor));
         };
-        if sequence != self.next_sequence || digest != expected_digest {
+        if sequence != self.next_sequence || digest != pending.digest {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        if self.buffer.front_cloned().is_none() {
+            return Err(super::internal());
+        }
+        let positions = pending.positions.clone();
+        let rows = pending.rows;
+        let bytes = pending.bytes;
+        self.output_rows = self.output_rows.checked_add(rows).ok_or_else(|| {
+            QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows)
+        })?;
+        self.output_bytes = self.output_bytes.checked_add(bytes).ok_or_else(|| {
+            QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputBytes)
+        })?;
+        if let Err(failure) = self.advance(positions, digest) {
+            self.output_rows = self.output_rows.saturating_sub(rows);
+            self.output_bytes = self.output_bytes.saturating_sub(bytes);
+            return Err(failure);
         }
         if self.buffer.pop().is_none() {
             return Err(super::internal());
         }
-        self.pending_batches.pop_front();
-        self.advance(positions, digest)?;
+        self.pending_batch = None;
         self.last_acknowledged = Some((sequence, digest));
         Ok(())
     }
@@ -94,6 +109,7 @@ impl TailSession<'_, '_, '_, '_> {
                 self.terminal = Some(super::admission::terminal_for_failure(
                     failure.code(),
                     Some(self.cursor.clone()),
+                    self.terminal_stats(),
                 ));
             }
             return self.take_terminal();
@@ -102,12 +118,13 @@ impl TailSession<'_, '_, '_, '_> {
             return self.take_terminal();
         }
         if let Some(batch) = self.buffer.front_cloned() {
-            let (digest, sequence) = match self.pending_batches.front() {
-                Some((_, digest)) => (*digest, self.next_sequence),
+            let (digest, sequence) = match self.pending_batch.as_ref() {
+                Some(pending) => (pending.digest, self.next_sequence),
                 None => {
-                    self.terminal_after_progress_failure(TailTerminal::StoreUnavailable(Some(
-                        self.cursor.clone(),
-                    )));
+                    self.terminal_after_progress_failure(TailTerminal::StoreUnavailable {
+                        cursor: Some(self.cursor.clone()),
+                        stats: self.terminal_stats(),
+                    });
                     return self.take_terminal();
                 },
             };
@@ -129,6 +146,7 @@ impl TailSession<'_, '_, '_, '_> {
                 let terminal = super::admission::terminal_for_failure(
                     failure.code(),
                     Some(self.cursor.clone()),
+                    self.terminal_stats(),
                 );
                 self.terminal_after_progress_failure(terminal);
                 self.take_terminal()
@@ -137,16 +155,16 @@ impl TailSession<'_, '_, '_, '_> {
     }
     pub fn cancel(&mut self) {
         self.query.cancellation.cancel();
-        self.finish(TailTerminal::Cancelled);
+        self.finish(TerminalKind::Cancelled);
     }
     pub fn disconnect(&mut self) {
-        self.finish(TailTerminal::Disconnected);
+        self.finish(TerminalKind::Disconnected);
     }
-    fn finish(&mut self, kind: fn(Option<TailCursor>) -> TailTerminal) {
+    fn finish(&mut self, kind: TerminalKind) {
         if self.terminal.is_none() {
             self.buffer.clear();
-            self.pending_batches.clear();
-            self.terminal = Some(kind(Some(self.cursor.clone())));
+            self.pending_batch = None;
+            self.terminal = Some(kind.build(Some(self.cursor.clone()), self.terminal_stats()));
             self.replace_terminal_after_progress_failure();
         }
     }
@@ -156,6 +174,7 @@ impl TailSession<'_, '_, '_, '_> {
             self.terminal = Some(super::admission::terminal_for_failure(
                 failure.code(),
                 Some(self.cursor.clone()),
+                self.terminal_stats(),
             ));
         }
     }
@@ -165,11 +184,15 @@ impl TailSession<'_, '_, '_, '_> {
         self.replace_terminal_after_progress_failure();
     }
     fn take_terminal(&mut self) -> Option<TailEvent> {
+        let stats = self.terminal_stats();
         if let Some(terminal) = self.terminal.as_mut()
             && let Err(failure) = self.lease_owner.release()
         {
-            *terminal =
-                super::admission::terminal_for_failure(failure.code(), Some(self.cursor.clone()));
+            *terminal = super::admission::terminal_for_failure(
+                failure.code(),
+                Some(self.cursor.clone()),
+                stats,
+            );
         }
         take_terminal_value(&mut self.terminal, &mut self.terminal_emitted)
     }
@@ -212,14 +235,36 @@ impl TailSession<'_, '_, '_, '_> {
             self.cpu_work_units,
         );
     }
+
+    pub(super) fn terminal_stats(&self) -> TailStats {
+        TailStats {
+            scanned_bytes: self.scanned_bytes,
+            decoded_records: self.decoded_records,
+            emitted_records: self.output_rows,
+            emitted_bytes: self.output_bytes,
+            memory_peak_bytes: self.memory_peak_bytes,
+            cpu_work_units: self.cpu_work_units,
+            elapsed_seconds: self.elapsed_seconds,
+            last_sequence: self.next_sequence.checked_sub(1),
+            result_digest: self.prior_digest,
+            cumulative_budget: self.query.budget,
+            resume_count: self.resume_count,
+            repeated_batch_count: self.repeated_batch_count,
+            reduced_pruning: false,
+        }
+    }
+
     fn revalidate(&mut self) -> Result<(), QueryFailure> {
         if self.query.cancellation.is_cancelled() {
-            self.finish(TailTerminal::Cancelled);
+            self.finish(TerminalKind::Cancelled);
             return Ok(());
         }
         let now = self.service.now()?;
+        self.elapsed_seconds = self
+            .elapsed_seconds
+            .max(now.saturating_sub(self.query.started_at));
         if now >= self.state.expiry() {
-            self.finish(TailTerminal::Expired);
+            self.finish(TerminalKind::Expired);
             return Ok(());
         }
         self.service
@@ -227,9 +272,9 @@ impl TailSession<'_, '_, '_, '_> {
             .map(|_| ())
             .inspect_err(|failure| {
                 self.finish(if failure.code() == QueryFailureCode::Unauthorized {
-                    TailTerminal::AuthorizationChanged
+                    TerminalKind::AuthorizationChanged
                 } else {
-                    TailTerminal::StoreUnavailable
+                    TerminalKind::StoreUnavailable
                 });
             })
     }
@@ -247,40 +292,81 @@ fn take_terminal_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{TailEvent, TailTerminal, take_terminal_value};
-    use crate::QueryFailureCode;
+    use super::{TailEvent, TailStats, TailTerminal, take_terminal_value};
+    use crate::{QueryBudget, QueryFailureCode};
+
+    fn stats() -> TailStats {
+        TailStats {
+            scanned_bytes: 0,
+            decoded_records: 0,
+            emitted_records: 0,
+            emitted_bytes: 0,
+            memory_peak_bytes: 0,
+            cpu_work_units: 0,
+            elapsed_seconds: 0,
+            last_sequence: None,
+            result_digest: [0; 32],
+            cumulative_budget: QueryBudget::new(1, 1, 1, 1, 1, 1).expect("test budget"),
+            resume_count: 0,
+            repeated_batch_count: 0,
+            reduced_pruning: false,
+        }
+    }
 
     #[test]
     fn failure_terminals_and_terminal_emission_are_exhaustive() {
         assert!(matches!(
-            super::super::admission::terminal_for_failure(QueryFailureCode::BudgetExhausted, None),
-            TailTerminal::BudgetExhausted(None)
+            super::super::admission::terminal_for_failure(
+                QueryFailureCode::BudgetExhausted,
+                None,
+                stats()
+            ),
+            TailTerminal::BudgetExhausted { cursor: None, .. }
         ));
         assert!(matches!(
-            super::super::admission::terminal_for_failure(QueryFailureCode::Cancelled, None),
-            TailTerminal::Cancelled(None)
+            super::super::admission::terminal_for_failure(
+                QueryFailureCode::Cancelled,
+                None,
+                stats()
+            ),
+            TailTerminal::Cancelled { cursor: None, .. }
         ));
         assert!(matches!(
-            super::super::admission::terminal_for_failure(QueryFailureCode::SnapshotExpired, None),
-            TailTerminal::Expired(None)
+            super::super::admission::terminal_for_failure(
+                QueryFailureCode::SnapshotExpired,
+                None,
+                stats()
+            ),
+            TailTerminal::Expired { cursor: None, .. }
         ));
         assert!(matches!(
             super::super::admission::terminal_for_failure(
                 QueryFailureCode::AuthorizationChanged,
-                None
+                None,
+                stats()
             ),
-            TailTerminal::AuthorizationChanged(None)
+            TailTerminal::AuthorizationChanged { cursor: None, .. }
         ));
         assert!(matches!(
-            super::super::admission::terminal_for_failure(QueryFailureCode::Internal, None),
-            TailTerminal::StoreUnavailable(None)
+            super::super::admission::terminal_for_failure(
+                QueryFailureCode::Internal,
+                None,
+                stats()
+            ),
+            TailTerminal::StoreUnavailable { cursor: None, .. }
         ));
 
-        let mut terminal = Some(TailTerminal::Cancelled(None));
+        let mut terminal = Some(TailTerminal::Cancelled {
+            cursor: None,
+            stats: stats(),
+        });
         let mut emitted = false;
         assert!(matches!(
             take_terminal_value(&mut terminal, &mut emitted),
-            Some(TailEvent::Terminal(TailTerminal::Cancelled(None)))
+            Some(TailEvent::Terminal(TailTerminal::Cancelled {
+                cursor: None,
+                ..
+            }))
         ));
         assert!(emitted);
         assert!(take_terminal_value(&mut terminal, &mut emitted).is_none());

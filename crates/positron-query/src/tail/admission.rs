@@ -1,13 +1,12 @@
-use std::collections::VecDeque;
-
 use crate::stream::{QueryHeader, ResultLease, ResultSnapshot};
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
 use super::cursor::{TailCursor, TailCursorState, TailPosition, budget_digest};
 use super::lease::TailLeaseOwner;
-use super::session::{TailSession, TailStart, TailTerminal};
+use super::session::{TailSession, TailStart};
 use super::source::TailSourceSet;
+use super::terminal::{TailStats, TailTerminal};
 
 fn validate_resume_history(
     state: &TailCursorState,
@@ -43,13 +42,16 @@ fn validate_resume_history(
 pub(super) fn terminal_for_failure(
     code: QueryFailureCode,
     cursor: Option<TailCursor>,
+    stats: TailStats,
 ) -> TailTerminal {
     match code {
-        QueryFailureCode::BudgetExhausted => TailTerminal::BudgetExhausted(cursor),
-        QueryFailureCode::Cancelled => TailTerminal::Cancelled(cursor),
-        QueryFailureCode::SnapshotExpired => TailTerminal::Expired(cursor),
-        QueryFailureCode::AuthorizationChanged => TailTerminal::AuthorizationChanged(cursor),
-        _ => TailTerminal::StoreUnavailable(cursor),
+        QueryFailureCode::BudgetExhausted => TailTerminal::BudgetExhausted { cursor, stats },
+        QueryFailureCode::Cancelled => TailTerminal::Cancelled { cursor, stats },
+        QueryFailureCode::SnapshotExpired => TailTerminal::Expired { cursor, stats },
+        QueryFailureCode::AuthorizationChanged => {
+            TailTerminal::AuthorizationChanged { cursor, stats }
+        },
+        _ => TailTerminal::StoreUnavailable { cursor, stats },
     }
 }
 
@@ -176,6 +178,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         frontiers.sort_unstable_by_key(|(shard, _)| *shard);
         let digest = sources.digest(&self.ledger.control_tokens())?;
         let expected_budget = budget_digest(&self.ledger.control_tokens(), query.budget)?;
+        let resumed = resume.is_some();
         let (state, cursor, replay) = match resume {
             Some((state, cursor)) => {
                 if state.positions().len() != sources.readers().len()
@@ -230,7 +233,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let maximum_records = usize::try_from(query.budget.output_rows())
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidBudget))?
             .min(super::MAX_TAIL_BATCH_ROWS);
-        let buffer = TailBuffer::new(maximum_records, query.budget.output_bytes())?;
+        let buffer = TailBuffer::new(
+            maximum_records,
+            query.budget.output_bytes(),
+            query.budget.memory_bytes(),
+        )?;
         let header = QueryHeader::new(
             &query.plan,
             query.budget,
@@ -259,6 +266,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state.output_bytes(),
             state.cpu_work_units(),
         );
+        let elapsed_seconds = query.last_observed_at.saturating_sub(query.started_at);
         let mut session = TailSession {
             service: self,
             query,
@@ -269,7 +277,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             cursor,
             header: Some(header),
             buffer,
-            pending_batches: VecDeque::new(),
+            pending_batch: None,
             historical_frontiers: if matches!(start, TailStart::Historical { .. }) {
                 frontiers
                     .iter()
@@ -289,6 +297,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             output_rows,
             output_bytes,
             cpu_work_units,
+            memory_peak_bytes: 0,
+            elapsed_seconds,
+            resume_count: u64::from(resumed),
+            repeated_batch_count: u64::from(replay),
         };
         if matches!(start, TailStart::Historical { .. }) {
             session.fill_sources(max_rows)?;

@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
+use super::session::PendingBatch;
 use super::{TailPosition, TailSession, TailTerminal};
 use crate::execution::{ScanAfter, execute_scan};
 use crate::execution_support::{QueryScanObserver, query_record};
@@ -148,6 +149,33 @@ impl TailSession<'_, '_, '_, '_> {
             }
             return Ok(());
         }
+        let rows = u64::try_from(records.len())
+            .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
+        let bytes = crate::execution_support::output_bytes_for_records(
+            self.service,
+            &records,
+            &mut self.cpu_work_units,
+            self.query.budget.cpu_work_units(),
+            &self.query.cancellation,
+        )?;
+        let next_rows = self
+            .output_rows
+            .checked_add(rows)
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
+        if next_rows > self.query.budget.output_rows() {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::OutputRows,
+            ));
+        }
+        let next_bytes = self
+            .output_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
+        if next_bytes > self.query.budget.output_bytes() {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::OutputBytes,
+            ));
+        }
         let mut digest_memory = QueryMemory::new(self.query.budget.memory_bytes());
         let mut digest_observer = crate::execution_support::QueryValueObserver::new(
             self.service,
@@ -169,12 +197,19 @@ impl TailSession<'_, '_, '_, '_> {
             &mut digest_memory,
         )?;
         if self.buffer.push(records).is_err() {
-            self.terminal_after_progress_failure(TailTerminal::ConsumerLagged(Some(
-                self.cursor.clone(),
-            )));
+            self.terminal_after_progress_failure(TailTerminal::ConsumerLagged {
+                cursor: Some(self.cursor.clone()),
+                stats: self.terminal_stats(),
+            });
             return Ok(());
         }
-        self.pending_batches.push_back((positions, digest));
+        self.memory_peak_bytes = self.memory_peak_bytes.max(self.buffer.memory_peak());
+        self.pending_batch = Some(PendingBatch {
+            positions,
+            digest,
+            rows,
+            bytes,
+        });
         Ok(())
     }
 
@@ -287,19 +322,7 @@ impl TailSession<'_, '_, '_, '_> {
         if records.is_empty() {
             return Ok((Vec::new(), last_scanned, scan_complete));
         }
-        state.physical_output_rows = self.output_rows;
-        state.physical_output_bytes = self.output_bytes;
-        let output_result = crate::execution_support::charge_output(
-            self.service,
-            &mut state,
-            &records,
-            &self.query.cancellation,
-            false,
-        );
         self.cpu_work_units = state.physical_cpu_work_units;
-        self.output_rows = state.physical_output_rows;
-        self.output_bytes = state.physical_output_bytes;
-        output_result?;
         let candidates = records
             .into_iter()
             .zip(record_positions)

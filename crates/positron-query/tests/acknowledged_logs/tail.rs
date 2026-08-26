@@ -47,7 +47,7 @@ fn tail_reads_acknowledged_history_then_stays_idle_until_disconnect() -> Result<
     tail.disconnect();
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
     ));
     assert!(tail.poll().is_none());
     Ok(())
@@ -74,9 +74,41 @@ fn tail_revalidation_failure_emits_one_terminal() -> Result<(), Box<dyn Error>> 
     clock.arm();
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable(Some(_))))
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_terminal_stats_count_only_acknowledged_rows_and_digest() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-terminal-stats")?;
+    fixture.kernel.append_log("undelivered", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("tail batch missing".into());
+    };
+    tail.disconnect();
+    let Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. })) = tail.poll() else {
+        return Err("tail terminal missing".into());
+    };
+    assert_eq!(stats.emitted_records(), 0);
+    assert_eq!(stats.emitted_bytes(), 0);
+    assert_eq!(stats.result_digest(), [0; 32]);
+    assert!(stats.scanned_bytes() > 0);
+    assert!(stats.decoded_records() > 0);
+    assert_eq!(batch.records().len(), 1);
     Ok(())
 }
 
@@ -118,7 +150,7 @@ fn tail_poll_requires_an_explicit_acknowledgement_before_advancing_cursor()
     tail.disconnect();
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
     ));
     Ok(())
 }
@@ -143,7 +175,7 @@ fn tail_disconnect_before_ack_replays_the_same_batch_identity() -> Result<(), Bo
     tail.disconnect();
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
     ));
     drop(tail);
 
@@ -244,7 +276,10 @@ fn tail_release_failure_is_one_terminal_and_drop_retries_deferred_cleanup()
         });
     assert!(matches!(
         terminal,
-        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable(Some(_))))
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(tail.poll().is_none());
     drop(tail);
@@ -330,14 +365,20 @@ fn tail_terminal_and_drop_paths_reclaim_lease_capacity_repeatedly() -> Result<()
                 tail.cancel();
                 assert!(matches!(
                     tail.poll(),
-                    Some(TailEvent::Terminal(TailTerminal::Cancelled(Some(_))))
+                    Some(TailEvent::Terminal(TailTerminal::Cancelled {
+                        cursor: Some(_),
+                        ..
+                    }))
                 ));
             },
             1 => {
                 tail.disconnect();
                 assert!(matches!(
                     tail.poll(),
-                    Some(TailEvent::Terminal(TailTerminal::Disconnected(Some(_))))
+                    Some(TailEvent::Terminal(TailTerminal::Disconnected {
+                        cursor: Some(_),
+                        ..
+                    }))
                 ));
             },
             2 => {},
@@ -345,7 +386,10 @@ fn tail_terminal_and_drop_paths_reclaim_lease_capacity_repeatedly() -> Result<()
                 clock.set(160);
                 assert!(matches!(
                     tail.poll(),
-                    Some(TailEvent::Terminal(TailTerminal::Expired(Some(_))))
+                    Some(TailEvent::Terminal(TailTerminal::Expired {
+                        cursor: Some(_),
+                        ..
+                    }))
                 ));
             },
         }
@@ -413,7 +457,7 @@ fn tail_cursor_resumes_after_ledger_reopen_without_a_gap() -> Result<(), Box<dyn
     resumed.disconnect();
     assert!(matches!(
         resumed.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
     ));
     Ok(())
 }
@@ -666,7 +710,10 @@ fn tail_scan_cancellation_is_one_typed_terminal() -> Result<(), Box<dyn Error>> 
     let event = tail.poll();
     assert!(matches!(
         event,
-        Some(TailEvent::Terminal(TailTerminal::Cancelled(Some(_))))
+        Some(TailEvent::Terminal(TailTerminal::Cancelled {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(tail.poll().is_none());
     Ok(())
@@ -724,7 +771,10 @@ fn tail_revalidates_expiry_and_lifecycle_before_following() -> Result<(), Box<dy
     let event = tail.poll();
     assert!(matches!(
         event,
-        Some(TailEvent::Terminal(TailTerminal::Expired(Some(_))))
+        Some(TailEvent::Terminal(TailTerminal::Expired {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(tail.poll().is_none());
 
@@ -740,9 +790,10 @@ fn tail_revalidates_expiry_and_lifecycle_before_following() -> Result<(), Box<dy
     fixture.kernel.publish_lifecycle_for_test(3, 0xd4)?;
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::AuthorizationChanged(
-            Some(_)
-        )))
+        Some(TailEvent::Terminal(TailTerminal::AuthorizationChanged {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(tail.poll().is_none());
     Ok(())
@@ -855,7 +906,10 @@ fn tail_follow_maps_a_later_store_failure_to_one_terminal() -> Result<(), Box<dy
     fixture.kernel.append_malformed_log_block(1)?;
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable(Some(_))))
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(tail.poll().is_none());
     Ok(())
@@ -894,7 +948,9 @@ fn tail_follow_maps_cumulative_budget_exhaustion_to_one_terminal() -> Result<(),
     let mut budget_terminal = false;
     for _ in 0..4 {
         match tail.poll() {
-            Some(TailEvent::Terminal(TailTerminal::BudgetExhausted(Some(_)))) => {
+            Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+                cursor: Some(_), ..
+            })) => {
                 budget_terminal = true;
                 break;
             },
@@ -923,7 +979,10 @@ fn tail_external_cancellation_is_revalidated_before_following() -> Result<(), Bo
     cancellation.cancel();
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Cancelled(Some(_))))
+        Some(TailEvent::Terminal(TailTerminal::Cancelled {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(tail.poll().is_none());
     Ok(())
@@ -1290,7 +1349,10 @@ fn tail_resume_preserves_batch_chain_and_cumulative_output_budget() -> Result<()
     resumed.acknowledge(second.sequence(), second.digest())?;
     assert!(matches!(
         resumed.poll(),
-        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted(Some(_))))
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(_),
+            ..
+        }))
     ));
     assert!(resumed.poll().is_none());
     Ok(())
@@ -1504,7 +1566,7 @@ fn tail_overflow_is_a_single_lag_terminal_and_never_complete() -> Result<(), Box
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::ConsumerLagged(_)))
+        Some(TailEvent::Terminal(TailTerminal::ConsumerLagged { .. }))
     ));
     assert!(tail.poll().is_none());
     Ok(())
@@ -1525,7 +1587,7 @@ fn tail_cancel_is_one_typed_terminal_and_not_complete() -> Result<(), Box<dyn Er
     tail.cancel();
     assert!(matches!(
         tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Cancelled(_)))
+        Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
     ));
     assert!(tail.poll().is_none());
     Ok(())
@@ -1548,7 +1610,7 @@ fn tail_cancel_and_disconnect_drop_buffered_rows_before_the_terminal() -> Result
     cancelled.cancel();
     assert!(matches!(
         cancelled.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Cancelled(_)))
+        Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
     ));
     assert!(cancelled.poll().is_none());
 
@@ -1562,7 +1624,7 @@ fn tail_cancel_and_disconnect_drop_buffered_rows_before_the_terminal() -> Result
     disconnected.disconnect();
     assert!(matches!(
         disconnected.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Disconnected(_)))
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
     ));
     assert!(disconnected.poll().is_none());
     Ok(())
