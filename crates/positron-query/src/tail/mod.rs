@@ -1,6 +1,7 @@
 mod admission;
 mod buffer;
 mod cursor;
+mod history;
 mod lease;
 mod materialize;
 mod merge;
@@ -8,6 +9,8 @@ mod session;
 mod source;
 mod terminal;
 
+#[cfg(feature = "test-support")]
+pub use cursor::fail_next_encode;
 pub use cursor::{TailCursor, TailCursorState, TailPosition};
 pub use session::{TailEvent, TailSession, TailStart};
 pub use source::TailSourceSet;

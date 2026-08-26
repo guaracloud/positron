@@ -1,16 +1,27 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{CommitPosition, RecordOrdinal, VirtualShardId};
 use positron_kernel::{ControlTokenAuthentication, ControlTokenProtector};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{TailCursorState, TailPosition, invalid, resource};
+use super::{HistoricalMarker, TailCursorState, TailPosition, invalid, resource};
 use crate::{QueryFailure, QueryFailureCode};
 
 const MAGIC: [u8; 8] = *b"POSTCUR3";
 const PURPOSE: &[u8] = b"tail-cursor-v3";
 const VERSION: u16 = 2;
-const MAX_BYTES: usize = 2_048;
+const MAX_BYTES: usize = 4_096;
 const AUTH_BYTES: usize = 32;
+const EXT_MAGIC: [u8; 4] = *b"TX01";
 const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 16 + 32 + 2;
+
+#[cfg(any(test, feature = "test-support"))]
+static FAIL_NEXT_ENCODE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_next_encode() {
+    FAIL_NEXT_ENCODE.store(true, Ordering::Release);
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct TailCursor(Vec<u8>);
@@ -20,8 +31,14 @@ impl TailCursor {
         protector: &ControlTokenProtector<'_>,
         state: &TailCursorState,
     ) -> Result<Self, QueryFailure> {
+        #[cfg(any(test, feature = "test-support"))]
+        if FAIL_NEXT_ENCODE.swap(false, Ordering::AcqRel) {
+            return Err(invalid());
+        }
+        let extension = extension_bytes(state)?;
         let payload = PREFIX_BYTES
             .checked_add(state.positions.len().checked_mul(16).ok_or_else(resource)?)
+            .and_then(|value| value.checked_add(extension))
             .ok_or_else(resource)?;
         let total = payload.checked_add(AUTH_BYTES).ok_or_else(resource)?;
         if total > MAX_BYTES {
@@ -56,6 +73,23 @@ impl TailCursor {
             bytes.extend_from_slice(&position.position.value().to_be_bytes());
             bytes.extend_from_slice(&position.ordinal.value().to_be_bytes());
             bytes.extend_from_slice(&[u8::from(state.record_bound), 0]);
+        }
+        if extension > 0 {
+            bytes.extend_from_slice(&EXT_MAGIC);
+            let markers = state.historical_markers().unwrap_or(&[]);
+            bytes.extend_from_slice(
+                &u16::try_from(markers.len())
+                    .map_err(|_| invalid())?
+                    .to_be_bytes(),
+            );
+            for marker in markers {
+                bytes.extend_from_slice(&marker.lower_bound().value().to_be_bytes());
+                bytes.extend_from_slice(&marker.handoff_frontier().value().to_be_bytes());
+            }
+            bytes.extend_from_slice(&state.memory_peak_bytes().to_be_bytes());
+            bytes.extend_from_slice(&state.elapsed_seconds().to_be_bytes());
+            bytes.push(u8::from(state.reduced_pruning()));
+            bytes.push(limiting_budget_code(state.limiting_budget()));
         }
         let auth = protector
             .authenticate_query_cursor(PURPOSE, &bytes)
@@ -110,10 +144,10 @@ impl TailCursor {
         if count == 0 || count > super::MAX_SHARDS {
             return Err(invalid());
         }
-        let expected = PREFIX_BYTES
+        let positions_end = PREFIX_BYTES
             .checked_add(count.checked_mul(16).ok_or_else(invalid)?)
             .ok_or_else(invalid)?;
-        if payload.len() != expected {
+        if payload.len() < positions_end {
             return Err(invalid());
         }
         let mut positions = Vec::new();
@@ -156,6 +190,56 @@ impl TailCursor {
         );
         state.budget_digest = budget_digest;
         state.set_resume_stats(resume_count, repeated_batch_count);
+        if payload.len() != positions_end {
+            let extension_start = positions_end;
+            if payload.get(extension_start..extension_start + EXT_MAGIC.len())
+                != Some(EXT_MAGIC.as_slice())
+            {
+                return Err(invalid());
+            }
+            let marker_count = usize::from(u16_at(payload, extension_start + 4)?);
+            if marker_count != 0 && marker_count != count {
+                return Err(invalid());
+            }
+            let markers_end = extension_start
+                .checked_add(4)
+                .and_then(|value| value.checked_add(2))
+                .and_then(|value| value.checked_add(marker_count.checked_mul(16)?))
+                .ok_or_else(invalid)?;
+            let stats_end = markers_end.checked_add(18).ok_or_else(invalid)?;
+            if payload.len() != stats_end {
+                return Err(invalid());
+            }
+            if marker_count > 0 {
+                let mut markers = Vec::new();
+                markers
+                    .try_reserve_exact(marker_count)
+                    .map_err(|_| resource())?;
+                for index in 0..marker_count {
+                    let offset = extension_start
+                        .checked_add(6)
+                        .and_then(|value| value.checked_add(index.checked_mul(16)?))
+                        .ok_or_else(invalid)?;
+                    let lower_bound = commit_position(u64_at(payload, offset)?)?;
+                    let handoff_frontier = commit_position(u64_at(payload, offset + 8)?)?;
+                    markers.push(HistoricalMarker::new(lower_bound, handoff_frontier)?);
+                }
+                state.set_historical_markers(markers)?;
+            }
+            let memory_peak = u64_at(payload, markers_end)?;
+            let elapsed = u64_at(payload, markers_end + 8)?;
+            let reduced = match payload.get(markers_end + 16) {
+                Some(0) => false,
+                Some(1) => true,
+                _ => return Err(invalid()),
+            };
+            state.set_runtime_stats(
+                memory_peak,
+                elapsed,
+                reduced,
+                limiting_budget_from_code(*payload.get(markers_end + 17).ok_or_else(invalid)?)?,
+            );
+        }
         Ok(state)
     }
 
@@ -204,6 +288,63 @@ fn u32_at(bytes: &[u8], start: usize) -> Result<u32, QueryFailure> {
 
 fn u64_at(bytes: &[u8], start: usize) -> Result<u64, QueryFailure> {
     Ok(u64::from_be_bytes(array_at(bytes, start)?))
+}
+
+fn commit_position(value: u64) -> Result<CommitPosition, QueryFailure> {
+    match std::num::NonZeroU64::new(value) {
+        Some(value) => CommitPosition::origin()
+            .advance_by(value)
+            .map_err(|_| invalid()),
+        None => Ok(CommitPosition::origin()),
+    }
+}
+
+fn extension_bytes(state: &TailCursorState) -> Result<usize, QueryFailure> {
+    let has_extension = state.historical_markers().is_some()
+        || state.memory_peak_bytes() != 0
+        || state.elapsed_seconds() != 0
+        || state.reduced_pruning()
+        || state.limiting_budget().is_some();
+    if !has_extension {
+        return Ok(0);
+    }
+    let markers = state.historical_markers().map_or(0, <[_]>::len);
+    4_usize
+        .checked_add(2)
+        .and_then(|value| value.checked_add(markers.checked_mul(16)?))
+        .and_then(|value| value.checked_add(18))
+        .ok_or_else(resource)
+}
+
+fn limiting_budget_code(dimension: Option<crate::QueryBudgetDimension>) -> u8 {
+    match dimension {
+        None => 0,
+        Some(crate::QueryBudgetDimension::ScannedBytes) => 1,
+        Some(crate::QueryBudgetDimension::DecodedRecords) => 2,
+        Some(crate::QueryBudgetDimension::OutputRows) => 3,
+        Some(crate::QueryBudgetDimension::OutputBytes) => 4,
+        Some(crate::QueryBudgetDimension::MemoryBytes) => 5,
+        Some(crate::QueryBudgetDimension::CpuWorkUnits) => 6,
+        Some(crate::QueryBudgetDimension::WallSeconds) => 7,
+        Some(crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds) => 8,
+    }
+}
+
+fn limiting_budget_from_code(
+    code: u8,
+) -> Result<Option<crate::QueryBudgetDimension>, QueryFailure> {
+    Ok(match code {
+        0 => None,
+        1 => Some(crate::QueryBudgetDimension::ScannedBytes),
+        2 => Some(crate::QueryBudgetDimension::DecodedRecords),
+        3 => Some(crate::QueryBudgetDimension::OutputRows),
+        4 => Some(crate::QueryBudgetDimension::OutputBytes),
+        5 => Some(crate::QueryBudgetDimension::MemoryBytes),
+        6 => Some(crate::QueryBudgetDimension::CpuWorkUnits),
+        7 => Some(crate::QueryBudgetDimension::WallSeconds),
+        8 => Some(crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds),
+        _ => return Err(invalid()),
+    })
 }
 
 pub(crate) fn budget_digest(

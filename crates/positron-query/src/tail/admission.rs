@@ -2,7 +2,7 @@ use crate::stream::{QueryHeader, ResultLease, ResultSnapshot};
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
-use super::cursor::{TailCursor, TailCursorState, TailPosition, budget_digest};
+use super::cursor::{HistoricalMarker, TailCursor, TailCursorState, TailPosition, budget_digest};
 use super::lease::TailLeaseOwner;
 use super::session::{TailSession, TailStart};
 use super::source::TailSourceSet;
@@ -26,7 +26,26 @@ fn validate_resume_history(
         if position.position() > snapshot.frontier() {
             return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
         }
-        if state.record_bound()
+        if let Some(markers) = state.historical_markers() {
+            let marker = markers
+                .get(
+                    state
+                        .positions()
+                        .iter()
+                        .position(|candidate| candidate.shard() == snapshot.scope().shard_id())
+                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?,
+                )
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+            if marker.handoff_frontier() > snapshot.frontier()
+                || (marker.handoff_frontier() > marker.lower_bound()
+                    && !snapshot.blocks().iter().any(|block| {
+                        block.position() >= marker.lower_bound()
+                            && block.position() <= marker.handoff_frontier()
+                    }))
+            {
+                return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
+            }
+        } else if state.record_bound()
             && position.position() != positron_domain::routing::CommitPosition::origin()
             && !snapshot
                 .blocks()
@@ -222,6 +241,19 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     [0; 32],
                 )?;
                 state.set_budget_digest(expected_budget);
+                if matches!(start, TailStart::Historical { .. }) {
+                    let mut markers = Vec::new();
+                    markers
+                        .try_reserve_exact(frontiers.len())
+                        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+                    for (_, frontier) in &frontiers {
+                        markers.push(HistoricalMarker::new(
+                            positron_domain::routing::CommitPosition::origin(),
+                            *frontier,
+                        )?);
+                    }
+                    state.set_historical_markers(markers)?;
+                }
                 let cursor = TailCursor::encode(&self.ledger.control_tokens(), &state)?;
                 (state, cursor, false)
             },
@@ -257,6 +289,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             output_rows,
             output_bytes,
             cpu_work_units,
+            memory_peak_bytes,
+            elapsed_seconds,
+            reduced_pruning,
+            limiting_budget,
         ) = (
             state.sequence(),
             state.prior_digest(),
@@ -265,8 +301,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state.output_rows(),
             state.output_bytes(),
             state.cpu_work_units(),
+            state.memory_peak_bytes(),
+            state.elapsed_seconds(),
+            state.reduced_pruning(),
+            state.limiting_budget(),
         );
-        let elapsed_seconds = query.last_observed_at.saturating_sub(query.started_at);
         let (resume_count, repeated_batch_count, cursor) = if resumed {
             let resume_count = state
                 .resume_count()
@@ -282,6 +321,19 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         } else {
             (state.resume_count(), state.repeated_batch_count(), cursor)
         };
+        let historical_frontiers = state
+            .historical_markers()
+            .map(|markers| {
+                frontiers
+                    .iter()
+                    .zip(markers.iter())
+                    .map(|((shard, _), marker)| {
+                        TailPosition::new(*shard, marker.handoff_frontier())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let elapsed_anchor = query.last_observed_at;
         let mut session = TailSession {
             service: self,
             query,
@@ -293,14 +345,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             header: Some(header),
             buffer,
             pending_batch: None,
-            historical_frontiers: if matches!(start, TailStart::Historical { .. }) {
-                frontiers
-                    .iter()
-                    .map(|(shard, frontier)| TailPosition::new(*shard, *frontier))
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            historical_frontiers,
             terminal: None,
             terminal_emitted: false,
             next_sequence,
@@ -312,8 +357,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             output_rows,
             output_bytes,
             cpu_work_units,
-            memory_peak_bytes: 0,
+            memory_peak_bytes,
             elapsed_seconds,
+            elapsed_anchor,
+            reduced_pruning,
+            limiting_budget,
             resume_count,
             repeated_batch_count,
         };

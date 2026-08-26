@@ -27,6 +27,7 @@ pub(super) struct PendingBatch {
     pub(super) digest: [u8; 32],
     pub(super) rows: u64,
     pub(super) bytes: u64,
+    pub(super) historical_complete: bool,
 }
 
 struct AdvancedBatch {
@@ -61,6 +62,9 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) cpu_work_units: u64,
     pub(super) memory_peak_bytes: u64,
     pub(super) elapsed_seconds: u64,
+    pub(super) elapsed_anchor: u64,
+    pub(super) reduced_pruning: bool,
+    pub(super) limiting_budget: Option<crate::QueryBudgetDimension>,
     pub(super) resume_count: u64,
     pub(super) repeated_batch_count: u64,
 }
@@ -85,19 +89,41 @@ impl TailSession<'_, '_, '_, '_> {
         let positions = pending.positions.clone();
         let rows = pending.rows;
         let bytes = pending.bytes;
+        let historical_complete = pending.historical_complete;
         let output_rows = self.output_rows.checked_add(rows).ok_or_else(|| {
             QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows)
         })?;
         let output_bytes = self.output_bytes.checked_add(bytes).ok_or_else(|| {
             QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputBytes)
         })?;
-        let advanced = self.candidate_advance(positions, digest, output_rows, output_bytes)?;
+        let advanced = match self.candidate_advance(
+            positions,
+            digest,
+            output_rows,
+            output_bytes,
+            historical_complete,
+        ) {
+            Ok(advanced) => advanced,
+            Err(failure) => {
+                self.limiting_budget = failure.limiting_budget();
+                let terminal = super::admission::terminal_for_failure(
+                    failure.code(),
+                    Some(self.cursor.clone()),
+                    self.terminal_stats(),
+                );
+                self.terminal = Some(terminal);
+                return Err(failure);
+            },
+        };
         self.state = advanced.state;
         self.cursor = advanced.cursor;
         self.prior_digest = advanced.prior_digest;
         self.next_sequence = advanced.next_sequence;
         self.output_rows = output_rows;
         self.output_bytes = output_bytes;
+        if historical_complete {
+            self.historical_frontiers.clear();
+        }
         if self.buffer.pop().is_none() {
             return Err(super::internal());
         }
@@ -114,6 +140,7 @@ impl TailSession<'_, '_, '_, '_> {
             return Some(TailEvent::Header(header));
         }
         if let Err(failure) = self.revalidate() {
+            self.limiting_budget = failure.limiting_budget();
             if self.terminal.is_none() {
                 self.terminal = Some(super::admission::terminal_for_failure(
                     failure.code(),
@@ -152,6 +179,7 @@ impl TailSession<'_, '_, '_, '_> {
             Ok(()) if !self.buffer.is_empty() => self.poll(),
             Ok(()) => Some(TailEvent::Idle),
             Err(failure) => {
+                self.limiting_budget = failure.limiting_budget();
                 let terminal = super::admission::terminal_for_failure(
                     failure.code(),
                     Some(self.cursor.clone()),
@@ -211,6 +239,7 @@ impl TailSession<'_, '_, '_, '_> {
         digest: [u8; 32],
         output_rows: u64,
         output_bytes: u64,
+        historical_complete: bool,
     ) -> Result<AdvancedBatch, QueryFailure> {
         let mut state = self.state.clone();
         state.set_progress(
@@ -220,7 +249,10 @@ impl TailSession<'_, '_, '_, '_> {
             output_bytes,
             self.cpu_work_units,
         );
-        let state = state.advance_batch(&positions, digest)?;
+        let mut state = state.advance_batch(&positions, digest)?;
+        if historical_complete {
+            state.clear_historical_markers();
+        }
         let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
         let next_sequence = self
             .next_sequence
@@ -237,9 +269,13 @@ impl TailSession<'_, '_, '_, '_> {
     pub(super) fn advance_positions(
         &mut self,
         positions: &[TailPosition],
+        clear_historical: bool,
     ) -> Result<(), QueryFailure> {
         self.sync_state_progress();
-        let state = self.state.advance_positions(positions)?;
+        let mut state = self.state.advance_positions(positions)?;
+        if clear_historical {
+            state.clear_historical_markers();
+        }
         let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
         self.state = state;
         self.cursor = cursor;
@@ -258,6 +294,12 @@ impl TailSession<'_, '_, '_, '_> {
             self.output_bytes,
             self.cpu_work_units,
         );
+        self.state.set_runtime_stats(
+            self.memory_peak_bytes,
+            self.elapsed_seconds,
+            self.reduced_pruning,
+            self.limiting_budget,
+        );
     }
 
     pub(super) fn terminal_stats(&self) -> TailStats {
@@ -274,7 +316,8 @@ impl TailSession<'_, '_, '_, '_> {
             cumulative_budget: self.query.budget,
             resume_count: self.resume_count,
             repeated_batch_count: self.repeated_batch_count,
-            reduced_pruning: false,
+            reduced_pruning: self.reduced_pruning,
+            limiting_budget: self.limiting_budget,
         }
     }
 
@@ -284,9 +327,11 @@ impl TailSession<'_, '_, '_, '_> {
             return Ok(());
         }
         let now = self.service.now()?;
-        self.elapsed_seconds = self
-            .elapsed_seconds
-            .max(now.saturating_sub(self.query.started_at));
+        let elapsed = now.saturating_sub(self.elapsed_anchor);
+        self.elapsed_seconds = self.elapsed_seconds.checked_add(elapsed).ok_or_else(|| {
+            QueryFailure::budget_exhausted(crate::QueryBudgetDimension::WallSeconds)
+        })?;
+        self.elapsed_anchor = now;
         if now >= self.state.expiry() {
             self.finish(TerminalKind::Expired);
             return Ok(());
@@ -315,92 +360,5 @@ fn take_terminal_value(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{TailEvent, TailStats, TailTerminal, TerminalKind, take_terminal_value};
-    use crate::{QueryBudget, QueryFailureCode};
-
-    fn stats() -> TailStats {
-        TailStats {
-            scanned_bytes: 0,
-            decoded_records: 0,
-            emitted_records: 0,
-            emitted_bytes: 0,
-            memory_peak_bytes: 0,
-            cpu_work_units: 0,
-            elapsed_seconds: 0,
-            last_sequence: None,
-            result_digest: [0; 32],
-            cumulative_budget: QueryBudget::new(1, 1, 1, 1, 1, 1).expect("test budget"),
-            resume_count: 0,
-            repeated_batch_count: 0,
-            reduced_pruning: false,
-        }
-    }
-
-    #[test]
-    fn failure_terminals_and_terminal_emission_are_exhaustive() {
-        assert!(matches!(
-            super::super::admission::terminal_for_failure(
-                QueryFailureCode::BudgetExhausted,
-                None,
-                stats()
-            ),
-            TailTerminal::BudgetExhausted { cursor: None, .. }
-        ));
-        assert!(matches!(
-            super::super::admission::terminal_for_failure(
-                QueryFailureCode::Cancelled,
-                None,
-                stats()
-            ),
-            TailTerminal::Cancelled { cursor: None, .. }
-        ));
-        assert!(matches!(
-            super::super::admission::terminal_for_failure(
-                QueryFailureCode::SnapshotExpired,
-                None,
-                stats()
-            ),
-            TailTerminal::Expired { cursor: None, .. }
-        ));
-        assert!(matches!(
-            super::super::admission::terminal_for_failure(
-                QueryFailureCode::AuthorizationChanged,
-                None,
-                stats()
-            ),
-            TailTerminal::AuthorizationChanged { cursor: None, .. }
-        ));
-        assert!(matches!(
-            super::super::admission::terminal_for_failure(
-                QueryFailureCode::Internal,
-                None,
-                stats()
-            ),
-            TailTerminal::StoreUnavailable { cursor: None, .. }
-        ));
-
-        let mut terminal = Some(TailTerminal::Cancelled {
-            cursor: None,
-            stats: stats(),
-        });
-        let mut emitted = false;
-        assert!(matches!(
-            take_terminal_value(&mut terminal, &mut emitted),
-            Some(TailEvent::Terminal(TailTerminal::Cancelled {
-                cursor: None,
-                ..
-            }))
-        ));
-        assert!(emitted);
-        assert!(take_terminal_value(&mut terminal, &mut emitted).is_none());
-    }
-
-    #[test]
-    fn terminal_kind_builds_the_store_failure_variant() {
-        assert!(matches!(
-            TerminalKind::StoreUnavailable.build(None, stats()),
-            TailTerminal::StoreUnavailable { cursor: None, .. }
-        ));
-    }
-}
+#[path = "session_tests.rs"]
+mod tests;

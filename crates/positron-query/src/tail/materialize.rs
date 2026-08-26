@@ -174,12 +174,13 @@ impl TailSession<'_, '_, '_, '_> {
                 crate::tail::merge::update_position(&mut positions, scanned)?;
             }
         }
-        if historical && records.len() < limit && all_sources_complete {
-            self.historical_frontiers.clear();
-        }
+        let historical_complete = historical && all_sources_complete;
         if records.is_empty() {
             if !positions.is_empty() {
-                self.advance_positions(&positions)?;
+                self.advance_positions(&positions, historical_complete)?;
+                if historical_complete {
+                    self.historical_frontiers.clear();
+                }
             }
             return Ok(());
         }
@@ -243,6 +244,7 @@ impl TailSession<'_, '_, '_, '_> {
             digest,
             rows,
             bytes,
+            historical_complete,
         });
         Ok(())
     }
@@ -299,6 +301,7 @@ impl TailSession<'_, '_, '_, '_> {
         self.decoded_records = state.physical_decoded_records;
         self.cpu_work_units = state.physical_cpu_work_units;
         let scan_complete = scan.complete();
+        self.reduced_pruning |= scan.reduced_pruning();
         let scanned_retained_bytes = scan.retained_size_bytes();
         let mut memory = QueryMemory::new(state.budget.memory_bytes());
         memory.acquire(scanned_retained_bytes)?;
@@ -314,6 +317,31 @@ impl TailSession<'_, '_, '_, '_> {
         let mut last_scanned = None;
         let shard = snapshot.scope().shard_id();
         for mut record in scan.into_records() {
+            if state.cancellation.is_cancelled() {
+                return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+            }
+            let operator_count = state.plan.operator_count();
+            if operator_count > 0 {
+                let units = self
+                    .service
+                    .work_units(crate::QueryWorkStage::Operators)?
+                    .checked_mul(operator_count)
+                    .ok_or_else(|| {
+                        QueryFailure::budget_exhausted(QueryBudgetDimension::CpuWorkUnits)
+                    })?;
+                state.physical_cpu_work_units = state
+                    .physical_cpu_work_units
+                    .checked_add(units)
+                    .ok_or_else(|| {
+                        QueryFailure::budget_exhausted(QueryBudgetDimension::CpuWorkUnits)
+                    })?;
+                if state.physical_cpu_work_units > state.budget.cpu_work_units() {
+                    self.cpu_work_units = state.physical_cpu_work_units;
+                    return Err(QueryFailure::budget_exhausted(
+                        QueryBudgetDimension::CpuWorkUnits,
+                    ));
+                }
+            }
             last_scanned = Some(TailPosition::with_ordinal(
                 shard,
                 record.commit_position(),
@@ -324,6 +352,7 @@ impl TailSession<'_, '_, '_, '_> {
                     Ok(record) => record,
                     Err(failure) => {
                         self.cpu_work_units = state.physical_cpu_work_units;
+                        self.memory_peak_bytes = self.memory_peak_bytes.max(memory.peak());
                         return Err(failure);
                     },
                 };
@@ -342,6 +371,7 @@ impl TailSession<'_, '_, '_, '_> {
                 break;
             }
         }
+        self.memory_peak_bytes = self.memory_peak_bytes.max(memory.peak());
         let released_scan_bytes = if self.query.plan.transform().is_some() {
             scanned_retained_bytes
         } else {

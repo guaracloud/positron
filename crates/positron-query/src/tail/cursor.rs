@@ -2,8 +2,11 @@ use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{CommitPosition, RecordOrdinal, VirtualShardId};
 #[path = "cursor_wire.rs"]
 mod wire;
+pub(super) use super::history::HistoricalMarker;
 pub use wire::TailCursor;
 pub(crate) use wire::budget_digest;
+#[cfg(feature = "test-support")]
+pub use wire::fail_next_encode;
 
 use crate::{QueryFailure, QueryFailureCode};
 
@@ -68,6 +71,11 @@ pub struct TailCursorState {
     resume_count: u64,
     repeated_batch_count: u64,
     budget_digest: [u8; 32],
+    pub(super) historical_markers: Option<Vec<HistoricalMarker>>,
+    memory_peak_bytes: u64,
+    elapsed_seconds: u64,
+    reduced_pruning: bool,
+    limiting_budget: Option<crate::QueryBudgetDimension>,
 }
 
 impl TailCursorState {
@@ -109,6 +117,11 @@ impl TailCursorState {
             resume_count: 0,
             repeated_batch_count: 0,
             budget_digest: [0; 32],
+            historical_markers: None,
+            memory_peak_bytes: 0,
+            elapsed_seconds: 0,
+            reduced_pruning: false,
+            limiting_budget: None,
         })
     }
     pub const fn principal(&self) -> PrincipalId {
@@ -164,6 +177,35 @@ impl TailCursorState {
     }
     pub const fn budget_digest(&self) -> [u8; 32] {
         self.budget_digest
+    }
+
+    pub(crate) const fn memory_peak_bytes(&self) -> u64 {
+        self.memory_peak_bytes
+    }
+
+    pub(crate) const fn elapsed_seconds(&self) -> u64 {
+        self.elapsed_seconds
+    }
+
+    pub(crate) const fn reduced_pruning(&self) -> bool {
+        self.reduced_pruning
+    }
+
+    pub(crate) const fn limiting_budget(&self) -> Option<crate::QueryBudgetDimension> {
+        self.limiting_budget
+    }
+
+    pub(crate) fn set_runtime_stats(
+        &mut self,
+        memory_peak_bytes: u64,
+        elapsed_seconds: u64,
+        reduced_pruning: bool,
+        limiting_budget: Option<crate::QueryBudgetDimension>,
+    ) {
+        self.memory_peak_bytes = memory_peak_bytes;
+        self.elapsed_seconds = elapsed_seconds;
+        self.reduced_pruning = reduced_pruning;
+        self.limiting_budget = limiting_budget;
     }
 
     pub(crate) fn set_budget_digest(&mut self, digest: [u8; 32]) {
@@ -266,6 +308,13 @@ impl TailCursorState {
         );
         state.budget_digest = self.budget_digest;
         state.set_resume_stats(self.resume_count, self.repeated_batch_count);
+        state.historical_markers = self.historical_markers.clone();
+        state.set_runtime_stats(
+            self.memory_peak_bytes,
+            self.elapsed_seconds,
+            self.reduced_pruning,
+            self.limiting_budget,
+        );
         Ok(state)
     }
 
@@ -310,6 +359,13 @@ impl TailCursorState {
         );
         state.budget_digest = self.budget_digest;
         state.set_resume_stats(self.resume_count, self.repeated_batch_count);
+        state.historical_markers = self.historical_markers.clone();
+        state.set_runtime_stats(
+            self.memory_peak_bytes,
+            self.elapsed_seconds,
+            self.reduced_pruning,
+            self.limiting_budget,
+        );
         Ok(state)
     }
 }

@@ -15,6 +15,7 @@ pub struct TailStats {
     pub(super) resume_count: u64,
     pub(super) repeated_batch_count: u64,
     pub(super) reduced_pruning: bool,
+    pub(super) limiting_budget: Option<crate::QueryBudgetDimension>,
 }
 
 impl TailStats {
@@ -81,6 +82,11 @@ impl TailStats {
     #[must_use]
     pub const fn reduced_pruning(self) -> bool {
         self.reduced_pruning
+    }
+
+    #[must_use]
+    pub const fn limiting_budget(self) -> Option<crate::QueryBudgetDimension> {
+        self.limiting_budget
     }
 }
 

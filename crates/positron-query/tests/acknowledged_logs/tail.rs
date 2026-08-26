@@ -134,11 +134,17 @@ fn tail_terminal_stats_accumulate_resume_and_repeat_counts() -> Result<(), Box<d
     assert!(matches!(first.poll(), Some(TailEvent::Batch(_))));
     let cursor = first.cursor().clone();
     first.disconnect();
-    assert!(matches!(
-        first.poll(),
-        Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. }))
-            if stats.resume_count() == 0 && stats.repeated_batch_count() == 0
-    ));
+    let first_memory_peak = match first.poll() {
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. })) => {
+            assert_eq!(stats.resume_count(), 0);
+            assert_eq!(stats.repeated_batch_count(), 0);
+            stats.memory_peak_bytes()
+        },
+        _ => return Err("initial tail terminal missing".into()),
+    };
+    assert!(first_memory_peak > 0);
+    assert!(first.poll().is_none());
+
     drop(first);
 
     let query = service.plan_pipeline(
@@ -153,7 +159,9 @@ fn tail_terminal_stats_accumulate_resume_and_repeat_counts() -> Result<(), Box<d
     assert!(matches!(
         resumed.poll(),
         Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. }))
-            if stats.resume_count() == 1 && stats.repeated_batch_count() == 1
+            if stats.resume_count() == 1
+                && stats.repeated_batch_count() == 1
+                && stats.memory_peak_bytes() >= first_memory_peak
     ));
     Ok(())
 }
@@ -198,6 +206,44 @@ fn tail_poll_requires_an_explicit_acknowledgement_before_advancing_cursor()
         tail.poll(),
         Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
     ));
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn tail_ack_cursor_encode_failure_keeps_safe_progress_and_terminalizes_once()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-ack-encode-failure")?;
+    fixture.kernel.append_log("one", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = tail.cursor().clone();
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("acknowledgement failure batch missing".into());
+    };
+    positron_query::fail_next_tail_cursor_encode();
+    assert_eq!(
+        tail.acknowledge(batch.sequence(), batch.digest())
+            .expect_err("injected cursor encoding failure must be returned")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    assert_eq!(tail.cursor(), &safe_cursor);
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            stats,
+            cursor: Some(cursor),
+        })) if cursor == safe_cursor && stats.emitted_records() == 0
+    ));
+    assert!(tail.poll().is_none());
     Ok(())
 }
 
@@ -504,6 +550,65 @@ fn tail_cursor_resumes_after_ledger_reopen_without_a_gap() -> Result<(), Box<dyn
     assert!(matches!(
         resumed.poll(),
         Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
+    ));
+    Ok(())
+}
+
+#[test]
+fn tail_historical_resume_rejects_a_pruned_handoff_before_ack() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-pruned-handoff")?;
+    fixture.kernel.append_log("historical", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(_)) = tail.poll() else {
+        return Err("historical batch missing".into());
+    };
+    let handoff = fixture
+        .kernel
+        .ledger()?
+        .reader()?
+        .snapshot()?
+        .frontier()
+        .value()
+        .checked_add(1)
+        .ok_or("handoff overflow")?;
+    let mut bytes = tail.cursor().as_bytes().to_vec();
+    let payload_len = bytes.len().checked_sub(32).ok_or("cursor tag missing")?;
+    let extension_start = payload_len
+        .checked_sub(40)
+        .ok_or("history marker missing")?;
+    let handoff_offset = extension_start
+        .checked_add(14)
+        .ok_or("handoff offset overflow")?;
+    bytes
+        .get_mut(handoff_offset..handoff_offset + 8)
+        .ok_or("handoff bytes missing")?
+        .copy_from_slice(&handoff.to_be_bytes());
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let authentication = protector.authenticate_query_cursor(
+        b"tail-cursor-v3",
+        bytes.get(..payload_len).ok_or("cursor payload missing")?,
+    )?;
+    bytes
+        .get_mut(payload_len..)
+        .ok_or("cursor tag missing")?
+        .copy_from_slice(&authentication.tag());
+    let forged = TailCursor::from_bytes(&bytes)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    assert!(matches!(
+        service.resume_tail(query, &forged),
+        Err(failure) if failure.code() == QueryFailureCode::StoreUnavailable
     ));
     Ok(())
 }
