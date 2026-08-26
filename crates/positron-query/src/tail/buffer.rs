@@ -84,6 +84,29 @@ impl TailBuffer {
         Ok(())
     }
 
+    pub(crate) fn reserve_queue_bytes(&mut self, bytes: u64) -> Result<u64, QueryFailure> {
+        let next_memory = self
+            .memory_used
+            .checked_add(bytes)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        if next_memory > self.memory_limit {
+            return Err(QueryFailure::budget_exhausted(
+                crate::QueryBudgetDimension::MemoryBytes,
+            ));
+        }
+        self.memory_used = next_memory;
+        self.memory_peak = self.memory_peak.max(next_memory);
+        Ok(bytes)
+    }
+
+    pub(crate) fn release_queue(&mut self, bytes: u64) -> Result<(), QueryFailure> {
+        self.memory_used = self
+            .memory_used
+            .checked_sub(bytes)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        Ok(())
+    }
+
     pub(crate) fn pop(&mut self) -> Option<Vec<QueryRecord>> {
         let batch = self.batch.take()?;
         if self.rows >= batch.len() {

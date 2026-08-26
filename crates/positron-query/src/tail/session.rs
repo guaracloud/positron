@@ -29,6 +29,13 @@ pub(super) struct PendingBatch {
     pub(super) bytes: u64,
 }
 
+struct AdvancedBatch {
+    state: TailCursorState,
+    cursor: TailCursor,
+    prior_digest: [u8; 32],
+    next_sequence: u64,
+}
+
 pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) service: &'service QueryService<'kernel, 'catalog, 'ledger>,
     pub(super) query: PlannedQuery<'kernel>,
@@ -72,23 +79,25 @@ impl TailSession<'_, '_, '_, '_> {
         if sequence != self.next_sequence || digest != pending.digest {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
-        if self.buffer.front_cloned().is_none() {
+        if self.buffer.is_empty() {
             return Err(super::internal());
         }
         let positions = pending.positions.clone();
         let rows = pending.rows;
         let bytes = pending.bytes;
-        self.output_rows = self.output_rows.checked_add(rows).ok_or_else(|| {
+        let output_rows = self.output_rows.checked_add(rows).ok_or_else(|| {
             QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows)
         })?;
-        self.output_bytes = self.output_bytes.checked_add(bytes).ok_or_else(|| {
+        let output_bytes = self.output_bytes.checked_add(bytes).ok_or_else(|| {
             QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputBytes)
         })?;
-        if let Err(failure) = self.advance(positions, digest) {
-            self.output_rows = self.output_rows.saturating_sub(rows);
-            self.output_bytes = self.output_bytes.saturating_sub(bytes);
-            return Err(failure);
-        }
+        let advanced = self.candidate_advance(positions, digest, output_rows, output_bytes)?;
+        self.state = advanced.state;
+        self.cursor = advanced.cursor;
+        self.prior_digest = advanced.prior_digest;
+        self.next_sequence = advanced.next_sequence;
+        self.output_rows = output_rows;
+        self.output_bytes = output_bytes;
         if self.buffer.pop().is_none() {
             return Err(super::internal());
         }
@@ -196,20 +205,33 @@ impl TailSession<'_, '_, '_, '_> {
         }
         take_terminal_value(&mut self.terminal, &mut self.terminal_emitted)
     }
-    fn advance(
-        &mut self,
+    fn candidate_advance(
+        &self,
         positions: Vec<TailPosition>,
         digest: [u8; 32],
-    ) -> Result<(), QueryFailure> {
-        self.sync_state_progress();
-        self.state = self.state.advance_batch(&positions, digest)?;
-        self.cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &self.state)?;
-        self.prior_digest = digest;
-        self.next_sequence = self
+        output_rows: u64,
+        output_bytes: u64,
+    ) -> Result<AdvancedBatch, QueryFailure> {
+        let mut state = self.state.clone();
+        state.set_progress(
+            self.scanned_bytes,
+            self.decoded_records,
+            output_rows,
+            output_bytes,
+            self.cpu_work_units,
+        );
+        let state = state.advance_batch(&positions, digest)?;
+        let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
+        let next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or_else(super::internal)?;
-        Ok(())
+        Ok(AdvancedBatch {
+            state,
+            cursor,
+            prior_digest: digest,
+            next_sequence,
+        })
     }
 
     pub(super) fn advance_positions(
@@ -217,8 +239,10 @@ impl TailSession<'_, '_, '_, '_> {
         positions: &[TailPosition],
     ) -> Result<(), QueryFailure> {
         self.sync_state_progress();
-        self.state = self.state.advance_positions(positions)?;
-        self.cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &self.state)?;
+        let state = self.state.advance_positions(positions)?;
+        let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
+        self.state = state;
+        self.cursor = cursor;
         Ok(())
     }
     pub(super) fn sync_progress(&mut self) -> Result<(), QueryFailure> {

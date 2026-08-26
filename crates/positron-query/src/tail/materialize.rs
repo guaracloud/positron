@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
+use super::merge::compare_candidates;
 use super::session::PendingBatch;
 use super::{TailPosition, TailSession, TailTerminal};
 use crate::execution::{ScanAfter, execute_scan};
@@ -15,6 +16,21 @@ pub(super) struct TailCandidate {
 
 impl TailSession<'_, '_, '_, '_> {
     pub(super) fn fill_sources(&mut self, limit: usize) -> Result<(), QueryFailure> {
+        let mut queue_memory = 0_u64;
+        let result = self.fill_sources_inner(limit, &mut queue_memory);
+        let cleanup = self.buffer.release_queue(queue_memory);
+        match (result, cleanup) {
+            (Err(failure), Ok(())) => Err(failure),
+            (Ok(()), Ok(())) => Ok(()),
+            (_, Err(failure)) => Err(failure),
+        }
+    }
+
+    fn fill_sources_inner(
+        &mut self,
+        limit: usize,
+        queue_memory: &mut u64,
+    ) -> Result<(), QueryFailure> {
         let output_remaining = self
             .query
             .budget
@@ -81,8 +97,25 @@ impl TailSession<'_, '_, '_, '_> {
             )?;
             all_sources_complete &= complete;
             let mut source_records = source_records;
-            source_records.sort_by(|left, right| self.compare_candidates(left, right));
+            self.sort_candidates(&mut source_records)?;
             let had_candidates = !source_records.is_empty();
+            let slots = u64::try_from(source_records.len())
+                .ok()
+                .and_then(|count| count.checked_mul(crate::memory::QUERY_RECORD_SLOT_BYTES))
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            let dynamic = source_records.iter().try_fold(0_u64, |total, candidate| {
+                total
+                    .checked_add(candidate.record.retained_dynamic_bytes()?)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))
+            })?;
+            let reserved = self.buffer.reserve_queue_bytes(
+                slots
+                    .checked_add(dynamic)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?,
+            )?;
+            *queue_memory = queue_memory
+                .checked_add(reserved)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
             let mut queue = VecDeque::new();
             queue
                 .try_reserve_exact(source_records.len())
@@ -112,7 +145,8 @@ impl TailSession<'_, '_, '_, '_> {
                             .front()
                             .ok_or_else(super::internal)?;
                         self.charge_merge_comparison()?;
-                        self.compare_candidates(left, right) == Ordering::Less
+                        compare_candidates(left, right, self.query.plan.ordering())
+                            == Ordering::Less
                     },
                     None => true,
                 };
@@ -129,7 +163,7 @@ impl TailSession<'_, '_, '_, '_> {
             if !selected_shards.contains(&source_index) {
                 selected_shards.push(source_index);
             }
-            update_position(&mut positions, candidate.position);
+            crate::tail::merge::update_position(&mut positions, candidate.position)?;
             records.push(candidate.record);
         }
         for (source_index, (scanned, had_candidates)) in source_progress.into_iter().enumerate() {
@@ -137,7 +171,7 @@ impl TailSession<'_, '_, '_, '_> {
                 && let Some(scanned) = scanned
                 && (!had_candidates || selected_shards.contains(&source_index))
             {
-                update_position(&mut positions, scanned);
+                crate::tail::merge::update_position(&mut positions, scanned)?;
             }
         }
         if historical && records.len() < limit && all_sources_complete {
@@ -220,9 +254,6 @@ impl TailSession<'_, '_, '_, '_> {
         frontier: positron_domain::routing::CommitPosition,
         limit: usize,
     ) -> Result<(Vec<TailCandidate>, Option<TailPosition>, bool), QueryFailure> {
-        let _reservation = self
-            .service
-            .reserve_query(snapshot.scope().tenant_id(), self.query.budget)?;
         let mut state =
             crate::execution_state::tail_state(&self.query, snapshot, self.state.expiry());
         state.physical_scanned_bytes = self.scanned_bytes;
@@ -323,47 +354,13 @@ impl TailSession<'_, '_, '_, '_> {
             return Ok((Vec::new(), last_scanned, scan_complete));
         }
         self.cpu_work_units = state.physical_cpu_work_units;
-        let candidates = records
-            .into_iter()
-            .zip(record_positions)
-            .map(|(record, position)| TailCandidate { record, position })
-            .collect();
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(records.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        for (record, position) in records.into_iter().zip(record_positions) {
+            candidates.push(TailCandidate { record, position });
+        }
         Ok((candidates, last_scanned, scan_complete))
-    }
-
-    fn compare_candidates(&self, left: &TailCandidate, right: &TailCandidate) -> Ordering {
-        crate::execution_support::compare_records(
-            &left.record,
-            &right.record,
-            self.query.plan.ordering(),
-        )
-        .then_with(|| left.position.shard().cmp(&right.position.shard()))
-    }
-
-    fn charge_merge_comparison(&mut self) -> Result<(), QueryFailure> {
-        let units = self.service.work_units(crate::QueryWorkStage::Operators)?;
-        self.cpu_work_units = self
-            .cpu_work_units
-            .checked_add(units)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::CpuWorkUnits))?;
-        if self.cpu_work_units > self.query.budget.cpu_work_units() {
-            return Err(QueryFailure::budget_exhausted(
-                QueryBudgetDimension::CpuWorkUnits,
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn update_position(positions: &mut Vec<TailPosition>, candidate: TailPosition) {
-    if let Some(existing) = positions
-        .iter_mut()
-        .find(|position| position.shard() == candidate.shard())
-    {
-        if candidate > *existing {
-            *existing = candidate;
-        }
-    } else {
-        positions.push(candidate);
     }
 }

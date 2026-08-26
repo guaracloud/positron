@@ -3,6 +3,7 @@ mod buffer;
 mod cursor;
 mod lease;
 mod materialize;
+mod merge;
 mod session;
 mod source;
 mod terminal;
