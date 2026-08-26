@@ -65,6 +65,8 @@ pub struct TailCursorState {
     output_rows: u64,
     output_bytes: u64,
     cpu_work_units: u64,
+    resume_count: u64,
+    repeated_batch_count: u64,
     budget_digest: [u8; 32],
 }
 
@@ -104,6 +106,8 @@ impl TailCursorState {
             output_rows: 0,
             output_bytes: 0,
             cpu_work_units: 0,
+            resume_count: 0,
+            repeated_batch_count: 0,
             budget_digest: [0; 32],
         })
     }
@@ -152,6 +156,12 @@ impl TailCursorState {
     pub const fn cpu_work_units(&self) -> u64 {
         self.cpu_work_units
     }
+    pub const fn resume_count(&self) -> u64 {
+        self.resume_count
+    }
+    pub const fn repeated_batch_count(&self) -> u64 {
+        self.repeated_batch_count
+    }
     pub const fn budget_digest(&self) -> [u8; 32] {
         self.budget_digest
     }
@@ -180,6 +190,11 @@ impl TailCursorState {
         self.output_rows = output_rows;
         self.output_bytes = output_bytes;
         self.cpu_work_units = cpu_work_units;
+    }
+
+    pub(crate) fn set_resume_stats(&mut self, resume_count: u64, repeated_batch_count: u64) {
+        self.resume_count = resume_count;
+        self.repeated_batch_count = repeated_batch_count;
     }
 
     pub fn validate_for_resume(
@@ -250,6 +265,7 @@ impl TailCursorState {
             self.cpu_work_units,
         );
         state.budget_digest = self.budget_digest;
+        state.set_resume_stats(self.resume_count, self.repeated_batch_count);
         Ok(state)
     }
 
@@ -293,6 +309,7 @@ impl TailCursorState {
             self.cpu_work_units,
         );
         state.budget_digest = self.budget_digest;
+        state.set_resume_stats(self.resume_count, self.repeated_batch_count);
         Ok(state)
     }
 }

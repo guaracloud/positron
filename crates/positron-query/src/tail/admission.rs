@@ -179,7 +179,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let digest = sources.digest(&self.ledger.control_tokens())?;
         let expected_budget = budget_digest(&self.ledger.control_tokens(), query.budget)?;
         let resumed = resume.is_some();
-        let (state, cursor, replay) = match resume {
+        let (mut state, cursor, replay) = match resume {
             Some((state, cursor)) => {
                 if state.positions().len() != sources.readers().len()
                     || state
@@ -267,6 +267,21 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state.cpu_work_units(),
         );
         let elapsed_seconds = query.last_observed_at.saturating_sub(query.started_at);
+        let (resume_count, repeated_batch_count, cursor) = if resumed {
+            let resume_count = state
+                .resume_count()
+                .checked_add(1)
+                .ok_or_else(super::internal)?;
+            let repeated_batch_count = state
+                .repeated_batch_count()
+                .checked_add(u64::from(replay))
+                .ok_or_else(super::internal)?;
+            state.set_resume_stats(resume_count, repeated_batch_count);
+            let cursor = super::cursor::TailCursor::encode(&self.ledger.control_tokens(), &state)?;
+            (resume_count, repeated_batch_count, cursor)
+        } else {
+            (state.resume_count(), state.repeated_batch_count(), cursor)
+        };
         let mut session = TailSession {
             service: self,
             query,
@@ -299,8 +314,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             cpu_work_units,
             memory_peak_bytes: 0,
             elapsed_seconds,
-            resume_count: u64::from(resumed),
-            repeated_batch_count: u64::from(replay),
+            resume_count,
+            repeated_batch_count,
         };
         if matches!(start, TailStart::Historical { .. }) {
             session.fill_sources(max_rows)?;

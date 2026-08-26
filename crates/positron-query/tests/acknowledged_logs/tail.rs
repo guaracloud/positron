@@ -113,6 +113,46 @@ fn tail_terminal_stats_count_only_acknowledged_rows_and_digest() -> Result<(), B
 }
 
 #[test]
+fn tail_terminal_stats_accumulate_resume_and_repeat_counts() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-terminal-resume-stats")?;
+    fixture.kernel.append_log("repeat", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut first = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(first.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(first.poll(), Some(TailEvent::Batch(_))));
+    let cursor = first.cursor().clone();
+    first.disconnect();
+    assert!(matches!(
+        first.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. }))
+            if stats.resume_count() == 0 && stats.repeated_batch_count() == 0
+    ));
+    drop(first);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut resumed = service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(resumed.poll(), Some(TailEvent::Batch(_))));
+    resumed.disconnect();
+    assert!(matches!(
+        resumed.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. }))
+            if stats.resume_count() == 1 && stats.repeated_batch_count() == 1
+    ));
+    Ok(())
+}
+
+#[test]
 fn tail_poll_requires_an_explicit_acknowledgement_before_advancing_cursor()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-explicit-ack")?;
@@ -584,8 +624,8 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
         .is_err()
     );
     let mut bad_count = cursor.as_bytes().to_vec();
-    bad_count[242] = 0;
-    bad_count[243] = 0;
+    bad_count[258] = 0;
+    bad_count[259] = 0;
     assert!(
         TailCursor::decode(
             &fixture.kernel.ledger()?.control_tokens(),
@@ -608,19 +648,19 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
     };
     let mut zero_count = cursor.as_bytes().to_vec();
     authenticate(&mut zero_count)?;
-    zero_count[242] = 0;
-    zero_count[243] = 0;
+    zero_count[258] = 0;
+    zero_count[259] = 0;
     authenticate(&mut zero_count)?;
     assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&zero_count)?).is_err());
 
     let mut mismatched_length = cursor.as_bytes().to_vec();
-    mismatched_length[242] = 0;
-    mismatched_length[243] = 2;
+    mismatched_length[258] = 0;
+    mismatched_length[259] = 2;
     authenticate(&mut mismatched_length)?;
     assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&mismatched_length)?,).is_err());
 
     let mut invalid_marker = cursor.as_bytes().to_vec();
-    invalid_marker[244 + 14] = 2;
+    invalid_marker[260 + 14] = 2;
     authenticate(&mut invalid_marker)?;
     assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&invalid_marker)?,).is_err());
 

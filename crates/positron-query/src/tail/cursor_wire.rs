@@ -10,7 +10,7 @@ const PURPOSE: &[u8] = b"tail-cursor-v3";
 const VERSION: u16 = 2;
 const MAX_BYTES: usize = 2_048;
 const AUTH_BYTES: usize = 32;
-const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 32 + 2;
+const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 16 + 32 + 2;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct TailCursor(Vec<u8>);
@@ -45,6 +45,8 @@ impl TailCursor {
         bytes.extend_from_slice(&state.output_rows.to_be_bytes());
         bytes.extend_from_slice(&state.output_bytes.to_be_bytes());
         bytes.extend_from_slice(&state.cpu_work_units.to_be_bytes());
+        bytes.extend_from_slice(&state.resume_count.to_be_bytes());
+        bytes.extend_from_slice(&state.repeated_batch_count.to_be_bytes());
         bytes.extend_from_slice(&state.budget_digest);
         bytes.extend_from_slice(
             &(u16::try_from(state.positions.len()).map_err(|_| invalid())?).to_be_bytes(),
@@ -101,8 +103,10 @@ impl TailCursor {
         let output_rows = u64_at(payload, 186)?;
         let output_bytes = u64_at(payload, 194)?;
         let cpu_work_units = u64_at(payload, 202)?;
-        let budget_digest = array_at_at::<32>(payload, 210)?;
-        let count = usize::from(u16_at(payload, 242)?);
+        let resume_count = u64_at(payload, 210)?;
+        let repeated_batch_count = u64_at(payload, 218)?;
+        let budget_digest = array_at_at::<32>(payload, 226)?;
+        let count = usize::from(u16_at(payload, 258)?);
         if count == 0 || count > super::MAX_SHARDS {
             return Err(invalid());
         }
@@ -151,6 +155,7 @@ impl TailCursor {
             cpu_work_units,
         );
         state.budget_digest = budget_digest;
+        state.set_resume_stats(resume_count, repeated_batch_count);
         Ok(state)
     }
 
