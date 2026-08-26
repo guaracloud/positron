@@ -6,6 +6,7 @@ pub use contract::{
     QueryHeader, ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
 };
 pub(crate) use events::QueryCounters;
+pub(crate) use events::{BatchMemoryAccount, BatchMemoryClaim};
 pub use events::{QueryBatch, QueryEvent, QueryIncomplete, QueryStats, QueryTerminal};
 
 use positron_domain::routing::{CommitPosition, RecordOrdinal};

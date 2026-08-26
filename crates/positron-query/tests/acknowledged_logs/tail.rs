@@ -2479,3 +2479,40 @@ fn tail_advances_the_safe_cursor_when_a_bounded_scan_has_no_matching_rows()
     assert_eq!(batch.records()[0].body_text(), Some("missing"));
     Ok(())
 }
+
+#[test]
+fn repeated_unacknowledged_delivery_keeps_memory_accounted() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-repeated-delivery-memory")?;
+    fixture.kernel.append_log("first", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget =
+        QueryBudget::new(1_048_576, 16, 2, 1_048_576, 780, 60)?.with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(first)) = tail.poll() else {
+        return Err("initial tail batch missing".into());
+    };
+    let identity = (first.sequence(), first.digest());
+    let mut repeats = Vec::new();
+    for _ in 0..8 {
+        let Some(TailEvent::Batch(repeated)) = tail.poll() else {
+            return Err("pending batch was not repeatable".into());
+        };
+        assert_eq!((repeated.sequence(), repeated.digest()), identity);
+        repeats.push(repeated);
+    }
+    tail.acknowledge(identity.0, identity.1)?;
+    fixture.kernel.append_log("second", 2, 2)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::ConsumerLagged { .. }))
+    ));
+    drop(repeats);
+    drop(first);
+    Ok(())
+}

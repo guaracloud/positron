@@ -1,17 +1,25 @@
+use std::sync::Arc;
+
 use crate::memory::QUERY_RECORD_SLOT_BYTES;
+use crate::stream::{BatchMemoryAccount, BatchMemoryClaim};
 use crate::{QueryFailure, QueryFailureCode, QueryRecord};
 
 const MAX_BYTES: u64 = 16 * 1_048_576;
 
 pub(crate) struct TailBuffer {
-    batch: Option<Vec<QueryRecord>>,
+    batch: Option<BufferedBatch>,
     rows: usize,
     bytes: u64,
     max_rows: usize,
     max_bytes: u64,
-    memory_limit: u64,
     memory_used: u64,
     memory_peak: u64,
+    account: Arc<BatchMemoryAccount>,
+}
+
+struct BufferedBatch {
+    records: Arc<[QueryRecord]>,
+    claim: Arc<BatchMemoryClaim>,
 }
 
 impl TailBuffer {
@@ -29,9 +37,9 @@ impl TailBuffer {
             bytes: 0,
             max_rows,
             max_bytes,
-            memory_limit,
             memory_used: 0,
             memory_peak: 0,
+            account: Arc::new(BatchMemoryAccount::new(memory_limit)),
         })
     }
 
@@ -64,112 +72,90 @@ impl TailBuffer {
                 QueryFailureCode::ResourceAdmissionRefused,
             ));
         }
-        let next_memory = self
-            .memory_used
-            .checked_add(bytes)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        if next_memory > self.memory_limit {
-            return Err(QueryFailure::new(
-                QueryFailureCode::ResourceAdmissionRefused,
-            ));
-        }
+        self.account.reserve(
+            bytes,
+            QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused),
+        )?;
         self.rows = self
             .rows
             .checked_add(rows)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         self.bytes = next;
-        self.memory_used = next_memory;
-        self.memory_peak = self.memory_peak.max(next_memory);
-        self.batch = Some(batch);
+        self.memory_used = self.account.used();
+        self.memory_peak = self.memory_peak.max(self.account.peak());
+        let records = Arc::from(batch.into_boxed_slice());
+        self.batch = Some(BufferedBatch {
+            records,
+            claim: BatchMemoryClaim::new(Arc::clone(&self.account), bytes),
+        });
         Ok(())
     }
 
     pub(crate) fn reserve_queue_bytes(&mut self, bytes: u64) -> Result<u64, QueryFailure> {
-        let next_memory = self
-            .memory_used
-            .checked_add(bytes)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        if next_memory > self.memory_limit {
-            return Err(QueryFailure::budget_exhausted(
-                crate::QueryBudgetDimension::MemoryBytes,
-            ));
-        }
-        self.memory_used = next_memory;
-        self.memory_peak = self.memory_peak.max(next_memory);
+        self.account.reserve(
+            bytes,
+            QueryFailure::budget_exhausted(crate::QueryBudgetDimension::MemoryBytes),
+        )?;
+        self.memory_used = self.account.used();
+        self.memory_peak = self.memory_peak.max(self.account.peak());
         Ok(bytes)
     }
 
     pub(crate) fn release_queue(&mut self, bytes: u64) -> Result<(), QueryFailure> {
-        self.memory_used = self
-            .memory_used
-            .checked_sub(bytes)
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        if self.account.used() < bytes {
+            return Err(QueryFailure::new(QueryFailureCode::Internal));
+        }
+        self.account.release(bytes);
+        self.memory_used = self.account.used();
         Ok(())
     }
 
-    pub(crate) fn pop(&mut self) -> Option<Vec<QueryRecord>> {
+    pub(crate) fn pop(&mut self) -> Option<Arc<[QueryRecord]>> {
         let batch = self.batch.take()?;
-        if self.rows >= batch.len() {
-            self.rows -= batch.len();
+        if self.rows >= batch.records.len() {
+            self.rows -= batch.records.len();
         } else {
             self.rows = 0;
         }
-        let bytes = batch
-            .len()
-            .checked_mul(usize::try_from(QUERY_RECORD_SLOT_BYTES).ok()?)
-            .and_then(|value| u64::try_from(value).ok());
-        let dynamic = batch
-            .iter()
-            .try_fold(0_u64, |total, record| {
-                total
-                    .checked_add(record.retained_dynamic_bytes().map_err(|_| ())?)
-                    .ok_or(())
-            })
-            .ok();
-        if let (Some(bytes), Some(dynamic)) = (bytes, dynamic)
-            && let Some(bytes) = bytes.checked_add(dynamic)
-        {
-            if self.bytes >= bytes {
-                self.bytes -= bytes;
-            } else {
-                self.bytes = 0;
-            }
-            if self.memory_used >= bytes {
-                self.memory_used -= bytes;
-            } else {
-                self.memory_used = 0;
-            }
+        if self.bytes >= batch.claim.bytes() {
+            self.bytes -= batch.claim.bytes();
         } else {
             self.bytes = 0;
-            self.memory_used = 0;
         }
-        Some(batch)
+        let records = Arc::clone(&batch.records);
+        drop(batch);
+        self.memory_used = self.account.used();
+        Some(records)
     }
 
-    pub(crate) fn front_cloned(&self) -> Option<Vec<QueryRecord>> {
-        self.batch.clone()
+    pub(crate) fn front_shared(&self) -> Option<(Arc<[QueryRecord]>, Arc<BatchMemoryClaim>)> {
+        let batch = self.batch.as_ref()?;
+        Some((Arc::clone(&batch.records), Arc::clone(&batch.claim)))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.batch.is_none()
     }
 
-    pub(crate) const fn memory_peak(&self) -> u64 {
-        self.memory_peak
+    pub(crate) fn memory_peak(&self) -> u64 {
+        self.memory_peak.max(self.account.peak())
     }
 
     pub(crate) fn clear(&mut self) {
         self.batch = None;
         self.rows = 0;
         self.bytes = 0;
-        self.memory_used = 0;
+        self.memory_used = self.account.used();
     }
 }
 
 #[cfg(test)]
 mod accounting_tests {
+    use std::sync::Arc;
+
     use super::{MAX_BYTES, TailBuffer};
-    use crate::stream::QueryRecord;
+    use crate::stream::{BatchMemoryClaim, QueryRecord};
+    use crate::{QueryFailure, QueryFailureCode};
 
     #[test]
     fn pop_reconciles_underflow_and_overflowed_dynamic_accounting() {
@@ -183,9 +169,17 @@ mod accounting_tests {
         assert!(buffer.pop().is_some());
 
         let mut buffer = TailBuffer::new(2, MAX_BYTES, MAX_BYTES).expect("bounded buffer");
-        buffer.batch = Some(vec![
-            QueryRecord::count_record(1).test_with_retained_bytes(u64::MAX, 1),
-        ]);
+        buffer
+            .account
+            .reserve(1, QueryFailure::new(QueryFailureCode::Internal))
+            .expect("manual claim fits");
+        buffer.batch = Some(super::BufferedBatch {
+            records: Arc::from(
+                vec![QueryRecord::count_record(1).test_with_retained_bytes(u64::MAX, 1)]
+                    .into_boxed_slice(),
+            ),
+            claim: BatchMemoryClaim::new(Arc::clone(&buffer.account), 1),
+        });
         buffer.rows = 1;
         buffer.bytes = 1;
         assert!(buffer.pop().is_some());

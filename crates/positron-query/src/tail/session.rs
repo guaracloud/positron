@@ -154,7 +154,7 @@ impl TailSession<'_, '_, '_, '_> {
         if self.terminal.is_some() {
             return self.take_terminal();
         }
-        if let Some(batch) = self.buffer.front_cloned() {
+        if let Some((records, claim)) = self.buffer.front_shared() {
             let (digest, sequence) = match self.pending_batch.as_ref() {
                 Some(pending) => (pending.digest, self.next_sequence),
                 None => {
@@ -165,11 +165,12 @@ impl TailSession<'_, '_, '_, '_> {
                     return self.take_terminal();
                 },
             };
-            return Some(TailEvent::Batch(QueryBatch::new(
+            return Some(TailEvent::Batch(QueryBatch::from_shared(
                 sequence,
-                batch,
+                records,
                 self.prior_digest,
                 digest,
+                claim,
             )));
         }
         if let Some(terminal) = self.terminal.take() {
@@ -177,6 +178,7 @@ impl TailSession<'_, '_, '_, '_> {
             return Some(TailEvent::Terminal(terminal));
         }
         match self.fill_sources(super::MAX_TAIL_BATCH_ROWS) {
+            Ok(()) if self.terminal.is_some() => self.take_terminal(),
             Ok(()) if !self.buffer.is_empty() => self.poll(),
             Ok(()) => Some(TailEvent::Idle),
             Err(failure) => {
