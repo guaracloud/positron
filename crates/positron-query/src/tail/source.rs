@@ -9,15 +9,15 @@ const MAX_SOURCES: usize = 64;
 /// The bounded, ordered set of durable sources observed by one tail session.
 /// Every source must describe the same tenant and signal; the shard vector is
 /// part of the authenticated cursor binding.
-pub struct TailSourceSet<'kernel, 'catalog> {
-    readers: Vec<CommittedLedgerReader<'kernel, 'catalog>>,
+pub struct TailSourceSet<'kernel, 'catalog, 'ledger> {
+    readers: Vec<CommittedLedgerReader<'kernel, 'catalog, 'ledger>>,
     tenant: TenantId,
     signal: SignalKind,
 }
 
-impl<'kernel, 'catalog> TailSourceSet<'kernel, 'catalog> {
+impl<'kernel, 'catalog, 'ledger> TailSourceSet<'kernel, 'catalog, 'ledger> {
     pub fn new(
-        mut readers: Vec<CommittedLedgerReader<'kernel, 'catalog>>,
+        mut readers: Vec<CommittedLedgerReader<'kernel, 'catalog, 'ledger>>,
     ) -> Result<Self, QueryFailure> {
         if readers.is_empty() || readers.len() > MAX_SOURCES {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
@@ -46,12 +46,12 @@ impl<'kernel, 'catalog> TailSourceSet<'kernel, 'catalog> {
     }
 
     pub(crate) fn single(
-        reader: CommittedLedgerReader<'kernel, 'catalog>,
+        reader: CommittedLedgerReader<'kernel, 'catalog, 'ledger>,
     ) -> Result<Self, QueryFailure> {
         Self::new(vec![reader])
     }
 
-    pub(crate) fn readers(&self) -> &[CommittedLedgerReader<'kernel, 'catalog>] {
+    pub(crate) fn readers(&self) -> &[CommittedLedgerReader<'kernel, 'catalog, 'ledger>] {
         &self.readers
     }
 

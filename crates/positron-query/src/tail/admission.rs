@@ -3,14 +3,14 @@ use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
 use super::cursor::{HistoricalMarker, TailCursor, TailCursorState, TailPosition, budget_digest};
-use super::lease::TailLeaseOwner;
+use super::lease::{TailLeaseOwner, TailLeaseSet};
 use super::session::{TailSession, TailStart};
 use super::source::TailSourceSet;
 use super::terminal::{TailStats, TailTerminal};
 
 fn validate_resume_history(
     state: &TailCursorState,
-    sources: &TailSourceSet<'_, '_>,
+    sources: &TailSourceSet<'_, '_, '_>,
 ) -> Result<(), QueryFailure> {
     for reader in sources.readers() {
         let snapshot = reader
@@ -91,7 +91,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
         start: TailStart,
-        sources: TailSourceSet<'kernel, 'catalog>,
+        sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
         self.admit_tail(query, start, None, sources)
     }
@@ -112,7 +112,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
         cursor: &TailCursor,
-        sources: TailSourceSet<'kernel, 'catalog>,
+        sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
         let state = TailCursor::decode(&self.ledger.control_tokens(), cursor)?;
         let (tenant, _, _generation) = self.current_query_catalog(query.context)?;
@@ -139,7 +139,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         start: TailStart,
         resume: Option<(TailCursorState, TailCursor)>,
-        sources: TailSourceSet<'kernel, 'catalog>,
+        sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
         let (tenant, catalog_identity, generation) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
@@ -173,6 +173,20 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let lease_owner = TailLeaseOwner::new(self.ledger, lease.identity());
         if sources.tenant() != tenant {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+        }
+        let mut source_lease_owners = TailLeaseSet::with_capacity(sources.readers().len())?;
+        for reader in sources.readers() {
+            if reader.scope() == self.ledger.scope() {
+                continue;
+            }
+            let authority = reader
+                .lease_authority()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+            let source_lease = authority
+                .create_snapshot_lease(now, expiry)
+                .map_err(crate::execution_support::map_ledger_failure)?;
+            source_lease_owners.push(TailLeaseOwner::new(authority, source_lease.identity()));
+            drop(source_lease);
         }
         let mut frontiers = Vec::new();
         frontiers
@@ -340,6 +354,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             sources,
             _lease: lease,
             lease_owner,
+            source_lease_owners,
             state,
             cursor,
             header: Some(header),

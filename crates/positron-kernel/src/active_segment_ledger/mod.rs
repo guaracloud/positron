@@ -260,13 +260,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
 
     /// Opens a read-only observation handle without acquiring another writer
     /// lease. The reader shares the immutable protection capability only.
-    pub fn reader(&self) -> Result<CommittedLedgerReader<'kernel, 'catalog>, LedgerFailure> {
-        CommittedLedgerReader::open(
-            self.authority,
-            self.catalog,
-            self.scope,
-            self.protection.clone(),
-        )
+    pub fn reader<'ledger>(
+        &'ledger self,
+    ) -> Result<CommittedLedgerReader<'kernel, 'catalog, 'ledger>, LedgerFailure> {
+        CommittedLedgerReader::open_with_lease_authority(self)
     }
 
     #[must_use]

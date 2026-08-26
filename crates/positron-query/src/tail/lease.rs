@@ -10,6 +10,36 @@ pub(super) struct TailLeaseOwner<'ledger, 'kernel, 'catalog> {
     released: bool,
 }
 
+pub(super) struct TailLeaseSet<'ledger, 'kernel, 'catalog> {
+    owners: Vec<TailLeaseOwner<'ledger, 'kernel, 'catalog>>,
+}
+
+impl<'ledger, 'kernel, 'catalog> TailLeaseSet<'ledger, 'kernel, 'catalog> {
+    pub(super) fn with_capacity(capacity: usize) -> Result<Self, QueryFailure> {
+        let mut owners = Vec::new();
+        owners
+            .try_reserve_exact(capacity)
+            .map_err(|_| QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
+        Ok(Self { owners })
+    }
+
+    pub(super) fn push(&mut self, owner: TailLeaseOwner<'ledger, 'kernel, 'catalog>) {
+        self.owners.push(owner);
+    }
+
+    pub(super) fn release(&mut self) -> Result<(), QueryFailure> {
+        let mut first_failure = None;
+        for owner in &mut self.owners {
+            if let Err(failure) = owner.release()
+                && first_failure.is_none()
+            {
+                first_failure = Some(failure);
+            }
+        }
+        first_failure.map_or(Ok(()), Err)
+    }
+}
+
 impl<'ledger, 'kernel, 'catalog> TailLeaseOwner<'ledger, 'kernel, 'catalog> {
     pub(super) const fn new(
         ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,

@@ -117,10 +117,10 @@ pub fn fuzz_tail_state_machine(data: &[u8]) {
             .ok()
     }
 
-    fn sources<'kernel, 'catalog>(
-        first: &ActiveSegmentLedger<'kernel, 'catalog>,
-        second: &ActiveSegmentLedger<'kernel, 'catalog>,
-    ) -> Option<TailSourceSet<'kernel, 'catalog>> {
+    fn sources<'kernel, 'catalog, 'ledger>(
+        first: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+        second: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    ) -> Option<TailSourceSet<'kernel, 'catalog, 'ledger>> {
         TailSourceSet::new(vec![first.reader().ok()?, second.reader().ok()?]).ok()
     }
 

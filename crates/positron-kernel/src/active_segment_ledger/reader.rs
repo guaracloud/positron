@@ -5,7 +5,10 @@ use super::capacity::{recovery_claim, snapshot_retained_claim};
 use super::reconstruction::reconstruct;
 use super::recovery::RecoveryMode;
 use super::storage::LedgerStorage;
-use super::{LedgerFailure, LedgerFailureCode, LedgerSnapshot, SegmentProtectionKey, SegmentScope};
+use super::{
+    ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, LedgerSnapshot, SegmentProtectionKey,
+    SegmentScope,
+};
 
 const MAX_SNAPSHOT_RETRIES: usize = 2;
 
@@ -14,21 +17,22 @@ const MAX_SNAPSHOT_RETRIES: usize = 2;
 /// Unlike [`super::ActiveSegmentLedger`], this handle never acquires the
 /// active-segment writer lease and never repairs storage. Each snapshot pins a
 /// fresh Catalog generation and reconstructs only its acknowledged objects.
-pub struct CommittedLedgerReader<'kernel, 'catalog> {
+pub struct CommittedLedgerReader<'kernel, 'catalog, 'ledger> {
     authority: &'kernel StorageKernelResourceAuthority,
     catalog: &'catalog Catalog<'kernel>,
     scope: SegmentScope,
     storage: LedgerStorage,
     protection: SegmentProtectionKey,
+    lease_authority: Option<&'ledger ActiveSegmentLedger<'kernel, 'catalog>>,
 }
 
-impl std::fmt::Debug for CommittedLedgerReader<'_, '_> {
+impl std::fmt::Debug for CommittedLedgerReader<'_, '_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CommittedLedgerReader { <storage-and-key-redacted> }")
     }
 }
 
-impl<'kernel, 'catalog> CommittedLedgerReader<'kernel, 'catalog> {
+impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledger> {
     #[must_use]
     pub const fn scope(&self) -> SegmentScope {
         self.scope
@@ -49,7 +53,28 @@ impl<'kernel, 'catalog> CommittedLedgerReader<'kernel, 'catalog> {
             scope,
             storage: LedgerStorage::open_observed(volume)?,
             protection,
+            lease_authority: None,
         })
+    }
+
+    pub(crate) fn open_with_lease_authority(
+        ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    ) -> Result<Self, LedgerFailure> {
+        let mut reader = Self::open(
+            ledger.authority,
+            ledger.catalog,
+            ledger.scope,
+            ledger.protection.clone(),
+        )?;
+        reader.lease_authority = Some(ledger);
+        Ok(reader)
+    }
+
+    /// Returns the internal lease authority for a reader created by an active
+    /// ledger. Tail admission uses it to pin every involved source; callers
+    /// cannot release or transfer the returned capability directly.
+    pub fn lease_authority(&self) -> Option<&'ledger ActiveSegmentLedger<'kernel, 'catalog>> {
+        self.lease_authority
     }
 
     /// Captures one complete Catalog generation and its acknowledged durable
