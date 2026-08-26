@@ -7,13 +7,14 @@ use positron_kernel::{
     SnapshotLeaseId, WorkClass, with_catalog_publication_fault_after,
 };
 use positron_query::{
-    QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal, TailCursor, TailCursorState,
-    TailEvent, TailPosition, TailSourceSet, TailStart, TailTerminal,
+    QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal, TailCursor,
+    TailCursorState, TailEvent, TailPosition, TailSourceSet, TailStart, TailTerminal,
 };
 
 use super::support::{
-    CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock, FailAfterArmOutputMeter,
-    TestClock, merge_work_service, stage_work_service, zero_work_clock_service,
+    CancellingOperatorCallMeter, CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock,
+    FailAfterArmOutputMeter, TestClock, merge_work_service, stage_work_service,
+    zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -2514,5 +2515,76 @@ fn repeated_unacknowledged_delivery_keeps_memory_accounted() -> Result<(), Box<d
     ));
     drop(repeats);
     drop(first);
+    Ok(())
+}
+
+#[test]
+fn acknowledged_resume_preserves_runtime_statistics() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-ack-resume-runtime-stats")?;
+    fixture.kernel.append_log("runtime-stats", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut first = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(first.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = first.poll() else {
+        return Err("runtime-statistics batch missing".into());
+    };
+    first.acknowledge(batch.sequence(), batch.digest())?;
+    let cursor = first.cursor().clone();
+    first.disconnect();
+    let Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. })) = first.poll() else {
+        return Err("initial runtime-statistics terminal missing".into());
+    };
+    let initial_peak = stats.memory_peak_bytes();
+    assert!(initial_peak > 0);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut resumed = service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    resumed.disconnect();
+    let Some(TailEvent::Terminal(TailTerminal::Disconnected { stats, .. })) = resumed.poll() else {
+        return Err("resumed runtime-statistics terminal missing".into());
+    };
+    assert!(stats.memory_peak_bytes() >= initial_peak);
+    Ok(())
+}
+
+#[test]
+fn tail_merge_cancellation_is_observed_before_candidate_mutation() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-merge-cancel")?;
+    let meter = CancellingOperatorCallMeter::shared(1);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        meter.clone(),
+    );
+    let budget =
+        QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    meter.bind(query.cancellation())?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("first", 1, 1)?;
+    fixture.kernel.append_log("second", 2, 2)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
+    ));
+    assert!(tail.poll().is_none());
     Ok(())
 }

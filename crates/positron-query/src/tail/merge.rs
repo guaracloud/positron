@@ -13,12 +13,11 @@ impl TailSession<'_, '_, '_, '_> {
         for index in 1..candidates.len() {
             let mut current = index;
             while current > 0 {
-                self.charge_merge_comparison()?;
-                if compare_candidates(
+                if self.compare_candidates_cooperatively(
                     &candidates[current - 1],
                     &candidates[current],
                     self.query.plan.ordering(),
-                ) != Ordering::Greater
+                )? != Ordering::Greater
                 {
                     break;
                 }
@@ -41,6 +40,26 @@ impl TailSession<'_, '_, '_, '_> {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn compare_candidates_cooperatively(
+        &mut self,
+        left: &TailCandidate,
+        right: &TailCandidate,
+        ordering: OrderSpec,
+    ) -> Result<Ordering, QueryFailure> {
+        if self.query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        self.charge_merge_comparison()?;
+        if self.query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        let result = compare_candidates(left, right, ordering);
+        if self.query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        Ok(result)
     }
 }
 

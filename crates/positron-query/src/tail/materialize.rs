@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
-use super::merge::compare_candidates;
 use super::session::PendingBatch;
 use super::{TailPosition, TailSession, TailTerminal};
 use crate::execution::{ScanAfter, execute_scan};
@@ -144,9 +143,11 @@ impl TailSession<'_, '_, '_, '_> {
                         let right = source_batches[best_index]
                             .front()
                             .ok_or_else(super::internal)?;
-                        self.charge_merge_comparison()?;
-                        compare_candidates(left, right, self.query.plan.ordering())
-                            == Ordering::Less
+                        self.compare_candidates_cooperatively(
+                            left,
+                            right,
+                            self.query.plan.ordering(),
+                        )? == Ordering::Less
                     },
                     None => true,
                 };

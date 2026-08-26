@@ -66,6 +66,7 @@ impl<'kernel, 'catalog, 'ledger> TailSourceSet<'kernel, 'catalog, 'ledger> {
         let bytes = 1_usize
             .checked_add(std::mem::size_of::<[u8; 16]>())
             .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(1))
             .and_then(|value| value.checked_add(self.readers.len().checked_mul(4)?))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let mut canonical = Vec::new();

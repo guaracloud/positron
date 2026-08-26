@@ -254,6 +254,12 @@ impl TailSession<'_, '_, '_, '_> {
             output_bytes,
             self.cpu_work_units,
         );
+        state.set_runtime_stats(
+            self.memory_peak_bytes,
+            self.elapsed_seconds,
+            self.reduced_pruning,
+            self.limiting_budget,
+        );
         let mut state = state.advance_batch(&positions, digest)?;
         if historical_complete {
             state.clear_historical_markers();
