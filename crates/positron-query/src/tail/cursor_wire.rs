@@ -1,7 +1,7 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{CommitPosition, RecordOrdinal, VirtualShardId};
 use positron_kernel::{ControlTokenAuthentication, ControlTokenProtector};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{HistoricalMarker, TailCursorState, TailPosition, invalid, resource};
@@ -15,10 +15,10 @@ const AUTH_BYTES: usize = 32;
 const EXT_MAGIC: [u8; 4] = *b"TX01";
 const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 16 + 32 + 2;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 static FAIL_NEXT_ENCODE: AtomicBool = AtomicBool::new(false);
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 pub fn fail_next_encode() {
     FAIL_NEXT_ENCODE.store(true, Ordering::Release);
 }
@@ -31,7 +31,7 @@ impl TailCursor {
         protector: &ControlTokenProtector<'_>,
         state: &TailCursorState,
     ) -> Result<Self, QueryFailure> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(feature = "test-support")]
         if FAIL_NEXT_ENCODE.swap(false, Ordering::AcqRel) {
             return Err(invalid());
         }

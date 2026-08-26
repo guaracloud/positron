@@ -116,7 +116,7 @@ impl TailBuffer {
         }
         let bytes = batch
             .len()
-            .checked_mul(std::mem::size_of::<QueryRecord>())
+            .checked_mul(usize::try_from(QUERY_RECORD_SLOT_BYTES).ok()?)
             .and_then(|value| u64::try_from(value).ok());
         let dynamic = batch
             .iter()
@@ -235,5 +235,6 @@ mod tests {
             .expect("one retained slot fits");
         assert_eq!(buffer.memory_peak(), QUERY_RECORD_SLOT_BYTES);
         assert_eq!(buffer.pop().expect("retained batch").len(), 1);
+        assert_eq!(buffer.memory_used, 0);
     }
 }
