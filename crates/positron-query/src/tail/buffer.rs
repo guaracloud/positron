@@ -156,6 +156,7 @@ mod accounting_tests {
             .expect("record fits in the buffer");
         buffer.rows = 0;
         buffer.bytes = 0;
+        buffer.memory_used = 0;
         assert!(buffer.pop().is_some());
 
         let mut buffer = TailBuffer::new(2, MAX_BYTES, MAX_BYTES).expect("bounded buffer");

@@ -8,7 +8,7 @@ use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use super::support::TemporaryRoot;
 use crate::active_segment_ledger::format::{SegmentMetadata, SegmentState};
 use crate::active_segment_ledger::recovery::{
-    publish_frontier, read_blocks, recover, segment_name,
+    RecoveryMode, publish_frontier, read_blocks, recover, recover_with_mode, segment_name,
 };
 use crate::active_segment_ledger::{
     LedgerFailureCode, MAX_ENCODED_FRAME_BYTES, SegmentId, SegmentScope, object_context,
@@ -26,6 +26,37 @@ fn recovery_rejects_a_file_shorter_than_its_declared_header() -> Result<(), Box<
         .err()
         .expect("the segment cannot be shorter than its header");
     assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+    Ok(())
+}
+
+#[test]
+fn observe_recovery_ignores_unfrontiered_bytes_without_repairing_storage()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let directory = File::open(root.path())?;
+    let metadata = metadata(CommitPosition::origin());
+    fs::write(root.path().join(segment_name(metadata.id)), [0_u8, 1])?;
+    let state = recover_with_mode(
+        &directory,
+        &directory,
+        metadata,
+        &key(metadata)?,
+        1,
+        RecoveryMode::Observe,
+        false,
+    )?;
+    assert_eq!(state.frontier, CommitPosition::origin());
+    assert!(state.blocks.is_empty());
+    assert_eq!(
+        fs::read(root.path().join(segment_name(metadata.id)))?,
+        [0, 1]
+    );
+    let repaired = recover(&directory, &directory, metadata, &key(metadata)?, 1, true)?;
+    assert!(repaired.blocks.is_empty());
+    assert_eq!(
+        fs::metadata(root.path().join(segment_name(metadata.id)))?.len(),
+        1
+    );
     Ok(())
 }
 

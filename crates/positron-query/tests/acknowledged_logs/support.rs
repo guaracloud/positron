@@ -247,6 +247,19 @@ impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
 
 pub struct ConstantWorkMeter(pub u64);
 
+pub struct MergeWorkMeter;
+
+impl positron_query::QueryWorkMeter for MergeWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(u64::from(
+            stage == positron_query::QueryWorkStage::Operators,
+        ))
+    }
+}
+
 pub struct StageCountingWorkMeter {
     calls: [AtomicU64; 4],
 }
@@ -344,6 +357,20 @@ pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         TestClock::shared(100),
         Arc::new(ZeroScanWorkMeter),
+    )
+}
+
+pub fn merge_work_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        TestClock::shared(100),
+        Arc::new(MergeWorkMeter),
     )
 }
 

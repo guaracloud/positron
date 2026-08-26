@@ -7,12 +7,12 @@ use positron_kernel::{
     with_catalog_publication_fault_after,
 };
 use positron_query::{
-    QueryBudget, QueryEvent, QueryFailureCode, TailCursor, TailCursorState, TailEvent,
-    TailPosition, TailSourceSet, TailStart, TailTerminal,
+    QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal, TailCursor, TailCursorState,
+    TailEvent, TailPosition, TailSourceSet, TailStart, TailTerminal,
 };
 
 use super::support::{
-    CancellingStageWorkMeter, FailAfterArmClock, TestClock, stage_work_service,
+    CancellingStageWorkMeter, FailAfterArmClock, TestClock, merge_work_service, stage_work_service,
     zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
@@ -106,6 +106,12 @@ fn tail_terminal_stats_count_only_acknowledged_rows_and_digest() -> Result<(), B
     assert_eq!(stats.emitted_records(), 0);
     assert_eq!(stats.emitted_bytes(), 0);
     assert_eq!(stats.result_digest(), [0; 32]);
+    assert!(stats.memory_peak_bytes() > 0);
+    assert!(stats.cpu_work_units() <= budget.cpu_work_units());
+    assert_eq!(stats.elapsed_seconds(), 0);
+    assert_eq!(stats.last_sequence(), None);
+    assert_eq!(stats.cumulative_budget().output_rows(), 1);
+    assert!(!stats.reduced_pruning());
     assert!(stats.scanned_bytes() > 0);
     assert!(stats.decoded_records() > 0);
     assert_eq!(batch.records().len(), 1);
@@ -1004,6 +1010,111 @@ fn tail_follow_maps_cumulative_budget_exhaustion_to_one_terminal() -> Result<(),
 }
 
 #[test]
+fn tail_follow_maps_output_bytes_budget_to_one_terminal() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-follow-output-bytes")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("larger-than-budget", 1, 1)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn tail_follow_rechecks_output_rows_after_acknowledgement() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-follow-output-rows")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+
+    fixture.kernel.append_log("first", 1, 1)?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("first tail batch missing".into());
+    };
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+
+    fixture.kernel.append_log("second", 2, 2)?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("second tail batch missing".into());
+    };
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+
+    fixture.kernel.append_log("third", 3, 3)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn page_operator_cancellation_reports_a_framed_terminal() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("page-cancel-after-scan")?;
+    fixture.kernel.append_log("cancel-after-scan", 1, 1)?;
+    let meter = CancellingStageWorkMeter::shared(positron_query::QueryWorkStage::Operators);
+    let service = positron_query::QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        std::sync::Arc::clone(&meter) as std::sync::Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"cancel-after-scan\" | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let mut stream = service.execute_page(query)?;
+    assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+    let event = stream.next();
+    let debug = format!("{event:?}");
+    assert!(
+        matches!(
+            event.as_ref(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+                if incomplete.code() == QueryFailureCode::Cancelled
+        ),
+        "unexpected event: {debug}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tail_external_cancellation_is_revalidated_before_following() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-follow-cancellation")?;
     let service = fixture.service(16)?;
@@ -1265,6 +1376,70 @@ fn tail_multi_shard_history_uses_canonical_query_time_order() -> Result<(), Box<
         .collect::<Vec<_>>();
     assert_eq!(bodies, ["early", "tie-one", "tie-two", "late"]);
     tail.acknowledge(batch.sequence(), batch.digest())?;
+    drop(tail);
+
+    let limited_service = merge_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let limited_budget =
+        QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1)?;
+    let query = limited_service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        limited_budget,
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let mut limited = limited_service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(limited.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(30),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "future-one".to_owned(),
+                )),
+            ),
+            (
+                Some(31),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "future-two".to_owned(),
+                )),
+            ),
+        ],
+        3,
+    )?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![
+            (
+                Some(32),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "future-three".to_owned(),
+                )),
+            ),
+            (
+                Some(33),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "future-four".to_owned(),
+                )),
+            ),
+        ],
+        4,
+    )?;
+    let event = limited.poll();
+    assert!(
+        matches!(
+            event,
+            Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+                cursor: Some(_),
+                ..
+            }))
+        ),
+        "unexpected event: {event:?}"
+    );
     Ok(())
 }
 

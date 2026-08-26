@@ -292,7 +292,7 @@ fn take_terminal_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{TailEvent, TailStats, TailTerminal, take_terminal_value};
+    use super::{TailEvent, TailStats, TailTerminal, TerminalKind, take_terminal_value};
     use crate::{QueryBudget, QueryFailureCode};
 
     fn stats() -> TailStats {
@@ -370,5 +370,13 @@ mod tests {
         ));
         assert!(emitted);
         assert!(take_terminal_value(&mut terminal, &mut emitted).is_none());
+    }
+
+    #[test]
+    fn terminal_kind_builds_the_store_failure_variant() {
+        assert!(matches!(
+            TerminalKind::StoreUnavailable.build(None, stats()),
+            TailTerminal::StoreUnavailable { cursor: None, .. }
+        ));
     }
 }
