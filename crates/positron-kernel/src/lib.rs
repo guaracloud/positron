@@ -143,7 +143,7 @@ pub use data_protection::fuzz_authenticated_frame;
 #[doc(hidden)]
 pub use data_protection::fuzz_local_root_key_file;
 
-#[cfg(any(fuzzing, feature = "test-support"))]
+#[cfg(any(fuzzing, all(feature = "test-support", not(test))))]
 #[doc(hidden)]
 pub use data_protection::fuzz_control_token_protector;
 
