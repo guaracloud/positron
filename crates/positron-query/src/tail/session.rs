@@ -106,7 +106,7 @@ impl TailSession<'_, '_, '_, '_> {
         ) {
             Ok(advanced) => advanced,
             Err(failure) => {
-                self.limiting_budget = failure.limiting_budget();
+                self.record_limiting_budget(&failure);
                 let terminal = super::admission::terminal_for_failure(
                     failure.code(),
                     Some(self.cursor.clone()),
@@ -141,7 +141,7 @@ impl TailSession<'_, '_, '_, '_> {
             return Some(TailEvent::Header(header));
         }
         if let Err(failure) = self.revalidate() {
-            self.limiting_budget = failure.limiting_budget();
+            self.record_limiting_budget(&failure);
             if self.terminal.is_none() {
                 self.terminal = Some(super::admission::terminal_for_failure(
                     failure.code(),
@@ -180,7 +180,7 @@ impl TailSession<'_, '_, '_, '_> {
             Ok(()) if !self.buffer.is_empty() => self.poll(),
             Ok(()) => Some(TailEvent::Idle),
             Err(failure) => {
-                self.limiting_budget = failure.limiting_budget();
+                self.record_limiting_budget(&failure);
                 let terminal = super::admission::terminal_for_failure(
                     failure.code(),
                     Some(self.cursor.clone()),
@@ -303,6 +303,12 @@ impl TailSession<'_, '_, '_, '_> {
             self.reduced_pruning,
             self.limiting_budget,
         );
+    }
+
+    fn record_limiting_budget(&mut self, failure: &QueryFailure) {
+        if let Some(dimension) = failure.limiting_budget() {
+            self.limiting_budget = Some(dimension);
+        }
     }
 
     pub(super) fn terminal_stats(&self) -> TailStats {
