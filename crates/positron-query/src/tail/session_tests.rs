@@ -78,3 +78,43 @@ fn terminal_kind_builds_the_store_failure_variant() {
         TailTerminal::StoreUnavailable { cursor: None, .. }
     ));
 }
+
+#[test]
+fn tail_stats_exposes_the_cumulative_runtime_fields() {
+    let stats = TailStats {
+        scanned_bytes: 1,
+        decoded_records: 2,
+        emitted_records: 3,
+        emitted_bytes: 4,
+        memory_peak_bytes: 5,
+        cpu_work_units: 6,
+        elapsed_seconds: 7,
+        last_sequence: Some(8),
+        result_digest: [9; 32],
+        cumulative_budget: QueryBudget::new(10, 11, 12, 13, 14, 15)
+            .expect("test budget")
+            .with_cpu_work_units(16)
+            .expect("test CPU budget"),
+        resume_count: 17,
+        repeated_batch_count: 18,
+        reduced_pruning: true,
+        limiting_budget: Some(crate::QueryBudgetDimension::MemoryBytes),
+    };
+    assert_eq!(stats.scanned_bytes(), 1);
+    assert_eq!(stats.decoded_records(), 2);
+    assert_eq!(stats.emitted_records(), 3);
+    assert_eq!(stats.emitted_bytes(), 4);
+    assert_eq!(stats.memory_peak_bytes(), 5);
+    assert_eq!(stats.cpu_work_units(), 6);
+    assert_eq!(stats.elapsed_seconds(), 7);
+    assert_eq!(stats.last_sequence(), Some(8));
+    assert_eq!(stats.result_digest(), [9; 32]);
+    assert_eq!(stats.cumulative_budget().output_rows(), 12);
+    assert_eq!(stats.resume_count(), 17);
+    assert_eq!(stats.repeated_batch_count(), 18);
+    assert!(stats.reduced_pruning());
+    assert_eq!(
+        stats.limiting_budget(),
+        Some(crate::QueryBudgetDimension::MemoryBytes)
+    );
+}

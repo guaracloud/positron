@@ -148,3 +148,34 @@ fn state_validation_rejects_expired_mismatched_and_budget_changed_resumes() {
         QueryFailureCode::AuthorizationChanged
     );
 }
+
+#[test]
+fn historical_markers_validate_bounds_and_source_count() {
+    let origin = positron_domain::routing::CommitPosition::origin();
+    let later = origin
+        .advance_by(NonZeroU64::new(2).expect("non-zero position"))
+        .expect("position");
+    assert_eq!(
+        super::HistoricalMarker::new(later, origin)
+            .expect_err("a marker cannot hand off before its lower bound")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+
+    let mut state = state();
+    assert_eq!(
+        state
+            .set_historical_markers(Vec::new())
+            .expect_err("marker count must match source count")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    state
+        .set_historical_markers(vec![
+            super::HistoricalMarker::new(origin, later).expect("valid marker"),
+        ])
+        .expect("marker count matches source count");
+    assert!(state.historical_markers().is_some());
+    state.clear_historical_markers();
+    assert!(state.historical_markers().is_none());
+}

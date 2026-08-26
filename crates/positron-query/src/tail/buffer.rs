@@ -237,4 +237,63 @@ mod tests {
         assert_eq!(buffer.pop().expect("retained batch").len(), 1);
         assert_eq!(buffer.memory_used, 0);
     }
+
+    #[test]
+    fn queue_reservation_and_release_are_checked_against_memory() {
+        let mut buffer = TailBuffer::new(1, MAX_BYTES, 1).expect("window");
+        assert_eq!(
+            buffer
+                .reserve_queue_bytes(2)
+                .expect_err("queue reservation exceeds memory")
+                .code(),
+            QueryFailureCode::BudgetExhausted
+        );
+        assert_eq!(
+            buffer
+                .release_queue(1)
+                .expect_err("release cannot underflow memory")
+                .code(),
+            QueryFailureCode::Internal
+        );
+        buffer.reserve_queue_bytes(1).expect("one byte fits");
+        assert_eq!(buffer.memory_peak(), 1);
+        buffer.release_queue(1).expect("reserved byte released");
+        assert_eq!(buffer.memory_used, 0);
+    }
+
+    #[test]
+    fn push_checks_existing_batch_byte_window_and_memory_window() {
+        let record = crate::stream::QueryRecord::count_record(1);
+        let mut buffer = TailBuffer::new(1, MAX_BYTES, MAX_BYTES).expect("window");
+        buffer
+            .push(vec![record.clone()])
+            .expect("record fits in the buffer");
+        assert_eq!(
+            buffer
+                .push(vec![record.clone()])
+                .expect_err("a second batch cannot be retained")
+                .code(),
+            QueryFailureCode::ResourceAdmissionRefused
+        );
+
+        let mut bytes = TailBuffer::new(1, QUERY_RECORD_SLOT_BYTES - 1, MAX_BYTES)
+            .expect("window below one retained slot");
+        assert_eq!(
+            bytes
+                .push(vec![record.clone()])
+                .expect_err("retained bytes exceed the window")
+                .code(),
+            QueryFailureCode::ResourceAdmissionRefused
+        );
+
+        let mut memory = TailBuffer::new(1, MAX_BYTES, QUERY_RECORD_SLOT_BYTES - 1)
+            .expect("memory window below one retained slot");
+        assert_eq!(
+            memory
+                .push(vec![record])
+                .expect_err("retained bytes exceed memory")
+                .code(),
+            QueryFailureCode::ResourceAdmissionRefused
+        );
+    }
 }

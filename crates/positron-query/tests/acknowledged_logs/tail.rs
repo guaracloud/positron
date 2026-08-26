@@ -3,8 +3,8 @@ use std::error::Error;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::AttributeValueKind;
 use positron_kernel::{
-    ActiveSegmentLedger, CatalogPublicationFault, SegmentProtectionKey, SnapshotLeaseId, WorkClass,
-    with_catalog_publication_fault_after,
+    ActiveSegmentLedger, CatalogPublicationFault, CommittedLedgerReader, SegmentProtectionKey,
+    SnapshotLeaseId, WorkClass, with_catalog_publication_fault_after,
 };
 use positron_query::{
     QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal, TailCursor, TailCursorState,
@@ -12,8 +12,8 @@ use positron_query::{
 };
 
 use super::support::{
-    CancellingStageWorkMeter, FailAfterArmClock, TestClock, merge_work_service, stage_work_service,
-    zero_work_clock_service,
+    CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock, FailAfterArmOutputMeter,
+    TestClock, merge_work_service, stage_work_service, zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -115,6 +115,67 @@ fn tail_terminal_stats_count_only_acknowledged_rows_and_digest() -> Result<(), B
     assert!(stats.scanned_bytes() > 0);
     assert!(stats.decoded_records() > 0);
     assert_eq!(batch.records().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn tail_resume_frames_cumulative_elapsed_overflow_before_delivery() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-elapsed-overflow")?;
+    fixture.kernel.append_log("elapsed", 1, 1)?;
+    let clock = TestClock::shared(100);
+    let service = positron_query::QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        clock.clone(),
+        std::sync::Arc::new(ConstantWorkMeter(0)),
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let mut bytes = tail.cursor().as_bytes().to_vec();
+    drop(tail);
+
+    let extension_start = 260 + 16;
+    let markers_end = extension_start + 4 + 2 + 16;
+    let elapsed_offset = markers_end + 8;
+    bytes[elapsed_offset..elapsed_offset + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+    let payload_len = bytes.len().checked_sub(32).ok_or("cursor tag missing")?;
+    let authentication = fixture
+        .kernel
+        .ledger()?
+        .control_tokens()
+        .authenticate_query_cursor(
+            b"tail-cursor-v3",
+            bytes.get(..payload_len).ok_or("cursor payload missing")?,
+        )?;
+    bytes
+        .get_mut(payload_len..)
+        .ok_or("cursor tag missing")?
+        .copy_from_slice(&authentication.tag());
+    let cursor = TailCursor::from_bytes(&bytes)?;
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut resumed = service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    clock.set(101);
+    assert!(matches!(
+        resumed.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(_),
+            stats,
+        })) if stats.limiting_budget() == Some(positron_query::QueryBudgetDimension::WallSeconds)
+    ));
+    assert!(resumed.poll().is_none());
     Ok(())
 }
 
@@ -835,6 +896,73 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
 }
 
 #[test]
+fn tail_rejects_a_source_without_a_ledger_lease_capability_before_snapshot_work()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-source-lease-capability")?;
+    let reader = CommittedLedgerReader::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x64; 32])),
+    )?;
+    let sources = TailSourceSet::new(vec![reader])?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    assert!(matches!(
+        service.tail_with_sources(query, TailStart::Now, sources),
+        Err(failure) if failure.code() == QueryFailureCode::StoreUnavailable
+    ));
+    Ok(())
+}
+
+#[test]
+fn tail_rejects_a_source_for_another_tenant_and_invalid_buffer_budget() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-source-tenant-boundary")?;
+    let other_tenant = positron_domain::identity::TenantId::from_bytes([0x91; 16])?;
+    let other = CommittedLedgerReader::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(other_tenant, SignalKind::Logs, VirtualShardId::new(2)?),
+        SegmentProtectionKey::from_owned(Box::new([0x65; 32])),
+    )?;
+    let sources = TailSourceSet::new(vec![other])?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    assert!(matches!(
+        service.tail_with_sources(query, TailStart::Now, sources),
+        Err(failure) if failure.code() == QueryFailureCode::Unauthorized
+    ));
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 16_777_217, 1_048_576, 60)?,
+    )?;
+    assert!(matches!(
+        service.tail(query, TailStart::Now),
+        Err(failure) if failure.code() == QueryFailureCode::InvalidBudget
+    ));
+    Ok(())
+}
+
+#[test]
 fn tail_scan_cancellation_is_one_typed_terminal() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-scan-cancel")?;
     let meter = CancellingStageWorkMeter::shared(positron_query::QueryWorkStage::ScanDecode);
@@ -862,6 +990,173 @@ fn tail_scan_cancellation_is_one_typed_terminal() -> Result<(), Box<dyn Error>> 
     assert!(matches!(
         event,
         Some(TailEvent::Terminal(TailTerminal::Cancelled {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_operator_cpu_budget_fails_before_delivering_an_overrun_batch() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-operator-cpu-boundary")?;
+    let service = stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source =
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit 2";
+    let minimum_plan_cpu = (1..=1_024)
+        .find_map(|units| {
+            let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)
+                .ok()?
+                .with_cpu_work_units(units)
+                .ok()?;
+            service
+                .plan_pipeline(fixture.context, source, budget)
+                .ok()
+                .map(|_| units)
+        })
+        .ok_or("no plan-admissible CPU budget")?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?
+        .with_cpu_work_units(minimum_plan_cpu)?;
+    let query = service
+        .plan_pipeline(fixture.context, source, budget)
+        .map_err(|failure| format!("tail operator plan failed: {failure:?}"))?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_logs(
+        (1_i64..=2)
+            .map(|event_time| {
+                (
+                    Some(event_time),
+                    Some(positron_domain::value::CandidateAttributeValue::string(
+                        "cpu".to_owned(),
+                    )),
+                )
+            })
+            .collect(),
+        1,
+    )?;
+    let event = tail.poll();
+    assert!(matches!(
+        event,
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(_),
+            stats,
+        })) if stats.limiting_budget() == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_admission_rejects_wall_expiry_overflow() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-expiry-overflow")?;
+    let service = positron_query::QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(u64::MAX),
+        std::sync::Arc::new(ConstantWorkMeter(0)),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    assert!(matches!(
+        service.tail(query, TailStart::Now),
+        Err(failure) if failure.code() == QueryFailureCode::InvalidBudget
+    ));
+    Ok(())
+}
+
+#[test]
+fn tail_output_size_work_failure_is_terminal_before_delivery() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-output-work-failure")?;
+    let meter = FailAfterArmOutputMeter::shared(0);
+    meter.arm();
+    let work_meter: std::sync::Arc<dyn positron_query::QueryWorkMeter> = meter;
+    let service = positron_query::QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        work_meter,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("output-failure", 1, 1)?;
+    let event = tail.poll();
+    assert!(matches!(
+        event,
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_digest_work_failure_is_terminal_before_delivery() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-digest-work-failure")?;
+    let meter = FailAfterArmOutputMeter::shared(1);
+    meter.arm();
+    let work_meter: std::sync::Arc<dyn positron_query::QueryWorkMeter> = meter;
+    let service = positron_query::QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        work_meter,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("digest-failure", 1, 1)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn tail_terminal_cursor_sync_failure_is_framed_once() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-terminal-sync-failure")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    positron_query::fail_next_tail_cursor_encode();
+    tail.disconnect();
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
             cursor: Some(_),
             ..
         }))
@@ -1330,6 +1625,66 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn tail_multi_shard_secondary_release_failure_is_deferred_and_retried() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-secondary-release-retry")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x71; 32])),
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let baseline = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    tail.disconnect();
+    let terminal =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+            tail.poll()
+        });
+    assert!(matches!(
+        terminal,
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+    assert!(tail.poll().is_none());
+    drop(tail);
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        baseline
+    );
+    Ok(())
+}
+
+#[test]
 fn tail_historical_max_rows_is_global_across_shards() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-global-shard-limit")?;
     fixture.kernel.append_logs(
@@ -1774,6 +2129,53 @@ fn tail_resume_rejects_a_cursor_beyond_retained_history() -> Result<(), Box<dyn 
         Err(failure) => failure,
     };
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
+fn tail_resume_rejects_a_record_cursor_without_its_retained_block() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-record-history-gap")?;
+    fixture.kernel.append_log("frontier", 1, 10)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let tail = service.tail(query, TailStart::Now)?;
+    let mut bytes = tail.cursor().as_bytes().to_vec();
+    drop(tail);
+
+    let position_offset = 260 + 4;
+    bytes[position_offset..position_offset + 8].copy_from_slice(&5_u64.to_be_bytes());
+    bytes[260 + 14] = 1;
+    let payload_len = bytes.len().checked_sub(32).ok_or("cursor tag missing")?;
+    let authentication = fixture
+        .kernel
+        .ledger()?
+        .control_tokens()
+        .authenticate_query_cursor(
+            b"tail-cursor-v3",
+            bytes.get(..payload_len).ok_or("cursor payload missing")?,
+        )?;
+    bytes
+        .get_mut(payload_len..)
+        .ok_or("cursor tag missing")?
+        .copy_from_slice(&authentication.tag());
+    let cursor = TailCursor::from_bytes(&bytes)?;
+    let decoded = TailCursor::decode(&fixture.kernel.ledger()?.control_tokens(), &cursor)?;
+    assert!(decoded.record_bound());
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    assert!(matches!(
+        service.resume_tail(query, &cursor),
+        Err(failure) if failure.code() == QueryFailureCode::StoreUnavailable
+    ));
     Ok(())
 }
 

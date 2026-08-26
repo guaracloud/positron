@@ -186,7 +186,7 @@ impl<'key> ControlTokenProtector<'key> {
 /// The key is process-local fuzz fixture data and is only compiled into fuzz
 /// builds; production callers can obtain a protector only through Catalog
 /// custody.
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "test-support"))]
 #[doc(hidden)]
 pub fn fuzz_control_token_protector() -> ControlTokenProtector<'static> {
     static SECRET: std::sync::OnceLock<Mutex<CatalogSecret>> = std::sync::OnceLock::new();

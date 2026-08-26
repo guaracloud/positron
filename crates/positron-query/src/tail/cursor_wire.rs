@@ -371,3 +371,7 @@ pub(crate) fn budget_digest(
         .digest(b"tail-budget-v1", &bytes)
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
 }
+
+#[cfg(test)]
+#[path = "cursor_wire_tests.rs"]
+mod tests;
