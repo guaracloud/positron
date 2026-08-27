@@ -834,6 +834,63 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
     authenticate(&mut mismatched_length)?;
     assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&mismatched_length)?,).is_err());
 
+    let mut short_positions = cursor.as_bytes().to_vec();
+    short_positions[258] = 0;
+    short_positions[259] = 2;
+    short_positions.truncate(292 + 32 - 7);
+    authenticate(&mut short_positions)?;
+    assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&short_positions)?).is_err());
+
+    let mut short_stats = cursor.as_bytes().to_vec();
+    short_stats.truncate(300 + 32 - 1);
+    authenticate(&mut short_stats)?;
+    assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&short_stats)?).is_err());
+
+    let mut mismatched_marker_count = cursor.as_bytes().to_vec();
+    mismatched_marker_count[280] = 0;
+    mismatched_marker_count[281] = 2;
+    authenticate(&mut mismatched_marker_count)?;
+    assert!(
+        TailCursor::decode(
+            &protector,
+            &TailCursor::from_bytes(&mismatched_marker_count)?,
+        )
+        .is_err()
+    );
+
+    let mut invalid_extension = cursor.as_bytes().to_vec();
+    invalid_extension[276] ^= 1;
+    authenticate(&mut invalid_extension)?;
+    assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&invalid_extension)?).is_err());
+
+    let mut invalid_runtime_flag = cursor.as_bytes().to_vec();
+    invalid_runtime_flag[298] = 2;
+    authenticate(&mut invalid_runtime_flag)?;
+    assert!(
+        TailCursor::decode(&protector, &TailCursor::from_bytes(&invalid_runtime_flag)?,).is_err()
+    );
+
+    let mut mismatched_binding_count = cursor.as_bytes().to_vec();
+    mismatched_binding_count[304] = 0;
+    mismatched_binding_count[305] = 2;
+    authenticate(&mut mismatched_binding_count)?;
+    assert!(
+        TailCursor::decode(
+            &protector,
+            &TailCursor::from_bytes(&mismatched_binding_count)?,
+        )
+        .is_err()
+    );
+
+    let mut trailing_binding = cursor.as_bytes().to_vec();
+    let payload_len = trailing_binding
+        .len()
+        .checked_sub(32)
+        .ok_or("cursor tag missing")?;
+    trailing_binding.insert(payload_len, 0);
+    authenticate(&mut trailing_binding)?;
+    assert!(TailCursor::decode(&protector, &TailCursor::from_bytes(&trailing_binding)?).is_err());
+
     let mut invalid_marker = cursor.as_bytes().to_vec();
     invalid_marker[260 + 14] = 2;
     authenticate(&mut invalid_marker)?;
