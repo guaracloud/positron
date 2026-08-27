@@ -399,6 +399,60 @@ fn prepared_snapshot_lease_replacement_refusal_restores_its_reservation()
 }
 
 #[test]
+fn committed_replacement_rollback_refusal_preserves_the_candidate_until_capacity_returns()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x79; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let old_identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        ledger.record_snapshot_lease_usage(
+            old_identity,
+            SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7),
+        )?;
+        ledger.append(prepared(scope, b"future")?)?;
+
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(old_identity, 101, 200)?;
+        let grant = replacement.commit()?;
+        let new_identity = grant.identity();
+        drop(grant);
+
+        let blocker = resize_blocker(authority, scope.tenant)?;
+        let refusal = replacement
+            .rollback()
+            .expect_err("rollback growth must refuse under bounded pressure");
+        assert_eq!(refusal.code(), LedgerFailureCode::ResourceAdmissionRefused);
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(old_identity, 102)
+                .expect_err("the old identity stays retired while rollback is pending")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        drop(blocker);
+
+        replacement.rollback()?;
+        assert_eq!(
+            ledger.resume_snapshot_lease(old_identity, 103)?.identity(),
+            old_identity
+        );
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(new_identity, 103)
+                .expect_err("a successful rollback removes the candidate")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        ledger.release_snapshot_lease(old_identity)?;
+        Ok(())
+    })
+}
+
+#[test]
 fn prepared_snapshot_lease_replacement_rejects_a_durable_expiry() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let ledger = ActiveSegmentLedger::open(
