@@ -212,15 +212,21 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let now = state.last_snapshot_lease_time.max(now);
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
-        let (old_encoded, old_record) = basis
-            .plaintext_objects()
-            .find_map(|bytes| {
-                decode(bytes).ok().flatten().and_then(|record| {
-                    (record.identity == old_identity && record.scope == self.scope)
-                        .then(|| (bytes.to_owned(), record))
-                })
-            })
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::SnapshotExpired))?;
+        let mut old = None;
+        for bytes in basis.plaintext_objects() {
+            if bytes.get(..8) != Some(b"PSLEASE1") {
+                continue;
+            }
+            let Some(record) = decode(bytes)? else {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            };
+            if record.identity == old_identity && record.scope == self.scope {
+                old = Some((bytes.to_owned(), record));
+                break;
+            }
+        }
+        let (old_encoded, old_record) =
+            old.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::SnapshotExpired))?;
         if now >= old_record.expiry {
             return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
         }

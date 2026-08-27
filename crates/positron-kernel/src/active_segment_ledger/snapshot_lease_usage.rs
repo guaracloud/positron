@@ -242,23 +242,25 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
         #[cfg(any(test, fuzzing, feature = "test-support"))]
         super::fault::emit_event(super::fault::LedgerFileEvent::BeforeLeaseUsageReconciliation)?;
-        let observed = self
-            .catalog
-            .refresh_state()
-            .ok()
-            .and_then(|()| self.catalog.pin().ok())
-            .and_then(|snapshot| {
-                snapshot.plaintext_objects().find_map(|bytes| {
-                    let record = super::snapshot_lease_codec::decode(bytes).ok().flatten()?;
-                    (record.identity == identity && record.scope == self.scope).then_some(record)
-                })
-            });
+        self.catalog.refresh_state()?;
+        let snapshot = self.catalog.pin()?;
+        let mut observed = None;
+        for bytes in snapshot.plaintext_objects() {
+            if bytes.get(..8) != Some(b"PSLEASE1") {
+                continue;
+            }
+            let Some(record) = super::snapshot_lease_codec::decode(bytes)? else {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            };
+            if record.identity == identity && record.scope == self.scope {
+                observed = Some(record);
+                break;
+            }
+        }
 
         if let Some(record) = observed.as_ref()
             && record.usage == expected.usage
-            && super::snapshot_lease_codec::encode(record)
-                .ok()
-                .is_some_and(|encoded| encoded == expected_encoded)
+            && super::snapshot_lease_codec::encode(record)? == expected_encoded
         {
             cache_marker(state, record);
             return Ok(record.usage);

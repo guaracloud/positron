@@ -1664,8 +1664,9 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
         )],
         4,
     )?;
-    let Some(TailEvent::Batch(batch)) = tail.poll() else {
-        return Err("multi-shard live tail batch missing".into());
+    let event = tail.poll();
+    let Some(TailEvent::Batch(batch)) = event else {
+        return Err(format!("multi-shard live tail batch missing: {event:?}").into());
     };
     assert_eq!(batch.records()[0].body_text(), Some("live-one"));
     assert_eq!(batch.records()[1].body_text(), Some("live-two"));
@@ -1821,6 +1822,140 @@ fn tail_historical_max_rows_is_global_across_shards() -> Result<(), Box<dyn Erro
     assert_eq!(batch.records().len(), 2);
     tail.acknowledge(batch.sequence(), batch.digest())?;
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    Ok(())
+}
+
+#[test]
+fn tail_historical_global_order_preserves_unselected_source_candidates()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-global-order-no-loss")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(20),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "a-late".to_owned(),
+                )),
+            ),
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "a-early".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x77; 32])),
+    )?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(2),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "b-middle".to_owned(),
+            )),
+        )],
+        2,
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 8, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 3",
+        budget,
+    )?;
+    let mut tail =
+        service.tail_with_sources(query, TailStart::Historical { max_rows: 2 }, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(first)) = tail.poll() else {
+        return Err("first historical batch missing".into());
+    };
+    let first_bodies = first
+        .records()
+        .iter()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(first_bodies, ["a-early", "b-middle"]);
+    tail.acknowledge(first.sequence(), first.digest())?;
+
+    let Some(TailEvent::Batch(second_batch)) = tail.poll() else {
+        return Err("unselected historical candidate was lost".into());
+    };
+    let second_bodies = second_batch
+        .records()
+        .iter()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(second_bodies, ["a-late"]);
+    tail.acknowledge(second_batch.sequence(), second_batch.digest())?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    Ok(())
+}
+
+#[test]
+fn tail_historical_resume_uses_the_admission_snapshot_after_new_commits()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-history-pinned-resume")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "historical".to_owned(),
+                )),
+            ),
+            (
+                Some(2),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "historical-second".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("historical batch missing".into());
+    };
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    let cursor = tail.cursor().clone();
+    drop(tail);
+
+    fixture.kernel.append_log("newer-commit", 0, 2)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        budget,
+    )?;
+    let mut resumed = service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = resumed.poll() else {
+        return Err("pinned historical row was replaced by a fresh snapshot".into());
+    };
+    assert_eq!(batch.records()[0].body_text(), Some("historical-second"));
     Ok(())
 }
 
@@ -2190,6 +2325,17 @@ fn tail_secondary_only_resume_reattaches_source_lease() -> Result<(), Box<dyn Er
         ),
         SegmentProtectionKey::from_owned(Box::new([0x57; 32])),
     )?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(1),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "secondary-history".to_owned(),
+            )),
+        )],
+        1,
+    )?;
     let service = fixture.service(16)?;
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
@@ -2198,8 +2344,13 @@ fn tail_secondary_only_resume_reattaches_source_lease() -> Result<(), Box<dyn Er
         budget,
     )?;
     let sources = TailSourceSet::new(vec![second.reader()?])?;
-    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    let mut tail =
+        service.tail_with_sources(query, TailStart::Historical { max_rows: 1 }, sources)?;
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("secondary historical source was not scanned".into());
+    };
+    assert_eq!(batch.records()[0].body_text(), Some("secondary-history"));
     let cursor = tail.cursor().clone();
     drop(tail);
 

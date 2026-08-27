@@ -1,6 +1,7 @@
 use super::super::cursor::{TailCursor, TailPosition};
 use super::{AdvancedBatch, TailSession};
 use crate::QueryFailure;
+use crate::result_key::HistoricalTotalKey;
 
 impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) fn candidate_advance(
@@ -10,8 +11,12 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         output_rows: u64,
         output_bytes: u64,
         historical_complete: bool,
+        historical_key: Option<HistoricalTotalKey>,
     ) -> Result<AdvancedBatch<'kernel, 'catalog, 'ledger>, QueryFailure> {
         let mut state = self.state.clone();
+        if historical_key.is_some() {
+            state.set_historical_key(historical_key);
+        }
         state.set_progress(
             self.scanned_bytes,
             self.decoded_records,
@@ -27,9 +32,11 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         );
         let mut state = state.advance_batch(&positions, digest)?;
         if historical_complete {
+            state = state.advance_positions(&self.historical_frontiers)?;
+            state.set_record_bound(false);
             state.clear_historical_markers();
         }
-        let lease_rotation = self.prepare_lease_rotation(&mut state)?;
+        let lease_rotation = self.prepare_lease_rotation(&mut state, historical_complete)?;
         let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
         let next_sequence = self
             .next_sequence
@@ -52,9 +59,10 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         self.sync_state_progress();
         let mut state = self.state.advance_positions(positions)?;
         if clear_historical {
+            state.set_record_bound(false);
             state.clear_historical_markers();
         }
-        let lease_rotation = self.prepare_lease_rotation(&mut state)?;
+        let lease_rotation = self.prepare_lease_rotation(&mut state, clear_historical)?;
         let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
         self.commit_lease_rotation(lease_rotation)?;
         self.state = state;

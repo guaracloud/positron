@@ -62,6 +62,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             validate_resume_leases(state, &sources, now)?;
         }
         let mut source_lease_owners = TailLeaseSet::with_capacity(sources.readers().len())?;
+        let mut source_lease_grants = Vec::new();
+        source_lease_grants
+            .try_reserve_exact(sources.readers().len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let mut source_lease_ids = Vec::new();
         let mut source_frontiers = Vec::new();
         source_lease_ids
@@ -132,7 +136,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             source_frontiers.push((shard, frontier));
             if let Some(source_lease) = source_lease {
                 source_lease_owners.push(TailLeaseOwner::new(authority, source_lease.identity()));
-                drop(source_lease);
+                source_lease_grants.push(source_lease);
             }
         }
         let mut frontiers = Vec::new();
@@ -237,6 +241,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             TailStart::Historical { max_rows } => max_rows,
             TailStart::Now => 1,
         };
+        let retain_source_grants =
+            matches!(start, TailStart::Historical { .. }) || state.historical_markers().is_some();
         let maximum_records = usize::try_from(query.budget.output_rows())
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidBudget))?
             .min(super::MAX_TAIL_BATCH_ROWS);
@@ -313,9 +319,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             service: self,
             query,
             sources,
-            _lease: lease,
+            _lease: Some(lease),
             lease_owner,
             source_lease_owners,
+            source_lease_grants: if retain_source_grants {
+                source_lease_grants
+            } else {
+                Vec::new()
+            },
             state,
             cursor,
             header: Some(header),

@@ -31,16 +31,24 @@ impl LedgerStorage {
         repair: bool,
     ) -> Result<Vec<SegmentMetadata>, LedgerFailure> {
         let mut all_segments = Vec::new();
+        all_segments
+            .try_reserve_exact(snapshot.plaintext_object_count())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         for plaintext in snapshot.plaintext_objects() {
             if let Some(metadata) = decode_metadata(plaintext)? {
                 all_segments.push(metadata);
             }
         }
         self.reject_unpublished_entries(&all_segments, repair)?;
-        let mut segments: Vec<_> = all_segments
-            .into_iter()
-            .filter(|metadata| metadata.scope == scope)
-            .collect();
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(all_segments.len())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        for metadata in all_segments {
+            if metadata.scope == scope {
+                segments.push(metadata);
+            }
+        }
         if segments
             .iter()
             .filter(|metadata| metadata.state == SegmentState::Active)

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::{
     HistoricalMarker, TailCursorState, TailPosition, TailSourceBinding, invalid, resource,
 };
+use crate::result_key::{HISTORICAL_TOTAL_KEY_BYTES, HistoricalTotalKey};
 use crate::{QueryFailure, QueryFailureCode};
 #[path = "cursor_wire_helpers.rs"]
 mod helpers;
@@ -99,6 +100,15 @@ impl TailCursor {
             bytes.extend_from_slice(&state.elapsed_seconds().to_be_bytes());
             bytes.push(u8::from(state.reduced_pruning()));
             bytes.push(limiting_budget_code(state.limiting_budget()));
+            if state.historical_markers().is_some() {
+                if let Some(key) = state.historical_key() {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&key.encode());
+                } else {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&[0; HISTORICAL_TOTAL_KEY_BYTES]);
+                }
+            }
             if let Some(bindings) = state.source_bindings() {
                 bytes.extend_from_slice(&BIND_MAGIC);
                 bytes.extend_from_slice(
@@ -267,7 +277,26 @@ impl TailCursor {
                 reduced,
                 limiting_budget_from_code(*payload.get(markers_end + 17).ok_or_else(invalid)?)?,
             );
-            let bindings_start = stats_end;
+            let history_key_end = if marker_count > 0 {
+                let flag = *payload.get(stats_end).ok_or_else(invalid)?;
+                let key_start = stats_end.checked_add(1).ok_or_else(invalid)?;
+                let key_end = key_start
+                    .checked_add(HISTORICAL_TOTAL_KEY_BYTES)
+                    .ok_or_else(invalid)?;
+                let key_bytes = payload.get(key_start..key_end).ok_or_else(invalid)?;
+                match flag {
+                    0 if key_bytes.iter().all(|byte| *byte == 0) => {},
+                    1 => {
+                        let key = HistoricalTotalKey::decode(key_bytes)?.ok_or_else(invalid)?;
+                        state.set_historical_key(Some(key));
+                    },
+                    _ => return Err(invalid()),
+                }
+                key_end
+            } else {
+                stats_end
+            };
+            let bindings_start = history_key_end;
             if payload.len() > bindings_start {
                 let binding_magic_end = bindings_start
                     .checked_add(BIND_MAGIC.len())

@@ -6,6 +6,7 @@ mod progress;
 #[path = "cursor_wire.rs"]
 mod wire;
 pub(super) use super::history::HistoricalMarker;
+use crate::result_key::HistoricalTotalKey;
 pub use wire::TailCursor;
 pub(crate) use wire::budget_digest;
 #[cfg(feature = "test-support")]
@@ -108,6 +109,7 @@ pub struct TailCursorState {
     repeated_batch_count: u64,
     budget_digest: [u8; 32],
     pub(super) historical_markers: Option<Vec<HistoricalMarker>>,
+    pub(super) historical_key: Option<HistoricalTotalKey>,
     pub(super) snapshot_identity: [u8; 32],
     pub(super) snapshot_generation: u64,
     pub(super) source_bindings: Option<Vec<TailSourceBinding>>,
@@ -157,6 +159,7 @@ impl TailCursorState {
             repeated_batch_count: 0,
             budget_digest: [0; 32],
             historical_markers: None,
+            historical_key: None,
             snapshot_identity: [0; 32],
             snapshot_generation: 0,
             source_bindings: None,
@@ -186,6 +189,10 @@ impl TailCursorState {
     }
     pub const fn record_bound(&self) -> bool {
         self.record_bound
+    }
+
+    pub(super) fn set_record_bound(&mut self, record_bound: bool) {
+        self.record_bound = record_bound;
     }
     pub const fn expiry(&self) -> u64 {
         self.expiry

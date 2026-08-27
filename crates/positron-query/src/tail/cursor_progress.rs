@@ -16,8 +16,9 @@ impl TailCursorState {
         positions.extend_from_slice(&self.positions);
         for update in updates {
             let entry = positions
-                .iter_mut()
-                .find(|entry| entry.shard == update.shard)
+                .binary_search_by_key(&update.shard, |entry| entry.shard)
+                .ok()
+                .and_then(|index| positions.get_mut(index))
                 .ok_or_else(|| crate::QueryFailure::new(crate::QueryFailureCode::InvalidCursor))?;
             if (update.position, update.ordinal) < (entry.position, entry.ordinal) {
                 return Err(invalid());
@@ -48,6 +49,7 @@ impl TailCursorState {
         state.budget_digest = self.budget_digest;
         state.set_resume_stats(self.resume_count, self.repeated_batch_count);
         state.historical_markers = self.historical_markers.clone();
+        state.historical_key = self.historical_key;
         state.snapshot_identity = self.snapshot_identity;
         state.snapshot_generation = self.snapshot_generation;
         state.source_bindings = self.source_bindings.clone();
@@ -74,8 +76,9 @@ impl TailCursorState {
         positions.extend_from_slice(&self.positions);
         for update in updates {
             let entry = positions
-                .iter_mut()
-                .find(|entry| entry.shard == update.shard)
+                .binary_search_by_key(&update.shard, |entry| entry.shard)
+                .ok()
+                .and_then(|index| positions.get_mut(index))
                 .ok_or_else(|| crate::QueryFailure::new(crate::QueryFailureCode::InvalidCursor))?;
             if (update.position, update.ordinal) < (entry.position, entry.ordinal) {
                 return Err(invalid());
@@ -105,6 +108,7 @@ impl TailCursorState {
         state.budget_digest = self.budget_digest;
         state.set_resume_stats(self.resume_count, self.repeated_batch_count);
         state.historical_markers = self.historical_markers.clone();
+        state.historical_key = self.historical_key;
         state.snapshot_identity = self.snapshot_identity;
         state.snapshot_generation = self.snapshot_generation;
         state.source_bindings = self.source_bindings.clone();

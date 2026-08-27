@@ -84,7 +84,6 @@ impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledge
         for attempt in 0..MAX_SNAPSHOT_RETRIES {
             self.catalog.refresh_state()?;
             let basis = self.catalog.pin()?;
-            let metadata = self.storage.catalog_segments_observed(&basis, self.scope)?;
             let reconstruction_claim = WorkClaim::tenant(
                 self.scope.tenant_id(),
                 WorkKind::InteractiveQueryTail,
@@ -96,6 +95,7 @@ impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledge
                 .governor()
                 .reserve(reconstruction_claim)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+            let metadata = self.storage.catalog_segments_observed(&basis, self.scope)?;
             let reconstruction = reconstruct(
                 &self.storage,
                 &metadata,

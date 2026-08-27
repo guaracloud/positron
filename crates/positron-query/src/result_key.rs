@@ -1,6 +1,9 @@
-use positron_domain::routing::{CommitPosition, RecordOrdinal};
+use std::cmp::Ordering;
+
+use positron_domain::routing::{CommitPosition, RecordOrdinal, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 
+use crate::plan::{OrderDirection, OrderSpec};
 use crate::{QueryFailure, QueryFailureCode, QueryRecord};
 
 /// Fixed authenticated representation of the last delivered result.
@@ -126,11 +129,96 @@ impl ResultResumeKey {
                     && self.record_ordinal == record.record_ordinal()))
             && self.result_digest == result_digest
     }
+
+    pub(crate) fn compare_ordering(self, other: Self, ordering: OrderSpec) -> Ordering {
+        let primary = self.ordering_time.cmp(&other.ordering_time);
+        let primary = match ordering.primary_direction() {
+            OrderDirection::Ascending => primary,
+            OrderDirection::Descending => primary.reverse(),
+        };
+        if primary != Ordering::Equal {
+            return primary;
+        }
+        let commit = self.commit_position.cmp(&other.commit_position);
+        let commit = match ordering.commit_direction() {
+            OrderDirection::Ascending => commit,
+            OrderDirection::Descending => commit.reverse(),
+        };
+        if commit != Ordering::Equal {
+            return commit;
+        }
+        let ordinal = self.record_ordinal.cmp(&other.record_ordinal);
+        match ordering.commit_direction() {
+            OrderDirection::Ascending => ordinal,
+            OrderDirection::Descending => ordinal.reverse(),
+        }
+    }
+}
+
+/// The bounded continuation for a canonical historical tail result.
+///
+/// The result key owns the query ordering fields and comparator. A source is
+/// appended only to make otherwise equal records from different shards total.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalTotalKey {
+    result: ResultResumeKey,
+    source: VirtualShardId,
+}
+
+pub(crate) const HISTORICAL_TOTAL_KEY_BYTES: usize = RESULT_RESUME_KEY_BYTES + 4;
+
+impl HistoricalTotalKey {
+    pub(crate) fn from_record(record: &QueryRecord, source: VirtualShardId) -> Self {
+        Self {
+            result: ResultResumeKey::from_record(record, [0; 32]),
+            source,
+        }
+    }
+
+    pub(crate) fn compare(self, other: Self, ordering: OrderSpec) -> Ordering {
+        self.result
+            .compare_ordering(other.result, ordering)
+            .then_with(|| self.source.cmp(&other.source))
+    }
+
+    pub(crate) fn encode(self) -> [u8; HISTORICAL_TOTAL_KEY_BYTES] {
+        let mut bytes = [0; HISTORICAL_TOTAL_KEY_BYTES];
+        bytes[..RESULT_RESUME_KEY_BYTES].copy_from_slice(&self.result.encode());
+        bytes[RESULT_RESUME_KEY_BYTES..].copy_from_slice(&self.source.value().to_be_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Option<Self>, QueryFailure> {
+        if bytes.len() != HISTORICAL_TOTAL_KEY_BYTES {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        let result = ResultResumeKey::decode(
+            bytes
+                .get(..RESULT_RESUME_KEY_BYTES)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?,
+        )?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        let source = VirtualShardId::new(u32::from_be_bytes(
+            bytes
+                .get(RESULT_RESUME_KEY_BYTES..)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?
+                .try_into()
+                .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?,
+        ))
+        .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        Ok(Some(Self { result, source }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RESULT_RESUME_KEY_BYTES, ResultResumeKey};
+    use positron_domain::routing::VirtualShardId;
+
+    use super::{
+        HISTORICAL_TOTAL_KEY_BYTES, HistoricalTotalKey, RESULT_RESUME_KEY_BYTES, ResultResumeKey,
+    };
 
     #[test]
     fn fixed_resume_key_rejects_short_empty_and_nonzero_reserved_bytes() {
@@ -162,5 +250,15 @@ mod tests {
                 .expect("tagged keys must carry a result frontier");
             assert_eq!(decoded.encode(), encoded);
         }
+    }
+
+    #[test]
+    fn historical_total_key_round_trips_its_source_tiebreaker() {
+        let record = crate::QueryRecord::count_record(1);
+        let source = VirtualShardId::new(7).expect("valid source");
+        let key = HistoricalTotalKey::from_record(&record, source);
+        let bytes = key.encode();
+        assert_eq!(bytes.len(), HISTORICAL_TOTAL_KEY_BYTES);
+        assert_eq!(HistoricalTotalKey::decode(&bytes), Ok(Some(key)));
     }
 }

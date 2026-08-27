@@ -89,6 +89,26 @@ fn extended_cursor_round_trips_markers_runtime_stats_and_each_budget_dimension()
 }
 
 #[test]
+fn extended_cursor_authenticates_and_round_trips_historical_total_key() {
+    let protector = positron_kernel::fuzz_control_token_protector();
+    let mut state = state();
+    state
+        .set_historical_markers(vec![
+            super::HistoricalMarker::new(CommitPosition::origin(), CommitPosition::origin())
+                .expect("valid marker"),
+        ])
+        .expect("marker count matches positions");
+    let key = crate::result_key::HistoricalTotalKey::from_record(
+        &crate::QueryRecord::count_record(1),
+        VirtualShardId::new(1).expect("source"),
+    );
+    state.set_historical_key(Some(key));
+    let encoded = TailCursor::encode(&protector, &state).expect("key cursor encodes");
+    let decoded = TailCursor::decode(&protector, &encoded).expect("key cursor decodes");
+    assert_eq!(decoded.historical_key(), Some(key));
+}
+
+#[test]
 fn extended_cursor_rejects_bad_magic_marker_count_reduced_flag_and_budget_code() {
     let protector = positron_kernel::fuzz_control_token_protector();
     let mut state = state();

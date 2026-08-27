@@ -53,6 +53,11 @@ pub(super) fn extension_bytes(state: &TailCursorState) -> Result<usize, QueryFai
         return Ok(0);
     }
     let markers = state.historical_markers().map_or(0, <[_]>::len);
+    let historical_key = if state.historical_markers().is_some() {
+        crate::result_key::HISTORICAL_TOTAL_KEY_BYTES + 1
+    } else {
+        0
+    };
     let bindings = state.source_bindings().map_or(0, |bindings| {
         4 + 2 + 32 + 8 + bindings.len().saturating_mul(24)
     });
@@ -60,6 +65,7 @@ pub(super) fn extension_bytes(state: &TailCursorState) -> Result<usize, QueryFai
         .checked_add(2)
         .and_then(|value| value.checked_add(markers.checked_mul(16)?))
         .and_then(|value| value.checked_add(18))
+        .and_then(|value| value.checked_add(historical_key))
         .and_then(|value| value.checked_add(bindings))
         .ok_or_else(resource)
 }

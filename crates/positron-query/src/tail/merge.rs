@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use super::materialize::TailCandidate;
 use super::{TailPosition, TailSession};
 use crate::plan::OrderSpec;
+use crate::result_key::HistoricalTotalKey;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode};
 
 #[derive(Clone, Copy)]
@@ -69,6 +70,32 @@ impl TailSession<'_, '_, '_, '_> {
     }
 }
 
+impl TailSession<'_, '_, '_, '_> {
+    pub(super) fn update_position(
+        &mut self,
+        positions: &mut Vec<TailPosition>,
+        candidate: TailPosition,
+    ) -> Result<(), QueryFailure> {
+        for position in positions.iter_mut() {
+            if self.query.cancellation.is_cancelled() {
+                return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+            }
+            self.charge_merge_comparison()?;
+            if position.shard() == candidate.shard() {
+                if candidate > *position {
+                    *position = candidate;
+                }
+                return Ok(());
+            }
+        }
+        positions
+            .try_reserve(1)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        positions.push(candidate);
+        Ok(())
+    }
+}
+
 pub(super) fn compare_candidates(
     left: &TailCandidate,
     right: &TailCandidate,
@@ -76,8 +103,10 @@ pub(super) fn compare_candidates(
 ) -> Ordering {
     match ordering {
         TailOrdering::Historical(ordering) => {
-            crate::execution_support::compare_records(&left.record, &right.record, ordering)
-                .then_with(|| left.position.cmp(&right.position))
+            HistoricalTotalKey::from_record(&left.record, left.position.shard()).compare(
+                HistoricalTotalKey::from_record(&right.record, right.position.shard()),
+                ordering,
+            )
         },
         TailOrdering::CommitVector => left
             .position
@@ -96,24 +125,4 @@ impl TailSession<'_, '_, '_, '_> {
             TailOrdering::Historical(self.query.plan.ordering())
         }
     }
-}
-
-pub(super) fn update_position(
-    positions: &mut Vec<TailPosition>,
-    candidate: TailPosition,
-) -> Result<(), QueryFailure> {
-    if let Some(existing) = positions
-        .iter_mut()
-        .find(|position| position.shard() == candidate.shard())
-    {
-        if candidate > *existing {
-            *existing = candidate;
-        }
-    } else {
-        positions
-            .try_reserve(1)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        positions.push(candidate);
-    }
-    Ok(())
 }

@@ -44,6 +44,9 @@ impl TailSession<'_, '_, '_, '_> {
                 crate::QueryBudgetDimension::OutputRows,
             ));
         }
+        if !self.historical_frontiers.is_empty() {
+            return self.fill_historical_sources(limit, queue_memory);
+        }
         let snapshots = self
             .sources
             .readers()
@@ -67,15 +70,8 @@ impl TailSession<'_, '_, '_, '_> {
         positions
             .try_reserve_exact(source_count)
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        let historical = !self.historical_frontiers.is_empty();
-        let mut all_sources_complete = true;
         for snapshot in snapshots {
             let shard = snapshot.scope().shard_id();
-            let handoff_frontier = self
-                .historical_frontiers
-                .iter()
-                .find(|position| position.shard() == shard)
-                .map(|position| position.position());
             let after = self
                 .state
                 .positions()
@@ -88,13 +84,8 @@ impl TailSession<'_, '_, '_, '_> {
             } else {
                 ScanAfter::Position(after.position())
             };
-            let (source_records, position, complete) = self.materialize_snapshot(
-                &snapshot,
-                after,
-                handoff_frontier.unwrap_or_else(|| snapshot.frontier()),
-                limit,
-            )?;
-            all_sources_complete &= complete;
+            let (source_records, position, _) =
+                self.materialize_snapshot(&snapshot, after, snapshot.frontier(), limit)?;
             let mut source_records = source_records;
             self.sort_candidates(&mut source_records)?;
             let had_candidates = !source_records.is_empty();
@@ -107,6 +98,10 @@ impl TailSession<'_, '_, '_, '_> {
                     .checked_add(candidate.record.retained_dynamic_bytes()?)
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))
             })?;
+            let mut queue = VecDeque::new();
+            queue
+                .try_reserve_exact(source_records.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
             let reserved = self.buffer.reserve_queue_bytes(
                 slots
                     .checked_add(dynamic)
@@ -115,10 +110,6 @@ impl TailSession<'_, '_, '_, '_> {
             *queue_memory = queue_memory
                 .checked_add(reserved)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-            let mut queue = VecDeque::new();
-            queue
-                .try_reserve_exact(source_records.len())
-                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
             queue.extend(source_records);
             source_batches.push(queue);
             source_progress.push((position, had_candidates));
@@ -131,6 +122,7 @@ impl TailSession<'_, '_, '_, '_> {
         selected_shards
             .try_reserve_exact(source_count)
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        selected_shards.resize(source_count, false);
         while records.len() < limit {
             let mut best: Option<usize> = None;
             for (source_index, queue) in source_batches.iter().enumerate() {
@@ -158,27 +150,21 @@ impl TailSession<'_, '_, '_, '_> {
             let candidate = source_batches[source_index]
                 .pop_front()
                 .ok_or_else(super::internal)?;
-            if !selected_shards.contains(&source_index) {
-                selected_shards.push(source_index);
-            }
-            crate::tail::merge::update_position(&mut positions, candidate.position)?;
+            selected_shards[source_index] = true;
+            self.update_position(&mut positions, candidate.position)?;
             records.push(candidate.record);
         }
         for (source_index, (scanned, had_candidates)) in source_progress.into_iter().enumerate() {
             if source_batches[source_index].is_empty()
                 && let Some(scanned) = scanned
-                && (!had_candidates || selected_shards.contains(&source_index))
+                && (!had_candidates || selected_shards[source_index])
             {
-                crate::tail::merge::update_position(&mut positions, scanned)?;
+                self.update_position(&mut positions, scanned)?;
             }
         }
-        let historical_complete = historical && all_sources_complete;
         if records.is_empty() {
             if !positions.is_empty() {
-                self.advance_positions(&positions, historical_complete)?;
-                if historical_complete {
-                    self.historical_frontiers.clear();
-                }
+                self.advance_positions(&positions, false)?;
             }
             return Ok(());
         }
@@ -229,12 +215,15 @@ impl TailSession<'_, '_, '_, '_> {
             },
             &mut digest_memory,
         )?;
-        if self.buffer.push(records).is_err() {
-            self.terminal_after_progress_failure(TailTerminal::ConsumerLagged {
-                cursor: Some(self.cursor.clone()),
-                stats: self.terminal_stats(),
-            });
-            return Ok(());
+        if let Err(failure) = self.buffer.push(records) {
+            if failure.code() == QueryFailureCode::ResourceAdmissionRefused {
+                self.terminal_after_progress_failure(TailTerminal::ConsumerLagged {
+                    cursor: Some(self.cursor.clone()),
+                    stats: self.terminal_stats(),
+                });
+                return Ok(());
+            }
+            return Err(failure);
         }
         self.memory_peak_bytes = self.memory_peak_bytes.max(self.buffer.memory_peak());
         self.pending_batch = Some(PendingBatch {
@@ -242,12 +231,13 @@ impl TailSession<'_, '_, '_, '_> {
             digest,
             rows,
             bytes,
-            historical_complete,
+            historical_complete: false,
+            historical_key: None,
         });
         Ok(())
     }
 
-    fn materialize_snapshot(
+    pub(super) fn materialize_snapshot(
         &mut self,
         snapshot: &positron_kernel::LedgerSnapshot<'_>,
         after: ScanAfter,

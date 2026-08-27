@@ -49,6 +49,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
     pub(super) fn prepare_lease_rotation(
         &self,
         state: &mut TailCursorState,
+        force_refresh: bool,
     ) -> Result<LeaseRotation<'kernel, 'catalog, 'ledger>, QueryFailure> {
         let Some(existing_bindings) = state.source_bindings() else {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
@@ -77,7 +78,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 .find(|binding| binding.shard() == shard)
                 .copied()
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-            if position.position() <= binding.frontier() {
+            if !force_refresh && position.position() <= binding.frontier() {
                 continue;
             }
             let authority = reader
@@ -169,30 +170,35 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 },
                 Err(failure) => {
                     drop(secondary_grants);
-                    let mut rollback_failure = committed_secondary
-                        .into_iter()
-                        .rev()
-                        .find_map(|index| secondary[index].replacement.rollback().err())
-                        .map(crate::execution_support::map_ledger_failure);
-                    if rollback_failure.is_none()
-                        && let Some(replacement) = primary.as_mut()
-                        && primary_grant.take().is_some()
-                    {
-                        rollback_failure = replacement
-                            .replacement
-                            .rollback()
-                            .err()
-                            .map(crate::execution_support::map_ledger_failure);
+                    let mut rollback_failure = None;
+                    for index in committed_secondary.into_iter().rev() {
+                        if let Err(failure) = secondary[index].replacement.rollback() {
+                            retain_stronger(
+                                &mut rollback_failure,
+                                crate::execution_support::map_ledger_failure(failure),
+                            );
+                        }
                     }
-                    return Err(rollback_failure
-                        .unwrap_or_else(|| crate::execution_support::map_ledger_failure(failure)));
+                    if let Some(replacement) = primary.as_mut()
+                        && primary_grant.take().is_some()
+                        && let Err(failure) = replacement.replacement.rollback()
+                    {
+                        retain_stronger(
+                            &mut rollback_failure,
+                            crate::execution_support::map_ledger_failure(failure),
+                        );
+                    }
+                    let failure = crate::execution_support::map_ledger_failure(failure);
+                    return Err(rollback_failure.map_or(failure.clone(), |rollback| {
+                        stronger_failure(rollback, failure)
+                    }));
                 },
             }
         }
         if let (Some(replacement), Some(grant)) = (primary, primary_grant.take()) {
             let owner = TailLeaseOwner::new(replacement.authority, grant.identity());
             let old = std::mem::replace(&mut self.lease_owner, owner);
-            self._lease = grant;
+            self._lease = Some(grant);
             drop(old);
         }
         for (replacement, grant) in secondary.into_iter().zip(secondary_grants) {
@@ -201,8 +207,39 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 .source_lease_owners
                 .replace(replacement.old_identity, owner)?;
             drop(old);
+            if let Some(index) = self
+                .source_lease_grants
+                .iter()
+                .position(|existing| existing.identity() == replacement.old_identity)
+            {
+                drop(self.source_lease_grants.swap_remove(index));
+            }
             drop(grant);
         }
         Ok(())
+    }
+}
+
+fn retain_stronger(current: &mut Option<QueryFailure>, candidate: QueryFailure) {
+    match current {
+        Some(existing) => *existing = stronger_failure(existing.clone(), candidate),
+        None => *current = Some(candidate),
+    }
+}
+
+fn stronger_failure(left: QueryFailure, right: QueryFailure) -> QueryFailure {
+    if failure_rank(right.code()) > failure_rank(left.code()) {
+        right
+    } else {
+        left
+    }
+}
+
+fn failure_rank(code: QueryFailureCode) -> u8 {
+    match code {
+        QueryFailureCode::Internal | QueryFailureCode::MalformedPersistentData => 4,
+        QueryFailureCode::StoreUnavailable | QueryFailureCode::AuthorizationChanged => 3,
+        QueryFailureCode::ResourceExhausted | QueryFailureCode::BudgetExhausted => 2,
+        _ => 1,
     }
 }

@@ -1,6 +1,7 @@
 use positron_domain::routing::CommitPosition;
 
 use super::cursor::TailCursorState;
+use crate::result_key::HistoricalTotalKey;
 use crate::{QueryFailure, QueryFailureCode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +51,15 @@ impl TailCursorState {
 
     pub(super) fn clear_historical_markers(&mut self) {
         self.historical_markers = None;
+        self.historical_key = None;
+    }
+
+    pub(super) fn historical_key(&self) -> Option<HistoricalTotalKey> {
+        self.historical_key
+    }
+
+    pub(super) fn set_historical_key(&mut self, key: Option<HistoricalTotalKey>) {
+        self.historical_key = key;
     }
 }
 

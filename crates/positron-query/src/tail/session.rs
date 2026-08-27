@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+use crate::result_key::HistoricalTotalKey;
 use crate::stream::QueryBatch;
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
@@ -37,6 +38,7 @@ pub(super) struct PendingBatch {
     pub(super) rows: u64,
     pub(super) bytes: u64,
     pub(super) historical_complete: bool,
+    pub(super) historical_key: Option<HistoricalTotalKey>,
 }
 
 struct AdvancedBatch<'kernel, 'catalog, 'ledger> {
@@ -51,9 +53,10 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) service: &'service QueryService<'kernel, 'catalog, 'ledger>,
     pub(super) query: PlannedQuery<'kernel>,
     pub(super) sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
-    pub(super) _lease: positron_kernel::SnapshotLeaseGrant<'kernel>,
+    pub(super) _lease: Option<positron_kernel::SnapshotLeaseGrant<'kernel>>,
     pub(super) lease_owner: TailLeaseOwner<'ledger, 'kernel, 'catalog>,
     pub(super) source_lease_owners: TailLeaseSet<'ledger, 'kernel, 'catalog>,
+    pub(super) source_lease_grants: Vec<positron_kernel::SnapshotLeaseGrant<'kernel>>,
     pub(super) state: TailCursorState,
     pub(super) cursor: TailCursor,
     pub(super) header: Option<crate::stream::QueryHeader>,
@@ -103,6 +106,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         let rows = pending.rows;
         let bytes = pending.bytes;
         let historical_complete = pending.historical_complete;
+        let historical_key = pending.historical_key;
         let output_rows = self.output_rows.checked_add(rows).ok_or_else(|| {
             QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows)
         })?;
@@ -115,6 +119,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             output_rows,
             output_bytes,
             historical_complete,
+            historical_key,
         ) {
             Ok(advanced) => advanced,
             Err(failure) => {
@@ -258,11 +263,11 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             // A caller that has taken the opaque cursor may reconnect after an
             // incomplete terminal. Keep the exact durable leases alive; their
             // bounded expiry and the kernel's cleanup path remain authoritative.
-            if self
-                .state
-                .source_binding(self._lease.snapshot().scope().shard_id())
-                .is_some()
-            {
+            if self._lease.as_ref().is_some_and(|lease| {
+                self.state
+                    .source_binding(lease.snapshot().scope().shard_id())
+                    .is_some()
+            }) {
                 self.lease_owner.retain();
             }
             self.source_lease_owners.retain();

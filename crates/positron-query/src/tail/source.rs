@@ -48,7 +48,12 @@ impl<'kernel, 'catalog, 'ledger> TailSourceSet<'kernel, 'catalog, 'ledger> {
     pub(crate) fn single(
         reader: CommittedLedgerReader<'kernel, 'catalog, 'ledger>,
     ) -> Result<Self, QueryFailure> {
-        Self::new(vec![reader])
+        let mut readers = Vec::new();
+        readers
+            .try_reserve_exact(1)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        readers.push(reader);
+        Self::new(readers)
     }
 
     pub(crate) fn readers(&self) -> &[CommittedLedgerReader<'kernel, 'catalog, 'ledger>] {
@@ -94,7 +99,7 @@ impl<'kernel, 'catalog, 'ledger> TailSourceSet<'kernel, 'catalog, 'ledger> {
 
     pub(crate) fn contains(&self, shard: VirtualShardId) -> bool {
         self.readers
-            .iter()
-            .any(|reader| reader.scope().shard_id() == shard)
+            .binary_search_by_key(&shard, |reader| reader.scope().shard_id())
+            .is_ok()
     }
 }
