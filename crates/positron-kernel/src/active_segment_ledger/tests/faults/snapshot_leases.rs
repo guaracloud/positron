@@ -4,6 +4,32 @@ use crate::{
     OrdinaryPool, ResourceAmounts, ResourceDimension, SnapshotLeaseUsage, WorkClaim, WorkKind,
 };
 
+fn resize_blocker(
+    authority: &crate::StorageKernelResourceAuthority,
+    tenant: positron_domain::identity::TenantId,
+) -> Result<crate::ResourceReservation<'_>, Box<dyn Error>> {
+    let snapshot = authority.governor().inspect()?;
+    let dimension = ResourceDimension::MemoryBytes;
+    let shared = snapshot
+        .pool_capacity(OrdinaryPool::Shared, dimension)
+        .checked_sub(snapshot.pool_usage(OrdinaryPool::Shared, dimension))
+        .ok_or("shared memory usage exceeds capacity")?;
+    let query = snapshot
+        .pool_capacity(OrdinaryPool::InteractiveQueryTail, dimension)
+        .checked_sub(snapshot.pool_usage(OrdinaryPool::InteractiveQueryTail, dimension))
+        .ok_or("query memory usage exceeds capacity")?;
+    let amount = shared
+        .checked_add(query)
+        .and_then(|available| available.checked_sub(1))
+        .ok_or("resize blocker cannot leave one byte of headroom")?;
+    let claim = WorkClaim::tenant(
+        tenant,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(dimension, amount)?,
+    )?;
+    Ok(authority.governor().reserve(claim)?)
+}
+
 #[test]
 fn snapshot_lease_pins_exact_visibility_across_append_restart_release_and_expiry()
 -> Result<(), Box<dyn Error>> {
@@ -123,6 +149,273 @@ fn fresh_lease_rejects_expiry_before_the_recovered_clock_floor() -> Result<(), B
             .expect_err("the durable clock floor must preserve a positive lease interval");
         assert_eq!(failure.code(), LedgerFailureCode::InvalidInput);
         reopened.release_snapshot_lease(held)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn prepared_snapshot_lease_replacement_is_atomic_and_reversible() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let old_identity = lease.identity();
+        drop(lease);
+        ledger.append(prepared(scope, b"future")?)?;
+
+        let mut failed = ledger.prepare_snapshot_lease_replacement(old_identity, 101, 200)?;
+        assert_eq!(failed.old_identity(), old_identity);
+        assert_eq!(
+            failed
+                .snapshot()
+                .ok_or("candidate snapshot")?
+                .frontier()
+                .value(),
+            2
+        );
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || failed.commit())
+            .expect_err("a replacement publication fault must preserve the old lease");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        drop(failed);
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(old_identity, 101)?
+                .snapshot()
+                .frontier()
+                .value(),
+            1
+        );
+        ledger.release_snapshot_lease(old_identity)?;
+
+        let old = ledger.create_snapshot_lease(102, 200)?;
+        let old_identity = old.identity();
+        drop(old);
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(old_identity, 103, 200)?;
+        let grant = replacement.commit()?;
+        let new_identity = grant.identity();
+        drop(grant);
+        assert!(replacement.snapshot().is_none());
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(old_identity, 103)
+                .expect_err("committed replacement must retire its old identity")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        replacement.rollback()?;
+        assert_eq!(
+            ledger.resume_snapshot_lease(old_identity, 104)?.identity(),
+            old_identity
+        );
+        ledger.release_snapshot_lease(old_identity)?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(new_identity, 104)
+                .expect_err("rolled back replacement must retire its new identity")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn prepared_snapshot_lease_replacement_rejects_stale_and_invalid_transitions()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x76; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let old_identity = lease.identity();
+        drop(lease);
+        let failure = ledger
+            .prepare_snapshot_lease_replacement(old_identity, 100, 100)
+            .err()
+            .ok_or("an empty replacement interval unexpectedly succeeded")?;
+        assert_eq!(failure.code(), LedgerFailureCode::InvalidInput);
+        assert!(
+            ledger
+                .prepare_snapshot_lease_replacement(old_identity, 99, 200)
+                .is_err()
+        );
+        drop(ledger.resume_snapshot_lease(old_identity, 101)?);
+        let failure = ledger
+            .prepare_snapshot_lease_replacement(old_identity, 100, 101)
+            .err()
+            .ok_or("the recovered clock floor unexpectedly allowed an empty interval")?;
+        assert_eq!(failure.code(), LedgerFailureCode::InvalidInput);
+        ledger.append(prepared(scope, b"future")?)?;
+
+        let mut stale = ledger.prepare_snapshot_lease_replacement(old_identity, 102, 200)?;
+        ledger.record_snapshot_lease_usage(
+            old_identity,
+            SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+        )?;
+        assert_eq!(
+            stale
+                .commit()
+                .expect_err("a changed old record must not be overwritten")
+                .code(),
+            LedgerFailureCode::ConcurrentWriter
+        );
+        assert!(stale.rollback().is_ok());
+        drop(stale);
+
+        let missing = ledger.create_snapshot_lease(103, 200)?;
+        let missing_identity = missing.identity();
+        drop(missing);
+        let mut missing_replacement =
+            ledger.prepare_snapshot_lease_replacement(missing_identity, 104, 200)?;
+        ledger.release_snapshot_lease(missing_identity)?;
+        assert_eq!(
+            missing_replacement
+                .commit()
+                .expect_err("a retired old identity cannot be replaced")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        drop(missing_replacement);
+
+        let old = ledger.create_snapshot_lease(105, 200)?;
+        let old_identity = old.identity();
+        drop(old);
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(old_identity, 106, 200)?;
+        assert!(replacement.rollback().is_ok());
+        let grant = replacement.commit()?;
+        let new_identity = grant.identity();
+        drop(grant);
+        assert!(replacement.commit().is_err());
+        replacement.rollback()?;
+        assert!(replacement.rollback().is_ok());
+        ledger.release_snapshot_lease(old_identity)?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(new_identity, 107)
+                .expect_err("rollback must retire the candidate identity")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+
+        let old = ledger.create_snapshot_lease(108, 200)?;
+        let old_identity = old.identity();
+        drop(old);
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(old_identity, 109, 200)?;
+        let grant = replacement.commit()?;
+        let new_identity = grant.identity();
+        drop(grant);
+        ledger.release_snapshot_lease(new_identity)?;
+        assert_eq!(
+            replacement
+                .rollback()
+                .expect_err("a retired candidate cannot be rolled back")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+
+        let old = ledger.create_snapshot_lease(110, 200)?;
+        let old_identity = old.identity();
+        drop(old);
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(old_identity, 111, 200)?;
+        let grant = replacement.commit()?;
+        let new_identity = grant.identity();
+        drop(grant);
+        ledger.record_snapshot_lease_usage(
+            new_identity,
+            SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0),
+        )?;
+        assert_eq!(
+            replacement
+                .rollback()
+                .expect_err("a changed candidate must not be overwritten")
+                .code(),
+            LedgerFailureCode::ConcurrentWriter
+        );
+        ledger.release_snapshot_lease(new_identity)?;
+
+        let old = ledger.create_snapshot_lease(112, 200)?;
+        let old_identity = old.identity();
+        drop(old);
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(old_identity, 113, 200)?;
+        let grant = replacement.commit()?;
+        let new_identity = grant.identity();
+        drop(grant);
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            replacement.rollback()
+        })
+        .expect_err("a rollback publication fault must remain retryable");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        replacement.rollback()?;
+        ledger.release_snapshot_lease(old_identity)?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(new_identity, 114)
+                .expect_err("a successful rollback removes the candidate")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn prepared_snapshot_lease_replacement_refusal_restores_its_reservation()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x77; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let lease = ledger.create_snapshot_lease(100, 200)?;
+        let identity = lease.identity();
+        drop(lease);
+        ledger.append(prepared(scope, b"future")?)?;
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(identity, 101, 200)?;
+        let blocker = resize_blocker(authority, scope.tenant)?;
+        let failure = replacement
+            .commit()
+            .expect_err("replacement growth must refuse under bounded pressure");
+        assert_eq!(failure.code(), LedgerFailureCode::ResourceAdmissionRefused);
+        drop(blocker);
+        assert_eq!(
+            ledger.resume_snapshot_lease(identity, 102)?.identity(),
+            identity
+        );
+        ledger.release_snapshot_lease(identity)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn prepared_snapshot_lease_replacement_rejects_a_durable_expiry() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x78; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0x78, |bytes| {
+            bytes[103..111].copy_from_slice(&101_u64.to_be_bytes());
+        })?;
+        let failure = ledger
+            .prepare_snapshot_lease_replacement(identity, 101, 200)
+            .err()
+            .ok_or("replacement must reject a durable lease expired at observation time")?;
+        assert_eq!(failure.code(), LedgerFailureCode::SnapshotExpired);
         Ok(())
     })
 }

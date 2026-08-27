@@ -74,10 +74,21 @@ pub fn fuzz_tail_state_machine(data: &[u8]) {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use positron_domain::identity::TenantId;
     use positron_domain::routing::{SignalKind, VirtualShardId};
+    use positron_domain::time::UnixNanoseconds;
+    use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
     use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-    use positron_kernel::{ActiveSegmentLedger, Catalog, SegmentProtectionKey, SegmentScope};
-    use positron_query::{QueryBudget, QueryService, TailEvent, TailSourceSet, TailStart};
+    use positron_ingest::{IngestPolicy, PolicyEvaluation, PolicyReceiver};
+    use positron_kernel::{
+        ActiveSegmentLedger, Catalog, FixedLifecycleClockSource, LifecycleClock, ResourceAmounts,
+        ResourceDimension, SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority,
+        StoreBlockIdentity, WorkClaim, WorkKind,
+    };
+    use positron_query::{
+        QueryBudget, QueryService, TailCursor, TailEvent, TailSourceSet, TailStart,
+    };
+    use positron_signals::{LogRecord, LogStore};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -115,6 +126,52 @@ pub fn fuzz_tail_state_machine(data: &[u8]) {
             .ok()?
             .with_cpu_work_units(64)
             .ok()
+    }
+
+    fn append_valid<'kernel, 'catalog>(
+        authority: &'kernel StorageKernelResourceAuthority,
+        ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: TenantId,
+        shard: VirtualShardId,
+        identity: u8,
+        event_time: i64,
+        body: &str,
+    ) -> Option<()> {
+        let candidate = positron_ingest::NativeLogCandidate::new(
+            Some(event_time),
+            None,
+            Some(CandidateAttributeValue::string(body.to_owned())),
+            Vec::new(),
+            positron_ingest::LogMetadata::empty(),
+        );
+        let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)
+            .ok()?
+            .evaluate(candidate, PolicyReceiver::OtlpGrpc)
+            .ok()?
+        else {
+            return None;
+        };
+        let record =
+            LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)
+                .ok()?;
+        let capacity = authority
+            .governor()
+            .reserve(
+                WorkClaim::tenant(
+                    tenant,
+                    WorkKind::Ingest,
+                    ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576).ok()?,
+                )
+                .ok()?,
+            )
+            .ok()?;
+        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50)));
+        let identity = StoreBlockIdentity::new([identity; 16]).ok()?;
+        let block = LogStore::new()
+            .prepare(capacity, &clock, tenant, shard, identity, vec![record])
+            .ok()?
+            .into_store_block();
+        ledger.append(block).ok().map(|_| ())
     }
 
     fn sources<'kernel, 'catalog, 'ledger>(
@@ -172,6 +229,24 @@ pub fn fuzz_tail_state_machine(data: &[u8]) {
             SegmentProtectionKey::from_owned(Box::new([0x42; 32])),
         )
         .ok()?;
+        append_valid(
+            &instance._authority,
+            &first_ledger,
+            instance.tenant,
+            instance.logs_shard,
+            1,
+            90,
+            "first-historical",
+        )?;
+        append_valid(
+            &instance._authority,
+            &second_ledger,
+            instance.tenant,
+            second_shard,
+            2,
+            1,
+            "second-historical",
+        )?;
         let service = QueryService::new(instance._authority.governor(), &first_ledger, 1);
         let source = "pipeline:v1 logs | range query_time -100 100 | limit 1";
         let Some(query) = service.plan_pipeline(context, source, budget()?).ok() else {
@@ -180,28 +255,63 @@ pub fn fuzz_tail_state_machine(data: &[u8]) {
         let Some(mut session) = service
             .tail_with_sources(
                 query,
-                TailStart::Now,
+                TailStart::Historical { max_rows: 1 },
                 sources(&first_ledger, &second_ledger)?,
             )
             .ok()
         else {
             return None;
         };
+        let mut pending = None;
 
         for action in data.iter().copied().take(256) {
             match action % 8 {
-                0 | 1 | 2 => {
-                    let _ = session.poll();
+                0 | 1 => {
+                    if let Some(TailEvent::Batch(batch)) = session.poll() {
+                        pending = Some((batch.sequence(), batch.digest()));
+                    }
+                },
+                2 => {
+                    if let Some((sequence, digest)) = pending {
+                        let digest = if action & 1 == 0 {
+                            digest
+                        } else {
+                            [action; 32]
+                        };
+                        if session.acknowledge(sequence, digest).is_ok() {
+                            pending = None;
+                        }
+                    }
                 },
                 3 => {
-                    let sequence = u64::from(action);
-                    let _ = session.acknowledge(sequence, [action; 32]);
+                    let cursor = session.cursor().clone();
+                    let mut bytes = cursor.as_bytes().to_vec();
+                    if let Some(byte) = bytes.get_mut(24) {
+                        *byte ^= 1;
+                    }
+                    if let Ok(forged) = TailCursor::from_bytes(&bytes) {
+                        let Some(query) = service.plan_pipeline(context, source, budget()?).ok()
+                        else {
+                            return None;
+                        };
+                        let _ = service.resume_tail_with_sources(
+                            query,
+                            &forged,
+                            sources(&first_ledger, &second_ledger)?,
+                        );
+                    }
                 },
                 4 => {
                     session.disconnect();
                     let _ = session.poll();
+                    pending = None;
                 },
-                5 | 6 | 7 => {
+                5 => {
+                    session.cancel();
+                    let _ = session.poll();
+                    pending = None;
+                },
+                6 | 7 => {
                     let cursor = session.cursor().clone();
                     drop(session);
                     let Some(query) = service.plan_pipeline(context, source, budget()?).ok() else {

@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 #[path = "snapshot_lease_lifecycle.rs"]
 mod snapshot_lease_lifecycle;
 #[path = "snapshot_lease_support.rs"]
-mod snapshot_lease_support;
+pub(crate) mod snapshot_lease_support;
 use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFailureCode};
 use crate::CatalogGenerationId;
 pub(super) use snapshot_lease_support::map_catalog_failure;

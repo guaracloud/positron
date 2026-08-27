@@ -4,8 +4,16 @@ use positron_kernel::{ControlTokenAuthentication, ControlTokenProtector};
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{HistoricalMarker, TailCursorState, TailPosition, invalid, resource};
+use super::{
+    HistoricalMarker, TailCursorState, TailPosition, TailSourceBinding, invalid, resource,
+};
 use crate::{QueryFailure, QueryFailureCode};
+#[path = "cursor_wire_helpers.rs"]
+mod helpers;
+use helpers::{
+    array_at, array_at_at, commit_position, extension_bytes, limiting_budget_code,
+    limiting_budget_from_code, u16_at, u32_at, u64_at,
+};
 
 const MAGIC: [u8; 8] = *b"POSTCUR3";
 const PURPOSE: &[u8] = b"tail-cursor-v3";
@@ -13,6 +21,7 @@ const VERSION: u16 = 2;
 const MAX_BYTES: usize = 4_096;
 const AUTH_BYTES: usize = 32;
 const EXT_MAGIC: [u8; 4] = *b"TX01";
+const BIND_MAGIC: [u8; 4] = *b"TB01";
 const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 16 + 32 + 2;
 
 #[cfg(feature = "test-support")]
@@ -90,6 +99,20 @@ impl TailCursor {
             bytes.extend_from_slice(&state.elapsed_seconds().to_be_bytes());
             bytes.push(u8::from(state.reduced_pruning()));
             bytes.push(limiting_budget_code(state.limiting_budget()));
+            if let Some(bindings) = state.source_bindings() {
+                bytes.extend_from_slice(&BIND_MAGIC);
+                bytes.extend_from_slice(
+                    &u16::try_from(bindings.len())
+                        .map_err(|_| invalid())?
+                        .to_be_bytes(),
+                );
+                bytes.extend_from_slice(&state.snapshot_identity());
+                bytes.extend_from_slice(&state.snapshot_generation().to_be_bytes());
+                for binding in bindings {
+                    bytes.extend_from_slice(&binding.lease().to_bytes());
+                    bytes.extend_from_slice(&binding.frontier().value().to_be_bytes());
+                }
+            }
         }
         let auth = protector
             .authenticate_query_cursor(PURPOSE, &bytes)
@@ -177,6 +200,11 @@ impl TailCursor {
             record_bound = Some(position_record_bound);
             positions.push(TailPosition::with_ordinal(shard, position, ordinal));
         }
+        let mut position_shards = Vec::new();
+        position_shards
+            .try_reserve_exact(positions.len())
+            .map_err(|_| resource())?;
+        position_shards.extend(positions.iter().map(|position| position.shard()));
         let mut state = TailCursorState::new(
             principal, tenant, generation, plan, signal, positions, expiry, sequence, prior,
         )?;
@@ -207,7 +235,7 @@ impl TailCursor {
                 .and_then(|value| value.checked_add(marker_count.checked_mul(16)?))
                 .ok_or_else(invalid)?;
             let stats_end = markers_end.checked_add(18).ok_or_else(invalid)?;
-            if payload.len() != stats_end {
+            if payload.len() < stats_end {
                 return Err(invalid());
             }
             if marker_count > 0 {
@@ -239,6 +267,46 @@ impl TailCursor {
                 reduced,
                 limiting_budget_from_code(*payload.get(markers_end + 17).ok_or_else(invalid)?)?,
             );
+            let bindings_start = stats_end;
+            if payload.len() > bindings_start {
+                let binding_magic_end = bindings_start
+                    .checked_add(BIND_MAGIC.len())
+                    .ok_or_else(invalid)?;
+                if payload.get(bindings_start..binding_magic_end) != Some(BIND_MAGIC.as_slice()) {
+                    return Err(invalid());
+                }
+                let binding_count = usize::from(u16_at(payload, bindings_start + 4)?);
+                if binding_count != count {
+                    return Err(invalid());
+                }
+                let identity_start = bindings_start.checked_add(6).ok_or_else(invalid)?;
+                let generation_start = identity_start.checked_add(32).ok_or_else(invalid)?;
+                let bindings_start_data = generation_start.checked_add(8).ok_or_else(invalid)?;
+                let bindings_end = bindings_start_data
+                    .checked_add(binding_count.checked_mul(24).ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?;
+                if payload.len() != bindings_end {
+                    return Err(invalid());
+                }
+                let snapshot_identity = array_at_at::<32>(payload, identity_start)?;
+                let snapshot_generation = u64_at(payload, generation_start)?;
+                let mut bindings = Vec::new();
+                bindings
+                    .try_reserve_exact(binding_count)
+                    .map_err(|_| resource())?;
+                for index in 0..binding_count {
+                    let offset = bindings_start_data
+                        .checked_add(index.checked_mul(24).ok_or_else(invalid)?)
+                        .ok_or_else(invalid)?;
+                    let lease =
+                        positron_kernel::SnapshotLeaseId::new(array_at_at::<16>(payload, offset)?)
+                            .map_err(|_| invalid())?;
+                    let frontier = commit_position(u64_at(payload, offset + 16)?)?;
+                    let shard = *position_shards.get(index).ok_or_else(invalid)?;
+                    bindings.push(TailSourceBinding::new(shard, lease, frontier));
+                }
+                state.set_source_bindings(snapshot_identity, snapshot_generation, bindings)?;
+            }
         }
         Ok(state)
     }
@@ -264,87 +332,6 @@ impl std::fmt::Debug for TailCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("TailCursor { <opaque> }")
     }
-}
-
-fn array_at<const N: usize>(bytes: &[u8], start: usize) -> Result<[u8; N], QueryFailure> {
-    array_at_at(bytes, start)
-}
-
-fn array_at_at<const N: usize>(bytes: &[u8], start: usize) -> Result<[u8; N], QueryFailure> {
-    bytes
-        .get(start..start.checked_add(N).ok_or_else(invalid)?)
-        .ok_or_else(invalid)?
-        .try_into()
-        .map_err(|_| invalid())
-}
-
-fn u16_at(bytes: &[u8], start: usize) -> Result<u16, QueryFailure> {
-    Ok(u16::from_be_bytes(array_at(bytes, start)?))
-}
-
-fn u32_at(bytes: &[u8], start: usize) -> Result<u32, QueryFailure> {
-    Ok(u32::from_be_bytes(array_at(bytes, start)?))
-}
-
-fn u64_at(bytes: &[u8], start: usize) -> Result<u64, QueryFailure> {
-    Ok(u64::from_be_bytes(array_at(bytes, start)?))
-}
-
-fn commit_position(value: u64) -> Result<CommitPosition, QueryFailure> {
-    match std::num::NonZeroU64::new(value) {
-        Some(value) => CommitPosition::origin()
-            .advance_by(value)
-            .map_err(|_| invalid()),
-        None => Ok(CommitPosition::origin()),
-    }
-}
-
-fn extension_bytes(state: &TailCursorState) -> Result<usize, QueryFailure> {
-    let has_extension = state.historical_markers().is_some()
-        || state.memory_peak_bytes() != 0
-        || state.elapsed_seconds() != 0
-        || state.reduced_pruning()
-        || state.limiting_budget().is_some();
-    if !has_extension {
-        return Ok(0);
-    }
-    let markers = state.historical_markers().map_or(0, <[_]>::len);
-    4_usize
-        .checked_add(2)
-        .and_then(|value| value.checked_add(markers.checked_mul(16)?))
-        .and_then(|value| value.checked_add(18))
-        .ok_or_else(resource)
-}
-
-fn limiting_budget_code(dimension: Option<crate::QueryBudgetDimension>) -> u8 {
-    match dimension {
-        None => 0,
-        Some(crate::QueryBudgetDimension::ScannedBytes) => 1,
-        Some(crate::QueryBudgetDimension::DecodedRecords) => 2,
-        Some(crate::QueryBudgetDimension::OutputRows) => 3,
-        Some(crate::QueryBudgetDimension::OutputBytes) => 4,
-        Some(crate::QueryBudgetDimension::MemoryBytes) => 5,
-        Some(crate::QueryBudgetDimension::CpuWorkUnits) => 6,
-        Some(crate::QueryBudgetDimension::WallSeconds) => 7,
-        Some(crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds) => 8,
-    }
-}
-
-fn limiting_budget_from_code(
-    code: u8,
-) -> Result<Option<crate::QueryBudgetDimension>, QueryFailure> {
-    Ok(match code {
-        0 => None,
-        1 => Some(crate::QueryBudgetDimension::ScannedBytes),
-        2 => Some(crate::QueryBudgetDimension::DecodedRecords),
-        3 => Some(crate::QueryBudgetDimension::OutputRows),
-        4 => Some(crate::QueryBudgetDimension::OutputBytes),
-        5 => Some(crate::QueryBudgetDimension::MemoryBytes),
-        6 => Some(crate::QueryBudgetDimension::CpuWorkUnits),
-        7 => Some(crate::QueryBudgetDimension::WallSeconds),
-        8 => Some(crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds),
-        _ => return Err(invalid()),
-    })
 }
 
 pub(crate) fn budget_digest(

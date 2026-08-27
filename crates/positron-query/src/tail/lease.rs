@@ -8,6 +8,7 @@ pub(super) struct TailLeaseOwner<'ledger, 'kernel, 'catalog> {
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     identity: SnapshotLeaseId,
     released: bool,
+    retained: bool,
 }
 
 pub(super) struct TailLeaseSet<'ledger, 'kernel, 'catalog> {
@@ -27,6 +28,23 @@ impl<'ledger, 'kernel, 'catalog> TailLeaseSet<'ledger, 'kernel, 'catalog> {
         self.owners.push(owner);
     }
 
+    pub(super) fn contains(&self, identity: SnapshotLeaseId) -> bool {
+        self.owners.iter().any(|owner| owner.identity == identity)
+    }
+
+    pub(super) fn replace(
+        &mut self,
+        identity: SnapshotLeaseId,
+        replacement: TailLeaseOwner<'ledger, 'kernel, 'catalog>,
+    ) -> Result<TailLeaseOwner<'ledger, 'kernel, 'catalog>, QueryFailure> {
+        let owner = self
+            .owners
+            .iter_mut()
+            .find(|owner| owner.identity == identity)
+            .ok_or_else(|| QueryFailure::new(crate::QueryFailureCode::InvalidCursor))?;
+        Ok(std::mem::replace(owner, replacement))
+    }
+
     pub(super) fn release(&mut self) -> Result<(), QueryFailure> {
         let mut first_failure = None;
         for owner in &mut self.owners {
@@ -37,6 +55,12 @@ impl<'ledger, 'kernel, 'catalog> TailLeaseSet<'ledger, 'kernel, 'catalog> {
             }
         }
         first_failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn retain(&mut self) {
+        for owner in &mut self.owners {
+            owner.retain();
+        }
     }
 }
 
@@ -49,11 +73,12 @@ impl<'ledger, 'kernel, 'catalog> TailLeaseOwner<'ledger, 'kernel, 'catalog> {
             ledger,
             identity,
             released: false,
+            retained: false,
         }
     }
 
     pub(super) fn release(&mut self) -> Result<(), QueryFailure> {
-        if self.released {
+        if self.released || self.retained {
             return Ok(());
         }
         self.ledger
@@ -62,11 +87,19 @@ impl<'ledger, 'kernel, 'catalog> TailLeaseOwner<'ledger, 'kernel, 'catalog> {
         self.released = true;
         Ok(())
     }
+
+    pub(super) fn retain(&mut self) {
+        self.retained = true;
+    }
+
+    pub(super) const fn identity(&self) -> SnapshotLeaseId {
+        self.identity
+    }
 }
 
 impl Drop for TailLeaseOwner<'_, '_, '_> {
     fn drop(&mut self) {
-        if !self.released {
+        if !self.released && !self.retained {
             // `release_snapshot_lease` registers the identity in the ledger's
             // fixed-capacity pending-release set before publication. Ignoring
             // the returned error here is safe only because that durable intent

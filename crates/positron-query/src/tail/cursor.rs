@@ -1,5 +1,8 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{CommitPosition, RecordOrdinal, VirtualShardId};
+use positron_kernel::SnapshotLeaseId;
+#[path = "cursor_progress.rs"]
+mod progress;
 #[path = "cursor_wire.rs"]
 mod wire;
 pub(super) use super::history::HistoricalMarker;
@@ -17,6 +20,39 @@ pub struct TailPosition {
     shard: VirtualShardId,
     position: CommitPosition,
     ordinal: RecordOrdinal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TailSourceBinding {
+    shard: VirtualShardId,
+    lease: SnapshotLeaseId,
+    frontier: CommitPosition,
+}
+
+impl TailSourceBinding {
+    pub(super) const fn new(
+        shard: VirtualShardId,
+        lease: SnapshotLeaseId,
+        frontier: CommitPosition,
+    ) -> Self {
+        Self {
+            shard,
+            lease,
+            frontier,
+        }
+    }
+
+    pub(super) const fn shard(self) -> VirtualShardId {
+        self.shard
+    }
+
+    pub(super) const fn lease(self) -> SnapshotLeaseId {
+        self.lease
+    }
+
+    pub(super) const fn frontier(self) -> CommitPosition {
+        self.frontier
+    }
 }
 
 impl TailPosition {
@@ -72,6 +108,9 @@ pub struct TailCursorState {
     repeated_batch_count: u64,
     budget_digest: [u8; 32],
     pub(super) historical_markers: Option<Vec<HistoricalMarker>>,
+    pub(super) snapshot_identity: [u8; 32],
+    pub(super) snapshot_generation: u64,
+    pub(super) source_bindings: Option<Vec<TailSourceBinding>>,
     memory_peak_bytes: u64,
     elapsed_seconds: u64,
     reduced_pruning: bool,
@@ -118,6 +157,9 @@ impl TailCursorState {
             repeated_batch_count: 0,
             budget_digest: [0; 32],
             historical_markers: None,
+            snapshot_identity: [0; 32],
+            snapshot_generation: 0,
+            source_bindings: None,
             memory_peak_bytes: 0,
             elapsed_seconds: 0,
             reduced_pruning: false,
@@ -212,6 +254,54 @@ impl TailCursorState {
         self.budget_digest = digest;
     }
 
+    pub(super) fn set_source_bindings(
+        &mut self,
+        snapshot_identity: [u8; 32],
+        snapshot_generation: u64,
+        mut bindings: Vec<TailSourceBinding>,
+    ) -> Result<(), QueryFailure> {
+        if bindings.is_empty() || bindings.len() > MAX_SHARDS {
+            return Err(invalid());
+        }
+        bindings.sort_unstable_by_key(|binding| binding.shard);
+        if bindings
+            .windows(2)
+            .any(|pair| pair[0].shard == pair[1].shard)
+        {
+            return Err(invalid());
+        }
+        self.snapshot_identity = snapshot_identity;
+        self.snapshot_generation = snapshot_generation;
+        self.source_bindings = Some(bindings);
+        Ok(())
+    }
+
+    pub(super) fn source_bindings(&self) -> Option<&[TailSourceBinding]> {
+        self.source_bindings.as_deref()
+    }
+
+    pub(crate) const fn snapshot_identity(&self) -> [u8; 32] {
+        self.snapshot_identity
+    }
+
+    pub(crate) const fn snapshot_generation(&self) -> u64 {
+        self.snapshot_generation
+    }
+
+    /// Returns the durable source frontier covered by this cursor binding.
+    #[must_use]
+    pub fn source_frontier(&self, shard: VirtualShardId) -> Option<CommitPosition> {
+        self.source_binding(shard).map(TailSourceBinding::frontier)
+    }
+
+    pub(super) fn source_binding(&self, shard: VirtualShardId) -> Option<TailSourceBinding> {
+        self.source_bindings
+            .as_ref()?
+            .iter()
+            .find(|binding| binding.shard == shard)
+            .copied()
+    }
+
     pub(crate) fn validate_budget(&self, expected: [u8; 32]) -> Result<(), QueryFailure> {
         if self.budget_digest != expected {
             return Err(QueryFailure::new(QueryFailureCode::AuthorizationChanged));
@@ -260,113 +350,6 @@ impl TailCursorState {
             return Err(QueryFailure::new(QueryFailureCode::AuthorizationChanged));
         }
         Ok(())
-    }
-
-    pub(crate) fn advance_batch(
-        &self,
-        updates: &[TailPosition],
-        digest: [u8; 32],
-    ) -> Result<Self, QueryFailure> {
-        if updates.is_empty() {
-            return Err(invalid());
-        }
-        let mut positions = Vec::new();
-        positions
-            .try_reserve_exact(self.positions.len())
-            .map_err(|_| resource())?;
-        positions.extend_from_slice(&self.positions);
-        for update in updates {
-            let entry = positions
-                .iter_mut()
-                .find(|entry| entry.shard == update.shard)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-            if (update.position, update.ordinal) < (entry.position, entry.ordinal) {
-                return Err(invalid());
-            }
-            entry.position = update.position;
-            entry.ordinal = update.ordinal;
-        }
-        let sequence = self.sequence.checked_add(1).ok_or_else(invalid)?;
-        let mut state = Self::new(
-            self.principal,
-            self.tenant,
-            self.authorization_generation,
-            self.plan_digest,
-            self.signal_digest,
-            positions,
-            self.expiry,
-            sequence,
-            digest,
-        )?;
-        state.record_bound = true;
-        state.set_progress(
-            self.scanned_bytes,
-            self.decoded_records,
-            self.output_rows,
-            self.output_bytes,
-            self.cpu_work_units,
-        );
-        state.budget_digest = self.budget_digest;
-        state.set_resume_stats(self.resume_count, self.repeated_batch_count);
-        state.historical_markers = self.historical_markers.clone();
-        state.set_runtime_stats(
-            self.memory_peak_bytes,
-            self.elapsed_seconds,
-            self.reduced_pruning,
-            self.limiting_budget,
-        );
-        Ok(state)
-    }
-
-    pub(crate) fn advance_positions(&self, updates: &[TailPosition]) -> Result<Self, QueryFailure> {
-        if updates.is_empty() {
-            return Err(invalid());
-        }
-        let mut positions = Vec::new();
-        positions
-            .try_reserve_exact(self.positions.len())
-            .map_err(|_| resource())?;
-        positions.extend_from_slice(&self.positions);
-        for update in updates {
-            let entry = positions
-                .iter_mut()
-                .find(|entry| entry.shard == update.shard)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-            if (update.position, update.ordinal) < (entry.position, entry.ordinal) {
-                return Err(invalid());
-            }
-            entry.position = update.position;
-            entry.ordinal = update.ordinal;
-        }
-        let mut state = Self::new(
-            self.principal,
-            self.tenant,
-            self.authorization_generation,
-            self.plan_digest,
-            self.signal_digest,
-            positions,
-            self.expiry,
-            self.sequence,
-            self.prior_digest,
-        )?;
-        state.record_bound = true;
-        state.set_progress(
-            self.scanned_bytes,
-            self.decoded_records,
-            self.output_rows,
-            self.output_bytes,
-            self.cpu_work_units,
-        );
-        state.budget_digest = self.budget_digest;
-        state.set_resume_stats(self.resume_count, self.repeated_batch_count);
-        state.historical_markers = self.historical_markers.clone();
-        state.set_runtime_stats(
-            self.memory_peak_bytes,
-            self.elapsed_seconds,
-            self.reduced_pruning,
-            self.limiting_budget,
-        );
-        Ok(state)
     }
 }
 

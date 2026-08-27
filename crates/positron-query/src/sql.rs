@@ -94,7 +94,10 @@ impl<'source> Parser<'source> {
             },
         }
         let default_ordering = OrderSpec::ascending(plan.temporal_axis());
-        Ok(plan.with_ordering(ordering.unwrap_or(default_ordering)))
+        Ok(match ordering {
+            Some(ordering) => plan.with_explicit_ordering(ordering),
+            None => plan.with_ordering(default_ordering),
+        })
     }
 
     fn selection(&mut self) -> Result<Selection, QueryFailure> {

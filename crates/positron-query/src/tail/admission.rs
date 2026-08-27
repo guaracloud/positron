@@ -1,140 +1,24 @@
+use positron_kernel::SnapshotLeaseGrant;
+
 use crate::stream::{QueryHeader, ResultLease, ResultSnapshot};
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
-use super::cursor::{HistoricalMarker, TailCursor, TailCursorState, TailPosition, budget_digest};
+use super::cursor::{
+    HistoricalMarker, TailCursor, TailCursorState, TailPosition, TailSourceBinding, budget_digest,
+};
 use super::lease::{TailLeaseOwner, TailLeaseSet};
 use super::session::{TailSession, TailStart};
 use super::source::TailSourceSet;
-use super::terminal::{TailStats, TailTerminal};
-
-fn validate_resume_history(
-    state: &TailCursorState,
-    sources: &TailSourceSet<'_, '_, '_>,
-) -> Result<(), QueryFailure> {
-    for reader in sources.readers() {
-        let snapshot = reader
-            .snapshot()
-            .map_err(crate::execution_support::map_ledger_failure)?;
-        let Some(position) = state
-            .positions()
-            .iter()
-            .find(|position| position.shard() == snapshot.scope().shard_id())
-        else {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
-        };
-        if position.position() > snapshot.frontier() {
-            return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
-        }
-        if let Some(markers) = state.historical_markers() {
-            let marker = markers
-                .get(
-                    state
-                        .positions()
-                        .iter()
-                        .position(|candidate| candidate.shard() == snapshot.scope().shard_id())
-                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?,
-                )
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-            if marker.handoff_frontier() > snapshot.frontier()
-                || (marker.handoff_frontier() > marker.lower_bound()
-                    && !snapshot.blocks().iter().any(|block| {
-                        block.position() >= marker.lower_bound()
-                            && block.position() <= marker.handoff_frontier()
-                    }))
-            {
-                return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
-            }
-        } else if state.record_bound()
-            && position.position() != positron_domain::routing::CommitPosition::origin()
-            && !snapshot
-                .blocks()
-                .iter()
-                .any(|block| block.position() == position.position())
-        {
-            return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn terminal_for_failure(
-    code: QueryFailureCode,
-    cursor: Option<TailCursor>,
-    stats: TailStats,
-) -> TailTerminal {
-    match code {
-        QueryFailureCode::BudgetExhausted => TailTerminal::BudgetExhausted { cursor, stats },
-        QueryFailureCode::Cancelled => TailTerminal::Cancelled { cursor, stats },
-        QueryFailureCode::SnapshotExpired => TailTerminal::Expired { cursor, stats },
-        QueryFailureCode::AuthorizationChanged => {
-            TailTerminal::AuthorizationChanged { cursor, stats }
-        },
-        _ => TailTerminal::StoreUnavailable { cursor, stats },
-    }
-}
+#[path = "admission_resume.rs"]
+mod resume;
+pub(super) use resume::terminal_for_failure;
+use resume::{resume_source_lease_for_tail as resume_source_lease, validate_resume_leases};
+#[path = "admission_api.rs"]
+mod api;
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
-    pub fn tail(
-        &self,
-        query: PlannedQuery<'kernel>,
-        start: TailStart,
-    ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
-        let reader = self
-            .ledger
-            .reader()
-            .map_err(crate::execution_support::map_ledger_failure)?;
-        self.tail_with_sources(query, start, TailSourceSet::single(reader)?)
-    }
-
-    pub fn tail_with_sources(
-        &self,
-        query: PlannedQuery<'kernel>,
-        start: TailStart,
-        sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
-    ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
-        self.admit_tail(query, start, None, sources)
-    }
-
-    pub fn resume_tail(
-        &self,
-        query: PlannedQuery<'kernel>,
-        cursor: &TailCursor,
-    ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
-        let reader = self
-            .ledger
-            .reader()
-            .map_err(crate::execution_support::map_ledger_failure)?;
-        self.resume_tail_with_sources(query, cursor, TailSourceSet::single(reader)?)
-    }
-
-    pub fn resume_tail_with_sources(
-        &self,
-        query: PlannedQuery<'kernel>,
-        cursor: &TailCursor,
-        sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
-    ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
-        let state = TailCursor::decode(&self.ledger.control_tokens(), cursor)?;
-        let (tenant, _, _generation) = self.current_query_catalog(query.context)?;
-        let signal_digest = sources.digest(&self.ledger.control_tokens())?;
-        state.validate_for_resume(
-            query.context.principal_id(),
-            tenant,
-            query.context.authorization_generation(),
-            query.plan_digest,
-            signal_digest,
-            self.now()?,
-        )?;
-        validate_resume_history(&state, &sources)?;
-        self.admit_tail(
-            query,
-            TailStart::Now,
-            Some((state, cursor.clone())),
-            sources,
-        )
-    }
-
-    fn admit_tail(
+    pub(super) fn admit_tail(
         &self,
         query: PlannedQuery<'kernel>,
         start: TailStart,
@@ -145,7 +29,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
-        if query.plan.tail_incompatible() {
+        if sources.tenant() != tenant {
+            return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+        }
+        if query.plan.tail_incompatible()
+            || (matches!(start, TailStart::Now) && query.plan.has_explicit_ordering())
+        {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         let now = self.now()?;
@@ -166,48 +55,107 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
-        let lease = self
-            .ledger
-            .create_snapshot_lease(now, expiry)
-            .map_err(crate::execution_support::map_ledger_failure)?;
-        let lease_owner = TailLeaseOwner::new(self.ledger, lease.identity());
-        if sources.tenant() != tenant {
-            return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+        if let Some((state, _)) = resume.as_ref() {
+            if state.source_bindings().is_none() {
+                return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+            }
+            validate_resume_leases(state, &sources, now)?;
         }
         let mut source_lease_owners = TailLeaseSet::with_capacity(sources.readers().len())?;
-        for reader in sources.readers() {
-            if reader.scope() == self.ledger.scope() {
-                continue;
+        let mut source_lease_ids = Vec::new();
+        let mut source_frontiers = Vec::new();
+        source_lease_ids
+            .try_reserve_exact(sources.readers().len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        let (lease, lease_owner) = if let Some((state, _)) = resume.as_ref() {
+            let primary_shard = self.ledger.scope().shard_id();
+            if let Some(binding) = state.source_binding(primary_shard) {
+                let lease = resume_source_lease(
+                    self.ledger,
+                    binding,
+                    state,
+                    now,
+                    Some((catalog_identity, generation)),
+                )?;
+                let owner = TailLeaseOwner::new(self.ledger, lease.identity());
+                (lease, owner)
+            } else {
+                // A caller may supply an observed secondary-only source set.
+                // The primary lease still owns the response header, but is not
+                // part of that source vector and therefore has no cursor
+                // binding to reattach.
+                let lease = self
+                    .ledger
+                    .create_snapshot_lease(now, expiry)
+                    .map_err(crate::execution_support::map_ledger_failure)?;
+                let owner = TailLeaseOwner::new(self.ledger, lease.identity());
+                (lease, owner)
             }
-            let authority = reader
-                .lease_authority()
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
-            let source_lease = authority
-                .create_snapshot_lease(now, expiry)
+        } else {
+            let lease = self
+                .ledger
+                .create_snapshot_lease_at_catalog(now, expiry, catalog_identity)
                 .map_err(crate::execution_support::map_ledger_failure)?;
-            source_lease_owners.push(TailLeaseOwner::new(authority, source_lease.identity()));
-            drop(source_lease);
+            let owner = TailLeaseOwner::new(self.ledger, lease.identity());
+            (lease, owner)
+        };
+        for reader in sources.readers() {
+            let shard = reader.scope().shard_id();
+            let (authority, source_lease) = if reader.scope() == self.ledger.scope() {
+                (self.ledger, None)
+            } else if let Some((state, _)) = resume.as_ref() {
+                let binding = state
+                    .source_binding(shard)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+                let authority = reader
+                    .lease_authority()
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+                let source_lease = resume_source_lease(authority, binding, state, now, None)?;
+                (authority, Some(source_lease))
+            } else {
+                let authority = reader
+                    .lease_authority()
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+                let source_lease = authority
+                    .create_snapshot_lease(now, expiry)
+                    .map_err(crate::execution_support::map_ledger_failure)?;
+                (authority, Some(source_lease))
+            };
+            let lease_id = source_lease
+                .as_ref()
+                .map_or_else(|| lease.identity(), SnapshotLeaseGrant::identity);
+            source_lease_ids.push((shard, lease_id));
+            let frontier = source_lease.as_ref().map_or_else(
+                || lease.snapshot().frontier(),
+                |grant| grant.snapshot().frontier(),
+            );
+            source_frontiers.push((shard, frontier));
+            if let Some(source_lease) = source_lease {
+                source_lease_owners.push(TailLeaseOwner::new(authority, source_lease.identity()));
+                drop(source_lease);
+            }
         }
         let mut frontiers = Vec::new();
         frontiers
             .try_reserve_exact(sources.readers().len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        let mut header_snapshot = None;
+        let mut header_snapshot = Some(lease.snapshot());
         for reader in sources.readers() {
-            let snapshot = reader
-                .snapshot()
-                .map_err(crate::execution_support::map_ledger_failure)?;
-            if snapshot.scope().tenant_id() != tenant {
-                return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+            let shard = reader.scope().shard_id();
+            let frontier = source_frontiers
+                .iter()
+                .find(|(candidate, _)| *candidate == shard)
+                .map(|(_, frontier)| *frontier)
+                .ok_or_else(super::internal)?;
+            if reader.scope() == self.ledger.scope() {
+                // The primary grant is the authoritative snapshot used for the
+                // response header. It was captured at the same catalog basis as
+                // every source grant above.
+                header_snapshot = Some(lease.snapshot());
             }
-            if header_snapshot.is_none() {
-                header_snapshot = Some(snapshot);
-            } else {
-                frontiers.push((snapshot.scope().shard_id(), snapshot.frontier()));
-            }
+            frontiers.push((shard, frontier));
         }
         let snapshot = header_snapshot.ok_or_else(super::internal)?;
-        frontiers.push((snapshot.scope().shard_id(), snapshot.frontier()));
         frontiers.sort_unstable_by_key(|(shard, _)| *shard);
         let digest = sources.digest(&self.ledger.control_tokens())?;
         let expected_budget = budget_digest(&self.ledger.control_tokens(), query.budget)?;
@@ -268,6 +216,19 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     }
                     state.set_historical_markers(markers)?;
                 }
+                let mut bindings = Vec::new();
+                bindings
+                    .try_reserve_exact(frontiers.len())
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+                for (shard, frontier) in &frontiers {
+                    let lease = source_lease_ids
+                        .iter()
+                        .find(|(candidate, _)| candidate == shard)
+                        .map(|(_, lease)| *lease)
+                        .ok_or_else(super::internal)?;
+                    bindings.push(TailSourceBinding::new(*shard, lease, *frontier));
+                }
+                state.set_source_bindings(catalog_identity.to_bytes(), generation, bindings)?;
                 let cursor = TailCursor::encode(&self.ledger.control_tokens(), &state)?;
                 (state, cursor, false)
             },
@@ -379,6 +340,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             limiting_budget,
             resume_count,
             repeated_batch_count,
+            cursor_observed: std::cell::Cell::new(false),
         };
         if matches!(start, TailStart::Historical { .. }) {
             session.fill_sources(max_rows)?;

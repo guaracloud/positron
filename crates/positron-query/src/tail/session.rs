@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use crate::stream::QueryBatch;
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
@@ -6,6 +8,13 @@ use super::cursor::{TailCursor, TailCursorState, TailPosition};
 use super::lease::{TailLeaseOwner, TailLeaseSet};
 use super::source::TailSourceSet;
 use super::terminal::{TailStats, TailTerminal, TerminalKind};
+#[path = "session_leases.rs"]
+mod leases;
+#[path = "session_lifecycle.rs"]
+mod lifecycle;
+use leases::LeaseRotation;
+#[path = "session_progress.rs"]
+mod progress;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TailStart {
@@ -30,11 +39,12 @@ pub(super) struct PendingBatch {
     pub(super) historical_complete: bool,
 }
 
-struct AdvancedBatch {
+struct AdvancedBatch<'kernel, 'catalog, 'ledger> {
     state: TailCursorState,
     cursor: TailCursor,
     prior_digest: [u8; 32],
     next_sequence: u64,
+    lease_rotation: LeaseRotation<'kernel, 'catalog, 'ledger>,
 }
 
 pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
@@ -68,10 +78,12 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) limiting_budget: Option<crate::QueryBudgetDimension>,
     pub(super) resume_count: u64,
     pub(super) repeated_batch_count: u64,
+    pub(super) cursor_observed: Cell<bool>,
 }
 
-impl TailSession<'_, '_, '_, '_> {
+impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub fn cursor(&self) -> &TailCursor {
+        self.cursor_observed.set(true);
         &self.cursor
     }
 
@@ -116,10 +128,27 @@ impl TailSession<'_, '_, '_, '_> {
                 return Err(failure);
             },
         };
-        self.state = advanced.state;
-        self.cursor = advanced.cursor;
-        self.prior_digest = advanced.prior_digest;
-        self.next_sequence = advanced.next_sequence;
+        let AdvancedBatch {
+            state,
+            cursor,
+            prior_digest,
+            next_sequence,
+            lease_rotation,
+        } = advanced;
+        if let Err(failure) = self.commit_lease_rotation(lease_rotation) {
+            self.record_limiting_budget(&failure);
+            let terminal = super::admission::terminal_for_failure(
+                failure.code(),
+                Some(self.cursor.clone()),
+                self.terminal_stats(),
+            );
+            self.terminal = Some(terminal);
+            return Err(failure);
+        }
+        self.state = state;
+        self.cursor = cursor;
+        self.prior_digest = prior_digest;
+        self.next_sequence = next_sequence;
         self.output_rows = output_rows;
         self.output_bytes = output_bytes;
         if historical_complete {
@@ -225,100 +254,33 @@ impl TailSession<'_, '_, '_, '_> {
     }
     fn take_terminal(&mut self) -> Option<TailEvent> {
         let stats = self.terminal_stats();
-        let primary_failure = self.lease_owner.release().err();
-        let secondary_failure = self.source_lease_owners.release().err();
-        if let Some(failure) = primary_failure.or(secondary_failure)
-            && let Some(terminal) = self.terminal.as_mut()
-        {
-            *terminal = super::admission::terminal_for_failure(
-                failure.code(),
-                Some(self.cursor.clone()),
-                stats,
-            );
+        if self.cursor_observed.get() {
+            // A caller that has taken the opaque cursor may reconnect after an
+            // incomplete terminal. Keep the exact durable leases alive; their
+            // bounded expiry and the kernel's cleanup path remain authoritative.
+            if self
+                .state
+                .source_binding(self._lease.snapshot().scope().shard_id())
+                .is_some()
+            {
+                self.lease_owner.retain();
+            }
+            self.source_lease_owners.retain();
+        } else {
+            let primary_failure = self.lease_owner.release().err();
+            let secondary_failure = self.source_lease_owners.release().err();
+            if let Some(failure) = primary_failure.or(secondary_failure)
+                && let Some(terminal) = self.terminal.as_mut()
+            {
+                *terminal = super::admission::terminal_for_failure(
+                    failure.code(),
+                    Some(self.cursor.clone()),
+                    stats,
+                );
+            }
         }
         take_terminal_value(&mut self.terminal, &mut self.terminal_emitted)
     }
-    fn candidate_advance(
-        &self,
-        positions: Vec<TailPosition>,
-        digest: [u8; 32],
-        output_rows: u64,
-        output_bytes: u64,
-        historical_complete: bool,
-    ) -> Result<AdvancedBatch, QueryFailure> {
-        let mut state = self.state.clone();
-        state.set_progress(
-            self.scanned_bytes,
-            self.decoded_records,
-            output_rows,
-            output_bytes,
-            self.cpu_work_units,
-        );
-        state.set_runtime_stats(
-            self.memory_peak_bytes,
-            self.elapsed_seconds,
-            self.reduced_pruning,
-            self.limiting_budget,
-        );
-        let mut state = state.advance_batch(&positions, digest)?;
-        if historical_complete {
-            state.clear_historical_markers();
-        }
-        let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
-        let next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(super::internal)?;
-        Ok(AdvancedBatch {
-            state,
-            cursor,
-            prior_digest: digest,
-            next_sequence,
-        })
-    }
-
-    pub(super) fn advance_positions(
-        &mut self,
-        positions: &[TailPosition],
-        clear_historical: bool,
-    ) -> Result<(), QueryFailure> {
-        self.sync_state_progress();
-        let mut state = self.state.advance_positions(positions)?;
-        if clear_historical {
-            state.clear_historical_markers();
-        }
-        let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
-        self.state = state;
-        self.cursor = cursor;
-        Ok(())
-    }
-    pub(super) fn sync_progress(&mut self) -> Result<(), QueryFailure> {
-        self.sync_state_progress();
-        self.cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &self.state)?;
-        Ok(())
-    }
-    fn sync_state_progress(&mut self) {
-        self.state.set_progress(
-            self.scanned_bytes,
-            self.decoded_records,
-            self.output_rows,
-            self.output_bytes,
-            self.cpu_work_units,
-        );
-        self.state.set_runtime_stats(
-            self.memory_peak_bytes,
-            self.elapsed_seconds,
-            self.reduced_pruning,
-            self.limiting_budget,
-        );
-    }
-
-    fn record_limiting_budget(&mut self, failure: &QueryFailure) {
-        if let Some(dimension) = failure.limiting_budget() {
-            self.limiting_budget = Some(dimension);
-        }
-    }
-
     pub(super) fn terminal_stats(&self) -> TailStats {
         TailStats {
             scanned_bytes: self.scanned_bytes,

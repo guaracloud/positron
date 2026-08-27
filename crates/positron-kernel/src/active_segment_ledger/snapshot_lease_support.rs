@@ -91,7 +91,7 @@ impl LeaseReservationTransaction {
     }
 }
 
-pub(super) fn snapshot_from_record<'kernel>(
+pub(crate) fn snapshot_from_record<'kernel>(
     ledger: &ActiveSegmentLedger<'kernel, '_>,
     state: &super::super::state::LedgerState<'kernel>,
     record: &LeaseRecord,
@@ -331,7 +331,7 @@ pub(crate) fn records(
     Ok(records)
 }
 
-pub(super) fn fresh_identity() -> Result<SnapshotLeaseId, LedgerFailure> {
+pub(crate) fn fresh_identity() -> Result<SnapshotLeaseId, LedgerFailure> {
     let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
     let bytes = random
         .get(..16)

@@ -216,7 +216,7 @@ fn parse_versioned_pipeline(
     }
     if let Some(ordering) = ordering {
         let parsed = parse_ordering(plan.temporal_axis(), ordering, memory)?;
-        plan = plan.with_ordering(parsed);
+        plan = plan.with_explicit_ordering(parsed);
     }
     Ok(plan)
 }

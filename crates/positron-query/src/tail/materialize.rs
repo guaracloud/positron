@@ -143,11 +143,8 @@ impl TailSession<'_, '_, '_, '_> {
                         let right = source_batches[best_index]
                             .front()
                             .ok_or_else(super::internal)?;
-                        self.compare_candidates_cooperatively(
-                            left,
-                            right,
-                            self.query.plan.ordering(),
-                        )? == Ordering::Less
+                        self.compare_candidates_cooperatively(left, right, self.tail_ordering())?
+                            == Ordering::Less
                     },
                     None => true,
                 };

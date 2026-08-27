@@ -21,6 +21,7 @@ mod snapshot_lease_grant;
 mod snapshot_lease_pending;
 mod snapshot_lease_record;
 mod snapshot_lease_recovery;
+mod snapshot_lease_replace;
 mod snapshot_lease_usage;
 mod state;
 mod storage;
@@ -53,6 +54,7 @@ pub use snapshot_lease_grant::SnapshotLeaseGrant;
 pub use snapshot_lease_record::{
     MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId, SnapshotLeaseUsage,
 };
+pub use snapshot_lease_replace::SnapshotLeaseReplacement;
 use state::LedgerState;
 use storage::LedgerStorage;
 #[cfg(feature = "test-support")]
@@ -111,6 +113,19 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     pub fn current_catalog_snapshot(&self) -> Result<CatalogSnapshot, LedgerFailure> {
         self.catalog.refresh_state()?;
         self.catalog.pin().map_err(Into::into)
+    }
+
+    /// Returns the monotonic timestamp persisted by Snapshot Lease recovery.
+    ///
+    /// Query runtimes may use a clock source that lags the lifecycle clock used
+    /// while reopening a ledger. Lease operations must still be attempted at
+    /// this floor so a valid durable lease is not mistaken for a clock
+    /// regression during reconnect.
+    pub fn snapshot_lease_time(&self) -> Result<u64, LedgerFailure> {
+        self.state
+            .lock()
+            .map(|state| state.last_snapshot_lease_time)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))
     }
 
     pub fn open(

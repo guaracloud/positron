@@ -5,6 +5,12 @@ use super::{TailPosition, TailSession};
 use crate::plan::OrderSpec;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode};
 
+#[derive(Clone, Copy)]
+pub(super) enum TailOrdering {
+    Historical(OrderSpec),
+    CommitVector,
+}
+
 impl TailSession<'_, '_, '_, '_> {
     pub(super) fn sort_candidates(
         &mut self,
@@ -16,7 +22,7 @@ impl TailSession<'_, '_, '_, '_> {
                 if self.compare_candidates_cooperatively(
                     &candidates[current - 1],
                     &candidates[current],
-                    self.query.plan.ordering(),
+                    self.tail_ordering(),
                 )? != Ordering::Greater
                 {
                     break;
@@ -46,7 +52,7 @@ impl TailSession<'_, '_, '_, '_> {
         &mut self,
         left: &TailCandidate,
         right: &TailCandidate,
-        ordering: OrderSpec,
+        ordering: TailOrdering,
     ) -> Result<Ordering, QueryFailure> {
         if self.query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
@@ -66,10 +72,30 @@ impl TailSession<'_, '_, '_, '_> {
 pub(super) fn compare_candidates(
     left: &TailCandidate,
     right: &TailCandidate,
-    ordering: OrderSpec,
+    ordering: TailOrdering,
 ) -> Ordering {
-    crate::execution_support::compare_records(&left.record, &right.record, ordering)
-        .then_with(|| left.position.shard().cmp(&right.position.shard()))
+    match ordering {
+        TailOrdering::Historical(ordering) => {
+            crate::execution_support::compare_records(&left.record, &right.record, ordering)
+                .then_with(|| left.position.cmp(&right.position))
+        },
+        TailOrdering::CommitVector => left
+            .position
+            .position()
+            .cmp(&right.position.position())
+            .then_with(|| left.position.ordinal().cmp(&right.position.ordinal()))
+            .then_with(|| left.position.shard().cmp(&right.position.shard())),
+    }
+}
+
+impl TailSession<'_, '_, '_, '_> {
+    pub(super) fn tail_ordering(&self) -> TailOrdering {
+        if self.historical_frontiers.is_empty() {
+            TailOrdering::CommitVector
+        } else {
+            TailOrdering::Historical(self.query.plan.ordering())
+        }
+    }
 }
 
 pub(super) fn update_position(

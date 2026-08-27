@@ -13,7 +13,7 @@ use positron_query::{
 
 use super::support::{
     CancellingOperatorCallMeter, CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock,
-    FailAfterArmOutputMeter, TestClock, merge_work_service, stage_work_service,
+    FailAfterArmOutputMeter, StepClock, TestClock, merge_work_service, stage_work_service,
     zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
@@ -166,7 +166,9 @@ fn tail_resume_frames_cumulative_elapsed_overflow_before_delivery() -> Result<()
         "pipeline:v1 logs | range query_time -100 100 | limit 1",
         budget,
     )?;
-    let mut resumed = service.resume_tail(query, &cursor)?;
+    let mut resumed = service
+        .resume_tail(query, &cursor)
+        .map_err(|failure| format!("resume: {failure:?}"))?;
     assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
     clock.set(101);
     assert!(matches!(
@@ -1590,7 +1592,8 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
     assert_eq!(batch.records().len(), 2);
     assert_eq!(batch.records()[0].body_text(), Some("one"));
     assert_eq!(batch.records()[1].body_text(), Some("two"));
-    tail.acknowledge(batch.sequence(), batch.digest())?;
+    tail.acknowledge(batch.sequence(), batch.digest())
+        .map_err(|failure| format!("historical ack: {failure:?}"))?;
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
     fixture.kernel.append_log("live-one", 3, 3)?;
     fixture.kernel.append_logs_to(
@@ -1609,7 +1612,8 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
     };
     assert_eq!(batch.records()[0].body_text(), Some("live-one"));
     assert_eq!(batch.records()[1].body_text(), Some("live-two"));
-    tail.acknowledge(batch.sequence(), batch.digest())?;
+    tail.acknowledge(batch.sequence(), batch.digest())
+        .map_err(|failure| format!("live ack: {failure:?}"))?;
     let cursor = tail.cursor().clone();
     let mismatch = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?])?;
     let query = service.plan_pipeline(
@@ -1760,6 +1764,396 @@ fn tail_historical_max_rows_is_global_across_shards() -> Result<(), Box<dyn Erro
     assert_eq!(batch.records().len(), 2);
     tail.acknowledge(batch.sequence(), batch.digest())?;
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    Ok(())
+}
+
+#[test]
+fn tail_live_multi_shard_order_uses_commit_vector_not_event_time() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-live-shard-order")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x56; 32])),
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("late-event", 90, 1)?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(1),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "early-event".to_owned(),
+            )),
+        )],
+        2,
+    )?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("live multi-shard batch missing".into());
+    };
+    let bodies = batch
+        .records()
+        .iter()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["late-event", "early-event"]);
+    Ok(())
+}
+
+#[test]
+fn tail_ack_rolls_source_lease_forward_for_post_admission_commits() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-live-lease-roll")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("post-admission", 1, 1)?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("post-admission batch missing".into());
+    };
+    let initial_cursor = tail.cursor().as_bytes().to_vec();
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    let state = TailCursor::decode(&fixture.kernel.ledger()?.control_tokens(), tail.cursor())?;
+    assert_eq!(state.positions()[0].position().value(), 1);
+    assert_eq!(
+        state
+            .source_frontier(VirtualShardId::new(1)?)
+            .map(|value| value.value()),
+        Some(1)
+    );
+    assert_ne!(initial_cursor, tail.cursor().as_bytes());
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn tail_lease_roll_encode_failure_keeps_the_old_safe_binding() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-live-lease-roll-failure")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = tail.cursor().clone();
+    fixture.kernel.append_log("post-admission", 1, 1)?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("post-admission batch missing".into());
+    };
+    positron_query::fail_next_tail_cursor_encode();
+    assert_eq!(
+        tail.acknowledge(batch.sequence(), batch.digest())
+            .expect_err("cursor encoding failure must be returned")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    assert_eq!(tail.cursor(), &safe_cursor);
+    let state = TailCursor::decode(&fixture.kernel.ledger()?.control_tokens(), tail.cursor())?;
+    assert_eq!(
+        state
+            .source_frontier(VirtualShardId::new(1)?)
+            .map(|value| value.value()),
+        Some(0)
+    );
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_lease_roll_rejects_an_expired_replacement_before_publication() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-live-lease-roll-expiry")?;
+    let clock = StepClock::shared(0);
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        clock,
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 5)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("expired-roll", 1, 1)?;
+    let event = tail.poll();
+    let Some(TailEvent::Batch(batch)) = event else {
+        return Err(format!("expired replacement batch missing: {event:?}").into());
+    };
+    assert_eq!(
+        tail.acknowledge(batch.sequence(), batch.digest())
+            .expect_err("an expired replacement must reject the acknowledgement")
+            .code(),
+        QueryFailureCode::SnapshotExpired
+    );
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Expired { .. }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-live-lease-roll-rollback")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x58; 32])),
+    )?;
+    let third = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(3)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
+    )?;
+    let sources = TailSourceSet::new(vec![second.reader()?, third.reader()?])?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = tail.cursor().clone();
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(2),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "post-admission-two".to_owned(),
+            )),
+        )],
+        2,
+    )?;
+    fixture.kernel.append_logs_to(
+        &third,
+        VirtualShardId::new(3)?,
+        vec![(
+            Some(3),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "post-admission-three".to_owned(),
+            )),
+        )],
+        3,
+    )?;
+    let event = tail.poll();
+    let Some(TailEvent::Batch(batch)) = event else {
+        return Err(format!("post-admission multi-source batch missing: {event:?}").into());
+    };
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+            tail.acknowledge(batch.sequence(), batch.digest())
+        })
+        .expect_err("a secondary lease publication failure must reject the ack");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert_eq!(tail.cursor(), &safe_cursor);
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_primary_lease_rolls_back_after_secondary_publication_failure() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-live-primary-lease-roll-rollback")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = tail.cursor().clone();
+    fixture.kernel.append_log("primary-roll", 1, 1)?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(2),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "secondary-roll".to_owned(),
+            )),
+        )],
+        2,
+    )?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("primary rollback batch missing".into());
+    };
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+            tail.acknowledge(batch.sequence(), batch.digest())
+        })
+        .expect_err("a secondary publication failure must roll back the primary lease");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert_eq!(tail.cursor(), &safe_cursor);
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(_),
+            ..
+        }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_lease_roll_restarts_from_the_new_safe_frontier() -> Result<(), Box<dyn Error>> {
+    let mut fixture = QueryFixture::new("tail-live-lease-roll-restart")?;
+    let cursor = {
+        let service = fixture.service(16)?;
+        let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit 2",
+            budget,
+        )?;
+        let mut tail = service.tail(query, TailStart::Now)?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        fixture.kernel.append_log("before-restart", 1, 1)?;
+        let Some(TailEvent::Batch(batch)) = tail.poll() else {
+            return Err("pre-restart batch missing".into());
+        };
+        tail.acknowledge(batch.sequence(), batch.digest())?;
+        let cursor = tail.cursor().clone();
+        drop(tail);
+        cursor
+    };
+    fixture.kernel.reopen_ledger()?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut resumed = service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("after-restart", 2, 2)?;
+    let event = resumed.poll();
+    let Some(TailEvent::Batch(batch)) = event else {
+        return Err(format!("post-restart batch missing: {event:?}").into());
+    };
+    assert_eq!(batch.records()[0].body_text(), Some("after-restart"));
+    Ok(())
+}
+
+#[test]
+fn tail_secondary_only_resume_reattaches_source_lease() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-secondary-only-resume")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x57; 32])),
+    )?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let sources = TailSourceSet::new(vec![second.reader()?])?;
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let cursor = tail.cursor().clone();
+    drop(tail);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let sources = TailSourceSet::new(vec![second.reader()?])?;
+    let mut resumed = service.resume_tail_with_sources(query, &cursor, sources)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
     Ok(())
 }
 
