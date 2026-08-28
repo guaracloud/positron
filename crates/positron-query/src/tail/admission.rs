@@ -13,7 +13,7 @@ use super::source::TailSourceSet;
 #[path = "admission_resume.rs"]
 mod resume;
 pub(super) use resume::terminal_for_failure;
-use resume::{resume_source_lease_for_tail as resume_source_lease, validate_resume_leases};
+use resume::{resume_source_lease, validate_resume_leases};
 #[path = "admission_api.rs"]
 mod api;
 
@@ -32,10 +32,7 @@ pub(super) fn validate_tail_shape(
     if query.plan.tail_incompatible()
         || query.plan.has_total_limit()
         || query.plan.has_explicit_ordering()
-        || !sources
-            .readers()
-            .iter()
-            .any(|reader| reader.scope() == ledger_scope)
+        || !sources.contains(ledger_scope.shard_id())
     {
         return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
     }
@@ -81,12 +78,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         source_lease_grants
             .try_reserve_exact(sources.readers().len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        let mut source_lease_ids = Vec::new();
-        let mut source_frontiers = Vec::new();
-        source_lease_ids
+        let mut bindings = Vec::new();
+        bindings
             .try_reserve_exact(sources.readers().len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        source_frontiers
+        let mut frontiers = Vec::new();
+        frontiers
             .try_reserve_exact(sources.readers().len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let (lease, lease_owner) = if let Some((state, _)) = resume.as_ref() {
@@ -136,39 +133,18 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             let lease_id = source_lease
                 .as_ref()
                 .map_or_else(|| lease.identity(), SnapshotLeaseGrant::identity);
-            source_lease_ids.push((shard, lease_id));
             let frontier = source_lease.as_ref().map_or_else(
                 || lease.snapshot().frontier(),
                 |grant| grant.snapshot().frontier(),
             );
-            source_frontiers.push((shard, frontier));
+            bindings.push(TailSourceBinding::new(shard, lease_id, frontier));
+            frontiers.push((shard, frontier));
             if let Some(source_lease) = source_lease {
                 source_lease_owners.push(TailLeaseOwner::new(authority, source_lease.identity()));
                 source_lease_grants.push(source_lease);
             }
         }
-        let mut frontiers = Vec::new();
-        frontiers
-            .try_reserve_exact(sources.readers().len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        let mut header_snapshot = Some(lease.snapshot());
-        for reader in sources.readers() {
-            let shard = reader.scope().shard_id();
-            let frontier = source_frontiers
-                .iter()
-                .find(|(candidate, _)| *candidate == shard)
-                .map(|(_, frontier)| *frontier)
-                .ok_or_else(super::internal)?;
-            if reader.scope() == self.ledger.scope() {
-                // The primary grant is the authoritative snapshot used for the
-                // response header. It was captured at the same catalog basis as
-                // every source grant above.
-                header_snapshot = Some(lease.snapshot());
-            }
-            frontiers.push((shard, frontier));
-        }
-        let snapshot = header_snapshot.ok_or_else(super::internal)?;
-        frontiers.sort_unstable_by_key(|(shard, _)| *shard);
+        let snapshot = lease.snapshot();
         let digest = sources.digest(&self.ledger.control_tokens())?;
         let expected_budget = budget_digest(&self.ledger.control_tokens(), query.budget)?;
         let resumed = resume.is_some();
@@ -232,18 +208,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                         )?);
                     }
                     state.set_historical_markers(markers)?;
-                }
-                let mut bindings = Vec::new();
-                bindings
-                    .try_reserve_exact(frontiers.len())
-                    .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-                for (shard, frontier) in &frontiers {
-                    let lease = source_lease_ids
-                        .iter()
-                        .find(|(candidate, _)| candidate == shard)
-                        .map(|(_, lease)| *lease)
-                        .ok_or_else(super::internal)?;
-                    bindings.push(TailSourceBinding::new(*shard, lease, *frontier));
                 }
                 state.set_source_bindings(catalog_identity.to_bytes(), generation, bindings)?;
                 let cursor = TailCursor::encode(&self.ledger.control_tokens(), &state)?;

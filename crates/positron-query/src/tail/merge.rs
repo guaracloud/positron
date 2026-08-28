@@ -56,18 +56,7 @@ impl TailSession<'_, '_, '_, '_> {
         right: &TailCandidate,
         ordering: TailOrdering,
     ) -> Result<Ordering, QueryFailure> {
-        if self.query.cancellation.is_cancelled() {
-            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
-        }
-        self.charge_merge_comparison()?;
-        if self.query.cancellation.is_cancelled() {
-            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
-        }
-        let result = compare_candidates(left, right, ordering);
-        if self.query.cancellation.is_cancelled() {
-            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
-        }
-        Ok(result)
+        self.cooperative_compare(|| compare_candidates(left, right, ordering))
     }
 
     pub(super) fn compare_history_keys_cooperatively(
@@ -76,6 +65,13 @@ impl TailSession<'_, '_, '_, '_> {
         right: HistoricalTotalKey,
         ordering: OrderSpec,
     ) -> Result<Ordering, QueryFailure> {
+        self.cooperative_compare(|| left.compare(right, ordering))
+    }
+
+    fn cooperative_compare(
+        &mut self,
+        compare: impl FnOnce() -> Ordering,
+    ) -> Result<Ordering, QueryFailure> {
         if self.query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
@@ -83,7 +79,7 @@ impl TailSession<'_, '_, '_, '_> {
         if self.query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
-        let result = left.compare(right, ordering);
+        let result = compare();
         if self.query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }

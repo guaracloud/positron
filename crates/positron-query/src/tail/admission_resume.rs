@@ -55,7 +55,7 @@ pub(super) fn validate_resume_history(
     Ok(())
 }
 
-fn resume_source_lease<'kernel, 'catalog, 'ledger>(
+pub(super) fn resume_source_lease<'kernel, 'catalog, 'ledger>(
     authority: &'ledger positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
     binding: TailSourceBinding,
     state: &TailCursorState,
@@ -94,16 +94,6 @@ fn resume_source_lease<'kernel, 'catalog, 'ledger>(
         return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
     }
     Ok(grant)
-}
-
-pub(super) fn resume_source_lease_for_tail<'kernel, 'catalog, 'ledger>(
-    authority: &'ledger positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
-    binding: TailSourceBinding,
-    state: &TailCursorState,
-    now: u64,
-    expected_catalog: Option<(positron_kernel::CatalogGenerationId, u64)>,
-) -> Result<SnapshotLeaseGrant<'kernel>, QueryFailure> {
-    resume_source_lease(authority, binding, state, now, expected_catalog)
 }
 
 pub(super) fn validate_resume_leases(
