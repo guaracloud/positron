@@ -1960,6 +1960,102 @@ fn tail_historical_resume_uses_the_admission_snapshot_after_new_commits()
 }
 
 #[test]
+fn tail_historical_budget_exhaustion_never_delivers_an_unknown_prefix()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-budget-prefix")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "historical-first".to_owned(),
+                )),
+            ),
+            (
+                Some(2),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "historical-second".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 4, 1, 1_048_576, 60)?
+        .with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        budget,
+    )?;
+    let failure = match service.tail(query, TailStart::Historical { max_rows: 4 }) {
+        Ok(_) => return Err("historical admission exposed an unknown prefix".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(positron_query::QueryBudgetDimension::OutputBytes)
+    );
+    Ok(())
+}
+
+#[test]
+fn tail_historical_cancellation_never_delivers_a_partial_window() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-cancel-window")?;
+    fixture.kernel.append_logs(
+        (1_i64..=2)
+            .map(|event_time| {
+                (
+                    Some(event_time),
+                    Some(positron_domain::value::CandidateAttributeValue::string(
+                        "historical-cancel".to_owned(),
+                    )),
+                )
+            })
+            .collect(),
+        1,
+    )?;
+    let meter = CancellingStageWorkMeter::shared(positron_query::QueryWorkStage::Operators);
+    let service = positron_query::QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        std::sync::Arc::clone(&meter) as std::sync::Arc<dyn positron_query::QueryWorkMeter>,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 4",
+        QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let failure = match service.tail(query, TailStart::Historical { max_rows: 4 }) {
+        Ok(_) => return Err("cancelled historical materialization exposed a prefix".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::Cancelled);
+    Ok(())
+}
+
+#[test]
+fn tail_historical_empty_result_advances_only_after_the_snapshot_scan() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-historical-empty-result")?;
+    fixture.kernel.append_log("not-selected", 1, 1)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"absent\" | limit 4",
+        QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    Ok(())
+}
+
+#[test]
 fn tail_live_multi_shard_order_uses_commit_vector_not_event_time() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-live-shard-order")?;
     let second = ActiveSegmentLedger::open(
