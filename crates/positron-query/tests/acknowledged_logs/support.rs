@@ -1024,7 +1024,7 @@ fn fixture_configuration(
     tenant: TenantId,
     detected_inventory: FixtureInventory,
 ) -> Result<ResourceGovernorConfiguration, Box<dyn Error>> {
-    let cardinality = InventoryCardinalityLimits::new(1, 16)?;
+    let cardinality = InventoryCardinalityLimits::new(1, 24)?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);

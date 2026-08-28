@@ -289,6 +289,9 @@ impl TailSession<'_, '_, '_, '_> {
         self.decoded_records = state.physical_decoded_records;
         self.cpu_work_units = state.physical_cpu_work_units;
         let scan_complete = scan.complete();
+        if scan.scanned_bytes_limited() {
+            self.limiting_budget = Some(QueryBudgetDimension::ScannedBytes);
+        }
         self.reduced_pruning |= scan.reduced_pruning();
         let scanned_retained_bytes = scan.retained_size_bytes();
         let mut memory = QueryMemory::new(state.budget.memory_bytes());

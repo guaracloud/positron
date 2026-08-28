@@ -1669,6 +1669,31 @@ fn snapshot_lease_usage_ambiguous_publication_reconciles_durable_truth()
 }
 
 #[test]
+fn usage_rejects_a_malformed_durable_lease_without_reservation_change() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let malformed = ledger.create_snapshot_lease(100, 200)?.identity();
+        let target = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite_for_identity(catalog, 0xe2, malformed, corrupt_lease_version)?;
+        let baseline = authority.governor().inspect()?;
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+
+        let failure = ledger
+            .record_snapshot_lease_usage(target, delta)
+            .expect_err("usage must fail closed on malformed durable state");
+        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        let after = authority.governor().inspect()?;
+        assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(after.usage(dimension), baseline.usage(dimension));
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_usage_retries_after_an_ambiguous_prepublication() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
@@ -1890,6 +1915,27 @@ fn malformed_snapshot_lease_catalog_records_fail_closed() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn replacement_rejects_a_malformed_durable_lease_before_publication() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xe1, corrupt_lease_version)?;
+        let failure = match ledger.prepare_snapshot_lease_replacement(identity, 101, 200) {
+            Ok(_) => return Err("replacement accepted malformed durable lease data".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        Ok(())
+    })
+}
+
+#[test]
 fn active_legacy_lease_with_unprovable_remaining_ttl_fails_closed() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let ledger = ActiveSegmentLedger::open(
@@ -1960,6 +2006,40 @@ fn publish_lease_rewrite(
         })
         .collect::<Result<Vec<_>, _>>()?;
     assert!(found, "snapshot lease catalog record missing");
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([transaction; 16])?,
+            FormatEpoch::new(1)?,
+            objects,
+        )?,
+        None,
+    )?;
+    Ok(())
+}
+
+fn publish_lease_rewrite_for_identity(
+    catalog: &Catalog<'_>,
+    transaction: u8,
+    target: crate::SnapshotLeaseId,
+    rewrite: fn(&mut Vec<u8>),
+) -> Result<(), Box<dyn Error>> {
+    let basis = catalog.pin()?;
+    let mut found = false;
+    let target_bytes = target.to_bytes();
+    let objects = basis
+        .plaintext_objects()
+        .map(|bytes| {
+            let mut bytes = bytes.to_vec();
+            if bytes.starts_with(b"PSLEASE1") && bytes.get(10..26) == Some(target_bytes.as_slice())
+            {
+                rewrite(&mut bytes);
+                found = true;
+            }
+            CatalogObject::new(bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(found, "target snapshot lease catalog record missing");
     catalog.commit(
         basis.identity(),
         CatalogProposal::new(

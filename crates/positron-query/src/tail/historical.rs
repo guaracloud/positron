@@ -118,13 +118,14 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         self.restore_historical_grants(grants);
         scan_result?;
         if !complete {
-            let dimension = (self.scanned_bytes >= self.query.budget.scanned_bytes())
-                .then_some(QueryBudgetDimension::ScannedBytes)
-                .or(
-                    (self.decoded_records >= self.query.budget.decoded_records())
-                        .then_some(QueryBudgetDimension::DecodedRecords),
-                )
-                .unwrap_or(QueryBudgetDimension::DecodedRecords);
+            let dimension = (self.limiting_budget == Some(QueryBudgetDimension::ScannedBytes)
+                || self.scanned_bytes >= self.query.budget.scanned_bytes())
+            .then_some(QueryBudgetDimension::ScannedBytes)
+            .or(
+                (self.decoded_records >= self.query.budget.decoded_records())
+                    .then_some(QueryBudgetDimension::DecodedRecords),
+            )
+            .unwrap_or(QueryBudgetDimension::DecodedRecords);
             return Err(QueryFailure::budget_exhausted(dimension));
         }
         let historical_complete = complete && !window_overflow;

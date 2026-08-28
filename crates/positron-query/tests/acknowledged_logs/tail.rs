@@ -5,6 +5,7 @@ use positron_domain::value::AttributeValueKind;
 use positron_kernel::{
     ActiveSegmentLedger, CatalogPublicationFault, CommittedLedgerReader, SegmentProtectionKey,
     SnapshotLeaseId, WorkClass, with_catalog_publication_fault_after,
+    with_catalog_publication_fault_sequence_after,
 };
 use positron_query::{
     QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal, TailCursor,
@@ -2110,6 +2111,28 @@ fn tail_historical_budget_exhaustion_never_delivers_an_unknown_prefix() -> Resul
 }
 
 #[test]
+fn tail_historical_scan_budget_fails_before_a_retained_record() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-scan-budget")?;
+    fixture.kernel.append_log("scan-budget", 1, 1)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1, 1_024, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let failure = match service.tail(query, TailStart::Historical { max_rows: 1 }) {
+        Ok(_) => return Err("a scan budget refusal exposed a historical prefix".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(positron_query::QueryBudgetDimension::ScannedBytes)
+    );
+    Ok(())
+}
+
+#[test]
 fn tail_historical_cancellation_never_delivers_a_partial_window() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-historical-cancel-window")?;
     fixture.kernel.append_logs(
@@ -2502,49 +2525,77 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
         ),
         SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
     )?;
-    let sources = TailSourceSet::new(vec![second.reader()?, third.reader()?])?;
-    let service = fixture.service(16)?;
-    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
-    let query = service.plan_pipeline(
-        fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
-        budget,
-    )?;
-    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
-    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let safe_cursor = tail.cursor().clone();
     fixture.kernel.append_logs_to(
         &second,
         VirtualShardId::new(2)?,
         vec![(
             Some(2),
             Some(positron_domain::value::CandidateAttributeValue::string(
-                "post-admission-two".to_owned(),
+                "historical-two".to_owned(),
             )),
         )],
         2,
     )?;
-    fixture.kernel.append_logs_to(
-        &third,
-        VirtualShardId::new(3)?,
-        vec![(
-            Some(3),
-            Some(positron_domain::value::CandidateAttributeValue::string(
-                "post-admission-three".to_owned(),
-            )),
-        )],
-        3,
+    fixture.kernel.append_log("historical-primary", 1, 1)?;
+    let sources = TailSourceSet::new(vec![
+        fixture.kernel.ledger()?.reader()?,
+        second.reader()?,
+        third.reader()?,
+    ])?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 5, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 5",
+        budget,
     )?;
+    let mut tail =
+        service.tail_with_sources(query, TailStart::Historical { max_rows: 2 }, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
     let event = tail.poll();
     let Some(TailEvent::Batch(batch)) = event else {
         return Err(format!("post-admission multi-source batch missing: {event:?}").into());
     };
     assert_eq!(batch.records().len(), 2);
-    let failure =
-        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
-            tail.acknowledge(batch.sequence(), batch.digest())
-        })
-        .expect_err("a secondary lease publication failure must reject the ack");
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    fixture.kernel.append_log("live-primary-three", 3, 3)?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(4),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "live-secondary-three".to_owned(),
+            )),
+        )],
+        4,
+    )?;
+    fixture.kernel.append_logs_to(
+        &third,
+        VirtualShardId::new(3)?,
+        vec![(
+            Some(5),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "live-tertiary-three".to_owned(),
+            )),
+        )],
+        5,
+    )?;
+    let event = tail.poll();
+    let Some(TailEvent::Batch(batch)) = event else {
+        return Err(format!("post-historical live batch missing: {event:?}").into());
+    };
+    assert_eq!(batch.records().len(), 3);
+    let safe_cursor = tail.cursor().clone();
+    let failure = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeCommit, 2),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+        ],
+        || tail.acknowledge(batch.sequence(), batch.digest()),
+    )
+    .expect_err("a rollback publication failure must reject the ack");
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
     assert_eq!(tail.cursor(), &safe_cursor);
     assert!(matches!(
