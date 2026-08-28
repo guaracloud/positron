@@ -1651,6 +1651,35 @@ fn snapshot_lease_usage_writes_reject_a_durable_expiry_at_the_observed_time()
 }
 
 #[test]
+fn snapshot_lease_usage_rejects_expiry_without_recovery_pruning_the_active_lease()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let clock = ledger.create_snapshot_lease(101, 201)?.identity();
+        let baseline = authority.governor().inspect()?;
+        publish_lease_rewrite_for_identity(catalog, 0xe8, identity, |bytes| {
+            bytes[103..111].copy_from_slice(&101_u64.to_be_bytes());
+        })?;
+        assert_eq!(ledger.snapshot_lease_time()?, 101);
+
+        let failure = ledger
+            .record_snapshot_lease_usage(identity, SnapshotLeaseUsage::new(1, 0, 0, 0, 0, 0, 0))
+            .expect_err("an expired durable lease must be rejected before usage publication");
+        assert_eq!(failure.code(), LedgerFailureCode::SnapshotExpired);
+        let after = authority.governor().inspect()?;
+        assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(after.usage(dimension), baseline.usage(dimension));
+        }
+        ledger.release_snapshot_lease(identity)?;
+        ledger.release_snapshot_lease(clock)?;
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_usage_ambiguous_publication_reconciles_durable_truth()
 -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
@@ -1925,12 +1954,31 @@ fn replacement_rejects_a_malformed_durable_lease_before_publication() -> Result<
             SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
         )?;
         let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let baseline = authority.governor().inspect()?;
+        let lease_count = catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+            .count();
         publish_lease_rewrite(catalog, 0xe1, corrupt_lease_version)?;
         let failure = match ledger.prepare_snapshot_lease_replacement(identity, 101, 200) {
             Ok(_) => return Err("replacement accepted malformed durable lease data".into()),
             Err(failure) => failure,
         };
         assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        let after = authority.governor().inspect()?;
+        assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(after.usage(dimension), baseline.usage(dimension));
+        }
+        assert_eq!(
+            catalog
+                .pin()?
+                .plaintext_objects()
+                .filter(|bytes| bytes.starts_with(b"PSLEASE1"))
+                .count(),
+            lease_count
+        );
         Ok(())
     })
 }

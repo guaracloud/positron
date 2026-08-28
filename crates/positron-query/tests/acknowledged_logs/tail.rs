@@ -422,6 +422,41 @@ fn tail_drop_releases_its_durable_lease_and_admission() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn tail_resume_maps_a_released_source_lease_to_store_unavailable() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-released-lease")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    let lease_identity = match tail.poll() {
+        Some(TailEvent::Header(header)) => SnapshotLeaseId::new(header.lease().identity())?,
+        _ => return Err("tail header missing".into()),
+    };
+    let cursor = tail.cursor().clone();
+    fixture
+        .kernel
+        .ledger()?
+        .release_snapshot_lease(lease_identity)?;
+    drop(tail);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let failure = match service.resume_tail(query, &cursor) {
+        Ok(_) => return Err("a released source lease unexpectedly resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
 fn tail_release_failure_is_one_terminal_and_drop_retries_deferred_cleanup()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-release-retry")?;
@@ -3233,6 +3268,55 @@ fn tail_resume_rejects_a_record_cursor_without_its_retained_block() -> Result<()
 }
 
 #[test]
+fn tail_resume_rejects_a_source_binding_with_a_different_frontier() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-binding-frontier")?;
+    fixture.kernel.append_log("frontier-binding", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let tail = service.tail(query, TailStart::Now)?;
+    let mut bytes = tail.cursor().as_bytes().to_vec();
+    let payload_len = bytes.len().checked_sub(32).ok_or("cursor tag missing")?;
+    let bindings_start = bytes
+        .get(..payload_len)
+        .and_then(|payload| payload.windows(4).position(|window| window == b"TB01"))
+        .ok_or("source bindings missing")?;
+    let binding_frontier = bindings_start
+        .checked_add(4 + 2 + 32 + 8 + 16)
+        .ok_or("binding frontier offset overflow")?;
+    bytes[binding_frontier..binding_frontier + 8].copy_from_slice(&2_u64.to_be_bytes());
+    let authentication = fixture
+        .kernel
+        .ledger()?
+        .control_tokens()
+        .authenticate_query_cursor(
+            b"tail-cursor-v3",
+            bytes.get(..payload_len).ok_or("cursor payload missing")?,
+        )?;
+    bytes
+        .get_mut(payload_len..)
+        .ok_or("cursor tag missing")?
+        .copy_from_slice(&authentication.tag());
+    let cursor = TailCursor::from_bytes(&bytes)?;
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let failure = match service.resume_tail(query, &cursor) {
+        Ok(_) => return Err("a source binding frontier mismatch resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
 fn tail_sql_materialization_matches_the_ordinary_query_record() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-sql-parity")?;
     fixture.kernel.append_log("sql-value", 1, 1)?;
@@ -3274,6 +3358,24 @@ fn tail_rejects_future_knowledge_operators_with_a_typed_failure() -> Result<(), 
     )?;
     let failure = match service.tail(query, TailStart::Now) {
         Ok(_) => return Err("aggregate tail unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    Ok(())
+}
+
+#[test]
+fn tail_now_rejects_an_explicit_time_ordering() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-explicit-live-order")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time asc, commit_position asc | limit 1",
+        budget,
+    )?;
+    let failure = match service.tail(query, TailStart::Now) {
+        Ok(_) => return Err("a live explicit time ordering unexpectedly succeeded".into()),
         Err(failure) => failure,
     };
     assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
