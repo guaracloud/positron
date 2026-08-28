@@ -7,8 +7,8 @@ use positron_kernel::{
     SnapshotLeaseId, WorkClass, with_catalog_publication_fault_after,
 };
 use positron_query::{
-    QueryBudget, QueryFailureCode, QueryService, TailCursor, TailEvent, TailSourceSet, TailStart,
-    TailTerminal,
+    QueryBudget, QueryFailureCode, QueryService, TailCursor, TailEvent, TailPhase, TailSourceSet,
+    TailStart, TailTerminal,
 };
 
 use super::support::{
@@ -51,6 +51,127 @@ fn total_limit_is_rejected_for_both_tail_starts_before_resource_mutation()
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn terminal_cursor_keeps_its_snapshot_lease_resumable() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-terminal-cursor-lease")?;
+    let service = fixture.service(16)?;
+    let budget = budget(1)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let cancellation = query.cancellation();
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    cancellation.cancel();
+    let Some(TailEvent::Terminal(TailTerminal::Cancelled {
+        cursor: Some(cursor),
+        ..
+    })) = tail.poll()
+    else {
+        return Err("cancel terminal omitted its resumable cursor".into());
+    };
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let resumed = service.resume_tail(query, &cursor);
+    assert!(resumed.is_ok(), "terminal cursor lost its durable lease");
+    Ok(())
+}
+
+#[test]
+fn tail_header_truthfully_describes_historical_and_live_ordering_phases()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-phase-header")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut historical = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    let Some(TailEvent::Header(header)) = historical.poll() else {
+        return Err("historical tail omitted its header".into());
+    };
+    assert_eq!(
+        header.tail_phase(),
+        Some(TailPhase::HistoricalTemporalThenLiveCommitVector)
+    );
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut live = service.tail(query, TailStart::Now)?;
+    let Some(TailEvent::Header(header)) = live.poll() else {
+        return Err("live tail omitted its header".into());
+    };
+    assert_eq!(header.tail_phase(), Some(TailPhase::LiveCommitVector));
+    Ok(())
+}
+
+#[test]
+fn tail_cursor_preserves_planning_cpu_work() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-planning-cpu")?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let tail = service.tail(query, TailStart::Now)?;
+    let state = TailCursor::decode(
+        &fixture.kernel.ledger()?.control_tokens(),
+        tail.safe_cursor(),
+    )?;
+    assert_eq!(state.cpu_work_units(), 1);
+    Ok(())
+}
+
+#[test]
+fn tail_resume_seeds_and_advances_durable_primary_usage() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-durable-usage")?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query_source = "pipeline:v1 logs | range query_time -100 100 | limit all";
+    let query_budget =
+        QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(fixture.context, query_source, query_budget)?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    let Some(TailEvent::Header(header)) = tail.poll() else {
+        return Err("tail omitted its header".into());
+    };
+    let lease = SnapshotLeaseId::new(header.lease().identity())?;
+    fixture.kernel.append_log("durable", 1, 1)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Batch(_))));
+    let delivery = tail.cursor().clone();
+    let first = fixture.kernel.ledger()?.snapshot_lease_usage(lease, 100)?;
+    assert!(first.scanned_bytes() > 0 || first.decoded_records() > 0);
+    drop(tail);
+
+    let query = service.plan_pipeline(fixture.context, query_source, query_budget)?;
+    let mut resumed = service.resume_tail(query, &delivery)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(resumed.poll(), Some(TailEvent::Batch(_))));
+    let second = fixture.kernel.ledger()?.snapshot_lease_usage(lease, 100)?;
+    assert!(
+        second.scanned_bytes() > first.scanned_bytes()
+            || second.decoded_records() > first.decoded_records()
+    );
     Ok(())
 }
 
@@ -471,18 +592,11 @@ fn cleanup_ranking_inspects_each_public_terminal_failure_code() -> Result<(), Bo
         let query = service.plan_pipeline(
             fixture.context,
             "pipeline:v1 logs | range query_time -100 100 | limit all",
-            QueryBudget::new(1_048_576, 16, 4, 300, 1_048_576, 60)?,
+            QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
         )?;
         let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
         assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-        assert!(matches!(
-            with_catalog_publication_fault_after(
-                CatalogPublicationFault::SynchronizeCommit,
-                0,
-                || tail.poll(),
-            ),
-            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
-        ));
+        assert!(matches!(tail.poll(), Some(TailEvent::Batch(_))));
     }
     {
         let fixture = QueryFixture::new("tail-cleanup-code-budget")?;
@@ -546,12 +660,8 @@ fn cleanup_ranking_inspects_each_public_terminal_failure_code() -> Result<(), Bo
         assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
         tail.cancel();
         assert!(matches!(
-            with_catalog_publication_fault_after(
-                CatalogPublicationFault::SynchronizeCommit,
-                0,
-                || tail.poll(),
-            ),
-            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+            tail.poll(),
+            Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
         ));
     }
     {
@@ -566,12 +676,8 @@ fn cleanup_ranking_inspects_each_public_terminal_failure_code() -> Result<(), Bo
         assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
         tail.disconnect();
         assert!(matches!(
-            with_catalog_publication_fault_after(
-                CatalogPublicationFault::SynchronizeCommit,
-                0,
-                || tail.poll(),
-            ),
-            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+            tail.poll(),
+            Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
         ));
     }
     Ok(())

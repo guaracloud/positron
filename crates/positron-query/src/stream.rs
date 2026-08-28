@@ -4,6 +4,7 @@ mod events;
 pub(crate) use contract::column_type;
 pub use contract::{
     QueryHeader, ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
+    TailPhase,
 };
 pub(crate) use events::QueryCounters;
 pub(crate) use events::{BatchMemoryAccount, BatchMemoryClaim};

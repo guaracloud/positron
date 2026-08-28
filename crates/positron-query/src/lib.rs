@@ -46,7 +46,7 @@ pub use runtime::{
 };
 pub use stream::{
     QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryTerminal,
-    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
+    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType, TailPhase,
 };
 pub use stream_lifecycle::QueryStream;
 #[cfg(feature = "test-support")]

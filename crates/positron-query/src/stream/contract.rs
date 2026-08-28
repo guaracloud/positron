@@ -222,6 +222,13 @@ pub struct QueryHeader {
     snapshot: ResultSnapshot,
     lease: ResultLease,
     initial_cursor: Option<QueryCursor>,
+    tail_phase: Option<TailPhase>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TailPhase {
+    LiveCommitVector,
+    HistoricalTemporalThenLiveCommitVector,
 }
 
 impl QueryHeader {
@@ -239,7 +246,13 @@ impl QueryHeader {
             snapshot,
             lease,
             initial_cursor,
+            tail_phase: None,
         })
+    }
+
+    pub(crate) fn with_tail_phase(mut self, phase: TailPhase) -> Self {
+        self.tail_phase = Some(phase);
+        self
     }
     #[must_use]
     pub fn schema(&self) -> &ResultSchema {
@@ -264,5 +277,9 @@ impl QueryHeader {
     #[must_use]
     pub const fn initial_cursor(&self) -> Option<&QueryCursor> {
         self.initial_cursor.as_ref()
+    }
+    #[must_use]
+    pub const fn tail_phase(&self) -> Option<TailPhase> {
+        self.tail_phase
     }
 }

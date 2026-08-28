@@ -16,6 +16,8 @@ mod lifecycle;
 use leases::LeaseRotation;
 #[path = "session_progress.rs"]
 mod progress;
+#[path = "session_usage.rs"]
+mod usage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TailStart {
@@ -54,6 +56,8 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) query: PlannedQuery<'kernel>,
     pub(super) sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
     pub(super) _lease: Option<positron_kernel::SnapshotLeaseGrant<'kernel>>,
+    pub(super) lease_usage_before: positron_kernel::SnapshotLeaseUsage,
+    pub(super) lease_attempt: Option<positron_kernel::SnapshotLeaseAttempt>,
     pub(super) lease_owner: TailLeaseOwner<'ledger, 'kernel, 'catalog>,
     pub(super) source_lease_owners: TailLeaseSet<'ledger, 'kernel, 'catalog>,
     pub(super) source_lease_grants: Vec<positron_kernel::SnapshotLeaseGrant<'kernel>>,
@@ -107,6 +111,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             self.replay_delivery = None;
             self.replay = false;
         }
+        self.persist_lease_usage()?;
         let mut delivery_state = self.state.clone();
         delivery_state.set_unacknowledged_delivery((self.next_sequence, digest));
         self.delivery_cursor = Some(TailCursor::encode(
@@ -265,7 +270,9 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         self.replace_terminal_after_progress_failure();
     }
     fn take_terminal(&mut self) -> Option<TailEvent> {
-        if self.cursor_observed.get() {
+        if self.cursor_observed.get()
+            || self.terminal.as_ref().is_some_and(TailTerminal::has_cursor)
+        {
             // A caller that has taken the opaque cursor may reconnect after an
             // incomplete terminal. Keep the exact durable leases alive; their
             // bounded expiry and the kernel's cleanup path remain authoritative.

@@ -1,6 +1,6 @@
 use positron_kernel::SnapshotLeaseGrant;
 
-use crate::stream::{QueryHeader, ResultLease, ResultSnapshot};
+use crate::stream::{QueryHeader, ResultLease, ResultSnapshot, TailPhase};
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
 
 use super::buffer::TailBuffer;
@@ -45,7 +45,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         query: PlannedQuery<'kernel>,
         start: TailStart,
-        resume: Option<(TailCursorState, TailCursor)>,
+        mut resume: Option<(TailCursorState, TailCursor)>,
         sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
         let (tenant, catalog_identity, generation) = self.current_query_catalog(query.context)?;
@@ -84,7 +84,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         bindings
             .try_reserve_exact(sources.readers().len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        let (lease, lease_owner) = if let Some((state, _)) = resume.as_ref() {
+        let (mut lease, lease_owner) = if let Some((state, _)) = resume.as_ref() {
             let primary_shard = self.ledger.scope().shard_id();
             let binding = state
                 .source_binding(primary_shard)
@@ -106,6 +106,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             let owner = TailLeaseOwner::new(self.ledger, lease.identity());
             (lease, owner)
         };
+        let lease_usage_before = lease.usage();
+        let lease_attempt = lease.take_attempt();
         for reader in sources.readers() {
             let shard = reader.scope().shard_id();
             let (authority, source_lease) = if reader.scope() == self.ledger.scope() {
@@ -145,6 +147,35 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let digest = sources.digest(&self.ledger.control_tokens())?;
         let expected_budget = budget_digest(&self.ledger.control_tokens(), query.budget)?;
         let resumed = resume.is_some();
+        if let Some((state, _)) = resume.as_mut() {
+            state.set_progress(
+                state
+                    .scanned_bytes()
+                    .max(lease_usage_before.scanned_bytes()),
+                state
+                    .decoded_records()
+                    .max(lease_usage_before.decoded_records()),
+                state.output_rows(),
+                state.output_bytes(),
+                state
+                    .cpu_work_units()
+                    .max(lease_usage_before.cpu_work_units()),
+            );
+            state.set_runtime_stats(
+                state
+                    .memory_peak_bytes()
+                    .max(lease_usage_before.memory_peak_bytes()),
+                state
+                    .elapsed_seconds()
+                    .max(lease_usage_before.wall_seconds()),
+                state.reduced_pruning(),
+                state.limiting_budget(),
+            );
+        }
+        let historical_phase = matches!(start, TailStart::Historical { .. })
+            || resume
+                .as_ref()
+                .is_some_and(|(state, _)| state.historical_markers().is_some());
         let (mut state, cursor, replay, replay_delivery) = match resume {
             Some((mut state, _cursor)) => {
                 if state.positions().len() != sources.readers().len()
@@ -193,6 +224,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     [0; 32],
                 )?;
                 state.set_budget_digest(expected_budget);
+                state.set_progress(0, 0, 0, 0, query.cpu_work_units);
                 if matches!(start, TailStart::Historical { .. }) {
                     let mut markers = Vec::new();
                     markers
@@ -225,6 +257,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             query.budget.output_bytes(),
             memory_budget.execution_limit,
         )?;
+        let phase = if historical_phase {
+            TailPhase::HistoricalTemporalThenLiveCommitVector
+        } else {
+            TailPhase::LiveCommitVector
+        };
         let header = QueryHeader::new(
             &query.plan,
             query.budget,
@@ -235,7 +272,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             ),
             ResultLease::new(lease.identity().to_bytes(), expiry),
             None,
-        )?;
+        )?
+        .with_tail_phase(phase);
         let (
             next_sequence,
             prior_digest,
@@ -303,6 +341,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             query,
             sources,
             _lease: Some(lease),
+            lease_usage_before,
+            lease_attempt,
             lease_owner,
             source_lease_owners,
             source_lease_grants: if retain_source_grants {

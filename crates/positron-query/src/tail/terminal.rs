@@ -123,6 +123,18 @@ pub enum TailTerminal {
 }
 
 impl TailTerminal {
+    pub(super) const fn has_cursor(&self) -> bool {
+        match self {
+            Self::ConsumerLagged { cursor, .. }
+            | Self::BudgetExhausted { cursor, .. }
+            | Self::Expired { cursor, .. }
+            | Self::AuthorizationChanged { cursor, .. }
+            | Self::Cancelled { cursor, .. }
+            | Self::Disconnected { cursor, .. }
+            | Self::StoreUnavailable { cursor, .. } => cursor.is_some(),
+        }
+    }
+
     pub(super) const fn failure_code(&self) -> crate::QueryFailureCode {
         match self {
             Self::ConsumerLagged { .. } => crate::QueryFailureCode::ResourceAdmissionRefused,

@@ -72,6 +72,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
 
     pub(in crate::tail) fn sync_progress(&mut self) -> Result<(), QueryFailure> {
         self.sync_state_progress();
+        self.persist_lease_usage()?;
         self.cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &self.state)?;
         Ok(())
     }
