@@ -16,8 +16,8 @@ use positron_query::{
 use super::support::{
     CancellingOperatorCallMeter, CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock,
     FailAfterArmOutputMeter, StepClock, TestClock, merge_work_service, stage_work_service,
-    tail_cursor_with_cpu_progress, tail_cursor_with_source_binding, tail_cursor_with_source_lease,
-    zero_work_clock_service,
+    tail_cursor_with_cpu_progress, tail_cursor_with_position, tail_cursor_with_source_binding,
+    tail_cursor_with_source_lease, tail_cursor_with_trailing_byte, zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -2180,6 +2180,52 @@ fn tail_multi_source_resume_rejects_an_authenticated_binding_mutation_without_mu
     for dimension in positron_kernel::ResourceDimension::ALL {
         assert_eq!(after.usage(dimension), baseline.usage(dimension));
     }
+
+    let record_bound = tail_cursor_with_position(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+        0,
+        0,
+    )?;
+    let missing_frontier = tail_cursor_with_position(
+        &fixture.kernel.ledger()?.control_tokens(),
+        &record_bound,
+        1,
+        999,
+    )?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let failure = match service.resume_tail_with_sources(
+        query,
+        &missing_frontier,
+        TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?,
+    ) {
+        Ok(_) => return Err("a cursor beyond the retained frontier resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+
+    let trailing = tail_cursor_with_trailing_byte(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+    )?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let failure = match service.resume_tail_with_sources(
+        query,
+        &trailing,
+        TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?,
+    ) {
+        Ok(_) => return Err("an authenticated trailing cursor byte resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
     drop(initial);
     Ok(())
 }
@@ -4105,6 +4151,62 @@ fn tail_merge_cancellation_is_observed_before_candidate_mutation() -> Result<(),
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
     fixture.kernel.append_log("first", 1, 1)?;
     fixture.kernel.append_log("second", 2, 2)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_two_source_merge_cancellation_is_observed_during_comparison() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-two-source-merge-cancel")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x7a; 32])),
+    )?;
+    let meter = CancellingOperatorCallMeter::shared(1);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        meter.clone(),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?,
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let cancellation = query.cancellation();
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    meter.bind(cancellation)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("primary", 1, 1)?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(2),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "secondary".to_owned(),
+            )),
+        )],
+        2,
+    )?;
     assert!(matches!(
         tail.poll(),
         Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))

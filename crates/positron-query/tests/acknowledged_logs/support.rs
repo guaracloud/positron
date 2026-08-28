@@ -445,6 +445,57 @@ pub(crate) fn tail_cursor_with_source_lease(
     })
 }
 
+pub(crate) fn tail_cursor_with_position(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    position_index: usize,
+    position: u64,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const PREFIX_BYTES: usize = 260;
+        const POSITION_BYTES: usize = 16;
+        let start = PREFIX_BYTES
+            .checked_add(
+                position_index
+                    .checked_mul(POSITION_BYTES)
+                    .ok_or("position overflow")?,
+            )
+            .ok_or("position offset overflow")?;
+        let position_start = start.checked_add(4).ok_or("position field overflow")?;
+        let position_end = position_start
+            .checked_add(8)
+            .ok_or("position field overflow")?;
+        payload
+            .get_mut(position_start..position_end)
+            .ok_or("position field missing")?
+            .copy_from_slice(&position.to_be_bytes());
+        *payload
+            .get_mut(start.checked_add(14).ok_or("position flag overflow")?)
+            .ok_or("position flag missing")? = 1;
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_trailing_byte(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    const AUTH_BYTES: usize = 32;
+    let bytes = cursor.as_bytes();
+    let payload_len = bytes
+        .len()
+        .checked_sub(AUTH_BYTES)
+        .ok_or("cursor tag missing")?;
+    let mut payload = bytes
+        .get(..payload_len)
+        .ok_or("cursor payload missing")?
+        .to_vec();
+    payload.push(0);
+    let authentication = protector.authenticate_query_cursor(b"tail-cursor-v3", &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(positron_query::TailCursor::from_bytes(&payload)?)
+}
+
 pub(crate) fn tail_cursor_with_snapshot_identity(
     protector: &ControlTokenProtector<'_>,
     cursor: &positron_query::TailCursor,
