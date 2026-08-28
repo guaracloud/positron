@@ -385,6 +385,7 @@ impl TailSession<'_, '_, '_, '_> {
         };
         memory.release(released_scan_bytes)?;
         if records.is_empty() {
+            self.cpu_work_units = state.physical_cpu_work_units;
             return Ok((Vec::new(), last_scanned, scan_complete));
         }
         self.cpu_work_units = state.physical_cpu_work_units;

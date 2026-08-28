@@ -140,6 +140,38 @@ fn tail_cursor_preserves_planning_cpu_work() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn tail_nonmatching_record_persists_filter_cpu_in_safe_cursor() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-filter-cpu-progress")?;
+    let service = super::support::stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget =
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "wanted" | limit all"#,
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let initial = TailCursor::decode(
+        &fixture.kernel.ledger()?.control_tokens(),
+        tail.safe_cursor(),
+    )?;
+    fixture.kernel.append_log("ignored", 1, 1)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+
+    let state = TailCursor::decode(
+        &fixture.kernel.ledger()?.control_tokens(),
+        tail.safe_cursor(),
+    )?;
+    assert!(state.cpu_work_units() > initial.cpu_work_units());
+    Ok(())
+}
+
+#[test]
 fn tail_resume_seeds_and_advances_durable_primary_usage() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-durable-usage")?;
     let service = super::support::stage_work_service(
