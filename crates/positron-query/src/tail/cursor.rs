@@ -113,6 +113,7 @@ pub struct TailCursorState {
     pub(super) snapshot_identity: [u8; 32],
     pub(super) snapshot_generation: u64,
     pub(super) source_bindings: Option<Vec<TailSourceBinding>>,
+    pub(super) unacknowledged_delivery: Option<(u64, [u8; 32])>,
     memory_peak_bytes: u64,
     elapsed_seconds: u64,
     reduced_pruning: bool,
@@ -163,6 +164,7 @@ impl TailCursorState {
             snapshot_identity: [0; 32],
             snapshot_generation: 0,
             source_bindings: None,
+            unacknowledged_delivery: None,
             memory_peak_bytes: 0,
             elapsed_seconds: 0,
             reduced_pruning: false,
@@ -224,6 +226,19 @@ impl TailCursorState {
     pub const fn repeated_batch_count(&self) -> u64 {
         self.repeated_batch_count
     }
+
+    pub(crate) const fn unacknowledged_delivery(&self) -> Option<(u64, [u8; 32])> {
+        self.unacknowledged_delivery
+    }
+
+    pub(crate) fn set_unacknowledged_delivery(&mut self, delivery: (u64, [u8; 32])) {
+        self.unacknowledged_delivery = Some(delivery);
+    }
+
+    pub(crate) fn clear_unacknowledged_delivery(&mut self) {
+        self.unacknowledged_delivery = None;
+    }
+
     pub const fn budget_digest(&self) -> [u8; 32] {
         self.budget_digest
     }

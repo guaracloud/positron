@@ -27,6 +27,12 @@ impl<'kernel, 'catalog, 'ledger> TailSourceSet<'kernel, 'catalog, 'ledger> {
             .first()
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?
             .scope();
+        if readers
+            .iter()
+            .any(|reader| reader.scope().signal_kind() != SignalKind::Logs)
+        {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
         if readers.windows(2).any(|pair| {
             let left = pair[0].scope();
             let right = pair[1].scope();

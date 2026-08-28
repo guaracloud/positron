@@ -122,6 +122,20 @@ pub enum TailTerminal {
     },
 }
 
+impl TailTerminal {
+    pub(super) const fn failure_code(&self) -> crate::QueryFailureCode {
+        match self {
+            Self::ConsumerLagged { .. } => crate::QueryFailureCode::ResourceAdmissionRefused,
+            Self::BudgetExhausted { .. } => crate::QueryFailureCode::BudgetExhausted,
+            Self::Expired { .. } => crate::QueryFailureCode::SnapshotExpired,
+            Self::AuthorizationChanged { .. } => crate::QueryFailureCode::AuthorizationChanged,
+            Self::Cancelled { .. } => crate::QueryFailureCode::Cancelled,
+            Self::Disconnected { .. } => crate::QueryFailureCode::Cancelled,
+            Self::StoreUnavailable { .. } => crate::QueryFailureCode::StoreUnavailable,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum TerminalKind {
     Expired,

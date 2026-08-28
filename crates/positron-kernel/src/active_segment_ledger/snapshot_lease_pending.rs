@@ -151,4 +151,31 @@ mod tests {
         assert_eq!(failure.code(), LedgerFailureCode::StaleGeneration);
         assert_eq!(pending.identities().count(), 0);
     }
+
+    #[test]
+    fn cleanup_capacity_covers_the_active_lease_ceiling_and_one_ambiguous_create() {
+        let mut pending = PendingLeaseReleases::new();
+        for index in 0..super::MAX_SNAPSHOT_LEASES - 1 {
+            let byte = u8::try_from(index + 1).expect("test identity is bounded");
+            pending
+                .register(SnapshotLeaseId::new([byte; 16]).expect("test identity is nonzero"))
+                .expect("expired identities fit");
+        }
+        let ambiguous = SnapshotLeaseId::new([0xff; 16]).expect("test identity is nonzero");
+        pending
+            .register(ambiguous)
+            .expect("one ambiguous create identity fits");
+        let active_owner = SnapshotLeaseId::new([0xfe; 16]).expect("test identity is nonzero");
+        pending
+            .register(active_owner)
+            .expect("an already admitted owner can defer its release");
+        assert_eq!(pending.identities().count(), super::MAX_SNAPSHOT_LEASES + 1);
+        assert_eq!(
+            pending
+                .register(SnapshotLeaseId::new([0xfd; 16]).expect("test identity is nonzero"))
+                .expect_err("a second extra owner cannot be admitted in this state")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+    }
 }

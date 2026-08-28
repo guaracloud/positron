@@ -20,9 +20,10 @@ impl TailSession<'_, '_, '_, '_> {
         for index in 1..candidates.len() {
             let mut current = index;
             while current > 0 {
+                let previous = current.checked_sub(1).ok_or_else(super::internal)?;
                 if self.compare_candidates_cooperatively(
-                    &candidates[current - 1],
-                    &candidates[current],
+                    candidates.get(previous).ok_or_else(super::internal)?,
+                    candidates.get(current).ok_or_else(super::internal)?,
                     self.tail_ordering(),
                 )? != Ordering::Greater
                 {
@@ -63,6 +64,26 @@ impl TailSession<'_, '_, '_, '_> {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
         let result = compare_candidates(left, right, ordering);
+        if self.query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        Ok(result)
+    }
+
+    pub(super) fn compare_history_keys_cooperatively(
+        &mut self,
+        left: HistoricalTotalKey,
+        right: HistoricalTotalKey,
+        ordering: OrderSpec,
+    ) -> Result<Ordering, QueryFailure> {
+        if self.query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        self.charge_merge_comparison()?;
+        if self.query.cancellation.is_cancelled() {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        let result = left.compare(right, ordering);
         if self.query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }

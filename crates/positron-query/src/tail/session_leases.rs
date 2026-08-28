@@ -163,7 +163,10 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             None
         };
         for index in 0..secondary.len() {
-            match secondary[index].replacement.commit() {
+            let replacement = secondary
+                .get_mut(index)
+                .ok_or_else(super::super::internal)?;
+            match replacement.replacement.commit() {
                 Ok(grant) => {
                     secondary_grants.push(grant);
                     committed_secondary.push(index);
@@ -172,8 +175,15 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                     drop(secondary_grants);
                     let mut rollback_failure = None;
                     for index in committed_secondary.into_iter().rev() {
-                        if let Err(failure) = secondary[index].replacement.rollback() {
-                            retain_stronger(
+                        let Some(replacement) = secondary.get_mut(index) else {
+                            crate::failure::retain_stronger(
+                                &mut rollback_failure,
+                                super::super::internal(),
+                            );
+                            continue;
+                        };
+                        if let Err(failure) = replacement.replacement.rollback() {
+                            crate::failure::retain_stronger(
                                 &mut rollback_failure,
                                 crate::execution_support::map_ledger_failure(failure),
                             );
@@ -183,14 +193,14 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                         && primary_grant.take().is_some()
                         && let Err(failure) = replacement.replacement.rollback()
                     {
-                        retain_stronger(
+                        crate::failure::retain_stronger(
                             &mut rollback_failure,
                             crate::execution_support::map_ledger_failure(failure),
                         );
                     }
                     let failure = crate::execution_support::map_ledger_failure(failure);
                     return Err(rollback_failure.map_or(failure.clone(), |rollback| {
-                        stronger_failure(rollback, failure)
+                        crate::failure::stronger_failure(rollback, failure)
                     }));
                 },
             }
@@ -217,29 +227,5 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             drop(grant);
         }
         Ok(())
-    }
-}
-
-fn retain_stronger(current: &mut Option<QueryFailure>, candidate: QueryFailure) {
-    match current {
-        Some(existing) => *existing = stronger_failure(existing.clone(), candidate),
-        None => *current = Some(candidate),
-    }
-}
-
-fn stronger_failure(left: QueryFailure, right: QueryFailure) -> QueryFailure {
-    if failure_rank(right.code()) > failure_rank(left.code()) {
-        right
-    } else {
-        left
-    }
-}
-
-fn failure_rank(code: QueryFailureCode) -> u8 {
-    match code {
-        QueryFailureCode::Internal | QueryFailureCode::MalformedPersistentData => 4,
-        QueryFailureCode::StoreUnavailable | QueryFailureCode::AuthorizationChanged => 3,
-        QueryFailureCode::ResourceExhausted | QueryFailureCode::BudgetExhausted => 2,
-        _ => 1,
     }
 }

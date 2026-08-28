@@ -2084,6 +2084,30 @@ fn replacement_rejects_a_malformed_durable_lease_before_publication() -> Result<
 }
 
 #[test]
+fn replacement_rollback_rejects_a_magic_prefixed_malformed_lease() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x75; 32])),
+        )?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(identity, 101, 200)?;
+        let candidate = replacement.commit()?.identity();
+        publish_lease_rewrite_for_identity(catalog, 0xe3, candidate, corrupt_lease_version)?;
+        assert_eq!(
+            replacement
+                .rollback()
+                .expect_err("rollback must fail closed on malformed PSLEASE1")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn active_legacy_lease_with_unprovable_remaining_ttl_fails_closed() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let ledger = ActiveSegmentLedger::open(

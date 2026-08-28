@@ -175,7 +175,7 @@ pub(crate) fn query_record(
         Ok(result) => Ok(result),
         Err(failure) => match transformed.release() {
             Ok(()) => Err(failure),
-            Err(cleanup) => Err(cleanup),
+            Err(cleanup) => Err(crate::failure::stronger_failure(failure, cleanup)),
         },
     }
 }

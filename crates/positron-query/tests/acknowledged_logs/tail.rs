@@ -40,7 +40,7 @@ fn tail_reads_acknowledged_history_then_stays_idle_until_disconnect() -> Result<
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -80,7 +80,7 @@ fn tail_revalidation_failure_emits_one_terminal() -> Result<(), Box<dyn Error>> 
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -105,7 +105,7 @@ fn tail_terminal_stats_count_only_acknowledged_rows_and_digest() -> Result<(), B
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -147,7 +147,7 @@ fn tail_resume_frames_cumulative_elapsed_overflow_before_delivery() -> Result<()
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -176,7 +176,7 @@ fn tail_resume_frames_cumulative_elapsed_overflow_before_delivery() -> Result<()
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service
@@ -203,7 +203,7 @@ fn tail_terminal_stats_accumulate_resume_and_repeat_counts() -> Result<(), Box<d
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut first = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -226,7 +226,7 @@ fn tail_terminal_stats_accumulate_resume_and_repeat_counts() -> Result<(), Box<d
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -252,17 +252,17 @@ fn tail_poll_requires_an_explicit_acknowledgement_before_advancing_cursor()
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let safe_cursor = tail.cursor().clone();
+    let safe_cursor = tail.safe_cursor().clone();
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("tail batch missing".into());
     };
 
-    assert_eq!(tail.cursor(), &safe_cursor);
+    assert_eq!(tail.safe_cursor(), &safe_cursor);
     assert_eq!(
         tail.acknowledge(batch.sequence() + 1, batch.digest())
             .expect_err("out-of-order acknowledgement must be rejected")
@@ -297,7 +297,7 @@ fn tail_acknowledges_a_same_shard_live_batch_in_commit_order() -> Result<(), Box
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -350,7 +350,7 @@ fn tail_rejects_an_acknowledgement_before_a_batch_is_pending_and_remains_usable(
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -382,12 +382,12 @@ fn tail_ack_cursor_encode_failure_keeps_safe_progress_and_terminalizes_once()
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let safe_cursor = tail.cursor().clone();
+    let safe_cursor = tail.safe_cursor().clone();
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("acknowledgement failure batch missing".into());
     };
@@ -418,7 +418,7 @@ fn tail_disconnect_before_ack_replays_the_same_batch_identity() -> Result<(), Bo
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -436,7 +436,7 @@ fn tail_disconnect_before_ack_replays_the_same_batch_identity() -> Result<(), Bo
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -469,7 +469,7 @@ fn tail_drop_releases_its_durable_lease_and_admission() -> Result<(), Box<dyn Er
         .outstanding_for(WorkClass::InteractiveQueryTail);
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -515,7 +515,7 @@ fn tail_resume_maps_a_released_source_lease_to_store_unavailable() -> Result<(),
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -532,7 +532,7 @@ fn tail_resume_maps_a_released_source_lease_to_store_unavailable() -> Result<(),
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &cursor) {
@@ -551,7 +551,7 @@ fn tail_release_failure_is_one_terminal_and_drop_retries_deferred_cleanup()
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -600,7 +600,7 @@ fn tail_historical_admission_failure_releases_the_lease_before_returning()
         .outstanding_for(WorkClass::InteractiveQueryTail);
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     if service
@@ -642,7 +642,7 @@ fn tail_terminal_and_drop_paths_reclaim_lease_capacity_repeatedly() -> Result<()
             .outstanding_for(WorkClass::InteractiveQueryTail);
         let query = service.plan_pipeline(
             fixture.context,
-            "pipeline:v1 logs | range query_time -100 100 | limit 1",
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
             budget,
         )?;
         let mut tail = service.tail(query, TailStart::Now)?;
@@ -716,7 +716,7 @@ fn tail_cursor_resumes_after_ledger_reopen_without_a_gap() -> Result<(), Box<dyn
         let service = fixture.service(16)?;
         let query = service.plan_pipeline(
             fixture.context,
-            "pipeline:v1 logs | range query_time -100 100 | limit 2",
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
             budget,
         )?;
         let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -732,7 +732,7 @@ fn tail_cursor_resumes_after_ledger_reopen_without_a_gap() -> Result<(), Box<dyn
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -760,7 +760,7 @@ fn tail_historical_resume_rejects_a_pruned_handoff_before_ack() -> Result<(), Bo
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -800,7 +800,7 @@ fn tail_historical_resume_rejects_a_pruned_handoff_before_ack() -> Result<(), Bo
     let forged = TailCursor::from_bytes(&bytes)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     assert!(matches!(
@@ -834,7 +834,7 @@ fn tail_historical_cursor_rejects_a_corrupted_continuation_key() -> Result<(), B
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -894,7 +894,7 @@ fn tail_cursor_tamper_fails_closed_on_resume() -> Result<(), Box<dyn Error>> {
     let budget = QueryBudget::new(1_048_576, 16, 1, 1, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -904,7 +904,7 @@ fn tail_cursor_tamper_fails_closed_on_resume() -> Result<(), Box<dyn Error>> {
     let tampered = positron_query::TailCursor::from_bytes(&bytes)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     assert!(service.resume_tail(query, &tampered).is_err());
@@ -918,7 +918,7 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -1155,13 +1155,10 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
         ),
         SegmentProtectionKey::from_owned(Box::new([0x63; 32])),
     )?;
-    let trace_sources = TailSourceSet::new(vec![traces.reader()?])?;
-    let trace_query = service.plan_pipeline(
-        fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
-        budget,
-    )?;
-    let _trace_tail = service.tail_with_sources(trace_query, TailStart::Now, trace_sources)?;
+    assert!(matches!(
+        TailSourceSet::new(vec![traces.reader()?]),
+        Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
+    ));
     Ok(())
 }
 
@@ -1187,12 +1184,12 @@ fn tail_rejects_a_source_without_a_ledger_lease_capability_before_snapshot_work(
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     assert!(matches!(
         service.tail_with_sources(query, TailStart::Now, sources),
-        Err(failure) if failure.code() == QueryFailureCode::StoreUnavailable
+        Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
     ));
     Ok(())
 }
@@ -1212,7 +1209,7 @@ fn tail_rejects_a_source_for_another_tenant_and_invalid_buffer_budget() -> Resul
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     assert!(matches!(
@@ -1222,7 +1219,7 @@ fn tail_rejects_a_source_for_another_tenant_and_invalid_buffer_budget() -> Resul
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         QueryBudget::new(1_048_576, 16, 1, 16_777_217, 1_048_576, 60)?,
     )?;
     assert!(matches!(
@@ -1246,7 +1243,7 @@ fn tail_scan_cancellation_is_one_typed_terminal() -> Result<(), Box<dyn Error>> 
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     meter.bind(query.cancellation())?;
@@ -1278,7 +1275,7 @@ fn tail_operator_cpu_budget_fails_before_delivering_an_overrun_batch() -> Result
         16,
     );
     let source =
-        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit 2";
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit all";
     let minimum_plan_cpu = (1..=1_024)
         .find_map(|units| {
             let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)
@@ -1337,7 +1334,7 @@ fn tail_operator_work_overflow_emits_one_terminal_without_a_batch() -> Result<()
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1367,7 +1364,7 @@ fn tail_resume_cpu_progress_overflow_is_terminal_without_advancing() -> Result<(
         16,
     );
     let source =
-        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit 1";
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit all";
     let budget =
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     let query = service.plan_pipeline(fixture.context, source, budget)?;
@@ -1410,7 +1407,7 @@ fn tail_materialize_cpu_addition_overflow_preserves_cursor() -> Result<(), Box<d
         16,
     );
     let source =
-        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit 1";
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit all";
     let budget =
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     fixture
@@ -1461,7 +1458,7 @@ fn tail_materialize_cpu_multiplication_overflow_preserves_cursor() -> Result<(),
         TestClock::shared(100),
         std::sync::Arc::new(OperatorOverflowWorkMeter),
     );
-    let source = "pipeline:v1 logs | range query_time -100 100 | cast body as string | project body, query_time | limit 1";
+    let source = "pipeline:v1 logs | range query_time -100 100 | cast body as string | project body, query_time | limit all";
     let budget =
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     let query = service
@@ -1501,7 +1498,7 @@ fn tail_admission_rejects_wall_expiry_overflow() -> Result<(), Box<dyn Error>> {
     );
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     assert!(matches!(
@@ -1526,7 +1523,7 @@ fn tail_output_size_work_failure_is_terminal_before_delivery() -> Result<(), Box
     );
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit all",
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1559,7 +1556,7 @@ fn tail_digest_work_failure_is_terminal_before_delivery() -> Result<(), Box<dyn 
     );
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit all",
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1596,7 +1593,7 @@ fn tail_historical_output_work_failures_never_publish_a_batch() -> Result<(), Bo
         );
         let query = service.plan_pipeline(
             fixture.context,
-            "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+            "pipeline:v1 logs | range query_time -100 100 | project body | limit all",
             QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
         )?;
         let failure = match service.tail(query, TailStart::Historical { max_rows: 1 }) {
@@ -1615,7 +1612,7 @@ fn tail_terminal_cursor_sync_failure_is_framed_once() -> Result<(), Box<dyn Erro
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1641,7 +1638,7 @@ fn tail_admission_rejects_cancelled_and_invalid_historical_requests() -> Result<
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.tail(query, TailStart::Historical { max_rows: 0 }) {
@@ -1651,7 +1648,7 @@ fn tail_admission_rejects_cancelled_and_invalid_historical_requests() -> Result<
     assert_eq!(failure.code(), QueryFailureCode::InvalidBudget);
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     query.cancellation().cancel();
@@ -1676,7 +1673,7 @@ fn tail_revalidates_expiry_and_lifecycle_before_following() -> Result<(), Box<dy
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1696,7 +1693,7 @@ fn tail_revalidates_expiry_and_lifecycle_before_following() -> Result<(), Box<dy
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1727,7 +1724,7 @@ fn tail_admission_rejects_expired_budget_and_cursor_vector_mismatch() -> Result<
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     clock.set(160);
@@ -1741,7 +1738,7 @@ fn tail_admission_rejects_expired_budget_and_cursor_vector_mismatch() -> Result<
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -1766,7 +1763,7 @@ fn tail_admission_rejects_expired_budget_and_cursor_vector_mismatch() -> Result<
     )?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &vector_cursor) {
@@ -1794,7 +1791,7 @@ fn tail_admission_rejects_expired_budget_and_cursor_vector_mismatch() -> Result<
     )?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &missing_source_position) {
@@ -1812,7 +1809,7 @@ fn tail_follow_maps_a_later_store_failure_to_one_terminal() -> Result<(), Box<dy
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1841,7 +1838,7 @@ fn tail_follow_maps_cumulative_budget_exhaustion_to_one_terminal() -> Result<(),
         QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(2)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | filter body == \"budget\" | limit 16",
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"budget\" | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1884,7 +1881,7 @@ fn tail_follow_maps_output_bytes_budget_to_one_terminal() -> Result<(), Box<dyn 
     let budget = QueryBudget::new(1_048_576, 16, 1, 1, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1919,7 +1916,7 @@ fn tail_follow_rechecks_output_rows_after_acknowledgement() -> Result<(), Box<dy
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -1989,7 +1986,7 @@ fn tail_external_cancellation_is_revalidated_before_following() -> Result<(), Bo
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let cancellation = query.cancellation();
@@ -2041,7 +2038,7 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail =
@@ -2084,7 +2081,7 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
     let mismatch = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?])?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     assert!(
@@ -2124,7 +2121,7 @@ fn tail_multi_shard_secondary_release_failure_is_deferred_and_retried() -> Resul
         .outstanding_for(WorkClass::InteractiveQueryTail);
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
@@ -2213,7 +2210,7 @@ fn tail_historical_max_rows_is_global_across_shards() -> Result<(), Box<dyn Erro
     let budget = QueryBudget::new(1_048_576, 16, 8, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 8",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail =
@@ -2284,7 +2281,7 @@ fn tail_historical_global_order_preserves_unselected_source_candidates()
     let budget = QueryBudget::new(1_048_576, 16, 8, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 3",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail =
@@ -2340,7 +2337,7 @@ fn tail_historical_resume_uses_the_admission_snapshot_after_new_commits()
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -2355,7 +2352,7 @@ fn tail_historical_resume_uses_the_admission_snapshot_after_new_commits()
     fixture.kernel.append_log("newer-commit", 0, 2)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -2393,7 +2390,7 @@ fn tail_historical_budget_exhaustion_never_delivers_an_unknown_prefix() -> Resul
         QueryBudget::new(1_048_576, 16, 4, 1, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.tail(query, TailStart::Historical { max_rows: 4 }) {
@@ -2416,7 +2413,7 @@ fn tail_historical_scan_budget_fails_before_a_retained_record() -> Result<(), Bo
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         QueryBudget::new(1, 1_024, 1, 1_048_576, 1_048_576, 60)?,
     )?;
     let failure = match service.tail(query, TailStart::Historical { max_rows: 1 }) {
@@ -2457,7 +2454,7 @@ fn tail_historical_cancellation_never_delivers_a_partial_window() -> Result<(), 
     );
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | project body | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit all",
         QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
     )?;
     meter.bind(query.cancellation())?;
@@ -2502,7 +2499,7 @@ fn tail_historical_cancellation_during_record_processing_never_publishes_a_batch
         QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position desc | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     meter.bind(query.cancellation())?;
@@ -2522,7 +2519,7 @@ fn tail_historical_empty_result_advances_only_after_the_snapshot_scan() -> Resul
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | filter body == \"absent\" | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | filter body == \"absent\" | limit all",
         QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -2554,7 +2551,7 @@ fn tail_historical_rejects_a_batch_that_exceeds_output_limits() -> Result<(), Bo
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         QueryBudget::new(1_048_576, 16, 2, 1, 1_048_576, 60)?,
     )?;
     let failure = match service.tail(query, TailStart::Historical { max_rows: 2 }) {
@@ -2595,20 +2592,13 @@ fn tail_historical_descending_order_keeps_commit_and_ordinal_ties_deterministic(
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position desc | limit 3",
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position desc | limit all",
         QueryBudget::new(1_048_576, 16, 3, 1_048_576, 1_048_576, 60)?,
     )?;
-    let mut tail = service.tail(query, TailStart::Historical { max_rows: 3 })?;
-    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let Some(TailEvent::Batch(batch)) = tail.poll() else {
-        return Err("descending historical batch missing".into());
-    };
-    let bodies = batch
-        .records()
-        .iter()
-        .filter_map(|record| record.body_text())
-        .collect::<Vec<_>>();
-    assert_eq!(bodies, ["newer-commit", "ordinal-second", "ordinal-first"]);
+    assert!(matches!(
+        service.tail(query, TailStart::Historical { max_rows: 3 }),
+        Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
+    ));
     Ok(())
 }
 
@@ -2618,7 +2608,7 @@ fn tail_now_advances_past_a_nonmatching_scan_before_following() -> Result<(), Bo
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "wanted" | limit 2"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "wanted" | limit all"#,
         QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -2655,7 +2645,7 @@ fn tail_live_multi_shard_order_uses_commit_vector_not_event_time() -> Result<(),
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
@@ -2691,7 +2681,7 @@ fn tail_ack_rolls_source_lease_forward_for_post_admission_commits() -> Result<()
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -2722,7 +2712,7 @@ fn tail_lease_roll_encode_failure_keeps_the_old_safe_binding() -> Result<(), Box
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -2769,7 +2759,7 @@ fn tail_lease_roll_rejects_an_expired_replacement_before_publication() -> Result
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 5)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -2845,7 +2835,7 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
     let budget = QueryBudget::new(1_048_576, 16, 5, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 5",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail =
@@ -2885,7 +2875,7 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
         return Err(format!("post-historical live batch missing: {event:?}").into());
     };
     assert_eq!(batch.records().len(), 3);
-    let safe_cursor = tail.cursor().clone();
+    let safe_cursor = tail.safe_cursor().clone();
     let failure = with_catalog_publication_fault_sequence_after(
         &[
             (CatalogPublicationFault::SynchronizeCommit, 2),
@@ -2931,7 +2921,7 @@ fn tail_primary_lease_rolls_back_after_secondary_publication_failure() -> Result
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
@@ -2978,7 +2968,7 @@ fn tail_lease_roll_restarts_from_the_new_safe_frontier() -> Result<(), Box<dyn E
         let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
         let query = service.plan_pipeline(
             fixture.context,
-            "pipeline:v1 logs | range query_time -100 100 | limit 2",
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
             budget,
         )?;
         let mut tail = service.tail(query, TailStart::Now)?;
@@ -2997,7 +2987,7 @@ fn tail_lease_roll_restarts_from_the_new_safe_frontier() -> Result<(), Box<dyn E
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -3012,7 +3002,7 @@ fn tail_lease_roll_restarts_from_the_new_safe_frontier() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn tail_secondary_only_resume_reattaches_source_lease() -> Result<(), Box<dyn Error>> {
+fn tail_secondary_only_sources_are_rejected_at_admission() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-secondary-only-resume")?;
     let second = ActiveSegmentLedger::open(
         fixture.kernel.authority,
@@ -3043,28 +3033,14 @@ fn tail_secondary_only_resume_reattaches_source_lease() -> Result<(), Box<dyn Er
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let sources = TailSourceSet::new(vec![second.reader()?])?;
-    let mut tail =
-        service.tail_with_sources(query, TailStart::Historical { max_rows: 1 }, sources)?;
-    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let Some(TailEvent::Batch(batch)) = tail.poll() else {
-        return Err("secondary historical source was not scanned".into());
-    };
-    assert_eq!(batch.records()[0].body_text(), Some("secondary-history"));
-    let cursor = tail.cursor().clone();
-    drop(tail);
-
-    let query = service.plan_pipeline(
-        fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
-        budget,
-    )?;
-    let sources = TailSourceSet::new(vec![second.reader()?])?;
-    let mut resumed = service.resume_tail_with_sources(query, &cursor, sources)?;
-    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(
+        service.tail_with_sources(query, TailStart::Historical { max_rows: 1 }, sources),
+        Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
+    ));
     Ok(())
 }
 
@@ -3126,7 +3102,7 @@ fn tail_multi_shard_history_uses_canonical_query_time_order() -> Result<(), Box<
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail =
@@ -3153,7 +3129,7 @@ fn tail_multi_shard_history_uses_canonical_query_time_order() -> Result<(), Box<
         QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1)?;
     let query = limited_service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         limited_budget,
     )?;
     let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
@@ -3210,13 +3186,13 @@ fn tail_multi_shard_history_uses_canonical_query_time_order() -> Result<(), Box<
 }
 
 #[test]
-fn tail_resume_exposes_replayed_rows_after_an_undelivered_cursor() -> Result<(), Box<dyn Error>> {
+fn tail_resume_does_not_mark_rows_from_an_idle_cursor_as_replayed() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-replay")?;
     let service = fixture.service(16)?;
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -3225,7 +3201,7 @@ fn tail_resume_exposes_replayed_rows_after_an_undelivered_cursor() -> Result<(),
     fixture.kernel.append_log("replayed", 1, 1)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -3234,7 +3210,7 @@ fn tail_resume_exposes_replayed_rows_after_an_undelivered_cursor() -> Result<(),
         return Err("replayed tail batch missing".into());
     };
     assert_eq!(batch.records()[0].body_text(), Some("replayed"));
-    assert!(batch.records()[0].replayed());
+    assert!(!batch.records()[0].replayed());
     Ok(())
 }
 
@@ -3259,7 +3235,7 @@ fn tail_resume_starts_after_the_last_delivered_record_in_a_multi_record_block()
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut first = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -3274,7 +3250,7 @@ fn tail_resume_starts_after_the_last_delivered_record_in_a_multi_record_block()
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -3301,7 +3277,7 @@ fn tail_resume_preserves_batch_chain_and_cumulative_output_budget() -> Result<()
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -3316,7 +3292,7 @@ fn tail_resume_preserves_batch_chain_and_cumulative_output_budget() -> Result<()
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -3353,7 +3329,7 @@ fn tail_resume_retains_the_original_expiry() -> Result<(), Box<dyn Error>> {
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -3361,7 +3337,7 @@ fn tail_resume_retains_the_original_expiry() -> Result<(), Box<dyn Error>> {
     clock.set(160);
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &cursor) {
@@ -3379,7 +3355,7 @@ fn tail_resume_rejects_a_changed_cumulative_budget() -> Result<(), Box<dyn Error
     let original_budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         original_budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -3388,7 +3364,7 @@ fn tail_resume_rejects_a_changed_cumulative_budget() -> Result<(), Box<dyn Error
     let changed_budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         changed_budget,
     )?;
     let failure = match service.resume_tail(query, &cursor) {
@@ -3406,7 +3382,7 @@ fn tail_resume_rejects_a_cursor_beyond_retained_history() -> Result<(), Box<dyn 
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -3427,7 +3403,7 @@ fn tail_resume_rejects_a_cursor_beyond_retained_history() -> Result<(), Box<dyn 
     let cursor = TailCursor::encode(&fixture.kernel.ledger()?.control_tokens(), &future_state)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &cursor) {
@@ -3446,7 +3422,7 @@ fn tail_resume_rejects_a_record_cursor_without_its_retained_block() -> Result<()
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -3475,7 +3451,7 @@ fn tail_resume_rejects_a_record_cursor_without_its_retained_block() -> Result<()
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     assert!(matches!(
@@ -3493,7 +3469,7 @@ fn tail_resume_rejects_a_source_binding_with_a_different_frontier() -> Result<()
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
@@ -3506,7 +3482,7 @@ fn tail_resume_rejects_a_source_binding_with_a_different_frontier() -> Result<()
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &cursor) {
@@ -3525,7 +3501,7 @@ fn tail_resume_rejects_an_unknown_source_lease_without_mutation() -> Result<(), 
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut initial = service.tail(query, TailStart::Now)?;
@@ -3541,7 +3517,7 @@ fn tail_resume_rejects_an_unknown_source_lease_without_mutation() -> Result<(), 
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &cursor) {
@@ -3567,7 +3543,7 @@ fn tail_resume_rejects_a_source_binding_with_a_different_generation() -> Result<
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut initial = service.tail(query, TailStart::Now)?;
@@ -3584,7 +3560,7 @@ fn tail_resume_rejects_a_source_binding_with_a_different_generation() -> Result<
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.resume_tail(query, &cursor) {
@@ -3602,32 +3578,17 @@ fn tail_resume_rejects_a_source_binding_with_a_different_generation() -> Result<
 }
 
 #[test]
-fn tail_sql_materialization_matches_the_ordinary_query_record() -> Result<(), Box<dyn Error>> {
+fn tail_sql_rejects_a_total_limit_like_pipeline_tail() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-sql-parity")?;
     fixture.kernel.append_log("sql-value", 1, 1)?;
     let service = fixture.service(16)?;
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let source = "SELECT body FROM logs WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 4";
-    let ordinary = service
-        .execute(service.plan_sql(fixture.context, source, budget)?)?
-        .collect::<Vec<_>>();
-    let expected = ordinary
-        .iter()
-        .find_map(|event| match event {
-            QueryEvent::Batch(batch) => batch
-                .records()
-                .first()
-                .and_then(|record| record.body_text()),
-            _ => None,
-        })
-        .ok_or("ordinary SQL record missing")?;
     let query = service.plan_sql(fixture.context, source, budget)?;
-    let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
-    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let Some(TailEvent::Batch(batch)) = tail.poll() else {
-        return Err("tail SQL batch missing".into());
-    };
-    assert_eq!(batch.records()[0].body_text(), Some(expected));
+    assert!(matches!(
+        service.tail(query, TailStart::Historical { max_rows: 4 }),
+        Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
+    ));
     Ok(())
 }
 
@@ -3638,7 +3599,7 @@ fn tail_rejects_future_knowledge_operators_with_a_typed_failure() -> Result<(), 
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | aggregate count | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | aggregate count | limit all",
         budget,
     )?;
     let failure = match service.tail(query, TailStart::Now) {
@@ -3656,7 +3617,7 @@ fn tail_now_rejects_an_explicit_time_ordering() -> Result<(), Box<dyn Error>> {
     let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | order by query_time asc, commit_position asc | limit 1",
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time asc, commit_position asc | limit all",
         budget,
     )?;
     let failure = match service.tail(query, TailStart::Now) {
@@ -3678,7 +3639,7 @@ fn tail_reads_committed_active_and_sealed_rows_without_a_complete_terminal()
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3721,7 +3682,7 @@ fn tail_overflow_is_a_single_lag_terminal_and_never_complete() -> Result<(), Box
     let budget = QueryBudget::new(1_048_576, 16, 4, 300, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3741,7 +3702,7 @@ fn tail_cancel_is_one_typed_terminal_and_not_complete() -> Result<(), Box<dyn Er
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
@@ -3764,7 +3725,7 @@ fn tail_cancel_and_disconnect_drop_buffered_rows_before_the_terminal() -> Result
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut cancelled = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3778,7 +3739,7 @@ fn tail_cancel_and_disconnect_drop_buffered_rows_before_the_terminal() -> Result
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut disconnected = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3800,7 +3761,7 @@ fn tail_fails_closed_when_authenticated_history_is_malformed() -> Result<(), Box
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let failure = match service.tail(query, TailStart::Historical { max_rows: 4 }) {
@@ -3822,7 +3783,7 @@ fn tail_preserves_typed_json_transform_values_at_the_public_record_seam()
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | json | limit 4",
+        "pipeline:v1 logs | range query_time -100 100 | json | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3850,7 +3811,7 @@ fn tail_applies_logfmt_search_and_temporal_projection_before_delivery() -> Resul
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         search_fixture.context,
-        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "api" | limit 4"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "api" | limit all"#,
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3866,7 +3827,7 @@ fn tail_applies_logfmt_search_and_temporal_projection_before_delivery() -> Resul
     let service = fixture.service(16)?;
     let query = service.plan_pipeline(
         fixture.context,
-        r#"pipeline:v1 logs | range query_time -100 100 | logfmt | project body, query_time, ingest_time | limit 4"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | logfmt | project body, query_time, ingest_time | limit all"#,
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3905,7 +3866,7 @@ fn tail_advances_the_safe_cursor_when_a_bounded_scan_has_no_matching_rows()
     let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "missing" | limit 4"#,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "missing" | limit all"#,
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
@@ -3929,7 +3890,7 @@ fn repeated_unacknowledged_delivery_keeps_memory_accounted() -> Result<(), Box<d
         QueryBudget::new(1_048_576, 16, 2, 1_048_576, 780, 60)?.with_cpu_work_units(1_024)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -3965,7 +3926,7 @@ fn acknowledged_resume_preserves_runtime_statistics() -> Result<(), Box<dyn Erro
     let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut first = service.tail(query, TailStart::Historical { max_rows: 1 })?;
@@ -3984,7 +3945,7 @@ fn acknowledged_resume_preserves_runtime_statistics() -> Result<(), Box<dyn Erro
 
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     let mut resumed = service.resume_tail(query, &cursor)?;
@@ -4012,7 +3973,7 @@ fn tail_merge_cancellation_is_observed_before_candidate_mutation() -> Result<(),
         QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     let query = service.plan_pipeline(
         fixture.context,
-        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
         budget,
     )?;
     meter.bind(query.cancellation())?;

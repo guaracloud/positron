@@ -12,6 +12,8 @@ mod query_lifecycle_admission;
 mod support;
 #[path = "acknowledged_logs/tail.rs"]
 mod tail;
+#[path = "acknowledged_logs/tail_remediation.rs"]
+mod tail_remediation;
 #[path = "acknowledged_logs/terminal_and_bounds.rs"]
 mod terminal_and_bounds;
 #[path = "acknowledged_logs/transform_capacity.rs"]

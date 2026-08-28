@@ -67,15 +67,19 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                             limit.min(super::MAX_TAIL_BATCH_ROWS),
                         )?;
                     for candidate in source_records {
-                        if self.state.historical_key().is_some_and(|key| {
-                            HistoricalTotalKey::from_record(
+                        if let Some(key) = self.state.historical_key() {
+                            let candidate_key = HistoricalTotalKey::from_record(
                                 &candidate.record,
                                 candidate.position.shard(),
-                            )
-                            .compare(key, self.query.plan.ordering())
-                                != std::cmp::Ordering::Greater
-                        }) {
-                            continue;
+                            );
+                            if self.compare_history_keys_cooperatively(
+                                candidate_key,
+                                key,
+                                self.query.plan.ordering(),
+                            )? != std::cmp::Ordering::Greater
+                            {
+                                continue;
+                            }
                         }
                         let candidate_bytes = candidate_memory(&candidate)?;
                         let reserved = self.buffer.reserve_queue_bytes(candidate_bytes)?;
@@ -270,6 +274,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             historical_complete,
             historical_key,
         });
+        self.publish_delivery_cursor(digest)?;
         Ok(())
     }
 }

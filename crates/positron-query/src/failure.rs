@@ -69,3 +69,60 @@ impl Display for QueryFailure {
 }
 
 impl std::error::Error for QueryFailure {}
+
+pub(crate) fn stronger_failure(left: QueryFailure, right: QueryFailure) -> QueryFailure {
+    if failure_rank(right.code) > failure_rank(left.code) {
+        right
+    } else {
+        left
+    }
+}
+
+pub(crate) fn retain_stronger(current: &mut Option<QueryFailure>, candidate: QueryFailure) {
+    match current.take() {
+        Some(existing) => *current = Some(stronger_failure(existing, candidate)),
+        None => *current = Some(candidate),
+    }
+}
+
+fn failure_rank(code: QueryFailureCode) -> u8 {
+    match code {
+        QueryFailureCode::Internal | QueryFailureCode::MalformedPersistentData => 4,
+        QueryFailureCode::StoreUnavailable | QueryFailureCode::AuthorizationChanged => 3,
+        QueryFailureCode::ResourceExhausted | QueryFailureCode::BudgetExhausted => 2,
+        _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueryFailure, QueryFailureCode, stronger_failure};
+
+    #[test]
+    fn strongest_failure_preserves_primary_on_ties_and_prefers_integrity() {
+        assert_eq!(
+            stronger_failure(
+                QueryFailure::new(QueryFailureCode::StoreUnavailable),
+                QueryFailure::new(QueryFailureCode::BudgetExhausted),
+            )
+            .code(),
+            QueryFailureCode::StoreUnavailable
+        );
+        assert_eq!(
+            stronger_failure(
+                QueryFailure::new(QueryFailureCode::StoreUnavailable),
+                QueryFailure::new(QueryFailureCode::Internal),
+            )
+            .code(),
+            QueryFailureCode::Internal
+        );
+        assert_eq!(
+            stronger_failure(
+                QueryFailure::new(QueryFailureCode::Internal),
+                QueryFailure::new(QueryFailureCode::StoreUnavailable),
+            )
+            .code(),
+            QueryFailureCode::Internal
+        );
+    }
+}

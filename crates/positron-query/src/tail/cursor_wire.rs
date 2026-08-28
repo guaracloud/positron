@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::{
     HistoricalMarker, TailCursorState, TailPosition, TailSourceBinding, invalid, resource,
 };
+use crate::QueryFailure;
 use crate::result_key::{HISTORICAL_TOTAL_KEY_BYTES, HistoricalTotalKey};
-use crate::{QueryFailure, QueryFailureCode};
 #[path = "cursor_wire_helpers.rs"]
 mod helpers;
+pub(crate) use helpers::budget_digest;
 use helpers::{
     array_at, array_at_at, commit_position, extension_bytes, limiting_budget_code,
     limiting_budget_from_code, u16_at, u32_at, u64_at,
@@ -23,6 +24,7 @@ const MAX_BYTES: usize = 4_096;
 const AUTH_BYTES: usize = 32;
 const EXT_MAGIC: [u8; 4] = *b"TX01";
 const BIND_MAGIC: [u8; 4] = *b"TB01";
+const DELIVERY_MAGIC: [u8; 4] = *b"DLV1";
 const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 16 + 32 + 2;
 
 #[cfg(feature = "test-support")]
@@ -122,6 +124,11 @@ impl TailCursor {
                     bytes.extend_from_slice(&binding.lease().to_bytes());
                     bytes.extend_from_slice(&binding.frontier().value().to_be_bytes());
                 }
+            }
+            if let Some((sequence, digest)) = state.unacknowledged_delivery() {
+                bytes.extend_from_slice(&DELIVERY_MAGIC);
+                bytes.extend_from_slice(&sequence.to_be_bytes());
+                bytes.extend_from_slice(&digest);
             }
         }
         let auth = protector
@@ -297,13 +304,11 @@ impl TailCursor {
                 stats_end
             };
             let bindings_start = history_key_end;
-            if payload.len() > bindings_start {
-                let binding_magic_end = bindings_start
-                    .checked_add(BIND_MAGIC.len())
-                    .ok_or_else(invalid)?;
-                if payload.get(bindings_start..binding_magic_end) != Some(BIND_MAGIC.as_slice()) {
-                    return Err(invalid());
-                }
+            let mut trailing_start = bindings_start;
+            let binding_magic_end = bindings_start
+                .checked_add(BIND_MAGIC.len())
+                .ok_or_else(invalid)?;
+            if payload.get(bindings_start..binding_magic_end) == Some(BIND_MAGIC.as_slice()) {
                 let binding_count = usize::from(u16_at(payload, bindings_start + 4)?);
                 if binding_count != count {
                     return Err(invalid());
@@ -314,7 +319,7 @@ impl TailCursor {
                 let bindings_end = bindings_start_data
                     .checked_add(binding_count.checked_mul(24).ok_or_else(invalid)?)
                     .ok_or_else(invalid)?;
-                if payload.len() != bindings_end {
+                if payload.len() < bindings_end {
                     return Err(invalid());
                 }
                 let snapshot_identity = array_at_at::<32>(payload, identity_start)?;
@@ -335,6 +340,25 @@ impl TailCursor {
                     bindings.push(TailSourceBinding::new(shard, lease, frontier));
                 }
                 state.set_source_bindings(snapshot_identity, snapshot_generation, bindings)?;
+                trailing_start = bindings_end;
+            }
+            if payload.len() > trailing_start {
+                let delivery_end = trailing_start
+                    .checked_add(DELIVERY_MAGIC.len() + 8 + 32)
+                    .ok_or_else(invalid)?;
+                if payload.len() != delivery_end
+                    || payload.get(trailing_start..trailing_start + DELIVERY_MAGIC.len())
+                        != Some(DELIVERY_MAGIC.as_slice())
+                {
+                    return Err(invalid());
+                }
+                let sequence = u64_at(payload, trailing_start + DELIVERY_MAGIC.len())?;
+                let digest = array_at_at::<32>(payload, trailing_start + DELIVERY_MAGIC.len() + 8)?;
+                state.set_unacknowledged_delivery((sequence, digest));
+                trailing_start = delivery_end;
+            }
+            if payload.len() != trailing_start {
+                return Err(invalid());
             }
         }
         Ok(state)
@@ -361,31 +385,6 @@ impl std::fmt::Debug for TailCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("TailCursor { <opaque> }")
     }
-}
-
-pub(crate) fn budget_digest(
-    protector: &ControlTokenProtector<'_>,
-    budget: crate::QueryBudget,
-) -> Result<[u8; 32], QueryFailure> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(8 * std::mem::size_of::<u64>())
-        .map_err(|_| resource())?;
-    for value in [
-        budget.scanned_bytes(),
-        budget.decoded_records(),
-        budget.output_rows(),
-        budget.output_bytes(),
-        budget.memory_bytes(),
-        budget.cpu_work_units(),
-        budget.wall_seconds(),
-        budget.maximum_time_range_nanoseconds(),
-    ] {
-        bytes.extend_from_slice(&value.to_be_bytes());
-    }
-    protector
-        .digest(b"tail-budget-v1", &bytes)
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
 }
 
 #[cfg(test)]

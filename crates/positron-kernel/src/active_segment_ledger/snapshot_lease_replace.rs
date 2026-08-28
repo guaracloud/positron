@@ -125,11 +125,17 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
         self.ledger.retry_pending_releases(&mut state)?;
         self.ledger.catalog.refresh_state()?;
         let basis = self.ledger.catalog.pin()?;
-        if !basis.plaintext_objects().any(|bytes| {
-            decode(bytes).ok().flatten().is_some_and(|record| {
-                record.identity == self.new_identity && record.scope == self.ledger.scope
-            })
-        }) {
+        let mut new_record_visible = false;
+        for bytes in basis.plaintext_objects() {
+            if let Some(record) = decode(bytes)?
+                && record.identity == self.new_identity
+                && record.scope == self.ledger.scope
+            {
+                new_record_visible = true;
+                break;
+            }
+        }
+        if !new_record_visible {
             return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
         }
         if !basis

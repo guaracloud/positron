@@ -42,6 +42,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     ) -> Result<TailSession<'_, 'kernel, 'catalog, 'ledger>, QueryFailure> {
         let state = TailCursor::decode(&self.ledger.control_tokens(), cursor)?;
         let (tenant, _, _generation) = self.current_query_catalog(query.context)?;
+        super::validate_tail_shape(&query, &sources, tenant, self.ledger.scope())?;
         let signal_digest = sources.digest(&self.ledger.control_tokens())?;
         state.validate_for_resume(
             query.context.principal_id(),

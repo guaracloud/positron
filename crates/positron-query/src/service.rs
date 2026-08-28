@@ -18,7 +18,7 @@ pub(crate) fn parse_pipeline(
             let limit = crate::planning_memory::split_ascii_whitespace(limit, memory)?;
             match (range.as_slice(), limit.as_slice()) {
                 (["range", axis, start, end], ["limit", limit]) => {
-                    let limit = crate::sql::parse_limit(limit)?;
+                    let limit = crate::sql::parse_tail_limit(limit)?;
                     plan(axis, start, end, limit, memory)
                 },
                 _ => Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery)),
@@ -197,7 +197,7 @@ fn parse_versioned_pipeline(
         axis,
         start,
         end,
-        crate::sql::parse_limit(
+        crate::sql::parse_tail_limit(
             limit.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?,
         )?,
         memory,

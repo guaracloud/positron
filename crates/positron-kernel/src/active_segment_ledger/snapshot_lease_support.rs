@@ -194,16 +194,20 @@ fn publish_many_with_expected_catalog_inner(
     add: Vec<Vec<u8>>,
     reconcile_visible: bool,
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
-    let mut objects = basis
+    let capacity = basis
         .plaintext_objects()
-        .filter(|bytes| {
-            decode(bytes)
-                .ok()
-                .flatten()
-                .is_none_or(|record| !remove.contains(&record.identity))
-        })
-        .map(|bytes| CatalogObject::new(bytes.to_vec()))
-        .collect::<Result<Vec<_>, _>>()?;
+        .count()
+        .checked_add(add.len())
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(capacity)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    for bytes in basis.plaintext_objects() {
+        if decode(bytes)?.is_none_or(|record| !remove.contains(&record.identity)) {
+            objects.push(CatalogObject::new(bytes.to_vec())?);
+        }
+    }
     for encoded in &add {
         objects.push(CatalogObject::new(encoded.clone())?);
     }
@@ -229,7 +233,7 @@ fn publish_many_with_expected_catalog_inner(
                 return Err(LedgerFailure::ambiguous(code));
             }
             let current = catalog.pin().map_err(|_| LedgerFailure::ambiguous(code))?;
-            if publication_visible(&current, remove, &add) {
+            if publication_visible(&current, remove, &add)? {
                 Ok(current)
             } else {
                 Err(LedgerFailure::new(code))
@@ -242,32 +246,36 @@ pub(crate) fn publication_visible(
     snapshot: &crate::CatalogSnapshot,
     remove: &BTreeSet<SnapshotLeaseId>,
     additions: &[Vec<u8>],
-) -> bool {
-    if snapshot
-        .plaintext_objects()
-        .any(|published| decode(published).is_err())
-    {
-        return false;
+) -> Result<bool, LedgerFailure> {
+    let published_records = records(snapshot)?;
+    for identity in remove {
+        let replaced =
+            additions
+                .iter()
+                .try_fold(false, |found, addition| -> Result<bool, LedgerFailure> {
+                    if found {
+                        return Ok(true);
+                    }
+                    Ok(decode(addition)?.is_some_and(|record| record.identity == *identity))
+                })?;
+        if !replaced {
+            let remains = published_records
+                .iter()
+                .any(|record| record.identity == *identity);
+            if remains {
+                return Ok(false);
+            }
+        }
     }
-    remove.iter().all(|identity| {
-        let replaced = additions.iter().any(|addition| {
-            decode(addition)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.identity == *identity)
-        });
-        replaced
-            || !snapshot.plaintext_objects().any(|published| {
-                decode(published)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.identity == *identity)
-            })
-    }) && additions.iter().all(|addition| {
-        snapshot
+    for addition in additions {
+        if !snapshot
             .plaintext_objects()
             .any(|published| published == addition.as_slice())
-    })
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn map_catalog_failure(code: CatalogFailureCode) -> LedgerFailureCode {
@@ -323,6 +331,9 @@ pub(crate) fn records(
     snapshot: &crate::CatalogSnapshot,
 ) -> Result<Vec<LeaseRecord>, LedgerFailure> {
     let mut records = Vec::new();
+    records
+        .try_reserve_exact(snapshot.plaintext_objects().count())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     for bytes in snapshot.plaintext_objects() {
         if let Some(record) = decode(bytes)? {
             records.push(record);

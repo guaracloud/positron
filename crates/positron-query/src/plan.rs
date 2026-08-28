@@ -7,6 +7,8 @@ mod support;
 use support::CanonicalBuffer;
 pub use support::PlannedQuery;
 
+const UNBOUNDED_LIMIT: u16 = u16::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemporalAxis {
     QueryTime,
@@ -197,6 +199,14 @@ impl LogicalPlan {
         Ok(plan)
     }
 
+    pub(crate) fn logs_without_total_limit_with_memory(
+        axis: TemporalAxis,
+        range: TemporalRange,
+        memory: &crate::planning_memory::PlanningMemory,
+    ) -> Result<Self, crate::QueryFailure> {
+        Self::logs_with_memory(axis, range, UNBOUNDED_LIMIT, memory)
+    }
+
     #[must_use]
     pub const fn version(&self) -> u8 {
         self.version
@@ -358,6 +368,10 @@ impl LogicalPlan {
 
     pub(crate) const fn limit(&self) -> u16 {
         self.limit
+    }
+
+    pub(crate) const fn has_total_limit(&self) -> bool {
+        self.limit != UNBOUNDED_LIMIT
     }
 
     #[must_use]

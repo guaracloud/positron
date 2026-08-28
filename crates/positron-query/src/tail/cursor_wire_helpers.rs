@@ -1,7 +1,33 @@
 use positron_domain::routing::CommitPosition;
+use positron_kernel::ControlTokenProtector;
 
 use super::{TailCursorState, invalid, resource};
-use crate::QueryFailure;
+use crate::{QueryFailure, QueryFailureCode};
+
+pub(crate) fn budget_digest(
+    protector: &ControlTokenProtector<'_>,
+    budget: crate::QueryBudget,
+) -> Result<[u8; 32], QueryFailure> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(8 * std::mem::size_of::<u64>())
+        .map_err(|_| resource())?;
+    for value in [
+        budget.scanned_bytes(),
+        budget.decoded_records(),
+        budget.output_rows(),
+        budget.output_bytes(),
+        budget.memory_bytes(),
+        budget.cpu_work_units(),
+        budget.wall_seconds(),
+        budget.maximum_time_range_nanoseconds(),
+    ] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    protector
+        .digest(b"tail-budget-v1", &bytes)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+}
 
 pub(super) fn array_at<const N: usize>(
     bytes: &[u8],
@@ -48,7 +74,8 @@ pub(super) fn extension_bytes(state: &TailCursorState) -> Result<usize, QueryFai
         || state.elapsed_seconds() != 0
         || state.reduced_pruning()
         || state.limiting_budget().is_some()
-        || state.source_bindings().is_some();
+        || state.source_bindings().is_some()
+        || state.unacknowledged_delivery().is_some();
     if !has_extension {
         return Ok(0);
     }
@@ -58,15 +85,27 @@ pub(super) fn extension_bytes(state: &TailCursorState) -> Result<usize, QueryFai
     } else {
         0
     };
-    let bindings = state.source_bindings().map_or(0, |bindings| {
-        4 + 2 + 32 + 8 + bindings.len().saturating_mul(24)
-    });
+    let bindings = state.source_bindings().map_or(Ok(0), |bindings| {
+        bindings
+            .len()
+            .checked_mul(24)
+            .and_then(|bytes| {
+                4_usize
+                    .checked_add(2)?
+                    .checked_add(32)?
+                    .checked_add(8)?
+                    .checked_add(bytes)
+            })
+            .ok_or_else(resource)
+    })?;
+    let delivery = state.unacknowledged_delivery().map_or(0, |_| 4 + 8 + 32);
     4_usize
         .checked_add(2)
         .and_then(|value| value.checked_add(markers.checked_mul(16)?))
         .and_then(|value| value.checked_add(18))
         .and_then(|value| value.checked_add(historical_key))
         .and_then(|value| value.checked_add(bindings))
+        .and_then(|value| value.checked_add(delivery))
         .ok_or_else(resource)
 }
 

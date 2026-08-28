@@ -39,6 +39,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
+        if !query.plan.has_total_limit() {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
         let now = self.observe_planned(&query)?;
         let expiry = query
             .started_at
@@ -69,6 +72,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let (tenant, catalog_identity, _) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
+        if !query.plan.has_total_limit() {
+            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         if self.batch_limit == 0 {
             return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));

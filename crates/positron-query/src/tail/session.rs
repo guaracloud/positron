@@ -59,6 +59,7 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) source_lease_grants: Vec<positron_kernel::SnapshotLeaseGrant<'kernel>>,
     pub(super) state: TailCursorState,
     pub(super) cursor: TailCursor,
+    pub(super) delivery_cursor: Option<TailCursor>,
     pub(super) header: Option<crate::stream::QueryHeader>,
     pub(super) buffer: TailBuffer,
     pub(super) pending_batch: Option<PendingBatch>,
@@ -68,6 +69,7 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) next_sequence: u64,
     pub(super) prior_digest: [u8; 32],
     pub(super) replay: bool,
+    pub(super) replay_delivery: Option<(u64, [u8; 32])>,
     pub(super) last_acknowledged: Option<(u64, [u8; 32])>,
     pub(super) scanned_bytes: u64,
     pub(super) decoded_records: u64,
@@ -87,7 +89,29 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
 impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub fn cursor(&self) -> &TailCursor {
         self.cursor_observed.set(true);
+        self.delivery_cursor.as_ref().unwrap_or(&self.cursor)
+    }
+
+    pub fn safe_cursor(&self) -> &TailCursor {
+        self.cursor_observed.set(true);
         &self.cursor
+    }
+
+    pub(super) fn publish_delivery_cursor(&mut self, digest: [u8; 32]) -> Result<(), QueryFailure> {
+        if let Some(expected) = self.replay_delivery {
+            if expected != (self.next_sequence, digest) {
+                return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+            }
+            self.replay_delivery = None;
+            self.replay = false;
+        }
+        let mut delivery_state = self.state.clone();
+        delivery_state.set_unacknowledged_delivery((self.next_sequence, digest));
+        self.delivery_cursor = Some(TailCursor::encode(
+            &self.service.ledger.control_tokens(),
+            &delivery_state,
+        )?);
+        Ok(())
     }
 
     pub fn acknowledge(&mut self, sequence: u64, digest: [u8; 32]) -> Result<(), QueryFailure> {
@@ -123,6 +147,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         ) {
             Ok(advanced) => advanced,
             Err(failure) => {
+                self.delivery_cursor = None;
                 self.record_limiting_budget(&failure);
                 let terminal = super::admission::terminal_for_failure(
                     failure.code(),
@@ -141,6 +166,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             lease_rotation,
         } = advanced;
         if let Err(failure) = self.commit_lease_rotation(lease_rotation) {
+            self.delivery_cursor = None;
             self.record_limiting_budget(&failure);
             let terminal = super::admission::terminal_for_failure(
                 failure.code(),
@@ -152,6 +178,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         }
         self.state = state;
         self.cursor = cursor;
+        self.delivery_cursor = None;
         self.prior_digest = prior_digest;
         self.next_sequence = next_sequence;
         self.output_rows = output_rows;
@@ -238,6 +265,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         if self.terminal.is_none() {
             self.buffer.clear();
             self.pending_batch = None;
+            self.delivery_cursor = None;
             self.terminal = Some(kind.build(Some(self.cursor.clone()), self.terminal_stats()));
             self.replace_terminal_after_progress_failure();
         }
@@ -273,12 +301,22 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             self.source_lease_owners.retain();
         } else {
             let primary_failure = self.lease_owner.release().err();
-            let secondary_failure = self.source_lease_owners.release().err();
-            if let Some(failure) = primary_failure.or(secondary_failure)
+            let mut cleanup_failure = None;
+            if let Some(failure) = primary_failure {
+                crate::failure::retain_stronger(&mut cleanup_failure, failure);
+            }
+            if let Err(failure) = self.source_lease_owners.release() {
+                crate::failure::retain_stronger(&mut cleanup_failure, failure);
+            }
+            if let Some(failure) = cleanup_failure
                 && let Some(terminal) = self.terminal.as_mut()
             {
+                let selected = crate::failure::stronger_failure(
+                    QueryFailure::new(terminal.failure_code()),
+                    failure,
+                );
                 *terminal = super::admission::terminal_for_failure(
-                    failure.code(),
+                    selected.code(),
                     Some(self.cursor.clone()),
                     stats,
                 );

@@ -48,10 +48,8 @@ impl<'ledger, 'kernel, 'catalog> TailLeaseSet<'ledger, 'kernel, 'catalog> {
     pub(super) fn release(&mut self) -> Result<(), QueryFailure> {
         let mut first_failure = None;
         for owner in &mut self.owners {
-            if let Err(failure) = owner.release()
-                && first_failure.is_none()
-            {
-                first_failure = Some(failure);
+            if let Err(failure) = owner.release() {
+                crate::failure::retain_stronger(&mut first_failure, failure);
             }
         }
         first_failure.map_or(Ok(()), Err)
@@ -100,10 +98,11 @@ impl<'ledger, 'kernel, 'catalog> TailLeaseOwner<'ledger, 'kernel, 'catalog> {
 impl Drop for TailLeaseOwner<'_, '_, '_> {
     fn drop(&mut self) {
         if !self.released && !self.retained {
-            // `release_snapshot_lease` registers the identity in the ledger's
-            // fixed-capacity pending-release set before publication. Ignoring
-            // the returned error here is safe only because that durable intent
-            // remains available for the ledger's deterministic retry path.
+            // The kernel reserves MAX_SNAPSHOT_LEASES + 1 pending identities:
+            // every admitted owner either already occupies one of those slots
+            // or leaves a slot for this release. `release_snapshot_lease`
+            // registers before publication, so Drop cannot lose the durable
+            // intent; the kernel capacity proof covers the ignored result.
             let _ = self.ledger.release_snapshot_lease(self.identity);
         }
     }

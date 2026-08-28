@@ -7,12 +7,10 @@ use crate::execution::{ScanAfter, execute_scan};
 use crate::execution_support::{QueryScanObserver, query_record};
 use crate::memory::QueryMemory;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord};
-
 pub(super) struct TailCandidate {
     pub(super) record: QueryRecord,
     pub(super) position: TailPosition,
 }
-
 impl TailSession<'_, '_, '_, '_> {
     pub(super) fn fill_sources(&mut self, limit: usize) -> Result<(), QueryFailure> {
         let mut queue_memory = 0_u64;
@@ -21,10 +19,10 @@ impl TailSession<'_, '_, '_, '_> {
         match (result, cleanup) {
             (Err(failure), Ok(())) => Err(failure),
             (Ok(()), Ok(())) => Ok(()),
-            (_, Err(failure)) => Err(failure),
+            (Ok(()), Err(failure)) => Err(failure),
+            (Err(failure), Err(cleanup)) => Err(crate::failure::stronger_failure(failure, cleanup)),
         }
     }
-
     fn fill_sources_inner(
         &mut self,
         limit: usize,
@@ -47,16 +45,17 @@ impl TailSession<'_, '_, '_, '_> {
         if !self.historical_frontiers.is_empty() {
             return self.fill_historical_sources(limit, queue_memory);
         }
-        let snapshots = self
-            .sources
-            .readers()
-            .iter()
-            .map(|reader| {
+        let mut snapshots = Vec::new();
+        snapshots
+            .try_reserve_exact(self.sources.readers().len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        for reader in self.sources.readers() {
+            snapshots.push(
                 reader
                     .snapshot()
-                    .map_err(crate::execution_support::map_ledger_failure)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                    .map_err(crate::execution_support::map_ledger_failure)?,
+            );
+        }
         let source_count = snapshots.len();
         let mut source_batches = Vec::new();
         source_batches
@@ -84,11 +83,9 @@ impl TailSession<'_, '_, '_, '_> {
             } else {
                 ScanAfter::Position(after.position())
             };
-            let (source_records, position, _) =
+            let (mut source_records, position, _) =
                 self.materialize_snapshot(&snapshot, after, snapshot.frontier(), limit)?;
-            let mut source_records = source_records;
             self.sort_candidates(&mut source_records)?;
-            let had_candidates = !source_records.is_empty();
             let slots = u64::try_from(source_records.len())
                 .ok()
                 .and_then(|count| count.checked_mul(crate::memory::QUERY_RECORD_SLOT_BYTES))
@@ -111,8 +108,8 @@ impl TailSession<'_, '_, '_, '_> {
                 .checked_add(reserved)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
             queue.extend(source_records);
+            source_progress.push((position, queue.front().is_some()));
             source_batches.push(queue);
-            source_progress.push((position, had_candidates));
         }
         let mut records = Vec::new();
         records
@@ -132,7 +129,9 @@ impl TailSession<'_, '_, '_, '_> {
                 let better = match best {
                     Some(best_index) => {
                         let left = queue.front().ok_or_else(super::internal)?;
-                        let right = source_batches[best_index]
+                        let right = source_batches
+                            .get(best_index)
+                            .ok_or_else(super::internal)?
                             .front()
                             .ok_or_else(super::internal)?;
                         self.compare_candidates_cooperatively(left, right, self.tail_ordering())?
@@ -147,22 +146,35 @@ impl TailSession<'_, '_, '_, '_> {
             let Some(source_index) = best else {
                 break;
             };
-            let candidate = source_batches[source_index]
+            let candidate = source_batches
+                .get_mut(source_index)
+                .ok_or_else(super::internal)?
                 .pop_front()
                 .ok_or_else(super::internal)?;
-            selected_shards[source_index] = true;
+            *selected_shards
+                .get_mut(source_index)
+                .ok_or_else(super::internal)? = true;
             self.update_position(&mut positions, candidate.position)?;
             records.push(candidate.record);
         }
         for (source_index, (scanned, had_candidates)) in source_progress.into_iter().enumerate() {
-            if source_batches[source_index].is_empty()
+            if source_batches
+                .get(source_index)
+                .ok_or_else(super::internal)?
+                .is_empty()
                 && let Some(scanned) = scanned
-                && (!had_candidates || selected_shards[source_index])
+                && (!had_candidates
+                    || *selected_shards
+                        .get(source_index)
+                        .ok_or_else(super::internal)?)
             {
                 self.update_position(&mut positions, scanned)?;
             }
         }
         if records.is_empty() {
+            if self.replay_delivery.is_some() {
+                return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
+            }
             if !positions.is_empty() {
                 self.advance_positions(&positions, false)?;
             }
@@ -234,9 +246,9 @@ impl TailSession<'_, '_, '_, '_> {
             historical_complete: false,
             historical_key: None,
         });
+        self.publish_delivery_cursor(digest)?;
         Ok(())
     }
-
     pub(super) fn materialize_snapshot(
         &mut self,
         snapshot: &positron_kernel::LedgerSnapshot<'_>,
