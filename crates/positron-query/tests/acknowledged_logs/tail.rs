@@ -1092,6 +1092,28 @@ fn tail_cursor_public_state_and_wire_boundaries_fail_closed() -> Result<(), Box<
         .is_err()
     );
 
+    let mut truncated_binding_payload = cursor.as_bytes().to_vec();
+    let payload_len = truncated_binding_payload
+        .len()
+        .checked_sub(32)
+        .ok_or("cursor tag missing")?;
+    let bindings_start = truncated_binding_payload
+        .get(..payload_len)
+        .ok_or("cursor payload missing")?
+        .windows(4)
+        .position(|window| window == b"TB01")
+        .ok_or("source bindings missing")?;
+    assert!(bindings_start < payload_len);
+    truncated_binding_payload.truncate(payload_len - 1);
+    truncated_binding_payload.extend_from_slice(&[0; 32]);
+    authenticate(&mut truncated_binding_payload)?;
+    let failure = TailCursor::decode(
+        &protector,
+        &TailCursor::from_bytes(&truncated_binding_payload)?,
+    )
+    .expect_err("truncated authenticated bindings must fail closed");
+    assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
+
     let mut trailing_binding = cursor.as_bytes().to_vec();
     let payload_len = trailing_binding
         .len()
