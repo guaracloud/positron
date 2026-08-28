@@ -453,6 +453,65 @@ fn committed_replacement_rollback_refusal_preserves_the_candidate_until_capacity
 }
 
 #[test]
+fn replacement_publication_failure_preserves_old_lease_and_accounting() -> Result<(), Box<dyn Error>>
+{
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x7a; 32])),
+        )?;
+        let old_identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        ledger.record_snapshot_lease_usage(
+            old_identity,
+            SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7),
+        )?;
+        ledger.append(prepared(scope, b"future")?)?;
+        let mut replacement = ledger.prepare_snapshot_lease_replacement(old_identity, 101, 200)?;
+        let baseline = authority.governor().inspect()?;
+        let old_record = catalog
+            .pin()?
+            .plaintext_objects()
+            .find(|bytes| bytes.starts_with(b"PSLEASE1"))
+            .ok_or("old snapshot lease catalog record missing")?
+            .to_vec();
+        let new_identity = replacement.identity();
+        let blocker = resize_blocker(authority, scope.tenant)?;
+
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || replacement.commit())
+            .expect_err("publication failure must remain retryable");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        drop(blocker);
+        let after = authority.governor().inspect()?;
+        assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(after.usage(dimension), baseline.usage(dimension));
+        }
+        let durable = catalog.pin()?;
+        assert!(
+            durable
+                .plaintext_objects()
+                .any(|bytes| bytes == old_record.as_slice())
+        );
+        assert!(!durable.plaintext_objects().any(|bytes| {
+            bytes.starts_with(b"PSLEASE1")
+                && bytes.get(10..26) == Some(new_identity.to_bytes().as_slice())
+        }));
+        assert_eq!(
+            ledger.snapshot_lease_usage(old_identity, 102)?,
+            SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7)
+        );
+        assert_eq!(
+            ledger.resume_snapshot_lease(old_identity, 102)?.identity(),
+            old_identity
+        );
+        ledger.release_snapshot_lease(old_identity)?;
+        Ok(())
+    })
+}
+
+#[test]
 fn prepared_snapshot_lease_replacement_rejects_a_durable_expiry() -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {
         let ledger = ActiveSegmentLedger::open(
