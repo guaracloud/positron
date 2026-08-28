@@ -2072,6 +2072,51 @@ fn tail_historical_cancellation_never_delivers_a_partial_window() -> Result<(), 
 }
 
 #[test]
+fn tail_historical_cancellation_during_record_processing_never_publishes_a_batch()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-cancel-record")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "first".to_owned(),
+                )),
+            ),
+            (
+                Some(2),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "second".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let meter = CancellingOperatorCallMeter::shared(1);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        meter.clone(),
+    );
+    let budget =
+        QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position desc | limit 4",
+        budget,
+    )?;
+    meter.bind(query.cancellation())?;
+    let failure = match service.tail(query, TailStart::Historical { max_rows: 4 }) {
+        Ok(_) => return Err("cancelled historical materialization published".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::Cancelled);
+    Ok(())
+}
+
+#[test]
 fn tail_historical_empty_result_advances_only_after_the_snapshot_scan() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("tail-historical-empty-result")?;
