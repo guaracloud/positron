@@ -445,6 +445,31 @@ pub(crate) fn tail_cursor_with_source_lease(
     })
 }
 
+pub(crate) fn tail_cursor_with_snapshot_identity(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    identity: [u8; 32],
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let identity_start = bindings_start
+            .checked_add(BIND_MAGIC.len() + std::mem::size_of::<u16>())
+            .ok_or("tail cursor snapshot identity offset overflow")?;
+        let identity_end = identity_start
+            .checked_add(identity.len())
+            .ok_or("tail cursor snapshot identity field overflow")?;
+        payload
+            .get_mut(identity_start..identity_end)
+            .ok_or("tail cursor snapshot identity field missing")?
+            .copy_from_slice(&identity);
+        Ok(())
+    })
+}
+
 fn rewrite_tail_cursor(
     protector: &ControlTokenProtector<'_>,
     cursor: &positron_query::TailCursor,

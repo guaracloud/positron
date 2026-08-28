@@ -11,7 +11,7 @@ use positron_query::{
     TailTerminal,
 };
 
-use super::support::TestClock;
+use super::support::{CancellingOperatorCallMeter, TestClock, tail_cursor_with_snapshot_identity};
 use super::terminal_and_bounds::QueryFixture;
 
 fn budget(rows: u64) -> Result<QueryBudget, Box<dyn Error>> {
@@ -309,6 +309,98 @@ fn mismatched_delivery_digest_fails_closed_during_replay() -> Result<(), Box<dyn
     assert!(matches!(
         resumed.poll(),
         Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+    ));
+    Ok(())
+}
+
+#[test]
+fn resume_source_lease_publication_failure_is_store_unavailable() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-publication-failure")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut initial = service.tail(query, TailStart::Now)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let cursor = initial.safe_cursor().clone();
+    drop(initial);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let result =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            service.resume_tail(query, &cursor)
+        });
+    let failure = match result {
+        Ok(_) => return Err("resume marker publication unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
+fn resume_rejects_a_source_snapshot_identity_switch() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-snapshot-identity")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut initial = service.tail(query, TailStart::Now)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let cursor = tail_cursor_with_snapshot_identity(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.safe_cursor(),
+        [0x9a; 32],
+    )?;
+    drop(initial);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let failure = match service.resume_tail(query, &cursor) {
+        Ok(_) => return Err("a snapshot identity switch unexpectedly resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
+fn live_scan_observes_cancellation_before_accounting_scanned_bytes() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-scan-cancel-observer")?;
+    let meter = CancellingOperatorCallMeter::shared_for_stage(
+        positron_query::QueryWorkStage::ScanDecode,
+        1,
+    );
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        meter.clone(),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    meter.bind(query.cancellation())?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("cancelled", 1, 1)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
     ));
     Ok(())
 }
