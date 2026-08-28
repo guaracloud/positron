@@ -15,7 +15,8 @@ use positron_query::{
 use super::support::{
     CancellingOperatorCallMeter, CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock,
     FailAfterArmOutputMeter, StepClock, TestClock, merge_work_service, stage_work_service,
-    tail_cursor_with_cpu_progress, tail_cursor_with_source_binding, zero_work_clock_service,
+    tail_cursor_with_cpu_progress, tail_cursor_with_source_binding, tail_cursor_with_source_lease,
+    zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -3427,6 +3428,47 @@ fn tail_resume_rejects_a_source_binding_with_a_different_frontier() -> Result<()
         Err(failure) => failure,
     };
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
+fn tail_resume_rejects_an_unknown_source_lease_without_mutation() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-unknown-lease")?;
+    fixture.kernel.append_log("unknown-lease", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut initial = service.tail(query, TailStart::Now)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let cursor = tail_cursor_with_source_lease(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+        [0xa7; 16],
+    )?;
+    let cursor_bytes = cursor.as_bytes().to_vec();
+    drop(initial);
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let failure = match service.resume_tail(query, &cursor) {
+        Ok(_) => return Err("an unknown source lease unexpectedly resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    let after = fixture.kernel.authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), baseline.usage(dimension));
+    }
+    assert_eq!(cursor.as_bytes(), cursor_bytes.as_slice());
     Ok(())
 }
 

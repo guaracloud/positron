@@ -420,6 +420,31 @@ pub(crate) fn tail_cursor_with_source_binding(
     })
 }
 
+pub(crate) fn tail_cursor_with_source_lease(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    lease: [u8; 16],
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let lease_start = bindings_start
+            .checked_add(6 + 32 + 8)
+            .ok_or("tail cursor source lease offset overflow")?;
+        let lease_end = lease_start
+            .checked_add(lease.len())
+            .ok_or("tail cursor source lease field overflow")?;
+        payload
+            .get_mut(lease_start..lease_end)
+            .ok_or("tail cursor source lease field missing")?
+            .copy_from_slice(&lease);
+        Ok(())
+    })
+}
+
 fn rewrite_tail_cursor(
     protector: &ControlTokenProtector<'_>,
     cursor: &positron_query::TailCursor,
