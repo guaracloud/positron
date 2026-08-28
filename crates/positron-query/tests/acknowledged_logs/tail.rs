@@ -2127,6 +2127,64 @@ fn tail_cursor_binds_a_bounded_multi_shard_source_set() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn tail_multi_source_resume_rejects_an_authenticated_binding_mutation_without_mutation()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-mutated-source-binding")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x36; 32])),
+    )?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let mut initial = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let cursor = tail_cursor_with_source_binding(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+        Some(u64::MAX),
+        None,
+    )?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let failure = match service.resume_tail_with_sources(
+        query,
+        &cursor,
+        TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?,
+    ) {
+        Ok(_) => return Err("an authenticated source-binding mutation resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    let after = fixture.kernel.authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), baseline.usage(dimension));
+    }
+    drop(initial);
+    Ok(())
+}
+
+#[test]
 fn tail_multi_shard_secondary_release_failure_is_deferred_and_retried() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("tail-secondary-release-retry")?;
@@ -2932,8 +2990,12 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
     .expect_err("a rollback publication failure must reject the ack");
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
     assert_eq!(tail.cursor(), &safe_cursor);
+    let terminal =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            tail.poll()
+        });
     assert!(matches!(
-        tail.poll(),
+        terminal,
         Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
             cursor: None,
             ..
