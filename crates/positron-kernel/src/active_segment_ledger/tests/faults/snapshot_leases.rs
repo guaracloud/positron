@@ -1835,6 +1835,47 @@ fn snapshot_lease_usage_retry_failure_restores_the_original_reservation()
 }
 
 #[test]
+fn snapshot_lease_usage_retry_cap_preserves_durable_usage_and_capacity()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        let baseline = authority.governor().inspect()?;
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+        let failure = with_ledger_fault_sequence(
+            &[
+                LedgerFileEvent::BeforeLeaseUsagePublication,
+                LedgerFileEvent::BeforeLeaseUsageReconciliation,
+                LedgerFileEvent::BeforeLeaseUsagePublication,
+                LedgerFileEvent::BeforeLeaseUsageReconciliation,
+            ],
+            || ledger.record_snapshot_lease_usage(identity, delta),
+        )
+        .expect_err("the bounded ambiguous retry cap must remain typed");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(
+            failure.completion_state(),
+            LedgerCompletionState::CommitAmbiguous
+        );
+        assert_eq!(
+            ledger.snapshot_lease_usage(identity, 101)?,
+            SnapshotLeaseUsage::default()
+        );
+        let after = authority.governor().inspect()?;
+        assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(after.usage(dimension), baseline.usage(dimension));
+        }
+
+        assert_eq!(ledger.record_snapshot_lease_usage(identity, delta)?, delta);
+        assert_eq!(ledger.snapshot_lease_usage(identity, 101)?, delta);
+        ledger.release_snapshot_lease(identity)?;
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_marker_retry_failure_restores_the_original_reservation()
 -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {

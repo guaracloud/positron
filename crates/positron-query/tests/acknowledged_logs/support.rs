@@ -11,12 +11,12 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, DiskObservation,
-    DiskPressureThresholds, FixedLifecycleClockSource, FormatEpoch, GovernanceFixtureObject,
-    GovernanceFixtureTarget, GovernorFailure, GovernorPolicy, InstanceId,
-    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
-    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret,
+    ControlTokenProtector, DiskObservation, DiskPressureThresholds, FixedLifecycleClockSource,
+    FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget, GovernorFailure, GovernorPolicy,
+    InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
+    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
     ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
     StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim,
     WorkKind,
@@ -358,6 +358,46 @@ pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
         TestClock::shared(100),
         Arc::new(ZeroScanWorkMeter),
     )
+}
+
+pub(crate) fn tail_cursor_with_cpu_progress(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    cpu_work_units: u64,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    const MAGIC: &[u8] = b"POSTCUR3";
+    const VERSION: [u8; 2] = 2_u16.to_be_bytes();
+    const CPU_WORK_UNITS_OFFSET: usize = 202;
+    const AUTH_BYTES: usize = 32;
+
+    let mut bytes = cursor.as_bytes().to_vec();
+    if bytes.get(..MAGIC.len()) != Some(MAGIC)
+        || bytes.get(MAGIC.len()..MAGIC.len() + VERSION.len()) != Some(VERSION.as_slice())
+    {
+        return Err("unsupported tail cursor wire version".into());
+    }
+    let cpu_end = CPU_WORK_UNITS_OFFSET
+        .checked_add(std::mem::size_of::<u64>())
+        .ok_or("tail cursor CPU field offset overflow")?;
+    bytes
+        .get_mut(CPU_WORK_UNITS_OFFSET..cpu_end)
+        .ok_or("tail cursor CPU field missing")?
+        .copy_from_slice(&cpu_work_units.to_be_bytes());
+    let payload_len = bytes
+        .len()
+        .checked_sub(AUTH_BYTES)
+        .ok_or("tail cursor authentication tag missing")?;
+    let authentication = protector.authenticate_query_cursor(
+        b"tail-cursor-v3",
+        bytes
+            .get(..payload_len)
+            .ok_or("tail cursor payload missing")?,
+    )?;
+    bytes
+        .get_mut(payload_len..)
+        .ok_or("tail cursor authentication tag missing")?
+        .copy_from_slice(&authentication.tag());
+    Ok(positron_query::TailCursor::from_bytes(&bytes)?)
 }
 
 pub fn merge_work_service<'kernel, 'catalog, 'ledger>(

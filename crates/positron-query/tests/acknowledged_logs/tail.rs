@@ -15,7 +15,7 @@ use positron_query::{
 use super::support::{
     CancellingOperatorCallMeter, CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock,
     FailAfterArmOutputMeter, StepClock, TestClock, merge_work_service, stage_work_service,
-    zero_work_clock_service,
+    tail_cursor_with_cpu_progress, zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -1268,6 +1268,99 @@ fn tail_operator_work_overflow_emits_one_terminal_without_a_batch() -> Result<()
             && stats.emitted_records() == 0
     ));
     assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_resume_cpu_progress_overflow_is_terminal_without_advancing() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-cpu-overflow")?;
+    let service = stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source =
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit 1";
+    let budget =
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(fixture.context, source, budget)?;
+    let mut initial = service.tail(query, TailStart::Now)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let forged = tail_cursor_with_cpu_progress(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+        u64::MAX,
+    )?;
+    drop(initial);
+
+    let query = service.plan_pipeline(fixture.context, source, budget)?;
+    let mut resumed = service
+        .resume_tail(query, &forged)
+        .map_err(|failure| format!("resume tail: {failure:?}"))?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = resumed.cursor().clone();
+    fixture.kernel.append_log("resume-cpu-overflow", 1, 1)?;
+    assert!(matches!(
+        resumed.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(cursor),
+            stats,
+        })) if cursor == safe_cursor
+            && stats.limiting_budget()
+                == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+            && stats.emitted_records() == 0
+    ));
+    assert!(resumed.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_materialize_cpu_addition_overflow_preserves_cursor() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-materialize-cpu-overflow")?;
+    let initial_service = stage_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let source =
+        "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit 1";
+    let budget =
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    fixture
+        .kernel
+        .append_log("materialize-cpu-overflow", 1, 1)?;
+    let query = initial_service.plan_pipeline(fixture.context, source, budget)?;
+    let mut initial = initial_service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let forged = tail_cursor_with_cpu_progress(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+        budget.cpu_work_units() - 1,
+    )?;
+    drop(initial);
+
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        std::sync::Arc::new(OperatorOverflowWorkMeter),
+    );
+    let query = service.plan_pipeline(fixture.context, source, budget)?;
+    let mut resumed = service.resume_tail(query, &forged)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = resumed.cursor().clone();
+    assert!(matches!(
+        resumed.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(cursor),
+            stats,
+        })) if cursor == safe_cursor
+            && stats.limiting_budget()
+                == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+            && stats.emitted_records() == 0
+    ));
+    assert!(resumed.poll().is_none());
     Ok(())
 }
 
