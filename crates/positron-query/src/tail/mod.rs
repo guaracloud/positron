@@ -1,6 +1,7 @@
 mod admission;
 mod buffer;
 mod cursor;
+mod delivery;
 #[cfg(fuzzing)]
 mod fuzz;
 mod historical;
