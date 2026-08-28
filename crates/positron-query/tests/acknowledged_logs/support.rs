@@ -420,6 +420,31 @@ pub(crate) fn tail_cursor_with_source_binding(
     })
 }
 
+pub(crate) fn tail_cursor_with_binding_count(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    count: u16,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let count_start = bindings_start
+            .checked_add(BIND_MAGIC.len())
+            .ok_or("tail cursor binding count offset overflow")?;
+        let count_end = count_start
+            .checked_add(std::mem::size_of::<u16>())
+            .ok_or("tail cursor binding count field overflow")?;
+        payload
+            .get_mut(count_start..count_end)
+            .ok_or("tail cursor binding count field missing")?
+            .copy_from_slice(&count.to_be_bytes());
+        Ok(())
+    })
+}
+
 pub(crate) fn tail_cursor_with_source_lease(
     protector: &ControlTokenProtector<'_>,
     cursor: &positron_query::TailCursor,

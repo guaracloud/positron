@@ -12,8 +12,8 @@ use positron_query::{
 };
 
 use super::support::{
-    CancellingOperatorCallMeter, TestClock, tail_cursor_with_delivery_sequence,
-    tail_cursor_with_snapshot_identity,
+    CancellingOperatorCallMeter, TestClock, tail_cursor_with_binding_count,
+    tail_cursor_with_delivery_sequence, tail_cursor_with_snapshot_identity,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -539,6 +539,105 @@ fn resume_source_lease_publication_failure_is_store_unavailable() -> Result<(), 
 }
 
 #[test]
+fn lease_rotation_publication_refusal_can_retry_from_the_safe_cursor() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-lease-rotation-retry")?;
+    let service = fixture.service(16)?;
+    let source = "pipeline:v1 logs | range query_time -100 100 | limit all";
+    let query = service.plan_pipeline(fixture.context, source, budget(1)?)?;
+    let mut initial = service.tail(query, TailStart::Now)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = initial.safe_cursor().clone();
+    fixture.kernel.append_log("rotation", 1, 1)?;
+    let Some(TailEvent::Batch(batch)) = initial.poll() else {
+        return Err("lease rotation batch missing".into());
+    };
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            initial.acknowledge(batch.sequence(), batch.digest())
+        })
+        .expect_err("the first lease rotation publication must refuse");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    let terminal_cursor = match initial.poll() {
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
+            cursor: Some(cursor),
+            ..
+        })) => cursor,
+        event => return Err(format!("rotation failure terminal missing: {event:?}").into()),
+    };
+    assert_eq!(terminal_cursor, safe_cursor);
+    drop(batch);
+    drop(initial);
+
+    let query = service.plan_pipeline(fixture.context, source, budget(1)?)?;
+    let mut resumed = service.resume_tail(query, &terminal_cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(retry)) = resumed.poll() else {
+        return Err("lease rotation retry batch missing".into());
+    };
+    resumed.acknowledge(retry.sequence(), retry.digest())?;
+    let event = resumed.poll();
+    if !matches!(
+        event,
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted { .. }))
+    ) {
+        return Err(format!("lease rotation retry terminal missing: {event:?}").into());
+    }
+    Ok(())
+}
+
+#[test]
+fn incomplete_historical_scan_keeps_safe_progress_and_idle_resume_unreplayed()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-incomplete-history-replay")?;
+    fixture.kernel.append_log("first", 1, 1)?;
+    fixture.kernel.append_log("second", 2, 2)?;
+    let service = fixture.service(16)?;
+    let source = "pipeline:v1 logs | range query_time -100 100 | limit all";
+    let query = service.plan_pipeline(
+        fixture.context,
+        source,
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(first)) = tail.poll() else {
+        return Err("incomplete historical batch missing".into());
+    };
+    tail.acknowledge(first.sequence(), first.digest())?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted { .. }))
+    ));
+
+    let second_fixture = QueryFixture::new("tail-historical-idle-replay")?;
+    let second_service = second_fixture.service(16)?;
+    let query = second_service.plan_pipeline(
+        second_fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"wanted\" | limit all",
+        budget(1)?,
+    )?;
+    let mut idle = second_service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(idle.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(idle.poll(), Some(TailEvent::Idle)));
+    let cursor = idle.safe_cursor().clone();
+    drop(idle);
+    second_fixture.kernel.append_log("wanted", 3, 3)?;
+    let query = second_service.plan_pipeline(
+        second_fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | search body contains \"wanted\" | limit all",
+        budget(1)?,
+    )?;
+    let mut resumed = second_service.resume_tail(query, &cursor)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = resumed.poll() else {
+        return Err("idle historical resume did not find the new row".into());
+    };
+    assert!(batch.records().iter().all(|record| !record.replayed()));
+    Ok(())
+}
+
+#[test]
 fn resume_rejects_a_source_snapshot_identity_switch() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-resume-snapshot-identity")?;
     let service = fixture.service(16)?;
@@ -566,6 +665,48 @@ fn resume_rejects_a_source_snapshot_identity_switch() -> Result<(), Box<dyn Erro
         Err(failure) => failure,
     };
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
+fn authenticated_multi_source_binding_count_mismatch_fails_before_resume_work()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-binding-count")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x7c; 32])),
+    )?;
+    let service = fixture.service(16)?;
+    let source = "pipeline:v1 logs | range query_time -100 100 | limit all";
+    let query = service.plan_pipeline(fixture.context, source, budget(1)?)?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let initial = service.tail_with_sources(query, TailStart::Now, sources)?;
+    let forged = tail_cursor_with_binding_count(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.safe_cursor(),
+        1,
+    )?;
+    drop(initial);
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(fixture.context, source, budget(1)?)?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let failure = match service.resume_tail_with_sources(query, &forged, sources) {
+        Ok(_) => return Err("authenticated binding-count truncation resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
+    let after = fixture.kernel.authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
     Ok(())
 }
 
@@ -1017,6 +1158,36 @@ fn historical_decoded_records_exhaustion_has_no_prefix_and_reports_dimension()
         failure.limiting_budget(),
         Some(positron_query::QueryBudgetDimension::DecodedRecords)
     );
+    Ok(())
+}
+
+#[test]
+fn historical_output_rows_refusal_never_publishes_a_prefix() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-output-rows")?;
+    fixture.kernel.append_log("row-one", 1, 1)?;
+    fixture.kernel.append_log("row-two", 2, 2)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 2 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("first historical row batch missing".into());
+    };
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    match tail.poll() {
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted { stats, .. })) => {
+            assert_eq!(stats.emitted_records(), 1);
+            assert_eq!(
+                stats.limiting_budget(),
+                Some(positron_query::QueryBudgetDimension::OutputRows)
+            );
+        },
+        event => return Err(format!("output row budget was not enforced: {event:?}").into()),
+    }
     Ok(())
 }
 

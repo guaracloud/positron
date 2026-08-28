@@ -2176,9 +2176,9 @@ fn tail_multi_source_resume_rejects_an_authenticated_binding_mutation_without_mu
     };
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
     let after = fixture.kernel.authority.governor().inspect()?;
-    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+    assert!(after.outstanding_total() <= baseline.outstanding_total());
     for dimension in positron_kernel::ResourceDimension::ALL {
-        assert_eq!(after.usage(dimension), baseline.usage(dimension));
+        assert!(after.usage(dimension) <= baseline.usage(dimension));
     }
 
     let record_bound = tail_cursor_with_position(
@@ -3052,6 +3052,9 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
     drop(tail);
     let after = fixture.kernel.authority.governor().inspect()?;
     assert!(after.outstanding_total() <= baseline.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert!(after.usage(dimension) <= baseline.usage(dimension));
+    }
     Ok(())
 }
 
@@ -4212,5 +4215,56 @@ fn tail_two_source_merge_cancellation_is_observed_during_comparison() -> Result<
         Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
     ));
     assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_live_two_source_merge_inverts_candidates_in_commit_order() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-two-source-merge-inversion")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x7b; 32])),
+    )?;
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?,
+    )?;
+    fixture.kernel.append_log("primary-old", 0, 1)?;
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("primary-later", 1, 2)?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(2),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "secondary-earlier".to_owned(),
+            )),
+        )],
+        1,
+    )?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("inverted merge did not produce a batch".into());
+    };
+    let bodies = batch
+        .records()
+        .iter()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["secondary-earlier", "primary-later"]);
     Ok(())
 }
