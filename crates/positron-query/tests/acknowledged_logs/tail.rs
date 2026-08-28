@@ -286,6 +286,92 @@ fn tail_poll_requires_an_explicit_acknowledgement_before_advancing_cursor()
     Ok(())
 }
 
+#[test]
+fn tail_acknowledges_a_same_shard_live_batch_in_commit_order() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-live-same-shard-order")?;
+    let service = merge_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "first".to_owned(),
+                )),
+            ),
+            (
+                Some(2),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "second".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("same-shard live batch missing".into());
+    };
+    let bodies = batch
+        .records()
+        .iter()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["first", "second"]);
+    let sequence = batch.sequence();
+    let digest = batch.digest();
+    tail.acknowledge(sequence, digest)?;
+
+    let state = TailCursor::decode(&fixture.kernel.ledger()?.control_tokens(), tail.cursor())?;
+    assert_eq!(state.positions().len(), 1);
+    assert_eq!(state.positions()[0].shard(), VirtualShardId::new(1)?);
+    assert_eq!(state.positions()[0].position().value(), 1);
+    assert_eq!(state.positions()[0].ordinal().value(), 1);
+    assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    Ok(())
+}
+
+#[test]
+fn tail_rejects_an_acknowledgement_before_a_batch_is_pending_and_remains_usable()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-ack-before-pending")?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert_eq!(
+        tail.acknowledge(7, [0x5a; 32])
+            .expect_err("an acknowledgement without a pending batch must fail")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+
+    fixture.kernel.append_log("usable", 1, 1)?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("tail did not remain usable after an invalid acknowledgement".into());
+    };
+    assert_eq!(batch.records()[0].body_text(), Some("usable"));
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    Ok(())
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn tail_ack_cursor_encode_failure_keeps_safe_progress_and_terminalizes_once()

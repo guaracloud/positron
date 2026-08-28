@@ -6,8 +6,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, CommittedLedgerReader, InstanceId,
-    MountQualification, PreparedStoreBlock, PrimaryDataVolume, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity,
+    LedgerFailureCode, MountQualification, PreparedStoreBlock, PrimaryDataVolume,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 
 use super::support::{TemporaryRoot, establish_kernel_authority};
@@ -78,4 +78,66 @@ fn committed_reader_coexists_with_writer_and_observes_acknowledged_appends()
     fs::remove_file(frontier)?;
     assert!(reader.snapshot()?.blocks().is_empty());
     Ok(())
+}
+
+#[test]
+fn observed_snapshot_rejects_a_malformed_active_frontier_without_repair_or_drift()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x75; 16])?,
+        CatalogSecret::from_owned(Box::new([0x76; 32]), Box::new([0x77; 32])),
+    )?;
+    let scope = SegmentScope::new(
+        TenantId::from_bytes([0x41; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let key = || SegmentProtectionKey::from_owned(Box::new([0x78; 32]));
+    let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, key())?;
+    let receipt = ledger.append(prepared(scope, 1, b"frontier")?)?;
+    let reader = CommittedLedgerReader::open(&authority, &catalog, scope, key())?;
+    let frontier_path = root
+        .path()
+        .join("segments/active")
+        .join(format!("{}.frontier", hex(receipt.segment_id().to_bytes())));
+    let segment_path = root
+        .path()
+        .join("segments/active")
+        .join(format!("{}.segment", hex(receipt.segment_id().to_bytes())));
+    let frontier_before = fs::read(&frontier_path)?;
+    let segment_before = fs::read(&segment_path)?;
+    let resources_before = authority.governor().inspect()?;
+    let catalog_before = {
+        let snapshot = catalog.pin()?;
+        (snapshot.identity(), snapshot.number())
+    };
+
+    let mut frontier = OpenOptions::new().append(true).open(&frontier_path)?;
+    frontier.write_all(&[0])?;
+    frontier.sync_all()?;
+    let malformed_frontier = fs::read(&frontier_path)?;
+
+    let failure = match reader.snapshot() {
+        Ok(_) => return Err("a malformed active frontier unexpectedly reconstructed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+    assert_eq!(fs::read(&frontier_path)?, malformed_frontier);
+    assert_eq!(fs::read(&segment_path)?, segment_before);
+    assert_eq!(authority.governor().inspect()?, resources_before);
+    let catalog_after = {
+        let snapshot = catalog.pin()?;
+        (snapshot.identity(), snapshot.number())
+    };
+    assert_eq!(catalog_after, catalog_before);
+    assert_eq!(frontier_before.len() + 1, malformed_frontier.len());
+    Ok(())
+}
+
+fn hex(bytes: [u8; 16]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
