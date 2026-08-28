@@ -1,12 +1,10 @@
-use std::cmp::Ordering;
-use std::collections::VecDeque;
-
 use super::session::PendingBatch;
 use super::{TailPosition, TailSession, TailTerminal};
 use crate::execution::{ScanAfter, execute_scan};
 use crate::execution_support::{QueryScanObserver, query_record};
 use crate::memory::QueryMemory;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord};
+use std::{cmp::Ordering, collections::VecDeque};
 pub(super) struct TailCandidate {
     pub(super) record: QueryRecord,
     pub(super) position: TailPosition,
