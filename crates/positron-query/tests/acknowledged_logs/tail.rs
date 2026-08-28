@@ -1200,6 +1200,38 @@ fn tail_digest_work_failure_is_terminal_before_delivery() -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[test]
+fn tail_historical_output_work_failures_never_publish_a_batch() -> Result<(), Box<dyn Error>> {
+    for (name, fail_after) in [("size", 0), ("digest", 1)] {
+        let fixture_name = format!("tail-historical-{name}-failure");
+        let fixture = QueryFixture::new(&fixture_name)?;
+        fixture
+            .kernel
+            .append_log("historical-output-failure", 1, 1)?;
+        let meter = FailAfterArmOutputMeter::shared(fail_after);
+        meter.arm();
+        let work_meter: std::sync::Arc<dyn positron_query::QueryWorkMeter> = meter;
+        let service = positron_query::QueryService::with_runtime(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            16,
+            TestClock::shared(100),
+            work_meter,
+        );
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+            QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?,
+        )?;
+        let failure = match service.tail(query, TailStart::Historical { max_rows: 1 }) {
+            Ok(_) => return Err("historical output failure unexpectedly admitted".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), QueryFailureCode::Internal);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn tail_terminal_cursor_sync_failure_is_framed_once() -> Result<(), Box<dyn Error>> {
@@ -1960,8 +1992,8 @@ fn tail_historical_resume_uses_the_admission_snapshot_after_new_commits()
 }
 
 #[test]
-fn tail_historical_budget_exhaustion_never_delivers_an_unknown_prefix()
--> Result<(), Box<dyn Error>> {
+fn tail_historical_budget_exhaustion_never_delivers_an_unknown_prefix() -> Result<(), Box<dyn Error>>
+{
     let fixture = QueryFixture::new("tail-historical-budget-prefix")?;
     fixture.kernel.append_logs(
         vec![
@@ -1981,8 +2013,8 @@ fn tail_historical_budget_exhaustion_never_delivers_an_unknown_prefix()
         1,
     )?;
     let service = fixture.service(16)?;
-    let budget = QueryBudget::new(1_048_576, 16, 4, 1, 1_048_576, 60)?
-        .with_cpu_work_units(1_024)?;
+    let budget =
+        QueryBudget::new(1_048_576, 16, 4, 1, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
     let query = service.plan_pipeline(
         fixture.context,
         "pipeline:v1 logs | range query_time -100 100 | limit 4",
@@ -1997,6 +2029,7 @@ fn tail_historical_budget_exhaustion_never_delivers_an_unknown_prefix()
         failure.limiting_budget(),
         Some(positron_query::QueryBudgetDimension::OutputBytes)
     );
+
     Ok(())
 }
 
@@ -2052,6 +2085,108 @@ fn tail_historical_empty_result_advances_only_after_the_snapshot_scan() -> Resul
     let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
     assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    Ok(())
+}
+
+#[test]
+fn tail_historical_rejects_a_batch_that_exceeds_output_limits() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-output-limits")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "first".to_owned(),
+                )),
+            ),
+            (
+                Some(2),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "second".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        QueryBudget::new(1_048_576, 16, 2, 1, 1_048_576, 60)?,
+    )?;
+    let failure = match service.tail(query, TailStart::Historical { max_rows: 2 }) {
+        Ok(_) => return Err("historical bytes unexpectedly exceeded their budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(positron_query::QueryBudgetDimension::OutputBytes)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn tail_historical_descending_order_keeps_commit_and_ordinal_ties_deterministic()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-descending-ties")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(7),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "ordinal-first".to_owned(),
+                )),
+            ),
+            (
+                Some(7),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "ordinal-second".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    fixture.kernel.append_log("newer-commit", 7, 2)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | order by query_time desc, commit_position desc | limit 3",
+        QueryBudget::new(1_048_576, 16, 3, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 3 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("descending historical batch missing".into());
+    };
+    let bodies = batch
+        .records()
+        .iter()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["newer-commit", "ordinal-second", "ordinal-first"]);
+    Ok(())
+}
+
+#[test]
+fn tail_now_advances_past_a_nonmatching_scan_before_following() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-live-filtered-cursor")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        r#"pipeline:v1 logs | range query_time -100 100 | search body contains "wanted" | limit 2"#,
+        QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("ignored", 1, 1)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Idle)));
+    fixture.kernel.append_log("wanted", 2, 2)?;
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("tail did not follow after a nonmatching scan".into());
+    };
+    assert_eq!(batch.records()[0].body_text(), Some("wanted"));
     Ok(())
 }
 
@@ -2283,6 +2418,7 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
     let Some(TailEvent::Batch(batch)) = event else {
         return Err(format!("post-admission multi-source batch missing: {event:?}").into());
     };
+    assert_eq!(batch.records().len(), 2);
     let failure =
         with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
             tail.acknowledge(batch.sequence(), batch.digest())
