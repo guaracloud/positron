@@ -144,7 +144,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             mut primary,
             mut secondary,
         } = rotation;
-        let mut secondary_grants: Vec<SnapshotLeaseGrant<'kernel>> = Vec::new();
+        let mut secondary_grants: Vec<Option<SnapshotLeaseGrant<'kernel>>> = Vec::new();
         secondary_grants
             .try_reserve_exact(secondary.len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
@@ -168,11 +168,10 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 .ok_or_else(super::super::internal)?;
             match replacement.replacement.commit() {
                 Ok(grant) => {
-                    secondary_grants.push(grant);
+                    secondary_grants.push(Some(grant));
                     committed_secondary.push(index);
                 },
                 Err(failure) => {
-                    drop(secondary_grants);
                     let mut rollback_failure = None;
                     for index in committed_secondary.into_iter().rev() {
                         let Some(replacement) = secondary.get_mut(index) else {
@@ -183,20 +182,54 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                             continue;
                         };
                         if let Err(failure) = replacement.replacement.rollback() {
+                            self.terminal_cursor_allowed = false;
                             crate::failure::retain_stronger(
                                 &mut rollback_failure,
                                 crate::execution_support::map_ledger_failure(failure),
                             );
+                            if let Some(grant) =
+                                secondary_grants.get_mut(index).and_then(Option::take)
+                            {
+                                let owner =
+                                    TailLeaseOwner::new(replacement.authority, grant.identity());
+                                match self
+                                    .source_lease_owners
+                                    .replace(replacement.old_identity, owner)
+                                {
+                                    Ok(old) => drop(old),
+                                    Err(failure) => crate::failure::retain_stronger(
+                                        &mut rollback_failure,
+                                        failure,
+                                    ),
+                                }
+                            } else {
+                                crate::failure::retain_stronger(
+                                    &mut rollback_failure,
+                                    super::super::internal(),
+                                );
+                            }
                         }
                     }
                     if let Some(replacement) = primary.as_mut()
-                        && primary_grant.take().is_some()
+                        && primary_grant.is_some()
                         && let Err(failure) = replacement.replacement.rollback()
                     {
+                        self.terminal_cursor_allowed = false;
                         crate::failure::retain_stronger(
                             &mut rollback_failure,
                             crate::execution_support::map_ledger_failure(failure),
                         );
+                        if let Some(grant) = primary_grant.take() {
+                            let owner =
+                                TailLeaseOwner::new(replacement.authority, grant.identity());
+                            let old = std::mem::replace(&mut self.lease_owner, owner);
+                            drop(old);
+                        } else {
+                            crate::failure::retain_stronger(
+                                &mut rollback_failure,
+                                super::super::internal(),
+                            );
+                        }
                     }
                     let failure = crate::execution_support::map_ledger_failure(failure);
                     return Err(rollback_failure.map_or(failure.clone(), |rollback| {
@@ -211,7 +244,10 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             self._lease = Some(grant);
             drop(old);
         }
-        for (replacement, grant) in secondary.into_iter().zip(secondary_grants) {
+        for (replacement, grant) in secondary
+            .into_iter()
+            .zip(secondary_grants.into_iter().flatten())
+        {
             let owner = TailLeaseOwner::new(replacement.authority, grant.identity());
             let old = self
                 .source_lease_owners

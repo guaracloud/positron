@@ -70,6 +70,7 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) historical_frontiers: Vec<TailPosition>,
     pub(super) terminal: Option<TailTerminal>,
     pub(super) terminal_emitted: bool,
+    pub(super) terminal_cursor_allowed: bool,
     pub(super) next_sequence: u64,
     pub(super) prior_digest: [u8; 32],
     pub(super) replay: bool,
@@ -219,9 +220,8 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 claim,
             )));
         }
-        if let Some(terminal) = self.terminal.take() {
-            self.terminal_emitted = true;
-            return Some(TailEvent::Terminal(terminal));
+        if self.terminal.is_some() {
+            return self.take_terminal();
         }
         match self.fill_sources(super::MAX_TAIL_BATCH_ROWS) {
             Ok(()) if self.terminal.is_some() => self.take_terminal(),
@@ -270,9 +270,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         self.replace_terminal_after_progress_failure();
     }
     fn take_terminal(&mut self) -> Option<TailEvent> {
-        if self.cursor_observed.get()
-            || self.terminal.as_ref().is_some_and(TailTerminal::has_cursor)
-        {
+        if self.terminal.as_ref().is_some_and(TailTerminal::has_cursor) {
             // A caller that has taken the opaque cursor may reconnect after an
             // incomplete terminal. Keep the exact durable leases alive; their
             // bounded expiry and the kernel's cleanup path remain authoritative.
@@ -310,7 +308,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
     fn terminal_for_failure(&self, failure: &QueryFailure) -> TailTerminal {
         super::admission::terminal_for_failure(
             failure.code(),
-            Some(self.cursor.clone()),
+            self.terminal_cursor_allowed.then(|| self.cursor.clone()),
             self.terminal_stats(),
         )
     }

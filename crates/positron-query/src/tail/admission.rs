@@ -359,6 +359,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             historical_frontiers,
             terminal: None,
             terminal_emitted: false,
+            terminal_cursor_allowed: true,
             next_sequence,
             prior_digest,
             replay,

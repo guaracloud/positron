@@ -2873,12 +2873,15 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
     let mut tail =
         service.tail_with_sources(query, TailStart::Historical { max_rows: 2 }, sources)?;
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let event = tail.poll();
-    let Some(TailEvent::Batch(batch)) = event else {
-        return Err(format!("post-admission multi-source batch missing: {event:?}").into());
+    let batch = match tail.poll() {
+        Some(TailEvent::Batch(batch)) => batch,
+        event => {
+            return Err(format!("post-admission multi-source batch missing: {event:?}").into());
+        },
     };
     assert_eq!(batch.records().len(), 2);
     tail.acknowledge(batch.sequence(), batch.digest())?;
+    drop(batch);
     fixture.kernel.append_log("live-primary-three", 3, 3)?;
     fixture.kernel.append_logs_to(
         &second,
@@ -2902,6 +2905,7 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
         )],
         5,
     )?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
     let event = tail.poll();
     let Some(TailEvent::Batch(batch)) = event else {
         return Err(format!("post-historical live batch missing: {event:?}").into());
@@ -2922,11 +2926,15 @@ fn tail_multi_source_lease_roll_failure_restores_every_old_binding() -> Result<(
     assert!(matches!(
         tail.poll(),
         Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
-            cursor: Some(_),
+            cursor: None,
             ..
         }))
     ));
     assert!(tail.poll().is_none());
+    drop(batch);
+    drop(tail);
+    let after = fixture.kernel.authority.governor().inspect()?;
+    assert!(after.outstanding_total() <= baseline.outstanding_total());
     Ok(())
 }
 
