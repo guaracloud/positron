@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::sync::Mutex;
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::AttributeValueKind;
@@ -21,6 +22,8 @@ use super::support::{
 use super::terminal_and_bounds::QueryFixture;
 
 struct OperatorOverflowWorkMeter;
+
+static TAIL_CURSOR_FAULT_LOCK: Mutex<()> = Mutex::new(());
 
 impl positron_query::QueryWorkMeter for OperatorOverflowWorkMeter {
     fn units(
@@ -391,6 +394,9 @@ fn tail_ack_cursor_encode_failure_keeps_safe_progress_and_terminalizes_once()
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("acknowledgement failure batch missing".into());
     };
+    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
+        .lock()
+        .map_err(|_| "fault lock poisoned")?;
     positron_query::fail_next_tail_cursor_encode();
     assert_eq!(
         tail.acknowledge(batch.sequence(), batch.digest())
@@ -1636,6 +1642,9 @@ fn tail_terminal_cursor_sync_failure_is_framed_once() -> Result<(), Box<dyn Erro
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
+        .lock()
+        .map_err(|_| "fault lock poisoned")?;
     positron_query::fail_next_tail_cursor_encode();
     tail.disconnect();
     assert!(matches!(
@@ -2741,6 +2750,9 @@ fn tail_lease_roll_encode_failure_keeps_the_old_safe_binding() -> Result<(), Box
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("post-admission batch missing".into());
     };
+    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
+        .lock()
+        .map_err(|_| "fault lock poisoned")?;
     positron_query::fail_next_tail_cursor_encode();
     assert_eq!(
         tail.acknowledge(batch.sequence(), batch.digest())
