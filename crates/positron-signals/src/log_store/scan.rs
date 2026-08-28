@@ -15,6 +15,7 @@ pub trait ScanCancellation: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanObservationFailureCode {
     BudgetExhausted,
+    DecodedRecordsExhausted,
     Cancelled,
     ResourceExhausted,
     Internal,

@@ -293,6 +293,115 @@ fn unbounded_tail_spans_historical_batches_resume_and_live_transition() -> Resul
 }
 
 #[test]
+fn multi_shard_resume_after_ack_and_new_commits_preserves_accounting() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-multi-shard-resume-accounting")?;
+    let second = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Logs,
+            VirtualShardId::new(2)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x77; 32])),
+    )?;
+    let service = fixture.service(16)?;
+    let source = "pipeline:v1 logs | range query_time -100 100 | limit all";
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let query = service.plan_pipeline(fixture.context, source, budget(8)?)?;
+    let mut tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("primary-history", 1, 1)?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(2),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "secondary-history".to_owned(),
+            )),
+        )],
+        2,
+    )?;
+    let Some(TailEvent::Batch(history)) = tail.poll() else {
+        return Err("multi-shard history batch missing".into());
+    };
+    assert_eq!(history.records().len(), 2);
+    tail.acknowledge(history.sequence(), history.digest())?;
+    let cursor = tail.cursor().clone();
+
+    fixture.kernel.append_log("primary-live", 3, 3)?;
+    fixture.kernel.append_logs_to(
+        &second,
+        VirtualShardId::new(2)?,
+        vec![(
+            Some(4),
+            Some(positron_domain::value::CandidateAttributeValue::string(
+                "secondary-live".to_owned(),
+            )),
+        )],
+        4,
+    )?;
+    drop(tail);
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+
+    let sources = TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+    let query = service.plan_pipeline(fixture.context, source, budget(8)?)?;
+    let mut resumed = service.resume_tail_with_sources(query, &cursor, sources)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(live)) = resumed.poll() else {
+        return Err("multi-shard resumed batch missing".into());
+    };
+    assert_eq!(live.records().len(), 2);
+    assert_eq!(live.sequence(), 1);
+    resumed.acknowledge(live.sequence(), live.digest())?;
+    assert_eq!(
+        resumed.poll().ok_or("resumed tail did not become idle")?,
+        TailEvent::Idle
+    );
+    drop(resumed);
+    let after = fixture.kernel.authority.governor().inspect()?;
+    assert!(after.outstanding_total() <= baseline.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert!(after.usage(dimension) <= baseline.usage(dimension));
+    }
+    Ok(())
+}
+
+#[test]
+fn historical_decoded_records_exhaustion_has_no_prefix_and_reports_dimension()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-decoded-budget")?;
+    fixture.kernel.append_log("decoded-first", 1, 1)?;
+    fixture.kernel.append_log("decoded-second", 2, 2)?;
+    let service = super::support::zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        QueryBudget::new(1_048_576, 1, 4, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?,
+    )?;
+    let failure = match service.tail(query, TailStart::Historical { max_rows: 1 }) {
+        Ok(_) => return Err("decoded budget refusal exposed a historical prefix".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::BudgetExhausted);
+    assert_eq!(
+        failure.limiting_budget(),
+        Some(positron_query::QueryBudgetDimension::DecodedRecords)
+    );
+    Ok(())
+}
+
+#[test]
 fn late_sequence_delivery_cursor_replays_once_without_double_counting() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("tail-late-delivery-cursor")?;

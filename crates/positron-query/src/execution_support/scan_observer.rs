@@ -117,7 +117,8 @@ impl ScanObserver for QueryScanObserver<'_> {
     }
 
     fn observe_decoded_records(&self, records: u64) -> Result<(), ScanObservationFailureCode> {
-        self.observe_progress(&self.decoded_records, records, self.decoded_records_limit)?;
+        self.observe_progress(&self.decoded_records, records, self.decoded_records_limit)
+            .map_err(|_| ScanObservationFailureCode::DecodedRecordsExhausted)?;
         if self.cancellation.is_cancelled() {
             return Err(ScanObservationFailureCode::Cancelled);
         }
@@ -180,7 +181,7 @@ mod tests {
             observer
                 .observe_decoded_records(1)
                 .expect_err("decoded record ceiling is hard"),
-            ScanObservationFailureCode::BudgetExhausted
+            ScanObservationFailureCode::DecodedRecordsExhausted
         );
     }
 }

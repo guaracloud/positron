@@ -12,6 +12,7 @@ pub(super) fn map_observation_failure(failure: ScanObservationFailureCode) -> Sc
     match failure {
         ScanObservationFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
         ScanObservationFailureCode::BudgetExhausted
+        | ScanObservationFailureCode::DecodedRecordsExhausted
         | ScanObservationFailureCode::ResourceExhausted
         | ScanObservationFailureCode::Internal => SchemaSessionFailure::StateUnavailable,
     }

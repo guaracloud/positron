@@ -71,6 +71,7 @@ impl TenantSchemaSession {
             observer.observe_work(1).map_err(|failure| match failure {
                 ScanObservationFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
                 ScanObservationFailureCode::BudgetExhausted
+                | ScanObservationFailureCode::DecodedRecordsExhausted
                 | ScanObservationFailureCode::ResourceExhausted
                 | ScanObservationFailureCode::Internal => SchemaSessionFailure::StateUnavailable,
             })?;
