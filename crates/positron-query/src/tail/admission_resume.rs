@@ -13,10 +13,11 @@ pub(super) fn validate_resume_history(
         let snapshot = reader
             .snapshot()
             .map_err(crate::execution_support::map_ledger_failure)?;
-        let Some(position) = state
+        let Some((position_index, position)) = state
             .positions()
             .iter()
-            .find(|position| position.shard() == snapshot.scope().shard_id())
+            .enumerate()
+            .find(|(_, position)| position.shard() == snapshot.scope().shard_id())
         else {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         };
@@ -25,13 +26,7 @@ pub(super) fn validate_resume_history(
         }
         if let Some(markers) = state.historical_markers() {
             let marker = markers
-                .get(
-                    state
-                        .positions()
-                        .iter()
-                        .position(|candidate| candidate.shard() == snapshot.scope().shard_id())
-                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?,
-                )
+                .get(position_index)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
             if marker.handoff_frontier() > snapshot.frontier()
                 || (marker.handoff_frontier() > marker.lower_bound()

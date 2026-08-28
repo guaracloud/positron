@@ -146,17 +146,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             historical_key,
         ) {
             Ok(advanced) => advanced,
-            Err(failure) => {
-                self.delivery_cursor = None;
-                self.record_limiting_budget(&failure);
-                let terminal = super::admission::terminal_for_failure(
-                    failure.code(),
-                    Some(self.cursor.clone()),
-                    self.terminal_stats(),
-                );
-                self.terminal = Some(terminal);
-                return Err(failure);
-            },
+            Err(failure) => return Err(self.fail_acknowledgement(failure)),
         };
         let AdvancedBatch {
             state,
@@ -166,15 +156,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             lease_rotation,
         } = advanced;
         if let Err(failure) = self.commit_lease_rotation(lease_rotation) {
-            self.delivery_cursor = None;
-            self.record_limiting_budget(&failure);
-            let terminal = super::admission::terminal_for_failure(
-                failure.code(),
-                Some(self.cursor.clone()),
-                self.terminal_stats(),
-            );
-            self.terminal = Some(terminal);
-            return Err(failure);
+            return Err(self.fail_acknowledgement(failure));
         }
         self.state = state;
         self.cursor = cursor;
@@ -204,11 +186,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         if let Err(failure) = self.revalidate() {
             self.record_limiting_budget(&failure);
             if self.terminal.is_none() {
-                self.terminal = Some(super::admission::terminal_for_failure(
-                    failure.code(),
-                    Some(self.cursor.clone()),
-                    self.terminal_stats(),
-                ));
+                self.terminal = Some(self.terminal_for_failure(&failure));
             }
             return self.take_terminal();
         }
@@ -244,11 +222,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             Ok(()) => Some(TailEvent::Idle),
             Err(failure) => {
                 self.record_limiting_budget(&failure);
-                let terminal = super::admission::terminal_for_failure(
-                    failure.code(),
-                    Some(self.cursor.clone()),
-                    self.terminal_stats(),
-                );
+                let terminal = self.terminal_for_failure(&failure);
                 self.terminal_after_progress_failure(terminal);
                 self.take_terminal()
             },
@@ -273,12 +247,15 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
 
     fn replace_terminal_after_progress_failure(&mut self) {
         if let Err(failure) = self.sync_progress() {
-            self.terminal = Some(super::admission::terminal_for_failure(
-                failure.code(),
-                Some(self.cursor.clone()),
-                self.terminal_stats(),
-            ));
+            self.terminal = Some(self.terminal_for_failure(&failure));
         }
+    }
+
+    fn fail_acknowledgement(&mut self, failure: QueryFailure) -> QueryFailure {
+        self.delivery_cursor = None;
+        self.record_limiting_budget(&failure);
+        self.terminal = Some(self.terminal_for_failure(&failure));
+        failure
     }
 
     pub(super) fn terminal_after_progress_failure(&mut self, terminal: TailTerminal) {
@@ -286,7 +263,6 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         self.replace_terminal_after_progress_failure();
     }
     fn take_terminal(&mut self) -> Option<TailEvent> {
-        let stats = self.terminal_stats();
         if self.cursor_observed.get() {
             // A caller that has taken the opaque cursor may reconnect after an
             // incomplete terminal. Keep the exact durable leases alive; their
@@ -308,21 +284,26 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             if let Err(failure) = self.source_lease_owners.release() {
                 crate::failure::retain_stronger(&mut cleanup_failure, failure);
             }
-            if let Some(failure) = cleanup_failure
-                && let Some(terminal) = self.terminal.as_mut()
-            {
-                let selected = crate::failure::stronger_failure(
-                    QueryFailure::new(terminal.failure_code()),
-                    failure,
-                );
-                *terminal = super::admission::terminal_for_failure(
-                    selected.code(),
-                    Some(self.cursor.clone()),
-                    stats,
-                );
+            if let Some(failure) = cleanup_failure {
+                let selected = self.terminal.as_ref().map(|terminal| {
+                    crate::failure::stronger_failure(
+                        QueryFailure::new(terminal.failure_code()),
+                        failure,
+                    )
+                });
+                if let Some(selected) = selected {
+                    self.terminal = Some(self.terminal_for_failure(&selected));
+                }
             }
         }
         take_terminal_value(&mut self.terminal, &mut self.terminal_emitted)
+    }
+    fn terminal_for_failure(&self, failure: &QueryFailure) -> TailTerminal {
+        super::admission::terminal_for_failure(
+            failure.code(),
+            Some(self.cursor.clone()),
+            self.terminal_stats(),
+        )
     }
     pub(super) fn terminal_stats(&self) -> TailStats {
         TailStats {

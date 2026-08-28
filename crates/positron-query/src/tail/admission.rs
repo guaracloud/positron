@@ -82,10 +82,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         bindings
             .try_reserve_exact(sources.readers().len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-        let mut frontiers = Vec::new();
-        frontiers
-            .try_reserve_exact(sources.readers().len())
-            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let (lease, lease_owner) = if let Some((state, _)) = resume.as_ref() {
             let primary_shard = self.ledger.scope().shard_id();
             let binding = state
@@ -138,7 +134,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 |grant| grant.snapshot().frontier(),
             );
             bindings.push(TailSourceBinding::new(shard, lease_id, frontier));
-            frontiers.push((shard, frontier));
             if let Some(source_lease) = source_lease {
                 source_lease_owners.push(TailLeaseOwner::new(authority, source_lease.identity()));
                 source_lease_grants.push(source_lease);
@@ -171,13 +166,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             None => {
                 let mut positions = Vec::new();
                 positions
-                    .try_reserve_exact(frontiers.len())
+                    .try_reserve_exact(bindings.len())
                     .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-                for (shard, frontier) in &frontiers {
+                for binding in &bindings {
                     positions.push(TailPosition::new(
-                        *shard,
+                        binding.shard(),
                         match start {
-                            TailStart::Now => *frontier,
+                            TailStart::Now => binding.frontier(),
                             TailStart::Historical { .. } => {
                                 positron_domain::routing::CommitPosition::origin()
                             },
@@ -199,12 +194,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 if matches!(start, TailStart::Historical { .. }) {
                     let mut markers = Vec::new();
                     markers
-                        .try_reserve_exact(frontiers.len())
+                        .try_reserve_exact(bindings.len())
                         .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-                    for (_, frontier) in &frontiers {
+                    for binding in &bindings {
                         markers.push(HistoricalMarker::new(
                             positron_domain::routing::CommitPosition::origin(),
-                            *frontier,
+                            binding.frontier(),
                         )?);
                     }
                     state.set_historical_markers(markers)?;
@@ -280,12 +275,21 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             (state.resume_count(), state.repeated_batch_count(), cursor)
         };
         let historical_frontiers = if let Some(markers) = state.historical_markers() {
+            let bindings = state
+                .source_bindings()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+            if bindings.len() != markers.len() {
+                return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+            }
             let mut positions = Vec::new();
             positions
                 .try_reserve_exact(markers.len())
                 .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
-            for ((shard, _), marker) in frontiers.iter().zip(markers) {
-                positions.push(TailPosition::new(*shard, marker.handoff_frontier()));
+            for (binding, marker) in bindings.iter().zip(markers) {
+                positions.push(TailPosition::new(
+                    binding.shard(),
+                    marker.handoff_frontier(),
+                ));
             }
             positions
         } else {
