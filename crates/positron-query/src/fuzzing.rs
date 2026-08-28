@@ -102,3 +102,38 @@ pub(super) fn fuzz_query_transforms(data: &[u8]) {
         }
     }
 }
+
+pub(super) fn fuzz_query_search_matcher(data: &[u8]) {
+    if data.is_empty() || data.len() > 4_096 {
+        return;
+    }
+    let pattern_len = usize::from(data[0]).min(data.len().saturating_sub(1));
+    let (pattern, body) = data[1..].split_at(pattern_len);
+    let Ok(pattern) = std::str::from_utf8(pattern) else {
+        return;
+    };
+    let Ok(body) = std::str::from_utf8(body) else {
+        return;
+    };
+    let Ok(mut regex) = crate::search::BoundedRegex::from_source(pattern.to_owned()) else {
+        return;
+    };
+    if regex.compile().is_err() {
+        return;
+    }
+    let mut observer = crate::search::UnobservedSearch;
+    let _ = regex.is_match_observed(body, &mut observer);
+    let Ok(mut substring) = crate::search::BoundedSubstring::from_source(pattern.to_owned()) else {
+        return;
+    };
+    if substring.compile().is_err() {
+        return;
+    }
+    let _ = substring.is_match_observed(body, &mut observer);
+    let literals = regex
+        .pruning_literals()
+        .iter()
+        .map(|literal| literal.to_vec())
+        .collect::<Vec<_>>();
+    positron_signals::fuzz_text_search_pruning(body, &literals);
+}

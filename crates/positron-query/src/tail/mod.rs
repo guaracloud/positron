@@ -1,6 +1,8 @@
 mod admission;
 mod buffer;
 mod cursor;
+#[cfg(fuzzing)]
+mod fuzz;
 mod historical;
 mod history;
 mod lease;
@@ -16,6 +18,9 @@ pub use cursor::{TailCursor, TailCursorState, TailPosition};
 pub use session::{TailEvent, TailSession, TailStart};
 pub use source::TailSourceSet;
 pub use terminal::{TailStats, TailTerminal};
+
+#[cfg(fuzzing)]
+pub(super) use fuzz::fuzz_tail_cursor;
 
 use crate::{QueryFailure, QueryFailureCode};
 

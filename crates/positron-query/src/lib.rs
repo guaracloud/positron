@@ -257,46 +257,7 @@ pub fn fuzz_query_cursor(data: &[u8]) {
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub fn fuzz_tail_cursor(data: &[u8]) {
-    if data.len() > 4_096 {
-        return;
-    }
-    let _ = QueryCursor::from_bytes(data);
-    let protector = positron_kernel::fuzz_control_token_protector();
-    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
-        .expect("fuzz principal fixture is valid");
-    let tenant = positron_domain::identity::TenantId::from_bytes([2; 16])
-        .expect("fuzz tenant fixture is valid");
-    let shard =
-        positron_domain::routing::VirtualShardId::new(1).expect("fuzz shard fixture is valid");
-    let state = tail::TailCursorState::new(
-        principal,
-        tenant,
-        7,
-        [3; 32],
-        [5; 32],
-        vec![tail::TailPosition::new(
-            shard,
-            positron_domain::routing::CommitPosition::origin(),
-        )],
-        60,
-        0,
-        [4; 32],
-    )
-    .expect("fuzz cursor state is valid");
-    let cursor = tail::TailCursor::encode(&protector, &state).expect("fuzz cursor encodes");
-    let decoded = tail::TailCursor::decode(&protector, &cursor).expect("fuzz cursor decodes");
-    assert_eq!(decoded, state);
-    let _ = tail::TailCursor::from_bytes(data);
-    if !data.is_empty() {
-        let mut mutated = cursor.as_bytes().to_vec();
-        for (index, byte) in data.iter().enumerate().take(mutated.len()) {
-            if let Some(slot) = mutated.get_mut(index) {
-                *slot ^= *byte;
-            }
-        }
-        let _ = tail::TailCursor::from_bytes(&mutated)
-            .and_then(|cursor| tail::TailCursor::decode(&protector, &cursor));
-    }
+    tail::fuzz_tail_cursor(data);
 }
 
 #[cfg(fuzzing)]
@@ -418,38 +379,7 @@ fn query_classification(
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub fn fuzz_query_search_matcher(data: &[u8]) {
-    if data.is_empty() || data.len() > 4_096 {
-        return;
-    }
-    let pattern_len = usize::from(data[0]).min(data.len().saturating_sub(1));
-    let (pattern, body) = data[1..].split_at(pattern_len);
-    let Ok(pattern) = std::str::from_utf8(pattern) else {
-        return;
-    };
-    let Ok(body) = std::str::from_utf8(body) else {
-        return;
-    };
-    let Ok(mut regex) = search::BoundedRegex::from_source(pattern.to_owned()) else {
-        return;
-    };
-    if regex.compile().is_err() {
-        return;
-    }
-    let mut observer = search::UnobservedSearch;
-    let _ = regex.is_match_observed(body, &mut observer);
-    let Ok(mut substring) = search::BoundedSubstring::from_source(pattern.to_owned()) else {
-        return;
-    };
-    if substring.compile().is_err() {
-        return;
-    }
-    let _ = substring.is_match_observed(body, &mut observer);
-    let literals = regex
-        .pruning_literals()
-        .iter()
-        .map(|literal| literal.to_vec())
-        .collect::<Vec<_>>();
-    positron_signals::fuzz_text_search_pruning(body, &literals);
+    fuzzing::fuzz_query_search_matcher(data);
 }
 
 #[cfg(fuzzing)]
