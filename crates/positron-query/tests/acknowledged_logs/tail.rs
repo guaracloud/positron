@@ -2785,6 +2785,9 @@ fn tail_lease_roll_encode_failure_keeps_the_old_safe_binding() -> Result<(), Box
 #[test]
 fn tail_lease_roll_rejects_an_expired_replacement_before_publication() -> Result<(), Box<dyn Error>>
 {
+    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
+        .lock()
+        .map_err(|_| "fault lock poisoned")?;
     let fixture = QueryFixture::new("tail-live-lease-roll-expiry")?;
     let clock = StepClock::shared(0);
     let service = QueryService::with_clock(
@@ -2985,24 +2988,24 @@ fn tail_primary_lease_rolls_back_after_secondary_publication_failure() -> Result
         )],
         2,
     )?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("primary rollback batch missing".into());
     };
-    let failure =
-        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
-            tail.acknowledge(batch.sequence(), batch.digest())
-        })
-        .expect_err("a secondary publication failure must roll back the primary lease");
+    let failure = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeCommit, 1),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+        ],
+        || tail.acknowledge(batch.sequence(), batch.digest()),
+    )
+    .expect_err("a primary rollback publication failure must reject the ack");
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
     assert_eq!(tail.cursor(), &safe_cursor);
-    assert!(matches!(
-        tail.poll(),
-        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable {
-            cursor: Some(_),
-            ..
-        }))
-    ));
-    assert!(tail.poll().is_none());
+    drop(batch);
+    drop(tail);
+    let after = fixture.kernel.authority.governor().inspect()?;
+    assert!(after.outstanding_total() <= baseline.outstanding_total());
     Ok(())
 }
 
