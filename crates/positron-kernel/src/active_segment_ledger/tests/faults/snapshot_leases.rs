@@ -2135,6 +2135,69 @@ fn bounded_active_legacy_lease_is_normalized_when_resumed() -> Result<(), Box<dy
     })
 }
 
+#[test]
+fn legacy_lease_normalization_failure_preserves_durable_v1_and_accounting()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xd9, |bytes| rewrite_v2_lease_as_v1(bytes, 200))?;
+
+        let legacy = catalog
+            .pin()?
+            .plaintext_objects()
+            .find(|bytes| {
+                bytes.starts_with(b"PSLEASE1")
+                    && bytes.get(10..26) == Some(identity.to_bytes().as_slice())
+            })
+            .ok_or("legacy snapshot lease catalog record missing")?
+            .to_vec();
+        assert_eq!(legacy.get(8..10), Some(1_u16.to_be_bytes().as_slice()));
+        let baseline = authority.governor().inspect()?;
+
+        let failure = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            ledger.resume_snapshot_lease(identity, 101)
+        })
+        .expect_err("failed normalization must not acknowledge a resumed lease");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        let after = authority.governor().inspect()?;
+        assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+        for dimension in ResourceDimension::ALL {
+            assert_eq!(after.usage(dimension), baseline.usage(dimension));
+        }
+        let durable = catalog.pin()?;
+        let current = durable
+            .plaintext_objects()
+            .find(|bytes| {
+                bytes.starts_with(b"PSLEASE1")
+                    && bytes.get(10..26) == Some(identity.to_bytes().as_slice())
+            })
+            .ok_or("failed normalization removed the lease record")?;
+        assert_eq!(current, legacy.as_slice());
+
+        assert_eq!(
+            ledger.resume_snapshot_lease(identity, 101)?.identity(),
+            identity
+        );
+        let normalized_snapshot = catalog.pin()?;
+        let normalized = normalized_snapshot
+            .plaintext_objects()
+            .find(|bytes| {
+                bytes.starts_with(b"PSLEASE1")
+                    && bytes.get(10..26) == Some(identity.to_bytes().as_slice())
+            })
+            .ok_or("successful retry did not publish a lease record")?;
+        assert_eq!(normalized.get(8..10), Some(2_u16.to_be_bytes().as_slice()));
+        assert_eq!(
+            normalized.get(95..103),
+            Some(101_u64.to_be_bytes().as_slice())
+        );
+        ledger.release_snapshot_lease(identity)?;
+        Ok(())
+    })
+}
+
 fn publish_lease_rewrite(
     catalog: &Catalog<'_>,
     transaction: u8,
