@@ -200,6 +200,9 @@ fn tail_resume_frames_cumulative_elapsed_overflow_before_delivery() -> Result<()
 
 #[test]
 fn tail_terminal_stats_accumulate_resume_and_repeat_counts() -> Result<(), Box<dyn Error>> {
+    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
+        .lock()
+        .map_err(|_| "fault lock poisoned")?;
     let fixture = QueryFixture::new("tail-terminal-resume-stats")?;
     fixture.kernel.append_log("repeat", 1, 1)?;
     let service = fixture.service(16)?;
@@ -627,6 +630,9 @@ fn tail_historical_admission_failure_releases_the_lease_before_returning()
 
 #[test]
 fn tail_terminal_and_drop_paths_reclaim_lease_capacity_repeatedly() -> Result<(), Box<dyn Error>> {
+    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
+        .lock()
+        .map_err(|_| "fault lock poisoned")?;
     let fixture = QueryFixture::new("tail-terminal-release-loop")?;
     let clock = TestClock::shared(100);
     let service = zero_work_clock_service(
