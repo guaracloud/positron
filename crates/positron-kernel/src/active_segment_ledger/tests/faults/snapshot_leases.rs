@@ -1,7 +1,8 @@
 use super::super::super::fault::{LedgerFileEvent, with_ledger_fault, with_ledger_fault_sequence};
 use super::*;
 use crate::{
-    OrdinaryPool, ResourceAmounts, ResourceDimension, SnapshotLeaseUsage, WorkClaim, WorkKind,
+    OrdinaryPool, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
+    SnapshotLeaseUsage, WorkClaim, WorkKind,
 };
 
 fn resize_blocker(
@@ -1752,6 +1753,98 @@ fn snapshot_lease_usage_ambiguous_publication_reconciles_durable_truth()
         })?;
         assert_eq!(usage, delta);
         assert_eq!(ledger.snapshot_lease_usage(identity, 101)?, delta);
+        Ok(())
+    })
+}
+
+#[test]
+fn usage_ambiguity_and_expired_sibling_cleanup_remain_retryable() -> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, key())?;
+        // Keep a committed data object ahead of the lease records so ambiguous
+        // reconciliation proves it skips unrelated Catalog objects.
+        ledger.append(prepared(scope, b"committed-before-lease")?)?;
+        let expired = ledger.create_snapshot_lease(100, 101)?.identity();
+        let target = ledger.create_snapshot_lease(100, 200)?.identity();
+        let delta = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+
+        let usage = with_ledger_fault(LedgerFileEvent::AfterLeaseUsagePublication, || {
+            ledger.record_snapshot_lease_usage(target, delta)
+        })?;
+        assert_eq!(usage, delta);
+        assert_eq!(ledger.snapshot_lease_usage(target, 101)?, delta);
+        let failed_delta = SnapshotLeaseUsage::new(2, 0, 0, 0, 0, 0, 0);
+        let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+            ledger.record_snapshot_lease_usage(target, failed_delta)
+        })
+        .expect_err("a rejected usage publication must preserve durable usage");
+        assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+        assert_eq!(ledger.snapshot_lease_usage(target, 101)?, delta);
+
+        let snapshot = authority.governor().inspect()?;
+        let shared_memory = snapshot.recovery_shared_capacity(ResourceDimension::MemoryBytes);
+        let blocker_amount = shared_memory
+            .checked_sub(snapshot.usage(ResourceDimension::MemoryBytes))
+            .and_then(|available| available.checked_sub(1))
+            .ok_or("recovery capacity arithmetic overflow")?;
+        let blocker = authority.recovery().reserve(RecoveryWorkClaim::system(
+            RecoveryWorkKind::DurabilityCompletion,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, blocker_amount)?,
+        )?)?;
+
+        let failure = ledger
+            .resume_snapshot_lease_with_marker(target, 101, 1, [9; 32])
+            .expect_err("expired sibling cleanup must report admission refusal");
+        assert_eq!(failure.code(), LedgerFailureCode::ResourceAdmissionRefused);
+        drop(blocker);
+
+        let resumed = ledger.resume_snapshot_lease_with_marker(target, 101, 1, [9; 32])?;
+        assert_eq!(resumed.identity(), target);
+        assert_eq!(resumed.resume_count(), 1);
+        drop(resumed);
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(expired, 102)
+                .expect_err("the expired sibling must be removed by the retry")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+        ledger.release_snapshot_lease(target)?;
+
+        let orphan = ledger.create_snapshot_lease(103, 200)?;
+        let orphan_identity = orphan.identity();
+        let orphan_bytes = catalog
+            .pin()?
+            .plaintext_objects()
+            .find(|bytes| {
+                bytes.starts_with(b"PSLEASE1")
+                    && bytes.get(10..26) == Some(orphan_identity.to_bytes().as_slice())
+            })
+            .ok_or("orphan lease catalog record missing")?
+            .to_vec();
+        drop(orphan);
+        ledger.release_snapshot_lease(orphan_identity)?;
+        let basis = catalog.pin()?;
+        let mut objects = basis
+            .plaintext_objects()
+            .map(|bytes| CatalogObject::new(bytes.to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        objects.push(CatalogObject::new(orphan_bytes)?);
+        catalog.commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([0xb8; 16])?,
+                FormatEpoch::new(1)?,
+                objects,
+            )?,
+            None,
+        )?;
+        let failure = match ledger.prepare_snapshot_lease_replacement(orphan_identity, 104, 200) {
+            Ok(_) => return Err("a durable lease without a live reservation was accepted".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
         Ok(())
     })
 }
