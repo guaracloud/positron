@@ -470,6 +470,31 @@ pub(crate) fn tail_cursor_with_snapshot_identity(
     })
 }
 
+pub(crate) fn tail_cursor_with_delivery_sequence(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    sequence: u64,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const DELIVERY_MAGIC: &[u8] = b"DLV1";
+        let delivery_start = payload
+            .windows(DELIVERY_MAGIC.len())
+            .position(|window| window == DELIVERY_MAGIC)
+            .ok_or("tail cursor delivery marker missing")?;
+        let sequence_start = delivery_start
+            .checked_add(DELIVERY_MAGIC.len())
+            .ok_or("tail cursor delivery sequence offset overflow")?;
+        let sequence_end = sequence_start
+            .checked_add(std::mem::size_of::<u64>())
+            .ok_or("tail cursor delivery sequence field overflow")?;
+        payload
+            .get_mut(sequence_start..sequence_end)
+            .ok_or("tail cursor delivery sequence field missing")?
+            .copy_from_slice(&sequence.to_be_bytes());
+        Ok(())
+    })
+}
+
 fn rewrite_tail_cursor(
     protector: &ControlTokenProtector<'_>,
     cursor: &positron_query::TailCursor,

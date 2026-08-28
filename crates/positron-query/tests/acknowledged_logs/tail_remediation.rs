@@ -11,7 +11,10 @@ use positron_query::{
     TailTerminal,
 };
 
-use super::support::{CancellingOperatorCallMeter, TestClock, tail_cursor_with_snapshot_identity};
+use super::support::{
+    CancellingOperatorCallMeter, TestClock, tail_cursor_with_delivery_sequence,
+    tail_cursor_with_snapshot_identity,
+};
 use super::terminal_and_bounds::QueryFixture;
 
 fn budget(rows: u64) -> Result<QueryBudget, Box<dyn Error>> {
@@ -402,6 +405,168 @@ fn live_scan_observes_cancellation_before_accounting_scanned_bytes() -> Result<(
         tail.poll(),
         Some(TailEvent::Terminal(TailTerminal::Cancelled { .. }))
     ));
+    Ok(())
+}
+
+#[test]
+fn cleanup_ranking_inspects_each_public_terminal_failure_code() -> Result<(), Box<dyn Error>> {
+    {
+        let fixture = QueryFixture::new("tail-cleanup-code-lag")?;
+        fixture.kernel.append_logs(
+            vec![
+                (
+                    Some(1),
+                    Some(positron_domain::value::CandidateAttributeValue::string(
+                        "one".to_owned(),
+                    )),
+                ),
+                (
+                    Some(2),
+                    Some(positron_domain::value::CandidateAttributeValue::string(
+                        "two".to_owned(),
+                    )),
+                ),
+            ],
+            1,
+        )?;
+        let service = fixture.service(16)?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            QueryBudget::new(1_048_576, 16, 4, 300, 1_048_576, 60)?,
+        )?;
+        let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        assert!(matches!(
+            with_catalog_publication_fault_after(
+                CatalogPublicationFault::SynchronizeCommit,
+                0,
+                || tail.poll(),
+            ),
+            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+        ));
+    }
+    {
+        let fixture = QueryFixture::new("tail-cleanup-code-budget")?;
+        let service = super::support::stage_work_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            16,
+        );
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | project body, query_time | limit all",
+            QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1)?,
+        )?;
+        let mut tail = service.tail(query, TailStart::Now)?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        fixture.kernel.append_log("budget", 1, 1)?;
+        assert!(matches!(
+            with_catalog_publication_fault_after(
+                CatalogPublicationFault::SynchronizeCommit,
+                0,
+                || tail.poll(),
+            ),
+            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+        ));
+    }
+    {
+        let fixture = QueryFixture::new("tail-cleanup-code-expired")?;
+        let clock = TestClock::shared(100);
+        let service = super::support::zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            16,
+            clock.clone(),
+        );
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            budget(1)?,
+        )?;
+        let mut tail = service.tail(query, TailStart::Now)?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        clock.set(160);
+        assert!(matches!(
+            with_catalog_publication_fault_after(
+                CatalogPublicationFault::SynchronizeCommit,
+                0,
+                || tail.poll(),
+            ),
+            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+        ));
+    }
+    {
+        let fixture = QueryFixture::new("tail-cleanup-code-cancelled")?;
+        let service = fixture.service(16)?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            budget(1)?,
+        )?;
+        let mut tail = service.tail(query, TailStart::Now)?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        tail.cancel();
+        assert!(matches!(
+            with_catalog_publication_fault_after(
+                CatalogPublicationFault::SynchronizeCommit,
+                0,
+                || tail.poll(),
+            ),
+            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+        ));
+    }
+    {
+        let fixture = QueryFixture::new("tail-cleanup-code-disconnected")?;
+        let service = fixture.service(16)?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            budget(1)?,
+        )?;
+        let mut tail = service.tail(query, TailStart::Now)?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        tail.disconnect();
+        assert!(matches!(
+            with_catalog_publication_fault_after(
+                CatalogPublicationFault::SynchronizeCommit,
+                0,
+                || tail.poll(),
+            ),
+            Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn resume_rejects_a_delivery_cursor_with_a_late_sequence() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-resume-delivery-sequence")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut initial = service.tail(query, TailStart::Now)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("delivery-sequence", 1, 1)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Batch(_))));
+    let forged = tail_cursor_with_delivery_sequence(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+        1,
+    )?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let failure = match service.resume_tail(query, &forged) {
+        Ok(_) => return Err("a late delivery sequence unexpectedly resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
     Ok(())
 }
 
