@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fs;
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
@@ -6,7 +7,7 @@ use positron_kernel::{
     with_catalog_publication_fault_after,
 };
 use positron_query::{
-    QueryBudget, QueryFailureCode, QueryService, TailEvent, TailSourceSet, TailStart,
+    QueryBudget, QueryFailureCode, QueryService, TailEvent, TailSourceSet, TailStart, TailTerminal,
 };
 
 use super::support::TestClock;
@@ -146,6 +147,33 @@ fn traces_are_rejected_at_source_admission() -> Result<(), Box<dyn Error>> {
         TailSourceSet::new(vec![traces.reader()?]),
         Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
     ));
+    Ok(())
+}
+
+#[test]
+fn catalog_failure_during_active_revalidation_is_store_unavailable() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-catalog-revalidation-failure")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+
+    let commits = fixture.kernel.catalog_data_root_for_test().join("commits");
+    let commit = fs::read_dir(&commits)?
+        .next()
+        .ok_or("catalog commit missing")??
+        .path();
+    fs::remove_file(commit)?;
+
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+    ));
+    assert!(tail.poll().is_none());
     Ok(())
 }
 

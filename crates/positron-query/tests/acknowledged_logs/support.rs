@@ -842,6 +842,10 @@ impl KernelFixture {
         self.catalog
     }
 
+    pub fn catalog_data_root_for_test(&self) -> PathBuf {
+        self._root.0.join("catalog")
+    }
+
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {
         let ledger = self.ledger.take().ok_or("ledger unavailable")?;
         ledger.seal()?;
