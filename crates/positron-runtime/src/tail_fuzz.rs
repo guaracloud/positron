@@ -78,7 +78,7 @@ fn run_checked(data: &[u8]) -> Result<(), String> {
         Arc::new(FuzzClock),
         Arc::new(FuzzWorkMeter),
     );
-    let source = "pipeline:v1 logs | range query_time -100 100 | limit 16";
+    let source = "pipeline:v1 logs | range query_time -100 100 | limit all";
     let baseline = instance
         ._authority
         .governor()
@@ -86,6 +86,20 @@ fn run_checked(data: &[u8]) -> Result<(), String> {
         .map_err(describe)?
         .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
     let mut branches = Branches::default();
+    let low_budget = QueryBudget::new(1, 16, 16, 1_048_576, 1_048_576, 60)
+        .map_err(describe)?
+        .with_cpu_work_units(1)
+        .map_err(describe)?;
+    let query = plan(&service, context, source, low_budget)?;
+    let budget_sources =
+        positron_query::TailSourceSet::new(vec![first_ledger.reader().map_err(describe)?])
+            .map_err(describe)?;
+    match service.tail_with_sources(query, TailStart::Historical { max_rows: 1 }, budget_sources) {
+        Err(failure) if failure.code() == QueryFailureCode::BudgetExhausted => {},
+        Err(failure) => return Err(format!("budget tail: {failure:?}")),
+        Ok(_) => return Err("tail fuzz budget was not observed".to_owned()),
+    }
+    branches.budgets += 1;
     {
         let query = plan(&service, context, source, budget()?)?;
         let mut session = service
@@ -186,26 +200,21 @@ fn run_checked(data: &[u8]) -> Result<(), String> {
             return Err("tail fuzz cancellation did not terminate".to_owned());
         }
         branches.cancellations += 1;
+        let cancelled_cursor = cancelled.cursor().clone();
         drop(cancelled);
-        let low_budget = QueryBudget::new(1, 16, 16, 1_048_576, 1_048_576, 60)
-            .map_err(describe)?
-            .with_cpu_work_units(1)
-            .map_err(describe)?;
-        let query = plan(&service, context, source, low_budget)?;
-        let mut budgeted = service
-            .tail_with_sources(
+        drop(resumed);
+        let query = plan(&service, context, source, budget()?)?;
+        let mut resumed = service
+            .resume_tail_with_sources(
                 query,
-                TailStart::Now,
+                &cancelled_cursor,
                 sources(&first_ledger, &second_ledger)?,
             )
-            .map_err(|error| format!("budget tail: {error:?}"))?;
-        if !matches!(budgeted.poll(), Some(TailEvent::Header(_))) {
-            return Err("tail fuzz budget session missing header".to_owned());
+            .map_err(|error| format!("resume cancelled tail: {error:?}"))?;
+        if !matches!(resumed.poll(), Some(TailEvent::Header(_))) {
+            return Err("tail fuzz cancellation resume did not emit a header".to_owned());
         }
-        if !matches!(budgeted.poll(), Some(TailEvent::Terminal(_))) {
-            return Err("tail fuzz budget was not observed".to_owned());
-        }
-        branches.budgets += 1;
+        let cursor = cancelled_cursor;
         for action in data.iter().copied().take(256) {
             match action % 4 {
                 0 => match resumed.poll() {
@@ -293,6 +302,17 @@ fn run_checked(data: &[u8]) -> Result<(), String> {
                 _ => return Err("tail fuzz action dispatch escaped its bound".to_owned()),
             }
         }
+        let cleanup_cursor = resumed.cursor().clone();
+        drop(resumed);
+        let query = plan(&service, context, source, budget()?)?;
+        let cleanup = service
+            .resume_tail_with_sources(
+                query,
+                &cleanup_cursor,
+                sources(&first_ledger, &second_ledger)?,
+            )
+            .map_err(|error| format!("tail fuzz cleanup resume: {error:?}"))?;
+        drop(cleanup);
     }
     let remaining = instance
         ._authority
