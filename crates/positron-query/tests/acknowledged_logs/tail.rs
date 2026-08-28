@@ -645,9 +645,8 @@ fn tail_historical_resume_rejects_a_pruned_handoff_before_ack() -> Result<(), Bo
         .ok_or("handoff overflow")?;
     let mut bytes = tail.cursor().as_bytes().to_vec();
     let payload_len = bytes.len().checked_sub(32).ok_or("cursor tag missing")?;
-    let extension_start = payload_len
-        .checked_sub(40)
-        .ok_or("history marker missing")?;
+    let positions_end = 276_usize;
+    let extension_start = positions_end;
     let handoff_offset = extension_start
         .checked_add(14)
         .ok_or("handoff offset overflow")?;
@@ -674,6 +673,83 @@ fn tail_historical_resume_rejects_a_pruned_handoff_before_ack() -> Result<(), Bo
         service.resume_tail(query, &forged),
         Err(failure) if failure.code() == QueryFailureCode::StoreUnavailable
     ));
+    Ok(())
+}
+
+#[test]
+fn tail_historical_cursor_rejects_a_corrupted_continuation_key() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-historical-key-corruption")?;
+    fixture.kernel.append_logs(
+        vec![
+            (
+                Some(1),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "first".to_owned(),
+                )),
+            ),
+            (
+                Some(2),
+                Some(positron_domain::value::CandidateAttributeValue::string(
+                    "second".to_owned(),
+                )),
+            ),
+        ],
+        1,
+    )?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 2, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 2",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("historical key batch missing".into());
+    };
+    tail.acknowledge(batch.sequence(), batch.digest())?;
+    let cursor = tail.cursor().clone();
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let authenticate = |bytes: &mut Vec<u8>| -> Result<(), Box<dyn Error>> {
+        let payload_len = bytes.len().checked_sub(32).ok_or("cursor tag missing")?;
+        let authentication = protector.authenticate_query_cursor(
+            b"tail-cursor-v3",
+            bytes.get(..payload_len).ok_or("cursor payload missing")?,
+        )?;
+        bytes
+            .get_mut(payload_len..)
+            .ok_or("cursor tag missing")?
+            .copy_from_slice(&authentication.tag());
+        Ok(())
+    };
+    let positions_end = 276_usize;
+    let stats_end = positions_end + 6 + 16 + 18;
+
+    let mut invalid_flag = cursor.as_bytes().to_vec();
+    invalid_flag[stats_end] = 2;
+    authenticate(&mut invalid_flag)?;
+    assert_eq!(
+        TailCursor::decode(&protector, &TailCursor::from_bytes(&invalid_flag)?)
+            .expect_err("unknown historical key flag")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+
+    let mut absent_key = cursor.as_bytes().to_vec();
+    absent_key[stats_end] = 1;
+    let key_start = stats_end + 1;
+    absent_key
+        .get_mut(key_start..key_start + 68)
+        .ok_or("historical key bytes missing")?
+        .fill(0);
+    authenticate(&mut absent_key)?;
+    assert_eq!(
+        TailCursor::decode(&protector, &TailCursor::from_bytes(&absent_key)?)
+            .expect_err("zero historical key")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
     Ok(())
 }
 
