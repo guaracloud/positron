@@ -238,8 +238,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let record = LeaseRecord {
             identity: new_identity,
             scope: self.scope,
-            catalog_identity: basis.identity(),
-            catalog_generation: basis.number(),
+            catalog_identity: old_record.catalog_identity,
+            catalog_generation: old_record.catalog_generation,
             frontier: state.frontier,
             observed_at: now,
             expiry,

@@ -85,7 +85,11 @@ fn resume_source_lease<'kernel, 'catalog, 'ledger>(
     }
     .map_err(crate::execution_support::map_ledger_failure)?;
     let snapshot = grant.snapshot();
-    if snapshot.scope().shard_id() != binding.shard() || snapshot.frontier() != binding.frontier() {
+    if snapshot.scope().shard_id() != binding.shard()
+        || snapshot.frontier() != binding.frontier()
+        || snapshot.catalog_identity().to_bytes() != state.snapshot_identity()
+        || snapshot.catalog_generation() != state.snapshot_generation()
+    {
         return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
     }
     Ok(grant)
@@ -130,6 +134,8 @@ pub(super) fn validate_resume_leases(
         let snapshot = grant.snapshot();
         if snapshot.scope().shard_id() != binding.shard()
             || snapshot.frontier() != binding.frontier()
+            || snapshot.catalog_identity().to_bytes() != state.snapshot_identity()
+            || snapshot.catalog_generation() != state.snapshot_generation()
         {
             return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
         }

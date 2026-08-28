@@ -365,9 +365,68 @@ pub(crate) fn tail_cursor_with_cpu_progress(
     cursor: &positron_query::TailCursor,
     cpu_work_units: u64,
 ) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const CPU_WORK_UNITS_OFFSET: usize = 202;
+        let cpu_end = CPU_WORK_UNITS_OFFSET
+            .checked_add(std::mem::size_of::<u64>())
+            .ok_or("tail cursor CPU field offset overflow")?;
+        payload
+            .get_mut(CPU_WORK_UNITS_OFFSET..cpu_end)
+            .ok_or("tail cursor CPU field missing")?
+            .copy_from_slice(&cpu_work_units.to_be_bytes());
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_source_binding(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    snapshot_generation: Option<u64>,
+    frontier: Option<u64>,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let generation_start = bindings_start
+            .checked_add(6 + 32)
+            .ok_or("tail cursor generation offset overflow")?;
+        if let Some(snapshot_generation) = snapshot_generation {
+            let generation_end = generation_start
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor generation field overflow")?;
+            payload
+                .get_mut(generation_start..generation_end)
+                .ok_or("tail cursor generation field missing")?
+                .copy_from_slice(&snapshot_generation.to_be_bytes());
+        }
+        if let Some(frontier) = frontier {
+            let frontier_start = generation_start
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor frontier offset overflow")?
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor frontier offset overflow")?;
+            let frontier_end = frontier_start
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor frontier field overflow")?;
+            payload
+                .get_mut(frontier_start..frontier_end)
+                .ok_or("tail cursor frontier field missing")?
+                .copy_from_slice(&frontier.to_be_bytes());
+        }
+        Ok(())
+    })
+}
+
+fn rewrite_tail_cursor(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    rewrite: impl FnOnce(&mut [u8]) -> Result<(), Box<dyn Error>>,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
     const MAGIC: &[u8] = b"POSTCUR3";
     const VERSION: [u8; 2] = 2_u16.to_be_bytes();
-    const CPU_WORK_UNITS_OFFSET: usize = 202;
     const AUTH_BYTES: usize = 32;
 
     let mut bytes = cursor.as_bytes().to_vec();
@@ -376,17 +435,15 @@ pub(crate) fn tail_cursor_with_cpu_progress(
     {
         return Err("unsupported tail cursor wire version".into());
     }
-    let cpu_end = CPU_WORK_UNITS_OFFSET
-        .checked_add(std::mem::size_of::<u64>())
-        .ok_or("tail cursor CPU field offset overflow")?;
-    bytes
-        .get_mut(CPU_WORK_UNITS_OFFSET..cpu_end)
-        .ok_or("tail cursor CPU field missing")?
-        .copy_from_slice(&cpu_work_units.to_be_bytes());
     let payload_len = bytes
         .len()
         .checked_sub(AUTH_BYTES)
         .ok_or("tail cursor authentication tag missing")?;
+    rewrite(
+        bytes
+            .get_mut(..payload_len)
+            .ok_or("tail cursor payload missing")?,
+    )?;
     let authentication = protector.authenticate_query_cursor(
         b"tail-cursor-v3",
         bytes

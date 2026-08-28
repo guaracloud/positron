@@ -15,7 +15,7 @@ use positron_query::{
 use super::support::{
     CancellingOperatorCallMeter, CancellingStageWorkMeter, ConstantWorkMeter, FailAfterArmClock,
     FailAfterArmOutputMeter, StepClock, TestClock, merge_work_service, stage_work_service,
-    tail_cursor_with_cpu_progress, zero_work_clock_service,
+    tail_cursor_with_cpu_progress, tail_cursor_with_source_binding, zero_work_clock_service,
 };
 use super::terminal_and_bounds::QueryFixture;
 
@@ -1361,6 +1361,44 @@ fn tail_materialize_cpu_addition_overflow_preserves_cursor() -> Result<(), Box<d
             && stats.emitted_records() == 0
     ));
     assert!(resumed.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_materialize_cpu_multiplication_overflow_preserves_cursor() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-materialize-cpu-multiplication-overflow")?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        std::sync::Arc::new(OperatorOverflowWorkMeter),
+    );
+    let source = "pipeline:v1 logs | range query_time -100 100 | cast body as string | project body, query_time | limit 1";
+    let budget =
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    let query = service
+        .plan_pipeline(fixture.context, source, budget)
+        .map_err(|failure| format!("plan: {failure:?}"))?;
+    let mut tail = service
+        .tail(query, TailStart::Now)
+        .map_err(|failure| format!("tail: {failure:?}"))?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = tail.cursor().clone();
+    fixture
+        .kernel
+        .append_log("materialize-cpu-multiplication-overflow", 2, 2)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(cursor),
+            stats,
+        })) if cursor == safe_cursor
+            && stats.limiting_budget()
+                == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+            && stats.emitted_records() == 0
+    ));
+    assert!(tail.poll().is_none());
     Ok(())
 }
 
@@ -3372,29 +3410,12 @@ fn tail_resume_rejects_a_source_binding_with_a_different_frontier() -> Result<()
         budget,
     )?;
     let tail = service.tail(query, TailStart::Now)?;
-    let mut bytes = tail.cursor().as_bytes().to_vec();
-    let payload_len = bytes.len().checked_sub(32).ok_or("cursor tag missing")?;
-    let bindings_start = bytes
-        .get(..payload_len)
-        .and_then(|payload| payload.windows(4).position(|window| window == b"TB01"))
-        .ok_or("source bindings missing")?;
-    let binding_frontier = bindings_start
-        .checked_add(4 + 2 + 32 + 8 + 16)
-        .ok_or("binding frontier offset overflow")?;
-    bytes[binding_frontier..binding_frontier + 8].copy_from_slice(&2_u64.to_be_bytes());
-    let authentication = fixture
-        .kernel
-        .ledger()?
-        .control_tokens()
-        .authenticate_query_cursor(
-            b"tail-cursor-v3",
-            bytes.get(..payload_len).ok_or("cursor payload missing")?,
-        )?;
-    bytes
-        .get_mut(payload_len..)
-        .ok_or("cursor tag missing")?
-        .copy_from_slice(&authentication.tag());
-    let cursor = TailCursor::from_bytes(&bytes)?;
+    let cursor = tail_cursor_with_source_binding(
+        &fixture.kernel.ledger()?.control_tokens(),
+        tail.cursor(),
+        None,
+        Some(2),
+    )?;
 
     let query = service.plan_pipeline(
         fixture.context,
@@ -3406,6 +3427,49 @@ fn tail_resume_rejects_a_source_binding_with_a_different_frontier() -> Result<()
         Err(failure) => failure,
     };
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    Ok(())
+}
+
+#[test]
+fn tail_resume_rejects_a_source_binding_with_a_different_generation() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("tail-resume-binding-generation")?;
+    fixture.kernel.append_log("generation-binding", 1, 1)?;
+    let service = fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let mut initial = service.tail(query, TailStart::Now)?;
+    assert!(matches!(initial.poll(), Some(TailEvent::Header(_))));
+    let cursor = tail_cursor_with_source_binding(
+        &fixture.kernel.ledger()?.control_tokens(),
+        initial.cursor(),
+        Some(u64::MAX),
+        None,
+    )?;
+    let cursor_bytes = cursor.as_bytes().to_vec();
+    drop(initial);
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        budget,
+    )?;
+    let failure = match service.resume_tail(query, &cursor) {
+        Ok(_) => return Err("a source binding generation mismatch resumed".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    let after = fixture.kernel.authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), baseline.usage(dimension));
+    }
+    assert_eq!(cursor.as_bytes(), cursor_bytes.as_slice());
     Ok(())
 }
 
