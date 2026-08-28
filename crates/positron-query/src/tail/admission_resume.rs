@@ -87,8 +87,9 @@ fn resume_source_lease<'kernel, 'catalog, 'ledger>(
     let snapshot = grant.snapshot();
     if snapshot.scope().shard_id() != binding.shard()
         || snapshot.frontier() != binding.frontier()
-        || snapshot.catalog_identity().to_bytes() != state.snapshot_identity()
-        || snapshot.catalog_generation() != state.snapshot_generation()
+        || expected_catalog.is_some()
+            && (snapshot.catalog_identity().to_bytes() != state.snapshot_identity()
+                || snapshot.catalog_generation() != state.snapshot_generation())
     {
         return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
     }
@@ -109,6 +110,7 @@ pub(super) fn validate_resume_leases(
     state: &TailCursorState,
     sources: &TailSourceSet<'_, '_, '_>,
     now: u64,
+    primary_shard: positron_domain::routing::VirtualShardId,
 ) -> Result<(), QueryFailure> {
     for reader in sources.readers() {
         let binding = state
@@ -134,8 +136,9 @@ pub(super) fn validate_resume_leases(
         let snapshot = grant.snapshot();
         if snapshot.scope().shard_id() != binding.shard()
             || snapshot.frontier() != binding.frontier()
-            || snapshot.catalog_identity().to_bytes() != state.snapshot_identity()
-            || snapshot.catalog_generation() != state.snapshot_generation()
+            || (snapshot.scope().shard_id() == primary_shard
+                && (snapshot.catalog_identity().to_bytes() != state.snapshot_identity()
+                    || snapshot.catalog_generation() != state.snapshot_generation()))
         {
             return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
         }

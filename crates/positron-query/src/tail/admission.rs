@@ -59,7 +59,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             if state.source_bindings().is_none() {
                 return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
             }
-            validate_resume_leases(state, &sources, now)?;
+            validate_resume_leases(state, &sources, now, self.ledger.scope().shard_id())?;
         }
         let mut source_lease_owners = TailLeaseSet::with_capacity(sources.readers().len())?;
         let mut source_lease_grants = Vec::new();
