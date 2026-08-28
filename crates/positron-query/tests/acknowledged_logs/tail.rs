@@ -19,6 +19,17 @@ use super::support::{
 };
 use super::terminal_and_bounds::QueryFixture;
 
+struct OperatorOverflowWorkMeter;
+
+impl positron_query::QueryWorkMeter for OperatorOverflowWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(u64::from(stage == positron_query::QueryWorkStage::Operators) * u64::MAX)
+    }
+}
+
 #[test]
 fn tail_reads_acknowledged_history_then_stays_idle_until_disconnect() -> Result<(), Box<dyn Error>>
 {
@@ -1185,6 +1196,41 @@ fn tail_operator_cpu_budget_fails_before_delivering_an_overrun_batch() -> Result
             cursor: Some(_),
             stats,
         })) if stats.limiting_budget() == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+    ));
+    assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn tail_operator_work_overflow_emits_one_terminal_without_a_batch() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-operator-work-overflow")?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        16,
+        TestClock::shared(100),
+        std::sync::Arc::new(OperatorOverflowWorkMeter),
+    );
+    let budget =
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(1_024)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | project body | limit 1",
+        budget,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let safe_cursor = tail.cursor().clone();
+    fixture.kernel.append_log("operator-overflow", 1, 1)?;
+    assert!(matches!(
+        tail.poll(),
+        Some(TailEvent::Terminal(TailTerminal::BudgetExhausted {
+            cursor: Some(cursor),
+            stats,
+        })) if cursor == safe_cursor
+            && stats.limiting_budget()
+                == Some(positron_query::QueryBudgetDimension::CpuWorkUnits)
+            && stats.emitted_records() == 0
     ));
     assert!(tail.poll().is_none());
     Ok(())
