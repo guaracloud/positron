@@ -235,7 +235,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 QueryBudgetDimension::OutputBytes,
             ));
         }
-        let mut digest_memory = QueryMemory::new(self.query.budget.memory_bytes());
+        let mut digest_memory = QueryMemory::new(self.runtime_memory_limit);
         let mut digest_observer = crate::execution_support::QueryValueObserver::new(
             self.service,
             &mut self.cpu_work_units,
@@ -255,6 +255,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             },
             &mut digest_memory,
         )?;
+        self.record_memory_peak(digest_memory.peak())?;
         if let Err(failure) = self.buffer.push(records) {
             if failure.code() == QueryFailureCode::ResourceAdmissionRefused {
                 self.terminal_after_progress_failure(TailTerminal::ConsumerLagged {
@@ -265,7 +266,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             }
             return Err(failure);
         }
-        self.memory_peak_bytes = self.memory_peak_bytes.max(self.buffer.memory_peak());
+        self.record_memory_peak(self.buffer.memory_peak())?;
         self.pending_batch = Some(PendingBatch {
             positions,
             digest,

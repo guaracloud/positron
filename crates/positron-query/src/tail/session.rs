@@ -77,6 +77,8 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) output_bytes: u64,
     pub(super) cpu_work_units: u64,
     pub(super) memory_peak_bytes: u64,
+    pub(super) retained_memory_bytes: u64,
+    pub(super) runtime_memory_limit: u64,
     pub(super) elapsed_seconds: u64,
     pub(super) elapsed_anchor: u64,
     pub(super) reduced_pruning: bool,
@@ -322,6 +324,15 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             reduced_pruning: self.reduced_pruning,
             limiting_budget: self.limiting_budget,
         }
+    }
+
+    pub(super) fn record_memory_peak(&mut self, execution_peak: u64) -> Result<(), QueryFailure> {
+        let total = self
+            .retained_memory_bytes
+            .checked_add(execution_peak)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        self.memory_peak_bytes = self.memory_peak_bytes.max(total);
+        Ok(())
     }
 
     fn revalidate(&mut self) -> Result<(), QueryFailure> {

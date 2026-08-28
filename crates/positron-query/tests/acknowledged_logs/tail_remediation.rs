@@ -55,6 +55,44 @@ fn total_limit_is_rejected_for_both_tail_starts_before_resource_mutation()
 }
 
 #[test]
+fn tail_memory_budget_reserves_retained_plan_and_source_before_materialization()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-retained-memory-boundary")?;
+    fixture.kernel.append_log("one-row", 1, 1)?;
+    let service = fixture.service(16)?;
+    let source = format!(
+        "pipeline:v1 logs | range query_time -100 100 | limit all{}",
+        " ".repeat(4_000)
+    );
+    let budget_for = |memory| {
+        QueryBudget::new(1_048_576, 16, 1, 1_048_576, memory, 60)
+            .and_then(|budget| budget.with_cpu_work_units(1_024))
+    };
+    let mut lower = 1_u64;
+    let mut upper = 1_048_576_u64;
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        if service
+            .plan_pipeline(fixture.context, &source, budget_for(middle)?)
+            .is_ok()
+        {
+            upper = middle;
+        } else {
+            lower = middle.checked_add(1).ok_or("memory floor overflowed")?;
+        }
+    }
+    let query = service.plan_pipeline(fixture.context, &source, budget_for(lower)?)?;
+    assert!(matches!(
+        service.tail(query, TailStart::Historical { max_rows: 1 }),
+        Err(failure)
+            if failure.code() == QueryFailureCode::BudgetExhausted
+                && failure.limiting_budget()
+                    == Some(positron_query::QueryBudgetDimension::MemoryBytes)
+    ));
+    Ok(())
+}
+
+#[test]
 fn total_limit_is_rejected_on_resume_before_history_or_lease_work() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-total-limit-resume")?;
     let service = fixture.service(16)?;

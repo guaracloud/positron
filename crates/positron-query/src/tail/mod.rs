@@ -7,6 +7,7 @@ mod historical;
 mod history;
 mod lease;
 mod materialize;
+mod memory;
 mod merge;
 mod session;
 mod source;

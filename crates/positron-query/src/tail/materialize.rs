@@ -207,7 +207,7 @@ impl TailSession<'_, '_, '_, '_> {
                 QueryBudgetDimension::OutputBytes,
             ));
         }
-        let mut digest_memory = QueryMemory::new(self.query.budget.memory_bytes());
+        let mut digest_memory = QueryMemory::new(self.runtime_memory_limit);
         let mut digest_observer = crate::execution_support::QueryValueObserver::new(
             self.service,
             &mut self.cpu_work_units,
@@ -227,6 +227,7 @@ impl TailSession<'_, '_, '_, '_> {
             },
             &mut digest_memory,
         )?;
+        self.record_memory_peak(digest_memory.peak())?;
         if let Err(failure) = self.buffer.push(records) {
             if failure.code() == QueryFailureCode::ResourceAdmissionRefused {
                 self.terminal_after_progress_failure(TailTerminal::ConsumerLagged {
@@ -237,7 +238,7 @@ impl TailSession<'_, '_, '_, '_> {
             }
             return Err(failure);
         }
-        self.memory_peak_bytes = self.memory_peak_bytes.max(self.buffer.memory_peak());
+        self.record_memory_peak(self.buffer.memory_peak())?;
         self.pending_batch = Some(PendingBatch {
             positions,
             digest,
@@ -306,7 +307,7 @@ impl TailSession<'_, '_, '_, '_> {
         }
         self.reduced_pruning |= scan.reduced_pruning();
         let scanned_retained_bytes = scan.retained_size_bytes();
-        let mut memory = QueryMemory::new(state.budget.memory_bytes());
+        let mut memory = QueryMemory::new(self.runtime_memory_limit);
         memory.acquire(scanned_retained_bytes)?;
         let mut records = Vec::new();
         records
@@ -355,7 +356,7 @@ impl TailSession<'_, '_, '_, '_> {
                     Ok(record) => record,
                     Err(failure) => {
                         self.cpu_work_units = state.physical_cpu_work_units;
-                        self.memory_peak_bytes = self.memory_peak_bytes.max(memory.peak());
+                        self.record_memory_peak(memory.peak())?;
                         return Err(failure);
                     },
                 };
@@ -374,7 +375,7 @@ impl TailSession<'_, '_, '_, '_> {
                 break;
             }
         }
-        self.memory_peak_bytes = self.memory_peak_bytes.max(memory.peak());
+        self.record_memory_peak(memory.peak())?;
         let released_scan_bytes = if self.query.plan.transform().is_some() {
             scanned_retained_bytes
         } else {

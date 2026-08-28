@@ -8,6 +8,7 @@ use super::cursor::{
     HistoricalMarker, TailCursor, TailCursorState, TailPosition, TailSourceBinding, budget_digest,
 };
 use super::lease::{TailLeaseOwner, TailLeaseSet};
+use super::memory::tail_memory_budget;
 use super::session::{TailSession, TailStart};
 use super::source::TailSourceSet;
 #[path = "admission_resume.rs"]
@@ -73,6 +74,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             }
             validate_resume_leases(state, &sources, now, self.ledger.scope().shard_id())?;
         }
+        let memory_budget = tail_memory_budget(&query)?;
         let mut source_lease_owners = TailLeaseSet::with_capacity(sources.readers().len())?;
         let mut source_lease_grants = Vec::new();
         source_lease_grants
@@ -221,7 +223,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let buffer = TailBuffer::new(
             maximum_records,
             query.budget.output_bytes(),
-            query.budget.memory_bytes(),
+            memory_budget.execution_limit,
         )?;
         let header = QueryHeader::new(
             &query.plan,
@@ -334,8 +336,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             limiting_budget,
             resume_count,
             repeated_batch_count,
+            retained_memory_bytes: memory_budget.retained_bytes,
+            runtime_memory_limit: memory_budget.execution_limit,
             cursor_observed: std::cell::Cell::new(false),
         };
+        session.record_memory_peak(0)?;
         if matches!(start, TailStart::Historical { .. }) {
             session.fill_sources(max_rows)?;
         }
