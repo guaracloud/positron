@@ -7,7 +7,8 @@ use positron_kernel::{
     SnapshotLeaseId, WorkClass, with_catalog_publication_fault_after,
 };
 use positron_query::{
-    QueryBudget, QueryFailureCode, QueryService, TailEvent, TailSourceSet, TailStart, TailTerminal,
+    QueryBudget, QueryFailureCode, QueryService, TailCursor, TailEvent, TailSourceSet, TailStart,
+    TailTerminal,
 };
 
 use super::support::TestClock;
@@ -251,6 +252,64 @@ fn catalog_failure_during_active_revalidation_is_store_unavailable() -> Result<(
         Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
     ));
     assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[test]
+fn mismatched_delivery_digest_fails_closed_during_replay() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-delivery-digest-mismatch")?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Now)?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    fixture.kernel.append_log("replay", 1, 1)?;
+    let Some(TailEvent::Batch(_)) = tail.poll() else {
+        return Err("tail batch missing".into());
+    };
+    let mut forged = tail.cursor().as_bytes().to_vec();
+    let payload_len = forged.len().checked_sub(32).ok_or("cursor tag missing")?;
+    let delivery_start = forged
+        .get(..payload_len)
+        .ok_or("cursor payload missing")?
+        .windows(4)
+        .position(|window| window == b"DLV1")
+        .ok_or("delivery marker missing")?;
+    let digest_start = delivery_start
+        .checked_add(4 + 8)
+        .ok_or("delivery digest offset overflow")?;
+    *forged
+        .get_mut(digest_start)
+        .ok_or("delivery digest missing")? ^= 1;
+    let authentication = fixture
+        .kernel
+        .ledger()?
+        .control_tokens()
+        .authenticate_query_cursor(
+            b"tail-cursor-v3",
+            forged.get(..payload_len).ok_or("cursor payload missing")?,
+        )?;
+    forged
+        .get_mut(payload_len..)
+        .ok_or("cursor tag missing")?
+        .copy_from_slice(&authentication.tag());
+    let forged = TailCursor::from_bytes(&forged)?;
+    drop(tail);
+
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(1)?,
+    )?;
+    let mut resumed = service.resume_tail(query, &forged)?;
+    assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+    assert!(matches!(
+        resumed.poll(),
+        Some(TailEvent::Terminal(TailTerminal::StoreUnavailable { .. }))
+    ));
     Ok(())
 }
 
