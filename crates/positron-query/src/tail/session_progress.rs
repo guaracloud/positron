@@ -1,7 +1,7 @@
 use super::super::cursor::{TailCursor, TailPosition};
 use super::{AdvancedBatch, TailSession};
-use crate::QueryFailure;
 use crate::result_key::HistoricalTotalKey;
+use crate::{QueryBudgetDimension, QueryFailure};
 
 impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) fn candidate_advance(
@@ -97,5 +97,31 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         if let Some(dimension) = failure.limiting_budget() {
             self.limiting_budget = Some(dimension);
         }
+    }
+
+    pub(in crate::tail) fn checked_output_totals(
+        &self,
+        rows: u64,
+        bytes: u64,
+    ) -> Result<(u64, u64), QueryFailure> {
+        let output_rows = self
+            .output_rows
+            .checked_add(rows)
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
+        if output_rows > self.query.budget.output_rows() {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::OutputRows,
+            ));
+        }
+        let output_bytes = self
+            .output_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
+        if output_bytes > self.query.budget.output_bytes() {
+            return Err(QueryFailure::budget_exhausted(
+                QueryBudgetDimension::OutputBytes,
+            ));
+        }
+        Ok((output_rows, output_bytes))
     }
 }

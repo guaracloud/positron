@@ -1,3 +1,4 @@
+use super::queue::QueueAccounting;
 use super::{TailPosition, TailSession};
 use crate::execution::{ScanAfter, execute_scan};
 use crate::execution_support::{QueryScanObserver, query_record};
@@ -10,9 +11,9 @@ pub(super) struct TailCandidate {
 }
 impl TailSession<'_, '_, '_, '_> {
     pub(super) fn fill_sources(&mut self, limit: usize) -> Result<(), QueryFailure> {
-        let mut queue_memory = 0_u64;
+        let mut queue_memory = QueueAccounting::new();
         let result = self.fill_sources_inner(limit, &mut queue_memory);
-        let cleanup = self.buffer.release_queue(queue_memory);
+        let cleanup = self.buffer.release_queue(queue_memory.take());
         match (result, cleanup) {
             (Err(failure), Ok(())) => Err(failure),
             (Ok(()), Ok(())) => Ok(()),
@@ -23,7 +24,7 @@ impl TailSession<'_, '_, '_, '_> {
     fn fill_sources_inner(
         &mut self,
         limit: usize,
-        queue_memory: &mut u64,
+        queue_memory: &mut QueueAccounting,
     ) -> Result<(), QueryFailure> {
         let output_remaining = self
             .query
@@ -101,9 +102,7 @@ impl TailSession<'_, '_, '_, '_> {
                     .checked_add(dynamic)
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?,
             )?;
-            *queue_memory = queue_memory
-                .checked_add(reserved)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            queue_memory.add(reserved)?;
             queue.extend(source_records);
             source_progress.push((position, queue.front().is_some()));
             source_batches.push(queue);

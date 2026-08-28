@@ -10,6 +10,7 @@ mod lease;
 mod materialize;
 mod memory;
 mod merge;
+mod queue;
 mod session;
 mod source;
 mod terminal;

@@ -139,12 +139,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         let bytes = pending.bytes;
         let historical_complete = pending.historical_complete;
         let historical_key = pending.historical_key;
-        let output_rows = self.output_rows.checked_add(rows).ok_or_else(|| {
-            QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputRows)
-        })?;
-        let output_bytes = self.output_bytes.checked_add(bytes).ok_or_else(|| {
-            QueryFailure::budget_exhausted(crate::QueryBudgetDimension::OutputBytes)
-        })?;
+        let (output_rows, output_bytes) = self.checked_output_totals(rows, bytes)?;
         let advanced = match self.candidate_advance(
             positions,
             digest,

@@ -1,5 +1,6 @@
 use super::TailSession;
 use super::materialize::TailCandidate;
+use super::queue::QueueAccounting;
 use crate::result_key::HistoricalTotalKey;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode};
 
@@ -14,7 +15,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
     pub(super) fn fill_historical_sources(
         &mut self,
         limit: usize,
-        queue_memory: &mut u64,
+        queue_memory: &mut QueueAccounting,
     ) -> Result<(), QueryFailure> {
         let mut candidates = Vec::new();
         candidates
@@ -81,25 +82,19 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                         }
                         let candidate_bytes = candidate_memory(&candidate)?;
                         let reserved = self.buffer.reserve_queue_bytes(candidate_bytes)?;
-                        *queue_memory = queue_memory.checked_add(reserved).ok_or_else(|| {
-                            QueryFailure::new(QueryFailureCode::ResourceExhausted)
-                        })?;
+                        queue_memory.add(reserved)?;
                         let (accepted, evicted) =
                             self.insert_historical_candidate(&mut candidates, candidate, limit)?;
                         if let Some(evicted) = evicted {
                             window_overflow = true;
                             let released = candidate_memory(&evicted)?;
                             self.buffer.release_queue(released)?;
-                            *queue_memory = queue_memory
-                                .checked_sub(released)
-                                .ok_or_else(super::internal)?;
+                            queue_memory.release(released)?;
                         }
                         if !accepted {
                             window_overflow = true;
                             self.buffer.release_queue(candidate_bytes)?;
-                            *queue_memory = queue_memory
-                                .checked_sub(candidate_bytes)
-                                .ok_or_else(super::internal)?;
+                            queue_memory.release(candidate_bytes)?;
                         }
                     }
                     if source_complete {
@@ -153,8 +148,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             ));
             records.push(candidate.record);
         }
-        let candidate_memory = std::mem::take(queue_memory);
-        self.buffer.release_queue(candidate_memory)?;
+        self.buffer.release_queue(queue_memory.take())?;
         self.deliver_records(records, positions, historical_complete, last_key)
     }
 

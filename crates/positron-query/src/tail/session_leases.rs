@@ -175,10 +175,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                     let mut rollback_failure = None;
                     for index in committed_secondary.into_iter().rev() {
                         let Some(replacement) = secondary.get_mut(index) else {
-                            crate::failure::retain_stronger(
-                                &mut rollback_failure,
-                                super::super::internal(),
-                            );
+                            crate::failure::retain_internal(&mut rollback_failure);
                             continue;
                         };
                         if let Err(failure) = replacement.replacement.rollback() {
@@ -203,10 +200,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                                     ),
                                 }
                             } else {
-                                crate::failure::retain_stronger(
-                                    &mut rollback_failure,
-                                    super::super::internal(),
-                                );
+                                crate::failure::retain_internal(&mut rollback_failure);
                             }
                         }
                     }
@@ -225,10 +219,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                             let old = std::mem::replace(&mut self.lease_owner, owner);
                             drop(old);
                         } else {
-                            crate::failure::retain_stronger(
-                                &mut rollback_failure,
-                                super::super::internal(),
-                            );
+                            crate::failure::retain_internal(&mut rollback_failure);
                         }
                     }
                     let failure = crate::execution_support::map_ledger_failure(failure);

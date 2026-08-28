@@ -20,24 +20,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             self.query.budget.cpu_work_units(),
             &self.query.cancellation,
         )?;
-        let next_rows = self
-            .output_rows
-            .checked_add(rows)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
-        if next_rows > self.query.budget.output_rows() {
-            return Err(QueryFailure::budget_exhausted(
-                QueryBudgetDimension::OutputRows,
-            ));
-        }
-        let next_bytes = self
-            .output_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
-        if next_bytes > self.query.budget.output_bytes() {
-            return Err(QueryFailure::budget_exhausted(
-                QueryBudgetDimension::OutputBytes,
-            ));
-        }
+        self.checked_output_totals(rows, bytes)?;
         let mut digest_memory = QueryMemory::new(self.runtime_memory_limit);
         let mut digest_observer = crate::execution_support::QueryValueObserver::new(
             self.service,

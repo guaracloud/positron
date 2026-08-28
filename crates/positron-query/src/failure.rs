@@ -85,6 +85,10 @@ pub(crate) fn retain_stronger(current: &mut Option<QueryFailure>, candidate: Que
     }
 }
 
+pub(crate) fn retain_internal(current: &mut Option<QueryFailure>) {
+    retain_stronger(current, QueryFailure::new(QueryFailureCode::Internal));
+}
+
 fn failure_rank(code: QueryFailureCode) -> u8 {
     match code {
         QueryFailureCode::Internal | QueryFailureCode::MalformedPersistentData => 4,
@@ -96,7 +100,7 @@ fn failure_rank(code: QueryFailureCode) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryFailure, QueryFailureCode, stronger_failure};
+    use super::{QueryFailure, QueryFailureCode, retain_internal, stronger_failure};
 
     #[test]
     fn strongest_failure_preserves_primary_on_ties_and_prefers_integrity() {
@@ -123,6 +127,16 @@ mod tests {
             )
             .code(),
             QueryFailureCode::Internal
+        );
+    }
+
+    #[test]
+    fn retain_internal_preserves_the_strongest_failure() {
+        let mut failure = Some(QueryFailure::new(QueryFailureCode::StoreUnavailable));
+        retain_internal(&mut failure);
+        assert_eq!(
+            failure.as_ref().map(QueryFailure::code),
+            Some(QueryFailureCode::Internal)
         );
     }
 }
