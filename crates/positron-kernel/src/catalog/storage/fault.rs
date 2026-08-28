@@ -58,6 +58,7 @@ pub(super) fn emit_event(_event: CatalogFileEvent) -> Result<(), CatalogFailure>
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 thread_local! {
     static CATALOG_FAULT: RefCell<Option<CatalogFault>> = const { RefCell::new(None) };
+    static CATALOG_FAULT_SEQUENCE: RefCell<Option<Vec<CatalogScheduledFault>>> = const { RefCell::new(None) };
 }
 
 #[cfg(any(test, fuzzing, feature = "test-support"))]
@@ -72,7 +73,35 @@ struct CatalogFault {
 }
 
 #[cfg(any(test, fuzzing, feature = "test-support"))]
+struct CatalogScheduledFault {
+    event: CatalogFileEvent,
+    remaining: usize,
+}
+
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 fn should_inject(event: CatalogFileEvent, catalog: Option<&crate::catalog::Catalog<'_>>) -> bool {
+    if let Some(fail) = CATALOG_FAULT_SEQUENCE.with(|sequence| {
+        let mut sequence = sequence.borrow_mut();
+        let items = sequence.as_mut()?;
+        let Some(selected) = items.first_mut() else {
+            *sequence = None;
+            return None;
+        };
+        if selected.event != event {
+            return None;
+        }
+        if selected.remaining > 0 {
+            selected.remaining -= 1;
+            return Some(false);
+        }
+        items.remove(0);
+        if items.is_empty() {
+            *sequence = None;
+        }
+        Some(true)
+    }) {
+        return fail;
+    }
     let (fail, hook) = CATALOG_FAULT.with(|fault| {
         let mut fault = fault.borrow_mut();
         let Some(selected) = fault.as_mut() else {
@@ -182,6 +211,30 @@ pub fn with_catalog_publication_fault_after<T>(
     action: impl FnOnce() -> T,
 ) -> T {
     with_catalog_fault_after(fault.storage_event(), preceding_occurrences, action)
+}
+
+/// Injects a bounded sequence of publication failures. Each entry names the
+/// publication event and the number of matching events to permit before the
+/// failure. This is test-support-only so rollback paths can be exercised in a
+/// deterministic order without changing product storage behavior.
+#[cfg(feature = "test-support")]
+pub fn with_catalog_publication_fault_sequence_after<T>(
+    faults: &[(CatalogPublicationFault, usize)],
+    action: impl FnOnce() -> T,
+) -> T {
+    let sequence = faults
+        .iter()
+        .map(|(fault, remaining)| CatalogScheduledFault {
+            event: fault.storage_event(),
+            remaining: *remaining,
+        })
+        .collect();
+    CATALOG_FAULT_SEQUENCE.with(|slot| {
+        let previous = slot.replace(Some(sequence));
+        let result = action();
+        slot.replace(previous);
+        result
+    })
 }
 
 /// Runs one action after the marker-resume publication seam has been reached.

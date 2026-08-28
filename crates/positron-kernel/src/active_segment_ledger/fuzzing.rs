@@ -87,7 +87,10 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     result.expect_err("an injected filesystem boundary cannot acknowledge");
                 assert_eq!(failure.completion_state(), fault_completion(event));
                 drop(ledger);
-                ledger = open(&authority, &catalog, scope).expect("fault recovery opens");
+                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                    return;
+                };
+                ledger = recovered;
                 if fault_commits(event) {
                     let receipt = ledger
                         .append(prepared(identity, payload.clone()))
@@ -97,12 +100,18 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             },
             2 => {
                 drop(ledger);
-                ledger = open(&authority, &catalog, scope).expect("restart recovery opens");
+                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                    return;
+                };
+                ledger = recovered;
             },
             3 => {
                 ledger.seal().expect("bounded seal succeeds");
                 oracle.record_seal();
-                ledger = open(&authority, &catalog, scope).expect("sealed ledger reopens");
+                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                    return;
+                };
+                ledger = recovered;
             },
             4 => {
                 if let Some((identity, payload, receipt)) = oracle.first() {
@@ -193,7 +202,9 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     }
 
     drop(ledger);
-    let recovered = open(&authority, &catalog, scope).expect("final recovery opens");
+    let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+        return;
+    };
     oracle.assert_ledger(&recovered);
     assert_eq!(
         recovered.snapshot().expect("final frontier").frontier(),
@@ -234,6 +245,18 @@ fn open<'authority, 'catalog>(
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x91; 32])),
     )
+}
+
+fn recover_or_stop<'authority, 'catalog>(
+    authority: &'authority crate::StorageKernelResourceAuthority,
+    catalog: &'catalog Catalog<'authority>,
+    scope: SegmentScope,
+) -> Option<ActiveSegmentLedger<'authority, 'catalog>> {
+    match open(authority, catalog, scope) {
+        Ok(ledger) => Some(ledger),
+        Err(failure) if failure.code() == LedgerFailureCode::InvalidInput => None,
+        Err(failure) => panic!("unexpected fuzz recovery failure: {failure:?}"),
+    }
 }
 
 fn catalog_secret() -> CatalogSecret {

@@ -74,16 +74,26 @@ impl ExecutionResources {
         state: &crate::cursor::CursorState,
         primary: QueryFailure,
     ) -> QueryFailure {
-        if let Err(failure) = self.persist_usage(ledger, state) {
-            return failure;
-        }
-        let cleanup = ledger
-            .release_snapshot_lease(self.lease)
-            .map_err(map_ledger_failure);
+        let usage_failure = self.persist_usage(ledger, state).err();
+        // An ambiguous usage publication keeps the lease durable and
+        // retryable; releasing it here could erase the only authoritative
+        // accounting record before the next reconciliation. Once usage is
+        // known durable, release is safe and its failure participates in the
+        // same strongest-failure selection as every other cleanup path.
+        let cleanup = usage_failure.is_none().then(|| {
+            ledger
+                .release_snapshot_lease(self.lease)
+                .map_err(map_ledger_failure)
+        });
         drop(self.admission);
-        match cleanup {
-            Ok(()) | Err(_) => primary,
+        let mut selected = primary;
+        if let Some(failure) = usage_failure {
+            selected = crate::failure::stronger_failure(selected, failure);
         }
+        if let Some(Err(failure)) = cleanup {
+            selected = crate::failure::stronger_failure(selected, failure);
+        }
+        selected
     }
 
     pub(super) fn fail_during_resume_planning(

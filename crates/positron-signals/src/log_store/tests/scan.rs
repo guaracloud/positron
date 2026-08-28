@@ -233,6 +233,69 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
 }
 
 #[test]
+fn exclusive_commit_lower_bound_reads_only_post_handoff_blocks() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x15; 16])?,
+        CatalogSecret::from_owned(Box::new([0x25; 32]), Box::new([0x35; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(6)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let store = LogStore::new();
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x56; 32])),
+    )?;
+    ledger.append(
+        store
+            .prepare(
+                preparation_capacity(&authority, tenant)?,
+                &clock(1),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x66; 16])?,
+                vec![minimal_record("before", 1)?],
+            )?
+            .into_store_block(),
+    )?;
+    let handoff = ledger.snapshot()?.frontier();
+    ledger.append(
+        store
+            .prepare(
+                preparation_capacity(&authority, tenant)?,
+                &clock(2),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x67; 16])?,
+                vec![minimal_record("after", 2)?],
+            )?
+            .into_store_block(),
+    )?;
+    let result = store.scan(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        LogScan::after(ScanLimit::new(1)?, handoff),
+    )?;
+    assert_eq!(result.records().len(), 1);
+    assert_eq!(
+        result.records()[0]
+            .record()
+            .body()
+            .and_then(positron_domain::value::ValidatedAttributeValue::as_str),
+        Some("after")
+    );
+    assert!(result.complete());
+    Ok(())
+}
+
+#[test]
 fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

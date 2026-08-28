@@ -31,12 +31,19 @@ pub(super) struct RecoveryState {
     pub(super) frontier: CommitPosition,
     pub(super) blocks: Vec<CommittedBlock>,
 }
+
+#[derive(Clone, Copy)]
+pub(super) enum RecoveryMode {
+    Repair,
+    Observe,
+}
 struct PublishedFrontier {
     durable_bytes: u64,
     next_sequence: u64,
     position: CommitPosition,
 }
 
+#[cfg(test)]
 pub(super) fn recover(
     segment_directory: &File,
     frontier_directory: &File,
@@ -45,11 +52,28 @@ pub(super) fn recover(
     header_bytes: usize,
     allow_post_frontier_truncation: bool,
 ) -> Result<RecoveryState, LedgerFailure> {
-    let mut file = open_regular(
+    recover_with_mode(
         segment_directory,
-        &segment_name(metadata.id),
+        frontier_directory,
+        metadata,
+        key,
+        header_bytes,
+        RecoveryMode::Repair,
         allow_post_frontier_truncation,
-    )?;
+    )
+}
+
+pub(super) fn recover_with_mode(
+    segment_directory: &File,
+    frontier_directory: &File,
+    metadata: SegmentMetadata,
+    key: &ObjectDataKey,
+    header_bytes: usize,
+    mode: RecoveryMode,
+    allow_post_frontier_truncation: bool,
+) -> Result<RecoveryState, LedgerFailure> {
+    let may_repair = matches!(mode, RecoveryMode::Repair) && allow_post_frontier_truncation;
+    let mut file = open_regular(segment_directory, &segment_name(metadata.id), may_repair)?;
     let frontier = read_frontier(frontier_directory, metadata.id, key)?;
     let file_length = file.metadata().map_err(map_io_error)?.len();
     let header_length = u64::try_from(header_bytes)
@@ -64,7 +88,13 @@ pub(super) fn recover(
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
         if file_length > header_length {
-            if !allow_post_frontier_truncation {
+            if matches!(mode, RecoveryMode::Observe) {
+                return Ok(RecoveryState {
+                    frontier: metadata.base_position,
+                    blocks: Vec::new(),
+                });
+            }
+            if !may_repair {
                 return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
             }
             emit_event(LedgerFileEvent::TruncatePostFrontier)?;
@@ -80,12 +110,16 @@ pub(super) fn recover(
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     if file_length > durable_bytes {
-        if !allow_post_frontier_truncation {
+        if matches!(mode, RecoveryMode::Observe) {
+            // The authenticated durability frontier bounds the read. Bytes after
+            // it are an unacknowledged tail and remain untouched by observers.
+        } else if !may_repair {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        } else {
+            emit_event(LedgerFileEvent::TruncatePostFrontier)?;
+            file.set_len(durable_bytes).map_err(map_io_error)?;
+            synchronize(&file)?;
         }
-        emit_event(LedgerFileEvent::TruncatePostFrontier)?;
-        file.set_len(durable_bytes).map_err(map_io_error)?;
-        synchronize(&file)?;
     }
     file.seek(SeekFrom::Start(header_length))
         .map_err(map_io_error)?;

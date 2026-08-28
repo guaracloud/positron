@@ -59,14 +59,20 @@ impl<'a> QueryScanObserver<'a> {
         state.physical_cpu_work_units = self.consumed();
     }
 
+    fn ensure_not_cancelled(&self) -> Result<(), ScanObservationFailureCode> {
+        if self.cancellation.is_cancelled() {
+            Err(ScanObservationFailureCode::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     fn observe_stage(
         &self,
         stage: QueryWorkStage,
         units: u64,
     ) -> Result<(), ScanObservationFailureCode> {
-        if self.cancellation.is_cancelled() {
-            return Err(ScanObservationFailureCode::Cancelled);
-        }
+        self.ensure_not_cancelled()?;
         let unit_cost = self
             .work_meter
             .units(stage)
@@ -110,17 +116,14 @@ impl ScanObserver for QueryScanObserver<'_> {
     }
 
     fn observe_scanned_bytes(&self, bytes: u64) -> Result<(), ScanObservationFailureCode> {
-        if self.cancellation.is_cancelled() {
-            return Err(ScanObservationFailureCode::Cancelled);
-        }
+        self.ensure_not_cancelled()?;
         self.observe_progress(&self.scanned_bytes, bytes, self.scanned_bytes_limit)
     }
 
     fn observe_decoded_records(&self, records: u64) -> Result<(), ScanObservationFailureCode> {
-        self.observe_progress(&self.decoded_records, records, self.decoded_records_limit)?;
-        if self.cancellation.is_cancelled() {
-            return Err(ScanObservationFailureCode::Cancelled);
-        }
+        self.observe_progress(&self.decoded_records, records, self.decoded_records_limit)
+            .map_err(|_| ScanObservationFailureCode::DecodedRecordsExhausted)?;
+        self.ensure_not_cancelled()?;
         Ok(())
     }
 }
@@ -136,11 +139,7 @@ impl positron_domain::value::NativeValueObserver for QueryScanObserver<'_> {
         if payload.len() > positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES {
             return Err(ScanObservationFailureCode::Internal);
         }
-        if self.cancellation.is_cancelled() {
-            Err(ScanObservationFailureCode::Cancelled)
-        } else {
-            Ok(())
-        }
+        self.ensure_not_cancelled()
     }
 }
 
@@ -180,7 +179,7 @@ mod tests {
             observer
                 .observe_decoded_records(1)
                 .expect_err("decoded record ceiling is hard"),
-            ScanObservationFailureCode::BudgetExhausted
+            ScanObservationFailureCode::DecodedRecordsExhausted
         );
     }
 }

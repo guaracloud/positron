@@ -138,6 +138,18 @@ fn scanned_bytes_are_atomic_across_schema_text() -> Result<(), Box<dyn Error>> {
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::ScannedBytes)
     ));
+    let tiny_budget = QueryBudget::new(1, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let tiny = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, tiny_budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(
+        !tiny
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
     Ok(())
 }
 
@@ -215,6 +227,18 @@ fn scanned_bytes_are_atomic_across_schema_attribute() -> Result<(), Box<dyn Erro
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::ScannedBytes)
     ));
+    let tiny_budget = QueryBudget::new(1, 4, 2, 1_048_576, 1_048_576, 60)?;
+    let tiny = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, tiny_budget)?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    assert!(
+        !tiny
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
     Ok(())
 }
 
@@ -646,7 +670,13 @@ fn repeated_resumes_retain_durable_wall_usage_at_the_exact_boundary() -> Result<
 #[test]
 fn zero_remaining_output_rows_with_pending_replay_is_incomplete() -> Result<(), Box<dyn Error>> {
     let fixture = super::terminal_and_bounds::QueryFixture::new("output-rows-replay-boundary")?;
-    for (identity, body) in [(1, "one"), (2, "two"), (3, "three")] {
+    let baseline = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    for (identity, body) in [(1, "one"), (2, "two")] {
         fixture
             .kernel
             .append_log(body, i64::from(identity), identity)?;
@@ -665,6 +695,21 @@ fn zero_remaining_output_rows_with_pending_replay_is_incomplete() -> Result<(), 
             budget,
         )?)?
         .collect::<Vec<_>>();
+    let first_batch = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("first page batch missing")?;
+    assert_eq!(first_batch.records().len(), 1);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Header(_)))
+            .count(),
+        1
+    );
     let cursor = continued_cursor(&first)?.clone();
 
     let raw_identity = first
@@ -684,26 +729,37 @@ fn zero_remaining_output_rows_with_pending_replay_is_incomplete() -> Result<(), 
     let replay = service
         .resume(fixture.context, &cursor)?
         .collect::<Vec<_>>();
-    assert!(
-        replay
-            .iter()
-            .all(|event| !matches!(event, QueryEvent::Batch(_)))
-    );
+    assert_eq!(replay.len(), 2);
     assert!(matches!(
-        replay.last(),
-        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+        replay.as_slice(),
+        [QueryEvent::Header(_), QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete))]
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().records() == 1
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::OutputRows)
     ));
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        baseline
+    );
     Ok(())
 }
 
 #[test]
 fn zero_remaining_output_bytes_with_pending_replay_is_incomplete() -> Result<(), Box<dyn Error>> {
     let fixture = super::terminal_and_bounds::QueryFixture::new("output-bytes-replay-boundary")?;
-    for (identity, body) in [(1, "one"), (2, "two"), (3, "three")] {
+    let baseline = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    for (identity, body) in [(1, "one"), (2, "two")] {
         fixture
             .kernel
             .append_log(body, i64::from(identity), identity)?;
@@ -722,6 +778,21 @@ fn zero_remaining_output_bytes_with_pending_replay_is_incomplete() -> Result<(),
             budget,
         )?)?
         .collect::<Vec<_>>();
+    let first_batch = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("first page batch missing")?;
+    assert_eq!(first_batch.records().len(), 1);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Header(_)))
+            .count(),
+        1
+    );
     let cursor = continued_cursor(&first)?.clone();
     let raw_identity = first
         .iter()
@@ -743,20 +814,25 @@ fn zero_remaining_output_bytes_with_pending_replay_is_incomplete() -> Result<(),
     let replay = service
         .resume(fixture.context, &cursor)?
         .collect::<Vec<_>>();
-    assert!(
-        replay
-            .iter()
-            .all(|event| !matches!(event, QueryEvent::Batch(_)))
-    );
+    assert_eq!(replay.len(), 2);
     assert!(matches!(
-        replay.last(),
-        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+        replay.as_slice(),
+        [QueryEvent::Header(_), QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete))]
             if incomplete.code() == QueryFailureCode::BudgetExhausted
                 && incomplete.stats().records() == 1
                 && incomplete.stats().output_bytes() == 17
                 && incomplete.stats().limiting_budget()
                     == Some(QueryBudgetDimension::OutputBytes)
     ));
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        baseline
+    );
     Ok(())
 }
 

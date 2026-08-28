@@ -9,6 +9,7 @@ use positron_kernel::{FixedLifecycleClockSource, LifecycleClock};
 
 struct RecordLayout {
     bytes: Vec<u8>,
+    stored: StoredLogRecord,
     observed_tag: usize,
     body_tag: usize,
     attribute: usize,
@@ -79,6 +80,7 @@ fn rich_record_layout() -> Result<RecordLayout, LogStoreFailure> {
         )?;
     Ok(RecordLayout {
         bytes,
+        stored,
         observed_tag: event_len,
         body_tag,
         attribute,
@@ -92,6 +94,18 @@ fn rejects(bytes: Vec<u8>) -> Result<(), LogStoreFailure> {
     let limits = CodecLimits::release_1()?;
     let mut input = Input::new(&bytes);
     record::validate_structure(&mut input, limits, METADATA_VERSION).map(|_| ())
+}
+
+#[test]
+fn block_header_rejects_unknown_version_and_empty_blocks() -> Result<(), LogStoreFailure> {
+    let tenant = TenantId::from_bytes([0x41; 16]).expect("tenant");
+    let mut bytes = MAGIC.to_vec();
+    put_u16(&mut bytes, VERSION + 1);
+    assert!(decode_block_header_with(tenant, Input::new(&bytes)).is_err());
+    assert!(encode_block(tenant, &[], 0).is_err());
+    let layout = rich_record_layout()?;
+    assert!(encode_block(tenant, &[layout.stored], 0).is_err());
+    Ok(())
 }
 
 #[test]

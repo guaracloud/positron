@@ -2,6 +2,7 @@ mod catalog;
 mod faults;
 mod format;
 mod io;
+mod reader;
 mod recovery;
 mod scopes;
 mod storage;

@@ -222,13 +222,24 @@ impl<'input> BlockDecode<'input> {
     }
 
     pub(super) fn decode(
+        self,
+        snapshot: &LedgerSnapshot<'_>,
+        limit: usize,
+        cancellation: &dyn super::ScanCancellation,
+    ) -> Result<DecodedBlock, LogStoreFailure> {
+        self.decode_after(snapshot, 0, limit, cancellation)
+    }
+
+    pub(super) fn decode_after(
         mut self,
         snapshot: &LedgerSnapshot<'_>,
+        skip: usize,
         limit: usize,
         cancellation: &dyn super::ScanCancellation,
     ) -> Result<DecodedBlock, LogStoreFailure> {
         decode_block_records(
             snapshot,
+            skip,
             limit,
             cancellation,
             &mut self.input,
@@ -257,8 +268,13 @@ impl<'input> BlockDecode<'input> {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded decoder passes one immutable snapshot and its authenticated block context"
+)]
 fn decode_block_records(
     snapshot: &LedgerSnapshot<'_>,
+    skip: usize,
     limit: usize,
     cancellation: &dyn super::ScanCancellation,
     input: &mut Input<'_>,
@@ -266,7 +282,14 @@ fn decode_block_records(
     limits: CodecLimits,
     count: usize,
 ) -> Result<DecodedBlock, LogStoreFailure> {
-    let retained_count = count.min(limit);
+    let skipped_count = skip.min(count);
+    for _ in 0..skipped_count {
+        if cancellation.is_cancelled() {
+            return Err(LogStoreFailure::cancelled());
+        }
+        record::validate_structure(input, limits, version)?;
+    }
+    let retained_count = count.saturating_sub(skipped_count).min(limit);
     let mut records = bounded_vec(retained_count)?;
     for _ in 0..retained_count {
         if cancellation.is_cancelled() {
@@ -283,7 +306,7 @@ fn decode_block_records(
     // no tail record is built or charged as decoded work.
     input.finish_component_observation()?;
     let mut tail = input.remaining_input();
-    for _ in retained_count..count {
+    for _ in skipped_count + retained_count..count {
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
         }

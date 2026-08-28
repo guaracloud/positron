@@ -32,6 +32,7 @@ mod sql_lexer;
 mod sql_selection;
 mod stream;
 mod stream_lifecycle;
+mod tail;
 mod transform;
 
 pub use budget::{QueryBudget, QueryBudgetDimension};
@@ -45,9 +46,15 @@ pub use runtime::{
 };
 pub use stream::{
     QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryTerminal,
-    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
+    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType, TailPhase,
 };
 pub use stream_lifecycle::QueryStream;
+#[cfg(feature = "test-support")]
+pub use tail::fail_next_encode as fail_next_tail_cursor_encode;
+pub use tail::{
+    TailCursor, TailCursorState, TailEvent, TailPosition, TailSession, TailSourceSet, TailStart,
+    TailStats, TailTerminal,
+};
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -83,10 +90,10 @@ pub fn fuzz_query_cursor(data: &[u8]) {
     }
 
     let protector = positron_kernel::fuzz_control_token_protector();
-    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
-        .expect("fuzz principal fixture is valid");
     let tenant = positron_domain::identity::TenantId::from_bytes([2; 16])
         .expect("fuzz tenant fixture is valid");
+    let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
+        .expect("fuzz principal fixture is valid");
     let range = TemporalRange::new(-100, 100).expect("fuzz range is ordered");
     let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
     let source = b"pipeline:v1 logs | range query_time -100 100 | limit 1";
@@ -249,6 +256,12 @@ pub fn fuzz_query_cursor(data: &[u8]) {
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
+pub fn fuzz_tail_cursor(data: &[u8]) {
+    tail::fuzz_tail_cursor(data);
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
 pub fn fuzz_query_sql(data: &[u8]) {
     const MAX_RAW_BYTES: usize = 4_096;
     const MAX_PARITY_LITERAL_BYTES: usize = 512;
@@ -366,38 +379,7 @@ fn query_classification(
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub fn fuzz_query_search_matcher(data: &[u8]) {
-    if data.is_empty() || data.len() > 4_096 {
-        return;
-    }
-    let pattern_len = usize::from(data[0]).min(data.len().saturating_sub(1));
-    let (pattern, body) = data[1..].split_at(pattern_len);
-    let Ok(pattern) = std::str::from_utf8(pattern) else {
-        return;
-    };
-    let Ok(body) = std::str::from_utf8(body) else {
-        return;
-    };
-    let Ok(mut regex) = search::BoundedRegex::from_source(pattern.to_owned()) else {
-        return;
-    };
-    if regex.compile().is_err() {
-        return;
-    }
-    let mut observer = search::UnobservedSearch;
-    let _ = regex.is_match_observed(body, &mut observer);
-    let Ok(mut substring) = search::BoundedSubstring::from_source(pattern.to_owned()) else {
-        return;
-    };
-    if substring.compile().is_err() {
-        return;
-    }
-    let _ = substring.is_match_observed(body, &mut observer);
-    let literals = regex
-        .pruning_literals()
-        .iter()
-        .map(|literal| literal.to_vec())
-        .collect::<Vec<_>>();
-    positron_signals::fuzz_text_search_pruning(body, &literals);
+    fuzzing::fuzz_query_search_matcher(data);
 }
 
 #[cfg(fuzzing)]

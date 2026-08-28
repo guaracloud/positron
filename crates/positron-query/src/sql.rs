@@ -56,7 +56,7 @@ impl<'source> Parser<'source> {
             return Err(unsupported());
         }
         self.keyword("limit")?;
-        let limit = parse_limit(self.take()?)?;
+        let limit = parse_tail_limit(self.take()?)?;
         if self.index != self.tokens.len() {
             return Err(unsupported());
         }
@@ -94,7 +94,10 @@ impl<'source> Parser<'source> {
             },
         }
         let default_ordering = OrderSpec::ascending(plan.temporal_axis());
-        Ok(plan.with_ordering(ordering.unwrap_or(default_ordering)))
+        Ok(match ordering {
+            Some(ordering) => plan.with_explicit_ordering(ordering),
+            None => plan.with_ordering(default_ordering),
+        })
     }
 
     fn selection(&mut self) -> Result<Selection, QueryFailure> {
@@ -339,7 +342,7 @@ pub(crate) fn plan(
     axis: &str,
     start: &str,
     end: &str,
-    limit: u16,
+    limit: Option<u16>,
     memory: &crate::planning_memory::PlanningMemory,
 ) -> Result<LogicalPlan, QueryFailure> {
     let axis = if axis.eq_ignore_ascii_case("query_time") {
@@ -353,11 +356,22 @@ pub(crate) fn plan(
     };
     let range = TemporalRange::new(parse_timestamp(start)?, parse_timestamp(end)?)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
-    LogicalPlan::logs_with_memory(axis, range, limit, memory)
+    match limit {
+        Some(limit) => LogicalPlan::logs_with_memory(axis, range, limit, memory),
+        None => LogicalPlan::logs_without_total_limit_with_memory(axis, range, memory),
+    }
 }
 
 pub(crate) fn parse_limit(source: &str) -> Result<u16, QueryFailure> {
     crate::sql_helpers::parse_limit(source)
+}
+
+pub(crate) fn parse_tail_limit(source: &str) -> Result<Option<u16>, QueryFailure> {
+    if source.eq_ignore_ascii_case("all") {
+        Ok(None)
+    } else {
+        parse_limit(source).map(Some)
+    }
 }
 
 fn parse_attribute_predicate(

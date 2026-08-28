@@ -1,17 +1,98 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{QueryBudgetDimension, QueryCursor, QueryFailure, QueryFailureCode};
 
 use super::{QueryHeader, QueryRecord};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
+pub(crate) struct BatchMemoryAccount {
+    limit: u64,
+    used: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl BatchMemoryAccount {
+    pub(crate) const fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn reserve(&self, bytes: u64, failure: QueryFailure) -> Result<(), QueryFailure> {
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(bytes)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            if next > self.limit {
+                return Err(failure);
+            }
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    self.peak.fetch_max(next, Ordering::AcqRel);
+                    return Ok(());
+                },
+                Err(observed) => used = observed,
+            }
+        }
+    }
+
+    pub(crate) fn release(&self, bytes: u64) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
+    pub(crate) fn used(&self) -> u64 {
+        self.used.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BatchMemoryClaim {
+    account: Arc<BatchMemoryAccount>,
+    bytes: u64,
+}
+
+impl BatchMemoryClaim {
+    pub(crate) fn new(account: Arc<BatchMemoryAccount>, bytes: u64) -> Arc<Self> {
+        Arc::new(Self { account, bytes })
+    }
+
+    pub(crate) const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for BatchMemoryClaim {
+    fn drop(&mut self) {
+        self.account.release(self.bytes);
+    }
+}
+
+#[derive(Debug)]
 pub struct QueryBatch {
     sequence: u64,
-    records: Vec<QueryRecord>,
+    records: Arc<[QueryRecord]>,
     prior_digest: [u8; 32],
     digest: [u8; 32],
+    claim: Option<Arc<BatchMemoryClaim>>,
 }
 
 impl QueryBatch {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         sequence: u64,
         records: Vec<QueryRecord>,
         prior_digest: [u8; 32],
@@ -19,9 +100,26 @@ impl QueryBatch {
     ) -> Self {
         Self {
             sequence,
+            records: Arc::from(records.into_boxed_slice()),
+            prior_digest,
+            digest,
+            claim: None,
+        }
+    }
+
+    pub(crate) fn from_shared(
+        sequence: u64,
+        records: Arc<[QueryRecord]>,
+        prior_digest: [u8; 32],
+        digest: [u8; 32],
+        claim: Arc<BatchMemoryClaim>,
+    ) -> Self {
+        Self {
+            sequence,
             records,
             prior_digest,
             digest,
+            claim: Some(claim),
         }
     }
     #[must_use]
@@ -41,6 +139,29 @@ impl QueryBatch {
         self.digest
     }
 }
+
+impl Clone for QueryBatch {
+    fn clone(&self) -> Self {
+        Self {
+            sequence: self.sequence,
+            records: Arc::clone(&self.records),
+            prior_digest: self.prior_digest,
+            digest: self.digest,
+            claim: self.claim.clone(),
+        }
+    }
+}
+
+impl PartialEq for QueryBatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence
+            && self.records == other.records
+            && self.prior_digest == other.prior_digest
+            && self.digest == other.digest
+    }
+}
+
+impl Eq for QueryBatch {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Cumulative statistics for the current bounded native-query execution state.

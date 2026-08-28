@@ -4,8 +4,10 @@ mod events;
 pub(crate) use contract::column_type;
 pub use contract::{
     QueryHeader, ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
+    TailPhase,
 };
 pub(crate) use events::QueryCounters;
+pub(crate) use events::{BatchMemoryAccount, BatchMemoryClaim};
 pub use events::{QueryBatch, QueryEvent, QueryIncomplete, QueryStats, QueryTerminal};
 
 use positron_domain::routing::{CommitPosition, RecordOrdinal};
@@ -34,6 +36,7 @@ pub struct QueryRecord {
     count: Option<u64>,
     attributes: Vec<AttributeProjection>,
     attribute_retained_bytes: u64,
+    replayed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +111,7 @@ impl QueryRecord {
             count: None,
             attributes: selection.attributes,
             attribute_retained_bytes: selection.attribute_retained_bytes,
+            replayed: false,
         }
     }
 
@@ -129,7 +133,19 @@ impl QueryRecord {
             count: Some(count),
             attributes: Vec::new(),
             attribute_retained_bytes: 0,
+            replayed: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_retained_bytes(
+        mut self,
+        body_retained_bytes: u64,
+        attribute_retained_bytes: u64,
+    ) -> Self {
+        self.body_retained_bytes = body_retained_bytes;
+        self.attribute_retained_bytes = attribute_retained_bytes;
+        self
     }
 
     pub(crate) fn grouped_count_record(fields: GroupedCountFields, count: u64) -> Self {
@@ -152,6 +168,7 @@ impl QueryRecord {
             count: Some(count),
             attributes: fields.attributes,
             attribute_retained_bytes: fields.attribute_retained_bytes,
+            replayed: false,
         }
     }
 
@@ -210,6 +227,16 @@ impl QueryRecord {
     #[must_use]
     pub const fn count(&self) -> Option<u64> {
         self.count
+    }
+
+    #[must_use]
+    pub const fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    pub(crate) const fn mark_replayed(mut self) -> Self {
+        self.replayed = true;
+        self
     }
 
     pub(crate) const fn order_key(&self) -> (UnixNanoseconds, CommitPosition, RecordOrdinal) {

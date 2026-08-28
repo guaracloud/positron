@@ -9,3 +9,5 @@ mod predicates;
 mod resources;
 mod results;
 mod scan;
+
+pub(crate) use scan::{ScanAfter, execute_scan};

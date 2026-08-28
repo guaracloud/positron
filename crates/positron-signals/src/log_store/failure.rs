@@ -80,6 +80,9 @@ impl LogStoreFailure {
             super::ScanObservationFailureCode::BudgetExhausted => {
                 LogStoreFailureCode::BudgetExhausted
             },
+            super::ScanObservationFailureCode::DecodedRecordsExhausted => {
+                LogStoreFailureCode::LimitExceeded
+            },
             super::ScanObservationFailureCode::Cancelled => LogStoreFailureCode::Cancelled,
             super::ScanObservationFailureCode::ResourceExhausted => {
                 LogStoreFailureCode::ResourceExhausted
@@ -132,6 +135,7 @@ impl Error for LogStoreFailure {}
 #[cfg(test)]
 mod tests {
     use super::{LogStoreFailure, LogStoreFailureCode};
+    use crate::log_store::ScanObservationFailureCode;
 
     #[test]
     fn infrastructure_failures_keep_distinct_redacted_public_codes() {
@@ -148,5 +152,12 @@ mod tests {
         let kernel = LogStoreFailure::kernel(ledger);
         assert_eq!(kernel.code(), LogStoreFailureCode::Kernel);
         assert_eq!(kernel.to_string(), "log store failure: Kernel");
+    }
+
+    #[test]
+    fn decoded_record_budget_observation_maps_to_public_limit_failure() {
+        let failure =
+            LogStoreFailure::observation(ScanObservationFailureCode::DecodedRecordsExhausted);
+        assert_eq!(failure.code(), LogStoreFailureCode::LimitExceeded);
     }
 }

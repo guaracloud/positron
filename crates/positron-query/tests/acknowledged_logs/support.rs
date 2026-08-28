@@ -11,12 +11,12 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, DiskObservation,
-    DiskPressureThresholds, FixedLifecycleClockSource, FormatEpoch, GovernanceFixtureObject,
-    GovernanceFixtureTarget, GovernorFailure, GovernorPolicy, InstanceId,
-    InventoryCardinalityLimits, LifecycleClock, MountQualification, ObservedResourceEnvironment,
-    OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret,
+    ControlTokenProtector, DiskObservation, DiskPressureThresholds, FixedLifecycleClockSource,
+    FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget, GovernorFailure, GovernorPolicy,
+    InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
+    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
     ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
     StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim,
     WorkKind,
@@ -247,6 +247,19 @@ impl positron_query::QueryWorkMeter for FailingStageWorkMeter {
 
 pub struct ConstantWorkMeter(pub u64);
 
+pub struct MergeWorkMeter;
+
+impl positron_query::QueryWorkMeter for MergeWorkMeter {
+    fn units(
+        &self,
+        stage: positron_query::QueryWorkStage,
+    ) -> Result<u64, positron_query::QueryWorkFailure> {
+        Ok(u64::from(
+            stage == positron_query::QueryWorkStage::Operators,
+        ))
+    }
+}
+
 pub struct StageCountingWorkMeter {
     calls: [AtomicU64; 4],
 }
@@ -344,6 +357,268 @@ pub fn stage_work_service<'kernel, 'catalog, 'ledger>(
         batch_limit,
         TestClock::shared(100),
         Arc::new(ZeroScanWorkMeter),
+    )
+}
+
+pub(crate) fn tail_cursor_with_cpu_progress(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    cpu_work_units: u64,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const CPU_WORK_UNITS_OFFSET: usize = 202;
+        let cpu_end = CPU_WORK_UNITS_OFFSET
+            .checked_add(std::mem::size_of::<u64>())
+            .ok_or("tail cursor CPU field offset overflow")?;
+        payload
+            .get_mut(CPU_WORK_UNITS_OFFSET..cpu_end)
+            .ok_or("tail cursor CPU field missing")?
+            .copy_from_slice(&cpu_work_units.to_be_bytes());
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_source_binding(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    snapshot_generation: Option<u64>,
+    frontier: Option<u64>,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let generation_start = bindings_start
+            .checked_add(6 + 32)
+            .ok_or("tail cursor generation offset overflow")?;
+        if let Some(snapshot_generation) = snapshot_generation {
+            let generation_end = generation_start
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor generation field overflow")?;
+            payload
+                .get_mut(generation_start..generation_end)
+                .ok_or("tail cursor generation field missing")?
+                .copy_from_slice(&snapshot_generation.to_be_bytes());
+        }
+        if let Some(frontier) = frontier {
+            let frontier_start = generation_start
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor frontier offset overflow")?
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor frontier offset overflow")?;
+            let frontier_end = frontier_start
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or("tail cursor frontier field overflow")?;
+            payload
+                .get_mut(frontier_start..frontier_end)
+                .ok_or("tail cursor frontier field missing")?
+                .copy_from_slice(&frontier.to_be_bytes());
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_binding_count(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    count: u16,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let count_start = bindings_start
+            .checked_add(BIND_MAGIC.len())
+            .ok_or("tail cursor binding count offset overflow")?;
+        let count_end = count_start
+            .checked_add(std::mem::size_of::<u16>())
+            .ok_or("tail cursor binding count field overflow")?;
+        payload
+            .get_mut(count_start..count_end)
+            .ok_or("tail cursor binding count field missing")?
+            .copy_from_slice(&count.to_be_bytes());
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_source_lease(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    lease: [u8; 16],
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let lease_start = bindings_start
+            .checked_add(6 + 32 + 8)
+            .ok_or("tail cursor source lease offset overflow")?;
+        let lease_end = lease_start
+            .checked_add(lease.len())
+            .ok_or("tail cursor source lease field overflow")?;
+        payload
+            .get_mut(lease_start..lease_end)
+            .ok_or("tail cursor source lease field missing")?
+            .copy_from_slice(&lease);
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_position(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    position_index: usize,
+    position: u64,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const PREFIX_BYTES: usize = 260;
+        const POSITION_BYTES: usize = 16;
+        let start = PREFIX_BYTES
+            .checked_add(
+                position_index
+                    .checked_mul(POSITION_BYTES)
+                    .ok_or("position overflow")?,
+            )
+            .ok_or("position offset overflow")?;
+        let position_start = start.checked_add(4).ok_or("position field overflow")?;
+        let position_end = position_start
+            .checked_add(8)
+            .ok_or("position field overflow")?;
+        payload
+            .get_mut(position_start..position_end)
+            .ok_or("position field missing")?
+            .copy_from_slice(&position.to_be_bytes());
+        *payload
+            .get_mut(start.checked_add(14).ok_or("position flag overflow")?)
+            .ok_or("position flag missing")? = 1;
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_trailing_byte(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    const AUTH_BYTES: usize = 32;
+    let bytes = cursor.as_bytes();
+    let payload_len = bytes
+        .len()
+        .checked_sub(AUTH_BYTES)
+        .ok_or("cursor tag missing")?;
+    let mut payload = bytes
+        .get(..payload_len)
+        .ok_or("cursor payload missing")?
+        .to_vec();
+    payload.push(0);
+    let authentication = protector.authenticate_query_cursor(b"tail-cursor-v3", &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(positron_query::TailCursor::from_bytes(&payload)?)
+}
+
+pub(crate) fn tail_cursor_with_snapshot_identity(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    identity: [u8; 32],
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const BIND_MAGIC: &[u8] = b"TB01";
+        let bindings_start = payload
+            .windows(BIND_MAGIC.len())
+            .position(|window| window == BIND_MAGIC)
+            .ok_or("tail cursor source bindings missing")?;
+        let identity_start = bindings_start
+            .checked_add(BIND_MAGIC.len() + std::mem::size_of::<u16>())
+            .ok_or("tail cursor snapshot identity offset overflow")?;
+        let identity_end = identity_start
+            .checked_add(identity.len())
+            .ok_or("tail cursor snapshot identity field overflow")?;
+        payload
+            .get_mut(identity_start..identity_end)
+            .ok_or("tail cursor snapshot identity field missing")?
+            .copy_from_slice(&identity);
+        Ok(())
+    })
+}
+
+pub(crate) fn tail_cursor_with_delivery_sequence(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    sequence: u64,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    rewrite_tail_cursor(protector, cursor, |payload| {
+        const DELIVERY_MAGIC: &[u8] = b"DLV1";
+        let delivery_start = payload
+            .windows(DELIVERY_MAGIC.len())
+            .position(|window| window == DELIVERY_MAGIC)
+            .ok_or("tail cursor delivery marker missing")?;
+        let sequence_start = delivery_start
+            .checked_add(DELIVERY_MAGIC.len())
+            .ok_or("tail cursor delivery sequence offset overflow")?;
+        let sequence_end = sequence_start
+            .checked_add(std::mem::size_of::<u64>())
+            .ok_or("tail cursor delivery sequence field overflow")?;
+        payload
+            .get_mut(sequence_start..sequence_end)
+            .ok_or("tail cursor delivery sequence field missing")?
+            .copy_from_slice(&sequence.to_be_bytes());
+        Ok(())
+    })
+}
+
+fn rewrite_tail_cursor(
+    protector: &ControlTokenProtector<'_>,
+    cursor: &positron_query::TailCursor,
+    rewrite: impl FnOnce(&mut [u8]) -> Result<(), Box<dyn Error>>,
+) -> Result<positron_query::TailCursor, Box<dyn Error>> {
+    const MAGIC: &[u8] = b"POSTCUR3";
+    const VERSION: [u8; 2] = 2_u16.to_be_bytes();
+    const AUTH_BYTES: usize = 32;
+
+    let mut bytes = cursor.as_bytes().to_vec();
+    if bytes.get(..MAGIC.len()) != Some(MAGIC)
+        || bytes.get(MAGIC.len()..MAGIC.len() + VERSION.len()) != Some(VERSION.as_slice())
+    {
+        return Err("unsupported tail cursor wire version".into());
+    }
+    let payload_len = bytes
+        .len()
+        .checked_sub(AUTH_BYTES)
+        .ok_or("tail cursor authentication tag missing")?;
+    rewrite(
+        bytes
+            .get_mut(..payload_len)
+            .ok_or("tail cursor payload missing")?,
+    )?;
+    let authentication = protector.authenticate_query_cursor(
+        b"tail-cursor-v3",
+        bytes
+            .get(..payload_len)
+            .ok_or("tail cursor payload missing")?,
+    )?;
+    bytes
+        .get_mut(payload_len..)
+        .ok_or("tail cursor authentication tag missing")?
+        .copy_from_slice(&authentication.tag());
+    Ok(positron_query::TailCursor::from_bytes(&bytes)?)
+}
+
+pub fn merge_work_service<'kernel, 'catalog, 'ledger>(
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    batch_limit: u16,
+) -> positron_query::QueryService<'kernel, 'catalog, 'ledger> {
+    positron_query::QueryService::with_runtime(
+        governor,
+        ledger,
+        batch_limit,
+        TestClock::shared(100),
+        Arc::new(MergeWorkMeter),
     )
 }
 
@@ -693,6 +968,10 @@ impl KernelFixture {
         self.catalog
     }
 
+    pub fn catalog_data_root_for_test(&self) -> PathBuf {
+        self._root.0.join("catalog")
+    }
+
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {
         let ledger = self.ledger.take().ok_or("ledger unavailable")?;
         ledger.seal()?;
@@ -754,6 +1033,17 @@ impl KernelFixture {
         candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
+        let ledger = self.ledger()?;
+        self.append_logs_to(ledger, self.shard, candidates, identity)
+    }
+
+    pub fn append_logs_to(
+        &self,
+        ledger: &ActiveSegmentLedger<'static, 'static>,
+        shard: VirtualShardId,
+        candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
         let mut records = Vec::new();
         records.try_reserve_exact(candidates.len())?;
         for (event_time, body) in candidates {
@@ -778,11 +1068,11 @@ impl KernelFixture {
             capacity,
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
             self.tenant,
-            self.shard,
+            shard,
             StoreBlockIdentity::new([identity; 16])?,
             records,
         )?;
-        self.ledger()?.append(block.into_store_block())?;
+        ledger.append(block.into_store_block())?;
         Ok(())
     }
 
@@ -986,7 +1276,7 @@ fn fixture_configuration(
     tenant: TenantId,
     detected_inventory: FixtureInventory,
 ) -> Result<ResourceGovernorConfiguration, Box<dyn Error>> {
-    let cardinality = InventoryCardinalityLimits::new(1, 16)?;
+    let cardinality = InventoryCardinalityLimits::new(1, 24)?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);

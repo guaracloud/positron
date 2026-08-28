@@ -115,6 +115,52 @@ pub(crate) fn initial_state<'kernel>(
     )
 }
 
+pub(crate) fn tail_state<'kernel>(
+    query: &PlannedQuery<'kernel>,
+    snapshot: &LedgerSnapshot<'kernel>,
+    expiry: u64,
+) -> CursorState {
+    let elapsed = query.last_observed_at.saturating_sub(query.started_at);
+    CursorState {
+        principal: query.context.principal_id(),
+        tenant: snapshot.scope().tenant_id(),
+        authorization_generation: query.context.authorization_generation(),
+        catalog_identity: snapshot.catalog_identity().to_bytes(),
+        catalog_generation: snapshot.catalog_generation(),
+        frontier: snapshot.frontier().value(),
+        plan: query.plan.clone(),
+        source: Some(query.source.clone()),
+        language: Some(query.language),
+        plan_digest: query.plan_digest,
+        resume_key: None,
+        sequence: 0,
+        prior_digest: [0; 32],
+        lease_identity: [0; 16],
+        expiry,
+        budget: query.budget,
+        scanned_bytes: 0,
+        decoded_records: 0,
+        physical_scanned_bytes: 0,
+        physical_decoded_records: 0,
+        output_rows: 0,
+        output_bytes: 0,
+        physical_output_rows: 0,
+        physical_output_bytes: 0,
+        memory_peak_bytes: 0,
+        physical_memory_peak_bytes: 0,
+        started_at: query.started_at,
+        last_observed_at: query.last_observed_at,
+        cpu_work_units: query.cpu_work_units,
+        elapsed_wall_seconds: elapsed,
+        physical_cpu_work_units: query.cpu_work_units,
+        physical_elapsed_wall_seconds: elapsed,
+        reduced_pruning: false,
+        resume_count: 0,
+        repeated_batch_count: 0,
+        cancellation: query.cancellation.clone(),
+    }
+}
+
 pub(crate) fn merge_durable_usage(state: &mut CursorState, usage: SnapshotLeaseUsage) {
     state.physical_scanned_bytes = state.physical_scanned_bytes.max(usage.scanned_bytes());
     state.physical_decoded_records = state.physical_decoded_records.max(usage.decoded_records());

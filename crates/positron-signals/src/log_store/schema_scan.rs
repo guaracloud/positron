@@ -1,4 +1,4 @@
-use super::scan::admit_block_bytes;
+use super::scan::{admit_block_bytes, includes_block, skipped_records};
 use positron_domain::identity::TenantId;
 use positron_domain::routing::SignalKind;
 use positron_domain::value::{NativeValueObserver, ObservedValueFailure};
@@ -97,10 +97,7 @@ impl LogStore {
         let mut encoded_bytes = 0_u64;
         for block in snapshot.blocks() {
             check_cancellation(cancellation)?;
-            if scan
-                .frontier()
-                .is_some_and(|frontier| block.position() > frontier)
-            {
+            if !includes_block(scan, block.position()) {
                 continue;
             }
             encoded_bytes = encoded_bytes
@@ -137,10 +134,7 @@ impl LogStore {
         let mut reduced_pruning = false;
         'blocks: for block in snapshot.blocks() {
             check_cancellation(cancellation)?;
-            if scan
-                .frontier()
-                .is_some_and(|frontier| block.position() > frontier)
-            {
+            if !includes_block(scan, block.position()) {
                 continue;
             }
             let remaining = match limit_kind {
@@ -183,12 +177,14 @@ impl LogStore {
             }
             let decode =
                 codec::BlockDecode::observed(tenant, block.payload(), cancellation, &*observer)?;
-            let oversized = decode.record_count() > remaining;
-            let decoded = decode.decode(snapshot, remaining, cancellation)?;
+            let skipped = skipped_records(scan, block.position());
+            let available = decode.record_count().saturating_sub(skipped);
+            let oversized = available > remaining;
+            let decoded = decode.decode_after(snapshot, skipped, remaining, cancellation)?;
             decoded_records = decoded_records
                 .checked_add(decoded.records.len())
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;
-            for (ordinal, record) in decoded.records.into_iter().enumerate() {
+            for (offset, record) in decoded.records.into_iter().enumerate() {
                 let result = schema
                     .query_stored_record_observed(&record, query, observer)
                     .map_err(map_traversal_failure)?;
@@ -200,8 +196,9 @@ impl LogStore {
                         complete = false;
                         break 'blocks;
                     }
-                    let ordinal = u16::try_from(ordinal)
-                        .ok()
+                    let ordinal = skipped
+                        .checked_add(offset)
+                        .and_then(|ordinal| u16::try_from(ordinal).ok())
                         .and_then(|ordinal| {
                             positron_domain::routing::RecordOrdinal::new(ordinal).ok()
                         })

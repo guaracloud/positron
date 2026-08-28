@@ -31,7 +31,7 @@ pub(crate) use context::{
     FrameObjectContext, FrameObjectId, FrameScope, FrameSequence, KeyEpoch, SegmentFramePurpose,
     SystemObjectKind,
 };
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, all(feature = "test-support", not(test))))]
 #[doc(hidden)]
 pub use control_token::fuzz_control_token_protector;
 pub use control_token::{

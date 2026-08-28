@@ -41,7 +41,7 @@ pub(crate) use fault::with_catalog_fault_after;
 #[cfg(feature = "test-support")]
 pub use fault::{
     CatalogPublicationFault, with_catalog_publication_fault_after,
-    with_catalog_publication_hook_after,
+    with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
 
 pub(super) const FRAME_OVERHEAD_BYTES: usize = 315;

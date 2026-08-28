@@ -26,6 +26,7 @@ pub(super) fn classify_replay_failure(failure: SchemaSessionFailure) -> ServiceF
             | positron_signals::SchemaFailure::AllocationUnavailable
             | positron_signals::SchemaFailure::Observed(
                 positron_signals::ScanObservationFailureCode::BudgetExhausted
+                | positron_signals::ScanObservationFailureCode::DecodedRecordsExhausted
                 | positron_signals::ScanObservationFailureCode::ResourceExhausted
                 | positron_signals::ScanObservationFailureCode::Internal,
             ) => ServiceFailure::CapacityUnavailable,

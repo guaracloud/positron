@@ -15,6 +15,7 @@ pub trait ScanCancellation: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanObservationFailureCode {
     BudgetExhausted,
+    DecodedRecordsExhausted,
     Cancelled,
     ResourceExhausted,
     Internal,
@@ -87,6 +88,8 @@ impl ScanLimit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogScan {
     limit: ScanLimit,
+    after: Option<CommitPosition>,
+    after_record: Option<(CommitPosition, RecordOrdinal)>,
     frontier: Option<CommitPosition>,
     scanned_bytes: Option<u64>,
 }
@@ -96,6 +99,8 @@ impl LogScan {
     pub const fn all(limit: ScanLimit) -> Self {
         Self {
             limit,
+            after: None,
+            after_record: None,
             frontier: None,
             scanned_bytes: None,
         }
@@ -105,6 +110,60 @@ impl LogScan {
     pub const fn through(limit: ScanLimit, frontier: CommitPosition) -> Self {
         Self {
             limit,
+            after: None,
+            after_record: None,
+            frontier: Some(frontier),
+            scanned_bytes: None,
+        }
+    }
+
+    /// Returns committed blocks strictly after `position` and up to the
+    /// current snapshot frontier. The lower bound is a commit position, never
+    /// a timestamp, so a tail handoff cannot skip a commit made at the same
+    /// source time.
+    #[must_use]
+    pub const fn after(limit: ScanLimit, position: CommitPosition) -> Self {
+        Self {
+            limit,
+            after: Some(position),
+            after_record: None,
+            frontier: None,
+            scanned_bytes: None,
+        }
+    }
+
+    /// Returns committed blocks in the exclusive/inclusive interval
+    /// `(after, frontier]`.
+    #[must_use]
+    pub const fn between(
+        limit: ScanLimit,
+        after: CommitPosition,
+        frontier: CommitPosition,
+    ) -> Self {
+        Self {
+            limit,
+            after: Some(after),
+            after_record: None,
+            frontier: Some(frontier),
+            scanned_bytes: None,
+        }
+    }
+
+    /// Returns committed records strictly after one stable record identity and
+    /// up to the current snapshot frontier. The containing block remains in
+    /// the scan so the decoder can structurally skip the already delivered
+    /// prefix without losing records that share its commit position.
+    #[must_use]
+    pub const fn between_record(
+        limit: ScanLimit,
+        position: CommitPosition,
+        ordinal: RecordOrdinal,
+        frontier: CommitPosition,
+    ) -> Self {
+        Self {
+            limit,
+            after: None,
+            after_record: Some((position, ordinal)),
             frontier: Some(frontier),
             scanned_bytes: None,
         }
@@ -120,6 +179,16 @@ impl LogScan {
         self.frontier
     }
 
+    #[must_use]
+    pub const fn after_position(self) -> Option<CommitPosition> {
+        self.after
+    }
+
+    #[must_use]
+    pub const fn after_record(self) -> Option<(CommitPosition, RecordOrdinal)> {
+        self.after_record
+    }
+
     /// Applies the cumulative raw-payload ceiling to this scan. The Signal
     /// Store checks this limit before authenticated block metadata, index, or
     /// decode work, so an atomic block that cannot fit contributes no work or
@@ -128,6 +197,8 @@ impl LogScan {
     pub const fn with_scanned_bytes(self, limit: u64) -> Self {
         Self {
             limit: self.limit,
+            after: self.after,
+            after_record: self.after_record,
             frontier: self.frontier,
             scanned_bytes: Some(limit),
         }
@@ -153,6 +224,21 @@ pub(super) fn admit_block_bytes(
     } else {
         Ok(Some(next))
     }
+}
+
+pub(super) fn includes_block(scan: LogScan, position: CommitPosition) -> bool {
+    (if let Some((after, _)) = scan.after_record() {
+        position >= after
+    } else {
+        scan.after_position().is_none_or(|after| position > after)
+    }) && scan.frontier().is_none_or(|frontier| position <= frontier)
+}
+
+pub(super) fn skipped_records(scan: LogScan, position: CommitPosition) -> usize {
+    scan.after_record()
+        .filter(|(after, _)| *after == position)
+        .and_then(|(_, ordinal)| usize::from(ordinal.value()).checked_add(1))
+        .unwrap_or(0)
 }
 
 /// A bounded logical result that holds its query capacity until drop.

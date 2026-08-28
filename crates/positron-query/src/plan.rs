@@ -1,12 +1,13 @@
-use positron_kernel::ControlTokenProtector;
-use std::fmt::Write as _;
-
 use crate::transform::BodyTransform;
 
+#[path = "plan_canonical.rs"]
+mod canonical;
 mod support;
 
 use support::CanonicalBuffer;
 pub use support::PlannedQuery;
+
+const UNBOUNDED_LIMIT: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemporalAxis {
@@ -126,7 +127,7 @@ impl OrderSpec {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq)]
 pub struct LogicalPlan {
     version: u8,
     axis: TemporalAxis,
@@ -136,7 +137,22 @@ pub struct LogicalPlan {
     projection: Vec<ProjectionColumn>,
     aggregate: Option<AggregateSpec>,
     ordering: OrderSpec,
+    ordering_explicit: bool,
     transform: Option<BodyTransform>,
+}
+
+impl PartialEq for LogicalPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.axis == other.axis
+            && self.range == other.range
+            && self.limit == other.limit
+            && self.filter == other.filter
+            && self.projection == other.projection
+            && self.aggregate == other.aggregate
+            && self.ordering == other.ordering
+            && self.transform == other.transform
+    }
 }
 
 impl LogicalPlan {
@@ -150,6 +166,7 @@ impl LogicalPlan {
             projection: vec![ProjectionColumn::Body],
             aggregate: None,
             ordering: OrderSpec::ascending(axis),
+            ordering_explicit: false,
             transform: None,
         }
     }
@@ -175,10 +192,19 @@ impl LogicalPlan {
             projection: projection.into_vec(),
             aggregate: None,
             ordering: OrderSpec::ascending(axis),
+            ordering_explicit: false,
             transform: None,
         };
         drop(plan_memory);
         Ok(plan)
+    }
+
+    pub(crate) fn logs_without_total_limit_with_memory(
+        axis: TemporalAxis,
+        range: TemporalRange,
+        memory: &crate::planning_memory::PlanningMemory,
+    ) -> Result<Self, crate::QueryFailure> {
+        Self::logs_with_memory(axis, range, UNBOUNDED_LIMIT, memory)
     }
 
     #[must_use]
@@ -206,6 +232,14 @@ impl LogicalPlan {
             || self.aggregate.is_some()
             || self.ordering != OrderSpec::ascending(self.axis)
             || self.transform.is_some()
+    }
+
+    pub(crate) fn tail_incompatible(&self) -> bool {
+        self.aggregate.is_some()
+    }
+
+    pub(crate) fn has_explicit_ordering(&self) -> bool {
+        self.ordering_explicit
     }
 
     pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
@@ -315,6 +349,12 @@ impl LogicalPlan {
         self
     }
 
+    pub(crate) fn with_explicit_ordering(mut self, ordering: OrderSpec) -> Self {
+        self.ordering = ordering;
+        self.ordering_explicit = true;
+        self
+    }
+
     pub(crate) const fn ordering(&self) -> OrderSpec {
         self.ordering
     }
@@ -330,6 +370,10 @@ impl LogicalPlan {
         self.limit
     }
 
+    pub(crate) const fn has_total_limit(&self) -> bool {
+        self.limit != UNBOUNDED_LIMIT
+    }
+
     #[must_use]
     pub const fn temporal_axis(&self) -> TemporalAxis {
         self.axis
@@ -338,59 +382,5 @@ impl LogicalPlan {
     #[must_use]
     pub const fn temporal_range(&self) -> TemporalRange {
         self.range
-    }
-
-    /// Computes the authenticated semantic plan identity shared by every
-    /// frontend. Source spelling and frontend language are deliberately absent;
-    /// only the parsed LogicalPlan's bounded operators and parameters enter
-    /// this visitor.
-    pub(crate) fn canonical_digest(
-        &self,
-        protector: &ControlTokenProtector<'_>,
-    ) -> Result<[u8; 32], crate::QueryFailure> {
-        let mut canonical = CanonicalBuffer::new();
-        write!(
-            canonical,
-            "plan:v4;version={};axis={:?};range={}..{};limit={};filter=",
-            self.version,
-            self.axis,
-            self.range.start_nanoseconds,
-            self.range.end_nanoseconds,
-            self.limit,
-        )
-        .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
-        match self.filter.as_ref() {
-            Some(FilterPredicate::BodyEquals(value)) => write!(canonical, "body_equals:{value:?}"),
-            Some(FilterPredicate::BodyContains(value)) => {
-                write!(
-                    canonical,
-                    "body_contains:{}:{}",
-                    value.source().len(),
-                    value.source()
-                )
-            },
-            Some(FilterPredicate::BodyRegex(value)) => {
-                write!(
-                    canonical,
-                    "body_regex:{}:{}",
-                    value.source().len(),
-                    value.source()
-                )
-            },
-            Some(FilterPredicate::AttributeEquals(query)) => {
-                write!(canonical, "attribute_equals:{query:?}")
-            },
-            None => Ok(()),
-        }
-        .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
-        write!(
-            canonical,
-            ";projection={:?};aggregate={:?};ordering={:?};transform={:?}",
-            self.projection, self.aggregate, self.ordering, self.transform,
-        )
-        .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
-        protector
-            .digest_query_plan(b"query-plan-canonical-v1", canonical.as_slice())
-            .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::Internal))
     }
 }

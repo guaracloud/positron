@@ -10,6 +10,10 @@ mod listener;
 mod native_host;
 mod process;
 mod services;
+#[cfg(fuzzing)]
+mod tail_fuzz;
+#[cfg(fuzzing)]
+mod tail_fuzz_support;
 mod task;
 
 pub use health::{HealthState, Liveness, ProcessPhase, Readiness};
@@ -65,4 +69,10 @@ pub fn fuzz_process_inputs(data: &[u8]) {
         let control = BoundEndpoint::control(PathBuf::from(format!("/tmp/{byte}.sock")));
         assert!(control.is_ok());
     }
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_tail_state_machine(data: &[u8]) {
+    tail_fuzz::run(data);
 }

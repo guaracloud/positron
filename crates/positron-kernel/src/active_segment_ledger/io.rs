@@ -50,6 +50,17 @@ pub(super) fn open_or_create_directory(parent: &File, name: &str) -> Result<File
     Ok(directory)
 }
 
+pub(super) fn open_existing_directory(parent: &File, name: &str) -> Result<File, LedgerFailure> {
+    unix_fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(map_errno)
+}
+
 pub(super) fn open_regular(
     directory: &File,
     name: &str,

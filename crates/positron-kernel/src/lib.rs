@@ -84,7 +84,7 @@ pub use catalog::{
 #[cfg(feature = "test-support")]
 pub use catalog::{
     CatalogPublicationFault, with_catalog_publication_fault_after,
-    with_catalog_publication_hook_after,
+    with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
@@ -92,11 +92,11 @@ pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 #[cfg(feature = "test-support")]
 pub use active_segment_ledger::publish_snapshot_lease_marker_for_test;
 pub use active_segment_ledger::{
-    ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, LedgerCompletionState,
-    LedgerFailure, LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS,
-    PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseUsage,
-    StoreBlockIdentity,
+    ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
+    LedgerCompletionState, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
+    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, SealedSegment, SegmentId,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId,
+    SnapshotLeaseReplacement, SnapshotLeaseUsage, StoreBlockIdentity,
 };
 
 pub use data_protection::{
@@ -143,7 +143,7 @@ pub use data_protection::fuzz_authenticated_frame;
 #[doc(hidden)]
 pub use data_protection::fuzz_local_root_key_file;
 
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, all(feature = "test-support", not(test))))]
 #[doc(hidden)]
 pub use data_protection::fuzz_control_token_protector;
 

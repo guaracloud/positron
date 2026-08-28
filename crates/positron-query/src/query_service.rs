@@ -201,14 +201,16 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         plan: &LogicalPlan,
         budget: QueryBudget,
     ) -> Result<(), QueryFailure> {
-        if plan.limit() == 0 || plan.limit() > 1_024 {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
-        }
-        if u64::from(plan.limit()) > budget.output_rows() {
-            return Err(QueryFailure::for_budget(
-                QueryFailureCode::InvalidBudget,
-                QueryBudgetDimension::OutputRows,
-            ));
+        if plan.has_total_limit() {
+            if plan.limit() == 0 || plan.limit() > 1_024 {
+                return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
+            }
+            if u64::from(plan.limit()) > budget.output_rows() {
+                return Err(QueryFailure::for_budget(
+                    QueryFailureCode::InvalidBudget,
+                    QueryBudgetDimension::OutputRows,
+                ));
+            }
         }
         if plan
             .temporal_range()
