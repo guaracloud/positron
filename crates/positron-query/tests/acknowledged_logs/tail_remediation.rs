@@ -412,6 +412,28 @@ fn historical_tail_has_a_public_header_before_waiting_for_live_data() -> Result<
 }
 
 #[test]
+fn historical_tail_orders_records_across_multiple_committed_blocks() -> Result<(), Box<dyn Error>> {
+    let mut fixture = QueryFixture::new("tail-historical-ordering")?;
+    fixture.kernel.append_log("later", 20, 1)?;
+    fixture.kernel.seal_and_reopen()?;
+    fixture.kernel.append_log("earlier", 10, 2)?;
+    let service = fixture.service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget(2)?,
+    )?;
+    let mut tail = service.tail(query, TailStart::Historical { max_rows: 2 })?;
+    assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(batch)) = tail.poll() else {
+        return Err("historical batch missing".into());
+    };
+    assert_eq!(batch.records()[0].body_text(), Some("earlier"));
+    assert_eq!(batch.records()[1].body_text(), Some("later"));
+    Ok(())
+}
+
+#[test]
 fn unbounded_tail_spans_historical_batches_resume_and_live_transition() -> Result<(), Box<dyn Error>>
 {
     let fixture = QueryFixture::new("tail-unbounded-transition")?;
