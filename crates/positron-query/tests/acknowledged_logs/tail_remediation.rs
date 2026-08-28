@@ -3,8 +3,8 @@ use std::fs;
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
-    ActiveSegmentLedger, CatalogPublicationFault, SegmentProtectionKey, SnapshotLeaseId, WorkClass,
-    with_catalog_publication_fault_after,
+    ActiveSegmentLedger, CatalogPublicationFault, CommittedLedgerReader, SegmentProtectionKey,
+    SnapshotLeaseId, WorkClass, with_catalog_publication_fault_after,
 };
 use positron_query::{
     QueryBudget, QueryFailureCode, QueryService, TailEvent, TailSourceSet, TailStart, TailTerminal,
@@ -142,6 +142,83 @@ fn traces_are_rejected_at_source_admission() -> Result<(), Box<dyn Error>> {
             VirtualShardId::new(3)?,
         ),
         SegmentProtectionKey::from_owned(Box::new([0x73; 32])),
+    )?;
+    assert!(matches!(
+        TailSourceSet::new(vec![traces.reader()?]),
+        Err(failure) if failure.code() == QueryFailureCode::UnsupportedQuery
+    ));
+    Ok(())
+}
+
+#[test]
+fn source_set_rejections_keep_the_public_failure_types() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-source-set-rejections")?;
+    assert!(matches!(
+        TailSourceSet::new(Vec::new()),
+        Err(failure) if failure.code() == QueryFailureCode::InvalidBudget
+    ));
+
+    let overlimit = (1..=65)
+        .map(|value| {
+            CommittedLedgerReader::open(
+                fixture.kernel.authority,
+                fixture.kernel.catalog_for_test(),
+                positron_kernel::SegmentScope::new(
+                    fixture
+                        .context
+                        .tenant_attribution()
+                        .ok_or("tenant")?
+                        .tenant_id(),
+                    SignalKind::Logs,
+                    VirtualShardId::new(value)?,
+                ),
+                SegmentProtectionKey::from_owned(Box::new([0x78; 32])),
+            )
+            .map_err(|failure| -> Box<dyn Error> { Box::new(failure) })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    assert!(matches!(
+        TailSourceSet::new(overlimit),
+        Err(failure) if failure.code() == QueryFailureCode::InvalidBudget
+    ));
+
+    let primary = fixture.kernel.ledger()?.reader()?;
+    let duplicate = fixture.kernel.ledger()?.reader()?;
+    assert!(matches!(
+        TailSourceSet::new(vec![primary, duplicate]),
+        Err(failure) if failure.code() == QueryFailureCode::Unauthorized
+    ));
+
+    let other_tenant = positron_domain::identity::TenantId::from_bytes([0x92; 16])?;
+    let other = CommittedLedgerReader::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            other_tenant,
+            SignalKind::Logs,
+            VirtualShardId::new(66)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x79; 32])),
+    )?;
+    let primary = fixture.kernel.ledger()?.reader()?;
+    assert!(matches!(
+        TailSourceSet::new(vec![primary, other]),
+        Err(failure) if failure.code() == QueryFailureCode::Unauthorized
+    ));
+
+    let traces = ActiveSegmentLedger::open(
+        fixture.kernel.authority,
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::SegmentScope::new(
+            fixture
+                .context
+                .tenant_attribution()
+                .ok_or("tenant")?
+                .tenant_id(),
+            SignalKind::Traces,
+            VirtualShardId::new(67)?,
+        ),
+        SegmentProtectionKey::from_owned(Box::new([0x7a; 32])),
     )?;
     assert!(matches!(
         TailSourceSet::new(vec![traces.reader()?]),
