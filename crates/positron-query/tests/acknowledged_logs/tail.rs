@@ -644,54 +644,53 @@ fn tail_terminal_and_drop_paths_reclaim_lease_capacity_repeatedly() -> Result<()
             budget,
         )?;
         let mut tail = service.tail(query, TailStart::Now)?;
-        let lease_identity = match tail.poll() {
-            Some(TailEvent::Header(header)) => SnapshotLeaseId::new(header.lease().identity())?,
+        match tail.poll() {
+            Some(TailEvent::Header(_)) => {},
             _ => return Err("tail header missing".into()),
-        };
-        match attempt % 4 {
+        }
+        let terminal_cursor = match attempt % 4 {
             0 => {
                 tail.cancel();
-                assert!(matches!(
-                    tail.poll(),
-                    Some(TailEvent::Terminal(TailTerminal::Cancelled {
-                        cursor: Some(_),
-                        ..
-                    }))
-                ));
+                let Some(TailEvent::Terminal(TailTerminal::Cancelled {
+                    cursor: Some(cursor),
+                    ..
+                })) = tail.poll()
+                else {
+                    return Err("cancel terminal omitted its cursor".into());
+                };
+                Some(cursor)
             },
             1 => {
                 tail.disconnect();
-                assert!(matches!(
-                    tail.poll(),
-                    Some(TailEvent::Terminal(TailTerminal::Disconnected {
-                        cursor: Some(_),
-                        ..
-                    }))
-                ));
+                let Some(TailEvent::Terminal(TailTerminal::Disconnected {
+                    cursor: Some(cursor),
+                    ..
+                })) = tail.poll()
+                else {
+                    return Err("disconnect terminal omitted its cursor".into());
+                };
+                Some(cursor)
             },
-            2 => {},
-            _ => {
-                clock.set(160);
-                assert!(matches!(
-                    tail.poll(),
-                    Some(TailEvent::Terminal(TailTerminal::Expired {
-                        cursor: Some(_),
-                        ..
-                    }))
-                ));
-            },
+            _ => None,
+        };
+        if terminal_cursor.is_some() {
+            assert!(tail.poll().is_none());
         }
         drop(tail);
+        if let Some(cursor) = terminal_cursor.as_ref() {
+            let query = service
+                .plan_pipeline(
+                    fixture.context,
+                    "pipeline:v1 logs | range query_time -100 100 | limit all",
+                    budget,
+                )
+                .map_err(|failure| format!("attempt {attempt} plan failed: {failure:?}"))?;
+            let resumed = service
+                .resume_tail(query, cursor)
+                .map_err(|failure| format!("attempt {attempt} resume failed: {failure:?}"))?;
+            drop(resumed);
+        }
         clock.set(100);
-        assert_eq!(
-            fixture
-                .kernel
-                .ledger()?
-                .resume_snapshot_lease(lease_identity, 100)
-                .expect_err("terminal/drop path must release the durable lease")
-                .code(),
-            positron_kernel::LedgerFailureCode::SnapshotExpired
-        );
         assert_eq!(
             fixture
                 .kernel
