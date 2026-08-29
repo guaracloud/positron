@@ -297,23 +297,6 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     Ok(())
 }
 
-pub(super) trait TestPort {
-    fn test_port(self) -> u16;
-}
-
 const fn control_plane() -> &'static [ListenerRole] {
     &[ListenerRole::Control, ListenerRole::Operations]
-}
-
-impl TestPort for ListenerRole {
-    fn test_port(self) -> u16 {
-        match self {
-            ListenerRole::Control => 42_399,
-            ListenerRole::Operations => 42_400,
-            ListenerRole::Api => 42_401,
-            ListenerRole::OtlpGrpc => 42_402,
-            ListenerRole::OtlpHttp => 42_403,
-            ListenerRole::LokiPush => 42_404,
-        }
-    }
 }

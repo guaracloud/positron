@@ -1,6 +1,6 @@
 //! Registration-before-spawn failure contract.
 
-#[path = "process_lifecycle.rs"]
+#[path = "support/process_lifecycle.rs"]
 mod lifecycle;
 
 use lifecycle::{ObservingListeners, ObservingTasks, TestRoots};
@@ -12,7 +12,10 @@ use positron_runtime::{
 fn task_registration_failure_is_typed_before_any_spawn() -> Result<(), Box<dyn std::error::Error>> {
     let roots = TestRoots::new("register-fault")?;
     let listeners = ObservingListeners::default();
-    let tasks = ObservingTasks::failing_registration(TaskRole::Api);
+    let tasks = ObservingTasks {
+        fail_registration: Some(TaskRole::Api),
+        ..ObservingTasks::default()
+    };
     let failure = ApplicationRuntime::start(
         ServeConfiguration::new(
             roots.bootstrap_paths()?,

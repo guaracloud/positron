@@ -1,7 +1,7 @@
 //! Recoverable startup dependency contract at the public runtime seam.
 
-#[path = "process_lifecycle.rs"]
-#[expect(dead_code, reason = "shared public lifecycle fixture")]
+#[path = "support/process_lifecycle.rs"]
+#[expect(dead_code, reason = "shared lifecycle support")]
 mod lifecycle;
 
 use lifecycle::{ObservingListeners, ObservingTasks, TestRoots};
