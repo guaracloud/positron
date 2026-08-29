@@ -118,6 +118,24 @@ fn unrelated_length_delimited_fields_do_not_count_as_known_containers() {
 }
 
 #[test]
+fn unknown_nested_collection_fields_remain_forward_compatible() {
+    let unknown_array_field = message(2, &[]);
+    assert_eq!(
+        validate_record_count(&request_with_body(&message(5, &unknown_array_field))),
+        Ok(())
+    );
+
+    let unknown_key_value_list_field = message(2, &[]);
+    assert_eq!(
+        validate_record_count(&request_with_body(&message(
+            6,
+            &unknown_key_value_list_field,
+        ))),
+        Ok(())
+    );
+}
+
+#[test]
 fn malformed_nested_wire_is_rejected() {
     for request in [
         vec![0x0a, 0x02, 0x12],
@@ -144,6 +162,7 @@ fn unknown_wire_types_are_skipped_and_group_hazards_fail_closed() {
         vec![0x00],
         vec![0x0e],
         vec![0x0c],
+        vec![0x80; 10],
         vec![0x0a, 0x80, 0x00],
         vec![0x11, 0, 0, 0],
         vec![0x1d, 0, 0],
