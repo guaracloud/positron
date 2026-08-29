@@ -82,11 +82,7 @@ pub(super) fn ingest_native_batch(
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     drop(catalog);
-    let result = IngestRequestOutcome::new(outcomes);
-    if result.accepted_records() > 0 {
-        services.mark_schema_dirty();
-    }
-    Ok(result)
+    Ok(IngestRequestOutcome::new(outcomes))
 }
 
 fn open_catalog<'instance>(

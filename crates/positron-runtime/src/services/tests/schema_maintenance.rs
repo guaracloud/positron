@@ -132,6 +132,25 @@ fn shutdown_capacity_is_reserved_before_admission_closes_and_released_after_publ
 }
 
 #[test]
+fn unchanged_session_skips_shutdown_checkpoint_publication() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let initial_audits = schema_audit_count(&initialized)?;
+
+    services.prepare_shutdown_schema_checkpoint()?;
+    services.publish_prepared_shutdown_schema_checkpoint()?;
+
+    assert_eq!(schema_audit_count(&initialized)?, initial_audits);
+    let after = initialized._authority.begin_shutdown()?;
+    assert_eq!(
+        after.outstanding_for(WorkClass::OrdinaryMaintenanceBackup),
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn failed_shutdown_publication_releases_its_pre_admitted_capacity() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let (initialized, ingest, _) = fixture.initialized()?;

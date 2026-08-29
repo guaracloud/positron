@@ -89,6 +89,11 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
             fixture.authority.governor(),
         )
         .expect("commit schema");
+    assert!(
+        session
+            .has_checkpoint_changes()
+            .expect("committed schema changed checkpoint state")
+    );
 
     let query = SchemaQuery::value(
         SchemaPath::root(AttributeNamespace::Record, "order.id".to_owned()).expect("path"),
@@ -258,10 +263,20 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
         promoted_charge,
         "checkpoint-loaded scalar sidecar capacity remains separately attributable"
     );
+    assert!(
+        !reopened_session
+            .has_checkpoint_changes()
+            .expect("reopened checkpoint is the recovery basis")
+    );
     let reopened_base_charge = reopened_promoted.base_charge_bytes();
     reopened_session
         .remove_query_evidence(fixture.tenant, &path, fixture.authority.governor())
         .expect("demote base-reserved reopened sidecar");
+    assert!(
+        reopened_session
+            .has_checkpoint_changes()
+            .expect("demotion changed checkpoint state")
+    );
     let reopened_demoted = reopened_session.checkpoint().expect("reopened demotion");
     assert_eq!(reopened_demoted.retained_charge_bytes(), 0);
     assert_eq!(reopened_demoted.base_charge_bytes(), reopened_base_charge);

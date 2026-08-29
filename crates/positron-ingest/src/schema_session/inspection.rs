@@ -104,7 +104,9 @@ impl TenantSchemaSession {
         state
             .catalog
             .retain_reachable_indexes(reachable)
-            .map_err(SchemaSessionFailure::Schema)
+            .map_err(SchemaSessionFailure::Schema)?;
+        state.checkpoint_changed = true;
+        Ok(())
     }
 
     pub(crate) fn retain_reachable_indexes_work_units(&self) -> Result<u64, SchemaSessionFailure> {
@@ -148,7 +150,9 @@ impl TenantSchemaSession {
                 | positron_signals::SchemaFailure::MalformedCatalog => {
                     SchemaSessionFailure::Schema(failure)
                 },
-            })
+            })?;
+        state.checkpoint_changed = true;
+        Ok(())
     }
 
     pub fn discover(
@@ -275,6 +279,7 @@ fn commit_query_update(
         .map_err(SchemaSessionFailure::Schema)?;
     state.query_capacity = next_capacity.map(ResourceReservation::transfer);
     state.query_charge_bytes = next_charge;
+    state.checkpoint_changed = true;
     Ok(())
 }
 

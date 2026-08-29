@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use positron_governance::{
@@ -7,7 +6,7 @@ use positron_governance::{
 };
 use positron_ingest::{
     AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest, IngestRequestOutcome,
-    LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry,
+    LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry, TenantSchemaSession,
     reserve_log_receiver_transport,
 };
 use positron_kernel::TransferredResourceReservation;
@@ -37,7 +36,6 @@ mod tests;
 pub struct ServiceHandle {
     ingest_policy: IngestPolicyServingSnapshot,
     schema_sessions: TenantSchemaRegistry,
-    schema_dirty: Arc<AtomicBool>,
     shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
@@ -84,7 +82,6 @@ impl ServiceHandle {
         Ok(Self {
             ingest_policy,
             schema_sessions: recovered.registry,
-            schema_dirty: Arc::new(AtomicBool::new(false)),
             shutdown_schema_capacity: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
@@ -93,7 +90,7 @@ impl ServiceHandle {
     }
 
     pub(crate) fn prepare_shutdown_schema_checkpoint(&self) -> Result<(), ServiceFailure> {
-        if !self.schema_dirty.load(Ordering::Acquire) {
+        if self.schema_session_with_checkpoint_changes()?.is_none() {
             return Ok(());
         }
         let capacity = schema_maintenance::reserve_shutdown_capacity(&self.instance)?;
@@ -105,28 +102,31 @@ impl ServiceHandle {
     }
 
     pub(crate) fn publish_prepared_shutdown_schema_checkpoint(&self) -> Result<(), ServiceFailure> {
-        if !self.schema_dirty.load(Ordering::Acquire) {
+        let Some(session) = self.schema_session_with_checkpoint_changes()? else {
             return Ok(());
-        }
+        };
         let capacity = self
             .shutdown_schema_capacity
             .lock()
             .map_err(|_| ServiceFailure::Internal)?
             .take()
             .ok_or(ServiceFailure::CapacityUnavailable)?;
-        let checkpoint = self
-            .schema_sessions
-            .session(self.instance.tenant, self.instance.resource_governor())
-            .map_err(|_| ServiceFailure::CapacityUnavailable)?
-            .checkpoint()
-            .map_err(|_| ServiceFailure::Internal)?;
+        let checkpoint = session.checkpoint().map_err(|_| ServiceFailure::Internal)?;
         schema_maintenance::publish_with_capacity(&self.instance, checkpoint, capacity)?;
-        self.schema_dirty.store(false, Ordering::Release);
         Ok(())
     }
 
-    pub(super) fn mark_schema_dirty(&self) {
-        self.schema_dirty.store(true, Ordering::Release);
+    fn schema_session_with_checkpoint_changes(
+        &self,
+    ) -> Result<Option<TenantSchemaSession>, ServiceFailure> {
+        let session = self
+            .schema_sessions
+            .session(self.instance.tenant, self.instance.resource_governor())
+            .map_err(|_| ServiceFailure::CapacityUnavailable)?;
+        session
+            .has_checkpoint_changes()
+            .map(|changed| changed.then_some(session))
+            .map_err(|_| ServiceFailure::Internal)
     }
 
     pub fn ingest_otlp_logs(

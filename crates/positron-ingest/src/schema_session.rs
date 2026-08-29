@@ -43,6 +43,7 @@ pub(super) struct SessionState {
     pub(super) retained_charge_bytes: u64,
     pub(super) pending: Option<PendingStage>,
     pub(super) in_flight: Option<StoreBlockIdentity>,
+    pub(super) checkpoint_changed: bool,
 }
 
 pub(super) struct PendingStage {
@@ -187,6 +188,7 @@ impl TenantSchemaSession {
                 retained_charge_bytes: 0,
                 pending: None,
                 in_flight: None,
+                checkpoint_changed: false,
             })),
         })
     }
@@ -274,6 +276,7 @@ impl TenantSchemaSession {
                 }
                 state.retained_charge_bytes = next_retained;
                 state.in_flight = None;
+                state.checkpoint_changed = true;
             },
             DurableSchemaOutcome::DefiniteFailure => {
                 state.in_flight = None;

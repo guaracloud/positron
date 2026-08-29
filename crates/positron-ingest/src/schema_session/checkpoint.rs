@@ -65,8 +65,22 @@ impl TenantSchemaSession {
                 retained_charge_bytes: 0,
                 pending: None,
                 in_flight: None,
+                checkpoint_changed: false,
             })),
         })
+    }
+
+    /// Reports whether checkpoint-relevant state changed after this session
+    /// was constructed from its recovery basis.
+    ///
+    /// The result is monotonic for the session lifetime because checkpoint
+    /// publication is a terminal, quiescent lifecycle operation.
+    pub fn has_checkpoint_changes(&self) -> Result<bool, SchemaSessionFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        Ok(state.checkpoint_changed)
     }
 
     pub fn checkpoint(&self) -> Result<TenantSchemaCheckpoint, SchemaSessionFailure> {

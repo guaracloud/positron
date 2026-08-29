@@ -91,6 +91,11 @@ fn ambiguous_delta_retains_one_exact_bounded_reservation_until_reconciliation() 
         session.checkpoint().expect("pending").pending_bytes(),
         staged_bytes
     );
+    assert!(
+        !session
+            .has_checkpoint_changes()
+            .expect("pending state remains unpublished")
+    );
 
     let mut same_shard_retry = records();
     assert!(matches!(
@@ -218,6 +223,11 @@ fn committed_ambiguity_reconciles_from_v2_and_shrinks_to_exact_retained_charge()
         )
         .expect("clear staged retry");
     let reconciled = session.checkpoint().expect("reconciled");
+    assert!(
+        session
+            .has_checkpoint_changes()
+            .expect("reconciliation changed checkpoint state")
+    );
     let catalog = SchemaCatalog::decode_catalog_object(reconciled.catalog_bytes())
         .expect("reconciled catalog");
     let empty = SchemaCatalog::new(fixture.tenant, SchemaBudget::release_1().expect("budget"))

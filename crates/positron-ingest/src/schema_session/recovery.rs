@@ -231,6 +231,7 @@ impl TenantSchemaSession {
         state.frontiers = candidate_frontiers;
         state.retained_capacity.extend(new_retained_capacity);
         state.retained_charge_bytes = candidate_retained_charge;
+        state.checkpoint_changed = true;
         Ok(())
     }
 
@@ -321,6 +322,7 @@ impl TenantSchemaSession {
                 .commit_observed(delta, block.identity(), digest, &observer)
                 .map_err(map_replay_observed_failure)?;
             publish_frontier(&mut state, frontier);
+            state.checkpoint_changed = true;
         }
         Ok(())
     }

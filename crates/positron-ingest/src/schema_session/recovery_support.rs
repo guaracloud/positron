@@ -114,6 +114,7 @@ pub(super) fn reconcile_pending(
     }
     state.retained_charge_bytes = next_retained;
     state.in_flight = None;
+    state.checkpoint_changed = true;
     Ok(())
 }
 

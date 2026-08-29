@@ -377,6 +377,11 @@ fn replay_cancellation_on_later_block_is_atomic_for_catalog_frontier_and_capacit
             .catalog_bytes(),
         before_checkpoint
     );
+    assert!(
+        !session
+            .has_checkpoint_changes()
+            .expect("cancelled replay is atomic")
+    );
     let after_governor = fixture.authority.governor().inspect().expect("governor");
     assert_eq!(
         after_governor.outstanding_total(),
@@ -401,6 +406,11 @@ fn replay_cancellation_on_later_block_is_atomic_for_catalog_frontier_and_capacit
     session
         .replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor())
         .expect("retry replay");
+    assert!(
+        session
+            .has_checkpoint_changes()
+            .expect("successful replay changed checkpoint state")
+    );
     let replayed_checkpoint = session.checkpoint().expect("replayed checkpoint");
     assert_eq!(replayed_checkpoint.catalog_bytes(), expected);
     assert_eq!(replayed_checkpoint.base_charge_bytes(), before_base_charge);
