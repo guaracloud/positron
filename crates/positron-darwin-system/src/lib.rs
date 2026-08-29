@@ -55,8 +55,8 @@ pub fn maximum_file_descriptor_count() -> Result<u64, DarwinSystemObservationErr
 mod tests {
     use super::{
         DarwinSystemObservationError, checked_host_available_memory_bytes,
-        host_available_memory_bytes, maximum_file_descriptor_count, physical_memory_bytes,
-        process_available_memory_bytes,
+        host_available_memory_bytes, maximum_file_descriptor_count, open_file_descriptor_count,
+        physical_memory_bytes, process_available_memory_bytes,
     };
 
     #[test]
@@ -78,6 +78,7 @@ mod tests {
         );
         assert!(physical.unwrap_or_default() > 0);
         assert!(host_available.unwrap_or_default() > 0);
+        assert!(open_file_descriptor_count().is_ok());
         assert!(maximum_file_descriptor_count().unwrap_or_default() > 0);
     }
 

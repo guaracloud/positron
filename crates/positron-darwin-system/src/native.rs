@@ -3,8 +3,9 @@
 //! Safety invariants:
 //! - `sysctlbyname` writes only to an initialized `u64` with its exact size;
 //! - `os_proc_available_memory` returns a value and borrows no caller memory;
-//! - `proc_pidinfo` writes into a fixed, initialized array of the documented
-//!   `proc_fdinfo` layout, and returned byte counts are validated before use;
+//! - `proc_pidinfo` writes into a fixed, initialized allocation of the
+//!   documented `proc_fdinfo` layout, and returned byte counts are validated
+//!   before use;
 //! - no pointer escapes this module and no native allocation is retained.
 
 #![allow(
@@ -262,10 +263,7 @@ fn host_available_memory_bytes_with<Api: MachHostApi>(
 }
 
 pub(super) fn open_file_descriptor_count() -> Result<u64, DarwinSystemObservationError> {
-    let mut entries = [ProcFdInfo {
-        descriptor: -1,
-        descriptor_type: 0,
-    }; MAX_OBSERVED_FILE_DESCRIPTORS];
+    let mut entries = allocate_file_descriptor_entries(MAX_OBSERVED_FILE_DESCRIPTORS)?;
     let byte_capacity = entries
         .len()
         .checked_mul(size_of::<ProcFdInfo>())
@@ -295,6 +293,26 @@ pub(super) fn open_file_descriptor_count() -> Result<u64, DarwinSystemObservatio
     }
     u64::try_from(returned / size_of::<ProcFdInfo>())
         .map_err(|_| DarwinSystemObservationError::FileDescriptorCountUnavailable)
+}
+
+fn allocate_file_descriptor_entries(
+    count: usize,
+) -> Result<Box<[ProcFdInfo]>, DarwinSystemObservationError> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| DarwinSystemObservationError::FileDescriptorCountUnavailable)?;
+    if entries.capacity() != count {
+        return Err(DarwinSystemObservationError::FileDescriptorCountUnavailable);
+    }
+    entries.resize(
+        count,
+        ProcFdInfo {
+            descriptor: -1,
+            descriptor_type: 0,
+        },
+    );
+    Ok(entries.into_boxed_slice())
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 use std::cell::Cell;
 
 use super::{
-    KERNEL_SUCCESS, MachHostApi, VmStatistics64RevisionZero, host_available_memory_bytes_with,
+    KERNEL_SUCCESS, MachHostApi, VmStatistics64RevisionZero, allocate_file_descriptor_entries,
+    host_available_memory_bytes_with,
 };
 use crate::DarwinSystemObservationError;
 
@@ -58,6 +59,14 @@ impl MachHostApi for FakeMachHostApi {
         self.deallocations.set(self.deallocations.get() + 1);
         self.deallocation_status
     }
+}
+
+#[test]
+fn descriptor_buffer_allocation_overflow_fails_closed() {
+    assert!(matches!(
+        allocate_file_descriptor_entries(usize::MAX),
+        Err(DarwinSystemObservationError::FileDescriptorCountUnavailable)
+    ));
 }
 
 #[test]
