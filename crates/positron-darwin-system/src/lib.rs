@@ -98,6 +98,25 @@ mod tests {
             Err(DarwinSystemObservationError::HostAvailableMemoryArithmetic)
         );
     }
+
+    #[test]
+    fn observation_errors_keep_native_details_out_of_diagnostics() {
+        for failure in [
+            DarwinSystemObservationError::PhysicalMemoryUnavailable,
+            DarwinSystemObservationError::HostAvailableMemoryUnavailable,
+            DarwinSystemObservationError::HostAvailableMemoryZero,
+            DarwinSystemObservationError::HostAvailableMemoryArithmetic,
+            DarwinSystemObservationError::HostPortDeallocationUnavailable,
+            DarwinSystemObservationError::FileDescriptorCountUnavailable,
+            DarwinSystemObservationError::FileDescriptorCountExceedsBound,
+            DarwinSystemObservationError::FileDescriptorCeilingUnavailable,
+        ] {
+            assert_eq!(
+                failure.to_string(),
+                "macOS system resource observation failed"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

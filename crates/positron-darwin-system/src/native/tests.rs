@@ -1,7 +1,9 @@
 use std::cell::Cell;
+use std::mem::size_of;
 
 use super::{
-    KERNEL_SUCCESS, MachHostApi, VmStatistics64RevisionZero, allocate_file_descriptor_entries,
+    KERNEL_SUCCESS, MachHostApi, ProcFdInfo, VmStatistics64RevisionZero,
+    allocate_file_descriptor_entries, file_descriptor_count_from_response,
     host_available_memory_bytes_with,
 };
 use crate::DarwinSystemObservationError;
@@ -67,6 +69,47 @@ fn descriptor_buffer_allocation_overflow_fails_closed() {
         allocate_file_descriptor_entries(usize::MAX),
         Err(DarwinSystemObservationError::FileDescriptorCountUnavailable)
     ));
+}
+
+#[test]
+fn descriptor_response_is_bounded_and_structurally_valid() -> Result<(), Box<dyn std::error::Error>>
+{
+    let entry_bytes = i32::try_from(size_of::<ProcFdInfo>())?;
+    let byte_capacity = entry_bytes.checked_mul(4).ok_or("fixture overflow")?;
+
+    assert_eq!(
+        file_descriptor_count_from_response(
+            entry_bytes.checked_mul(3).ok_or("fixture overflow")?,
+            byte_capacity
+        ),
+        Ok(3)
+    );
+    assert_eq!(
+        file_descriptor_count_from_response(0, byte_capacity),
+        Err(DarwinSystemObservationError::FileDescriptorCountUnavailable)
+    );
+    assert_eq!(
+        file_descriptor_count_from_response(-1, byte_capacity),
+        Err(DarwinSystemObservationError::FileDescriptorCountUnavailable)
+    );
+    assert_eq!(
+        file_descriptor_count_from_response(entry_bytes - 1, byte_capacity),
+        Err(DarwinSystemObservationError::FileDescriptorCountUnavailable)
+    );
+    assert_eq!(
+        file_descriptor_count_from_response(byte_capacity, byte_capacity),
+        Err(DarwinSystemObservationError::FileDescriptorCountExceedsBound)
+    );
+    assert_eq!(
+        file_descriptor_count_from_response(
+            byte_capacity
+                .checked_add(entry_bytes)
+                .ok_or("fixture overflow")?,
+            byte_capacity,
+        ),
+        Err(DarwinSystemObservationError::FileDescriptorCountExceedsBound)
+    );
+    Ok(())
 }
 
 #[test]

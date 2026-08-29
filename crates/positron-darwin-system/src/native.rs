@@ -280,10 +280,17 @@ pub(super) fn open_file_descriptor_count() -> Result<u64, DarwinSystemObservatio
             byte_capacity,
         )
     };
+    file_descriptor_count_from_response(returned, byte_capacity)
+}
+
+fn file_descriptor_count_from_response(
+    returned: c_int,
+    byte_capacity: c_int,
+) -> Result<u64, DarwinSystemObservationError> {
     if returned <= 0 {
         return Err(DarwinSystemObservationError::FileDescriptorCountUnavailable);
     }
-    if returned == byte_capacity {
+    if returned >= byte_capacity {
         return Err(DarwinSystemObservationError::FileDescriptorCountExceedsBound);
     }
     let returned = usize::try_from(returned)
