@@ -48,7 +48,7 @@ impl IngestPolicy {
         Ok(PolicyEvaluation::Accepted(Box::new(
             EvaluatedLogRecord::new(
                 record,
-                PolicyProvenance::new(self.generation, self.digest, applied),
+                PolicyProvenance::evaluated(self.generation, self.digest, applied),
             ),
         )))
     }

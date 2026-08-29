@@ -16,4 +16,4 @@ pub use policy::{
     PolicyEvaluation, PolicyEvaluationFailure, PolicyPredicate, PolicyReceiver, PolicyRule,
     PolicyTarget,
 };
-pub use provenance::PolicyProvenance;
+pub use provenance::{PolicyProvenance, PolicyProvenanceFailure};

@@ -106,7 +106,7 @@ impl IngestPolicy {
 
     #[must_use]
     pub fn provenance(&self) -> PolicyProvenance {
-        PolicyProvenance::new(self.generation, self.digest, Vec::new())
+        PolicyProvenance::evaluated(self.generation, self.digest, Vec::new())
     }
 
     #[must_use]

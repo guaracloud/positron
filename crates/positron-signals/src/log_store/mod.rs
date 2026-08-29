@@ -5,7 +5,6 @@ mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
 mod metadata;
-mod policy_provenance;
 mod scan;
 mod schema;
 mod schema_scan;
@@ -25,7 +24,7 @@ use positron_kernel::{
 
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
 pub use metadata::LogMetadata;
-pub use policy_provenance::PolicyProvenance;
+pub use positron_policy::PolicyProvenance;
 pub use scan::{
     LogScan, LogScanResult, ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver,
     ScannedLogRecord,

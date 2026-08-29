@@ -5,22 +5,6 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_kernel_authority(volume)?;
-    let invalid_policy = PolicyProvenance::new(0, [0x70; 32], vec![])
-        .expect_err("policy generation zero is not immutable provenance");
-    assert_eq!(invalid_policy.code(), LogStoreFailureCode::InvalidInput);
-    assert!(!invalid_policy.to_string().contains("secret-canary"));
-    assert_eq!(
-        PolicyProvenance::new(1, [0; 32], vec![])
-            .expect_err("zero digest is not policy identity")
-            .code(),
-        LogStoreFailureCode::InvalidInput
-    );
-    assert_eq!(
-        PolicyProvenance::new(1, [0x70; 32], vec![String::new()])
-            .expect_err("applied rule IDs are nonempty")
-            .code(),
-        LogStoreFailureCode::InvalidInput
-    );
     assert_eq!(
         ScanLimit::new(0)
             .expect_err("unbounded empty scan limit is invalid")

@@ -238,13 +238,14 @@ fn decode_attribute(
 fn decode_policy(input: &mut Input<'_>) -> Result<PolicyProvenance, LogStoreFailure> {
     let generation = input.u64()?;
     let digest = input.array()?;
-    let count = input.count(64)?;
-    let mut rule_slices = [""; 64];
+    let count = input.count(PolicyProvenance::MAX_APPLIED_RULES)?;
+    let mut rule_slices = [""; PolicyProvenance::MAX_APPLIED_RULES];
     for index in 0..count {
         input.observe_component()?;
         *rule_slices
             .get_mut(index)
-            .ok_or_else(LogStoreFailure::malformed_block)? = input.string_slice(256)?;
+            .ok_or_else(LogStoreFailure::malformed_block)? =
+            input.string_slice(PolicyProvenance::MAX_RULE_ID_BYTES)?;
     }
     let rules = rule_slices
         .get(..count)
@@ -261,13 +262,14 @@ fn decode_policy(input: &mut Input<'_>) -> Result<PolicyProvenance, LogStoreFail
 fn validate_policy(input: &mut Input<'_>) -> Result<(), LogStoreFailure> {
     let generation = input.u64()?;
     let digest = input.array()?;
-    let count = input.count(64)?;
-    let mut rule_slices = [""; 64];
+    let count = input.count(PolicyProvenance::MAX_APPLIED_RULES)?;
+    let mut rule_slices = [""; PolicyProvenance::MAX_APPLIED_RULES];
     for index in 0..count {
         input.observe_component()?;
         *rule_slices
             .get_mut(index)
-            .ok_or_else(LogStoreFailure::malformed_block)? = input.string_slice(256)?;
+            .ok_or_else(LogStoreFailure::malformed_block)? =
+            input.string_slice(PolicyProvenance::MAX_RULE_ID_BYTES)?;
     }
     let rules = rule_slices
         .get(..count)

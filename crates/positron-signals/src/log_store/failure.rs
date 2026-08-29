@@ -132,10 +132,25 @@ impl Display for LogStoreFailure {
 
 impl Error for LogStoreFailure {}
 
+impl From<positron_policy::PolicyProvenanceFailure> for LogStoreFailure {
+    fn from(_failure: positron_policy::PolicyProvenanceFailure) -> Self {
+        Self::invalid_input()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LogStoreFailure, LogStoreFailureCode};
     use crate::log_store::ScanObservationFailureCode;
+
+    #[test]
+    fn invalid_policy_provenance_maps_to_the_log_store_input_class() {
+        let provenance_failure =
+            positron_policy::PolicyProvenance::new(1, [0x70; 32], vec![String::new()])
+                .expect_err("empty rule identity");
+        let failure = LogStoreFailure::from(provenance_failure);
+        assert_eq!(failure.code(), LogStoreFailureCode::InvalidInput);
+    }
 
     #[test]
     fn infrastructure_failures_keep_distinct_redacted_public_codes() {
