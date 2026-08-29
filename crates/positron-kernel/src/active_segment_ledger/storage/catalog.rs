@@ -57,7 +57,12 @@ impl LedgerStorage {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
-        segments.sort_by_key(|metadata| metadata.base_position);
+        segments.sort_by_key(|metadata| {
+            (
+                metadata.base_position,
+                (metadata.state != SegmentState::Retired) as u8,
+            )
+        });
         Ok(segments)
     }
 

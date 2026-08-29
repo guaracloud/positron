@@ -131,6 +131,22 @@ pub(super) fn decode_block(
     )
 }
 
+pub(super) fn block_retention_range(
+    expected_tenant: TenantId,
+    snapshot: &LedgerSnapshot<'_>,
+    bytes: &[u8],
+) -> Result<Option<i64>, LogStoreFailure> {
+    let decoder = BlockDecode::new(expected_tenant, bytes)?;
+    let count = decoder.record_count();
+    let decoded = decoder.decode(snapshot, count, &super::scan::NeverCancelled)?;
+    let mut latest = None;
+    for record in decoded.records {
+        let instant = record.ingest_time().instant().value();
+        latest = Some(latest.map_or(instant, |current: i64| current.max(instant)));
+    }
+    Ok(latest)
+}
+
 pub(super) fn decode_block_cancellable(
     expected_tenant: TenantId,
     snapshot: &LedgerSnapshot<'_>,

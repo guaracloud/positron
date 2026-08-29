@@ -6,6 +6,10 @@ pub(super) fn recovery_claim() -> ResourceAmounts {
     ResourceAmounts::new([2_500_000, 1, 1, 2_500_000, 1_024, 0, 1, 1, 1, 6, 0])
 }
 
+pub(super) fn retention_claim() -> ResourceAmounts {
+    ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 1_024, 0, 1, 1, 1, 6, 1_048_576])
+}
+
 pub(super) fn append_claim(block_bytes: usize) -> Result<ResourceAmounts, LedgerFailure> {
     let bytes = u64::try_from(block_bytes)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;

@@ -134,6 +134,7 @@ pub(super) fn map_replay_observed_failure(
         | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch
         | positron_signals::LogStoreFailureCode::Kernel
         | positron_signals::LogStoreFailureCode::ClockUnavailable
+        | positron_signals::LogStoreFailureCode::ClockUncertain
         | positron_signals::LogStoreFailureCode::Internal => SchemaSessionFailure::ReplayIntegrity,
     }
 }

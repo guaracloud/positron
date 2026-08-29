@@ -243,14 +243,27 @@ impl LedgerStorage {
         if physical_metadata.state != SegmentState::Active
             || physical_metadata.scope != metadata.scope
             || physical_metadata.id != metadata.id
-            || physical_metadata.base_position != metadata.base_position
+            || (metadata.state != SegmentState::Retired
+                && physical_metadata.base_position != metadata.base_position)
         {
             return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
         }
+        // A retired Catalog entry carries the segment's final frontier as its
+        // continuity marker. The immutable on-disk header retains the
+        // original base needed to authenticate and decode its blocks.
+        let recovery_metadata = if metadata.state == SegmentState::Retired {
+            SegmentMetadata {
+                state: SegmentState::Sealed,
+                base_position: physical_metadata.base_position,
+                ..metadata
+            }
+        } else {
+            metadata
+        };
         let state = recover_with_mode(
             directory,
             frontier_directory,
-            metadata,
+            recovery_metadata,
             &key,
             decoded.encoded_bytes,
             mode,
@@ -328,6 +341,32 @@ impl LedgerStorage {
     pub(super) fn current_metadata(&self) -> Result<SegmentMetadata, LedgerFailure> {
         self.current
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+    }
+
+    /// Removes a retired sealed segment only after its catalog state has made
+    /// it invisible to new snapshots. Missing entries are already reclaimed
+    /// work and are therefore idempotent across crash recovery.
+    pub(super) fn reclaim_retired(&self, metadata: SegmentMetadata) -> Result<(), LedgerFailure> {
+        if metadata.state != SegmentState::Retired {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        if entry_exists(&self.active, &segment_name(metadata.id))?
+            || entry_exists(&self.active, &frontier_name(metadata.id))?
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        let mut changed = false;
+        for name in [segment_name(metadata.id), frontier_name(metadata.id)] {
+            match unix_fs::unlinkat(&self.sealed, name, AtFlags::empty()) {
+                Ok(()) => changed = true,
+                Err(rustix::io::Errno::NOENT) => {},
+                Err(error) => return Err(map_errno(error)),
+            }
+        }
+        if changed {
+            synchronize(&self.sealed)?;
+        }
+        Ok(())
     }
 }
 

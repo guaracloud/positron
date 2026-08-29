@@ -33,6 +33,7 @@ fn metadata_and_header_v3_round_trip_every_closed_tag() {
     for (state, signal) in [
         (SegmentState::Active, SignalKind::Logs),
         (SegmentState::Sealed, SignalKind::Traces),
+        (SegmentState::Retired, SignalKind::Logs),
     ] {
         let expected = metadata(state, signal);
         let encoded = encode_metadata(expected);

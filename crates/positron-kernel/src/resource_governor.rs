@@ -36,7 +36,7 @@ mod telemetry_tests;
 mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use accounting::{GovernorConfiguration, GovernorInner, GovernorSetupInput, KernelOwnership};
 pub(crate) use active_segment_leases::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
@@ -141,6 +141,8 @@ pub struct StorageKernelResourceAuthority {
     inner: GovernorInner,
     catalog_writer_held: AtomicBool,
     active_segment_scopes: Mutex<Box<ActiveSegmentScopes>>,
+    snapshot_protection: Arc<Mutex<std::collections::BTreeMap<[u8; 16], usize>>>,
+    snapshot_barrier: RwLock<()>,
 }
 
 type ActiveSegmentScopes = [Option<[u8; 22]>; MAX_TENANT_QUOTAS];

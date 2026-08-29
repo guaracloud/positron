@@ -16,6 +16,7 @@ pub(crate) const fn classify_log_store_failure_code(code: LogStoreFailureCode) -
         LogStoreFailureCode::ResourceExhausted
         | LogStoreFailureCode::BudgetExhausted
         | LogStoreFailureCode::ClockUnavailable
+        | LogStoreFailureCode::ClockUncertain
         | LogStoreFailureCode::ResourceAdmissionRefused => {
             IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
         },

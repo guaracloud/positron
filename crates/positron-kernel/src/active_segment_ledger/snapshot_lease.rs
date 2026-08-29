@@ -19,7 +19,7 @@ use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFai
 use crate::CatalogGenerationId;
 pub(super) use snapshot_lease_support::map_catalog_failure;
 pub(super) use snapshot_lease_support::{
-    LeaseReservationTransaction, expired_in_scope, publish_many, records,
+    LeaseReservationTransaction, active_segments, expired_in_scope, publish_many, records,
 };
 use snapshot_lease_support::{
     fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,

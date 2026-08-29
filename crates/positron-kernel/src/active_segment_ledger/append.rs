@@ -170,7 +170,9 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             segment: self.storage.segment_id()?,
             frontier_authenticator: authenticator,
         });
-        state.retained_reservations.push(retained_reservation);
+        state
+            .retained_reservations
+            .push((self.storage.segment_id()?, retained_reservation));
         state.frontier = position;
         state.retained_bytes = retained_bytes;
         state.next_sequence = state

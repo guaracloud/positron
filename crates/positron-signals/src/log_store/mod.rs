@@ -5,6 +5,7 @@ mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
 mod metadata;
+mod retention;
 mod scan;
 mod schema;
 mod schema_scan;
@@ -25,6 +26,7 @@ use positron_kernel::{
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
 pub use metadata::LogMetadata;
 pub use positron_policy::PolicyProvenance;
+pub use retention::{LogRetentionOutcome, LogRetentionPolicy, RetentionClockProvenance};
 pub use scan::{
     LogScan, LogScanResult, ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver,
     ScannedLogRecord,
@@ -234,6 +236,17 @@ impl LogStore {
             observer,
             None,
         )
+    }
+
+    /// Enforces retention for one tenant-scoped Log Store ledger.
+    pub fn enforce_retention<'kernel, 'catalog, S: LifecycleClockSource>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        clock: &LifecycleClock<S>,
+        tenant: TenantId,
+        policy: LogRetentionPolicy,
+    ) -> Result<LogRetentionOutcome, LogStoreFailure> {
+        retention::enforce_retention(ledger, clock, tenant, policy)
     }
 }
 

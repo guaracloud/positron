@@ -13,6 +13,7 @@ mod reader;
 mod receipt;
 mod reconstruction;
 mod recovery;
+mod retention;
 mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_attempt;
@@ -23,6 +24,7 @@ mod snapshot_lease_record;
 mod snapshot_lease_recovery;
 mod snapshot_lease_replace;
 mod snapshot_lease_usage;
+mod snapshot_protection;
 mod state;
 mod storage;
 #[cfg(feature = "test-support")]
@@ -32,6 +34,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::fmt::Formatter;
 use std::sync::{Arc, Mutex};
 
@@ -55,11 +58,31 @@ pub use snapshot_lease_record::{
     MAX_SNAPSHOT_LEASE_TTL_SECONDS, SnapshotLeaseId, SnapshotLeaseUsage,
 };
 pub use snapshot_lease_replace::SnapshotLeaseReplacement;
+use snapshot_protection::SnapshotProtection;
 use state::LedgerState;
 use storage::LedgerStorage;
 #[cfg(feature = "test-support")]
 pub use test_support::publish_snapshot_lease_marker_for_test;
 pub use types::*;
+
+/// Result of a kernel-owned whole-segment retention publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionReclamation {
+    logically_retired_segments: usize,
+    physically_reclaimed_segments: usize,
+}
+
+impl RetentionReclamation {
+    #[must_use]
+    pub const fn logically_retired_segments(self) -> usize {
+        self.logically_retired_segments
+    }
+
+    #[must_use]
+    pub const fn physically_reclaimed_segments(self) -> usize {
+        self.physically_reclaimed_segments
+    }
+}
 
 const MAX_STORE_BLOCK_BYTES: usize = 1_048_576;
 const MAX_RETAINED_BLOCKS: usize = 1_024;
@@ -213,22 +236,32 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let frontier = reconstruction.frontier;
         let recovered_active = reconstruction.recovered_active;
 
-        let recovered_capacity = if blocks.is_empty() {
-            None
-        } else {
+        let mut recovered_capacity = Vec::new();
+        let mut retained_by_segment = BTreeMap::<SegmentId, (usize, usize)>::new();
+        for block in &blocks {
+            let entry = retained_by_segment.entry(block.segment_id()).or_default();
+            entry.0 = entry
+                .0
+                .checked_add(block.payload.len())
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        }
+        for (segment, (bytes, count)) in retained_by_segment {
             let claim = WorkClaim::tenant(
                 scope.tenant,
                 WorkKind::Ingest,
-                retained_claim(retained_bytes, blocks.len())?,
+                retained_claim(bytes, count)?,
             )
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            Some(
-                authority
-                    .governor()
-                    .reserve(claim)
-                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?,
-            )
-        };
+            let reservation = authority
+                .governor()
+                .reserve(claim)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+            recovered_capacity.push((segment, reservation));
+        }
         let successor = fresh_metadata(scope, frontier)?;
         let key = storage.create_active(successor, &protection, catalog.instance())?;
         if let Some((predecessor, _recovered_key)) = recovered_active {
@@ -255,7 +288,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             key,
             state: Mutex::new(LedgerState {
                 _capacity: reservation,
-                retained_reservations: recovered_capacity.into_iter().collect(),
+                retained_reservations: recovered_capacity,
                 frontier,
                 blocks,
                 retained_bytes,
@@ -286,6 +319,24 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.scope
     }
 
+    /// Returns the active segment identity for this physical scope.
+    pub fn active_segment_id(&self) -> Result<SegmentId, LedgerFailure> {
+        self.storage.segment_id()
+    }
+
+    /// Atomically removes complete sealed segments from new snapshots.
+    ///
+    /// Physical reclamation is intentionally a later kernel-owned phase. The
+    /// retired metadata remains authenticated and reachable until that phase
+    /// proves that no protected snapshot or lease still references it.
+    pub fn retire_sealed_segments(
+        &self,
+        segments: &[SegmentId],
+        now: u64,
+    ) -> Result<RetentionReclamation, LedgerFailure> {
+        retention::retire_sealed_segments(self, segments, now)
+    }
+
     /// Builds an immutable snapshot for an already-admitted task. The caller's
     /// task reservation covers construction CPU; the returned snapshot retains
     /// only resources that remain live with the view.
@@ -294,6 +345,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        let barrier = SnapshotProtection::read_barrier(self.authority.snapshot_barrier())?;
         let claim = WorkClaim::tenant(
             self.scope.tenant,
             WorkKind::InteractiveQueryTail,
@@ -313,6 +365,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             catalog_generation: catalog.number(),
             catalog_identity: catalog.identity(),
             blocks: state.blocks.clone(),
+            _protection: SnapshotProtection::with_barrier(
+                self.authority.snapshot_protection(),
+                barrier,
+                state.blocks.iter().map(CommittedBlock::segment_id),
+            )?,
         })
     }
 

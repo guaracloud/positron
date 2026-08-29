@@ -14,6 +14,7 @@ pub enum LogStoreFailureCode {
     Kernel,
     ResourceExhausted,
     ClockUnavailable,
+    ClockUncertain,
     ResourceAdmissionRefused,
     Cancelled,
     BudgetExhausted,
@@ -60,6 +61,12 @@ impl LogStoreFailure {
     pub(super) const fn clock_unavailable() -> Self {
         Self {
             code: LogStoreFailureCode::ClockUnavailable,
+        }
+    }
+
+    pub(super) const fn clock_uncertain() -> Self {
+        Self {
+            code: LogStoreFailureCode::ClockUncertain,
         }
     }
 

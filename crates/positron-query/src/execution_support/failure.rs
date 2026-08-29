@@ -61,7 +61,8 @@ const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> 
             QueryFailureCode::MalformedPersistentData
         },
         positron_signals::LogStoreFailureCode::Kernel
-        | positron_signals::LogStoreFailureCode::ClockUnavailable => {
+        | positron_signals::LogStoreFailureCode::ClockUnavailable
+        | positron_signals::LogStoreFailureCode::ClockUncertain => {
             QueryFailureCode::StoreUnavailable
         },
         positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {

@@ -92,6 +92,7 @@ fn map_stage_failure(failure: positron_signals::LogStoreFailure) -> SchemaSessio
         | positron_signals::LogStoreFailureCode::BudgetExhausted
         | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused
         | positron_signals::LogStoreFailureCode::ClockUnavailable
+        | positron_signals::LogStoreFailureCode::ClockUncertain
         | positron_signals::LogStoreFailureCode::Kernel
         | positron_signals::LogStoreFailureCode::Internal => {
             SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)

@@ -4,6 +4,7 @@ use crate::resource_governor::{StorageKernelResourceAuthority, WorkClaim, WorkKi
 use super::capacity::{recovery_claim, snapshot_retained_claim};
 use super::reconstruction::reconstruct;
 use super::recovery::RecoveryMode;
+use super::snapshot_protection::SnapshotProtection;
 use super::storage::LedgerStorage;
 use super::{
     ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, LedgerSnapshot, SegmentProtectionKey,
@@ -82,6 +83,7 @@ impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledge
     /// generation result.
     pub fn snapshot(&self) -> Result<LedgerSnapshot<'kernel>, LedgerFailure> {
         for attempt in 0..MAX_SNAPSHOT_RETRIES {
+            let barrier = SnapshotProtection::read_barrier(self.authority.snapshot_barrier())?;
             self.catalog.refresh_state()?;
             let basis = self.catalog.pin()?;
             let reconstruction_claim = WorkClaim::tenant(
@@ -96,6 +98,11 @@ impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledge
                 .reserve(reconstruction_claim)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
             let metadata = self.storage.catalog_segments_observed(&basis, self.scope)?;
+            let protection_claim = SnapshotProtection::with_barrier(
+                self.authority.snapshot_protection(),
+                barrier,
+                metadata.iter().map(|segment| segment.id),
+            )?;
             let reconstruction = reconstruct(
                 &self.storage,
                 &metadata,
@@ -133,6 +140,7 @@ impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledge
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
             return Ok(LedgerSnapshot {
                 _capacity: capacity,
+                _protection: protection_claim,
                 scope: self.scope,
                 frontier: reconstruction.frontier,
                 catalog_generation: basis.number(),

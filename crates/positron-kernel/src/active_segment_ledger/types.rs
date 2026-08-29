@@ -230,6 +230,12 @@ impl CommittedBlock {
         self.position
     }
 
+    /// Returns the immutable segment that durably contains this block.
+    #[must_use]
+    pub const fn segment_id(&self) -> SegmentId {
+        self.segment
+    }
+
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
@@ -244,6 +250,7 @@ impl CommittedBlock {
 /// A verified immutable view bounded by the published Durability Frontier.
 pub struct LedgerSnapshot<'kernel> {
     pub(super) _capacity: ResourceReservation<'kernel>,
+    pub(super) _protection: super::snapshot_protection::SnapshotProtection,
     pub(super) scope: SegmentScope,
     pub(super) frontier: CommitPosition,
     pub(super) catalog_generation: u64,

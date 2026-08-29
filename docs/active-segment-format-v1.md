@@ -22,8 +22,8 @@ the owned Primary Data Volume and opened relative to retained directories:
 The immutable physical scope is `(tenant_id, signal_kind, virtual_shard_id)`.
 One Catalog object records the scope, segment identity, lifecycle state, and
 base Commit Position. At most one object per scope may be active. Catalog
-Generations are the lifecycle authority; the header state records creation and
-is not rewritten while sealing.
+Generations are the lifecycle authority; the encrypted physical header records
+segment creation and is not rewritten while sealing or reclaiming.
 
 ## Catalog segment metadata
 
@@ -31,12 +31,12 @@ is not rewritten while sealing.
 | ---: | --- | --- |
 | 8 | magic | ASCII `PSEGMET1` |
 | 2 | version | `1` |
-| 1 | state | `1` active, `2` sealed |
+| 1 | state | `1` active, `2` sealed, `3` retired |
 | 16 | tenant ID | nonzero domain identity |
 | 1 | signal | `1` logs, `2` traces |
 | 4 | virtual shard ID | valid nonzero shard |
 | 16 | segment ID | random, nonzero |
-| 8 | base Commit Position | predecessor frontier |
+| 8 | base Commit Position | predecessor frontier; for `retired`, the segment's final frontier |
 
 The encoding is exactly 56 bytes. Objects without this magic belong to another
 Catalog authority and are ignored. Matching magic with invalid length,
@@ -69,7 +69,10 @@ also embedded in the canonical wrapped payload and its context digest. The
 wrapped-key context binds the Positron instance, key kind, segment object and
 key epoch, segment scope, tenant, signal, shard, format epoch, and exact provider
 route. The encrypted metadata independently binds scope, segment identity,
-creation lifecycle, and base Commit Position. A wrong protection key,
+creation lifecycle, and the segment's creation base Commit Position. Retention
+does not rewrite this physical metadata; a retired Catalog continuity marker
+is the logical retirement record after the file leaves the active snapshot set.
+A wrong protection key,
 substituted route, or substituted context fails authentication.
 
 The header is written once, synchronized, then made reachable by synchronizing
@@ -170,8 +173,14 @@ migration path.
 
 Sealing moves the unchanged segment and frontier from `active` to `sealed`,
 synchronizes both directories, and publishes sealed Catalog metadata. It does
-not copy, decrypt, re-encrypt, or rewrite acknowledged bytes. Every rename and
-publication edge is idempotently recoverable.
+not copy, decrypt, re-encrypt, or rewrite acknowledged bytes. Retention changes
+sealed metadata to `retired` in one Catalog publication, recording its final
+frontier in the retired metadata and making the segment
+invisible to new snapshots. The retired files remain in `sealed` until no
+existing snapshot or live Snapshot Lease references them; reclamation then
+unlinks the files and retains a bounded retired Catalog continuity marker so
+the next active segment can be reopened without reintroducing expired data.
+Every rename and publication edge is idempotently recoverable.
 
 ## Bounds
 
