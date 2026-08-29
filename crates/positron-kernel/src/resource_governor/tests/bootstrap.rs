@@ -158,6 +158,18 @@ fn layout_arithmetic_overflow_is_rejected_without_allocation() {
 }
 
 #[test]
+fn zero_bootstrap_cardinalities_are_rejected_before_allocation() {
+    assert_eq!(
+        BootstrapInventoryLayout::new(0, 1),
+        Err(GovernorFailure::InvalidConfiguration)
+    );
+    assert_eq!(
+        BootstrapInventoryLayout::new(1, 0),
+        Err(GovernorFailure::InvalidConfiguration)
+    );
+}
+
+#[test]
 fn establishment_moves_every_retained_payload_without_reallocation() {
     let configuration = ResourceGovernorConfiguration::new(inventory(), policy(), recovery_pools())
         .expect("configuration is valid");
