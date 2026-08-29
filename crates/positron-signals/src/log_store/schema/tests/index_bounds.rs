@@ -564,8 +564,29 @@ fn query_indexes_merge_idempotently_and_reconcile_reachability() -> Result<(), B
     );
     catalog.install_query_index(index_for(&catalog, first, digest, "alpha")?)?;
     catalog.install_query_index(index_for(&catalog, first, digest, "alpha")?)?;
+    catalog.install_query_index(valued_index_for(&catalog, first, digest, "alpha", "first")?)?;
+    catalog.install_query_index(valued_index_for(
+        &catalog, first, digest, "alpha", "second",
+    )?)?;
+    catalog.install_query_index(valued_index_for(
+        &catalog, first, digest, "alpha", "second",
+    )?)?;
     catalog.install_query_index(index_for(&catalog, first, digest, "beta")?)?;
     catalog.install_query_index(index_for(&catalog, first, digest, "beta")?)?;
+    let first_index = catalog
+        .block_indexes
+        .iter()
+        .find(|index| index.identity == first)
+        .ok_or("first index")?;
+    let alpha_path = path(AttributeNamespace::Record, "alpha");
+    assert_eq!(
+        first_index.covers_value(&alpha_path, &SchemaValue::string("first")),
+        Some(true)
+    );
+    assert_eq!(
+        first_index.covers_value(&alpha_path, &SchemaValue::string("second")),
+        Some(true)
+    );
     assert_eq!(
         catalog.install_query_index(index_for(&catalog, first, [0x63; 32], "alpha")?),
         Err(super::super::SchemaFailure::InvalidValue)
@@ -764,6 +785,25 @@ fn index_for(
     let path = path(AttributeNamespace::Record, key);
     let variants = catalog.entry(&path).ok_or("entry")?.variants();
     let indexed = super::super::index::SchemaIndexPath::from_variants(&path, variants)?;
+    Ok(super::super::index::SchemaBlockIndex::one(
+        identity, digest, indexed,
+    )?)
+}
+
+fn valued_index_for(
+    catalog: &SchemaCatalog,
+    identity: StoreBlockIdentity,
+    digest: [u8; 32],
+    key: &str,
+    value: &str,
+) -> Result<super::super::index::SchemaBlockIndex, Box<dyn Error>> {
+    let path = path(AttributeNamespace::Record, key);
+    let variants = catalog.entry(&path).ok_or("entry")?.variants();
+    let indexed = super::super::index::SchemaIndexPath::from_variants_and_values(
+        &path,
+        variants,
+        &[SchemaValue::string(value)],
+    )?;
     Ok(super::super::index::SchemaBlockIndex::one(
         identity, digest, indexed,
     )?)

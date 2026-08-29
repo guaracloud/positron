@@ -125,21 +125,14 @@ impl SchemaCatalog {
                 if &merged == current {
                     return Ok(());
                 }
-                let mut projected = Vec::new();
-                projected
-                    .try_reserve_exact(known.paths.len())
-                    .map_err(|_| SchemaFailure::AllocationUnavailable)?;
-                for (path_index, known_path) in known.paths.iter().enumerate() {
-                    if path_index == existing {
-                        projected.push(merged.try_clone()?);
-                    } else {
-                        projected.push(known_path.try_clone()?);
-                    }
-                }
                 let mut next = self.clone_block_indexes()?;
-                next.get_mut(position)
+                let replacement = next
+                    .get_mut(position)
                     .ok_or(SchemaFailure::InvalidValue)?
-                    .paths = projected;
+                    .paths
+                    .get_mut(existing)
+                    .ok_or(SchemaFailure::InvalidValue)?;
+                *replacement = merged;
                 return self.replace_block_indexes(next, 0, 0, 0, 0);
             },
             Err(insertion) => insertion,
