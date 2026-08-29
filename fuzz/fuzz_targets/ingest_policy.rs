@@ -20,7 +20,7 @@ use positron_governance::{
 use positron_ingest::{
     AuthenticatedOtlpLogsRequest, FixedAdmissionGroupPlanner, IngestPolicy, LogIngest,
     OtlpLogsReceiver, PolicyAction, PolicyAttributePath, PolicyPredicate, PolicyReceiver,
-    PolicyRule, PolicyTarget,
+    PolicyRule, PolicyTarget, TenantSchemaRegistry, TenantSchemaSession,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, FixedLifecycleClockSource,
@@ -44,6 +44,7 @@ struct FuzzFixture {
     context: AuthorizedContext,
     authority: &'static StorageKernelResourceAuthority,
     ledger: &'static ActiveSegmentLedger<'static, 'static>,
+    schema: TenantSchemaSession,
     _root: FuzzRoot,
 }
 
@@ -97,11 +98,13 @@ impl FuzzFixture {
             SegmentScope::new(tenant, SignalKind::Logs, shard),
             SegmentProtectionKey::from_owned(Box::new([0x84; 32])),
         )?));
+        let schema = TenantSchemaRegistry::new(1)?.session(tenant, authority.governor())?;
         Ok(Self {
             tenant,
             context,
             authority,
             ledger,
+            schema,
             _root: FuzzRoot(root),
         })
     }
@@ -139,6 +142,7 @@ impl FuzzFixture {
             &policy,
             self.tenant,
             shard,
+            self.schema.clone(),
         )
         .accept(group.into_batch(), block_identity(data));
     }

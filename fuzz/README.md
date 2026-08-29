@@ -19,6 +19,14 @@ checkpoint round trips share one bounded production-API target:
 cargo +nightly fuzz run schema_discovery_query
 ```
 
+The bounded ingest-policy target compiles adversarial rule programs and drives
+them through authenticated OTLP decoding, admission grouping, schema ownership,
+and durable ingest:
+
+```console
+cargo +nightly fuzz run ingest_policy --sanitizer none -- -runs=1000
+```
+
 The repository's production toolchain remains pinned; `cargo-fuzz` uses an
 installed nightly toolchain only for sanitizer instrumentation.
 
