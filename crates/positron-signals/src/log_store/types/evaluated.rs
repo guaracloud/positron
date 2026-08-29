@@ -14,11 +14,8 @@ impl LogRecord {
         let attributes = attributes
             .into_iter()
             .map(|attribute| {
-                AttributeOccurrenceSetCandidate::new(
-                    attribute.namespace(),
-                    attribute.key().to_owned(),
-                    attribute.occurrences().to_vec(),
-                )
+                let (namespace, key, occurrences) = attribute.into_parts();
+                AttributeOccurrenceSetCandidate::new(namespace, key, occurrences)
             })
             .collect();
         Self::checked_receiver_candidate_with_metadata(

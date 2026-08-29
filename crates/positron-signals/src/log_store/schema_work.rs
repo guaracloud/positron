@@ -42,20 +42,15 @@ impl super::LogStore {
                 .try_reserve_exact(record.attributes().len())
                 .map_err(|_| LogStoreFailure::resource_exhausted())?;
             for attribute in record.attributes() {
-                attributes.push(
-                    attribute
-                        .occurrences()
-                        .try_clone()
-                        .map_err(LogStoreFailure::domain)?,
-                );
+                attributes.push(attribute.occurrences());
             }
-            let observation = schema
-                .stage_record(&attributes, &mut delta, &mut meter)
+            let representations = schema
+                .stage_record_representations(&attributes, &mut delta, &mut meter)
                 .map_err(map_schema_failure)?;
-            for (attribute, (_, representation)) in record
+            for (attribute, representation) in record
                 .attributes_mut()
                 .iter_mut()
-                .zip(observation.attributes())
+                .zip(representations.into_representations())
             {
                 attribute.set_representation(match representation {
                     SchemaRepresentation::Cataloged => AttributeRepresentation::Generic,

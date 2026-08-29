@@ -18,6 +18,7 @@ pub(crate) struct ObservedAttribute {
 }
 
 impl ObservedAttribute {
+    #[cfg(test)]
     pub(crate) const fn new(
         set: AttributeOccurrenceSet,
         path: SchemaPath,
@@ -32,6 +33,7 @@ impl ObservedAttribute {
 }
 
 impl SchemaObservation {
+    #[cfg(test)]
     pub(crate) fn new(attributes: Vec<ObservedAttribute>, overflow_bytes: u64) -> Self {
         let overflow_records = u64::from(
             attributes

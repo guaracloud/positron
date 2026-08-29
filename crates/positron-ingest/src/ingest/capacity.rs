@@ -15,10 +15,6 @@ const MAX_ADMITTED_TEXT_WORK_UNITS: u64 = 31;
 pub(super) struct SchemaAdmissionEstimate {
     staging_memory_bytes: u64,
     retained_memory_bytes: u64,
-    #[allow(dead_code)]
-    discovery_nodes: u64,
-    #[allow(dead_code)]
-    text_work_units: u64,
     schema_work_units: u64,
 }
 
@@ -31,16 +27,6 @@ impl SchemaAdmissionEstimate {
         self.retained_memory_bytes
     }
 
-    #[allow(dead_code)]
-    pub(super) const fn discovery_nodes(self) -> u64 {
-        self.discovery_nodes
-    }
-
-    #[allow(dead_code)]
-    pub(super) const fn text_work_units(self) -> u64 {
-        self.text_work_units
-    }
-
     pub(super) const fn schema_work_units(self) -> u64 {
         self.schema_work_units
     }
@@ -49,7 +35,7 @@ impl SchemaAdmissionEstimate {
 pub(super) fn schema_admission_estimate(
     records: &[NativeLogCandidate],
 ) -> Option<SchemaAdmissionEstimate> {
-    let mut clone_bytes = 0_u64;
+    let mut staging_view_bytes = 0_u64;
     let mut schema_bytes = u64::try_from(std::mem::size_of::<Vec<SchemaEntry>>()).ok()?;
     let mut discovery_nodes = 0_u64;
     let mut text_body_bytes = 0_usize;
@@ -57,16 +43,14 @@ pub(super) fn schema_admission_estimate(
     let mut has_text_body = false;
     let discovery_limit = u64::try_from(SchemaBudget::system_max_discovery_nodes()).ok()?;
     for record in records {
+        staging_view_bytes =
+            staging_view_bytes.max(schema_staging_view_bytes(record.attributes().len())?);
         if let Some(positron_domain::value::CandidateAttributeValue::String(body)) = record.body() {
             has_text_body = true;
             text_body_bytes = text_body_bytes.checked_add(body.len())?;
         }
         for attribute in record.attributes() {
-            clone_bytes = clone_bytes
-                .checked_add(u64::try_from(attribute.key().len()).ok()?)?
-                .checked_add(u64::try_from(std::mem::size_of_val(attribute)).ok()?)?;
             for value in attribute.occurrences() {
-                accumulate_clone_bytes(value, &mut clone_bytes)?;
                 accumulate_schema_bytes(value, attribute.key().len(), 1, &mut schema_bytes)?;
                 accumulate_discovery_nodes(value, &mut discovery_nodes, discovery_limit)?;
             }
@@ -90,8 +74,7 @@ pub(super) fn schema_admission_estimate(
     }
     let retained_memory_bytes =
         schema_bytes.min(u64::try_from(SchemaBudget::system_max_memory_bytes()).ok()?);
-    let staging_memory_bytes = clone_bytes
-        .checked_mul(2)?
+    let staging_memory_bytes = staging_view_bytes
         .checked_add(schema_bytes.min(schema_stage_ceiling_bytes()?))?
         .max(1);
     let text_optional_work = if has_text_body {
@@ -102,12 +85,22 @@ pub(super) fn schema_admission_estimate(
     Some(SchemaAdmissionEstimate {
         staging_memory_bytes,
         retained_memory_bytes,
-        discovery_nodes,
-        text_work_units,
         schema_work_units: schema_discovery_cpu_work_units(discovery_nodes)?
             .checked_add(text_work_units)?
             .checked_add(text_optional_work)?,
     })
+}
+
+fn schema_staging_view_bytes(attribute_count: usize) -> Option<u64> {
+    if attribute_count == 0 {
+        return Some(0);
+    }
+    let slots = attribute_count.checked_mul(
+        std::mem::size_of::<&positron_domain::value::AttributeOccurrenceSet>()
+            .checked_add(std::mem::size_of::<positron_signals::SchemaRepresentation>())?,
+    )?;
+    let allocator_overhead = 4_usize.checked_mul(std::mem::size_of::<usize>())?;
+    u64::try_from(slots.checked_add(allocator_overhead)?).ok()
 }
 
 pub(super) fn group_work_amounts(
@@ -163,43 +156,6 @@ fn schema_stage_ceiling_bytes() -> Option<u64> {
             .checked_add(std::mem::size_of::<Vec<SchemaEntry>>())?,
     )
     .ok()
-}
-
-fn accumulate_clone_bytes(
-    value: &positron_domain::value::CandidateAttributeValue,
-    bytes: &mut u64,
-) -> Option<()> {
-    use positron_domain::value::CandidateAttributeValue as Value;
-    let allocation_overhead =
-        u64::try_from(2_usize.checked_mul(std::mem::size_of::<usize>())?).ok()?;
-    *bytes = bytes.checked_add(u64::try_from(std::mem::size_of_val(value)).ok()?)?;
-    *bytes = bytes.checked_add(match value {
-        Value::Null | Value::Boolean(_) | Value::SignedInteger(_) | Value::FloatingPointBits(_) => {
-            0
-        },
-        Value::String(value) => u64::try_from(value.len())
-            .ok()?
-            .checked_add(allocation_overhead)?,
-        Value::Bytes(value) => u64::try_from(value.len())
-            .ok()?
-            .checked_add(allocation_overhead)?,
-        Value::Array(values) => {
-            for value in values {
-                accumulate_clone_bytes(value, bytes)?;
-            }
-            allocation_overhead
-        },
-        Value::KeyValueList(entries) => {
-            for entry in entries {
-                *bytes = bytes
-                    .checked_add(u64::try_from(std::mem::size_of::<String>()).ok()?)?
-                    .checked_add(u64::try_from(entry.key().len()).ok()?)?;
-                accumulate_clone_bytes(entry.value(), bytes)?;
-            }
-            allocation_overhead
-        },
-    })?;
-    Some(())
 }
 
 fn accumulate_discovery_nodes(

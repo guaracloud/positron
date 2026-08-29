@@ -701,7 +701,7 @@ fn nested_index_evidence_falls_back_at_the_value_ceiling() -> Result<(), Box<dyn
     let fallback = super::super::index::SchemaIndexPath::from_variants_and_attributes(
         &indexed_path,
         &variants,
-        &sets,
+        &sets.iter().collect::<Vec<_>>(),
     )?;
     assert!(fallback.values.is_empty());
 
@@ -713,7 +713,7 @@ fn nested_index_evidence_falls_back_at_the_value_ceiling() -> Result<(), Box<dyn
     let scalar_fallback = super::super::index::SchemaIndexPath::from_variants_and_attributes(
         &indexed_path,
         &variants,
-        &[scalar],
+        &[&scalar],
     )?;
     assert!(scalar_fallback.values.is_empty());
 
@@ -728,7 +728,7 @@ fn nested_index_evidence_falls_back_at_the_value_ceiling() -> Result<(), Box<dyn
     let complete_index = super::super::index::SchemaIndexPath::from_variants_and_attributes(
         &indexed_path,
         &variants,
-        &[complete],
+        &[&complete],
     )?;
     assert_eq!(complete_index.values, vec![SchemaValue::signed_integer(7)]);
     assert!(complete_index.encoded_bytes()? > 0);

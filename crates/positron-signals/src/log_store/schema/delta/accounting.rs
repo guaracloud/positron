@@ -13,7 +13,7 @@ pub(super) fn root_fits(
     catalog: &SchemaCatalog,
     delta: &SchemaDelta,
     root: &[SchemaEntry],
-    attributes: &[AttributeOccurrenceSet],
+    attributes: &[&AttributeOccurrenceSet],
 ) -> Result<bool, SchemaFailure> {
     if delta.build_physical_index
         && delta.index_paths.is_empty()

@@ -44,7 +44,7 @@ impl SchemaIndexPath {
     pub(crate) fn from_variants_and_attributes(
         path: &SchemaPath,
         variants: &[AttributeValueKind],
-        attributes: &[AttributeOccurrenceSet],
+        attributes: &[&AttributeOccurrenceSet],
     ) -> Result<Self, SchemaFailure> {
         let (_, nested_segments) = path
             .segments()

@@ -16,8 +16,6 @@ fn schema(memory: u64) -> SchemaAdmissionEstimate {
     SchemaAdmissionEstimate {
         staging_memory_bytes: memory,
         retained_memory_bytes: memory,
-        discovery_nodes: 1,
-        text_work_units: 0,
         schema_work_units: 1,
     }
 }
@@ -61,16 +59,33 @@ fn discovery_cpu_uses_actual_bounded_candidate_nodes() {
         let candidate = candidate_with_occurrences(nodes);
         let estimate =
             schema_admission_estimate(std::slice::from_ref(&candidate)).expect("bounded estimate");
+        let expected_nodes = u64::try_from(expected_nodes).expect("nodes");
         assert_eq!(
-            estimate.discovery_nodes(),
-            u64::try_from(expected_nodes).expect("nodes")
+            schema_discovery_cpu_work_units(expected_nodes),
+            Some(expected_quanta)
         );
         assert_eq!(
-            schema_discovery_cpu_work_units(estimate.discovery_nodes()),
-            Some(expected_quanta),
+            estimate.schema_work_units(),
+            expected_quanta,
             "node count {nodes}"
         );
     }
+}
+
+#[test]
+fn unindexed_attribute_payload_does_not_inflate_schema_staging_reservation() {
+    let small = candidate_with_string_attribute_payload(1);
+    let large = candidate_with_string_attribute_payload(32 * 1_024);
+    let small_estimate =
+        schema_admission_estimate(std::slice::from_ref(&small)).expect("small estimate");
+    let large_estimate =
+        schema_admission_estimate(std::slice::from_ref(&large)).expect("large estimate");
+
+    assert_eq!(
+        large_estimate.staging_memory_bytes(),
+        small_estimate.staging_memory_bytes(),
+        "schema staging retains paths and kinds, not unindexed scalar payload bytes"
+    );
 }
 
 #[test]
@@ -172,6 +187,33 @@ fn candidate_with_occurrences(nodes: usize) -> NativeLogCandidate {
             AttributeNamespace::Record,
             "node".to_owned(),
             vec![CandidateAttributeValue::Boolean(true); nodes],
+        )],
+        crate::LogMetadata::new(
+            0,
+            String::new(),
+            None,
+            None,
+            0,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            String::new(),
+            0,
+            String::new(),
+        ),
+    )
+}
+
+fn candidate_with_string_attribute_payload(bytes: usize) -> NativeLogCandidate {
+    NativeLogCandidate::new(
+        None,
+        None,
+        None,
+        vec![NativeLogAttribute::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            vec![CandidateAttributeValue::string("x".repeat(bytes))],
         )],
         crate::LogMetadata::new(
             0,

@@ -6,6 +6,7 @@ pub(crate) use super::discovery_meter::DiscoveryMeter;
 use super::failure::SchemaFailure;
 use super::index::{SchemaBlockIndex, SchemaIndexPath};
 use super::model::{SchemaEntry, SchemaPath, promoted_index_bytes};
+#[cfg(test)]
 use super::observation::{ObservedAttribute, SchemaObservation};
 use super::representation::SchemaRepresentation;
 use super::text_index::TextBlockSummary;
@@ -37,6 +38,24 @@ pub struct SchemaDelta {
     physical_memory_bytes: usize,
     build_physical_index: bool,
     text_summary: Option<TextBlockSummary>,
+}
+
+pub(crate) struct SchemaStageResult {
+    representations: Vec<SchemaRepresentation>,
+    #[cfg(test)]
+    overflow_bytes: u64,
+}
+
+impl SchemaStageResult {
+    pub(crate) fn into_representations(self) -> Vec<SchemaRepresentation> {
+        self.representations
+    }
+
+    fn all_cataloged(&self) -> bool {
+        self.representations
+            .iter()
+            .all(|representation| *representation == SchemaRepresentation::Cataloged)
+    }
 }
 
 impl SchemaDelta {
@@ -170,12 +189,7 @@ impl SchemaCatalog {
         let mut overflow_bytes = 0_u64;
         for attribute in attributes {
             match attribute.representation() {
-                AttributeRepresentation::Generic => generic.push(
-                    attribute
-                        .occurrences()
-                        .try_clone()
-                        .map_err(|_| SchemaFailure::AllocationUnavailable)?,
-                ),
+                AttributeRepresentation::Generic => generic.push(attribute.occurrences()),
                 AttributeRepresentation::SchemaOverflow => {
                     delta.mark_overflow_paths(self, attribute.occurrences(), meter)?;
                     overflow_bytes = overflow_bytes
@@ -184,11 +198,8 @@ impl SchemaCatalog {
                 },
             }
         }
-        let observation = self.stage_record(&generic, delta, meter)?;
-        if observation
-            .attributes()
-            .any(|(_, representation)| representation != SchemaRepresentation::Cataloged)
-        {
+        let staged = self.stage_record_representations(&generic, delta, meter)?;
+        if !staged.all_cataloged() {
             return Err(SchemaFailure::InvalidValue);
         }
         if overflow_bytes > 0 {
@@ -198,14 +209,14 @@ impl SchemaCatalog {
         Ok(())
     }
 
-    pub(crate) fn stage_record(
+    pub(crate) fn stage_record_representations(
         &self,
-        attributes: &[AttributeOccurrenceSet],
+        attributes: &[&AttributeOccurrenceSet],
         delta: &mut SchemaDelta,
         meter: &mut DiscoveryMeter,
-    ) -> Result<SchemaObservation, SchemaFailure> {
-        let mut observed = Vec::new();
-        observed
+    ) -> Result<SchemaStageResult, SchemaFailure> {
+        let mut representations = Vec::new();
+        representations
             .try_reserve_exact(attributes.len())
             .map_err(|_| SchemaFailure::AllocationUnavailable)?;
         let mut record_overflow_bytes = 0_u64;
@@ -236,22 +247,49 @@ impl SchemaCatalog {
             delta.persistent_bytes = persistent;
             delta.index_bytes = index;
             delta.staged_memory_bytes = staged_memory_bytes(delta)?;
-            observed.push(ObservedAttribute::new(
-                set.try_clone()
-                    .map_err(|_| SchemaFailure::AllocationUnavailable)?,
-                path,
-                if cataloged {
-                    SchemaRepresentation::Cataloged
-                } else {
-                    SchemaRepresentation::Overflow
-                },
-            ));
+            representations.push(if cataloged {
+                SchemaRepresentation::Cataloged
+            } else {
+                SchemaRepresentation::Overflow
+            });
         }
         if record_overflow_bytes > 0 {
             delta.overflow_records = delta.overflow_records.saturating_add(1);
             delta.overflow_bytes = delta.overflow_bytes.saturating_add(record_overflow_bytes);
         }
-        Ok(SchemaObservation::new(observed, record_overflow_bytes))
+        Ok(SchemaStageResult {
+            representations,
+            #[cfg(test)]
+            overflow_bytes: record_overflow_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_record(
+        &self,
+        attributes: &[AttributeOccurrenceSet],
+        delta: &mut SchemaDelta,
+        meter: &mut DiscoveryMeter,
+    ) -> Result<SchemaObservation, SchemaFailure> {
+        let mut borrowed = Vec::new();
+        borrowed
+            .try_reserve_exact(attributes.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        borrowed.extend(attributes);
+        let staged = self.stage_record_representations(&borrowed, delta, meter)?;
+        let mut observed = Vec::new();
+        observed
+            .try_reserve_exact(attributes.len())
+            .map_err(|_| SchemaFailure::AllocationUnavailable)?;
+        for (set, representation) in attributes.iter().zip(staged.representations) {
+            observed.push(ObservedAttribute::new(
+                set.try_clone()
+                    .map_err(|_| SchemaFailure::AllocationUnavailable)?,
+                SchemaPath::root_borrowed(set.namespace(), set.key())?,
+                representation,
+            ));
+        }
+        Ok(SchemaObservation::new(observed, staged.overflow_bytes))
     }
 }
 

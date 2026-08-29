@@ -12,7 +12,7 @@ pub(crate) fn additional_physical_cost(
     catalog: &SchemaCatalog,
     delta: &SchemaDelta,
     root: &[SchemaEntry],
-    attributes: &[AttributeOccurrenceSet],
+    attributes: &[&AttributeOccurrenceSet],
 ) -> Result<(usize, usize), SchemaFailure> {
     if !delta.build_physical_index {
         return Ok((0, 0));
@@ -32,7 +32,7 @@ fn scalar_values_fit(
     catalog: &SchemaCatalog,
     delta: &SchemaDelta,
     root: &[SchemaEntry],
-    attributes: &[AttributeOccurrenceSet],
+    attributes: &[&AttributeOccurrenceSet],
 ) -> Result<bool, SchemaFailure> {
     let (memory, wire) = match projected_physical_cost(catalog, delta, root, attributes, true) {
         Ok(cost) => cost,
@@ -57,7 +57,7 @@ fn projected_physical_cost(
     catalog: &SchemaCatalog,
     delta: &SchemaDelta,
     root: &[SchemaEntry],
-    attributes: &[AttributeOccurrenceSet],
+    attributes: &[&AttributeOccurrenceSet],
     include_values: bool,
 ) -> Result<(usize, usize), SchemaFailure> {
     let paths = projected_paths(delta, root, attributes, include_values)?;
@@ -90,7 +90,7 @@ fn projected_physical_cost(
 fn projected_paths(
     delta: &SchemaDelta,
     root: &[SchemaEntry],
-    attributes: &[AttributeOccurrenceSet],
+    attributes: &[&AttributeOccurrenceSet],
     include_values: bool,
 ) -> Result<Vec<SchemaIndexPath>, SchemaFailure> {
     let mut paths = Vec::new();
@@ -152,7 +152,7 @@ pub(super) fn stage_index_root(
     catalog: &SchemaCatalog,
     delta: &mut SchemaDelta,
     root: &[SchemaEntry],
-    attributes: &[AttributeOccurrenceSet],
+    attributes: &[&AttributeOccurrenceSet],
 ) -> Result<(), SchemaFailure> {
     if !delta.build_physical_index {
         return Ok(());

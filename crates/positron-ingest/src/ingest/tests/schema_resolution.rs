@@ -34,7 +34,7 @@ fn production_observed_schema_stage_publishes_a_complete_text_summary() {
     );
     let estimate = schema_admission_estimate(std::slice::from_ref(&candidate))
         .expect("bounded schema estimate");
-    assert!(estimate.text_work_units() > 0);
+    assert!(estimate.schema_work_units() > 0);
     let policy = IngestPolicy::preserving(1).expect("policy");
     let PolicyEvaluation::Accepted(evaluated) = policy
         .evaluate(candidate, PolicyReceiver::OtlpGrpc)

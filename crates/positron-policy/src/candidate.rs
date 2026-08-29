@@ -39,6 +39,11 @@ impl NativeLogAttribute {
         &self.occurrences
     }
 
+    #[must_use]
+    pub fn into_parts(self) -> (AttributeNamespace, String, Vec<CandidateAttributeValue>) {
+        (self.namespace, self.key, self.occurrences)
+    }
+
     pub(crate) fn occurrences_mut(&mut self) -> &mut Vec<CandidateAttributeValue> {
         &mut self.occurrences
     }
