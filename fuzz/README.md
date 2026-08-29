@@ -71,6 +71,13 @@ authentication, duplicate-shard rejection, and truncation handling:
 cargo +nightly fuzz run tail_cursor --sanitizer none -- -runs=1000
 ```
 
+The live-tail state-machine target drives bounded multi-shard poll,
+acknowledgement, resume, cancellation, disconnect, drop, and cleanup sequences:
+
+```console
+cargo +nightly fuzz run tail_state_machine --sanitizer none -- -runs=1000
+```
+
 The persistent snapshot-lease target exercises the production PSLEASE1 v1
 through v4 codec, including marker and physical-usage fields, checked lengths,
 unknown tags, truncation, and overflow mutations:

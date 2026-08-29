@@ -11,8 +11,6 @@ use super::source::TailSourceSet;
 use super::terminal::{TailStats, TailTerminal, TerminalKind};
 #[path = "session_leases.rs"]
 mod leases;
-#[path = "session_lifecycle.rs"]
-mod lifecycle;
 use leases::LeaseRotation;
 #[path = "session_progress.rs"]
 mod progress;
@@ -102,6 +100,17 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
     pub fn safe_cursor(&self) -> &TailCursor {
         self.cursor_observed.set(true);
         &self.cursor
+    }
+
+    fn retain_resumable_leases(&mut self) {
+        if self._lease.as_ref().is_some_and(|lease| {
+            self.state
+                .source_binding(lease.snapshot().scope().shard_id())
+                .is_some()
+        }) {
+            self.lease_owner.retain();
+        }
+        self.source_lease_owners.retain();
     }
 
     pub(super) fn publish_delivery_cursor(&mut self, digest: [u8; 32]) -> Result<(), QueryFailure> {
@@ -269,14 +278,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             // A caller that has taken the opaque cursor may reconnect after an
             // incomplete terminal. Keep the exact durable leases alive; their
             // bounded expiry and the kernel's cleanup path remain authoritative.
-            if self._lease.as_ref().is_some_and(|lease| {
-                self.state
-                    .source_binding(lease.snapshot().scope().shard_id())
-                    .is_some()
-            }) {
-                self.lease_owner.retain();
-            }
-            self.source_lease_owners.retain();
+            self.retain_resumable_leases();
         } else {
             let primary_failure = self.lease_owner.release().err();
             let mut cleanup_failure = None;
@@ -360,6 +362,14 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                     TerminalKind::StoreUnavailable
                 });
             })
+    }
+}
+
+impl Drop for TailSession<'_, '_, '_, '_> {
+    fn drop(&mut self) {
+        if self.terminal_cursor_allowed && (self.cursor_observed.get() || self.terminal_emitted) {
+            self.retain_resumable_leases();
+        }
     }
 }
 
