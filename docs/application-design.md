@@ -1269,10 +1269,10 @@ belongs to another module. Both are shown explicitly.
 No second module maintains an independently authoritative copy. Caches carry
 source generation or identity and invalidate when it changes.
 
-## 8. Proposed Rust workspace
+## 8. Rust workspace
 
 Crates are deployment and compilation tools, not a reason to fragment every
-internal module. Start with this coarse workspace:
+internal module. The implemented workspace is:
 
 ```text
 api/positron/v1/             canonical hand-edited Protobuf
@@ -1288,17 +1288,17 @@ crates/
   positron-policy/           bounded producer-neutral policy and evaluated type-state
   positron-ingest/           native ingest orchestration and receiver adapters
   positron-query/            planning, execution, cursor, tail, and export
-  positron-backup/           repositories, backup, restore, and purge support
-  positron-upgrade/          version preflight and persistent-format migration
-  positron-diagnostics/      doctor and support bundles
-  positron-operator/         Kubernetes reconciliation
-  positron-release/          manifest and trust verification
 integrations/grafana/        minimal host-required Grafana implementation
 sdk/                         generated SDK publication workspaces
 deploy/                      OCI, packages, Compose, Helm, Nix, and examples
 ```
 
-The initial crate dependency graph is acyclic:
+Backup and Restore, Upgrade and Migration, Diagnostics, Positron Operator, and
+Release Trust remain required Release 1 modules with the ownership assigned in
+this document. Each becomes a workspace crate with its first complete bounded
+behavior; empty crates are not kept as architectural placeholders.
+
+The production crate dependency graph is acyclic:
 
 ```mermaid
 flowchart TD
@@ -1308,33 +1308,28 @@ flowchart TD
     config["positron-config"]
     runtime["positron-runtime"]
     kernel["positron-kernel"]
+    darwin_acl["positron-darwin-acl"]
+    darwin_system["positron-darwin-system"]
     signals["positron-signals"]
     governance["positron-governance"]
     policy["positron-policy"]
     ingest["positron-ingest"]
     query["positron-query"]
-    backup["positron-backup"]
-    upgrade["positron-upgrade"]
-    diagnostics["positron-diagnostics"]
-    operator["positron-operator"]
-    release["positron-release"]
 
     app --> runtime
-    app --> governance
-    app --> ingest
-    app --> query
-    app --> backup
-    app --> upgrade
-    app --> diagnostics
-    app --> operator
-    app --> release
+    app --> config
+    app --> kernel
 
     runtime --> api
-    runtime --> config
     runtime --> domain
     runtime --> governance
+    runtime --> ingest
     runtime --> kernel
+    runtime --> query
+    runtime --> signals
     kernel --> domain
+    kernel --> darwin_acl
+    kernel --> darwin_system
     signals --> kernel
     signals --> domain
     signals --> policy
@@ -1348,17 +1343,6 @@ flowchart TD
     query --> signals
     query --> kernel
     query --> domain
-    backup --> governance
-    backup --> kernel
-    backup --> domain
-    upgrade --> governance
-    upgrade --> kernel
-    upgrade --> backup
-    upgrade --> release
-    diagnostics --> runtime
-    diagnostics --> governance
-    diagnostics --> kernel
-    operator --> api
 ```
 
 An arrow means “may depend on.” Registered handlers invert calls at runtime:

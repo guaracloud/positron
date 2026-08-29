@@ -2,22 +2,17 @@
 members = [
     "crates/positron",
     "crates/positron-api",
-    "crates/positron-backup",
     "crates/positron-config",
-    "crates/positron-diagnostics",
     "crates/positron-darwin-acl",
     "crates/positron-darwin-system",
     "crates/positron-domain",
     "crates/positron-governance",
     "crates/positron-ingest",
     "crates/positron-kernel",
-    "crates/positron-operator",
     "crates/positron-policy",
     "crates/positron-query",
-    "crates/positron-release",
     "crates/positron-runtime",
     "crates/positron-signals",
-    "crates/positron-upgrade",
 ]
 resolver = "3"
 

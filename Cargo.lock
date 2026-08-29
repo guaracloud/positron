@@ -1056,10 +1056,6 @@ name = "positron-api"
 version = "0.0.0"
 
 [[package]]
-name = "positron-backup"
-version = "0.0.0"
-
-[[package]]
 name = "positron-config"
 version = "0.0.0"
 dependencies = [
@@ -1072,10 +1068,6 @@ version = "0.0.0"
 
 [[package]]
 name = "positron-darwin-system"
-version = "0.0.0"
-
-[[package]]
-name = "positron-diagnostics"
 version = "0.0.0"
 
 [[package]]
@@ -1129,10 +1121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "positron-operator"
-version = "0.0.0"
-
-[[package]]
 name = "positron-policy"
 version = "0.0.0"
 dependencies = [
@@ -1153,10 +1141,6 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
 ]
-
-[[package]]
-name = "positron-release"
-version = "0.0.0"
 
 [[package]]
 name = "positron-runtime"
@@ -1200,10 +1184,6 @@ dependencies = [
  "positron-policy",
  "sha2",
 ]
-
-[[package]]
-name = "positron-upgrade"
-version = "0.0.0"
 
 [[package]]
 name = "potential_utf"
